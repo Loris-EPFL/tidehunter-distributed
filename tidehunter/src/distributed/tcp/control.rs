@@ -86,11 +86,11 @@ struct Queue {
     bytes: usize,
     stopped: bool,
     flush_failed: bool,
-    // Appends between dequeue and flush-queue hand-off (or failure).
+    // Stream operations between dequeue and completion/flush hand-off.
     active_appends: usize,
     // Next append ticket to hand out, in queue (submission) order.
     next_ticket: u64,
-    // A non-append control is executing; nothing else may start.
+    // An exclusive control is executing; nothing else may start.
     control_active: bool,
 }
 struct Shared {
@@ -106,7 +106,7 @@ struct Shared {
     flush: mpsc::SyncSender<FlushCommand>,
     // Tier policy. Synchronous: an append waits for the covering sync before
     // its reply. Native: the reply follows the WAL write and the node's syncer
-    // makes it durable in the background; every non-append control flushes first.
+    // makes it durable in the background; exclusive controls flush first.
     synchronous: AtomicBool,
     // Lock order: `durability` before `syncers`. Both are cold on the append
     // path (first append of each log, configuration and live fencing). A live
@@ -122,6 +122,8 @@ struct Shared {
     order_cv: Condvar,
     #[cfg(test)]
     before_ack: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    session_barrier_waits: std::sync::atomic::AtomicU64,
 }
 
 struct DurabilityState {
@@ -286,6 +288,8 @@ impl ControlOwner {
             order_cv: Condvar::new(),
             #[cfg(test)]
             before_ack: Mutex::new(None),
+            #[cfg(test)]
+            session_barrier_waits: std::sync::atomic::AtomicU64::new(0),
         });
         let flush_shared = shared.clone();
         let flush_thread = thread::Builder::new()
@@ -370,6 +374,29 @@ impl ControlOwner {
         let (resume_tx, resume) = mpsc::sync_channel(0);
         *self.shared.before_ack.lock() = Some((entered, resume));
         (entered_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_session_barrier_wait(&self) {
+        // Relaxed: test observation only, not a synchronization hand-off.
+        self.shared
+            .session_barrier_waits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn session_barrier_waits(&self) -> u64 {
+        self.shared.session_barrier_waits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn exclusive_waits_for_stream(&self) -> bool {
+        let queue = self.shared.queue.lock();
+        queue.active_appends != 0
+            && queue
+                .work
+                .front()
+                .is_some_and(|work| !is_stream_request(&work.request))
     }
 
     /// Full admission returns ownership unchanged; the session retains its
@@ -493,9 +520,9 @@ impl StorageNode {
 /// log's own state lock orders them. Everything else is an exclusive control.
 // Seal/fence are exclusive barriers: they wait for active stream operations,
 // including an unlocked close scan. Direct storage callers use `sealing`.
-fn is_stream_request(request: &Request) -> bool {
+pub(super) fn is_stream_request(request: &Request) -> bool {
     match request {
-        Request::Append { .. } => true,
+        Request::Append { .. } | Request::CheckpointPosition { .. } => true,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         Request::ReserveLiveGroup { .. }
         | Request::CompleteLiveGroup { .. }
@@ -506,11 +533,9 @@ fn is_stream_request(request: &Request) -> bool {
     }
 }
 
-/// Take the front command if the scheduling rules allow it: appends overlap each
-/// other (the partition's own state lock orders the WAL allocation), while any
-/// other control is a barrier that waits for every earlier append to reach the
-/// flush queue and holds back every later command until it finishes. Returns
-/// `None` when the queue is empty and stopped.
+/// Stream requests overlap; the log orders their state changes. Exclusive
+/// controls wait for all earlier stream operations, including position proofs,
+/// and block later work until completion. Returns `None` once stopped and empty.
 fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>, u64)> {
     let mut queue = shared.queue.lock();
     loop {
@@ -790,28 +815,35 @@ fn run(shared: &Shared) {
             request => request,
         };
 
-        // Every non-append control is a FIFO barrier: no fence, seal, status or
-        // recovery response can overtake accepted appends or their completions.
-        let (barrier_done, barrier_result) = mpsc::sync_channel(0);
-        let barrier_started = measured.then(Instant::now);
-        let barrier_sent = {
-            let queue = shared.queue.lock();
-            !queue.flush_failed
-                && shared
-                    .flush
-                    .send(FlushCommand::Barrier(barrier_done))
-                    .is_ok()
-        };
-        let (barrier_ok, barrier_wait_ns) = if barrier_sent {
-            let result = barrier_result.recv();
-            let wait = barrier_started.map_or(0, elapsed_ns);
-            if measured {
-                profile.control_queue_ns = profile.control_queue_ns.saturating_add(wait);
-            }
-            (result.is_ok(), wait)
-        } else {
-            (false, 0)
-        };
+        // Position validates the owner's completed-write frontier itself (or
+        // the leased coordinator's fixed acknowledged cut). It performs its own
+        // data barrier. Lifecycle controls still drain the ordered flush queue.
+        let (barrier_ok, barrier_wait_ns) =
+            if matches!(&request, Request::CheckpointPosition { .. }) {
+                (true, 0)
+            } else {
+                let (barrier_done, barrier_result) = mpsc::sync_channel(0);
+                let barrier_started = measured.then(Instant::now);
+                let barrier_sent = {
+                    let queue = shared.queue.lock();
+                    !queue.flush_failed
+                        && shared
+                            .flush
+                            .send(FlushCommand::Barrier(barrier_done))
+                            .is_ok()
+                };
+                let (barrier_ok, barrier_wait_ns) = if barrier_sent {
+                    let result = barrier_result.recv();
+                    let wait = barrier_started.map_or(0, elapsed_ns);
+                    if measured {
+                        profile.control_queue_ns = profile.control_queue_ns.saturating_add(wait);
+                    }
+                    (result.is_ok(), wait)
+                } else {
+                    (false, 0)
+                };
+                (barrier_ok, barrier_wait_ns)
+            };
         if !barrier_ok {
             shared.context.poison_readers();
             {
@@ -2259,27 +2291,48 @@ impl ControlContext {
                 through,
             } => {
                 let mut measured = profile.as_deref_mut();
-                let result = self
+                // The active stream slot excludes fence/seal/retirement. Retain
+                // the validated log, not inventory, across the slow file barrier.
+                let log = self
                     .inventory
                     .lock()
-                    .checkpoint_position(
-                        authority_epoch,
-                        epoch,
-                        through,
-                        measured
-                            .as_deref_mut()
-                            .map(|profile| &mut profile.storage_write),
-                    )
-                    .map(|proof| Response::CheckpointPosition {
-                        database: proof.database,
-                        partition: proof.partition,
-                        epoch: proof.epoch,
-                        durable_end: proof.durable_end,
-                    });
+                    .checkpoint_log(authority_epoch, epoch)?;
+                let durable_end = match log.as_ref() {
+                    Some(log) => log
+                        .persist_wal_through_profiled(
+                            through,
+                            measured
+                                .as_deref_mut()
+                                .map(|profile| &mut profile.storage_write),
+                        )
+                        .map_err(TcpError::component)?,
+                    None => 0,
+                };
+                // Both schedulers count this as active stream work. Check that
+                // invariant before replying instead of accepting a stale handle.
+                match (
+                    log.as_ref(),
+                    self.inventory
+                        .lock()
+                        .checkpoint_log(authority_epoch, epoch)?,
+                ) {
+                    (Some(before), Some(after)) if Arc::ptr_eq(before, &after) => {}
+                    (None, None) => {}
+                    _ => {
+                        return Err(TcpError::new(
+                            "position proof authority changed during sync",
+                        ));
+                    }
+                }
                 if let Some(profile) = measured {
                     profile.append_persist_ns = profile.storage_write.persist_total_ns;
                 }
-                result
+                Ok(Response::CheckpointPosition {
+                    database: self.partition.inventory.database,
+                    partition: self.partition.partition,
+                    epoch,
+                    durable_end,
+                })
             }
             Request::ReplayWal {
                 authority_epoch,

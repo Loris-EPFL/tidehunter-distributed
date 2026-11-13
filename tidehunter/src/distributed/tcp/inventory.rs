@@ -1410,13 +1410,11 @@ impl NodeInventory {
         Ok(())
     }
 
-    pub(super) fn checkpoint_position(
+    pub(super) fn checkpoint_log(
         &self,
         authority_epoch: u64,
         epoch: u64,
-        through: u64,
-        profile: Option<&mut super::super::storage::StorageWriteProfile>,
-    ) -> Result<checkpoint::CheckpointPositionProof, TcpError> {
+    ) -> Result<Option<Arc<super::super::storage::PartitionLog>>, TcpError> {
         self.require_history(true)?;
         self.active(authority_epoch)?;
         let record = self
@@ -1425,22 +1423,16 @@ impl NodeInventory {
             .iter()
             .find(|entry| entry.epoch == epoch)
             .ok_or_else(|| TcpError::new("checkpoint epoch absent"))?;
-        let durable_end = match record.state {
+        match record.state {
             EpochState::Active | EpochState::Sealed => self
                 .logs
                 .get(&epoch)
-                .ok_or_else(|| TcpError::new("checkpoint stream absent"))?
-                .persist_wal_through_profiled(through, profile)
-                .map_err(TcpError::component)?,
-            EpochState::Abandoned => 0,
-            EpochState::Preparing => return Err(TcpError::new("checkpoint epoch incomplete")),
-        };
-        Ok(checkpoint::CheckpointPositionProof {
-            database: self.config.partition.inventory.database,
-            partition: self.config.partition.partition,
-            epoch,
-            durable_end,
-        })
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| TcpError::new("checkpoint stream absent")),
+            EpochState::Abandoned => Ok(None),
+            EpochState::Preparing => Err(TcpError::new("checkpoint epoch incomplete")),
+        }
     }
 
     pub(super) fn replay_wal_page(

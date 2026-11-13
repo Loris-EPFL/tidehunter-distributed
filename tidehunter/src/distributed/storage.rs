@@ -330,6 +330,11 @@ pub(crate) enum LivePausePoint {
     CloseSuffix,
     AfterFrame,
     PressureObserved,
+    PositionBeforeData,
+    PositionBeforeRoot,
+    PositionRootLocked,
+    PositionAfterRoot,
+    LeaseWaitingForPersistence,
 }
 
 #[cfg(all(test, feature = "experimental-nvmeof"))]
@@ -1650,6 +1655,10 @@ impl PartitionLog {
         let config = self.config();
         if authority.epoch != config.inventory.epoch {
             return Err(StorageError::Fenced);
+        }
+        #[cfg(test)]
+        if self.persistence.is_locked() {
+            self.pause_live_at(LivePausePoint::LeaseWaitingForPersistence);
         }
         let _persistence = self.persistence.lock();
         let mut state = self.state.lock();
@@ -3195,9 +3204,16 @@ impl PartitionLog {
         self.state.lock().appended_end
     }
 
-    /// End of the prefix a WAL barrier has made durable.
+    /// End of the adopted-receipt prefix published by its covering barrier.
+    /// A position-root proof can be ahead without publishing receipt bookkeeping.
     pub fn synced_frontier(&self) -> u64 {
         self.durable_frontier.load(Ordering::Acquire)
+    }
+
+    /// Published position-root cut, distinct from the adopted receipt frontier.
+    #[cfg(test)]
+    pub(crate) fn position_frontier_for_test(&self) -> u64 {
+        self.state.lock().wal_root.as_ref().unwrap().synced_end
     }
 
     /// The durability layer's frontier, once the node attached it.
@@ -3512,7 +3528,15 @@ impl PartitionLog {
             .ok_or(StorageError::Invalid("unknown or foreign address"))?;
         #[cfg(feature = "experimental-nvmeof")]
         if self.live_stream && _authority.group_end() > self.readable_frontier() {
-            return Err(StorageError::NeedsPersistence);
+            // A position proof need not publish the adopted receipt frontier.
+            // Serving a batch obtains its own covering receipt barrier.
+            if !self.position_covers_batch(appended.address) {
+                return Err(StorageError::NeedsPersistence);
+            }
+            self.persist_appended()?;
+            if _authority.group_end() > self.readable_frontier() {
+                return Err(StorageError::NeedsPersistence);
+            }
         }
         let _admission = self.read_admission()?;
         let position = WalPosition::new(appended.address.offset, appended.address.len);
@@ -3670,6 +3694,19 @@ impl PartitionLog {
         self.references.lookup(address)
     }
 
+    fn position_covers_batch(&self, address: PhysicalValueAddress) -> bool {
+        address
+            .offset
+            .checked_add(u64::from(address.len))
+            .is_some_and(|end| {
+                self.state
+                    .lock()
+                    .wal_root
+                    .as_ref()
+                    .is_some_and(|root| end <= root.synced_end)
+            })
+    }
+
     /// End of the WAL prefix a reader may use: the synced frontier, or under the
     /// native tier the appended frontier. An appended group is in the page cache
     /// and already indexed, so serving it is correct for a live process; only a
@@ -3714,13 +3751,23 @@ impl PartitionLog {
         let registered = self
             .load_authority(reference.batch_address)?
             .ok_or(StorageError::Invalid("unknown record reference"))?;
-        self.validate_record_authority(reference, &registered)?;
+        match self.validate_record_authority(reference, &registered) {
+            Err(StorageError::NeedsPersistence)
+                if self.position_covers_batch(reference.batch_address) =>
+            {
+                // A completed position proof is not a receipt publication.
+                // Consume it through this read's own covering receipt barrier.
+                self.persist_appended()?;
+                self.validate_record_authority(reference, &registered)?;
+            }
+            result => result?,
+        }
         Ok(registered)
     }
 
-    /// Blocking owner-serving boundary. A live synchronous read may discover a
-    /// complete frame before adoption control; its own covering barrier must
-    /// finish before any record bytes or a namespace grant leave the owner.
+    /// Blocking owner-serving boundary. A position proof can cover bytes without
+    /// publishing the receipt frontier. The read obtains its own covering barrier
+    /// before record bytes or a namespace grant leave the owner.
     fn load_serving_record_authority(
         &self,
         reference: &ValueRecordReference,
@@ -3786,9 +3833,9 @@ impl PartitionLog {
             return Ok(None);
         };
         let plan = self.plan_registered_record_read(reference, registered);
-        #[cfg(feature = "experimental-nvmeof")]
-        if self.live_stream && matches!(&plan, Err(StorageError::NeedsPersistence)) {
-            // The caller-inline path cannot perform an owner persistence barrier.
+        if matches!(&plan, Err(StorageError::NeedsPersistence)) {
+            // Defer without reading position state or taking a blocking lock.
+            // The bounded worker retains the same above-cut error contract.
             return Ok(None);
         }
         plan.map(Some)
@@ -3860,7 +3907,13 @@ impl PartitionLog {
             return Err(StorageError::Invalid("foreign batch receipt"));
         }
         if registered.group_end() > self.readable_frontier() {
-            return Err(StorageError::NeedsPersistence);
+            if !self.position_covers_batch(receipt.address) {
+                return Err(StorageError::NeedsPersistence);
+            }
+            self.persist_appended()?;
+            if registered.group_end() > self.readable_frontier() {
+                return Err(StorageError::NeedsPersistence);
+            }
         }
         let _admission = self.read_admission()?;
         let position = WalPosition::new(receipt.address.offset, receipt.address.len);

@@ -97,6 +97,14 @@ pub struct ReplayPage {
     pub next: Option<u64>,
 }
 
+fn position_lifecycle(state: &State) -> (bool, bool, bool) {
+    #[cfg(feature = "experimental-nvmeof")]
+    let sealing = state.sealing;
+    #[cfg(not(feature = "experimental-nvmeof"))]
+    let sealing = false;
+    (state.sealed, state.writer.is_some(), sealing)
+}
+
 impl PartitionLog {
     pub(super) fn is_retired(&self, offset: u64) -> Result<bool, StorageError> {
         let state = self.state.lock();
@@ -107,8 +115,11 @@ impl PartitionLog {
         self.references.is_retired(offset)
     }
 
-    /// Sync bytes without adoption or receipt metadata. Persistence serializes
-    /// root changes; no state guard spans a file or directory barrier.
+    /// Sync the fixed acknowledged cut without blocking leases on the file barrier.
+    /// Lifecycle callers keep the log alive and exclude seal/fence/retirement.
+    /// The position root is separate from the adopted-receipt sync frontier:
+    /// checkpoint capture/recovery use this root and its proof reply, while
+    /// acknowledgements and owner reads obtain their own receipt barriers.
     pub fn persist_wal_through(&self, through: u64) -> Result<u64, StorageError> {
         self.persist_wal_through_profiled(through, None)
     }
@@ -119,10 +130,8 @@ impl PartitionLog {
         profile: Option<&mut StorageWriteProfile>,
     ) -> Result<u64, StorageError> {
         let mut timing = WriteTiming::new(profile, false);
-        timing.stage(Some(WriteStage::PersistSerializationLock));
-        let _persistence = self.persistence.lock();
         timing.stage(Some(WriteStage::PersistValidation));
-        let mut root = {
+        let (snapshot, lifecycle) = {
             let state = self.state.lock();
             let allocated = state
                 .writer
@@ -133,21 +142,44 @@ impl PartitionLog {
                     "checkpoint position beyond allocated WAL",
                 ));
             }
-            state
+            #[cfg(feature = "experimental-nvmeof")]
+            let leased = state.open_live_extent.is_some();
+            #[cfg(not(feature = "experimental-nvmeof"))]
+            let leased = false;
+            // Owner-RPC cuts must be below the owner's completed-write frontier.
+            // An open lease has no owner-visible CQE; only its coordinator may
+            // name a fully written acknowledged cut above that frontier.
+            if through > state.appended_end && !leased {
+                return Err(StorageError::Invalid(
+                    "checkpoint position beyond completed owner writes",
+                ));
+            }
+            let root = state
                 .wal_root
                 .clone()
-                .ok_or(StorageError::Invalid("request requires WAL replay history"))?
+                .ok_or(StorageError::Invalid("request requires WAL replay history"))?;
+            (root, position_lifecycle(&state))
         };
+        timing.stage(None);
         #[cfg(test)]
-        if let Some((entered, resume)) = self.before_persist.lock().take() {
-            let _ = entered.send(());
-            let _ = resume.recv();
+        {
+            let pause = self.before_persist.lock().take();
+            if let Some((entered, resume)) = pause {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
         }
+        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        self.pause_live_at(LivePausePoint::PositionBeforeData);
+        #[cfg(test)]
+        self.fail_position_at(4)?;
         let size = self.config().wal_file_bytes;
-        if through > root.scan_from {
-            for id in root.scan_from / size..=through.saturating_sub(1) / size {
+        // Required files cannot retire while this stream operation is active.
+        // WAL bytes below through are immutable; later writes may be synced too.
+        if through > snapshot.synced_end {
+            for id in snapshot.scan_from / size..=through.saturating_sub(1) / size {
                 let start = id * size;
-                if root.retired.binary_search(&start).is_err() {
+                if snapshot.retired.binary_search(&start).is_err() {
                     timing.stage(Some(WriteStage::PersistFile));
                     timing.record(|profile| profile.file_persist_calls += 1);
                     self.wal.persist_frame_file(WalPosition::new(start, 1))?;
@@ -161,6 +193,29 @@ impl PartitionLog {
             timing.record(|profile| profile.namespace_persist_successes += 1);
             timing.stage(None);
         }
+        #[cfg(test)]
+        self.fail_position_at(5)?;
+        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        self.pause_live_at(LivePausePoint::PositionBeforeRoot);
+        timing.stage(Some(WriteStage::PersistSerializationLock));
+        let _persistence = self.persistence.lock();
+        timing.stage(Some(WriteStage::PersistValidation));
+        let mut root = {
+            let state = self.state.lock();
+            // The node and session stream guards must prevent these lifecycle
+            // transitions. Never return a proof if a direct caller broke that rule.
+            if position_lifecycle(&state) != lifecycle {
+                return Err(StorageError::Invalid(
+                    "position proof lifecycle changed during sync",
+                ));
+            }
+            state
+                .wal_root
+                .clone()
+                .ok_or(StorageError::Invalid("position root removed during sync"))?
+        };
+        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        self.pause_live_at(LivePausePoint::PositionRootLocked);
         let scan_from =
             through.saturating_sub(1) / self.config().fragment_bytes * self.config().fragment_bytes;
         if through > root.synced_end || scan_from > root.scan_from {
@@ -174,6 +229,10 @@ impl PartitionLog {
             self.install_wal_root(&root)?;
             let synced_end = root.synced_end;
             self.state.lock().wal_root = Some(root);
+            #[cfg(test)]
+            self.fail_position_at(6)?;
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            self.pause_live_at(LivePausePoint::PositionAfterRoot);
             timing.success(0);
             return Ok(synced_end);
         }
@@ -181,10 +240,27 @@ impl PartitionLog {
         Ok(root.synced_end)
     }
 
+    #[cfg(test)]
+    fn fail_position_at(&self, phase: u8) -> Result<(), StorageError> {
+        if self
+            .fail_wal_root
+            .compare_exchange(phase, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Err(StorageError::Invalid("injected position persistence crash"));
+        }
+        Ok(())
+    }
+
     fn install_wal_root(&self, root: &WalRoot) -> Result<(), StorageError> {
         #[cfg(test)]
         {
-            let fail = self.fail_wal_root.swap(0, Ordering::AcqRel);
+            let fail = self
+                .fail_wal_root
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| {
+                    (1..=3).contains(&phase).then_some(0)
+                })
+                .unwrap_or(0);
             if fail == 1 {
                 return Err(StorageError::Invalid(
                     "injected crash before WAL root write",

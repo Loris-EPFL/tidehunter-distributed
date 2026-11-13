@@ -479,7 +479,7 @@ impl super::Client {
         }
     }
 
-    /// A position proof occupies the control slot, not the direct write queue.
+    /// Direct writes can proceed without the lease control slot while runway fits.
     /// Use the next frame's exact aligned size, or the maximum when not known.
     pub(crate) fn leased_append_needs_control(&self, frame_len: Option<usize>) -> bool {
         let Some(current) = &self.live_leased.current else {
@@ -501,21 +501,17 @@ impl super::Client {
                 || self.live_leased.next.is_none())
     }
 
-    /// Reserve the next extent before a position proof takes the control slot.
-    /// The worker parks only the proof; appends retain the current lease runway.
-    pub(crate) fn prepare_leased_position(&mut self) -> Result<bool, super::TcpError> {
+    /// Request the largest lease runway before submitting an independent proof.
+    /// The fixed, CQE-complete cut does not depend on adoption or a future grant.
+    pub(crate) fn prepare_leased_position(&mut self) -> Result<(), super::TcpError> {
         self.ensure_leased_healthy()?;
-        if self.live_leased.pending.is_some() {
-            return Ok(false);
-        }
         if self.lease_ahead()
             && self.live_leased.current.is_some()
             && (self.live_leased.closing.is_some() || self.live_leased.next.is_none())
         {
             self.submit_leased_adoption()?;
-            return Ok(false);
         }
-        Ok(true)
+        Ok(())
     }
 }
 

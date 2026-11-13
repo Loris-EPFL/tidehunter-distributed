@@ -1436,6 +1436,11 @@ pub(super) struct ClientState {
         u32,
     )>,
     control_target: Option<super::super::write_timeline::ControlTimelineTarget>,
+    // One fixed-cut position proof, independent of the lease control slot.
+    // Its envelope still consumes the session's bounded request/byte credits.
+    position: Option<(u64, Instant)>,
+    position_result: Option<Response>,
+    position_target: Option<super::super::write_timeline::ControlTimelineTarget>,
     message_read_requests: u64,
     progressed: bool,
 }
@@ -1533,11 +1538,28 @@ impl Client {
             _ => return,
         }
         timeline.control_event("submit", *owner, id, target, None);
-        self.reactor.control_target = Some(target);
+        if self
+            .reactor
+            .position
+            .is_some_and(|(position, _)| position == id)
+        {
+            self.reactor.position_target = Some(target);
+        } else {
+            self.reactor.control_target = Some(target);
+        }
     }
 
     fn trace_control_complete(&mut self, id: u64, success: bool) {
-        if let Some(target) = self.reactor.control_target.take()
+        let target = if self
+            .reactor
+            .position
+            .is_some_and(|(position, _)| position == id)
+        {
+            self.reactor.position_target.take()
+        } else {
+            self.reactor.control_target.take()
+        };
+        if let Some(target) = target
             && let Some((timeline, owner)) = self.reactor.control_timeline.as_ref()
         {
             timeline.control_event("complete", *owner, id, target, Some(success));
@@ -1592,6 +1614,8 @@ impl Client {
             || self.reactor.retained_append_bytes != 0
             || self.reactor.control.is_some()
             || self.reactor.control_result.is_some()
+            || self.reactor.position.is_some()
+            || self.reactor.position_result.is_some()
             || self.stream.header_used != 0
             || self.stream.input_used != 0
             || self.stream.input_started.is_some()
@@ -1670,6 +1694,9 @@ impl Client {
         if let Some((id, _)) = self.reactor.control {
             self.trace_control_complete(id, false);
         }
+        if let Some((id, _)) = self.reactor.position {
+            self.trace_control_complete(id, false);
+        }
         self.broken = true;
         self.stream.abort();
         self.reactor.reads.clear();
@@ -1683,6 +1710,8 @@ impl Client {
         self.reactor.control = None;
         self.reactor.control_result = None;
         self.reactor.control_profiled = false;
+        self.reactor.position = None;
+        self.reactor.position_result = None;
     }
     pub(crate) fn has_pending_io(&self) -> bool {
         !self.stream.output.is_empty()
@@ -1693,10 +1722,19 @@ impl Client {
             || !self.reactor.wire_appends.is_empty()
             || !self.reactor.append_ready.is_empty()
             || self.reactor.control.is_some()
+            || self.reactor.position.is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn checkpoint_pending(&self) -> bool {
+        self.reactor.control.is_some() || self.reactor.position.is_some()
     }
     #[cfg(test)]
     pub(crate) fn checkpoint_control_pending(&self) -> bool {
         self.reactor.control.is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn checkpoint_position_pending(&self) -> bool {
+        self.reactor.position.is_some()
     }
     fn data_request_count(&self) -> usize {
         self.reactor.reads.len()
@@ -2012,6 +2050,10 @@ impl Client {
                 .reactor
                 .control
                 .is_some_and(|(_, deadline)| now >= deadline)
+            || self
+                .reactor
+                .position
+                .is_some_and(|(_, deadline)| now >= deadline)
         {
             return Err(TcpError::new("remote operation deadline expired"));
         }
@@ -2056,6 +2098,17 @@ impl Client {
             }
             if envelope.id == 0 {
                 return Err(TcpError::new("invalid unsolicited response"));
+            }
+            if self
+                .reactor
+                .position
+                .is_some_and(|(id, _)| id == envelope.id)
+            {
+                if self.reactor.position_result.is_some() {
+                    return Err(TcpError::new("duplicate position response"));
+                }
+                self.reactor.position_result = Some(envelope.body);
+                continue;
             }
             if self
                 .reactor
@@ -2270,6 +2323,79 @@ impl Client {
             );
         }
     }
+    pub(super) fn exchange_position(&mut self, request: &Request) -> Result<Response, TcpError> {
+        if self.reactor.position.is_some() {
+            return Err(TcpError::new("position exchange already active"));
+        }
+        let deadline = Instant::now() + self.timeout;
+        let mut polling = ActivePoll::default();
+        let mut submitted = false;
+        loop {
+            if !submitted {
+                submitted = self.submit_position(request, deadline)?;
+            }
+            if let Err(error) = self.progress_correlated() {
+                self.fail_connection();
+                return Err(error);
+            }
+            if submitted && let Some(result) = self.take_position() {
+                return result;
+            }
+            polling.pause(
+                self.polling,
+                self.stream.is_fabric(),
+                self.reactor.progressed,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_position_for_test(&mut self) {
+        self.reactor.position.as_mut().unwrap().1 = Instant::now();
+    }
+
+    pub(super) fn submit_position(
+        &mut self,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<bool, TcpError> {
+        self.ensure_connection()?;
+        if self.reactor.position.is_some() {
+            return Ok(false);
+        }
+        let id = self
+            .reactor
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| TcpError::new("request ID space exhausted"))?;
+        let size = self.stream.queue_size(id, request, self.frame_limit)?;
+        if Instant::now() >= deadline {
+            return Err(TcpError::new("position output admission deadline expired"));
+        }
+        if !self.stream.can_queue(size) {
+            return Ok(false);
+        }
+        let id = self.reactor.allocate_id()?;
+        self.stream.queue(id, request, self.frame_limit)?;
+        self.reactor.position = Some((id, deadline));
+        self.trace_control_submit(id, request);
+        Ok(true)
+    }
+
+    pub(super) fn take_position(&mut self) -> Option<Result<Response, TcpError>> {
+        let (id, _) = self.reactor.position?;
+        if self.stream.output_pending(id) {
+            return None;
+        }
+        let response = self.reactor.position_result.take()?;
+        self.trace_control_complete(id, !matches!(&response, Response::Error(_)));
+        self.reactor.position = None;
+        Some(match response {
+            Response::Error(message) => Err(TcpError::new(message)),
+            response => Ok(response),
+        })
+    }
+
     pub(super) fn submit_control(
         &mut self,
         request: &Request,
@@ -2992,7 +3118,7 @@ pub(super) fn serve_session(
                         measured,
                         owner_trace,
                         owner_trace_shape,
-                        is_append: matches!(&envelope.body, Request::Append { .. }),
+                        is_append: control::is_stream_request(&envelope.body),
                         control_queued: measured.then(Instant::now),
                         output_started: None,
                         _lease: None,
@@ -3235,7 +3361,7 @@ pub(super) fn serve_session(
                     progressed = true;
                     continue;
                 }
-                let is_append = matches!(&request, Request::Append { .. });
+                let is_append = control::is_stream_request(&request);
                 let is_control = !matches!(
                     &request,
                     Request::Read { .. } | Request::ReadProfiled { .. }
@@ -3243,6 +3369,8 @@ pub(super) fn serve_session(
                 if is_control
                     && (blocked_control || barrier_active || (!is_append && active_appends != 0))
                 {
+                    #[cfg(test)]
+                    node.control.note_session_barrier_wait();
                     controls.push_back((id, request));
                     blocked_control = true;
                     continue;

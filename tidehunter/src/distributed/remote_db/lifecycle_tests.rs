@@ -35,7 +35,7 @@ fn control_monitor_waits_for_occupied_checkpoint_slot_and_stops_cleanly() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if db.clients[0].client.lock().checkpoint_control_pending() {
+        if db.clients[0].client.lock().checkpoint_pending() {
             break;
         }
         if Instant::now() >= deadline {
@@ -112,7 +112,7 @@ fn public_diagnostic_controls_wait_for_checkpoint_without_consuming_proof() {
             .send(Command::Checkpoint(db.epoch, db.epoch, 1, reply))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !db.clients[0].client.lock().checkpoint_control_pending() {
+        while !db.clients[0].client.lock().checkpoint_pending() {
             if Instant::now() >= deadline {
                 drop(release);
                 panic!("checkpoint control was not submitted");
@@ -172,7 +172,7 @@ fn nonpipelined_write_behind_pending_checkpoint_is_durable_and_recoverable() {
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     db.start_checkpoint().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !db.clients[0].client.lock().checkpoint_control_pending() {
+    while !db.clients[0].client.lock().checkpoint_pending() {
         if Instant::now() >= deadline {
             drop(release);
             panic!("checkpoint control was not submitted");
@@ -232,7 +232,7 @@ fn concurrent_eviction_waits_for_pending_checkpoint_control() {
         .send(Command::Checkpoint(db.epoch, db.epoch, 1, reply))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !db.clients[0].client.lock().checkpoint_control_pending() {
+    while !db.clients[0].client.lock().checkpoint_pending() {
         if Instant::now() >= deadline {
             drop(release);
             panic!("checkpoint control was not submitted");

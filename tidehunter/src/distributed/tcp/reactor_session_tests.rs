@@ -167,3 +167,259 @@ fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
         .unwrap();
     assert!(matches!(seal.body, Response::Sealed));
 }
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn session_and_node_use_the_same_stream_class_for_every_wal_request() {
+    use crate::distributed::durability::DurabilityTier;
+    use crate::distributed::storage::LivePausePoint;
+    use crate::distributed::tcp::leased_tests::Fixture;
+    for variant in 0..7 {
+        let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+        let mut client = fixture.writer_without_ahead();
+        let receipt = client
+            .write_leased_group(
+                1,
+                vec![fixture.batch(0)],
+                &crate::distributed::write_timeline::WriteTimeline::default(),
+                2,
+            )
+            .unwrap()[0];
+        let through =
+            receipt.appended().address().offset + u64::from(receipt.appended().address().len);
+        let (entered, release) = fixture
+            .node
+            .log_for_test(1)
+            .pause_live(LivePausePoint::PositionBeforeData);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            client
+                .submit_checkpoint_position(1, 1, through, deadline)
+                .unwrap()
+        );
+        loop {
+            client.progress_appends().unwrap();
+            if entered.try_recv().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let group = crate::distributed::group::CompleteGroup::new_live(
+            &KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap(),
+            vec![fixture.batch(1)],
+            fixture.config.partition.batch_limits,
+            fixture.config.partition.group_limits,
+        )
+        .unwrap();
+        let descriptor =
+            crate::distributed::nvmeof::live_storage::LiveGroupDescriptor::from_group(&group)
+                .unwrap()
+                .0;
+        // Absent epoch: a real error reply proves admission through BOTH
+        // schedulers without creating a new allocation or altering the log.
+        let request = match variant {
+            0 => Request::Append {
+                epoch: 2,
+                batches: vec![fixture.batch(1).encoded().clone().into()],
+            },
+            1 => Request::CheckpointPosition {
+                authority_epoch: 1,
+                epoch: 2,
+                through: 0,
+            },
+            2 => Request::LeaseLiveExtent { epoch: 2 },
+            3 => Request::PreleaseLiveExtent {
+                epoch: 2,
+                after: [0; 16],
+            },
+            4 => Request::AdoptLiveExtent {
+                epoch: 2,
+                token: [0; 16],
+                through: 0,
+                close: false,
+                lease_next: false,
+            },
+            5 => Request::CompleteLiveGroup {
+                epoch: 2,
+                token: [0; 16],
+            },
+            _ => Request::ReserveLiveGroup {
+                epoch: 2,
+                descriptor,
+            },
+        };
+        assert!(control::is_stream_request(&request));
+        assert!(client.submit_control(&request, deadline).unwrap());
+        let response = loop {
+            client.progress_appends().unwrap();
+            if let Some(response) = client.take_control() {
+                break Some(response);
+            }
+            if Instant::now() >= deadline - Duration::from_secs(1) {
+                break None;
+            }
+            std::thread::yield_now();
+        };
+        let proof_pending = client.reactor.position_result.is_none();
+        release.send(()).unwrap();
+        assert!(
+            response
+                .expect("both schedulers must admit this stream request")
+                .is_err()
+        );
+        assert!(proof_pending);
+        loop {
+            client.progress_appends().unwrap();
+            if let Some(proof) = client.take_checkpoint_position(1, through) {
+                proof.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn seal_fence_and_retirement_wait_for_active_position_proofs() {
+    use crate::distributed::durability::DurabilityTier;
+    use crate::distributed::storage::LivePausePoint;
+    use crate::distributed::tcp::leased_tests::Fixture;
+    // Same-session exclusion and node-wide exclusion are separate barriers.
+    for scenario in 0..6 {
+        let variant = scenario % 3;
+        let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+        let mut client = fixture.writer_without_ahead();
+        let mut other = fixture.client();
+        let receipt = client
+            .write_leased_group(
+                1,
+                vec![fixture.batch(0)],
+                &crate::distributed::write_timeline::WriteTimeline::default(),
+                2,
+            )
+            .unwrap()[0];
+        let through =
+            receipt.appended().address().offset + u64::from(receipt.appended().address().len);
+        if variant == 2 {
+            client.close_leased_extent().unwrap();
+            client.seal(1).unwrap();
+            client.fence_to(2).unwrap();
+        }
+        let authority = if variant == 2 { 2 } else { 1 };
+        let log = fixture
+            .node
+            .inventory
+            .lock()
+            .checkpoint_log(authority, 1)
+            .unwrap()
+            .unwrap();
+        let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeData);
+        drop(log); // Fence must not see a test-owned outstanding storage handle.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        client
+            .submit_checkpoint_position(authority, 1, through, deadline)
+            .unwrap();
+        loop {
+            client.progress_appends().unwrap();
+            if entered.try_recv().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let request = match variant {
+            0 => Request::Seal { epoch: 1 },
+            1 => Request::Fence { epoch: 2 },
+            _ => Request::RetireWalFiles {
+                authority_epoch: 2,
+                epoch: 1,
+                files: Vec::new(),
+            },
+        };
+        assert!(!control::is_stream_request(&request));
+        let session_waits = fixture.node.control.session_barrier_waits();
+        let control = if scenario < 3 {
+            &mut client
+        } else {
+            &mut other
+        };
+        assert!(control.submit_control(&request, deadline).unwrap());
+        let queued = loop {
+            client.progress_appends().unwrap();
+            other.progress_appends().unwrap();
+            let observed = if scenario < 3 {
+                fixture.node.control.session_barrier_waits() > session_waits
+            } else {
+                fixture.node.control.exclusive_waits_for_stream()
+            };
+            if observed {
+                break true;
+            }
+            let control = if scenario < 3 { &client } else { &other };
+            if control.reactor.control_result.is_some()
+                || Instant::now() >= deadline - Duration::from_secs(1)
+            {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let control = if scenario < 3 { &client } else { &other };
+        let pending = control.reactor.control_result.is_none();
+        release.send(()).unwrap();
+        assert!(queued, "control must be observed queued behind the proof");
+        assert!(pending);
+        let mut proof_done = false;
+        let mut control_done = false;
+        while !proof_done || !control_done {
+            client.progress_appends().unwrap();
+            other.progress_appends().unwrap();
+            if !proof_done && let Some(proof) = client.take_checkpoint_position(1, through) {
+                proof.unwrap();
+                proof_done = true;
+            }
+            let control = if scenario < 3 {
+                &mut client
+            } else {
+                &mut other
+            };
+            if !control_done && let Some(response) = control.take_control() {
+                response.unwrap();
+                control_done = true;
+            }
+            assert!(Instant::now() < deadline);
+        }
+    }
+}
+
+#[test]
+fn position_and_control_admission_keep_the_existing_session_bound() {
+    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
+    let mut client = server.client();
+    for _ in 0..SESSION_REQUESTS {
+        let id = client.reactor.allocate_id().unwrap();
+        client
+            .stream
+            .queue(id, &Request::Stats, client.frame_limit)
+            .unwrap();
+    }
+    let next_id = client.reactor.next_id;
+    let bytes = client.stream.output_bytes;
+    for _ in 0..128 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            !client
+                .submit_checkpoint_position(1, 1, 0, deadline)
+                .unwrap()
+        );
+        assert!(!client.submit_control(&Request::Stats, deadline).unwrap());
+        assert_eq!(client.reactor.next_id, next_id);
+        assert_eq!(client.stream.output.len(), SESSION_REQUESTS);
+        assert_eq!(client.stream.output_bytes, bytes);
+        assert!(client.reactor.position.is_none());
+        assert!(client.reactor.control.is_none());
+    }
+    assert!(bytes <= SESSION_BYTES);
+}

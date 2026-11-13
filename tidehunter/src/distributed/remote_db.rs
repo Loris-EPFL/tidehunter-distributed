@@ -5299,9 +5299,8 @@ impl ClientWorker {
                     }
                     let result = match command {
                         Command::Checkpoint(..) => client.settle_leased_extent(),
-                        Command::CheckpointPosition(..) | Command::ReadIoStats(_) => {
-                            client.wait_leased_control()
-                        }
+                        Command::CheckpointPosition(..) => Ok(()),
+                        Command::ReadIoStats(_) => client.wait_leased_control(),
                         Command::Seal(..) | Command::Control(_) => client.close_leased_extent(),
                         Command::Stats(_)
                         | Command::ArmProfile(..)
@@ -5362,7 +5361,8 @@ impl ClientWorker {
                             }
                             if let Some(command) = parked_checkpoint.as_ref() {
                                 let ready = if matches!(command, Command::CheckpointPosition(..)) {
-                                    client.prepare_leased_position()?
+                                    client.prepare_leased_position()?;
+                                    true
                                 } else {
                                     !client.leased_adoption_pending()
                                 };
@@ -5376,7 +5376,6 @@ impl ClientWorker {
                             }
                             if appends.is_empty()
                                 && checkpoint.is_none()
-                                && position.is_none()
                                 && parked_checkpoint.is_none()
                                 && matches!(queued.front(), Some(Command::Append(..)) | None)
                             {
@@ -5401,7 +5400,10 @@ impl ClientWorker {
                         if checkpoint.is_none()
                             && position.is_none()
                             && client.leased_adoption_pending()
-                            && !matches!(queued.front(), Some(Command::Append(..)))
+                            && !matches!(
+                                queued.front(),
+                                Some(Command::Append(..) | Command::CheckpointPosition(..))
+                            )
                         {
                             // The control slot progresses only on this thread. Do
                             // not park forever on the command channel or spin on
@@ -5472,10 +5474,12 @@ impl ClientWorker {
                             match budget.extend(count, payload, batches) {
                                 Some((next_count, next_payload)) => {
                                     let frame = (next_payload + 8 + 4095) & !4095;
-                                    if (position.is_some()
-                                        || (parked_checkpoint.is_some()
-                                            && client.leased_adoption_pending()))
+                                    // Harvest a pending prelease in the worker before
+                                    // a boundary write consumes it. This gives the
+                                    // parked proof its first free control turn.
+                                    if (position.is_some() || parked_checkpoint.is_some())
                                         && client.leased_append_needs_control(Some(frame))
+                                        && client.leased_adoption_pending()
                                     {
                                         break;
                                     }
@@ -5486,10 +5490,9 @@ impl ClientWorker {
                                 // The first group is sent alone even if it exceeds the
                                 // budget, so the owner reports the real limit error.
                                 None if take == 0 => {
-                                    if (position.is_none()
-                                        && (parked_checkpoint.is_none()
-                                            || !client.leased_adoption_pending()))
+                                    if (position.is_none() && parked_checkpoint.is_none())
                                         || !client.leased_append_needs_control(None)
+                                        || !client.leased_adoption_pending()
                                     {
                                         take = 1;
                                     }
@@ -5570,7 +5573,6 @@ impl ClientWorker {
                                 break;
                             }
                             if client.live_leased_mode()
-                                && position.is_none()
                                 && parked_checkpoint.is_none()
                                 && let Err(error) = client.submit_leased_adoption()
                             {
@@ -6131,6 +6133,18 @@ impl ClientWorker {
                         thread::yield_now();
                     }
                 }
+                if let Some((_, _, reply)) = position.take() {
+                    let message =
+                        failure_context(&first_failure, "TCP worker stopped during position proof");
+                    let _ = reply.send(Err(LocalDbError::new(message)));
+                }
+                if let Some((_, _, reply)) = checkpoint.take() {
+                    let message = failure_context(
+                        &first_failure,
+                        "TCP worker stopped during checkpoint proof",
+                    );
+                    let _ = reply.send(Err(LocalDbError::new(message)));
+                }
                 if let Some(command) = parked_checkpoint.take() {
                     let message = failure_context(
                         &first_failure,
@@ -6261,6 +6275,8 @@ mod tests;
 mod leased_tests;
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_bench_tests;
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+mod position_tests;
 
 #[cfg(test)]
 mod pipeline_tests;

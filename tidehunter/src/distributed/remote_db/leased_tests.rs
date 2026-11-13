@@ -4,7 +4,7 @@ use crate::distributed::durability::DurabilityTier;
 use crate::distributed::tcp::leased_tests::{Fixture, leased_latencies};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-fn worker(fixture: &Fixture, client: Client) -> (ClientWorker, Arc<AtomicBool>) {
+pub(super) fn worker(fixture: &Fixture, client: Client) -> (ClientWorker, Arc<AtomicBool>) {
     worker_with_capacity(fixture, client, 16)
 }
 
@@ -1017,12 +1017,21 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
         }
         Ok(receipts)
     })();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.metrics.snapshot().counts.adopt_profile_samples == before.adopt_profile_samples
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
     let pending = fixture.metrics.snapshot().counts;
     // Release before any failure assertion, so teardown cannot wait on this hook.
     release.send(()).unwrap();
     let receipts = overlapping.expect("direct frames must not wait for the position sync");
     assert_eq!(pending.leased_frames, before.leased_frames + 8);
-    assert_eq!(pending.adopt_profile_samples, before.adopt_profile_samples);
+    assert!(
+        pending.adopt_profile_samples > before.adopt_profile_samples,
+        "adoption must progress before the position reply"
+    );
     assert_eq!(pending.extent_preleases, before.extent_preleases);
     assert_eq!(
         pending.adoption_sync_exchanges,
@@ -1039,14 +1048,6 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
             .iter()
             .all(|receipt| receipt.appended().address().offset > proof.durable_end)
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while fixture.metrics.snapshot().counts.adopt_profile_samples == before.adopt_profile_samples {
-        assert!(
-            Instant::now() < deadline,
-            "adoption driver did not resume after the position reply"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
     let log = fixture.node.log_for_test(1);
     for (n, receipt) in (1..=8).zip(receipts) {
         let batch = fixture.batch(n);
@@ -1060,7 +1061,7 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
 }
 
 #[test]
-fn wal_replay_leased_append_that_needs_control_waits_for_position_reply() {
+fn wal_replay_leased_extent_control_progresses_during_position_sync() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let mut client = fixture.writer_without_ahead();
     let mut last = None;
@@ -1086,19 +1087,15 @@ fn wal_replay_leased_append_that_needs_control_waits_for_position_reply() {
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     let before = fixture.metrics.snapshot().counts;
     let append = worker.append(1, vec![fixture.batch(4)]).unwrap();
-    let early = append.recv_timeout(Duration::from_millis(100));
+    let early = append.recv_timeout(Duration::from_secs(5));
     let pending = fixture.metrics.snapshot().counts;
     release.send(()).unwrap();
-    assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
-    assert_eq!(pending.leased_frames, before.leased_frames);
+    let receipt = early.unwrap().unwrap()[0];
+    assert_eq!(pending.leased_frames, before.leased_frames + 1);
     checkpoint
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
-    let receipt = append
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap()[0];
     assert!(receipt.appended().address().offset >= 16384);
     let batch = fixture.batch(4);
     let reference = batch
@@ -1117,7 +1114,7 @@ fn wal_replay_leased_append_that_needs_control_waits_for_position_reply() {
 }
 
 #[test]
-fn parked_position_allows_appends_during_adoption_and_preserves_control_order() {
+fn position_is_submitted_during_adoption_and_preserves_control_order() {
     use crate::distributed::storage::LivePausePoint;
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
         let fixture = Fixture::new(tier, 128 * 1024);
@@ -1127,11 +1124,12 @@ fn parked_position_allows_appends_during_adoption_and_preserves_control_order() 
             .unwrap()[0];
         client.wait_leased_control().unwrap(); // Initial prelease.
         let log = fixture.node.log_for_test(1);
+        let through = first.appended().address().offset + u64::from(first.appended().address().len);
+        assert!(through > log.appended_frontier());
         let (entered, release) = log.pause_live(LivePausePoint::FrameProbe);
         client.submit_leased_adoption().unwrap();
         let (worker, failure) = worker(&fixture, client);
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        let through = first.appended().address().offset + u64::from(first.appended().address().len);
         let guard = worker.client.lock();
         let (reply, proof) = mpsc::sync_channel(1);
         worker
@@ -1147,12 +1145,22 @@ fn parked_position_allows_appends_during_adoption_and_preserves_control_order() 
         let later = worker.append(1, vec![fixture.batch(2)]).unwrap();
         drop(guard);
         let passed = passing.recv_timeout(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let submitted = loop {
+            if worker.client.lock().checkpoint_position_pending() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::yield_now();
+        };
         let proof_pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
         let control_pending = matches!(control.try_recv(), Err(mpsc::TryRecvError::Empty));
         let later_pending = matches!(later.try_recv(), Err(mpsc::TryRecvError::Empty));
         release.send(()).unwrap();
         let passed = passed.unwrap().unwrap()[0];
-        assert!(proof_pending && control_pending && later_pending);
+        assert!(submitted && proof_pending && control_pending && later_pending);
         assert!(passed.appended().address().offset > through);
         assert!(
             proof
@@ -1284,7 +1292,7 @@ fn parked_receipt_checkpoint_keeps_its_captured_prefix() {
 }
 
 #[test]
-fn failed_append_poison_replies_to_parked_position() {
+fn failed_append_poison_replies_to_inflight_position() {
     use crate::distributed::storage::LivePausePoint;
     let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
     let mut client = fixture.writer();
@@ -1295,19 +1303,53 @@ fn failed_append_poison_replies_to_parked_position() {
     let (entered, release) = fixture
         .node
         .log_for_test(1)
+        .pause_live(LivePausePoint::PositionBeforeData);
+    client.leased_test_fail_write(-libc::EIO);
+    let (worker, failure) = worker(&fixture, client);
+    let through = first.appended().address().offset + u64::from(first.appended().address().len);
+    let (reply, proof) = mpsc::sync_channel(1);
+    worker
+        .send(Command::CheckpointPosition(1, 1, through, reply))
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+    let result = append.recv_timeout(Duration::from_secs(5));
+    let proof_result = proof.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    assert!(result.unwrap().is_err());
+    assert!(proof_result.unwrap().is_err());
+    drop(worker);
+    assert!(failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn failed_append_poison_replies_to_parked_receipt_checkpoint() {
+    use crate::distributed::storage::{HistoryPersistence, LivePausePoint};
+    let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+    fixture
+        .node
+        .set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    let mut client = fixture.writer();
+    client
+        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .unwrap();
+    client.wait_leased_control().unwrap();
+    let (entered, release) = fixture
+        .node
+        .log_for_test(1)
         .pause_live(LivePausePoint::FrameProbe);
     client.submit_leased_adoption().unwrap();
     client.leased_test_fail_write(-libc::EIO);
     let (worker, failure) = worker(&fixture, client);
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let through = first.appended().address().offset + u64::from(first.appended().address().len);
     let guard = worker.client.lock();
     let (reply, proof) = mpsc::sync_channel(1);
-    worker
-        .send(Command::CheckpointPosition(1, 1, through, reply))
-        .unwrap();
+    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
     let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
     drop(guard);
+    // The receipt proof cannot leave its parked slot while adoption is held.
+    // The failed passing append must finalize that proof before owner progress.
     let result = append.recv_timeout(Duration::from_secs(5));
     let proof_result = proof.recv_timeout(Duration::from_secs(5));
     release.send(()).unwrap();

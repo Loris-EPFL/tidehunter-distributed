@@ -1933,8 +1933,8 @@ fn legacy_authority_without_explicit_limits_replays_before_format_upgrade() {
 
 #[test]
 fn native_checkpoint_commits_no_image_while_an_owner_sync_is_stalled() {
-    // Native owners acknowledge before their sync. A checkpoint may reference
-    // such a batch only once that owner's synced frontier covers it.
+    // Native owners acknowledge before sync. The position root, not the
+    // separately adopted receipt frontier, must cover a committed checkpoint.
     let fixture = Fixture::new();
     let mut db = fixture.open();
     let epoch = db.epoch();
@@ -1952,7 +1952,7 @@ fn native_checkpoint_commits_no_image_while_an_owner_sync_is_stalled() {
         let manifest: AuthorityManifest = read_metadata(&authority.join(MANIFEST)).unwrap();
         let held = (
             manifest.checkpoint.is_none(),
-            observer_log.synced_frontier() < acknowledged_end,
+            observer_log.position_frontier_for_test() < acknowledged_end,
         );
         release.send(()).unwrap();
         held
@@ -1965,7 +1965,7 @@ fn native_checkpoint_commits_no_image_while_an_owner_sync_is_stalled() {
     );
     assert!(still_unsynced, "the owner had already synced the batch");
     // After the sync completed the image exists and the owner covers its prefix.
-    assert!(log.synced_frontier() >= acknowledged_end);
+    assert!(log.position_frontier_for_test() >= acknowledged_end);
     let manifest: AuthorityManifest =
         read_metadata(&fixture.temp.path().join("authority").join(MANIFEST)).unwrap();
     assert!(manifest.checkpoint.is_some());

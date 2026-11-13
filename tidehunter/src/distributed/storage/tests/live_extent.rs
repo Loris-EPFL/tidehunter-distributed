@@ -1385,3 +1385,171 @@ fn owner_read_of_preleased_extent_frame_while_old_extent_closes() {
         }
     }
 }
+
+#[test]
+fn position_crash_cuts_with_interleaved_adoption_recover_in_both_tiers() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        // Root write, root file sync, rename, before data, after data, after root.
+        for phase in 1..=6 {
+            let (temp, config, log) = fixture();
+            let log = Arc::new(log);
+            log.attach_frontier(&DurabilityConfig::with_tier(tier))
+                .unwrap();
+            let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+            let (first, bytes) = encoded(&config, vec![batch(&config, 0)]);
+            write(&extent, 0, &bytes);
+            log.self_adopt_live_extent().unwrap();
+            let (second, bytes) = encoded(&config, vec![batch(&config, 1)]);
+            write(&extent, 4096, &bytes);
+            if tier == DurabilityTier::Synchronous {
+                // The initiator's data-sync completion is independent of proof metadata.
+                OpenOptions::new()
+                    .write(true)
+                    .open(&extent.segment.path)
+                    .unwrap()
+                    .sync_data()
+                    .unwrap();
+            }
+            let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeData);
+            let proof_log = log.clone();
+            let proof = std::thread::spawn(move || proof_log.persist_wal_through(4096));
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Adoption moves beyond the captured cut while the proof has no lock.
+            let adopted = log.self_adopt_live_extent();
+            log.fail_wal_root.store(phase, Ordering::Release);
+            release.send(()).unwrap();
+            adopted.unwrap();
+            assert!(proof.join().unwrap().is_err(), "phase {phase}, tier {tier}");
+            drop(log);
+            let recovered = PartitionLog::recover_live_sealed(
+                &temp.path().join("stream"),
+                &config,
+                metrics(),
+                // This direct-file fixture has no exported writable target.
+                || Ok(()),
+            )
+            .unwrap();
+            for (n, group, offset) in [(0, first, 0), (1, second, 4096)] {
+                let receipt = expected(&config, &group, offset, 4096)[0];
+                let reference = group.batches()[0]
+                    .record_reference(receipt.address(), 0)
+                    .unwrap();
+                assert_eq!(
+                    recovered.read_record(&reference).unwrap(),
+                    batch(&config, n).mutations()[0]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn position_proof_covers_completed_leased_bytes_before_owner_adoption() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        for read_kind in 0..3 {
+            let (_temp, config, log) = fixture();
+            let log = Arc::new(log);
+            log.attach_frontier(&DurabilityConfig::with_tier(tier))
+                .unwrap();
+            let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+            let (group, bytes) = encoded(&config, vec![batch(&config, 0)]);
+            write(&extent, 0, &bytes);
+            let through = bytes.len() as u64;
+            if tier == DurabilityTier::Synchronous {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&extent.segment.path)
+                    .unwrap()
+                    .sync_data()
+                    .unwrap();
+            }
+            assert!(
+                through > log.appended_frontier(),
+                "the requested leased cut must exceed the owner's adopted frontier"
+            );
+            assert!(log.persist_wal_through(through).unwrap() >= through);
+            assert_eq!(log.position_frontier_for_test(), through);
+            assert!(
+                log.appended_frontier() < through,
+                "proof must not require adoption"
+            );
+            assert!(log.synced_frontier() < through);
+            assert_eq!(log.receipt_count(), 0);
+            let receipt = expected(&config, &group, extent.start, bytes.len())[0];
+            let reference = group.batches()[0]
+                .record_reference(receipt.address(), 0)
+                .unwrap();
+            match read_kind {
+                0 => assert_eq!(
+                    log.read_record(&reference).unwrap(),
+                    batch(&config, 0).mutations()[0]
+                ),
+                1 => assert_eq!(
+                    log.read_batch(receipt).unwrap().mutations(),
+                    batch(&config, 0).mutations()
+                ),
+                _ => assert_eq!(
+                    log.resolve_live_batch(receipt).unwrap().len,
+                    receipt.address().len
+                ),
+            }
+            // Existing lookup still discovers and validates/adopts the frame;
+            // the durable position root is not a substitute for that authority.
+            assert_eq!(log.receipt_count(), 1);
+            if tier == DurabilityTier::Synchronous {
+                assert!(
+                    log.synced_frontier() >= through,
+                    "the read must obtain its own receipt barrier"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn position_root_does_not_authorize_an_above_cut_read() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let (_temp, config, log) = fixture();
+        let log = Arc::new(log);
+        log.attach_frontier(&DurabilityConfig::with_tier(tier))
+            .unwrap();
+        let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+        let (_, first) = encoded(&config, vec![batch(&config, 0)]);
+        write(&extent, 0, &first);
+        let cut = first.len() as u64;
+        assert_eq!(log.persist_wal_through(cut).unwrap(), cut);
+        let (second, bytes) = encoded(&config, vec![batch(&config, 1)]);
+        write(&extent, cut, &bytes);
+        let receipt = expected(&config, &second, cut, bytes.len())[0];
+        assert!(receipt.address().offset + u64::from(receipt.address().len) > cut);
+        let reference = second.batches()[0]
+            .record_reference(receipt.address(), 0)
+            .unwrap();
+        let record_read = log.read_record(&reference);
+        let profiled_read = log.read_record_profiled(&reference);
+        let batch_read = log.read_batch(receipt);
+        let lease_read = log.resolve_live_batch(receipt);
+        if tier == DurabilityTier::Synchronous {
+            assert!(matches!(batch_read, Err(StorageError::NeedsPersistence)));
+            assert!(matches!(lease_read, Err(StorageError::NeedsPersistence)));
+            assert!(matches!(record_read, Err(StorageError::NeedsPersistence)));
+            assert!(matches!(profiled_read, Err(StorageError::NeedsPersistence)));
+        } else {
+            // Native already permits complete, validated page-cache reads.
+            assert_eq!(
+                batch_read.unwrap().mutations(),
+                batch(&config, 1).mutations()
+            );
+            assert_eq!(lease_read.unwrap().len, receipt.address().len);
+            assert_eq!(record_read.unwrap(), batch(&config, 1).mutations()[0]);
+            assert_eq!(profiled_read.unwrap().0, batch(&config, 1).mutations()[0]);
+        }
+        assert_eq!(
+            log.receipt_count(),
+            2,
+            "existing lookup must adopt/validate"
+        );
+        assert_eq!(log.position_frontier_for_test(), cut);
+        assert_eq!(log.synced_frontier(), 0);
+    }
+}

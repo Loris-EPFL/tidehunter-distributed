@@ -33,6 +33,38 @@ fn reopened_legacy_owner_reports_stored_history_mode_before_selection() {
     );
 }
 
+fn position_proof(
+    node: &StorageNode,
+    authority: u64,
+    epoch: u64,
+    through: u64,
+) -> checkpoint::CheckpointPositionProof {
+    match node
+        .handle(
+            Request::CheckpointPosition {
+                authority_epoch: authority,
+                epoch,
+                through,
+            },
+            TcpLimits::default(),
+        )
+        .unwrap()
+    {
+        Response::CheckpointPosition {
+            database,
+            partition,
+            epoch,
+            durable_end,
+        } => checkpoint::CheckpointPositionProof {
+            database,
+            partition,
+            epoch,
+            durable_end,
+        },
+        _ => panic!("expected position proof"),
+    }
+}
+
 #[test]
 fn checkpoint_position_syncs_and_advances_owner_root() {
     let temp = tempdir::TempDir::new("tcp-wal-position").unwrap();
@@ -41,20 +73,9 @@ fn checkpoint_position_syncs_and_advances_owner_root() {
     node.inventory.lock().fence_to(1).unwrap();
     let receipts = append(&node, 1, &[batch(&config, 1, 0)]);
     let through = receipts[0].address.offset + u64::from(receipts[0].address.len);
-    let proof = node
-        .inventory
-        .lock()
-        .checkpoint_position(1, 1, through, None)
-        .unwrap();
+    let proof = position_proof(&node, 1, 1, through);
     assert_eq!(proof.durable_end, through);
-    assert_eq!(
-        node.inventory
-            .lock()
-            .checkpoint_position(1, 1, 0, None)
-            .unwrap()
-            .durable_end,
-        through
-    );
+    assert_eq!(position_proof(&node, 1, 1, 0).durable_end, through);
     assert!(
         config
             .root
@@ -64,13 +85,7 @@ fn checkpoint_position_syncs_and_advances_owner_root() {
     drop(node);
     let node = StorageNode::open(config, metrics()).unwrap();
     node.inventory.lock().fence_to(2).unwrap();
-    assert_eq!(
-        node.inventory
-            .lock()
-            .checkpoint_position(2, 1, 0, None)
-            .unwrap(),
-        proof
-    );
+    assert_eq!(position_proof(&node, 2, 1, 0), proof);
 }
 
 #[test]

@@ -205,7 +205,7 @@ impl Client {
         epoch: u64,
         through: u64,
     ) -> Result<CheckpointPositionProof, TcpError> {
-        let response = self.request(Request::CheckpointPosition {
+        let response = self.exchange_position(&Request::CheckpointPosition {
             authority_epoch,
             epoch,
             through,
@@ -220,7 +220,7 @@ impl Client {
         through: u64,
         deadline: Instant,
     ) -> Result<bool, TcpError> {
-        self.submit_control(
+        self.submit_position(
             &Request::CheckpointPosition {
                 authority_epoch,
                 epoch,
@@ -235,7 +235,7 @@ impl Client {
         epoch: u64,
         through: u64,
     ) -> Option<Result<CheckpointPositionProof, TcpError>> {
-        self.take_control()
+        self.take_position()
             .map(|response| self.validate_checkpoint_position_response(response?, epoch, through))
     }
 

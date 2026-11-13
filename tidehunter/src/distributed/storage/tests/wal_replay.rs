@@ -663,3 +663,130 @@ fn wal_replay_empty_mode_cutover_keeps_a_recoverable_root() {
     );
     assert_eq!(recovered.receipt_count(), 0);
 }
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn position_proof_rejects_allocated_but_uncompleted_owner_rpc_bytes() {
+    let temp = tempdir::TempDir::new("position-owner-frontier").unwrap();
+    let config = window_config();
+    let log =
+        PartitionLog::create(&temp.path().join("stream"), config, &shape(), metrics()).unwrap();
+    let _allocation = {
+        let state = log.state.lock();
+        state
+            .writer
+            .as_ref()
+            .unwrap()
+            .reserve_external(4096)
+            .unwrap()
+    };
+    assert!(matches!(
+        log.persist_wal_through(64),
+        Err(StorageError::Invalid(
+            "checkpoint position beyond completed owner writes"
+        ))
+    ));
+}
+
+#[test]
+fn position_root_can_advance_without_another_file_barrier() {
+    let temp = tempdir::TempDir::new("position-root-only").unwrap();
+    let config = config(vec![3], 3);
+    let log = PartitionLog::create(
+        &temp.path().join("stream"),
+        config.clone(),
+        &shape(),
+        metrics(),
+    )
+    .unwrap();
+    for n in 0..32 {
+        append(&log, &config, n);
+    }
+    let through = log.state.lock().appended_end;
+    log.persist_wal_through(through).unwrap();
+    let mut root = log.state.lock().wal_root.clone().unwrap();
+    assert!(root.scan_from > 0);
+    root.scan_from = 0; // A valid conservative replay root, with the same durable end.
+    root.install(&log.path).unwrap();
+    let generation = root.generation;
+    log.state.lock().wal_root = Some(root);
+    let mut profile = StorageWriteProfile::default();
+    log.persist_wal_through_profiled(through, Some(&mut profile))
+        .unwrap();
+    assert_eq!(
+        (profile.file_persist_calls, profile.namespace_persist_calls),
+        (0, 0)
+    );
+    let root = log.state.lock().wal_root.clone().unwrap();
+    assert!(root.scan_from > 0);
+    assert_eq!(root.generation, generation + 1);
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn position_recheck_rejects_a_direct_lifecycle_change_during_data_sync() {
+    let temp = tempdir::TempDir::new("position-lifecycle-recheck").unwrap();
+    let config = window_config();
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let receipt = append(&log, &config, 0);
+    let through = receipt.address().offset + u64::from(receipt.address().len);
+    let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeRoot);
+    let owner = log.clone();
+    let proof = std::thread::spawn(move || owner.persist_wal_through(through));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    // A storage caller outside the node scheduler deliberately breaks the
+    // lifecycle exclusion. The proof must fail, not silently install its cut.
+    let sealed = log.seal_epoch(authority(&config));
+    release.send(()).unwrap();
+    sealed.unwrap();
+    assert!(matches!(
+        proof.join().unwrap(),
+        Err(StorageError::Invalid(
+            "position proof lifecycle changed during sync"
+        ))
+    ));
+}
+
+#[test]
+fn proof_covered_inline_read_defers_without_waiting_for_position_state() {
+    use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
+    let temp = tempdir::TempDir::new("position-inline-no-state-wait").unwrap();
+    let config = window_config();
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let receipt = append(&log, &config, 0);
+    let reference = log.record_reference(receipt, 0).unwrap();
+    log.attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Synchronous))
+        .unwrap();
+    let cut = log.appended_frontier();
+    log.persist_wal_through(cut).unwrap();
+    assert!(log.synced_frontier() < cut);
+    let state = log.state.lock();
+    let reader = log.clone();
+    let (ready, result) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        ready.send(reader.try_plan_record_read(&reference)).unwrap();
+    });
+    let completed = result.recv_timeout(std::time::Duration::from_secs(5));
+    drop(state);
+    worker.join().unwrap();
+    assert!(
+        matches!(completed, Ok(Ok(None))),
+        "the reactor must not wait for state"
+    );
+}

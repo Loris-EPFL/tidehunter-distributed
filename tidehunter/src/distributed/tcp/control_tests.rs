@@ -592,6 +592,127 @@ fn native_checkpoint_proof_is_issued_only_after_its_prefix_is_synced() {
 }
 
 #[test]
+fn position_root_does_not_replace_read_or_synchronous_put_barriers() {
+    use crate::distributed::storage::PartitionLog;
+    use crate::distributed::types::RequestAuthority;
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let temp = tempdir::TempDir::new("position-receipt-consumers").unwrap();
+        let mut config = config(&temp.path().join("node"));
+        config.partition.fragment_bytes = 128 * 1024;
+        config.partition.wal_file_bytes = 256 * 1024;
+        let node = StorageNode::open(config.clone(), metrics()).unwrap();
+        node.set_durability(DurabilityConfig::with_tier(tier))
+            .unwrap();
+        node.inventory.lock().fence_to(1).unwrap();
+        let log = node.inventory.lock().active(1).unwrap();
+        // Seed completely written bytes without a receipt barrier. The proof
+        // must leave this adopted frontier behind even in synchronous policy.
+        let first = batch(&config, 1, 0);
+        let receipt = log
+            .append_complete_batch(RequestAuthority { epoch: 1 }, &first)
+            .unwrap();
+        node.control.shared.frontier_for(&log).unwrap();
+        let cut = log.appended_frontier();
+        let reference = first.record_reference(receipt.address(), 0).unwrap();
+        let (completed, completions) = mpsc::sync_channel(4);
+        assert!(
+            command(
+                &node,
+                1,
+                Request::CheckpointPosition {
+                    authority_epoch: 1,
+                    epoch: 1,
+                    through: cut
+                },
+                1,
+                &completed
+            )
+            .is_ok()
+        );
+        let Response::CheckpointPosition { durable_end, .. } =
+            receive(&completions, 1).response.unwrap()
+        else {
+            panic!("position proof")
+        };
+        assert!(durable_end >= cut);
+        assert_eq!(log.position_frontier_for_test(), durable_end);
+        assert!(log.synced_frontier() < durable_end);
+        assert_eq!(log.stats().persistence_barriers, 0);
+
+        // Copy the quiescent image BEFORE any read or receipt sync. Recovery
+        // must therefore use the position root, not a later receipt frontier.
+        let image = tempdir::TempDir::new("position-root-only-image").unwrap();
+        for entry in std::fs::read_dir(config.root.join("epoch_0000000000000001")).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            std::fs::copy(entry.path(), image.path().join(entry.file_name())).unwrap();
+        }
+        let recovered =
+            PartitionLog::recover_sealed(image.path(), &config.partition, metrics()).unwrap();
+        assert_eq!(
+            recovered.read_record(&reference).unwrap(),
+            first.mutations()[0]
+        );
+        assert!(
+            !recovered
+                .replay_page(0, 1, 64 * 1024, durable_end)
+                .unwrap()
+                .groups
+                .is_empty()
+        );
+
+        if tier == DurabilityTier::Synchronous {
+            // Inline serving must defer, not expose NeedsPersistence. The
+            // blocking owner-read boundary obtains its own covering sync.
+            assert!(log.try_plan_record_read(&reference).unwrap().is_none());
+            let (entered, release) = log.pause_next_persist();
+            let read_log = log.clone();
+            let (ready, result) = mpsc::sync_channel(1);
+            let read = std::thread::spawn(move || {
+                ready.send(read_log.read_record(&reference)).unwrap();
+            });
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let pending = result.recv_timeout(Duration::from_millis(100));
+            let still_behind = log.synced_frontier() < durable_end;
+            release.send(()).unwrap();
+            assert!(matches!(pending, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert!(still_behind);
+            assert_eq!(
+                result
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap(),
+                first.mutations()[0]
+            );
+            read.join().unwrap();
+        } else {
+            assert_eq!(log.read_record(&reference).unwrap(), first.mutations()[0]);
+            assert_eq!(log.stats().persistence_barriers, 0);
+        }
+        assert_eq!(
+            log.read_batch(receipt).unwrap().mutations(),
+            first.mutations()
+        );
+
+        if tier == DurabilityTier::Synchronous {
+            let (entered, release) = log.pause_next_persist();
+            assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let pending = completions.recv_timeout(Duration::from_millis(100));
+            let uncovered = log.synced_frontier() < log.appended_frontier();
+            release.send(()).unwrap();
+            assert!(matches!(pending, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert!(uncovered);
+            assert!(matches!(
+                receive(&completions, 2).response.unwrap(),
+                Response::Appended(_)
+            ));
+            assert!(log.synced_frontier() >= log.appended_frontier());
+        }
+    }
+}
+
+#[test]
 fn native_ack_paused_before_hand_off_fails_after_a_concurrent_persistence_failure() {
     let temp = tempdir::TempDir::new("control-native-paused-ack").unwrap();
     let config = config(&temp.path().join("node"));

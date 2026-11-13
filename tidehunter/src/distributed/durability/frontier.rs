@@ -318,9 +318,9 @@ impl Frontier {
 
     /// Highest position below which every position is durable (fsynced). Lock-free.
     ///
-    /// Recovery invariant: the coordinator stable checkpoint frontier and any persisted
-    /// index image may reference only positions below this value of the owner that holds
-    /// them. See `docs/distributed/DURABILITY_TIERS.md`.
+    /// Receipt-checkpoint capture bounds its persisted index cut by this frontier.
+    /// WAL-position checkpoint capture instead uses the installed position root
+    /// and its proof reply; that root can be ahead without publishing receipts.
     #[must_use]
     pub fn synced(&self) -> u64 {
         self.synced.load(Ordering::Acquire)
