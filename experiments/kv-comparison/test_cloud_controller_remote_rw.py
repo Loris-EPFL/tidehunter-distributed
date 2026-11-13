@@ -49,6 +49,8 @@ class CompactReadLifecycleTests(unittest.TestCase):
                  for mode in ('reserved', 'leased') for tier in ('native', 'synchronous')]
         cases += [next(j for j in jobs if j.get('live_inline_reads') is inline)
                   for inline in (False, True)]
+        cases.append(next(j for j in controller.cloud_campaign.make_focused_matrix('nvmeof_contracts')
+                          if j['measurement_operations'] == 200000 and j['durability_tier'] == 'synchronous'))
         nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
         for job in cases:
             with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as tmp:
@@ -58,7 +60,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
                 runtime.config = {'prefix': 'test', 'binary': '/unused',
                     'fleet': {'data_root': str(root), 'nodes': [{'address': '10.0.0.2'}],
                               'server_memory_mib': 8192},
-                    'spec': {'mode': 'focused', 'selection': 'leased_ab_compact',
+                    'spec': {'mode': 'focused', 'selection': job['selection'],
                              'backends': ['tidehunter_verbs_native', 'tidehunter_nvme_rdma'],
                              'case_deadline_seconds': 600}}
                 runtime.clients = {}
@@ -79,17 +81,22 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     client = {key: live[key] for key in ('max_inflight_requests', 'max_inflight_bytes',
                               'connect_timeout_ms', 'io_timeout_ms', 'write_mode', 'inline_reads',
                               'lease_ahead', 'polled_writes')}
-                    client.update(queue_geometry={'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
-                                  export_mode='on_demand')
+                    client.update(queue_geometry=live['queue_geometry'], export_mode=live['export_mode'])
                     client.update(host_nqn=nqn, host_id=controller.live_host_identity(nqn),
                                   leased_durability=prep['durability_tier'] if live['write_mode'] == 'leased' else None)
                     controller.dump(out / 'remote.json', {'tls': {}, 'live_nvme': client})
                     controller.dump(out / 'external_owner_read_config.json', [])
                     node = out / 'node-0'
                     node.mkdir()
-                    target = controller.live_target_for_owner(runtime.config, job['case_id'], 0, 'rdma', nqn)
-                    (node / 'launch.yaml').write_text(yaml.safe_dump({'tls': {}, 'node': {'live_target': target,
-                        'partition': {'fragment_bytes': 4194304, 'wal_file_bytes': 1073741824}}}))
+                    target = controller.live_target_for_owner(
+                        runtime.config, job['case_id'], 0, 'rdma', nqn, export_mode=live['export_mode'])
+                    fragment, wal_file = ((134217728, 10737418240)
+                                          if prep['owner_wal_geometry'] == 'native_default'
+                                          else (4194304, 1073741824))
+                    (node / 'launch.yaml').write_text(yaml.safe_dump({
+                        'tls': {}, 'history_persistence': prep['history_persistence'],
+                        'node': {'live_target': target,
+                                 'partition': {'fragment_bytes': fragment, 'wal_file_bytes': wal_file}}}))
                     return ''
                 with patch.object(controller, 'command', side_effect=fake_command), \
                      patch.object(controller, 'platform_module', return_value=None), \
@@ -103,7 +110,9 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     self.assertEqual(prep['live_nvmeof']['addresses'], ['10.0.0.2'])
                     self.assertEqual(prep['live_nvmeof']['write_mode'], job['live_write_mode'])
                     self.assertEqual(prep['live_nvmeof']['inline_reads'], job.get('live_inline_reads', True))
-                    self.assertEqual(prep['live_nvmeof']['export_mode'], 'on_demand')
+                    self.assertEqual(prep['live_nvmeof']['export_mode'], job.get('live_export_mode', 'on_demand'))
+                    self.assertEqual(prep['durability_tier'], job['durability_tier'])
+                    self.assertEqual(prep['history_persistence'], job.get('history_persistence', 'on_disk'))
                     self.assertTrue(prep['live_nvmeof']['lease_ahead'])
                     self.assertFalse(prep['live_nvmeof']['polled_writes'])
                     self.assertEqual(options['owners'], 1)

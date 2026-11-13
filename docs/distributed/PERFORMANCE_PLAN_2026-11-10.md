@@ -939,7 +939,18 @@ The step-size rule above did not apply: no slow call has one of the three labels
 Open after run 13:
 
 1. First-put pause closed by the combined focused run (`e0af084`): first 1 KiB put at 1 writer is 124 to 132 µs instead of 33 to 35 ms; at 16 writers 319 to 331 µs instead of 33 to 34 ms. Normal and timeline gates preserve the warm extent. All 12 KV cases completed, 245,056 successful calls; sustained 200,000 puts reached 94,975 puts/s with no call above 5 ms. Two 64 KiB cases still had 16 later calls above 5 ms each; attribution remains open.
-2. The remote small put is 20 to 25 times the `native` p50 (46.6 µs against 1.9 µs) and the 64 KiB put with 16 writers is 11 times. `wal_replay` removed the stalls, not the per-call cost of the network and the device.
+2. The remote small put is 20 to 25 times the `native` p50 (46.6 µs against 1.9 µs) and the 64 KiB put with 16 writers is 11 times. Stage breakdown of the 64 KiB case (combined run, timeline case `G20W-r0-fb6fb99bf8a683e8fbf4`, leased, page-cache acknowledgement, one owner, 4,096 puts; file `write-timeline.json` and `measurement-read-evidence.json` of that case):
+
+   | Stage (mean for each call) | µs | Share |
+   |---|---:|---:|
+   | `owner_enqueue_started` to `owner_dequeued` (wait for the `wal-write-owner` thread) | 447.2 | 24.5% |
+   | `owner_dequeued` to `prepared` (batch preparation; 3.1 µs at 1 KiB) | 61.6 | 3.4% |
+   | `admitted` to `append_enqueue_started` (wait before the append) | 476.9 | 26.1% |
+   | `live_io_started` to `live_io_completed` (NVMe-oF write of the group) | 724.3 | 39.6% |
+   | All other stages | 117.5 | 6.4% |
+   | Total | 1,827.6 | 100% |
+
+   The case wrote 256 data groups of 16 puts (about 1 MiB each), one group each 1.90 ms, 529 MiB/s with framing (527 MiB/s of payload). The counters show 258 leased-write I/O samples (256 groups and 2 skip markers). The leased-write counter interval is 0.60 ms for each sample (about 1.6 GiB/s while a write is in flight) and 32% of the wall time; this interval is measured at the coordinator and is not isolated device time. So the device and the network are not the limit. Reading (inference, not yet proved): preparation is serial on the one `wal-write-owner` thread (`remote_db/concurrent.rs:454`); 16 preparations of 61.6 µs are about 1 ms for each group, and one group is in flight at a time, so the two wait stages are time in the queue behind that thread and behind the group in flight. More owners spread the write (40% of the time) but not the preparation, which is one thread for the whole coordinator. Run A (plan `fair-contract-benchmarks`, selection `nvmeof_contracts`, row 4) repeats the timeline case in both acknowledgement classes; Run B gives the five-owner answer.
 3. Recovery was executed (owner restart with data, coordinator reopen) but not timed. Crash tests on hardware were not done.
 4. Sui guest library gate fixed on hardware using the focused profile. Replay remains unvalidated: r01's frozen producer inherited the measured default mutex count (1,024 rather than its stored 1) and aborted before RPC readiness. Post-run source-environment correction passed real producer startup and source-digest checks under both contracts locally. A separate partial-export collector schema error was also fixed; both archives were retained and verified. No further fleet is authorized. See `FOCUSED_CAMPAIGN_2026-11-07.md`, "Combined run result".
 

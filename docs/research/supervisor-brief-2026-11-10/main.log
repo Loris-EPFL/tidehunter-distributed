@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2023/Debian) (preloaded format=pdflatex 2026.10.25)  13 NOV 2026 01:08
+This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2023/Debian) (preloaded format=pdflatex 2026.10.25)  13 NOV 2026 02:07
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -605,7 +605,7 @@ owledgement-contracts.tex) [2
 [3
 
 ]
-<figures/durable-components.pdf, id=258, 508.75116pt x 265.12616pt>
+<figures/durable-components.pdf, id=260, 508.75116pt x 265.12616pt>
 File: figures/durable-components.pdf Graphic file (type pdf)
 <use figures/durable-components.pdf>
 Package pdftex.def Info: figures/durable-components.pdf  used on input line 120
@@ -622,7 +622,7 @@ Package pdftex.def Info: figures/durable-components.pdf  used on input line 120
 ] (./tab-delete.tex) (./tab-batch.tex) [7
 
 ]
-<figures/read-components.pdf, id=299, 509.65608pt x 437.70692pt>
+<figures/read-components.pdf, id=301, 509.65608pt x 437.70692pt>
 File: figures/read-components.pdf Graphic file (type pdf)
 <use figures/read-components.pdf>
 Package pdftex.def Info: figures/read-components.pdf  used on input line 176.
@@ -637,7 +637,7 @@ m64.tex) [9
 (./tab-ssd64.tex) (./rwc/section-rwc.tex [10
 
 ]
-<figures/rwc-parity.pdf, id=337, 505.89pt x 245.718pt>
+<figures/rwc-parity.pdf, id=339, 505.89pt x 245.718pt>
 File: figures/rwc-parity.pdf Graphic file (type pdf)
 <use figures/rwc-parity.pdf>
 Package pdftex.def Info: figures/rwc-parity.pdf  used on input line 10.
@@ -646,7 +646,7 @@ Package pdftex.def Info: figures/rwc-parity.pdf  used on input line 10.
 (./rwc/generated/tab-rwc-parity.tex) [11
 
  <./figures/rwc-parity.pdf>]
-<figures/rwc-write-latency.pdf, id=362, 505.89pt x 198.7425pt>
+<figures/rwc-write-latency.pdf, id=364, 505.89pt x 198.7425pt>
 File: figures/rwc-write-latency.pdf Graphic file (type pdf)
 <use figures/rwc-write-latency.pdf>
 Package pdftex.def Info: figures/rwc-write-latency.pdf  used on input line 17.
@@ -655,7 +655,7 @@ Package pdftex.def Info: figures/rwc-write-latency.pdf  used on input line 17.
 (./rwc/generated/tab-rwc-write.tex) [12
 
  <./figures/rwc-write-latency.pdf>]
-<figures/rwc-read-latency.pdf, id=424, 505.89pt x 325.215pt>
+<figures/rwc-read-latency.pdf, id=426, 505.89pt x 325.215pt>
 File: figures/rwc-read-latency.pdf Graphic file (type pdf)
 <use figures/rwc-read-latency.pdf>
 Package pdftex.def Info: figures/rwc-read-latency.pdf  used on input line 25.
@@ -665,7 +665,7 @@ Package pdftex.def Info: figures/rwc-read-latency.pdf  used on input line 25.
 
  <./figures/rwc-read-latency.pdf>]
 (./rwc/generated/tab-rwc-read-warm.tex)
-<figures/rwc-cold-warm.pdf, id=497, 505.89pt x 224.037pt>
+<figures/rwc-cold-warm.pdf, id=499, 505.89pt x 224.037pt>
 File: figures/rwc-cold-warm.pdf Graphic file (type pdf)
 <use figures/rwc-cold-warm.pdf>
 Package pdftex.def Info: figures/rwc-cold-warm.pdf  used on input line 34.
@@ -673,7 +673,7 @@ Package pdftex.def Info: figures/rwc-cold-warm.pdf  used on input line 34.
  [14
 
  <./figures/rwc-cold-warm.pdf>]
-<figures/rwc-throughput.pdf, id=519, 505.89pt x 476.98201pt>
+<figures/rwc-throughput.pdf, id=521, 505.89pt x 476.98201pt>
 File: figures/rwc-throughput.pdf Graphic file (type pdf)
 <use figures/rwc-throughput.pdf>
 Package pdftex.def Info: figures/rwc-throughput.pdf  used on input line 41.
@@ -682,7 +682,7 @@ Package pdftex.def Info: figures/rwc-throughput.pdf  used on input line 41.
 [15
 
  <./figures/rwc-throughput.pdf>]
-<figures/rwc-floors.pdf, id=584, 505.89pt x 397.485pt>
+<figures/rwc-floors.pdf, id=586, 505.89pt x 397.485pt>
 File: figures/rwc-floors.pdf Graphic file (type pdf)
 <use figures/rwc-floors.pdf>
 Package pdftex.def Info: figures/rwc-floors.pdf  used on input line 48.
@@ -692,7 +692,7 @@ Package pdftex.def Info: figures/rwc-floors.pdf  used on input line 48.
  <./figures/rwc-floors.pdf>] (./rwc10/generated/tab-rwc10-arms.tex) [17
 
 ]
-<figures/rwc10-warm.pdf, id=644, 505.89pt x 332.44202pt>
+<figures/rwc10-warm.pdf, id=646, 505.89pt x 332.44202pt>
 File: figures/rwc10-warm.pdf Graphic file (type pdf)
 <use figures/rwc10-warm.pdf>
 Package pdftex.def Info: figures/rwc10-warm.pdf  used on input line 18.
@@ -701,7 +701,7 @@ Package pdftex.def Info: figures/rwc10-warm.pdf  used on input line 18.
 (./rwc10/generated/tab-rwc10-warm.tex) [18
 
  <./figures/rwc10-warm.pdf>]
-<figures/rwc10-gap.pdf, id=667, 505.89pt x 332.44202pt>
+<figures/rwc10-gap.pdf, id=669, 505.89pt x 332.44202pt>
 File: figures/rwc10-gap.pdf Graphic file (type pdf)
 <use figures/rwc10-gap.pdf>
 Package pdftex.def Info: figures/rwc10-gap.pdf  used on input line 27.
@@ -710,7 +710,7 @@ Package pdftex.def Info: figures/rwc10-gap.pdf  used on input line 27.
 (./rwc10/generated/tab-rwc10-pairs.tex) [19
 
  <./figures/rwc10-gap.pdf>]
-<figures/rwc10-cpu.pdf, id=690, 505.89pt x 346.89601pt>
+<figures/rwc10-cpu.pdf, id=692, 505.89pt x 346.89601pt>
 File: figures/rwc10-cpu.pdf Graphic file (type pdf)
 <use figures/rwc10-cpu.pdf>
 Package pdftex.def Info: figures/rwc10-cpu.pdf  used on input line 37.
@@ -719,7 +719,7 @@ Package pdftex.def Info: figures/rwc10-cpu.pdf  used on input line 37.
 (./rwc10/generated/tab-rwc10-cpu.tex) [20
 
  <./figures/rwc10-cpu.pdf>]
-<figures/rwc10-cold.pdf, id=712, 505.89pt x 346.89601pt>
+<figures/rwc10-cold.pdf, id=714, 505.89pt x 346.89601pt>
 File: figures/rwc10-cold.pdf Graphic file (type pdf)
 <use figures/rwc10-cold.pdf>
 Package pdftex.def Info: figures/rwc10-cold.pdf  used on input line 46.
@@ -728,7 +728,7 @@ Package pdftex.def Info: figures/rwc10-cold.pdf  used on input line 46.
 (./rwc10/generated/tab-rwc10-cold.tex) [21
 
  <./figures/rwc10-cold.pdf>]
-<figures/rwc10-ladder.pdf, id=734, 505.89pt x 274.626pt>
+<figures/rwc10-ladder.pdf, id=736, 505.89pt x 274.626pt>
 File: figures/rwc10-ladder.pdf Graphic file (type pdf)
 <use figures/rwc10-ladder.pdf>
 Package pdftex.def Info: figures/rwc10-ladder.pdf  used on input line 56.
@@ -740,7 +740,7 @@ Package pdftex.def Info: figures/rwc10-ladder.pdf  used on input line 56.
 (./tab-network.tex) (./tab-ssd-read.tex) (./tab-ssd-write.tex) [23
 
 ]
-<figures/sync-step.pdf, id=763, 506.84511pt x 216.57526pt>
+<figures/sync-step.pdf, id=765, 506.84511pt x 216.57526pt>
 File: figures/sync-step.pdf Graphic file (type pdf)
 <use figures/sync-step.pdf>
 Package pdftex.def Info: figures/sync-step.pdf  used on input line 234.
@@ -749,7 +749,7 @@ Package pdftex.def Info: figures/sync-step.pdf  used on input line 234.
 (./tab-sync.tex) [24
 
  <./figures/sync-step.pdf>]
-<figures/put-stall.pdf, id=779, 505.80196pt x 194.48174pt>
+<figures/put-stall.pdf, id=781, 505.80196pt x 194.48174pt>
 File: figures/put-stall.pdf Graphic file (type pdf)
 <use figures/put-stall.pdf>
 Package pdftex.def Info: figures/put-stall.pdf  used on input line 250.
@@ -758,7 +758,7 @@ Package pdftex.def Info: figures/put-stall.pdf  used on input line 250.
 (./tab-sustained.tex) [25
 
  <./figures/put-stall.pdf>]
-<figures/run7-reads.pdf, id=809, 507.13403pt x 195.8895pt>
+<figures/run7-reads.pdf, id=811, 507.13403pt x 195.8895pt>
 File: figures/run7-reads.pdf Graphic file (type pdf)
 <use figures/run7-reads.pdf>
 Package pdftex.def Info: figures/run7-reads.pdf  used on input line 265.
@@ -767,7 +767,7 @@ Package pdftex.def Info: figures/run7-reads.pdf  used on input line 265.
 [26
 
  <./figures/run7-reads.pdf>]
-<figures/run7-puts.pdf, id=825, 507.13403pt x 195.8895pt>
+<figures/run7-puts.pdf, id=827, 507.13403pt x 195.8895pt>
 File: figures/run7-puts.pdf Graphic file (type pdf)
 <use figures/run7-puts.pdf>
 Package pdftex.def Info: figures/run7-puts.pdf  used on input line 277.
@@ -775,26 +775,26 @@ Package pdftex.def Info: figures/run7-puts.pdf  used on input line 277.
  (./tab-run7-puts.tex) (./contract-results.tex
 [27
 
- <./figures/run7-puts.pdf>] (./tab-contract-a.tex) [28
+ <./figures/run7-puts.pdf>] (./tab-contract-a.tex) (./contract-stages.tex
+(./tab-contract-stages.tex)) [28
 
-]
-(./tab-contract-b-controls.tex) (./tab-contract-indicative.tex)) [29
+] (./tab-contract-b-controls.tex)
+(./tab-contract-indicative.tex)) [29
 
-]
-(./cross-store-explanation.tex
+] (./cross-store-explanation.tex
 LaTeX Font Info:    External font `lmex10' loaded for size
 (Font)              <8> on input line 3.
- (./tab-per-node.tex) [30
 
-])
-(./cross-store-spike.tex [31] (./tab-spike.tex) [32
+(./tab-per-node.tex) [30
 
-] (./tab-local-structure.tex) (./cross-store-fair-native.tex (./tab-fair-native
-.tex)))
-(./cross-store-curves.tex [33
+]) (./cross-store-spike.tex [31] (./tab-spike.tex)
+[32
+
+] (./tab-local-structure.tex) (./cross-store-fair-native.tex
+(./tab-fair-native.tex))) (./cross-store-curves.tex [33
 
 ] [34]
-<figures/curves-write-c16.pdf, id=892, 498.37915pt x 570.38553pt>
+<figures/curves-write-c16.pdf, id=896, 498.37915pt x 570.38553pt>
 File: figures/curves-write-c16.pdf Graphic file (type pdf)
 <use figures/curves-write-c16.pdf>
 Package pdftex.def Info: figures/curves-write-c16.pdf  used on input line 5.
@@ -802,16 +802,15 @@ Package pdftex.def Info: figures/curves-write-c16.pdf  used on input line 5.
  [35
 
  <./figures/curves-write-c16.pdf>]
-<figures/curves-read-c16.pdf, id=965, 493.14084pt x 570.38553pt>
+<figures/curves-read-c16.pdf, id=969, 493.14084pt x 570.38553pt>
 File: figures/curves-read-c16.pdf Graphic file (type pdf)
 <use figures/curves-read-c16.pdf>
 Package pdftex.def Info: figures/curves-read-c16.pdf  used on input line 11.
 (pdftex.def)             Requested size: 489.10287pt x 565.72781pt.
-
-[36
+ [36
 
  <./figures/curves-read-c16.pdf>]
-<figures/curves-read32-c16.pdf, id=1035, 498.37915pt x 570.38553pt>
+<figures/curves-read32-c16.pdf, id=1039, 498.37915pt x 570.38553pt>
 File: figures/curves-read32-c16.pdf Graphic file (type pdf)
 <use figures/curves-read32-c16.pdf>
 Package pdftex.def Info: figures/curves-read32-c16.pdf  used on input line 17.
@@ -819,48 +818,48 @@ Package pdftex.def Info: figures/curves-read32-c16.pdf  used on input line 17.
  [37
 
  <./figures/curves-read32-c16.pdf>]
-<figures/curves-point-read-c1.pdf, id=1105, 493.14084pt x 570.38553pt>
+<figures/curves-point-read-c1.pdf, id=1109, 493.14084pt x 570.38553pt>
 File: figures/curves-point-read-c1.pdf Graphic file (type pdf)
 <use figures/curves-point-read-c1.pdf>
 Package pdftex.def Info: figures/curves-point-read-c1.pdf  used on input line 2
 3.
 (pdftex.def)             Requested size: 489.10287pt x 565.72781pt.
-
-[38
+ [38
 
  <./figures/curves-point-read-c1.pdf>]
-<figures/curves-point-put-c1.pdf, id=1174, 493.14084pt x 570.38553pt>
+<figures/curves-point-put-c1.pdf, id=1178, 493.14084pt x 570.38553pt>
 File: figures/curves-point-put-c1.pdf Graphic file (type pdf)
 <use figures/curves-point-put-c1.pdf>
 Package pdftex.def Info: figures/curves-point-put-c1.pdf  used on input line 29
 .
 (pdftex.def)             Requested size: 489.10287pt x 565.72781pt.
-) (./cross-store-paper.tex [39
+)
+(./cross-store-paper.tex [39
 
- <./figures/curves-point-put-c1.pdf>]) (./cross-store-sizes.tex [40]
-(./tab-sui-sizes.tex) [41
+ <./figures/curves-point-put-c1.pdf>])
+(./cross-store-sizes.tex [40] (./tab-sui-sizes.tex) [41
 
 ]) [42]
-<figures/scoreboard.pdf, id=1265, 491.99568pt x 339.36938pt>
+<figures/scoreboard.pdf, id=1269, 491.99568pt x 339.36938pt>
 File: figures/scoreboard.pdf Graphic file (type pdf)
 <use figures/scoreboard.pdf>
 Package pdftex.def Info: figures/scoreboard.pdf  used on input line 301.
 (pdftex.def)             Requested size: 489.10287pt x 337.39041pt.
  [43
 
- <./figures/scoreboard.pdf>]
-(./tab-onekib-1.tex) (./tab-onekib-2.tex) [44
+ <./figures/scoreboard.pdf>] (./tab-onekib-1.tex) (./tab-onekib-2.tex) [44
 
 ]
-<figures/others.pdf, id=1300, 536.7716pt x 224.09361pt>
+<figures/others.pdf, id=1304, 536.7716pt x 224.09361pt>
 File: figures/others.pdf Graphic file (type pdf)
 <use figures/others.pdf>
 Package pdftex.def Info: figures/others.pdf  used on input line 320.
 (pdftex.def)             Requested size: 489.10287pt x 204.19905pt.
- (./tab-stores.tex) [45
+
+(./tab-stores.tex) [45
 
  <./figures/others.pdf>]
-<figures/coherence.pdf, id=1322, 505.92125pt x 310.3724pt>
+<figures/coherence.pdf, id=1326, 505.92125pt x 310.3724pt>
 File: figures/coherence.pdf Graphic file (type pdf)
 <use figures/coherence.pdf>
 Package pdftex.def Info: figures/coherence.pdf  used on input line 330.
@@ -869,13 +868,12 @@ Package pdftex.def Info: figures/coherence.pdf  used on input line 330.
 
  <./figures/coherence.pdf>] [47
 
-]
-[48
+] [48
 
-] (./rwc10/generated/rwc10-provenance.tex) (./appendix-tables.tex [49
+] (./rwc10/generated/rwc10-provenance.tex)
+(./appendix-tables.tex [49
 
-]
-[50
+] [50
 
 ] [51
 
@@ -883,10 +881,10 @@ Package pdftex.def Info: figures/coherence.pdf  used on input line 330.
 
 ] [53
 
-]) (./rwc/appendix-rwc.tex [54
+]) (./rwc/appendix-rwc.tex
+[54
 
-]
-(./rwc/generated/tab-rwc-cold-qualification.tex) [55
+] (./rwc/generated/tab-rwc-cold-qualification.tex) [55
 
 ]
 (./rwc/generated/tab-rwc-floors.tex) (./rwc/generated/rwc-failures.tex)
@@ -898,13 +896,13 @@ LaTeX2e <2023-11-01> patch level 1
 L3 programming layer <2024-01-22>
  ***********
 Package rerunfilecheck Info: File `main.out' has not changed.
-(rerunfilecheck)             Checksum: 43ADA27E751C4EC3A7046CE8728C72A9;11835.
+(rerunfilecheck)             Checksum: 311DA8398D7C8CF403602382A9E16408;12085.
  ) 
 Here is how much of TeX's memory you used:
- 18542 strings out of 476182
- 359944 string characters out of 5795594
+ 18597 strings out of 476182
+ 362267 string characters out of 5795594
  1957975 words of memory out of 5000000
- 39729 multiletter control sequences out of 15000+600000
+ 39776 multiletter control sequences out of 15000+600000
  635143 words of font info for 188 fonts, out of 8000000 for 9000
  14 hyphenation exceptions out of 8191
  75i,13n,79p,1712b,542s stack positions out of 10000i,1000n,20000p,200000b,200000s
@@ -922,10 +920,10 @@ m/lmsy10.pfb></usr/share/texmf/fonts/type1/public/lm/lmsy8.pfb></usr/share/texm
 f/fonts/type1/public/lm/lmsy9.pfb></usr/share/texmf/fonts/type1/public/lm/lmtt1
 0.pfb></usr/share/texmf/fonts/type1/public/lm/lmtt8.pfb></usr/share/texmf/fonts
 /type1/public/lm/lmtt9.pfb>
-Output written on main.pdf (56 pages, 1254280 bytes).
+Output written on main.pdf (56 pages, 1257182 bytes).
 PDF statistics:
- 1537 PDF objects out of 1728 (max. 8388607)
- 835 compressed objects within 9 object streams
- 191 named destinations out of 1000 (max. 500000)
- 43038 words of extra memory for PDF output out of 51595 (max. 10000000)
+ 1541 PDF objects out of 1728 (max. 8388607)
+ 839 compressed objects within 9 object streams
+ 193 named destinations out of 1000 (max. 500000)
+ 43046 words of extra memory for PDF output out of 51595 (max. 10000000)
 

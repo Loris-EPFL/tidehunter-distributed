@@ -29,11 +29,13 @@ def _specs():
         sui_live_queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0),
         sui_fixture=dict(sha256=FIXTURE_SHA256), hard_deadline_seconds=FLEET_SECONDS,
         export_reserve_seconds=EXPORT_RESERVE_SECONDS)}
-    combined = copy.deepcopy(REVIEWED_SPECS["nvmeof_first_put"])
-    combined.update({key: copy.deepcopy(value) for key, value in specs["sui_nvmeof_compact"].items()
-                     if key.startswith("sui_")})
-    combined["suite"] = "both"
-    specs["sui_nvmeof_with_kv"] = combined
+    for name, selection in (('sui_nvmeof_with_kv', 'nvmeof_first_put'),
+                            ('sui_nvmeof_with_contracts', 'nvmeof_contracts')):
+        combined = copy.deepcopy(REVIEWED_SPECS[selection])
+        combined.update({key: copy.deepcopy(value) for key, value in specs['sui_nvmeof_compact'].items()
+                         if key.startswith('sui_')})
+        combined['suite'] = 'both'
+        specs[name] = combined
     return specs
 
 

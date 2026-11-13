@@ -8,6 +8,50 @@ import nvmeof_path as analysis
 
 
 class NvmeofPathTests(unittest.TestCase):
+    def test_contract_classes_and_separate_markdown_tables(self):
+        for tier, expected in (('value_wal_barrier', 'S'), ('page_cache', 'P')):
+            self.add(group='G21N', native_durability=tier, selection='nvmeof_contracts')
+            self.assertEqual(analysis.contract_class(self.jobs[-1]), expected)
+        for tier, expected in (('synchronous', 'S'), ('native', 'P')):
+            self.add('tidehunter_nvme_rdma', group='G21W', durability_tier=tier,
+                     selection='nvmeof_contracts')
+            self.assertEqual(analysis.contract_class(self.jobs[-1]), expected)
+        rows = self.generate()
+        self.assertEqual([row['contract_class'] for row in rows], ['S', 'P', 'S', 'P'])
+        text = (self.output / 'nvmeof_path.md').read_text()
+        for label in ('S', 'P'):
+            table = text.split('## Puts — class ' + label + '\n', 1)[1].split('## ', 1)[0]
+            case_ids = {line.split('|')[1].strip() for line in table.splitlines() if line.startswith('|')}
+            for row in rows:
+                self.assertEqual(row['case_id'] in case_ids,
+                                 row['contract_class'] == label)
+        self.assertIn('## Settings — S — synced', text)
+        self.assertIn('## Settings — P — page cache', text)
+
+    def test_stages_csv_uses_three_complete_captured_calls(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G21W', selection='nvmeof_contracts')
+        records = [dict(caller_sample_id=index, events=[
+            dict(stage='caller_start', elapsed_ns=0),
+            dict(stage='prepared', elapsed_ns=(index + 1) * 1000),
+            dict(stage='caller_finished', elapsed_ns=(index + 2) * 2000)])
+            for index in range(3)]
+        (directory / 'write-timeline.json').write_text(json.dumps(
+            dict(timeline=dict(records=records))))
+        expected = analysis.stage_rows(directory.parent)
+        self.assertEqual([row['stage_pair'] for row in expected],
+                         ['caller_start -> prepared', 'prepared -> caller_finished'])
+        self.assertEqual([row['mean_us'] for row in expected], [2, 4])
+        self.assertEqual([row['p50_us'] for row in expected], [2, 4])
+        self.assertEqual([row['share'] for row in expected], [1 / 3, 2 / 3])
+        self.generate()
+        with (self.output / 'stages.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['case_id'], self.cases[0]['case_id'])
+        self.assertEqual([float(row['mean_us']) for row in rows], [2, 4])
+        self.assertEqual([float(row['p50_us']) for row in rows], [2, 4])
+        self.assertAlmostEqual(sum(float(row['share']) for row in rows), 1)
+
     def test_stalls_join_switch_checkpoint_and_unattributed_calls(self):
         directory = self.add('tidehunter_nvme_rdma', group='G19W')
         samples = []

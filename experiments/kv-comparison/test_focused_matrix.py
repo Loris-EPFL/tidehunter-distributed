@@ -12,6 +12,77 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_nvmeof_contracts_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_contracts")
+        groups = {"G21W": 16, "G21R": 8, "G21N": 10}
+        self.assertEqual(len(jobs), 34)
+        self.assertEqual(Counter(job["group"] for job in jobs), groups)
+        self.assertEqual(campaign.FOCUSED_COUNTS["nvmeof_contracts"], 34)
+        self.assertEqual(campaign.selection_owner_hosts("nvmeof_contracts"), 1)
+        self.assertEqual({key: count for key, count in campaign.focused_group_counts(
+            "nvmeof_contracts").items() if key.startswith("G21")}, groups)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
+                         separators=(",", ":")).encode()).hexdigest(),
+                         "cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208")
+        self.assertEqual([job["case_id"] for job in jobs[:3]], [
+            "G21N-r0-fefb35e6dd1c47cfbffc", "G21W-r0-a60b30cc439cf0b55118",
+            "G21R-r0-1ceaaa5179c79dd670a2"])
+        self.assertEqual(jobs[0]["native_durability"], "page_cache")
+        self.assertEqual(jobs[1]["durability_tier"], "synchronous")
+        self.assertTrue(jobs[2]["require_media_qualified"])
+        self.assertEqual(jobs[2]["value_size"], 65536)
+        self.assertEqual(sum(job["backend"] == "tidehunter_nvme_rdma"
+                             and job["mix"]["put"] == 100
+                             and job["durability_tier"] == "synchronous" for job in jobs), 6)
+        sustained = [job for job in jobs if job["measurement_operations"] == 200000]
+        self.assertEqual({campaign.durability_tier(job) for job in sustained}, {"native", "synchronous"})
+        for job in sustained:
+            config = campaign.make_run_config(job, "/tmp/contracts-case", {}, "test")
+            self.assertEqual(config["backend"]["options"]["durability_tier"], job["durability_tier"])
+        for job in jobs:
+            campaign.validate_focused_job(job)
+            self.assertEqual(job["repeat"], 0)
+            if job["mix"]["read"]:
+                expected_calls = (2048 if job["value_size"] == 1024 else 4096) if (
+                    job.get("media", {}).get("expected") == "cold") else 8192
+                self.assertEqual(job["measurement_operations"], expected_calls)
+            else:
+                self.assertIn(job["measurement_operations"], (4096, 200000))
+            if job["backend"] != "native":
+                self.assertEqual(job["history_persistence"], "wal_replay")
+            if job.get("nvmeof_route") == "live":
+                self.assertEqual(job["live_write_mode"], "leased")
+                self.assertTrue(job["live_lease_ahead"])
+                self.assertFalse(job["live_polled_writes"])
+                self.assertEqual(job["live_poll_queues"], 0)
+        with self.assertRaises(ValueError):
+            campaign.validate_focused_job(dict(jobs[1], durability_tier="native"))
+
+    def test_contracts_keep_all_earlier_matrix_hashes(self):
+        expected = {
+            "recommended": "e033a68d931e9db33cacd5ac25ef43f0647bb3d919a1d7c7ac608d8c0414f08d",
+            "full": "04dff9517aff741c01289d534e6a55f2f3b1d0e211b2f0ea9cb58c8b5bf6650c",
+            "device": "8a0cf7c9ebf16552ef32d616aec14d6876d3f1a84eb904ee53e7a24cc28d9a43",
+            "floors": "5fb477358bc57c14c8fad9b7e0958b93afb22ff4d1ba085204d44b1e74fcd429",
+            "stages": "646207fe6727aa37367b727759a4d46005ebd56a59f29ec49b13a690de24a724",
+            "unified": "a73d7a070f8416f555aab6434e1c6893b4deca756e77036d0509001b23bc3506",
+            "append_floors": "646f9ff50949c4ecab44a4d77d2ad38e5b2700311cb5c1ce69e742ed521f4e40",
+            "fair_native": "7a8e64eeb181b0f5040f3b02105d76def85823e87f591fea448d34bcb6a7f2d9",
+            "parity": "ee942bda8565ff1295814a61fb00040f6feedce9cd73304dea29dec095169ec6",
+            "parity_compact": "4978687ab42ca839e2c864978fb1489854ae201d28f06facf89a283cdea8e0aa",
+            "fair_five_owner": "479601db27b3a709e83944dcdfa9b77e7f8e4bacac9637a29e04327e09151946",
+            "remote_rw_compact": "b2f2afc44afc1d066bedb27f819c5fa7789e000f96da0c7beb4c6f9359122620",
+            "fabric_ab_compact": "8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e",
+            "leased_ab_compact": "52029dc2047cecca4903b4240d7a84d8dcb402bfbfddcad827d605405f15c2dc",
+            "nvmeof_path_compact": "8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036",
+            "nvmeof_path_core": "f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55",
+            "nvmeof_path_fix": "aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606",
+            "nvmeof_first_put": "bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc"}
+        for selection, digest in expected.items():
+            with self.subTest(selection=selection):
+                self.assertEqual(hashlib.sha256(json.dumps(campaign.make_focused_matrix(selection),
+                    sort_keys=True, separators=(",", ":")).encode()).hexdigest(), digest)
+
     def test_nvmeof_first_put_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_first_put")
         sources = campaign.make_focused_matrix("nvmeof_path_fix")
@@ -83,7 +154,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}

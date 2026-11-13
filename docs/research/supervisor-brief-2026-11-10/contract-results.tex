@@ -1,60 +1,42 @@
 \clearpage
 \section{Distributed against original engine, page-cache acknowledgement, one owner}\label{sec:contract-a}
-\textbf{Class A only: same-fleet puts.} The leased live NVMe-oF/RDMA route uses
-\texttt{wal\_replay}, lease-ahead and interrupt-driven writes unless stated.
-Native is the original in-process engine under the harness's
-\texttt{page\_cache} mode, not its stronger barrier. Each arm has one data
-SSD: Native on the coordinator VM, distributed WAL on the remote owner VM.
-The remote arm still pays for the coordinator, index and network. Matching
-acknowledgement class does not match those costs.
+\textbf{Class P (retained Class A): same-fleet puts.} Leased live NVMe-oF/RDMA
+uses \texttt{wal\_replay}, lease-ahead and interrupt-driven writes. Native uses
+\texttt{page\_cache}, not its stronger barrier. Each has one data SSD: Native
+on the coordinator, distributed WAL on the remote owner. Only the remote arm
+pays coordinator/index/network costs.
 
-The combined run (revision \texttt{e0af084}, fleet
-\texttt{bench-e3638332bc2b43a1}, created 12 November) completed
-\N{B:contract-values:combined-cases:value|,.0f} cases and
+Combined run: revision \texttt{e0af084}, fleet \texttt{bench-e3638332bc2b43a1},
+12 November; \N{B:contract-values:combined-cases:value|,.0f} cases,
 \N{B:contract-values:combined-measured_calls:value|,.0f} measured calls.
-Run 13 (revision \texttt{3d5c0f7}, fleet \texttt{bench-c1dce8770c684804},
-12 November) completed \N{B:contract-values:run13-compared_cells:value|,.0f} cases and supplies other shapes. One owner, one fleet per run, one or two
-repetitions per cell. Cases are short except the sustained put case below.
-No fleet or repetition is pooled. A missing same-fleet Native partner is
-not supplied from another fleet.
+Run 13: \texttt{3d5c0f7}, fleet \texttt{bench-c1dce8770c684804}, 12 November,
+\N{B:contract-values:run13-compared_cells:value|,.0f} cases.
+One owner and fleet per run, one or two repetitions per cell; short cases
+except sustained puts. Only same-fleet Native partners enter the table.
 
 \begin{table}[H]\centering\fitinput{tab-contract-a.tex}
-\caption{Class A: page-cache acknowledgement on both sides. Same-fleet,
-same-size and same-caller put pairs only. Repetitions remain separate;
-API p50/p99/p99.9 in \us. One Native process/SSD versus one remote
-owner/SSD; coordinator cache off. Interrupt-driven, unprofiled leased
-\texttt{wal\_replay} with lease-ahead. Sources: each run's \texttt{puts.csv};
-case IDs and exact columns are in \texttt{contract-values.csv}. No external
-store or synchronous-tier value enters this table.}
+\caption{Class P (retained Class A): page-cache acknowledgement on both sides.
+Matched fleet, size, callers and repetition; API p50/p99/p99.9 in \us.
+One Native process/SSD versus one remote owner/SSD; coordinator cache off.
+Unprofiled leased \texttt{wal\_replay}, lease-ahead, no write polling.
+Sources: each run's \texttt{puts.csv}; exact cases/columns in \texttt{contract-values.csv}.}
 \end{table}
 
-\textbf{Sustained Class A case, not a Native pair.} The combined run's
-200,000-put, 1 KiB, sixteen-caller case has p50/p99/p99.9
-\N{B:contract-values:sustained-p50_us:value|.1f}/\N{B:contract-values:sustained-p99_us:value|.1f}/\N{B:contract-values:sustained-p999_us:value|.1f}~\us,
-\N{B:contract-values:sustained-calls_per_second:value|,.0f} puts/s,
-\N{B:contract-values:sustained-mean_inflight_calls:value|.1f} mean in-flight
-API calls, and \N{B:contract-values:sustained-calls_ge_5ms:value|,.0f} calls
-at least 5 ms. There is no matching sustained Native cell.
-Finite short-case rates are not capacity estimates; only latency is shown
-in the paired table.
+\textbf{Sustained P, no Native pair.} Combined run, 200,000 puts, 1 KiB,
+sixteen callers: p50/p99/p99.9
+\N{B:contract-values:sustained-p50_us:value|.1f}/\N{B:contract-values:sustained-p99_us:value|.1f}/\N{B:contract-values:sustained-p999_us:value|.1f}~\us;
+\N{B:contract-values:sustained-calls_per_second:value|,.0f} puts/s at
+\N{B:contract-values:sustained-mean_inflight_calls:value|.1f} mean in-flight calls;
+\N{B:contract-values:sustained-calls_ge_5ms:value|,.0f} calls at least 5 ms.
+Finite-case rates are not production capacity.
 
-\textbf{First-put change.} For the unprofiled 1 KiB single-caller case,
-\texttt{run13-comparison.csv} records first-call time
-\N{B:contract-values:first-run13_first_call_us:value|.1f}~\us\ in run 13 and
-\N{B:contract-values:first-first_call_us:value|.1f}~\us\ in the combined run.
-These are different fleets and revisions, not a controlled timing A/B.
-The campaign's regression fixture identifies the removed side effect:
-measurement-gate observations previously closed the warm extent.
-The combined run still has later slow calls in the unprofiled large-value
-cases. Their cause is not established; timeline copies do not reproduce
-them. No hardware crash or power-loss guarantee follows from these runs.
-
-Every new numeric cell maps to a source file, case ID, operation and column
-in \texttt{contract-values.csv}. \texttt{contract-inputs.json} pins source
-and generated-table hashes. The campaign narrative in
-\path{docs/distributed/FOCUSED_CAMPAIGN_2026-11-07.md}, ``Run 13 results''
-and ``Combined run result'', supplies the scope and limits, not copied
-performance numbers. This addition does not change any retained value.
+\textbf{First put, cross-fleet context only.} The unprofiled 1 KiB single-caller
+first call changed from \N{B:contract-values:first-run13_first_call_us:value|.1f}
+to \N{B:contract-values:first-first_call_us:value|.1f}~\us.
+The regression fixture confirms removal of the measurement gate's warm-extent
+close, not a controlled fleet timing A/B. Later large-value slow calls remain
+unattributed. No hardware crash or power-loss test follows.
+\input{contract-stages.tex}
 \clearpage
 \subsection{Separate Class B controls and read-path context}\label{sec:contract-b-controls}
 These controls are not Class A put comparisons. Run 13 measured the new

@@ -7,12 +7,20 @@
     "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/run13-comparison.csv": "d04f72c9f85a37c1ab2c331aaf7df727902483aab0f1d176dd20641c240cd577",
     "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/combined-kv-evidence.json": "becbe37071bcfd469975a9e8ab93a969c4a749f053b6712391ecf0ad3db86b88",
     "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/run13-evidence.json": "264ed515cd3f08c758aae244a689632928551cc928725165c983411c5b3b232d",
-    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv": "843b934587f81113af71b187bba218a7b3bd2211bd67c4f82481a087d04e3f6c"
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv": "843b934587f81113af71b187bba218a7b3bd2211bd67c4f82481a087d04e3f6c",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/report-root/cases/G20W-r0-fb6fb99bf8a683e8fbf4/result/write-timeline.json": "8908f28de8e8e6fdf9e81bd7173b3785a60eb542637ece354c040b44aaf80bbc",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/report-root/cases/G20W-r0-fb6fb99bf8a683e8fbf4/result/measurement-read-evidence.json": "616603f7ce4ed538d0334204fdb5dc9c908dd45330abec82de1e20090146392d",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/report-root/cases/G20W-r0-fb6fb99bf8a683e8fbf4/result/samples.csv": "2d55d5185f10f59849ab0b48ddb4a2f2a8a8d73d44b1de5860c042673c9f56f0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json": "ff2347cf48225072580a629a580bc8c28c888def27ef4c07e62363c8fc54cde1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json": "717d338b07a1b46a73ee1f7c3f7e26ff127107deaab9fc320be82043400bb84d"
   },
   "outputs": {
-    "contract-values.csv": "2491d8c8ec66ef83cbee93d16493a28b57e42c1c441ed9f7ad7720ccb07f545f",
+    "contract-values.csv": "e99f0fa01d198f9150539f60186e5b26918d7b9733d42a5d7eb08a6013cee487",
     "tab-contract-a.tex": "e14b65ac82eb863774c75ef3d35980cd3cc8691fe3ad57fd5e98108ed134dcf2",
     "tab-contract-b-controls.tex": "76454d3661b96f77de178b3d34c73567d0f37305babcbaac47ff38ec75513019",
-    "tab-contract-indicative.tex": "6cbffd95a4716985fedc9151ac39c549eb100906d2fdd063068fff5d28882d79"
+    "tab-contract-indicative.tex": "6cbffd95a4716985fedc9151ac39c549eb100906d2fdd063068fff5d28882d79",
+    "tab-contract-stages.tex": "9750a93247a1db1f6ba08c65ad76609a4ec23f42778ee2a0aa349c29ba740f87",
+    "contract-stage-metrics.json": "ff2347cf48225072580a629a580bc8c28c888def27ef4c07e62363c8fc54cde1",
+    "contract-benchmark-plan.json": "717d338b07a1b46a73ee1f7c3f7e26ff127107deaab9fc320be82043400bb84d"
   }
 }

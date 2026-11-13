@@ -225,6 +225,97 @@ class WriteTimelineAdmissionTests(unittest.TestCase):
 
 
 class CloudMatrixTests(unittest.TestCase):
+    def contract_spec(self):
+        arms = {'native': ['value_wal_barrier', 'page_cache'],
+                'tidehunter_verbs_native': ['synchronous', 'native'],
+                'tidehunter_nvme_rdma': ['synchronous', 'native'],
+                'valkey_tcp': ['synced'],
+                'valkey_rdma': ['synced', 'os_buffered', 'periodic_sync'],
+                'kvrocks': ['synced', 'page_cache']}
+        return self.spec(2) | {'mode': 'standard-with-live-nvmeof', 'backends': list(arms),
+                               'max_cases': 2000, 'shapes': 'contract_core', 'arms': arms}
+
+    def test_contract_core_profiles_and_arms(self):
+        spec = self.contract_spec()
+        jobs = cloud.make_matrix(spec)
+        self.assertEqual(len(jobs), 156)
+        self.assertEqual(len({job['case_id'] for job in jobs}), len(jobs))
+        self.assertEqual({job['backend'] for job in jobs}, set(spec['backends']))
+        self.assertEqual({job['profile'] for job in jobs},
+                         {'write-concurrent', 'write-c1', 'write-sustained', 'read-concurrent', 'read-c1'})
+        def arm(job):
+            backend = job['backend']
+            return (job['durability_tier'] if backend in cloud.TRANSPORTS else
+                    job['native_durability'] if backend == 'native' else job.get('ack_contract', 'synced'))
+        for job in jobs:
+            self.assertEqual(job['cohort'], 'primary_rf1')
+            self.assertEqual(job['distribution'], 'uniform')
+            self.assertIsNone(job['offered_ops_per_second'])
+            self.assertNotIn('diagnostics', job)
+            self.assertNotIn('sealed_dataset', job)
+            self.assertIn(job['value_size'], (1024, 65536))
+            self.assertEqual(job['concurrency'], 1 if job['profile'].endswith('-c1') else 16)
+            writing = job['profile'].startswith('write-')
+            self.assertEqual(job['mix'], cloud.mix(**{'put' if writing else 'read': 100}))
+            self.assertEqual(job['measurement_operations'], 200000 if job['profile'] == 'write-sustained'
+                             else 4096 if writing else 8192)
+            if job['profile'] == 'write-sustained':
+                self.assertEqual((job['repeat'], job['value_size']), (0, 1024))
+            backend = job['backend']
+            if backend == 'native' or backend in cloud.TRANSPORTS:
+                self.assertNotIn('ack_contract', job)
+            else:
+                self.assertEqual(cloud.ack_contract.selected(backend, job.get('ack_contract', 'synced')), arm(job))
+                self.assertEqual('ack_contract' in job, arm(job) != 'synced')
+            self.assertIn(arm(job), job['case_id'])
+            self.assertIn(job['profile'], job['case_id'])
+            self.assertEqual(cloud.active_owner_count(job), 5)
+            cloud.make_run_config(job, '/tmp/contract-core', {}, 'test')
+            if backend in cloud.TRANSPORTS:
+                self.assertEqual(job['history_persistence'], 'wal_replay')
+                self.assertEqual(job['read_lanes'], 2)
+            if backend == 'tidehunter_nvme_rdma':
+                self.assertEqual(job['nvmeof_route'], 'live')
+                self.assertEqual(job['live_write_mode'], 'leased')
+                self.assertTrue(job['live_lease_ahead'])
+                self.assertFalse(job['live_polled_writes'])
+                self.assertEqual(job['live_export_mode'], 'per_owner')
+                self.assertEqual(job['owner_wal_geometry'], 'native_default')
+        for backend, arms in spec['arms'].items():
+            selected = [job for job in jobs if job['backend'] == backend]
+            reads = [job for job in selected if job['mix']['read']]
+            self.assertEqual(len(reads), 8)
+            self.assertEqual({arm(job) for job in reads}, {arms[0]})
+            puts = {}
+            for job in selected:
+                if job['mix']['put']:
+                    puts.setdefault((job['profile'], job['value_size'], job['repeat']), []).append(arm(job))
+            self.assertEqual(len(puts), 9)
+            self.assertTrue(all(values == arms for values in puts.values()))
+        self.assertEqual(controller.controller_matrix(spec), jobs)
+        config = {'spec': spec, 'fleet': {'nodes': [{'address': f'10.0.0.{i+1}'} for i in range(5)]}}
+        live = next(job for job in jobs if job['backend'] == 'tidehunter_nvme_rdma')
+        self.assertEqual(len(controller.live_nvme_preparation(config, live['case_id'], 'rdma')['addresses']), 5)
+
+    def test_contract_core_optional_keys_are_strict(self):
+        spec = self.contract_spec()
+        cases = []
+        for value in (None, False, '', 'other', ['contract_core']):
+            cases.append(spec | {'shapes': value})
+        for value in (None, [], {}, {'native': ['page_cache']}):
+            cases.append(spec | {'arms': value})
+        for backend, values in (('native', []), ('native', ['page_cache', 'page_cache']),
+                                ('native', ['unknown']), ('valkey_rdma', ['page_cache']),
+                                ('valkey_tcp', ['os_buffered']), ('kvrocks', ['periodic_sync']),
+                                ('native', 'page_cache'), ('native', [None])):
+            cases.append(spec | {'arms': spec['arms'] | {backend: values}})
+        cases.append({key: value for key, value in spec.items() if key != 'shapes'})
+        cases.append(spec | {'arms': spec['arms'] | {'unknown': ['synced']}})
+        for changed in cases:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                cloud.make_matrix(changed)
+        self.assertEqual(len(cloud.make_matrix({key: value for key, value in spec.items() if key != 'arms'})), 102)
+
     def test_advertised_read_evidence_cannot_be_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             result = Path(directory) / "result"

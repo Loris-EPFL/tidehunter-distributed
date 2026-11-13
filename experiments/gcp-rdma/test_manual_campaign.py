@@ -104,9 +104,37 @@ def publish_export(store, state, status='incomplete'):
 
 
 class ManualCampaignTest(unittest.TestCase):
+    def test_existing_standard_matrix_hash_is_unchanged(self):
+        jobs = manual._reviewed_jobs(manual.REVIEWED_SPEC)
+        self.assertEqual(len(jobs), 652)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
+                         separators=(',', ':')).encode()).hexdigest(),
+                         'f48f60156261589c539ca030d535d80cba8a0d987df30184d597a419f82adb9d')
+
+    def test_reviewed_contract_spec_exact_admission_and_matrix(self):
+        spec = manual.REVIEWED_CONTRACT_SPEC
+        self.assertNotIn('valkey_reproduction_profiles', spec)
+        self.assertFalse(spec['spdk_comparison'])
+        self.assertTrue(spec['native_durability_cohort'])
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual(len(jobs), 156)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
+                         separators=(',', ':')).encode()).hexdigest(),
+                         '32cda41becb0128f3d7f50cf02a4ffc4c9c9650ce9e708226516d862e1cca8e2')
+        self.assertEqual(Counter(job['backend'] for job in jobs), {
+            'native': 26, 'tidehunter_verbs_native': 26, 'tidehunter_nvme_rdma': 26,
+            'valkey_tcp': 17, 'valkey_rdma': 35, 'kvrocks': 26})
+        for key in spec:
+            changed = copy.deepcopy(spec)
+            value = changed[key]
+            changed[key] = (not value if isinstance(value, bool) else value + 1 if isinstance(value, int)
+                            else value + '-changed' if isinstance(value, str) else None)
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                manual._reviewed_jobs(changed)
+
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34}[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
@@ -119,6 +147,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
                     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
                     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
+                    'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
                 }[selection])
 
     def test_state_save_retries_transient_with_original_generation(self):
@@ -2152,20 +2181,28 @@ class SuiRunGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CombinedSuiAdmissionTests(ManualSuiTests):
+    spec_name = 'sui_nvmeof_with_kv'
+
     def setUp(self):
         super().setUp()
-        self.spec = copy.deepcopy(self.sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv'])
+        self.spec = copy.deepcopy(self.sui.REVIEWED_SUI_SPECS[self.spec_name])
 
     def test_reviewed_sui_exact_and_each_field_mutation(self):
-        self.assertEqual(len(manual._reviewed_jobs(self.spec)), 12)
+        self.assertEqual(len(manual._reviewed_jobs(self.spec)), self.spec['job_count'])
         manual._check_config(CONFIG, self.spec, 0)
         for key in self.spec:
             changed = copy.deepcopy(self.spec)
             changed[key] = None
             with self.subTest(key=key), self.assertRaises(ValueError):
                 manual._reviewed_jobs(changed)
+        for index, cell in enumerate(self.spec['sui_cells']):
+            for key in cell:
+                changed = copy.deepcopy(self.spec)
+                changed['sui_cells'][index][key] = 'unreviewed'
+                with self.subTest(cell=index, key=key), self.assertRaises(ValueError):
+                    manual._reviewed_jobs(changed)
         expected = manual._reviewed_jobs(self.spec)
-        proof = dict(planned_cases=12,matrix_sha256=manual._digest(manual._json(expected)))
+        proof = dict(planned_cases=self.spec['job_count'],matrix_sha256=manual._digest(manual._json(expected)))
         with patch.object(manual.subprocess, 'run', return_value=type('Result',(),dict(returncode=0,stdout=json.dumps(proof)))()) as observer:
             self.assertEqual(manual._qualify_observer('/package',self.spec),proof)
         self.assertEqual(json.loads(observer.call_args.kwargs['input'])['suite'],'both')
@@ -2175,39 +2212,48 @@ class CombinedSuiSuiteTests(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_half_preserves_both_result_archives(self):
         import manual_sui
         from unittest.mock import Mock
-        spec=manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv']
-        for incomplete in ('kv','sui'):
-            with self.subTest(incomplete=incomplete), tempfile.TemporaryDirectory() as tmp:
-                store,state=Store(),parent()
-                state['policy']=dict(name='policy',id='1')
-                package=publish_export(store,state,status='incomplete' if incomplete=='kv' else 'completed')
-                key=state['run_id']+'/results/sui-results.tar.gz'
-                meta=store.put(key,b'archive')
-                result=dict(kv=dict(complete=incomplete!='kv',planned_cases=12,completed_cases=12),
-                    sui=dict(complete=incomplete!='sui',cells=spec['sui_cells']),
-                    sui_archive=dict(key=key,generation=meta['generation'],sha256=hashlib.sha256(b'archive').hexdigest()))
-                mailbox=Mock()
-                mailbox.wait.return_value=dict(exit_code=0,stdout=json.dumps(result))
-                ready=dict(_reference=dict(object='ready',generation='1',sha256='a'*64))
-                with patch.object(manual.gcp_runtime,'build_runtime_config',return_value={'package_root':'/package'}), \
-                     patch.object(manual.gcp_runtime,'RemoteMailbox',return_value=mailbox), \
-                     patch.object(manual.campaign,'save'), \
-                     patch.object(manual,'_wait_status',return_value=ready), \
-                     patch.object(manual,'_admit_nvmet_proof'):
-                    with self.assertRaisesRegex(RuntimeError,'coordinator did not complete'):
-                        await manual._suite(store,CONFIG,state,Path(tmp)/'state.json',
-                            [dict(name='coordinator',id='1'),dict(name='owner',id='2')],package,spec,tmp,'irdma0')
-                self.assertIn(key,state['terminal_export'])
-                self.assertIn(state['run_id']+'/results/controller.tar.gz',state['terminal_export'])
+        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts'):
+            spec=manual_sui.REVIEWED_SUI_SPECS[name]
+            for incomplete in ('kv','sui'):
+                with self.subTest(spec=name,incomplete=incomplete), tempfile.TemporaryDirectory() as tmp:
+                    store,state=Store(),parent()
+                    state['policy']=dict(name='policy',id='1')
+                    package=publish_export(store,state,status='incomplete' if incomplete=='kv' else 'completed')
+                    key=state['run_id']+'/results/sui-results.tar.gz'
+                    meta=store.put(key,b'archive')
+                    result=dict(kv=dict(complete=incomplete!='kv',planned_cases=spec['job_count'],completed_cases=spec['job_count']),
+                        sui=dict(complete=incomplete!='sui',cells=spec['sui_cells']),
+                        sui_archive=dict(key=key,generation=meta['generation'],sha256=hashlib.sha256(b'archive').hexdigest()))
+                    mailbox=Mock()
+                    mailbox.wait.return_value=dict(exit_code=0,stdout=json.dumps(result))
+                    ready=dict(_reference=dict(object='ready',generation='1',sha256='a'*64))
+                    with patch.object(manual.gcp_runtime,'build_runtime_config',return_value={'package_root':'/package'}), \
+                         patch.object(manual.gcp_runtime,'RemoteMailbox',return_value=mailbox), \
+                         patch.object(manual.campaign,'save'), \
+                         patch.object(manual,'_wait_status',return_value=ready), \
+                         patch.object(manual,'_admit_nvmet_proof'):
+                        with self.assertRaisesRegex(RuntimeError,'coordinator did not complete'):
+                            await manual._suite(store,CONFIG,state,Path(tmp)/'state.json',
+                                [dict(name='coordinator',id='1'),dict(name='owner',id='2')],package,spec,tmp,'irdma0')
+                    self.assertIn(key,state['terminal_export'])
+                    self.assertIn(state['run_id']+'/results/controller.tar.gz',state['terminal_export'])
+
 
 
 class CombinedSuiRunGateTests(SuiRunGateTests):
     async def test_run_forwards_staged_copy_focused_spec_and_both_abis(self):
         import manual_sui
         # Reuse the full launcher gate test with the exact combined reviewed spec.
-        with patch.dict(manual_sui.REVIEWED_SUI_SPECS,
-                        sui_nvmeof_compact=manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv']):
-            await super().test_run_forwards_staged_copy_focused_spec_and_both_abis()
+        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts'):
+            with self.subTest(spec=name):
+                with patch.dict(manual_sui.REVIEWED_SUI_SPECS,
+                                sui_nvmeof_compact=manual_sui.REVIEWED_SUI_SPECS[name]):
+                    await super().test_run_forwards_staged_copy_focused_spec_and_both_abis()
+
+
+class ContractsSuiAdmissionTests(CombinedSuiAdmissionTests):
+    spec_name = 'sui_nvmeof_with_contracts'
+
 
 
 if __name__ == '__main__':

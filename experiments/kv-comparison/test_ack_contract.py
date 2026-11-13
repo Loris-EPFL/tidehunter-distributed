@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import ack_contract
 import cloud_layout
@@ -10,6 +11,32 @@ from test_valkey_lifecycle import evidence
 
 
 class AcknowledgementContractTests(unittest.TestCase):
+    def test_run_b_relaxed_arms_keep_five_storage_nodes(self):
+        value = fleet()
+        value['valkey_rdma_package'] = True
+        for index, node in enumerate(value['nodes']):
+            node['rdma_address'] = f'10.2.0.{index + 1}'
+        metadata = {'source_commit': 'fe8d406c0b5a64ec897f6455e4de684629883764',
+                    'artifacts': {'src/valkey-server': {'sha256': 'a' * 64}}}
+        for backend, contract, fsync in (('kvrocks', 'page_cache', None),
+                                         ('valkey_rdma', 'os_buffered', 'no'),
+                                         ('valkey_rdma', 'periodic_sync', 'everysec')):
+            with self.subTest(backend=backend, contract=contract), patch.object(
+                    cloud_layout.valkey_service, 'identity', return_value=metadata):
+                plan = cloud_layout.build_plan(value, backend, contract)
+            self.assertEqual(plan['physical_storage_hosts'], 5)
+            stores = [node for node in plan['nodes'] if node['index'] >= 0]
+            self.assertEqual(len(stores), 5)
+            for node in stores:
+                self.assertEqual(node['ack_contract'], contract)
+                if backend == 'kvrocks':
+                    self.assertIn('rocksdb.write_options.sync no\n', node['files']['kvrocks.conf'])
+                    self.assertIn('rocksdb.write_options.disable_wal no\n', node['files']['kvrocks.conf'])
+                else:
+                    args = node['native_valkey']['args']
+                    self.assertEqual(args[args.index('--appendfsync') + 1], fsync)
+                    self.assertEqual(args[args.index('--cluster-enabled') + 1], 'yes')
+
     def test_valkey_arguments_and_bidirectional_readback(self):
         for backend in ("valkey_tcp", "valkey_rdma"):
             for contract, fsync in (("synced", "always"), ("os_buffered", "no"), ("periodic_sync", "everysec")):

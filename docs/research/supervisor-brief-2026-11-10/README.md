@@ -128,10 +128,10 @@ Document generation launches no infrastructure or production benchmark. The sele
 
 ## Acknowledgement-class update (13 November 2026)
 
-The hard 56-page limit stays unchanged. `acknowledgement-contracts.tex` defines
-Class A (page-cache acknowledgement), Class B (synced before acknowledgement),
-and unverified device sync. `contract-results.tex` adds same-fleet, one-owner
-Class A Native/leased pairs, separate Class B controls, and one explicit
+The hard 56-page limit stays unchanged. `acknowledgement-contracts.tex` now
+defines S (synced), P (page cache), and W (weaker than P). Retained figures
+use Class B for S and Class A for P. `contract-results.tex` adds same-fleet,
+one-owner P Native/leased pairs, separate S controls, and one explicit
 non-ranking historical Valkey scale table. No retained value changes.
 
 Run `build_contract_inputs.py` before `make_tables.py`. The builder reads the
@@ -169,14 +169,12 @@ cross-file labels; the established `latexmk` build remains definitive.
 The current PDF has 56 pages. Changed contract pages and compact provenance
 were visually inspected; no clipping was found on those pages.
 `contract-validation.json` records the independent new-value checks.
-`validation.json` binds the current PDF and records full acceptance:
-`verify_brief.py` passes. On 13 November the source pins of
-`experiments/kv-comparison/cloud_campaign.py` and
-`benchmarks/kv-research/src/runner.rs` in `inputs.json` were updated to the
-current files (owner decision), because the harness changed after the brief
-was built. No data pin changed. `source-pin-impact.json` verifies that the
-changed harness source still generates the retained design counts and matrix
-digests, with no numeric change.
+`validation.json` binds the current PDF and records its acceptance status.
+T6 runs `verify_brief.py` without repinning repository sources changed by
+the parallel harness tasks. `t6-source-pin-differences.json` lists any
+source-hash differences; Main owns the final repin and rerun.
+Earlier owner-approved repins changed source hashes only, not data pins.
+`source-pin-impact.json` preserves the earlier exact-source design check.
 `validation-pre-contracts.json` preserves the prior PDF's acceptance only.
 Run-9 and run-10 validation files bind the current PDF and pass.
 
@@ -188,3 +186,53 @@ They reuse `reads.csv:p50_us` and the same historical Valkey
 no historical count or numeric pin changed.
 `contract-file-manifest.json` lists all scoped files written or regenerated
 during this assignment, with hashes; regenerated files can be byte-identical.
+
+## T6 benchmark map and large-value stages
+
+The front section includes objectives O1–O5 and the Run A/Run B maps, both
+**planned, not run**. `contract-benchmark-plan.json` preserves the binding
+plan excerpt, its source path, planned counts and reviewed Run A matrix hash.
+The builder reads the named plan; verification checks the saved excerpt
+against it. No matrix, seal or fleet is launched by the document pipeline.
+
+`contract-stages.tex` and `tab-contract-stages.tex` show the Class P, one-owner
+64 KiB timeline case `G20W-r0-fb6fb99bf8a683e8fbf4`. Its three raw inputs are
+under the combined run's `analysis/report-root/cases/<case>/result/`.
+`contract-stage-metrics.json` records their exact paths and derived values.
+`contract-values.csv` links each displayed number to a field in that JSON;
+`verify_contracts.py` recomputes the fields independently from the raw inputs.
+
+| Derived field | Raw source and formula |
+|---|---|
+| `samples`, `mean_total_us` | `write-timeline.json:timeline.records`; count, and mean last-minus-first `events[].elapsed_ns` divided by 1,000. |
+| `queued_us`, `preparation_us`, `append_wait_us`, `live_io_us` | Consecutive `events` differences for the exact start/end stage pairs shown in the table, summed and divided by the full call count and 1,000. |
+| `other_us`, `*_share` | Unrounded total minus the four stage sums; each stage sum divided by total, times 100. |
+| `groups`, `puts_per_group` | `measurement-read-evidence.json:live_nvmeof.counters.leased_frames`, checked against complete `timeline.live_groups`; measurement call count divided by data groups. |
+| `wall_ns`, `group_period_ms` | Measurement `samples.csv`: max `completed_ns` minus min `scheduled_ns`; divide by groups and 1,000,000. |
+| `mean_leased_write_ms` | Counter `leased_write_ns` divided by `leased_write_samples` and 1,000,000. This includes marker writes, not isolated device time. |
+| `group_mib`, `leased_mib_s` | Counter `leased_bytes` divided by groups and 2^20, or by 2^20 and the measurement span in seconds. Bytes include framing. |
+| `payload_mib_s` | Sum measurement `samples.csv:bytes`, divided by 2^20 and the span in seconds. |
+| `active_write_gib_s`, `write_busy_pct` | `leased_bytes / 2^30 / (leased_write_ns / 1e9)`; `100 * leased_write_ns / wall_ns`. |
+| `callers`, `serial_preparation_ms` | Combined `puts.csv:concurrency` for the exact case; callers times `preparation_us / 1000`. |
+| `io_samples`, `skip_markers` | Read-evidence counters `leased_write_samples`, `leased_skip_markers`; timing samples equal data frames plus marker writes. |
+
+All stage means use the full retained call population, not only groups that
+have a particular stage. Raw evidence has 256 data groups, all with 16 calls,
+and zero dropped groups. The 258 leased-write timing samples include two skip
+markers, so 15.9 puts and 1.88 ms per sample are not data-group statistics.
+The corrected data-group period is 1.90 ms. The exact other-stage share is
+6.4%; framed WAL is 529 MiB/s, logical payload is 527 MiB/s, and active write
+rate is 1.63 GiB/s. These values come from the generated metrics, not rounded
+planning prose. Serial-preparation attribution and five-owner scaling remain
+inference until further measurement.
+
+Current T6 file inventory: `t6-file-manifest.json`. Current verification log:
+`t6-verification-output.txt`; source differences: `t6-source-pin-differences.json`.
+`validation-pre-t6.json` preserves the previous accepted PDF only.
+
+Run A call counts come from the plan's execution-note correction:
+`run_a_put_calls=4096`, `run_a_memory_read_calls=8192`,
+`run_a_device_1k_calls=2048`, `run_a_device_64k_calls=4096`.
+`contract-benchmark-plan.json:call_count_correction` preserves that source
+line; the builder and independent verifier parse and check each count.
+The older generic “4,096 measured calls” sentence does not apply to reads.

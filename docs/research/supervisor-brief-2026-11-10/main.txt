@@ -62,49 +62,68 @@ workloads and repetitions differ; the example in Section 12.1 shows why times mu
 
 
                                                               1
-2    Acknowledgement contracts
-Read the acknowledgement class before comparing stores. The original Tidehunter paper,
-arXiv:2602.01873v2, Section 3.1, states: “Writes complete without waiting for fsync”. The write reaches the
-operating-system page cache and survives an application crash. An acknowledgement does not establish survival
-of a kernel crash or power loss. The paper relies on background fsync for kernel-crash durability; applications that
-need a stronger guarantee can call explicit flush.
-Class A: page-cache acknowledgement. No sync is required before the reply. This is the paper’s default
-   contract. In these benchmarks, it is Native page_cache and owner native, including the new leased
-   NVMe-oF route. The owner tier name native does not mean the in-process Native backend. wal_replay
-   selects recovery history; it does not change the acknowledgement class.
-Class B: synced before acknowledgement. The reply waits for the configured sync or commit barrier.
-   Benchmarked settings are Tidehunter synchronous (covering fdatasync), Native value_wal_barrier
-  (per-put file and directory fsync), Native grouped barrier, Valkey appendfsync always, Kvrocks synced
-   WAL, and Garnet commit-wait. Sync scope and sharing still differ. This class records the acknowledgement
-   setting, not a proof of equal crash recovery or power-loss survival.
-Device sync not verified. Cassandra, TiKV and FoundationDB retain this status. They are not verified Class
-   B members and must not be used to infer Class A performance either.
-Coverage. The retained cross-store comparisons use Class B settings where verified. Class A cross-store data for
-external stores does not exist yet. The grey Native Class A curves and historical page-cache rows are separate
-references, not Class B competitors; their values are retained for continuity. Never infer a ranking by comparing
-the two classes. The one indicative scale table in Section 11.2 is explicitly not a fair comparison.
-External settings are not a binary switch. Valkey has three relevant settings: synced always (measured);
-periodic sync everysec (not measured); and OS-buffered, no fsync (appendfsync no, not measured). Neither of
-the latter settings is an exact page-cache equivalent; both are weaker than Tidehunter’s process-crash contract.
-Periodic sync can retain AOF writes in user space while a background fsync runs (Valkey latency documentation).
-The pinned Valkey source also does not guarantee AOF write completion before every reply in no mode: write
-errors are not fatal outside always, and later replies in the same loop are not covered. Source: Valkey commit
-fe8d406c, server.c:1898–1928 and aof.c:1194–1218. Kvrocks rocksdb.write_options.sync no is
-source-confirmed as a page-cache acknowledgement, but not measured. Kvrocks keeps RocksDB’s default
-manual_wal_flush=false; non-sync WAL writes reach the OS buffer before return. See RocksDB’s Basic
-Operations, “Non-sync Writes”. There is still no external Class A performance data.
-Reads. A read has no write acknowledgement. A read caption’s class names the database’s write/preparation
-setting only. Cache state, read route and device qualification remain separate requirements. In particular, Valkey
-GET reads RAM. A Class B setup does not make a read SSD-served.
-Current evidence gaps. No Sui replay result completed on hardware. The new design has no synchronous-tier
-put result at sixteen callers and no five-owner run. No external-store Class A arm was measured. Laptop checks
-are functional evidence only, not performance evidence. Later one-owner results below do not replace the
-historical cross-store values or prove five-owner scale-out.
+2     Acknowledgement contracts
+The original Tidehunter paper, arXiv:2602.01873v2, Section 3.1, states: “Writes complete without waiting for fsync”. Its
+page-cache acknowledgement survives an application crash, not an immediate kernel crash or power loss. Background fsync
+provides eventual kernel-crash durability; explicit flush supports stronger needs. wal_replay selects recovery history, not
+the acknowledgement contract.
+Binding classes. The new plan uses S, P and W. Retained figures use Class B for S and Class A for P; their values do
+not change.
+
+ Class         Reply condition                          Store membership and settings
+ S             Synced before acknowledgement            TideHunter synchronous; Native value_wal_barrier; Valkey
+                                                        always; Kvrocks synced WAL; Garnet commit-wait. Cassandra,
+                                                        TiKV and FoundationDB: S intent, device sync not verified.
+ P             Write in the storage host’s OS page      TideHunter native; Native page_cache; Kvrocks
+               cache                                    rocksdb.write_options.sync no, source-confirmed, not
+                                                        measured.
+ W             Reply can precede the kernel write       Valkey os_buffered (appendfsync no) and periodic_sync
+                                                        (everysec); both weaker than P, not measured.
+
+Valkey has no exact P mode: no does not guarantee the AOF write before every reply; everysec can retain writes in user
+space during fsync. Sources: Valkey fe8d406c, server.c:1898–1928, aof.c:1194–1218, and its latency documentation.
+Kvrocks keeps RocksDB’s manual_wal_flush=false; see Non-sync Writes. No external P or W performance data exists
+yet. S is the cross-store headline; P is the Sui-contract comparison; W is weaker context beside P, never a ranking. Reads
+state memory or device service; Valkey GET is memory only. Sync mechanics and crash guarantees still differ within S.
+Objectives. O1: fill the new design’s missing S cells at sixteen callers and sustained puts. O2: first hardware Sui replay
+under S and P. O3: explain the large-value put gap from existing stages and Run A diagnosis. O4: same-fleet,
+same-topology S/P comparisons with W context. O5: five-owner new-design results.
+Run A: planned, not run. 2 VMs, one coordinator and one owner; focused package, TideHunter and Native only.
+Selection nvmeof_contracts: 34 KV cases (G21W/G21R/G21N: 16/8/10).
+
+     Arm / class                             Cases    Coverage and objective
+     Leased NVMe-oF, S and P                     8    Put core shapes; O1
+     Leased NVMe-oF, S and P                     2    Sustained puts; O1
+     Leased NVMe-oF, S and P                     2    Large-value timeline copies; O3
+     Owner RPC verbs, S                          4    Put core shapes; O1 route control
+     Live reads, S preparation                   8    Core shapes from memory and device; O1
+     Native S/P puts and memory reads           10    Same-fleet references
+
+Core shapes: put/read, 1/64 KiB, 1/16 callers. Run A calls: puts 4,096; memory reads 8,192; device reads 2,048 at 1 KiB,
+4,096 at 64 KiB. Sustained: 200,000 puts, 1 KiB, sixteen callers. Matrix SHA-256:
+cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208. Then 4 Sui cells: owner RPC verbs and live
+NVMe-oF, each under original_default (P) and harness (S). Each requires Native/remote replay, equal checkpoint
+digest and state audit. Remote: wal_replay; leased: lease-ahead, no write polling.
+Run B: planned, not run. 6 VMs, one client/coordinator plus 5 storage hosts; full package. Core shapes and sustained
+puts; two repetitions. Reads run once per store under S, not once per write contract.
+
+     Store / route                                                 Planned arms
+     TideHunter leased NVMe-oF, five owners                        synchronous (S), native (P)
+     TideHunter owner RPC verbs, five owners                       synchronous (S), native (P)
+     Native, one process on coordinator SSD                        value_wal_barrier (S), page_cache (P)
+     Valkey RDMA                                                   synced (S), os_buffered/periodic_sync (W)
+     Valkey TCP                                                    synced (S)
+     Kvrocks                                                       synced (S), page_cache (P)
+
+Native remains a one-SSD reference, not an equal-device-count competitor. Garnet, Cassandra, TiKV and FoundationDB
+are not rerun: no clean P mode is in this plan. Their S rows stay historical, on other fleets; device sync remains unverified
+for Cassandra, TiKV and FoundationDB. No Sui replay result on hardware exists yet. Both runs require new launch
+authorization; neither has run.
 
 
 
 
-                                                         2
+                                                             2
 3    Method and contracts
 API time is completion minus dispatch. Response time is completion minus schedule time in the closed-loop
 harness; it includes scheduling and admission. Latency uses successful calls only. Rejected calls have no API
@@ -1811,16 +1830,13 @@ remain explicit.
                                                                                   27
 11      Distributed against original engine, page-cache acknowledgement,
         one owner
-Class A only: same-fleet puts. The leased live NVMe-oF/RDMA route uses wal_replay, lease-ahead and
-interrupt-driven writes unless stated. Native is the original in-process engine under the harness’s page_cache
-mode, not its stronger barrier. Each arm has one data SSD: Native on the coordinator VM, distributed WAL on
-the remote owner VM. The remote arm still pays for the coordinator, index and network. Matching
-acknowledgement class does not match those costs.
-The combined run (revision e0af084, fleet bench-e3638332bc2b43a1, created 12 November) completed 12 cases
-and 245,056 measured calls. Run 13 (revision 3d5c0f7, fleet bench-c1dce8770c684804, 12 November) completed
-37 cases and supplies other shapes. One owner, one fleet per run, one or two repetitions per cell. Cases are short
-except the sustained put case below. No fleet or repetition is pooled. A missing same-fleet Native partner is not
-supplied from another fleet.
+Class P (retained Class A): same-fleet puts. Leased live NVMe-oF/RDMA uses wal_replay, lease-ahead
+and interrupt-driven writes. Native uses page_cache, not its stronger barrier. Each has one data SSD: Native on
+the coordinator, distributed WAL on the remote owner. Only the remote arm pays coordinator/index/network
+costs.
+Combined run: revision e0af084, fleet bench-e3638332bc2b43a1, 12 November; 12 cases, 245,056 measured
+calls. Run 13: 3d5c0f7, fleet bench-c1dce8770c684804, 12 November, 37 cases. One owner and fleet per run,
+one or two repetitions per cell; short cases except sustained puts. Only same-fleet Native partners enter the table.
 
                     Run        KiB    c r Leased A: p50/p99/p99.9 µs Native A: p50/p99/p99.9 µs
                     combined      1 1 0 46.7/84.0/397.8                  1.9/3.2/9.1
@@ -1831,32 +1847,50 @@ supplied from another fleet.
                     run13        64 1 0 157.9/191.8/482.4                37.5/111.7/136.5
                     run13        64 16 0 1747.1/3944.5/31235.8           160.6/308.1/469.2
                     run13        64 16 1 1751.6/3982.9/31424.0           155.2/257.8/377.3
-Table 30: Class A: page-cache acknowledgement on both sides. Same-fleet, same-size and same-caller put pairs only.
-Repetitions remain separate; API p50/p99/p99.9 in µs. One Native process/SSD versus one remote owner/SSD;
-coordinator cache off. Interrupt-driven, unprofiled leased wal_replay with lease-ahead. Sources: each run’s puts.csv; case
-IDs and exact columns are in contract-values.csv. No external store or synchronous-tier value enters this table.
+Table 30: Class P (retained Class A): page-cache acknowledgement on both sides. Matched fleet, size, callers and
+repetition; API p50/p99/p99.9 in µs. One Native process/SSD versus one remote owner/SSD; coordinator cache off.
+Unprofiled leased wal_replay, lease-ahead, no write polling. Sources: each run’s puts.csv; exact cases/columns in
+contract-values.csv.
 
 
-Sustained Class A case, not a Native pair. The combined run’s 200,000-put, 1 KiB, sixteen-caller case has
-p50/p99/p99.9 129.9/388.0/1317.0 µs, 94,975 puts/s, 13.5 mean in-flight API calls, and 0 calls at least 5 ms.
-There is no matching sustained Native cell. Finite short-case rates are not capacity estimates; only latency is
-shown in the paired table.
-First-put change. For the unprofiled 1 KiB single-caller case, run13-comparison.csv records first-call time
-33367.4 µs in run 13 and 124.0 µs in the combined run. These are different fleets and revisions, not a controlled
-timing A/B. The campaign’s regression fixture identifies the removed side effect: measurement-gate observations
-previously closed the warm extent. The combined run still has later slow calls in the unprofiled large-value cases.
-Their cause is not established; timeline copies do not reproduce them. No hardware crash or power-loss guarantee
-follows from these runs.
-Every new numeric cell maps to a source file, case ID, operation and column in contract-values.csv.
-contract-inputs.json pins source and generated-table hashes. The campaign narrative in
-docs/distributed/FOCUSED_CAMPAIGN_2026-11-07.md, “Run 13 results” and “Combined run result”, supplies
-the scope and limits, not copied performance numbers. This addition does not change any retained value.
+Sustained P, no Native pair. Combined run, 200,000 puts, 1 KiB, sixteen callers: p50/p99/p99.9
+129.9/388.0/1317.0 µs; 94,975 puts/s at 13.5 mean in-flight calls; 0 calls at least 5 ms. Finite-case rates are not
+production capacity.
+First put, cross-fleet context only. The unprofiled 1 KiB single-caller first call changed from 33367.4 to
+124.0 µs. The regression fixture confirms removal of the measurement gate’s warm-extent close, not a controlled
+fleet timing A/B. Later large-value slow calls remain unattributed. No hardware crash or power-loss test follows.
 
 
+11.1     Why the large-value put gap remains
+Measured Class P (retained Class A), one owner. Combined-run timeline case
+G20W-r0-fb6fb99bf8a683e8fbf4: leased NVMe-oF, wal_replay, lease-ahead, 64 KiB and 16 callers. The table
+averages consecutive coordinator event differences over all 4,096 complete calls, not groups.
+
+                          Coordinator-clock interval                   Mean µs/call Share (%)
+                          owner_enqueue_started → owner_dequeued               447.2          24.5
+                          owner_dequeued → prepared                             61.6           3.4
+                          admitted → append_enqueue_started                    476.9          26.1
+                          live_io_started → live_io_completed                  724.3          39.6
+                          All other consecutive intervals                      117.5           6.4
+                          Total                                               1827.6         100.0
+Table 31: Class P, one owner. Consecutive timeline.records[].events elapsed_ns differences, averaged over all
+complete calls. Shares and residual use unrounded values; displayed sums can differ by rounding. Same-clock intervals, not
+isolated wire or SSD time.
+
+
+I/O: 258 timed writes including 2 skip markers; 256 data groups, 16.0 puts/group, 1.90 ms/group, 1.00
+MiB/group including framing. Span (last completion minus first scheduled call) gives 529 MiB/s of framed WAL
+traffic (527 MiB/s of logical payload). Summed leased-write time gives 0.60 ms per I/O sample, 1.63 GiB/s while
+writing, and 31.7% of the measurement span. These are counter-derived intervals, not device-only service times.
+[INFERENCE] The device and network are not the limit indicated by this case. Preparation runs on one
+wal-write-owner coordinator thread (remote_db/concurrent.rs:455); at the observed mean, 16 preparations
+take about 0.99 ms per group. The two large waits may queue behind that thread and one in-flight group. Five
+owners spread only the write stage (39.6% of call time), not preparation: inference until Run B. Sources and
+formulas: contract-stage-metrics.json and the README.
 
 
                                                            28
-11.1     Separate Class B controls and read-path context
+11.2     Separate Class B controls and read-path context
 These controls are not Class A put comparisons. Run 13 measured the new wal_replay design with
 synchronous-tier puts at one caller only. The read rows also record Class B preparation: their CSV contract is
 durable. They must not be relabelled as page-cache-acknowledged experiments. Live reads use a buffered target:
@@ -1874,7 +1908,7 @@ memory reads and Valkey RAM reads are not cold-device controls.
                             Owner RPC cold (B setup)          1 1     103.3   156.3     205.1
                             Owner RPC warm (B setup)          1 1      27.4    33.2      36.4
                             Native memory (B setup)           1 1       1.2     1.7       7.2
-Table 31: Separate Class B settings: synced-before-acknowledgement puts; read rows name the write/preparation setting,
+Table 32: Separate Class B settings: synced-before-acknowledgement puts; read rows name the write/preparation setting,
 not a read durability guarantee. Run 13 only, one owner, one repetition per row, coordinator cache off. The leased put
 uses lease-ahead; owner RPC is a different route. Polled warm read is a separate arm. API quantiles are µs, not
 device-service times. Sources: run-13 puts.csv and reads.csv; no subtraction or cross-class ranking.
@@ -1890,7 +1924,7 @@ either measured replay, so it supplies no timing, digest comparison or state aud
 decisions are historical hypotheses, not evidence that these gaps are closed.
 
 
-11.2     Order of magnitude only: new one-owner NVMe-oF design against historical
+11.3     Order of magnitude only: new one-owner NVMe-oF design against historical
          Valkey RDMA
 Indicative only. No ranking follows. API p50 in µs; semicolons keep new repetitions separate. Read labels
 state memory or device service. Valkey cells retain the historical per-run-p50 median for RAM GET.
@@ -1907,7 +1941,7 @@ state memory or device service. Valkey cells retain the historical per-run-p50 m
        read: from device                  1 16 127.9               B setup; cold; run13 43.1
        read: from device                 64 1 145.3                B setup; cold; run13 78.7
        read: from device                 64 16 not measured                             116.3
-Table 32: Order of magnitude only, not an equal-contract comparison. Owner count: one Tidehunter owner versus five
+Table 33: Order of magnitude only, not an equal-contract comparison. Owner count: one Tidehunter owner versus five
 Valkey storage nodes. Contract: new puts are Class A page-cache acknowledgement; Valkey SET is Class B appendfsync
 always; new read rows have Class B setup but Valkey reads come from RAM; new reads label memory or device service.
 Fleet: combined or run 13 versus historical external fleets, never the same fleet. Date: new cloud fleets created 12
@@ -1972,7 +2006,7 @@ durable intent, not proved crash or device-persistence equivalence.
  TiKV/unverified                      5        3.2    21,759             4,352       272.0    583.0    693.1    396.1    15.02
  FoundationDB/unverified              5        3.2     7,283             1,457        91.0   2141.8   2162.6    900.7    15.68
 
-Table 33: Verified cross-store series: Class B (synced before acknowledgement). Read classes name write/preparation
+Table 34: Verified cross-store series: Class B (synced before acknowledgement). Read classes name write/preparation
 settings. Cassandra, TiKV and FoundationDB: device sync not verified. 64 KiB puts, c16: aggregate rate / retained-final
 node count. Even spread assumed for callers, rate and payload; these are normalizations, not observed node-level metrics.
 Native: one process, one SSD. Tidehunter: five owners. Other external contributors record five configured or observed
@@ -2043,7 +2077,7 @@ cause is claimed. See external-spread.csv for external per-run spread; no whiske
 
                                                         31
 The retained pre-run-9 64 KiB points are reproducible. The retained c16 cases reproduce the high Native
-latency, not a particular cause. Table 34 shows each population separately. Native per-put barrier p50 spans
+latency, not a particular cause. Table 35 shows each population separately. Native per-put barrier p50 spans
 2,652.3–2,935.8 µs; Native page-cache p50 spans 164.2–181.7 µs. These are observed ranges, not confidence
 intervals or sustained-capacity results. Run-9 grouped-barrier controls are separate, not additions to these
 historical ranges.
@@ -2068,7 +2102,7 @@ historical ranges.
                                 V                  D        425.4          –           –
                                 V                  Q        418.7          –           –
                                 V                  M        386.5          –           –
-Table 34: Separate contract references, not a cross-class ranking: Class B rows B/S/V; Class A rows P. Individual 64 KiB
+Table 35: Separate contract references, not a cross-class ranking: Class B rows B/S/V; Class A rows P. Individual 64 KiB
 c16 successful-put API p50 values, recomputed from raw samples; 4,096 puts per population. B: Native per-put
 all-file/directory barrier, one process/SSD. P: Native page-cache acknowledgement, no per-put foreground fsync or per-put
 persistence guarantee. S: owner verbs synchronous covering persistence, five owners. V: Valkey RDMA AOF-always.
@@ -2136,7 +2170,7 @@ for a grouped-barrier speedup. The cloud step’s cause stays open.
                  Grouped data-sync model    64    1     638.05; 632.95 1,820.77; 1,687.02         1,497; 1,575
                  Grouped data-sync model    64   16 5,764.27; 5,652.97 88,023.19; 7,223.45        1,129; 2,804
 
-Table 35: Laptop functional diagnostics only, not performance evidence. No cross-store acknowledgement comparison.
+Table 36: Laptop functional diagnostics only, not performance evidence. No cross-store acknowledgement comparison.
 Local structure test: transcribed from the audit report; raw samples not retained. Each cell lists IEEE run 1; run 2
 separately; – means not measured. Fresh mapping, MAP_POPULATE, write-prefault, pwrite and anonymous memory have no
 per-put foreground persistence guarantee. Write-prefault writes every page and data-syncs before timing; MAP_POPULATE is
@@ -2169,7 +2203,7 @@ not durable.
    G14P       6        Separate Native/owner profiles;      Each source arm retains its instance, SSD, network, sync
                        writers 1, 16                        and routing differences; diagnostics are not unprofiled
                                                             controls.
-Table 36: Frozen design inventory, not completed counts. Class A: Native page cache. Class B: Native per-put/grouped
+Table 37: Frozen design inventory, not completed counts. Class A: Native page cache. Class B: Native per-put/grouped
 barrier and owner covering sync. No cross-class ranking. Run 9 includes G14N/G14O1 and three G14P diagnostics;
 G14S/G14O5 did not run. Instances, SSD location/count, network/security, sync scope and routing remain unmatched.
 
@@ -2617,7 +2651,7 @@ Its motivation names deduplication chunks of 4–64 KB, Haystack photos of about
 objects (typically 1KB–1MB)”. These are motivation claims, not measured frequencies in this replay. The paper
 has no synthetic 8 KiB or 64 KiB evaluation result. Source: papers/parsed/Tidehunter-2026-v2.md, lines
 23–25 (Figure 1), 31 (motivation), 237 (evaluation) and 375 (Sui claim); the paper’s KB/MB labels are retained.
-One captured Sui workload. Table 37 uses only the corrected remote events.tsv and its database metadata
+One captured Sui workload. Table 38 uses only the corrected remote events.tsv and its database metadata
 under checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/. It is a private
 generated-transfer chain, not mainnet, and includes initialization. Read rows count found payloads, including
 returned scan rows; put rows count successful members. Scalar writes’ internal batch copies are not counted
@@ -2657,7 +2691,7 @@ observations do not prove physical SSD reads or per-put persistence.
                                                                                                1,116            6
                  All tables            put    218,513    85    402      1,994 603,739     (0.5107%)    (0.0027%)
 
-Table 37: Observed value bytes in one corrected remote Sui capture. Each threshold count and share uses its row’s
+Table 38: Observed value bytes in one corrected remote Sui capture. Each threshold count and share uses its row’s
 population, not API calls. “All tables” includes the small metadata tables omitted above. Empty populations have no
 quantile or percentage. Full contents means full_checkpoint_content_v2; other displayed names map directly to
 sui-value-sizes.csv. One run only; read/write populations remain separate; cache and durability qualification are not
@@ -2688,7 +2722,7 @@ origin. No protocol violation is inferred.
                                                                              occur
     64 KiB       No                      Deduplication and Haystack          0 / 0; larger values      Below all five
                                          ranges                              occur
-Table 38: Exact chart sizes versus three different questions: evaluated, motivated and observed. No captured value equals
+Table 39: Exact chart sizes versus three different questions: evaluated, motivated and observed. No captured value equals
 any chart size; this does not mean that nearby or larger values are absent. “Below all five” means the payload size is below
 each listed baseline input limit, not that every database encoding is admitted. Read/write capture has no established
 cache or durability qualification.
@@ -2767,7 +2801,7 @@ This is not a pooled quantile or a matched new-fleet comparison.
                         TH NVMe-oF SPDK          71.7     156     147,290    702    1,248      22,172
                         Valkey TCP               53.4     113     188,256    183      469      73,443
                         Valkey RDMA              43.1    92.5     165,026    173      410      80,146
-Table 39: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
+Table 40: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
 Read classes name write/preparation settings. Scalar calls at c16, success-only API p50 and p99 in µs, successful calls/s.
 Native and Tidehunter: one run on the full-matrix fleet; other stores: median over 2 to 6 GCP runs (different fleets, days,
 binaries). These tables retain their original keys and CSV inputs.
@@ -2783,7 +2817,7 @@ binaries). These tables retain their original keys and CSV inputs.
                         TH NVMe-oF SPDK          642     2,740     18,391   2,253     4,030     6,405
                         Valkey TCP               389       807     29,860       –         –         –
                         Valkey RDMA              321       803     35,821       –         –         –
-Table 40: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
+Table 41: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
 Read classes name write/preparation settings. 32-key calls at c16; API p50/p99 in µs and successful calls/s. One call
 covers 32 values. Native and Tidehunter: one run on the full-matrix fleet; other stores: median over 2 to 6 GCP runs
 (different fleets, days, binaries). Valkey has no batch-write case; a dash is not zero.
@@ -2840,7 +2874,7 @@ runs (different fleets, days, binaries).
              FoundationDB             480/4,786     281/402     915/1,070    986/1,233        5,203/6,321
              Kvrocks                  50.0/62.1    94.4/141       135/166      262/864        2,061/7,242
              Garnet                   58.7/72.6    92.2/147       101/164   144/66,736        2,221/7,475
-Table 41: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
+Table 42: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
 Read classes name write/preparation settings. Cassandra, TiKV and FoundationDB: device sync not verified. API p50/p99
 in µs. c1 cells are mixed point operations. Native and Tidehunter: one run on the full-matrix fleet; other stores: median
 over 2 to 6 GCP runs (different fleets, days, binaries). Contracts differ as described above.
@@ -3191,7 +3225,7 @@ ties. This is a descriptive count, not a universal RDMA advantage. TLS differs b
                Kernel NVMe-oF (page cache), c1 read, 1 KiB          52.2   62.6%    82.1%     91.8%    97.7%
                Kernel NVMe-oF, cold 64 KiB, c16                      167   88.5%    94.5%     97.5%    99.3%
                Owner RPC over TCP, cold 64 KiB, c16                  610   96.8%    98.5%     99.3%    99.8%
-Table 42: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
+Table 43: Retained cross-store data, unchanged. Verified cross-store series: Class B (synced before acknowledgement).
 Read classes name write/preparation settings. Estimated cache hit ratio for target mean g. Miss cost L is the measured
 p50; hit cost H = 0.8 µs is the original measured-hit approximation. The estimate h = (L − g)/(L − H) uses medians as
 proxies for means, so miss tails make it optimistic. It is not a measured hit-ratio curve. Native and Tidehunter: one run on
@@ -3593,7 +3627,7 @@ not prove individual-call NAND access.
                     64 KiB / c16         Native completed             3.75 completed             3.71
                     64 KiB / c16     Owner TCP completed              1.00 completed             1.00
                     64 KiB / c16     Owner verbs completed            1.00 completed             1.00
-Table 43: Cold device qualification per case. Completed requires a qualified receipt and device reads per success at least
+Table 44: Cold device qualification per case. Completed requires a qualified receipt and device reads per success at least
 0.9; this is not per-call NAND proof. Ratios/reasons are indexed from remote_rw.md into cold_qualification.csv. Owner
 c5 uses one lane and is lane-limited; no transport ranking follows. Unmatched dimensions: sync/grouping, RPC/security,
 index/routing, and host SSD (Native coordinator SSD versus owner SSD). Read lanes: Native 0, owner 1 at c1/c5 and 4 at
@@ -3644,7 +3678,7 @@ populations, but these counters do not identify each call’s path.
                           owner 0 append_pwrite            65536 B      113.6     115.9         –
                           client direct fresh 2 GiB         4096 B       70.1      69.9      69.9
                           client direct fresh 2 GiB        65536 B       84.2      84.0      84.2
-Table 44: Independent floors (µs), not additive stages. QD1 append-pwrite/fdatasync and mmap/fsync on both hosts;
+Table 45: Independent floors (µs), not additive stages. QD1 append-pwrite/fdatasync and mmap/fsync on both hosts;
 direct random reads: fresh 2 GiB. Network: blocking eth0 TCP RTT and polled ib_send_lat (half RTT doubled). Append
 controls have r0/r1; network/read floors also r2. No 8 KiB network or 1/8 KiB SSD-read floor; no interpolation. Other
 modes/regions remain in floors.csv. Failed event-write controls are listed below. Unmatched dimensions: sync/grouping,

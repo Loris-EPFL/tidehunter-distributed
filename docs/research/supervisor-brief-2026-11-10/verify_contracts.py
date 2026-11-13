@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import json
+import math
 import re
 import subprocess
 from pathlib import Path
@@ -14,6 +15,93 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def check_stage_values():
+    derived = json.loads((HERE / 'contract-stage-metrics.json').read_text())
+    raw = {name: Path(path) for name, path in derived['sources'].items()}
+    timeline = json.loads(raw['write-timeline.json'].read_text())['timeline']
+    records = timeline['records']
+    with raw['samples.csv'].open(newline='') as stream:
+        samples = [r for r in csv.DictReader(stream) if r['phase'] == 'measurement']
+    assert len(records) == len(samples) == 4096
+    assert all(r['completed'] and r['error'] is None for r in records)
+    total_ns = sum(r['events'][-1]['elapsed_ns'] - r['events'][0]['elapsed_ns'] for r in records)
+    expected = dict(samples=len(records), mean_total_us=total_ns / len(records) / 1000)
+    intervals = {
+        'queued': ('owner_enqueue_started', 'owner_dequeued'),
+        'preparation': ('owner_dequeued', 'prepared'),
+        'append_wait': ('admitted', 'append_enqueue_started'),
+        'live_io': ('live_io_started', 'live_io_completed'),
+    }
+    selected_ns = 0
+    for name, (start, end) in intervals.items():
+        durations = []
+        for record in records:
+            pair, = [(a, b) for a, b in zip(record['events'], record['events'][1:])
+                     if (a['stage'], b['stage']) == (start, end)]
+            durations.append(pair[1]['elapsed_ns'] - pair[0]['elapsed_ns'])
+        value = sum(durations)
+        selected_ns += value
+        expected[name + '_us'] = value / len(records) / 1000
+        expected[name + '_share'] = 100 * value / total_ns
+    expected.update(other_us=(total_ns - selected_ns) / len(records) / 1000,
+                    other_share=100 * (total_ns - selected_ns) / total_ns, total_share=100)
+    counters = json.loads(raw['measurement-read-evidence.json'].read_text())['live_nvmeof']['counters']
+    writes = counters['leased_write_samples']
+    assert writes == 258
+    groups, skips = counters['leased_frames'], counters['leased_skip_markers']
+    assert groups == 256 and skips == 2 and writes == groups + skips
+    assert timeline['dropped_live_groups'] == 0 and len(timeline['live_groups']) == groups
+    batch_ids = [(b['epoch'], b['sequence']) for g in timeline['live_groups'] for b in g['batches']]
+    assert len(batch_ids) == len(set(batch_ids)) == len(records)
+    assert set(batch_ids) == {(r['batch']['epoch'], r['batch']['sequence']) for r in records}
+    wall = max(int(r['completed_ns']) for r in samples) - min(int(r['scheduled_ns']) for r in samples)
+    write_ns, wal_bytes = counters['leased_write_ns'], counters['leased_bytes']
+    expected.update(groups=groups, io_samples=writes, skip_markers=skips,
+                    puts_per_group=len(samples) / groups, wall_ns=wall,
+                    group_period_ms=wall / groups / 1e6, mean_leased_write_ms=write_ns / writes / 1e6,
+                    group_mib=wal_bytes / groups / 1048576,
+                    leased_mib_s=wal_bytes / 1048576 * 1e9 / wall,
+                    payload_mib_s=sum(int(r['bytes']) for r in samples) / 1048576 * 1e9 / wall,
+                    active_write_gib_s=wal_bytes / 1073741824 * 1e9 / write_ns,
+                    write_busy_pct=100 * write_ns / wall)
+    with (raw['samples.csv'].parents[4] / 'output/puts.csv').open(newline='') as stream:
+        metadata, = [r for r in csv.DictReader(stream) if r['case_id'] == derived['case_id']]
+    expected['callers'] = int(metadata['concurrency'])
+    expected['serial_preparation_ms'] = expected['callers'] * expected['preparation_us'] / 1000
+    for name, value in expected.items():
+        assert math.isclose(derived[name], value, rel_tol=1e-12, abs_tol=1e-12), (name, derived[name], value)
+    assert math.isclose(sum(expected[key + '_share'] for key in (*intervals, 'other')), 100)
+    return dict(values=len(expected), samples=len(records), groups=groups, io_samples=writes,
+                mean_total_us=expected['mean_total_us'], other_share=expected['other_share'])
+
+
+def check_benchmark_plan():
+    plan = json.loads((HERE / 'contract-benchmark-plan.json').read_text())
+    source = Path(plan['source_path']).read_text()
+    assert plan['source_excerpt'] in source and plan['matrix_evidence'] in source
+    correction = plan['call_count_correction']
+    assert correction in source
+    assert plan['run_a_put_calls'] == int(re.search(r'([\d,]+) measured calls', correction)[1].replace(',', '')) == 4096
+    read_counts = tuple(int(n.replace(',', '')) for n in
+                        re.search(r'memory reads ([\d,]+); 1 KiB device reads ([\d,]+); 64 KiB device reads ([\d,]+)', correction).groups())
+    assert tuple(plan[k] for k in ('run_a_memory_read_calls', 'run_a_device_1k_calls',
+                                  'run_a_device_64k_calls')) == read_counts == (8192, 2048, 4096)
+    rows = {int(i): int(count) for i, count in
+            re.findall(r'^\| (\d+) \| G21[WRN] \| (\d+) \|', plan['source_excerpt'], re.M)}
+    assert sum(rows.values()) == plan['run_a_cases'] == 34
+    assert plan['run_a_w'] == sum(rows[i] for i in range(1, 6)) == 16
+    assert plan['run_a_r'] == rows[6] + rows[7] == 8
+    assert plan['run_a_n'] == sum(rows[i] for i in (8, 9, 10)) == 10
+    assert plan['run_a_vms'] == 2 and plan['run_a_sui_cells'] == 4
+    assert plan['run_b_vms'] == 6 and plan['run_b_storage_hosts'] == 5
+    assert plan['run_a_leased_puts'] == rows[1] + rows[2]
+    assert (plan['run_a_sustained'], plan['run_a_timelines'], plan['run_a_rpc']) == (rows[3], rows[4], rows[5])
+    assert plan['matrix_sha256'] == 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208'
+    assert plan['matrix_sha256'] in (HERE / 'acknowledgement-contracts.tex').read_text()
+    return dict(run_a_cases=plan['run_a_cases'], matrix_sha256=plan['matrix_sha256'],
+                status='planned, not run')
+
+
 def check_contracts(pdf_text):
     manifest = json.loads((HERE / 'contract-inputs.json').read_text())
     for filename, wanted in manifest['sources'].items():
@@ -23,6 +111,8 @@ def check_contracts(pdf_text):
     with (HERE / 'contract-values.csv').open(newline='') as stream:
         values = list(csv.DictReader(stream))
     assert len({r['label'] for r in values}) == len(values)
+    stage_checks = check_stage_values()
+    plan_checks = check_benchmark_plan()
     originals = {}
     for value in values:
         path = Path(value['source'])
@@ -44,7 +134,8 @@ def check_contracts(pdf_text):
     indexed = {r['label']: r for r in values}
     checked = []
     for filename in ('contract-results.tex', 'tab-contract-a.tex', 'tab-contract-b-controls.tex',
-                     'tab-contract-indicative.tex'):
+                     'tab-contract-indicative.tex', 'contract-stages.tex', 'tab-contract-stages.tex',
+                     'acknowledgement-contracts.tex'):
         source = (HERE / filename).read_text()
         for key in re.findall(r'\\N\{(B:contract-values:[^{}]+)\}', source):
             bare, _, fmt = key.partition('|')
@@ -102,8 +193,8 @@ def check_contracts(pdf_text):
                    'No ranking follows', 'device sync not verified', 'No Sui replay result on hardware'):
         assert phrase in normalized, phrase
     return dict(pass_check=True, numeric_occurrences=len(checked), source_linked_values=len(values),
-                sources=len(manifest['sources']), claims=checked,
-                scope='same-fleet Class A pairs; separate B controls; one explicitly non-ranking historical scale table')
+                sources=len(manifest['sources']), claims=checked, stages=stage_checks, plan=plan_checks,
+                scope='retained A/B labels map to P/S; measured stage intervals; planned S/P/W benchmark map')
 
 
 if __name__ == '__main__':

@@ -43,6 +43,41 @@ class NvmeDeploymentContract(unittest.TestCase):
             TH_DEFAULT_VALUE_CACHE_SIZE='1000', SUI_TH_READ_PROFILE_LIMIT='0',
             SUI_TH_NATIVE_WRITE_PROFILE_LIMIT='0'))
 
+    def test_frozen_producer_environment_overrides_both_measured_contracts(self):
+        non_layout_tuning = {
+            'TH_DEFAULT_MAX_DIRTY_KEYS', 'TH_DEFAULT_VALUE_CACHE_SIZE',
+        }
+        # The frozen producer shape_v2.yaml files put max_dirty_keys (null/2048)
+        # and value_cache_size (0/1000) under config, not in the key layout.
+        # key_shape.rs:272-276 rejects only mutexes, key_type and key_indexing.
+        # These two tuning overrides cannot cause that layout mismatch.
+        # Every other TH_DEFAULT_* key must be frozen; new keys fail this gate
+        # until they have been classified.
+        frozen = run.checkpoint.source_environment({})
+        inherited = {
+            'TH_DEFAULT_MUTEX_COUNT': '256',
+            'TH_DEFAULT_UNCLASSIFIED': 'must not reach the producer',
+            'TH_FRAG_SIZE': '1',
+            'TH_SYNC_WRITES': 'true',
+        }
+        with patch.dict(os.environ, inherited):
+            for contract in ('harness', 'original_default'):
+                with self.subTest(contract=contract):
+                    measured = run.replay_environment(os.environ, contract, 0, 0)
+                    # Capture the real Owned.spawn merge, not a test-side copy.
+                    with patch.object(run.build, 'OwnedProcess') as spawn:
+                        owned = run.Owned(Path('.'), measured)
+                        owned.spawn(['producer'], subprocess.DEVNULL, subprocess.DEVNULL, frozen)
+                    producer = spawn.call_args.kwargs['env']
+                    self.assertEqual(producer['TH_DEFAULT_MUTEX_COUNT'], '1')
+                    self.assertEqual(producer['TH_FRAG_SIZE'], '33554432')
+                    self.assertEqual(producer['TH_SYNC_WRITES'], 'false')
+                    self.assertNotIn('TH_DEFAULT_UNCLASSIFIED', producer)
+                    for key, value in producer.items():
+                        if key.startswith('TH_DEFAULT_') and key not in non_layout_tuning:
+                            self.assertIn(key, frozen)
+                            self.assertEqual(value, frozen[key])
+
     def test_external_host_validation(self):
         transport = {'kind': 'tcp'}
         hosts = [f'10.0.0.{i}' for i in range(1, 6)]

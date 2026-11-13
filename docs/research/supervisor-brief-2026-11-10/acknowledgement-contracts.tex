@@ -1,67 +1,83 @@
 \section{Acknowledgement contracts}\label{sec:ack}
-\textbf{Read the acknowledgement class before comparing stores.} The original
-Tidehunter paper, \href{https://arxiv.org/abs/2602.01873v2}{arXiv:2602.01873v2},
+\begingroup\small
+The original Tidehunter paper, \href{https://arxiv.org/abs/2602.01873v2}{arXiv:2602.01873v2},
 Section 3.1, states: ``Writes complete without waiting for fsync''.
-The write reaches the operating-system page cache and survives an application
-crash. An acknowledgement does not establish survival of a kernel crash or
-power loss. The paper relies on background fsync for kernel-crash durability;
-applications that need a stronger guarantee can call explicit flush.
+Its page-cache acknowledgement survives an application crash, not an immediate
+kernel crash or power loss. Background fsync provides eventual kernel-crash
+durability; explicit flush supports stronger needs. \texttt{wal\_replay}
+selects recovery history, not the acknowledgement contract.
 
-\begin{description}
-\item[Class A: page-cache acknowledgement.] No sync is required before the
-reply. This is the paper's default contract. In these benchmarks, it is
-Native \texttt{page\_cache} and owner \texttt{native}, including the new leased
-NVMe-oF route. The owner tier name \texttt{native} does not mean the in-process
-Native backend. \texttt{wal\_replay} selects recovery history; it does not
-change the acknowledgement class.
-\item[Class B: synced before acknowledgement.] The reply waits for the
-configured sync or commit barrier. Benchmarked settings are Tidehunter
-\texttt{synchronous} (covering fdatasync), Native
-\texttt{value\_wal\_barrier} (per-put file and directory fsync), Native grouped
-barrier, Valkey \texttt{appendfsync always}, Kvrocks synced WAL, and Garnet
-commit-wait. Sync scope and sharing still differ. This class records the
-acknowledgement setting, not a proof of equal crash recovery or power-loss
-survival.
-\item[Device sync not verified.] Cassandra, TiKV and FoundationDB retain this
-status. They are not verified Class B members and must not be used to infer
-Class A performance either.
-\end{description}
+\textbf{Binding classes.} The new plan uses S, P and W. Retained figures use
+Class B for S and Class A for P; their values do not change.
+\begin{center}
+\begin{tabular}{L{.08\linewidth}L{.31\linewidth}L{.53\linewidth}}\toprule
+Class & Reply condition & Store membership and settings\\\midrule
+S & Synced before acknowledgement & TideHunter \texttt{synchronous}; Native \texttt{value\_wal\_barrier}; Valkey \texttt{always}; Kvrocks synced WAL; Garnet commit-wait. Cassandra, TiKV and FoundationDB: S intent, device sync not verified.\\
+P & Write in the storage host's OS page cache & TideHunter \texttt{native}; Native \texttt{page\_cache}; Kvrocks \texttt{rocksdb.write\_options.sync no}, source-confirmed, not measured.\\
+W & Reply can precede the kernel write & Valkey \texttt{os\_buffered} (\texttt{appendfsync no}) and \texttt{periodic\_sync} (\texttt{everysec}); both weaker than P, not measured.\\\bottomrule
+\end{tabular}
+\end{center}
+Valkey has no exact P mode: \texttt{no} does not guarantee the AOF write before
+every reply; \texttt{everysec} can retain writes in user space during fsync.
+Sources: Valkey \texttt{fe8d406c}, \texttt{server.c:1898--1928},
+\texttt{aof.c:1194--1218}, and its \href{https://valkey.io/topics/latency/}{latency documentation}.
+Kvrocks keeps RocksDB's \texttt{manual\_wal\_flush=false}; see
+\href{https://github.com/facebook/rocksdb/wiki/Basic-Operations}{Non-sync Writes}.
+No external P or W performance data exists yet. S is the cross-store headline;
+P is the Sui-contract comparison; W is weaker context beside P, never a ranking.
+Reads state memory or device service; Valkey GET is memory only. Sync mechanics
+and crash guarantees still differ within S.
 
-\textbf{Coverage.} The retained cross-store comparisons use Class B settings
-where verified. Class A cross-store data for external stores does not exist
-yet. The grey Native Class A curves and historical page-cache rows are
-separate references, not Class B competitors; their values are retained for
-continuity. Never infer a ranking by comparing the two classes. The one
-indicative scale table in Section~\ref{sec:indicative} is explicitly not a
-fair comparison.
+\textbf{Objectives.} O1: fill the new design's missing S cells at sixteen callers
+and sustained puts. O2: first hardware Sui replay under S and P. O3: explain
+the large-value put gap from existing stages and Run A diagnosis. O4: same-fleet,
+same-topology S/P comparisons with W context. O5: five-owner new-design results.
 
-\textbf{External settings are not a binary switch.} Valkey has three relevant
-settings: synced \texttt{always} (measured); periodic sync
-\texttt{everysec} (not measured); and OS-buffered, no fsync
-(\texttt{appendfsync no}, not measured). Neither of the latter settings
-is an exact page-cache equivalent; both are weaker than Tidehunter's
-process-crash contract. Periodic sync can retain AOF writes in user space
-while a background fsync runs
-(\href{https://valkey.io/topics/latency/}{Valkey latency documentation}).
-The pinned Valkey source also does not guarantee AOF write completion before
-every reply in \texttt{no} mode: write errors are not fatal outside
-\texttt{always}, and later replies in the same loop are not covered.
-Source: Valkey commit \texttt{fe8d406c}, \texttt{server.c:1898--1928} and
-\texttt{aof.c:1194--1218}. Kvrocks \texttt{rocksdb.write\_options.sync no}
-is source-confirmed as a page-cache acknowledgement, but not measured.
-Kvrocks keeps RocksDB's default \texttt{manual\_wal\_flush=false}; non-sync
-WAL writes reach the OS buffer before return. See RocksDB's
-\href{https://github.com/facebook/rocksdb/wiki/Basic-Operations}{Basic Operations},
-``Non-sync Writes''. There is still no external Class A performance data.
+\textbf{Run A: planned, not run.} \N{B:contract-values:plan-run_a_vms:value|.0f} VMs,
+one coordinator and one owner; focused package, TideHunter and Native only.
+Selection \texttt{nvmeof\_contracts}: \N{B:contract-values:plan-run_a_cases:value|.0f} KV cases
+(G21W/G21R/G21N: \N{B:contract-values:plan-run_a_w:value|.0f}/\N{B:contract-values:plan-run_a_r:value|.0f}/\N{B:contract-values:plan-run_a_n:value|.0f}).
+\begin{center}
+\begin{tabular}{lrL{.52\linewidth}}\toprule
+Arm / class & Cases & Coverage and objective\\\midrule
+Leased NVMe-oF, S and P & \N{B:contract-values:plan-run_a_leased_puts:value|.0f} & Put core shapes; O1\\
+Leased NVMe-oF, S and P & \N{B:contract-values:plan-run_a_sustained:value|.0f} & Sustained puts; O1\\
+Leased NVMe-oF, S and P & \N{B:contract-values:plan-run_a_timelines:value|.0f} & Large-value timeline copies; O3\\
+Owner RPC verbs, S & \N{B:contract-values:plan-run_a_rpc:value|.0f} & Put core shapes; O1 route control\\
+Live reads, S preparation & \N{B:contract-values:plan-run_a_r:value|.0f} & Core shapes from memory and device; O1\\
+Native S/P puts and memory reads & \N{B:contract-values:plan-run_a_n:value|.0f} & Same-fleet references\\\bottomrule
+\end{tabular}
+\end{center}
+Core shapes: put/read, 1/64 KiB, 1/16 callers. Run A calls:
+puts \N{B:contract-values:plan-run_a_put_calls:value|,.0f};
+memory reads \N{B:contract-values:plan-run_a_memory_read_calls:value|,.0f};
+device reads \N{B:contract-values:plan-run_a_device_1k_calls:value|,.0f} at 1 KiB,
+\N{B:contract-values:plan-run_a_device_64k_calls:value|,.0f} at 64 KiB.
+Sustained: 200,000 puts, 1 KiB, sixteen callers. Matrix SHA-256:
+\path{cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208}.
+Then \N{B:contract-values:plan-run_a_sui_cells:value|.0f} Sui cells: owner RPC verbs and
+live NVMe-oF, each under \texttt{original\_default} (P) and \texttt{harness} (S).
+Each requires Native/remote replay, equal checkpoint digest and state audit.
+Remote: \texttt{wal\_replay}; leased: lease-ahead, no write polling.
 
-\textbf{Reads.} A read has no write acknowledgement. A read caption's class
-names the database's write/preparation setting only. Cache state, read route
-and device qualification remain separate requirements. In particular, Valkey
-GET reads RAM. A Class B setup does not make a read SSD-served.
-
-\textbf{Current evidence gaps.} No Sui replay result completed on hardware.
-The new design has no synchronous-tier put result at sixteen callers and no
-five-owner run. No external-store Class A arm was measured. Laptop checks
-are functional evidence only, not performance evidence. Later one-owner
-results below do not replace the historical cross-store values or prove
-five-owner scale-out.
+\textbf{Run B: planned, not run.} \N{B:contract-values:plan-run_b_vms:value|.0f} VMs,
+one client/coordinator plus \N{B:contract-values:plan-run_b_storage_hosts:value|.0f} storage hosts;
+full package. Core shapes and sustained puts; two repetitions. Reads run once
+per store under S, not once per write contract.
+\begin{center}
+\begin{tabular}{L{.48\linewidth}L{.42\linewidth}}\toprule
+Store / route & Planned arms\\\midrule
+TideHunter leased NVMe-oF, five owners & \texttt{synchronous} (S), \texttt{native} (P)\\
+TideHunter owner RPC verbs, five owners & \texttt{synchronous} (S), \texttt{native} (P)\\
+Native, one process on coordinator SSD & \texttt{value\_wal\_barrier} (S), \texttt{page\_cache} (P)\\
+Valkey RDMA & \texttt{synced} (S), \texttt{os\_buffered}/\texttt{periodic\_sync} (W)\\
+Valkey TCP & \texttt{synced} (S)\\
+Kvrocks & \texttt{synced} (S), \texttt{page\_cache} (P)\\\bottomrule
+\end{tabular}
+\end{center}
+Native remains a one-SSD reference, not an equal-device-count competitor.
+Garnet, Cassandra, TiKV and FoundationDB are not rerun: no clean P mode is in
+this plan. Their S rows stay historical, on other fleets; device sync remains
+unverified for Cassandra, TiKV and FoundationDB. No Sui replay result on hardware
+exists yet. Both runs require new launch authorization; neither has run.
+\endgroup

@@ -645,11 +645,13 @@ class ReviewedSuiRuntimeTests(unittest.TestCase):
 
 
 class ReviewedCombinedRuntimeTests(ReviewedSuiRuntimeTests):
+    spec_name = 'sui_nvmeof_with_kv'
+
     def config(self):
         import copy
         import manual_sui
         config=super().config()
-        config['spec']=copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv'])
+        config['spec']=copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS[self.spec_name])
         config['spec']['sui_fixture'].update(key='fixture',generation='1')
         config['spec']['sui_verification']=dict(key='proof',generation='2',sha256='f'*64)
         return config
@@ -681,7 +683,8 @@ class ReviewedCombinedRuntimeTests(ReviewedSuiRuntimeTests):
             if failed:
                 controller.run.side_effect=RuntimeError('KV exception')
             else:
-                controller.run.return_value=dict(complete=False,planned_cases=12,completed_cases=11)
+                controller.run.return_value=dict(complete=False,planned_cases=config['spec']['job_count'],
+                                                 completed_cases=config['spec']['job_count']-1)
             with self.subTest(failed=failed), patch.object(runtime,'validate_runtime'), \
                  patch('gcp_worker.identify',return_value={'index':0}), \
                  patch.object(runtime,'RemoteMailbox'), patch.object(runtime,'_controller_config',return_value={}), \
@@ -698,6 +701,10 @@ class ReviewedCombinedRuntimeTests(ReviewedSuiRuntimeTests):
                     self.assertFalse(result['kv']['complete'])
                     self.assertTrue(result['sui']['complete'])
                     sui.assert_called_once()
+
+
+class ReviewedContractsRuntimeTests(ReviewedCombinedRuntimeTests):
+    spec_name = 'sui_nvmeof_with_contracts'
 
 
 if __name__ == '__main__':

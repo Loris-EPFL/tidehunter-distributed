@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Build contract-separated tables from retained cloud CSVs. Launches nothing."""
+from collections import Counter
 import csv
 import hashlib
 import json
+import re
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +47,121 @@ def table(name, headers, body, columns):
     text += [' & '.join(row) + r'\\' for row in body]
     text += [r'\bottomrule\end{tabular}']
     (HERE / name).write_text('\n'.join(text) + '\n')
+
+
+def stage_finding():
+    case_id = 'G20W-r0-fb6fb99bf8a683e8fbf4'
+    root = RUNS['combined'].parent / 'report-root/cases' / case_id / 'result'
+    paths = {name: root / name for name in
+             ('write-timeline.json', 'measurement-read-evidence.json', 'samples.csv')}
+    for path in paths.values():
+        SOURCES[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    timeline = json.loads(paths['write-timeline.json'].read_text())['timeline']
+    records = timeline['records']
+    samples = [r for r in rows(paths['samples.csv']) if r['phase'] == 'measurement']
+    assert len(records) == len(samples) == 4096
+    assert {r['caller_sample_id'] for r in records} == {int(r['caller_sample_id']) for r in samples}
+    assert all(r['completed'] and r['error'] is None for r in records)
+    assert all(r['operation'] == 'put' and r['outcome'] == 'success' for r in samples)
+    spans = Counter()
+    for record in records:
+        events = record['events']
+        assert events[0]['stage'] == 'caller_start' and events[-1]['stage'] == 'caller_finished'
+        for first, last in zip(events, events[1:]):
+            delta = last['elapsed_ns'] - first['elapsed_ns']
+            assert delta >= 0
+            spans[first['stage'], last['stage']] += delta
+    pairs = {
+        'queued': ('owner_enqueue_started', 'owner_dequeued'),
+        'preparation': ('owner_dequeued', 'prepared'),
+        'append_wait': ('admitted', 'append_enqueue_started'),
+        'live_io': ('live_io_started', 'live_io_completed'),
+    }
+    assert all(pair in spans for pair in pairs.values())
+    total_ns = sum(spans.values())
+    metrics = dict(case_id=case_id, operation='put', samples=len(records),
+                   mean_total_us=total_ns / len(records) / 1000,
+                   sources={name: str(path) for name, path in paths.items()})
+    for name, pair in pairs.items():
+        metrics[name + '_us'] = spans[pair] / len(records) / 1000
+        metrics[name + '_share'] = 100 * spans[pair] / total_ns
+    other_ns = total_ns - sum(spans[pair] for pair in pairs.values())
+    metrics.update(other_us=other_ns / len(records) / 1000,
+                   other_share=100 * other_ns / total_ns, total_share=100)
+    counters = json.loads(paths['measurement-read-evidence.json'].read_text())['live_nvmeof']['counters']
+    io_samples, write_ns, wal_bytes = (counters[key] for key in
+                                      ('leased_write_samples', 'leased_write_ns', 'leased_bytes'))
+    groups = counters['leased_frames']
+    skips = counters['leased_skip_markers']
+    assert io_samples == groups + skips
+    assert timeline['dropped_live_groups'] == 0 and len(timeline['live_groups']) == groups
+    batch_id = lambda batch: (batch['epoch'], batch['sequence'])
+    covered = [batch_id(batch) for group in timeline['live_groups'] for batch in group['batches']]
+    assert len(covered) == len(set(covered)) == len(records)
+    assert set(covered) == {batch_id(record['batch']) for record in records}
+    wall_ns = max(int(r['completed_ns']) for r in samples) - min(int(r['scheduled_ns']) for r in samples)
+    metrics.update(groups=groups, io_samples=io_samples, skip_markers=skips,
+                   puts_per_group=len(samples) / groups,
+                   wall_ns=wall_ns, group_period_ms=wall_ns / groups / 1e6,
+                   mean_leased_write_ms=write_ns / io_samples / 1e6,
+                   group_mib=wal_bytes / groups / 2**20,
+                   leased_mib_s=wal_bytes / 2**20 / (wall_ns / 1e9),
+                   payload_mib_s=sum(int(r['bytes']) for r in samples) / 2**20 / (wall_ns / 1e9),
+                   active_write_gib_s=wal_bytes / 2**30 / (write_ns / 1e9),
+                   write_busy_pct=100 * write_ns / wall_ns)
+    metadata = one(rows(RUNS['combined'] / 'puts.csv'), case_id=case_id)
+    metrics['callers'] = int(metadata['concurrency'])
+    metrics['serial_preparation_ms'] = metrics['callers'] * metrics['preparation_us'] / 1000
+    output = HERE / 'contract-stage-metrics.json'
+    output.write_text(json.dumps(metrics, indent=2) + '\n')
+    SOURCES[str(output)] = hashlib.sha256(output.read_bytes()).hexdigest()
+    for column, value in metrics.items():
+        if isinstance(value, (int, float)):
+            number('stage', metrics, column, output)
+    labels = [('queued', r'\texttt{owner\_enqueue\_started} $\to$ \texttt{owner\_dequeued}'),
+              ('preparation', r'\texttt{owner\_dequeued} $\to$ \texttt{prepared}'),
+              ('append_wait', r'\texttt{admitted} $\to$ \texttt{append\_enqueue\_started}'),
+              ('live_io', r'\texttt{live\_io\_started} $\to$ \texttt{live\_io\_completed}'),
+              ('other', 'All other consecutive intervals')]
+    body = [[label, number('stage', metrics, name + '_us', output),
+             number('stage', metrics, name + '_share', output)] for name, label in labels]
+    body.append(['Total', number('stage', metrics, 'mean_total_us', output),
+                 number('stage', metrics, 'total_share', output)])
+    table('tab-contract-stages.tex', ['Coordinator-clock interval', r'Mean \us/call', r'Share (\%)'], body, 'lrr')
+
+
+def benchmark_plan():
+    path = Path('/home/hybr1d/.omp/agent/sessions/-Desktop-PDM-TideHunter/2026-11-06T09-38-13-397Z_01a1b039-1515-7107-8399-311b4ae17312/local/fair-contract-benchmarks-plan.md')
+    source = path.read_text()
+    excerpt = source.split('## Contract classes (binding definitions)\n', 1)[1].split('\n## Approach', 1)[0]
+    counts = {int(i): int(n) for i, n in re.findall(r'^\| (\d+) \| G21[WRN] \| (\d+) \|', excerpt, re.M)}
+    assert len(counts) == 10
+    matrix_line = next(line for line in source.splitlines() if '`nvmeof_contracts` SHA-256 `' in line)
+    matrix_hash = re.search(r'SHA-256 `([a-f0-9]{64})`', matrix_line)[1]
+    correction = next(line for line in source.splitlines() if line.startswith('- Correction of "core shapes'))
+    put_calls = int(re.search(r'([\d,]+) measured calls', correction)[1].replace(',', ''))
+    read_calls = [int(value.replace(',', '')) for value in
+                  re.search(r'memory reads ([\d,]+); 1 KiB device reads ([\d,]+); 64 KiB device reads ([\d,]+)', correction).groups()]
+    a_vms = int(re.search(r'### Run A: (\d+) VMs', excerpt)[1])
+    b_vms, storage = map(int, re.search(r'### Run B: (\d+) VMs \(1 client/coordinator \+ (\d+) storage hosts\)', excerpt).groups())
+    config = dict(source_path=str(path), source_excerpt=excerpt, matrix_evidence=matrix_line,
+                  matrix_sha256=matrix_hash, run_a_vms=a_vms, run_a_cases=sum(counts.values()),
+                  run_a_w=sum(counts[i] for i in range(1, 6)), run_a_r=counts[6] + counts[7],
+                  run_a_n=sum(counts[i] for i in (8, 9, 10)), run_a_leased_puts=counts[1] + counts[2],
+                  run_a_sustained=counts[3], run_a_timelines=counts[4], run_a_rpc=counts[5],
+                  run_a_sui_cells=len(re.findall(r'\br0[1-4]\b', excerpt)),
+                  run_b_vms=b_vms, run_b_storage_hosts=storage)
+    config.update(call_count_correction=correction, run_a_put_calls=put_calls,
+                  run_a_memory_read_calls=read_calls[0], run_a_device_1k_calls=read_calls[1],
+                  run_a_device_64k_calls=read_calls[2])
+    assert config['run_a_cases'] == 34 and config['run_a_sui_cells'] == 4
+    assert matrix_hash == 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208'
+    output = HERE / 'contract-benchmark-plan.json'
+    output.write_text(json.dumps(config, indent=2) + '\n')
+    SOURCES[str(output)] = hashlib.sha256(output.read_bytes()).hexdigest()
+    for column, value in config.items():
+        if isinstance(value, int):
+            number('plan', config, column, output, '.0f')
 
 
 def main():
@@ -163,13 +280,17 @@ def main():
                                      number(row['case_id'], row, 'p50_us', RUNS['run13'] / 'reads.csv'),
                                      'B setup; run13', old_value])
     table('tab-contract-indicative.tex', ['Call / TH path', 'KiB', '$c$', r'New TH p50 \us', 'TH contract / run', r'Historical Valkey B p50 \us'], body, 'lrrlll')
+    stage_finding()
+    benchmark_plan()
 
     with (HERE / 'contract-values.csv').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=list(VALUES[0]))
         writer.writeheader()
         writer.writerows(VALUES)
     outputs = {name: hashlib.sha256((HERE / name).read_bytes()).hexdigest() for name in
-               ('contract-values.csv', 'tab-contract-a.tex', 'tab-contract-b-controls.tex', 'tab-contract-indicative.tex')}
+               ('contract-values.csv', 'tab-contract-a.tex', 'tab-contract-b-controls.tex',
+                'tab-contract-indicative.tex', 'tab-contract-stages.tex',
+                'contract-stage-metrics.json', 'contract-benchmark-plan.json')}
     (HERE / 'contract-inputs.json').write_text(json.dumps(dict(sources=SOURCES, outputs=outputs), indent=2) + '\n')
     print('Contract tables:', len(VALUES), 'source-linked numeric cells')
 

@@ -32,8 +32,9 @@ PROFILE_COUNTERS = {'lease_reserve_ns': 'lease_profile_samples',
                     'adopt_close_scan_bytes': 'adopt_profile_samples'}
 RESULTS += tuple(name + '_mean' for name in PROFILE_COUNTERS) + (
     'lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits')
-RESULTS += ('first_call_us',)
+RESULTS += ('first_call_us', 'contract_class')
 STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
+STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share')
 
 
 def load(path):
@@ -43,6 +44,10 @@ def load(path):
 def contract(job):
     tier = job.get('native_durability' if job.get('backend') == 'native' else 'durability_tier', MISSING)
     return 'page_cache' if tier in ('native', 'page_cache') else 'durable' if tier in ('synchronous', 'value_wal_barrier') else tier
+
+
+def contract_class(job):
+    return {'durable': 'S', 'page_cache': 'P'}.get(contract(job))
 
 
 def operation(job):
@@ -132,6 +137,7 @@ def result_row(case, export):
                media_expected=j.get('media', {}).get('expected'), keys=j.get('keys'), read_lanes=None if native else j.get('read_lanes'),
                io_queues=j.get('live_io_queues'), queue_size=j.get('live_io_queue_size'), poll_queues=j.get('live_poll_queues'), inline_reads=j.get('live_inline_reads'),
                diagnostic='sustained' if j.get('measurement_operations') == 200000 else 'history diagnostics' if j.get('owner_history_diagnostics') else None)
+    row['contract_class'] = contract_class(j)
     row.update(history_persistence=None if native else j.get('history_persistence', 'on_disk'),
                lease_ahead=j.get('live_lease_ahead', True) if live(j) else None,
                polled_writes=j.get('live_polled_writes', False) if live(j) else None)
@@ -299,6 +305,38 @@ def floors(cases, export):
     return rows
 
 
+def stage_rows(case):
+    """Decompose complete captured calls into adjacent coordinator intervals."""
+    case = Path(case)
+    timeline = load(case / 'result' / 'write-timeline.json').get('timeline') or {}
+    calls = []
+    pairs = {}
+    total_ns = 0
+    for record in timeline.get('records', []):
+        events = record.get('events', [])
+        if not events or events[0]['stage'] != 'caller_start' or events[-1]['stage'] != 'caller_finished':
+            continue
+        durations = {}
+        for start, end in zip(events, events[1:]):
+            elapsed = end['elapsed_ns'] - start['elapsed_ns']
+            if elapsed < 0:
+                raise ValueError('write timeline events are not in clock order')
+            pair = start['stage'] + ' -> ' + end['stage']
+            pairs.setdefault(pair, None)
+            durations[pair] = durations.get(pair, 0) + elapsed
+        calls.append(durations)
+        total_ns += events[-1]['elapsed_ns'] - events[0]['elapsed_ns']
+    rows = []
+    for pair in pairs:
+        values = [call.get(pair, 0) for call in calls]
+        total = sum(values)
+        rows.append(dict(case_id=case.name, stage_pair=pair,
+                         mean_us=total / len(calls) / 1000,
+                         p50_us=analyze.quantile(values, .5) / 1000,
+                         share=total / total_ns if total_ns else None))
+    return rows
+
+
 def generate(export=None, report=None, output=None, matrix=None, settings_only=False):
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     source = Path(matrix) if matrix else Path(export) / 'matrix.json'
@@ -309,7 +347,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -322,7 +360,11 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
     lines.extend(['', *STATEMENTS, '', 'Matrix input accepts a job list or a wrapper with a `jobs` list.', '',
                   'The source tree retains the value-cache refill correctness fix and lock/shutdown ordering fixes. The buffered file read does not zero its buffer, as in the original engine. WAL and index formats are unchanged.',
                   'The live route preallocates WAL files; the original engine uses sparse files. The synchronous tier is outside the paper page-cache contract.', ''])
-    leased_ab._table(lines, 'Settings', SETTINGS, setting_rows)
+    for label, acknowledgement in (('S — synced', 'durable'), ('P — page cache', 'page_cache'),
+                                    ('not applicable', 'not applicable'), ('unknown', MISSING)):
+        members = [row for row in setting_rows if row['acknowledgement contract'] == acknowledgement]
+        if members:
+            leased_ab._table(lines, 'Settings — ' + label, SETTINGS, members)
     write_csv(output / 'settings.csv', SETTINGS, setting_rows)
     (output / 'nvmeof_path.md').write_text('\n'.join(lines))
     if errors:
@@ -344,15 +386,25 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
-    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W') and r['operation'] in ('put', 'put_batch')]
-    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R') and r['operation'] in ('read', 'get_many')]
+    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W') and r['operation'] in ('put', 'put_batch')]
+    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']
     write_csv(output / 'stalls.csv', STALL_FIELDS,
               [row for case in cases for row in stall_rows(case, export)])
+    write_csv(output / 'stages.csv', STAGE_FIELDS,
+              [row for case in cases for row in stage_rows(export / 'cases' / case['case_id'])])
+    lines.append('Stages use complete captured coordinator calls. Missing adjacent pairs contribute zero per call; their shares use the mean captured call duration.')
     for name, entries in tables.items():
         fields = tuple(dict.fromkeys(k for r in entries for k in r)) if name == 'floors' and entries else RESULTS
         write_csv(output / (name + '.csv'), fields, entries)
-        leased_ab._table(lines, name.replace('_', ' ').title(), fields, entries)
+        if name == 'floors':
+            leased_ab._table(lines, name.title(), fields, entries)
+        else:
+            for label in ('S', 'P', None):
+                members = [row for row in entries if row['contract_class'] == label]
+                if members:
+                    leased_ab._table(lines, name.replace('_', ' ').title() + ' — class ' + (label or 'unknown'),
+                                     fields, members)
     (output / 'nvmeof_path.md').write_text('\n'.join(lines))
     return rows
 

@@ -1,0 +1,259 @@
+{
+  "scope": "docs/research/supervisor-brief-2026-11-10/**",
+  "inventory": "Files written/regenerated since the first T6 source edit; byte-identical regenerated outputs included; no Git diff used.",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "008ea2e70bd1beca3951dec1ecb06c0a3896971a25792ff31327b44a47521369"
+    },
+    {
+      "path": "acknowledgement-contracts.tex",
+      "sha256": "5894f5e80fb5e0fac270401f4280576d9aa0b8df63ceaa36d79b505e4d79b947"
+    },
+    {
+      "path": "appendix-tables.tex",
+      "sha256": "2032af75afc87d405912b8ce6b483a1445bf92dd414df0c4ba1483c7d92c9c4a"
+    },
+    {
+      "path": "build-output.txt",
+      "sha256": "b2148034de2cc0bad705b532c1a21e122465c91cc10d058de6be01ae22cd2cfb"
+    },
+    {
+      "path": "build_contract_inputs.py",
+      "sha256": "f786bd7f9af3c1618756cedafebccc752c465bb7bf13a7c6acdbfaa87c11bbd1"
+    },
+    {
+      "path": "contract-benchmark-plan.json",
+      "sha256": "717d338b07a1b46a73ee1f7c3f7e26ff127107deaab9fc320be82043400bb84d"
+    },
+    {
+      "path": "contract-inputs.json",
+      "sha256": "8666b81f929f5c5eb74263c42949fffab1c95b4ae17cf0e053525bae8fa6ea63"
+    },
+    {
+      "path": "contract-results.tex",
+      "sha256": "ea4d27f174748952e915d37b932cd053638878a057f75013da525e20004a9fd0"
+    },
+    {
+      "path": "contract-stage-metrics.json",
+      "sha256": "ff2347cf48225072580a629a580bc8c28c888def27ef4c07e62363c8fc54cde1"
+    },
+    {
+      "path": "contract-stages.tex",
+      "sha256": "48a04ae6a7c24b95038eb54168dafabde4c56ba9e111f46c427b217ce76a7071"
+    },
+    {
+      "path": "contract-validation.json",
+      "sha256": "aa5fc77460af23e7b0a36279647368f9dfad356d51fc74804d84f64a26f56c71"
+    },
+    {
+      "path": "contract-values.csv",
+      "sha256": "e99f0fa01d198f9150539f60186e5b26918d7b9733d42a5d7eb08a6013cee487"
+    },
+    {
+      "path": "macros.tex",
+      "sha256": "c001632d36cde9c390a5a849fea6335d1ff90d8e0416c315560e8e01f60bf7cc"
+    },
+    {
+      "path": "main.aux",
+      "sha256": "c39f32a53c6c5d3f8fcbafd87bdbf7047bad1b11e77d23832697710ea932cadf"
+    },
+    {
+      "path": "main.fdb_latexmk",
+      "sha256": "178c84d46e1acf2cf1a858a9b5a8865bc260f3d63b34e6618dc4811b00f7668d"
+    },
+    {
+      "path": "main.fls",
+      "sha256": "6656487a6e0ba1b0d8e6c17687ccc16f90d27bf50bbf8e47d3fb34d60fcdb306"
+    },
+    {
+      "path": "main.log",
+      "sha256": "f650208813523d9c8ed876936946eea7399adfe5b66bf8bbae8fd00dd09c3e57"
+    },
+    {
+      "path": "main.out",
+      "sha256": "7bb120d97cd6ea687cb53352a94c9da8cd708204ed137fe432622b7d58daa9d9"
+    },
+    {
+      "path": "main.pdf",
+      "sha256": "2f77e1698aad5b0776342baa91d86b26f8bc5c8951f8f3fcfe87dfce405b5fa8"
+    },
+    {
+      "path": "main.txt",
+      "sha256": "7f552a67bad55155f5d4baa894541a5cd41ff8e27cdbf80e1130eb1f4c127eef"
+    },
+    {
+      "path": "numbers.tex",
+      "sha256": "bfbef6422a64fbc00240a0a899b9e5186a9cb6cc3bdd6230f7eda21eaa359225"
+    },
+    {
+      "path": "rendered/t6-02.png",
+      "sha256": "8e80417903efb326094684f6e4e68208257e34c7c96bf5f980200ba6ca32429b"
+    },
+    {
+      "path": "rendered/t6-28.png",
+      "sha256": "397df348106182f185fabdee0f2632652523c9536c4896bbb590a6f64122a366"
+    },
+    {
+      "path": "rendered/t6-29.png",
+      "sha256": "85a7fe9405fc03583288bc5ddf7e10cd99686450285d5ca8baeb152649a915f3"
+    },
+    {
+      "path": "rwc/generated/validation-rwc.json",
+      "sha256": "95d7a02938825d1cd623f914b14805c10145ebf58e7131d1724904916ebe41a2"
+    },
+    {
+      "path": "rwc10/generated/validation-rwc10.json",
+      "sha256": "792bfbe5205f84e86c76a5ed4b040e1c2f156137dcde3fb52ea25b555af32535"
+    },
+    {
+      "path": "t6-source-pin-differences.json",
+      "sha256": "021c1930511681002d277d2252a29c6c89b290f959b3d2995339c5efbfefc98b"
+    },
+    {
+      "path": "t6-verification-output.txt",
+      "sha256": "c09cbfaabefc8f630bf1d6aabfa8661b319513e60c212b98986de1a3c6debfe0"
+    },
+    {
+      "path": "tab-batch.tex",
+      "sha256": "4b035a1f743022213d0a24c0548028b490b8288e58dbfd463d950e95140844a1"
+    },
+    {
+      "path": "tab-contract-a.tex",
+      "sha256": "e14b65ac82eb863774c75ef3d35980cd3cc8691fe3ad57fd5e98108ed134dcf2"
+    },
+    {
+      "path": "tab-contract-b-controls.tex",
+      "sha256": "76454d3661b96f77de178b3d34c73567d0f37305babcbaac47ff38ec75513019"
+    },
+    {
+      "path": "tab-contract-indicative.tex",
+      "sha256": "6cbffd95a4716985fedc9151ac39c549eb100906d2fdd063068fff5d28882d79"
+    },
+    {
+      "path": "tab-contract-stages.tex",
+      "sha256": "9750a93247a1db1f6ba08c65ad76609a4ec23f42778ee2a0aa349c29ba740f87"
+    },
+    {
+      "path": "tab-delete.tex",
+      "sha256": "97fd25c8f71116a406d417a76cabefc9ac0c9cf6f4180f60aea1d34eabbf0b7f"
+    },
+    {
+      "path": "tab-fair-native.tex",
+      "sha256": "66de0de239575c9272245c521049da0014793f844e7c9d4e93f2860389157922"
+    },
+    {
+      "path": "tab-hitratio.tex",
+      "sha256": "f66ac9860ea97704f894386dd7c62424fa6f16d8e65df11ebf4bf5d749d7e70d"
+    },
+    {
+      "path": "tab-local-structure.tex",
+      "sha256": "57333a80e9c0d3a015f54e9fc4c84d63e29d7938c52ac6f41e464202e385bd01"
+    },
+    {
+      "path": "tab-mem1.tex",
+      "sha256": "0cd8f2ec9d2956ff8428e7345fabbe9253a23e8d77df6f89f2826110e44aca15"
+    },
+    {
+      "path": "tab-mem64.tex",
+      "sha256": "0e3413552b6eeb2d4ae357d5becb38ab3881d551f870811424e0451b9bf4549b"
+    },
+    {
+      "path": "tab-network.tex",
+      "sha256": "1bf379ce2850ac6c8a1f059bd7b56a281bbbc2486aa009ba434f7cfa3fa9c3db"
+    },
+    {
+      "path": "tab-onekib-1.tex",
+      "sha256": "80a8fcea040c751ee16b1bb1bc5701426ee9a1f0b17a324e6dbcde922dfa82ea"
+    },
+    {
+      "path": "tab-onekib-2.tex",
+      "sha256": "dbb816ff8612e0acaa62244346873898fc0d3e6d36ad1ef5bf17fadc8689149c"
+    },
+    {
+      "path": "tab-owner-profile.tex",
+      "sha256": "91a52b47f800693635bdea3b84653f2623c6967fab49115f929d8f2fef837f7f"
+    },
+    {
+      "path": "tab-owner-stages.tex",
+      "sha256": "0abf588b7bf116a387a06a149690f8efb7a4e4dd6918805e58e4ae6c29afd8a9"
+    },
+    {
+      "path": "tab-per-node.tex",
+      "sha256": "4f6947bdc733c31385f492a805617bf4d3ff05a3769db03258287a403fa2df07"
+    },
+    {
+      "path": "tab-put1.tex",
+      "sha256": "0582bd2bad464926808ed4b4fe25ab4974969422b45fe61ee6bb6539e2917b8e"
+    },
+    {
+      "path": "tab-put16.tex",
+      "sha256": "4e9b797164eb9efee3fec150fb26aeb51e52ce21a8dd8c6af70e76aaf24d51c0"
+    },
+    {
+      "path": "tab-put64.tex",
+      "sha256": "c1245c7f4ed6d57b872c76fb83c2093c4a29e44f50a3962e78aa1e01edea7618"
+    },
+    {
+      "path": "tab-run7-puts.tex",
+      "sha256": "f34d82771e2766988132fd5c2de6847979eda7ae29e805362a7ad7b9bc768431"
+    },
+    {
+      "path": "tab-run7-reads.tex",
+      "sha256": "d43b0992be6a9a21aa902e44d672a901daebeab6cec7290c62e5848ab6194d37"
+    },
+    {
+      "path": "tab-spike.tex",
+      "sha256": "89b56a9c65d16a54649c5a5134e3e23ecdcf429adceaa0ee95adda7661ae365d"
+    },
+    {
+      "path": "tab-ssd-read.tex",
+      "sha256": "ba17349ee708cbe82f066ed9d8d9a0dae123a8ac74269e34252e99142f61a775"
+    },
+    {
+      "path": "tab-ssd-write.tex",
+      "sha256": "c0f850f300c3492f63d7477dfc9ac091f70501981f361b645c304d28039a8a3f"
+    },
+    {
+      "path": "tab-ssd1.tex",
+      "sha256": "902bfd22740131bf49cdf2f3d75e6dc410af85ace83ff202e973c72e9850ae29"
+    },
+    {
+      "path": "tab-ssd64.tex",
+      "sha256": "30273afad01ed9dc4332e8f709f49aa0b5ba0c7ed11cfcd8a779a361fb7d8ba2"
+    },
+    {
+      "path": "tab-stall.tex",
+      "sha256": "9674b8d995544b7ae8ba82447d7d22c8413804a872b06426bbbb4af3ee124f72"
+    },
+    {
+      "path": "tab-stores.tex",
+      "sha256": "630b97e146623b6b06ccb2bb878436d25950db8256ec18fe72896e4a104fa9d4"
+    },
+    {
+      "path": "tab-sui-sizes.tex",
+      "sha256": "276d10dbab06f7fb9e1ada2fdb7d59a12795fbe0aa93127b01351fa6aae5b423"
+    },
+    {
+      "path": "tab-sustained.tex",
+      "sha256": "c729ec3cf86721e75277d06d7c5b206446e0bd93dd478c8357651ffd2a29dc81"
+    },
+    {
+      "path": "tab-sync.tex",
+      "sha256": "d83db6a04b8cd0f09e684f6b2146934400f00641c4d4d06d4736043da2265ec5"
+    },
+    {
+      "path": "validation-pre-t6.json",
+      "sha256": "c51882ecc2c0c7f17d2ea6ece558d83684454517c23d677c038187edb0504e01"
+    },
+    {
+      "path": "validation.json",
+      "sha256": "611fe8df33f0ca384ec321133b1cd6b6010a06d8995b8d3ad2025be838bac0d6"
+    },
+    {
+      "path": "verify_contracts.py",
+      "sha256": "8b44a4fedb9b80c51c938bd59b50f6bea8cbfce4791e0f48da84ddddd272b61c"
+    }
+  ],
+  "manifest_itself": "t6-file-manifest.json"
+}

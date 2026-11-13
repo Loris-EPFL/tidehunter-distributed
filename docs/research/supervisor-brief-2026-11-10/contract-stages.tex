@@ -1,0 +1,38 @@
+\subsection{Why the large-value put gap remains}\label{sec:contract-stages}
+\textbf{Measured Class P (retained Class A), one owner.} Combined-run timeline
+case \texttt{G20W-r0-fb6fb99bf8a683e8fbf4}: leased NVMe-oF, \texttt{wal\_replay},
+lease-ahead, 64 KiB and \N{B:contract-values:stage-callers:value|.0f} callers.
+The table averages consecutive coordinator event differences over all
+\N{B:contract-values:stage-samples:value|,.0f} complete calls, not groups.
+
+\begin{table}[H]\centering\fitinput{tab-contract-stages.tex}
+\caption{Class P, one owner. Consecutive \texttt{timeline.records[].events}
+\texttt{elapsed\_ns} differences, averaged over all complete calls.
+Shares and residual use unrounded values; displayed sums can differ by rounding.
+Same-clock intervals, not isolated wire or SSD time.}
+\end{table}
+
+I/O: \N{B:contract-values:stage-io_samples:value|.0f} timed writes including
+\N{B:contract-values:stage-skip_markers:value|.0f} skip markers;
+\N{B:contract-values:stage-groups:value|.0f} data groups,
+\N{B:contract-values:stage-puts_per_group:value|.1f} puts/group,
+\N{B:contract-values:stage-group_period_ms:value|.2f} ms/group,
+\N{B:contract-values:stage-group_mib:value|.2f} MiB/group including framing.
+Span (last completion minus first scheduled call) gives \N{B:contract-values:stage-leased_mib_s:value|.0f} MiB/s
+of framed WAL traffic (\N{B:contract-values:stage-payload_mib_s:value|.0f} MiB/s
+of logical payload). Summed leased-write time gives
+\N{B:contract-values:stage-mean_leased_write_ms:value|.2f} ms per I/O sample,
+\N{B:contract-values:stage-active_write_gib_s:value|.2f} GiB/s while writing,
+and \N{B:contract-values:stage-write_busy_pct:value|.1f}\% of the measurement span.
+These are counter-derived intervals, not device-only service times.
+
+\inference\ The device and network are not the limit indicated by this case.
+Preparation runs on one \texttt{wal-write-owner} coordinator thread
+(\path{remote_db/concurrent.rs:455}); at the observed mean,
+\N{B:contract-values:stage-callers:value|.0f} preparations take about
+\N{B:contract-values:stage-serial_preparation_ms:value|.2f} ms per group.
+The two large waits may queue behind that thread and one in-flight group.
+Five owners spread only the write stage
+(\N{B:contract-values:stage-live_io_share:value|.1f}\% of call time), not preparation:
+inference until Run B. Sources and formulas: \texttt{contract-stage-metrics.json}
+and the README.

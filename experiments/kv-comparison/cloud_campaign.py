@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts")
 
 
 
@@ -189,7 +189,7 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     required = {"schema_version", "seed", "repeats", "value_sizes", "backends",
                 "keys", "max_cases", "offered_rates", "offered_seconds",
                 "case_deadline_seconds", "hard_deadline_seconds", "export_reserve_seconds"}
-    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode", "spdk_comparison", "valkey_reproduction_profiles", "native_durability_cohort"}:
+    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode", "spdk_comparison", "valkey_reproduction_profiles", "native_durability_cohort", "shapes", "arms"}:
         raise ValueError("cloud matrix requires its explicit schema")
     if spec["schema_version"] != 1 or isinstance(spec["seed"], bool) or not isinstance(spec["seed"], int):
         raise ValueError("invalid cloud schema/seed")
@@ -221,6 +221,28 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
         raise ValueError("native Valkey profiles require both TCP and RDMA")
     supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if _allow_live_nvme or spec.get("mode") in ("nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") else set())
     backends = select_backends(None, backends, supported)
+    if "shapes" in spec and spec["shapes"] != "contract_core":
+        raise ValueError("shapes must be contract_core")
+    if "arms" in spec:
+        allowed = {
+            "tidehunter_verbs_native": ("synchronous", "native"),
+            "tidehunter_nvme_rdma": ("synchronous", "native"),
+            "native": ("value_wal_barrier", "page_cache"),
+            "valkey_rdma": ("synced", "os_buffered", "periodic_sync"),
+            "valkey_tcp": ("synced",), "kvrocks": ("synced", "page_cache")}
+        arms = spec["arms"]
+        if "shapes" not in spec:
+            raise ValueError("arms requires shapes")
+        if not isinstance(arms, dict) or set(arms) != set(backends):
+            raise ValueError("arms must name every selected backend exactly once")
+        for backend, names in arms.items():
+            if (backend not in allowed or not isinstance(names, list) or not names
+                    or any(not isinstance(name, str) or name not in allowed[backend] for name in names)
+                    or len(names) != len(set(names))):
+                raise ValueError("invalid arms for " + backend)
+            if backend not in TRANSPORTS and backend != "native":
+                for name in names:
+                    ack_contract.selected(backend, name)
     rates = spec["offered_rates"]
     if set(rates) != {1000, 10000, 50000} or len(rates) != 3 or any(type(rate) is not int for rate in rates):
         raise ValueError("full campaign requires all three offered rates without duplicates")
@@ -235,6 +257,13 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
                    "read_profile_limit": diagnostics.get("read_profile_limit", 0),
                    "write_timeline_limit": diagnostics.get("write_timeline_limit", 0),
                    "valkey_profile_limit": diagnostics.get("valkey_profile_limit", 0)}
+    if spec.get("shapes") == "contract_core":
+        if spec.get("mode", "standard") not in ("standard", "standard-with-nvmeof", "standard-with-live-nvmeof"):
+            raise ValueError("contract_core requires a standard campaign")
+        base = {key: value for key, value in spec.items() if key not in ("shapes", "arms")}
+        base.update(mode="standard", max_cases=2000, spdk_comparison=False, native_durability_cohort=False)
+        sources = make_matrix(base, _allow_live_nvme=_allow_live_nvme or spec.get("mode") == "standard-with-live-nvmeof")
+        return _contract_core_matrix(spec, sources)
     if spec.get("mode") in ("standard-with-nvmeof", "standard-with-live-nvmeof"):
         live = spec["mode"] == "standard-with-live-nvmeof"
         standard_backends = backends if live else [backend for backend in backends if backend not in NVME_BACKENDS]
@@ -430,6 +459,53 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     for number, job in enumerate(jobs):
         route = "-live-nvmeof" if job.get("nvmeof_route") == "live" else ""
         job["case_id"] = f"{number:04d}-{job['backend']}-{job['value_size']}-{job['profile']}-{job['cohort']}-r{job['repeat']}{route}"
+    return jobs
+
+
+def _contract_core_matrix(spec, sources):
+    live_settings = {}
+    if "tidehunter_nvme_rdma" in spec["backends"]:
+        live = _clone_source(make_focused_matrix("nvmeof_path_compact"), "G18W",
+                             "tidehunter_nvme_rdma", durability_tier="native",
+                             diagnostics=None, measurement_operations=4096)
+        live_settings = {key: live[key] for key in NVMEOF_PATH_LIVE_SETTING_KEYS if key in live}
+        live_settings.update(owner_count=5, history_persistence="wal_replay",
+                             live_lease_ahead=True, live_polled_writes=False)
+    jobs = []
+    for source in sources:
+        if (source["cohort"] != "primary_rf1" or source["value_size"] not in (1024, 65536)
+                or source["profile"] not in ("write-concurrent", "read-concurrent")):
+            continue
+        writing = source["profile"] == "write-concurrent"
+        shapes = [copy.deepcopy(source), {**copy.deepcopy(source),
+                  "profile": "write-c1" if writing else "read-c1", "concurrency": 1}]
+        if writing and source["value_size"] == 1024 and source["repeat"] == 0:
+            shapes.append({**copy.deepcopy(source), "profile": "write-sustained",
+                           "measurement_operations": 200000})
+        backend = source["backend"]
+        default = "synchronous" if backend in TRANSPORTS else (
+            "value_wal_barrier" if backend == "native" else "synced")
+        arms = spec.get("arms", {}).get(backend, [default])
+        for shape in shapes:
+            for arm in arms if writing else arms[:1]:
+                job = copy.deepcopy(shape)
+                if backend in TRANSPORTS:
+                    job["durability_tier"] = arm
+                    job["history_persistence"] = "wal_replay"
+                    # Standard one-caller point-mixed uses RemoteDatabaseConfig's default.
+                    job["read_lanes"] = 2
+                elif backend == "native":
+                    job["native_durability"] = arm
+                elif arm != "synced":
+                    job["ack_contract"] = ack_contract.selected(backend, arm)
+                if backend == "tidehunter_nvme_rdma":
+                    job.update(live_settings)
+                route = "-live-nvmeof" if job.get("nvmeof_route") == "live" else ""
+                job["case_id"] = (f"{len(jobs):04d}-{backend}-{job['value_size']}-{job['profile']}-"
+                                  f"{job['cohort']}-r{job['repeat']}-{arm}{route}")
+                jobs.append(job)
+    if len(jobs) > spec["max_cases"]:
+        raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
     return jobs
 
 
@@ -644,7 +720,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "fair_native": 168, "parity": 216, "parity_compact": 177, "fair_five_owner": 39,
                   "remote_rw_compact": 342, "fabric_ab_compact": 80, "leased_ab_compact": 72,
                   "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
-                  "nvmeof_first_put": 12}
+                  "nvmeof_first_put": 12, "nvmeof_contracts": 34}
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -682,6 +758,7 @@ _FOCUSED_GROUP_COUNTS = {
                           "G18M": 7, "G18B": 5, "G18X": 2},
     "nvmeof_path_fix": {"G19W": 21, "G19R": 7, "G19N": 8, "G19X": 1},
     "nvmeof_first_put": {"G20W": 9, "G20R": 1, "G20N": 2},
+    "nvmeof_contracts": {"G21W": 16, "G21R": 8, "G21N": 10},
 }
 
 
@@ -1383,84 +1460,88 @@ def _focused_jobs():
     return jobs
 
 
+def _clone_source(pool, group, backend, size=1024, concurrency=1, repeat=0, operation="put", **fields):
+    matches = [job for job in pool if job["group"] == group and job["backend"] == backend
+               and job["value_size"] == size and job["concurrency"] == concurrency
+               and job["repeat"] == repeat and job["mix"][operation] == 100
+               and all(job.get(key) == value for key, value in fields.items())]
+    if len(matches) != 1:
+        raise ValueError("NVMe-oF source cell is not unique: " + str(
+            (group, backend, size, concurrency, repeat, operation, fields)))
+    return matches[0]
+
+
+def _clone_job(result, selection, item, group, **overrides):
+    job = copy.deepcopy(item)
+    job.update(selection=selection, group=group)
+    if job["backend"] != "native":
+        job["history_persistence"] = "wal_replay"
+    if job.get("nvmeof_route") == "live":
+        job.update(live_lease_ahead=True, live_polled_writes=False)
+    job.update(overrides)
+    identity = hashlib.sha256(json.dumps(
+        {key: value for key, value in job.items() if key != "case_id"},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+    job["case_id"] = f"{group}-r{job['repeat']}-{identity}"
+    result.append(job)
+    return job
+
+
 def _nvmeof_path_fix(path, fabric):
     """Clone reviewed cells without changing their dataset identities."""
     result = []
-    def source(pool, group, backend, size=1024, concurrency=1, repeat=0, operation="put", **fields):
-        matches = [job for job in pool if job["group"] == group and job["backend"] == backend
-                   and job["value_size"] == size and job["concurrency"] == concurrency
-                   and job["repeat"] == repeat and job["mix"][operation] == 100
-                   and all(job.get(key) == value for key, value in fields.items())]
-        if len(matches) != 1:
-            raise ValueError("NVMe-oF fix source cell is not unique: " + str(
-                (group, backend, size, concurrency, repeat, operation, fields)))
-        return matches[0]
-    def clone(item, group, **overrides):
-        job = copy.deepcopy(item)
-        job.update(selection="nvmeof_path_fix", group=group)
-        if job["backend"] != "native":
-            job["history_persistence"] = "wal_replay"
-        if job.get("nvmeof_route") == "live":
-            job.update(live_lease_ahead=True, live_polled_writes=False)
-        job.update(overrides)
-        identity = hashlib.sha256(json.dumps(
-            {key: value for key, value in job.items() if key != "case_id"},
-            sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
-        job["case_id"] = f"{group}-r{job['repeat']}-{identity}"
-        result.append(job)
-        return job
     def put(backend="tidehunter_nvme_rdma", size=1024, concurrency=1, repeat=0, tier="native"):
-        return source(path, "G18W", backend, size, concurrency, repeat,
+        return _clone_source(path, "G18W", backend, size, concurrency, repeat,
                       durability_tier=tier, diagnostics=None, measurement_operations=4096)
-    leased64 = [clone(put(size=65536, concurrency=16, repeat=r), "G19W") for r in (0, 1)]
+    leased64 = [_clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16, repeat=r), "G19W") for r in (0, 1)]
     for r in (0, 1):
-        clone(put(size=65536, concurrency=16, repeat=r), "G19W", live_lease_ahead=False)
-    clone(put(size=65536, concurrency=16), "G19W", history_persistence="memory_only")
+        _clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16, repeat=r), "G19W", live_lease_ahead=False)
+    _clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16), "G19W", history_persistence="memory_only")
     for concurrency in (1, 16):
         for r in (0, 1):
-            clone(put(concurrency=concurrency, repeat=r), "G19W")
-    clone(put(tier="synchronous"), "G19W")
-    clone(put(size=65536), "G19W")
-    owner = [clone(put("tidehunter_verbs_native", repeat=r), "G19W") for r in (0, 1)]
-    clone(put("tidehunter_verbs_native", size=65536, concurrency=16), "G19W")
-    clone(put("tidehunter_verbs_native", tier="synchronous"), "G19W")
-    sustained = source(path, "G18W", "tidehunter_nvme_rdma", concurrency=16,
+            _clone_job(result, "nvmeof_path_fix", put(concurrency=concurrency, repeat=r), "G19W")
+    _clone_job(result, "nvmeof_path_fix", put(tier="synchronous"), "G19W")
+    _clone_job(result, "nvmeof_path_fix", put(size=65536), "G19W")
+    owner = [_clone_job(result, "nvmeof_path_fix", put("tidehunter_verbs_native", repeat=r), "G19W") for r in (0, 1)]
+    _clone_job(result, "nvmeof_path_fix", put("tidehunter_verbs_native", size=65536, concurrency=16), "G19W")
+    _clone_job(result, "nvmeof_path_fix", put("tidehunter_verbs_native", tier="synchronous"), "G19W")
+    sustained = _clone_source(path, "G18W", "tidehunter_nvme_rdma", concurrency=16,
                        measurement_operations=200000)
-    sustained_job = clone(sustained, "G19W")
-    clone(sustained, "G19W", history_persistence="on_disk")
+    sustained_job = _clone_job(result, "nvmeof_path_fix", sustained, "G19W")
+    _clone_job(result, "nvmeof_path_fix", sustained, "G19W", history_persistence="on_disk")
     timeline = next(job for job in path if job["group"] == "G18W"
                     and "write_timeline_limit" in job.get("diagnostics", {}))
-    clone(timeline, "G19W")
-    clone(put(size=65536, concurrency=16), "G19W",
+    _clone_job(result, "nvmeof_path_fix", timeline, "G19W")
+    _clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16), "G19W",
           diagnostics=copy.deepcopy(timeline["diagnostics"]),
           owner_history_diagnostics=timeline["owner_history_diagnostics"])
-    polled = clone(put(), "G19W", live_poll_queues=1, live_polled_writes=True)
-    clone(put(size=65536, concurrency=16), "G19W", live_poll_queues=1, live_polled_writes=True)
+    polled = _clone_job(result, "nvmeof_path_fix", put(), "G19W", live_poll_queues=1, live_polled_writes=True)
+    _clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16), "G19W", live_poll_queues=1, live_polled_writes=True)
     cold = []
     for size, concurrency in ((1024, 1), (65536, 1), (1024, 16)):
-        cold.append(clone(source(path, "G18R", "tidehunter_nvme_rdma", size, concurrency,
+        cold.append(_clone_job(result, "nvmeof_path_fix", _clone_source(path, "G18R", "tidehunter_nvme_rdma", size, concurrency,
                                  operation="read", live_inline_reads=True, live_poll_queues=0,
                                  live_io_queues=1, live_io_queue_size=32,
                                  read_lanes=4 if concurrency == 16 else 1), "G19R"))
     warm = []
     for polls in (0, 1):
-        warm.append(clone(source(path, "G18M", "tidehunter_nvme_rdma", operation="read",
+        warm.append(_clone_job(result, "nvmeof_path_fix", _clone_source(path, "G18M", "tidehunter_nvme_rdma", operation="read",
                                  live_poll_queues=polls, coordinator_cache_bytes=0), "G19R"))
-    owner_cold = clone(source(fabric, "G16C", "tidehunter_verbs_native", operation="read",
+    owner_cold = _clone_job(result, "nvmeof_path_fix", _clone_source(fabric, "G16C", "tidehunter_verbs_native", operation="read",
                               owner_polling="adaptive"), "G19R", owner_wal_geometry="native_default")
-    clone(source(fabric, "G16P", "tidehunter_verbs_native", operation="read",
+    _clone_job(result, "nvmeof_path_fix", _clone_source(fabric, "G16P", "tidehunter_verbs_native", operation="read",
                  owner_polling="adaptive"), "G19R", owner_wal_geometry="native_default")
     native = []
     for size, concurrency, repeats in ((1024, 1, (0, 1)), (1024, 16, (0,)),
                                        (65536, 16, (0, 1)), (65536, 1, (0,))):
         for r in repeats:
-            native.append(clone(source(path, "G18N", "native", size, concurrency, r,
+            native.append(_clone_job(result, "nvmeof_path_fix", _clone_source(path, "G18N", "native", size, concurrency, r,
                                        native_durability="page_cache"), "G19N"))
     for expected in ("memory", "cold"):
-        clone(source(path, "G18N", "native", operation="read",
+        _clone_job(result, "nvmeof_path_fix", _clone_source(path, "G18N", "native", operation="read",
                      media={"expected": expected, "history": "normal",
                             "wal_eviction": "selective" if expected == "cold" else "none"}), "G19N")
-    clone(source(path, "G18X", "tidehunter_nvme_rdma", 65536, operation="read",
+    _clone_job(result, "nvmeof_path_fix", _clone_source(path, "G18X", "tidehunter_nvme_rdma", 65536, operation="read",
                  live_io_queues=1, live_io_queue_size=32), "G19X")
     priority = [native[0], leased64[0], owner[0], cold[1], owner_cold, warm[0], polled, sustained_job]
     ids = {job["case_id"] for job in priority}
@@ -1470,6 +1551,68 @@ def _nvmeof_path_fix(path, fabric):
                 for group in _FOCUSED_GROUP_COUNTS["nvmeof_path_fix"]}
             != _FOCUSED_GROUP_COUNTS["nvmeof_path_fix"]):
         raise ValueError("NVMe-oF fix matrix differs from its reviewed counts")
+    return result
+
+
+def _nvmeof_contracts(path):
+    """Compare the device-synced and page-cache contracts on one fleet."""
+    result = []
+    leased = {}
+    for tier in ("synchronous", "native"):
+        leased[tier] = []
+        for size in (1024, 65536):
+            for concurrency in (1, 16):
+                item = _clone_source(path, "G18W", "tidehunter_nvme_rdma", size, concurrency,
+                                     durability_tier=tier, diagnostics=None, measurement_operations=4096)
+                leased[tier].append(_clone_job(result, "nvmeof_contracts", item, "G21W"))
+    sustained = _clone_source(path, "G18W", "tidehunter_nvme_rdma", 1024, 16,
+                              measurement_operations=200000)
+    for tier in ("synchronous", "native"):
+        _clone_job(result, "nvmeof_contracts", sustained, "G21W", durability_tier=tier)
+    timeline = _clone_source(path, "G18W", "tidehunter_nvme_rdma",
+                             diagnostics={"write_timeline_limit": 4096})
+    for tier in ("synchronous", "native"):
+        _clone_job(result, "nvmeof_contracts", leased[tier][-1], "G21W",
+                   diagnostics=copy.deepcopy(timeline["diagnostics"]),
+                   owner_history_diagnostics=timeline["owner_history_diagnostics"])
+    for size in (1024, 65536):
+        for concurrency in (1, 16):
+            item = _clone_source(path, "G18W", "tidehunter_verbs_native", size, concurrency,
+                                 durability_tier="synchronous", diagnostics=None,
+                                 measurement_operations=4096)
+            _clone_job(result, "nvmeof_contracts", item, "G21W")
+    cold = []
+    for group in ("G18M", "G18R"):
+        for size in (1024, 65536):
+            for concurrency in (1, 16):
+                item = _clone_source(path, group, "tidehunter_nvme_rdma", size, concurrency,
+                                     operation="read", live_poll_queues=0, coordinator_cache_bytes=0,
+                                     read_lanes=4 if concurrency == 16 else 1, live_inline_reads=True,
+                                     live_io_queues=1, live_io_queue_size=32)
+                job = _clone_job(result, "nvmeof_contracts", item, "G21R")
+                if group == "G18R":
+                    cold.append(job)
+    native = {}
+    for tier in ("value_wal_barrier", "page_cache"):
+        native[tier] = []
+        for size in (1024, 65536):
+            for concurrency in (1, 16):
+                item = _clone_source(path, "G18N", "native", size, concurrency,
+                                     native_durability=tier)
+                native[tier].append(_clone_job(result, "nvmeof_contracts", item, "G21N"))
+    for concurrency in (1, 16):
+        item = _clone_source(path, "G18N", "native", 1024, concurrency, operation="read",
+                             media={"expected": "memory", "history": "normal", "wal_eviction": "none"})
+        _clone_job(result, "nvmeof_contracts", item, "G21N")
+    priority = [native["page_cache"][0], leased["synchronous"][0], cold[2]]
+    ids = {job["case_id"] for job in priority}
+    result = priority + [job for job in result if job["case_id"] not in ids]
+    if (len(result) != FOCUSED_COUNTS["nvmeof_contracts"]
+            or len({job["case_id"] for job in result}) != len(result)
+            or {group: sum(job["group"] == group for job in result)
+                for group in _FOCUSED_GROUP_COUNTS["nvmeof_contracts"]}
+            != _FOCUSED_GROUP_COUNTS["nvmeof_contracts"]):
+        raise ValueError("NVMe-oF contracts matrix differs from its reviewed counts")
     return result
 
 
@@ -1641,6 +1784,8 @@ def make_focused_matrix(selection):
             return _nvmeof_path_fix(path, make_focused_matrix("fabric_ab_compact"))
         if selection == "nvmeof_first_put":
             return _nvmeof_first_put(make_focused_matrix("nvmeof_path_fix"))
+        if selection == "nvmeof_contracts":
+            return _nvmeof_contracts(path)
         result = []
         for source in path:
             group = source["group"]
@@ -2117,7 +2262,7 @@ def qualify_live_nvme_measurement(evidence, job):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W") and any(
+        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
             if job["live_write_mode"] == "leased":
                 if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
@@ -2128,7 +2273,7 @@ def qualify_live_nvme_measurement(evidence, job):
                     reasons.append("leased FUA count differs from frames and skip markers")
             elif counters["leased_frames"]:
                 reasons.append("reserved write observed leased frames")
-        if job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R") and job["mix"]["read"] == 100:
+        if job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R") and job["mix"]["read"] == 100:
             coordinator = (data.get("deltas") or {}).get("coordinator") or {}
             value = (coordinator.get("counters") or {}).get("read_profile_live_inline")
             first = (data.get("start") or {}).get("coordinator") or {}

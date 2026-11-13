@@ -231,8 +231,8 @@ INPUT /usr/share/texmf/fonts/enc/dvips/lm/lm-mathit.enc
 INPUT ./acknowledgement-contracts.tex
 INPUT ./acknowledgement-contracts.tex
 INPUT acknowledgement-contracts.tex
-INPUT /usr/share/texmf/fonts/tfm/public/lm/ec-lmbx10.tfm
 INPUT /usr/share/texmf/fonts/tfm/public/lm/ec-lmtt10.tfm
+INPUT /usr/share/texmf/fonts/tfm/public/lm/ec-lmbx10.tfm
 INPUT ./figures/durable-components.pdf
 INPUT ./figures/durable-components.pdf
 INPUT ./figures/durable-components.pdf
@@ -421,6 +421,12 @@ INPUT contract-results.tex
 INPUT ./tab-contract-a.tex
 INPUT ./tab-contract-a.tex
 INPUT tab-contract-a.tex
+INPUT ./contract-stages.tex
+INPUT ./contract-stages.tex
+INPUT contract-stages.tex
+INPUT ./tab-contract-stages.tex
+INPUT ./tab-contract-stages.tex
+INPUT tab-contract-stages.tex
 INPUT ./tab-contract-b-controls.tex
 INPUT ./tab-contract-b-controls.tex
 INPUT tab-contract-b-controls.tex

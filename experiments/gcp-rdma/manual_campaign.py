@@ -65,6 +65,20 @@ REVIEWED_SPEC = {
                     'valkey_profile_limit': 256},
 }
 
+REVIEWED_CONTRACT_SPEC = {
+    **{key: copy.deepcopy(value) for key, value in REVIEWED_SPEC.items()
+       if key != 'valkey_reproduction_profiles'},
+    'backends': ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma',
+                 'valkey_tcp', 'valkey_rdma', 'kvrocks'],
+    'repeats': 2, 'spdk_comparison': False, 'shapes': 'contract_core',
+    'arms': {'native': ['value_wal_barrier', 'page_cache'],
+             'tidehunter_verbs_native': ['synchronous', 'native'],
+             'tidehunter_nvme_rdma': ['synchronous', 'native'],
+             'valkey_tcp': ['synced'],
+             'valkey_rdma': ['synced', 'os_buffered', 'periodic_sync'],
+             'kvrocks': ['synced', 'page_cache']},
+}
+
 # Full focused estimate: 4.8892 fleet hours and $123.09 with allowance.
 # It is a planning estimate, not a bound; the full $145 quote is reserved.
 # Matrix digests bind the exact reviewed job order and content.
@@ -87,6 +101,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
+    'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -128,6 +143,7 @@ REVIEWED_SPECS = {
         ('nvmeof_path_core', FOCUSED_MATRIX_SHA256['nvmeof_path_core'], 66),
         ('nvmeof_path_fix', FOCUSED_MATRIX_SHA256['nvmeof_path_fix'], 37),
         ('nvmeof_first_put', FOCUSED_MATRIX_SHA256['nvmeof_first_put'], 12),
+        ('nvmeof_contracts', FOCUSED_MATRIX_SHA256['nvmeof_contracts'], 34),
     )
 }
 
@@ -228,7 +244,8 @@ def _reviewed_jobs(spec):
         if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(spec)):
             raise ValueError("an exact reviewed focused specification is required")
         return [] if spec["suite"] == "sui" else _reviewed_jobs(manual_sui.kv_spec(manual_sui.reviewed_part(spec)))
-    if isinstance(spec, dict) and _json(spec) == _json(REVIEWED_SPEC):
+    if isinstance(spec, dict) and any(_json(spec) == _json(reviewed)
+                                     for reviewed in (REVIEWED_SPEC, REVIEWED_CONTRACT_SPEC)):
         return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
     if (not isinstance(spec, dict) or type(spec.get('selection')) is not str
             or spec['selection'] not in REVIEWED_SPECS

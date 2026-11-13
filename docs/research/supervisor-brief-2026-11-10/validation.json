@@ -2,9 +2,9 @@
   "phase": "10 November supervisor brief: final acceptance",
   "acknowledgement_contracts": {
     "pass_check": true,
-    "numeric_occurrences": 113,
-    "source_linked_values": 101,
-    "sources": 8,
+    "numeric_occurrences": 159,
+    "source_linked_values": 144,
+    "sources": 13,
     "claims": [
       {
         "key": "B:contract-values:combined-cases:value|,.0f",
@@ -683,9 +683,298 @@
         "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
         "column": "api_p50_us",
         "case_id": "0179-valkey_rdma-65536-read-concurrent-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:stage-callers:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "callers",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-samples:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "samples",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-io_samples:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "io_samples",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-skip_markers:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "skip_markers",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-groups:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "groups",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-puts_per_group:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "puts_per_group",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-group_period_ms:value|.2f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "group_period_ms",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-group_mib:value|.2f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "group_mib",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-leased_mib_s:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "leased_mib_s",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-payload_mib_s:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "payload_mib_s",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-mean_leased_write_ms:value|.2f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "mean_leased_write_ms",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-active_write_gib_s:value|.2f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "active_write_gib_s",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-write_busy_pct:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "write_busy_pct",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-callers:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "callers",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-serial_preparation_ms:value|.2f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "serial_preparation_ms",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-live_io_share:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "live_io_share",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-queued_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "queued_us",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-queued_share:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "queued_share",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-preparation_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "preparation_us",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-preparation_share:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "preparation_share",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-append_wait_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "append_wait_us",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-append_wait_share:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "append_wait_share",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-live_io_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "live_io_us",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-live_io_share:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "live_io_share",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-other_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "other_us",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-other_share:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "other_share",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-mean_total_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "mean_total_us",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:stage-total_share:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-stage-metrics.json",
+        "column": "total_share",
+        "case_id": "G20W-r0-fb6fb99bf8a683e8fbf4"
+      },
+      {
+        "key": "B:contract-values:plan-run_a_vms:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_vms",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_cases:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_cases",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_w:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_w",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_r:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_r",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_n:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_n",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_leased_puts:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_leased_puts",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_sustained:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_sustained",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_timelines:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_timelines",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_rpc:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_rpc",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_r:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_r",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_n:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_n",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_put_calls:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_put_calls",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_memory_read_calls:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_memory_read_calls",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_device_1k_calls:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_device_1k_calls",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_device_64k_calls:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_device_64k_calls",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_a_sui_cells:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_a_sui_cells",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_b_vms:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_b_vms",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:plan-run_b_storage_hosts:value|.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/contract-benchmark-plan.json",
+        "column": "run_b_storage_hosts",
+        "case_id": ""
       }
     ],
-    "scope": "same-fleet Class A pairs; separate B controls; one explicitly non-ranking historical scale table"
+    "stages": {
+      "values": 27,
+      "samples": 4096,
+      "groups": 256,
+      "io_samples": 258,
+      "mean_total_us": 1827.5711928710937,
+      "other_share": 6.431594910697898
+    },
+    "plan": {
+      "run_a_cases": 34,
+      "matrix_sha256": "cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208",
+      "status": "planned, not run"
+    },
+    "scope": "retained A/B labels map to P/S; measured stage intervals; planned S/P/W benchmark map"
   },
   "inputs": {
     "outputs_hashed": 98,
@@ -1323,16 +1612,19 @@
       56
     ],
     "visual_inspection": {
-      "pdf_sha256": "51760763c59926b4d0f6bb7d551efc75086fd91827c585e5719757846d3812fc",
-      "pages": [
+      "pdf_sha256": "2f77e1698aad5b0776342baa91d86b26f8bc5c8951f8f3fcfe87dfce405b5fa8",
+      "final_pages": [
+        2
+      ],
+      "earlier_unchanged_content_pages": [
+        28,
         29
       ],
-      "method": "Assistant inspected rendered/contracts-29.png after the final rebuild",
-      "result": "Three memory rows and retained device rows are legible; no clipping. Pages 2, 28 and 49 were inspected in the preceding build."
+      "result": "Corrected Run A counts visually checked; no clipping. Stage and indicative pages were checked before this unchanged-content rebuild."
     }
   },
   "numbers": {
-    "resolved_keys": 2286,
+    "resolved_keys": 2328,
     "independent_pdf_checks": 82,
     "changed_keys": {
       "Q:run7-sustained-extract:0:late_puts_s|.0f": {
@@ -1482,7 +1774,49 @@
       "B:contract-values:historical-0190-valkey_rdma-65536-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
       "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-put-api_p50_us:value|.1f",
       "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "B:contract-values:plan-run_a_cases:value|.0f",
+      "B:contract-values:plan-run_a_device_1k_calls:value|,.0f",
+      "B:contract-values:plan-run_a_device_64k_calls:value|,.0f",
+      "B:contract-values:plan-run_a_leased_puts:value|.0f",
+      "B:contract-values:plan-run_a_memory_read_calls:value|,.0f",
+      "B:contract-values:plan-run_a_n:value|.0f",
+      "B:contract-values:plan-run_a_put_calls:value|,.0f",
+      "B:contract-values:plan-run_a_r:value|.0f",
+      "B:contract-values:plan-run_a_rpc:value|.0f",
+      "B:contract-values:plan-run_a_sui_cells:value|.0f",
+      "B:contract-values:plan-run_a_sustained:value|.0f",
+      "B:contract-values:plan-run_a_timelines:value|.0f",
+      "B:contract-values:plan-run_a_vms:value|.0f",
+      "B:contract-values:plan-run_a_w:value|.0f",
+      "B:contract-values:plan-run_b_storage_hosts:value|.0f",
+      "B:contract-values:plan-run_b_vms:value|.0f",
       "B:contract-values:run13-compared_cells:value|,.0f",
+      "B:contract-values:stage-active_write_gib_s:value|.2f",
+      "B:contract-values:stage-append_wait_share:value|.1f",
+      "B:contract-values:stage-append_wait_us:value|.1f",
+      "B:contract-values:stage-callers:value|.0f",
+      "B:contract-values:stage-group_mib:value|.2f",
+      "B:contract-values:stage-group_period_ms:value|.2f",
+      "B:contract-values:stage-groups:value|.0f",
+      "B:contract-values:stage-io_samples:value|.0f",
+      "B:contract-values:stage-leased_mib_s:value|.0f",
+      "B:contract-values:stage-live_io_share:value|.1f",
+      "B:contract-values:stage-live_io_us:value|.1f",
+      "B:contract-values:stage-mean_leased_write_ms:value|.2f",
+      "B:contract-values:stage-mean_total_us:value|.1f",
+      "B:contract-values:stage-other_share:value|.1f",
+      "B:contract-values:stage-other_us:value|.1f",
+      "B:contract-values:stage-payload_mib_s:value|.0f",
+      "B:contract-values:stage-preparation_share:value|.1f",
+      "B:contract-values:stage-preparation_us:value|.1f",
+      "B:contract-values:stage-puts_per_group:value|.1f",
+      "B:contract-values:stage-queued_share:value|.1f",
+      "B:contract-values:stage-queued_us:value|.1f",
+      "B:contract-values:stage-samples:value|,.0f",
+      "B:contract-values:stage-serial_preparation_ms:value|.2f",
+      "B:contract-values:stage-skip_markers:value|.0f",
+      "B:contract-values:stage-total_share:value|.1f",
+      "B:contract-values:stage-write_busy_pct:value|.1f",
       "B:contract-values:sustained-calls_ge_5ms:value|,.0f",
       "B:contract-values:sustained-calls_per_second:value|,.0f",
       "B:contract-values:sustained-mean_inflight_calls:value|.1f",
@@ -2324,6 +2658,312 @@
         "pass_check": true
       },
       {
+        "key": "J:native_reciprocal_pct|.0f",
+        "source_value": 95.40576331753779,
+        "pdf_value": "95",
+        "pass_check": true
+      },
+      {
+        "key": "B:paper-context:write_ops_s:value|,.0f",
+        "source_value": 830000.0,
+        "pdf_value": "830,000",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:write-concurrent:put:256|.1f",
+        "source_value": 72.334,
+        "pdf_value": "72.3",
+        "pass_check": true
+      },
+      {
+        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:64|.0f",
+        "source_value": 989.9014999999999,
+        "pdf_value": "990",
+        "pass_check": true
+      },
+      {
+        "key": "cps:native:primary_rf1:read-concurrent:read:1024|,.0f",
+        "source_value": 277534.0489930938,
+        "pdf_value": "277,534",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache_c1_64",
+        "source_value": 37.896,
+        "pdf_value": "37.9",
+        "pass_check": true
+      },
+      {
+        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:1024|.1f",
+        "source_value": 66.735745,
+        "pdf_value": "66.7",
+        "pass_check": true
+      },
+      {
+        "key": "J:owner64_software_pct|.0f",
+        "source_value": 47.442630000843344,
+        "pdf_value": "47",
+        "pass_check": true
+      },
+      {
+        "key": "p50:cassandra:primary_rf1:write-concurrent:put:1024|.0f",
+        "source_value": 263.3355,
+        "pdf_value": "263",
+        "pass_check": true
+      },
+      {
+        "key": "B:paper-context:skew_get_ops_s:value|,.0f",
+        "source_value": 3980000.0,
+        "pdf_value": "3,980,000",
+        "pass_check": true
+      },
+      {
+        "key": "C:p16v:queue",
+        "source_value": 70.04173022460938,
+        "pdf_value": "70.0",
+        "pass_check": true
+      },
+      {
+        "key": "C:p16v:coalescing",
+        "source_value": 80.97995947265625,
+        "pdf_value": "81.0",
+        "pass_check": true
+      },
+      {
+        "key": "J:native_mean_ratio",
+        "source_value": 16.212045382833818,
+        "pdf_value": "16.2",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:write-concurrent:put:1024|.1f",
+        "source_value": 63.798,
+        "pdf_value": "63.8",
+        "pass_check": true
+      },
+      {
+        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:8192|.0f",
+        "source_value": 631.9214999999999,
+        "pdf_value": "632",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:th_verbs:ratio|.2f",
+        "source_value": 1.0688989053444946,
+        "pdf_value": "1.07",
+        "pass_check": true
+      },
+      {
+        "key": "mean:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
+        "source_value": 112.44008344370862,
+        "pdf_value": "112.4",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:puts_s_node|,.0f",
+        "source_value": 6102.1850333507355,
+        "pdf_value": "6,102",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:valkey_rdma:puts_s_node|,.0f",
+        "source_value": 6380.479918638912,
+        "pdf_value": "6,380",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:read-concurrent:read:1024|.2f",
+        "source_value": 1.368,
+        "pdf_value": "1.37",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:valkey_rdma:minimum|,.0f",
+        "source_value": 1847.0,
+        "pdf_value": "1,847",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:point-mixed:put:65536|.1f",
+        "source_value": 154.121,
+        "pdf_value": "154.1",
+        "pass_check": true
+      },
+      {
+        "key": "p50:th_verbs:primary_rf1:read-concurrent:read:1024|.1f",
+        "source_value": 45.025,
+        "pdf_value": "45.0",
+        "pass_check": true
+      },
+      {
+        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:256|.1f",
+        "source_value": 69.579177,
+        "pdf_value": "69.6",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:mean_inflight_calls",
+        "source_value": 15.467225646878244,
+        "pdf_value": "15.5",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache8",
+        "source_value": 3.797,
+        "pdf_value": "3.8",
+        "pass_check": true
+      },
+      {
+        "key": "B:chart-anomalies:garnet:stall_max_ms|.0f",
+        "source_value": 90.487694,
+        "pdf_value": "90",
+        "pass_check": true
+      },
+      {
+        "key": "C:p16v:durable",
+        "source_value": 105.24902905273437,
+        "pdf_value": "105.2",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:valkey_rdma:ratio|.2f",
+        "source_value": 1.3584190579317812,
+        "pdf_value": "1.36",
+        "pass_check": true
+      },
+      {
+        "key": "p50:valkey_rdma:primary_rf1:read-concurrent:read:1024|.1f",
+        "source_value": 43.051,
+        "pdf_value": "43.1",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:th_verbs:maximum|,.0f",
+        "source_value": 1660.0,
+        "pdf_value": "1,660",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:valkey_rdma:maximum|,.0f",
+        "source_value": 2509.0,
+        "pdf_value": "2,509",
+        "pass_check": true
+      },
+      {
+        "key": "D:uput1v:p50_us",
+        "source_value": 121.4785,
+        "pdf_value": "121.5",
+        "pass_check": true
+      },
+      {
+        "key": "B:paper-context:uniform_get_ops_s:value|,.0f",
+        "source_value": 392000.0,
+        "pdf_value": "392,000",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:puts_s|,.0f",
+        "source_value": 6102.1850333507355,
+        "pdf_value": "6,102",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache_ms",
+        "source_value": 15.237582,
+        "pdf_value": "15.2",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:th_verbs:puts_s_node|,.0f",
+        "source_value": 1987.322772934948,
+        "pdf_value": "1,987",
+        "pass_check": true
+      },
+      {
+        "key": "C:p64v:coordinator",
+        "source_value": 91.88503857421875,
+        "pdf_value": "91.9",
+        "pass_check": true
+      },
+      {
+        "key": "B:chart-anomalies:garnet:stall_min_ms|.0f",
+        "source_value": 60.028398,
+        "pdf_value": "60",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:th_verbs:minimum|,.0f",
+        "source_value": 1553.0,
+        "pdf_value": "1,553",
+        "pass_check": true
+      },
+      {
+        "key": "mean:native:primary_rf1:point-mixed:put:65536|.1f",
+        "source_value": 156.34688688741724,
+        "pdf_value": "156.3",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:p50_us",
+        "source_value": 2713.716,
+        "pdf_value": "2713.7",
+        "pass_check": true
+      },
+      {
+        "key": "p50:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
+        "source_value": 108.837,
+        "pdf_value": "108.8",
+        "pass_check": true
+      },
+      {
+        "key": "p50:cassandra:primary_rf1:write-concurrent:put:256|.0f",
+        "source_value": 164.0745,
+        "pdf_value": "164",
+        "pass_check": true
+      },
+      {
+        "key": "D:p16v:mean_us",
+        "source_value": 420.8671442871094,
+        "pdf_value": "420.9",
+        "pass_check": true
+      },
+      {
+        "key": "J:native_reciprocal|,.0f",
+        "source_value": 6396.033972330279,
+        "pdf_value": "6,396",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache_jump",
+        "source_value": 47.8575190940216,
+        "pdf_value": "47.9",
+        "pass_check": true
+      },
+      {
+        "key": "W:p16v|.0f",
+        "source_value": 60.89112020946351,
+        "pdf_value": "61",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:mean_us",
+        "source_value": 2534.702825683594,
+        "pdf_value": "2534.7",
+        "pass_check": true
+      },
+      {
+        "key": "C:p64v:owner",
+        "source_value": 127.53080810546876,
+        "pdf_value": "127.5",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache64",
+        "source_value": 181.715,
+        "pdf_value": "181.7",
+        "pass_check": true
+      },
+      {
         "key": "D:uput1v:mean_us",
         "source_value": 126.59611486816405,
         "pdf_value": "126.6",
@@ -2336,315 +2976,9 @@
         "pass_check": true
       },
       {
-        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:8192|.0f",
-        "source_value": 631.9214999999999,
-        "pdf_value": "632",
-        "pass_check": true
-      },
-      {
-        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:64|.0f",
-        "source_value": 989.9014999999999,
-        "pdf_value": "990",
-        "pass_check": true
-      },
-      {
-        "key": "B:paper-context:skew_get_ops_s:value|,.0f",
-        "source_value": 3980000.0,
-        "pdf_value": "3,980,000",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:valkey_rdma:ratio|.2f",
-        "source_value": 1.3584190579317812,
-        "pdf_value": "1.36",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:th_verbs:ratio|.2f",
-        "source_value": 1.0688989053444946,
-        "pdf_value": "1.07",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:point-mixed:put:65536|.1f",
-        "source_value": 154.121,
-        "pdf_value": "154.1",
-        "pass_check": true
-      },
-      {
-        "key": "D:p16v:mean_us",
-        "source_value": 420.8671442871094,
-        "pdf_value": "420.9",
-        "pass_check": true
-      },
-      {
         "key": "J:pagecache1_cps|,.0f",
         "source_value": 268809.05382494413,
         "pdf_value": "268,809",
-        "pass_check": true
-      },
-      {
-        "key": "J:native_mean_ratio",
-        "source_value": 16.212045382833818,
-        "pdf_value": "16.2",
-        "pass_check": true
-      },
-      {
-        "key": "C:p16v:coalescing",
-        "source_value": 80.97995947265625,
-        "pdf_value": "81.0",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:puts_s|,.0f",
-        "source_value": 6102.1850333507355,
-        "pdf_value": "6,102",
-        "pass_check": true
-      },
-      {
-        "key": "W:p16v|.0f",
-        "source_value": 60.89112020946351,
-        "pdf_value": "61",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache_ms",
-        "source_value": 15.237582,
-        "pdf_value": "15.2",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:write-concurrent:put:256|.1f",
-        "source_value": 72.334,
-        "pdf_value": "72.3",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:valkey_rdma:minimum|,.0f",
-        "source_value": 1847.0,
-        "pdf_value": "1,847",
-        "pass_check": true
-      },
-      {
-        "key": "J:native_reciprocal|,.0f",
-        "source_value": 6396.033972330279,
-        "pdf_value": "6,396",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache8",
-        "source_value": 3.797,
-        "pdf_value": "3.8",
-        "pass_check": true
-      },
-      {
-        "key": "D:uput1v:p50_us",
-        "source_value": 121.4785,
-        "pdf_value": "121.5",
-        "pass_check": true
-      },
-      {
-        "key": "mean:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
-        "source_value": 112.44008344370862,
-        "pdf_value": "112.4",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:mean_us",
-        "source_value": 2534.702825683594,
-        "pdf_value": "2534.7",
-        "pass_check": true
-      },
-      {
-        "key": "J:native_reciprocal_pct|.0f",
-        "source_value": 95.40576331753779,
-        "pdf_value": "95",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:valkey_rdma:puts_s_node|,.0f",
-        "source_value": 6380.479918638912,
-        "pdf_value": "6,380",
-        "pass_check": true
-      },
-      {
-        "key": "p50:cassandra:primary_rf1:write-concurrent:put:1024|.0f",
-        "source_value": 263.3355,
-        "pdf_value": "263",
-        "pass_check": true
-      },
-      {
-        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:1024|.1f",
-        "source_value": 66.735745,
-        "pdf_value": "66.7",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:read-concurrent:read:1024|.2f",
-        "source_value": 1.368,
-        "pdf_value": "1.37",
-        "pass_check": true
-      },
-      {
-        "key": "p50:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
-        "source_value": 108.837,
-        "pdf_value": "108.8",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:mean_inflight_calls",
-        "source_value": 15.467225646878244,
-        "pdf_value": "15.5",
-        "pass_check": true
-      },
-      {
-        "key": "B:paper-context:uniform_get_ops_s:value|,.0f",
-        "source_value": 392000.0,
-        "pdf_value": "392,000",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:th_verbs:maximum|,.0f",
-        "source_value": 1660.0,
-        "pdf_value": "1,660",
-        "pass_check": true
-      },
-      {
-        "key": "C:p16v:durable",
-        "source_value": 105.24902905273437,
-        "pdf_value": "105.2",
-        "pass_check": true
-      },
-      {
-        "key": "p50:th_verbs:primary_rf1:read-concurrent:read:1024|.1f",
-        "source_value": 45.025,
-        "pdf_value": "45.0",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache_c1_64",
-        "source_value": 37.896,
-        "pdf_value": "37.9",
-        "pass_check": true
-      },
-      {
-        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:256|.1f",
-        "source_value": 69.579177,
-        "pdf_value": "69.6",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:th_verbs:puts_s_node|,.0f",
-        "source_value": 1987.322772934948,
-        "pdf_value": "1,987",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:p50_us",
-        "source_value": 2713.716,
-        "pdf_value": "2713.7",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:write-concurrent:put:1024|.1f",
-        "source_value": 63.798,
-        "pdf_value": "63.8",
-        "pass_check": true
-      },
-      {
-        "key": "C:p16v:queue",
-        "source_value": 70.04173022460938,
-        "pdf_value": "70.0",
-        "pass_check": true
-      },
-      {
-        "key": "J:owner64_software_pct|.0f",
-        "source_value": 47.442630000843344,
-        "pdf_value": "47",
-        "pass_check": true
-      },
-      {
-        "key": "mean:native:primary_rf1:point-mixed:put:65536|.1f",
-        "source_value": 156.34688688741724,
-        "pdf_value": "156.3",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:puts_s_node|,.0f",
-        "source_value": 6102.1850333507355,
-        "pdf_value": "6,102",
-        "pass_check": true
-      },
-      {
-        "key": "B:chart-anomalies:garnet:stall_max_ms|.0f",
-        "source_value": 90.487694,
-        "pdf_value": "90",
-        "pass_check": true
-      },
-      {
-        "key": "B:chart-anomalies:garnet:stall_min_ms|.0f",
-        "source_value": 60.028398,
-        "pdf_value": "60",
-        "pass_check": true
-      },
-      {
-        "key": "p50:valkey_rdma:primary_rf1:read-concurrent:read:1024|.1f",
-        "source_value": 43.051,
-        "pdf_value": "43.1",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:th_verbs:minimum|,.0f",
-        "source_value": 1553.0,
-        "pdf_value": "1,553",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache64",
-        "source_value": 181.715,
-        "pdf_value": "181.7",
-        "pass_check": true
-      },
-      {
-        "key": "p50:cassandra:primary_rf1:write-concurrent:put:256|.0f",
-        "source_value": 164.0745,
-        "pdf_value": "164",
-        "pass_check": true
-      },
-      {
-        "key": "C:p64v:owner",
-        "source_value": 127.53080810546876,
-        "pdf_value": "127.5",
-        "pass_check": true
-      },
-      {
-        "key": "C:p64v:coordinator",
-        "source_value": 91.88503857421875,
-        "pdf_value": "91.9",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:valkey_rdma:maximum|,.0f",
-        "source_value": 2509.0,
-        "pdf_value": "2,509",
-        "pass_check": true
-      },
-      {
-        "key": "cps:native:primary_rf1:read-concurrent:read:1024|,.0f",
-        "source_value": 277534.0489930938,
-        "pdf_value": "277,534",
-        "pass_check": true
-      },
-      {
-        "key": "B:paper-context:write_ops_s:value|,.0f",
-        "source_value": 830000.0,
-        "pdf_value": "830,000",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache_jump",
-        "source_value": 47.8575190940216,
-        "pdf_value": "47.9",
         "pass_check": true
       }
     ],
@@ -14426,7 +14760,7 @@
       "Agreement with the Tidehunter paper",
       "Where 64 KiB values occur"
     ],
-    "pdf_sha256": "51760763c59926b4d0f6bb7d551efc75086fd91827c585e5719757846d3812fc"
+    "pdf_sha256": "2f77e1698aad5b0776342baa91d86b26f8bc5c8951f8f3fcfe87dfce405b5fa8"
   },
   "source_defects": [
     {
