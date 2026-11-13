@@ -1243,6 +1243,7 @@ fn leased_checkpoint_tail_workstation() {
         && wal_file_bytes == 256 * MIB
         && replay_max_batches == 256
         && replay_max_bytes == 16 * MIB;
+    let timeline_output = std::env::var_os("TH_TAIL_TIMELINE_DIR").map(PathBuf::from);
     let base = tempdir::TempDir::new("leased-checkpoint-tail").unwrap();
     let value: Bytes = vec![0x5a; 65536].into();
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
@@ -1260,7 +1261,44 @@ fn leased_checkpoint_tail_workstation() {
         );
         fixture.config.preparation_workers = 8;
         let db = ConcurrentRemoteDatabase::new(fixture.open("C-buf")).unwrap();
-        let (samples, elapsed) = write_phase(&db, 16, 0, calls, &value);
+        let (samples, elapsed) = if timeline_output.is_some() {
+            db.arm_write_timeline(calls).unwrap();
+            let gate = Barrier::new(17);
+            thread::scope(|scope| {
+                let handles: Vec<_> = (0..16)
+                    .map(|writer| {
+                        let db = &db;
+                        let gate = &gate;
+                        let value = &value;
+                        scope.spawn(move || {
+                            let mut samples = Vec::with_capacity(calls.div_ceil(16));
+                            gate.wait();
+                            for sequence in (writer..calls).step_by(16) {
+                                let mutations = vec![put(sequence, value)];
+                                let operation = operation(sequence);
+                                let began = Instant::now();
+                                let sample = db.write_timeline.begin(sequence as u64).unwrap();
+                                db.write_timeline.operation(sample, operation);
+                                db.write_batch_traced(operation, mutations, Some(sample))
+                                    .unwrap();
+                                db.write_timeline.complete(sample, None);
+                                samples.push(began.elapsed().as_nanos() as u64);
+                            }
+                            samples
+                        })
+                    })
+                    .collect();
+                let began = Instant::now();
+                gate.wait();
+                let samples = handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().unwrap())
+                    .collect();
+                (samples, began.elapsed())
+            })
+        } else {
+            write_phase(&db, 16, 0, calls, &value)
+        };
         let counts = fixture.live.snapshot().counts;
         let manifest: AuthorityManifest =
             read_metadata(&fixture.root.path().join("authority").join(MANIFEST)).unwrap();
@@ -1288,6 +1326,17 @@ fn leased_checkpoint_tail_workstation() {
         let mut sorted = samples.clone();
         sorted.sort_unstable();
         let quantile = |p: usize, scale: usize| sorted[(p * sorted.len()).div_ceil(scale) - 1];
+        if let Some(output) = &timeline_output {
+            fs::create_dir_all(output).unwrap();
+            let export = db
+                .finish_write_timeline_until(Instant::now() + Duration::from_secs(60))
+                .unwrap();
+            fs::write(
+                output.join(format!("{tier}-timeline.json")),
+                serde_json::to_vec(&export).unwrap(),
+            )
+            .unwrap();
+        }
         println!(
             "checkpoint_tail_workstation {}",
             json!({
@@ -1297,7 +1346,7 @@ fn leased_checkpoint_tail_workstation() {
                 "extent_switch_waits": counts.extent_switch_waits,
                 "checkpoint_started": checkpoint_started,
                 "completed_checkpoint_lifetime_ns": completed_checkpoint_lifetime_ns,
-                "timeline_enabled": false,
+                "timeline_enabled": timeline_output.is_some(),
                 "fragment_bytes": fragment_bytes, "wal_file_bytes": wal_file_bytes,
                 "replay_max_batches": replay_max_batches, "replay_max_bytes": replay_max_bytes,
                 "p50_ns": quantile(50, 100), "p99_ns": quantile(99, 100),
