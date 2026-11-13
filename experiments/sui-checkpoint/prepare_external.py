@@ -49,6 +49,7 @@ def main():
         raise ValueError('hardware/fabric transport requires a fabric-enabled frozen build')
     output=args.output.resolve()
     schema=deployment.schemas(args.schema, 'native')
+    shape_sha256 = {name: build.digest(args.schema/name/'shape.yaml') for name in schema}
     config,nodes=deployment.prepare(output,schema,args.db_root,
         shape_yamls={name:(args.schema/name/'shape.yaml').read_text() for name in schema},hosts=hosts,port=args.port,
         transport=transport,owner_transports=owners,coordinator_cache=args.coordinator_cache_mib*deployment.MIB,
@@ -82,7 +83,7 @@ def main():
     build.save(output/'external-manifest.json',dict(schema=3 if grouped else 2,protocol=manifest['protocol'],transport=transport,owner_transports=owners,
         config_sha256=build.digest(output/'config.json'),build_manifest_sha256=build.digest(args.build/'build-manifest.json'),
         source_archive_sha256=manifest['source_archive_sha256'],storage_binary_sha256=manifest['binaries']['storage-node'],
-        write_profile_limit=args.write_profile_limit,hosts=host_records,
+        write_profile_limit=args.write_profile_limit,shape_sha256=shape_sha256,hosts=host_records,
         ownership='controller creates each fresh guest root, starts only listed process groups, bounds deadlines, collects /proc IO/RSS/swap and stops only owned groups',
         security=('trusted isolated cluster; no application TLS or certificate files'
                   if deployment.is_trusted(transport) else

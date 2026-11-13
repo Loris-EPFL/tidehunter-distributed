@@ -99,6 +99,67 @@ class SuiNvmePreparationTest(unittest.TestCase):
                             '--fabric', '--jobs', '2']
                 self.assertEqual(captured[0], expected + (['--nvmeof'] if nvmeof else []))
 
+    def test_preparation_runs_each_contract_before_bundling(self):
+        revision = 'ef6701911cc07d9102f55e52f5a0632e5ddb0a86'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root/'package-receipt.json').write_text(json.dumps({'source_revision': 'engine'}))
+            ci = SimpleNamespace(unpack_fixture=lambda fixture, output: root/'fixture',
+                local_replay_transport=lambda: {}, write_local_replay_transport=lambda path: None)
+            spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
+            captured = []
+            def capture(command, deadline):
+                captured.append(command)
+                if len(captured) == 4:
+                    raise RuntimeError('both replay commands captured')
+            with patch.object(prepare, 'checkout'), patch.object(gcp_sui, 'inspect_archive'), \
+                 patch.object(prepare.importlib.util, 'spec_from_file_location', return_value=spec), \
+                 patch.object(prepare.importlib.util, 'module_from_spec', return_value=ci), \
+                 patch.object(prepare.ci_prepare, 'bounded', side_effect=capture):
+                with self.assertRaisesRegex(RuntimeError, 'both replay commands captured'):
+                    prepare.prepare_sui(root, root, revision, root/'fixture.tar.gz', root/'target', 1800)
+            self.assertEqual(captured[2][captured[2].index('--output')+1], root/'sui/replay')
+            self.assertEqual(captured[3][captured[3].index('--output')+1], root/'sui/replay-original-default')
+            self.assertEqual(captured[3][captured[3].index('--contract')+1], 'original_default')
+
+    def test_package_admission_requires_both_contract_schemas(self):
+        from test_gcp_sui import write_verification
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build_dir = root/'build'
+            (build_dir/'binaries').mkdir(parents=True)
+            with tarfile.open(build_dir/'sources.tar.gz', 'w:gz'):
+                pass
+            binaries = {}
+            for name in gcp_sui.BINARIES:
+                binary = build_dir/'binaries'/name
+                binary.write_text(name)
+                binaries[name] = gcp_sui.sha(binary)
+            (build_dir/'build-manifest.json').write_text(json.dumps({'binaries': binaries}))
+            with tarfile.open(root/'build-bundle.tar.gz', 'w:gz') as archive:
+                for path in build_dir.rglob('*'):
+                    if path.is_file():
+                        archive.add(path, arcname=str(path.relative_to(build_dir)))
+            bundle = root/'sui-package.tar.gz'
+            with tarfile.open(bundle, 'w:gz') as archive:
+                archive.add(root/'build-bundle.tar.gz', arcname='build-bundle.tar.gz')
+            proofs = root/'proofs'
+            write_verification(proofs, 'harness', 'mutexes: 1')
+            verification = root/'verification.tar.gz'
+            def archive_proofs():
+                with tarfile.open(verification, 'w:gz') as archive:
+                    for path in proofs.iterdir():
+                        archive.add(path, arcname=path.name)
+            archive_proofs()
+            with self.assertRaisesRegex(ValueError, 'schema missing.*original_default'):
+                prepare.admit_sui_archives(bundle, verification)
+            write_verification(proofs, 'original_default', 'mutexes: 1024')
+            archive_proofs()
+            with patch.object(prepare.cloud_package, 'elf_identity', return_value={}) as identity, \
+                 patch.object(prepare.cloud_package, 'abi_requirements', return_value={'abi': 'checked'}):
+                self.assertEqual(prepare.admit_sui_archives(bundle, verification), {'abi': 'checked'})
+                self.assertEqual(identity.call_count, len(binaries))
+
 
 class BuildContainerOwnershipTest(unittest.TestCase):
     def inspect_result(self, owner):

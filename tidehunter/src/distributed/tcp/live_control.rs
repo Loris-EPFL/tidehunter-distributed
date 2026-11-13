@@ -143,8 +143,9 @@ impl Client {
                 1,
             );
         }
-        let Response::LiveExports(info) = response? else {
-            return self.wrong_response();
+        let response = response?;
+        let Response::LiveExports(info) = response else {
+            return self.wrong_variant("OpenLiveExports", &response, "LiveExports");
         };
         if self
             .live_config
@@ -166,7 +167,7 @@ impl Client {
             || info.service == 0
             || info.address.parse::<std::net::IpAddr>().is_err()
         {
-            return self.wrong_response();
+            return self.wrong_response("OpenLiveExports", format_args!("block_size={} (expected 4096), service={} (expected nonzero), address={} (expected IP address)", info.block_size, info.service, info.address));
         }
         let count = info.exported_files;
         self.live_exports = Some((authority_epoch, info, count));
@@ -178,7 +179,11 @@ impl Client {
     pub fn lease_live_extent(&mut self, epoch: u64) -> Result<LiveLeased, TcpError> {
         match self.request(Request::LeaseLiveExtent { epoch })? {
             Response::LiveLeased(leased) if self.valid_live_extent(&leased, epoch) => Ok(leased),
-            _ => self.wrong_response(),
+            response => self.wrong_variant(
+                "LeaseLiveExtent",
+                &response,
+                "LiveLeased with valid extent authority and geometry",
+            ),
         }
     }
 
@@ -197,7 +202,11 @@ impl Client {
     ) -> Option<Result<LiveLeased, TcpError>> {
         self.take_control().map(|response| match response? {
             Response::LiveLeased(leased) if self.valid_live_extent(&leased, epoch) => Ok(leased),
-            _ => self.wrong_response(),
+            response => self.wrong_variant(
+                "PreleaseLiveExtent",
+                &response,
+                "LiveLeased with valid extent authority and geometry",
+            ),
         })
     }
 
@@ -315,7 +324,7 @@ impl Client {
             {
                 Ok(reply)
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("AdoptLiveExtent", &response, "LiveAdopted with matching token, aligned adopted frontier, close state and next lease"),
         }
     }
 
@@ -323,7 +332,7 @@ impl Client {
     pub fn release_live_epoch_pin(&mut self, epoch: u64, token: [u8; 16]) -> Result<(), TcpError> {
         match self.request(Request::ReleaseLiveEpochPin { epoch, token })? {
             Response::NvmeofEpochReleased => Ok(()),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("ReleaseLiveEpochPin", &response, "NvmeofEpochReleased"),
         }
     }
 
@@ -453,13 +462,20 @@ impl Client {
                         .checked_add(u64::from(reservation.frame_len))
                         .is_none_or(|end| end > reservation.segment.bytes)
                 {
-                    return self.wrong_response();
+                    return self.wrong_response("ReserveLiveGroup", "reservation authority, token, frame length, alignment or file range differs");
                 }
                 Ok(LiveReserveResponse::Reserved(reserved))
             }
             Response::LiveReserved(LiveReserveWire::Existing(receipts)) => {
                 if receipts.len() != expected.batches.len() {
-                    return self.wrong_response();
+                    return self.wrong_response(
+                        "ReserveLiveGroup",
+                        format_args!(
+                            "existing receipts.len()={}, expected {}",
+                            receipts.len(),
+                            expected.batches.len()
+                        ),
+                    );
                 }
                 let mut durable = Vec::with_capacity(receipts.len());
                 for (receipt, summary) in receipts.into_iter().zip(expected.batches) {
@@ -478,7 +494,7 @@ impl Client {
                         || receipt.address.segment_generation != epoch
                         || receipt.address.len != summary.encoded_len.saturating_add(8)
                     {
-                        return self.wrong_response();
+                        return self.wrong_response("ReserveLiveGroup", "existing receipt identity, version, digest, partition or length differs");
                     }
                     durable.push(receipt.durable());
                 }
@@ -529,7 +545,7 @@ impl Client {
                             .checked_add(u64::from(receipt.address.len))
                             .is_none()
                     {
-                        return self.wrong_response();
+                        return self.wrong_response("CompleteLiveGroup", "receipt epoch, database, partition, segment generation or offset range differs");
                     }
                     durable.push(receipt.durable());
                 }
@@ -691,7 +707,7 @@ impl Client {
                     "unexpected live grant without authority epoch; owner pin may be quarantined",
                 ))
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("LiveTargetStats", &response, "LiveTargetStats"),
         }
     }
     /// Shut down a sealed owner target after all initiator I/O and pins drain.

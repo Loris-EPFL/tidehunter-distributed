@@ -67,7 +67,7 @@ impl Fixture {
         self
     }
 
-    fn new_with_config(
+    pub(super) fn new_with_config(
         max_batches: usize,
         shape: KeyShape,
         group_max_batches: u32,

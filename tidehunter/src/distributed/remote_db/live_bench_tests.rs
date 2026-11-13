@@ -117,7 +117,9 @@ impl Fixture {
             pipelined_writes: true,
             read_cache_bytes: 0,
             read_memory_allowance_bytes: 128 * MIB,
-            preparation_workers: 1,
+            preparation_workers: std::env::var("P11_BENCH_PREPARATION_WORKERS")
+                .map(|value| value.parse().unwrap())
+                .unwrap_or(1),
             scan_prefetch_pages: 1,
             read_lanes: 1,
             max_pending_reads: 64,
@@ -501,6 +503,11 @@ fn run_write(
         );
     }
     save_raw(output, &result.case, &samples);
+    println!(
+        "live_bench preparation_workers={} pipeline={:?}",
+        db.config.preparation_workers,
+        db.pipeline_stats()
+    );
     db.shutdown().unwrap();
     result
 }

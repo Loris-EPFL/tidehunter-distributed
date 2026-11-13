@@ -181,7 +181,7 @@ impl Client {
             {
                 Ok(proof)
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("Checkpoint", &response, "Checkpoint with matching database, partition, epoch and prefix, and retained >= prefix"),
         }
     }
 
@@ -263,10 +263,7 @@ impl Client {
                     durable_end,
                 })
             }
-            _ => {
-                self.broken = true;
-                Err(TcpError::new("checkpoint position proof differs"))
-            }
+            response => self.wrong_variant("CheckpointPosition", &response, "CheckpointPosition with matching database, partition and epoch, and durable_end >= through"),
         }
     }
 
@@ -312,7 +309,7 @@ impl Client {
                     )
                     .map_err(TcpError::component)?;
                     if batch.version().epoch != source_epoch || receipt.address.offset < from {
-                        return self.wrong_response();
+                        return self.wrong_response("ReplayWal", format_args!("batch epoch={} (expected {source_epoch}) or receipt offset={} below from={from}", batch.version().epoch, receipt.address.offset));
                     }
                     let durable = self.check_receipt(&batch, receipt)?;
                     result.push((batch, durable));
@@ -323,7 +320,11 @@ impl Client {
                     next,
                 })
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant(
+                "ReplayWal",
+                &response,
+                "Recovery within the page/group limit with a nonempty, advancing next cursor",
+            ),
         }
     }
 
@@ -353,7 +354,7 @@ impl Client {
             {
                 Ok(files)
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("RetirementFiles", &response, "RetirementFiles within the page limit with strictly increasing, file-aligned offsets after the cursor"),
         }
     }
 
@@ -380,7 +381,7 @@ impl Client {
             files,
         })? {
             Response::Retired => Ok(()),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("RetireFiles", &response, "Retired"),
         }
     }
 
@@ -405,7 +406,7 @@ impl Client {
             files,
         })? {
             Response::Retired => Ok(()),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("RetireWalFiles", &response, "Retired"),
         }
     }
 }

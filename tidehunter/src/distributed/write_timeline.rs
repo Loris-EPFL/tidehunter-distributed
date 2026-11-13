@@ -181,6 +181,10 @@ pub enum WriteTimelineStage {
     Published,
     CallerReplyQueued,
     CallerFinished,
+    /// Leased frame encoding and CRC passes are complete.
+    LiveFrameEncoded,
+    /// The kernel consumed the leased write SQE, before the CQE wait.
+    LiveIoSubmitted,
 }
 
 #[derive(Debug, Serialize)]

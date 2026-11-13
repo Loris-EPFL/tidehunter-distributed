@@ -1420,6 +1420,10 @@ pub struct RemoteDatabase {
     #[cfg(test)]
     before_preparation: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     #[cfg(test)]
+    owner_start_pause: Option<mpsc::Receiver<()>>,
+    #[cfg(test)]
+    fail_prepared_operation: Option<[u8; 16]>,
+    #[cfg(test)]
     concurrent_progress: Arc<Mutex<Option<mpsc::SyncSender<PipelineStats>>>>,
     #[cfg(test)]
     before_checkpoint_io: Option<mpsc::SyncSender<()>>,
@@ -2117,6 +2121,10 @@ impl RemoteDatabase {
             #[cfg(test)]
             before_preparation: None,
             #[cfg(test)]
+            owner_start_pause: None,
+            #[cfg(test)]
+            fail_prepared_operation: None,
+            #[cfg(test)]
             concurrent_progress: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             before_checkpoint_io: None,
@@ -2406,6 +2414,10 @@ impl RemoteDatabase {
     }
 
     fn prepare_admission(&self, batch: CompleteBatch) -> Result<PreparedAdmission, LocalDbError> {
+        #[cfg(test)]
+        if self.fail_prepared_operation == Some(batch.id().operation) {
+            return Err(LocalDbError::new("injected admission preparation failure"));
+        }
         let batch = batch.into_canonical_owned();
         let partition = self
             .inventory

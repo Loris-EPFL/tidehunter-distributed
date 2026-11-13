@@ -937,6 +937,12 @@ impl LiveIo {
             }
         }
     }
+    /// Flush a leased writer's SQE without waiting for its CQE. False means a
+    /// transient submit left work queued; the caller retains ownership and retries.
+    pub(crate) fn submit_pending_write(&mut self) -> Result<bool, LiveIoError> {
+        self.flush_submissions()?;
+        Ok(self.ring.submission().is_empty())
+    }
     /// Hands queued SQEs to the kernel. A transient EBUSY/EINTR leaves any
     /// unconsumed SQEs queued for the next call.
     fn flush_submissions(&mut self) -> Result<(), LiveIoError> {

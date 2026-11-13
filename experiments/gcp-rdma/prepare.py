@@ -279,7 +279,10 @@ def admit_sui_archives(bundle, verification):
         root = Path(temporary)
         nested(bundle, 'build-bundle.tar.gz', root / 'build.tar.gz')
         nested(root / 'build.tar.gz', 'sources.tar.gz', root / 'sources.tar.gz')
-        nested(verification, 'verification/evidence.tar.gz', root / 'evidence.tar.gz')
+        gcp_sui.extract(verification, root / 'verification')
+        for contract in ('harness', 'original_default'):
+            checked = gcp_sui.verification_for_contract(root / 'verification', contract)
+            gcp_sui.inspect_archive(checked / 'evidence.tar.gz')
         identities = []
         with tarfile.open(root / 'build.tar.gz', 'r:gz') as archive:
             member = archive.getmember('build-manifest.json')
@@ -334,12 +337,19 @@ def prepare_sui(output, sui, revision, fixture, target, deadline_seconds, nvmeof
         [sys.executable, script, 'build', '--output', build, '--target', Path(target), '--deadline', str(deadline_seconds)],
         [sys.executable, ROOT / 'experiments/sui-checkpoint/run.py', '--build', build, '--fixture', admitted_fixture,
          '--output', replay, '--deadline', '900', '--transport-config', transport_config],
+        [sys.executable, ROOT / 'experiments/sui-checkpoint/run.py', '--build', build, '--fixture', admitted_fixture,
+         '--output', work / 'replay-original-default', '--deadline', '900', '--transport-config', transport_config,
+         '--contract', 'original_default'],
     ]
     if nvmeof:
         commands[0].append('--nvmeof')
     for command in commands:
         ci_prepare.bounded(command, deadline)
     verification = ci.verification_bundle(replay, work / 'verification', transport)
+    original_verification = ci.verification_bundle(
+        work / 'replay-original-default', work / 'verification-original-default', transport)
+    for contract in ('harness', 'original_default'):
+        gcp_sui.verification_for_contract(work, contract)
     source = json.loads((build / 'source-manifest.json').read_text())
     if source['sui']['revision'] != revision or source['tidehunter-sharded-wal']['revision'] != json.loads((output / 'package-receipt.json').read_text())['source_revision']:
         raise ValueError('Sui build source revisions differ from admitted checkouts')
@@ -351,6 +361,7 @@ def prepare_sui(output, sui, revision, fixture, target, deadline_seconds, nvmeof
     verification_archive = work / 'verification.tar.gz'
     with tarfile.open(verification_archive, 'x:gz') as archive:
         archive.add(verification, arcname='verification')
+        archive.add(original_verification, arcname='verification-original-default')
     sui_abi = admit_sui_archives(bundle, verification_archive)
     receipt = json.loads((output / 'package-receipt.json').read_text())
     receipt.update(sui_archive_path=str(bundle.resolve()), sui_sha256=ci_prepare.sha(bundle), sui_revision=revision,

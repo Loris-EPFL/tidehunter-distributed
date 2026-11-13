@@ -954,6 +954,49 @@ Open after run 13:
 3. Recovery was executed (owner restart with data, coordinator reopen) but not timed. Crash tests on hardware were not done.
 4. Sui guest library gate fixed on hardware using the focused profile. Replay remains unvalidated: r01's frozen producer inherited the measured default mutex count (1,024 rather than its stored 1) and aborted before RPC readiness. Post-run source-environment correction passed real producer startup and source-digest checks under both contracts locally. A separate partial-export collector schema error was also fixed; both archives were retained and verified. No further fleet is authorized. See `FOCUSED_CAMPAIGN_2026-11-07.md`, "Combined run result".
 
+## Run A: contract classes and the 64 KiB put cycle (13 November 2026, one fleet, 34 of 34 cases)
+
+Fleet `bench-633e5e4bb53d4cbe`: 2 `z4m-highmem-16` VMs, one coordinator and one owner, selection `nvmeof_contracts`, revision `941afcd`. 551,552 measured calls, none failed. One repetition per case; no spread is known. Both VMs and the placement policy are deleted. Data: `checkpoint-work/contracts-launch-20261113-a1/analysis/output/` in the parent workspace. The four Sui cells did not complete (see `FOCUSED_CAMPAIGN_2026-11-07.md`, "Run A result").
+
+Class S replies after the device sync; class P replies after the write is in the page cache of the storage host.
+
+| Put, p50 / p99 µs | Leased NVMe-oF, S | Leased NVMe-oF, P | Owner RPC verbs, S | Native barrier, S | Native page cache, P |
+|---|---:|---:|---:|---:|---:|
+| 1 KiB, 1 caller | 67.3 / 236 | 45.3 / 88.8 | 87.4 / 117 | 26.5 / 78.5 | 1.9 / 3.4 |
+| 1 KiB, 16 callers | 166 / 612 | 161 / 484 | 289 / 567 | 61.8 / 158 | 2.9 / 5.8 |
+| 64 KiB, 1 caller | 267 / 465 | 159 / 194 | 384 / 451 | 150 / 214 | 37.6 / 102 |
+| 64 KiB, 16 callers | 2,156 / 2,657 | 1,758 / 3,977 | 3,847 / 4,674 | 2,718 / 3,361 | 155 / 238 |
+
+Sustained 200,000 puts, 1 KiB, 16 callers, complete one-second buckets: class S 77,152, 56,486, 51,958 puts/s; class P 90,437, 89,187 puts/s.
+
+### The 64 KiB cycle with 16 callers (measured)
+
+Source: write timelines of `G21W-r0-a0f43b2526801841f91f` (P) and `G21W-r0-e48025c5b86a96f2053d` (S); 256 groups of 16 puts in each case. Times are medians in µs, measured from the write completion of the previous group.
+
+| Step of one group | Thread | P | S |
+|---|---|---:|---:|
+| Publish and reply to the 16 callers of the previous group | `wal-write-owner` | 0 to 79 | 0 to 79 |
+| Callers send the next put (copy 1 of the value) | callers | 79 to 110 | 79 to 113 |
+| Prepare 16 puts, one after the other (61 µs each: copy 2, CRC32, BLAKE2b-256) | `wal-write-owner` | 110 to 1,094 | 113 to 1,096 |
+| Form the group and hand it to the write worker | both | 1,094 to 1,117 | 1,096 to 1,121 |
+| Encode the frame (copy 3, two CRC32 passes), one `io_uring` write, wait for completion | `value-wal-tcp` | 720 | 1,112 |
+| **One cycle (mean)** | | **1,932** | **2,273** |
+
+The two steps do not overlap. While the owner thread prepares, no write is in flight (1,117 µs of each cycle). While the write is in flight, no put is prepared, because all 16 callers wait for that write. The two long waits of the per-put stage table (`owner_enqueue_started -> owner_dequeued` 443 µs, `admitted -> append_enqueue_started` 473 µs) are the wait for the serial preparation of the other 15 puts; they are not separate costs. Payload rate: 518 MiB/s over the cycle (P), 1,372 MiB/s while a write is in flight.
+
+This replaces the inference of "Open after run 13", item 2: the serial preparation is now measured as 51% (S) to 58% (P) of the cycle. The write interval contains frame encoding and two CRC passes; it is not device time, and this run does not separate CPU, kernel, link and device inside it.
+
+### Candidate changes, in order of measured share (1 and 4 implemented 13 November, not measured on hardware)
+
+Implemented, no hardware result yet. Change 1: the owner thread drains the queued puts into a bounded window, validates them and assigns versions in order, encodes on the preparation pool when the window has at least 2 puts and 128 KiB (a starting value, not a measured crossover), and admits in version order; a put prepared with a version that an earlier failure made unreachable is encoded again before admission. The KV benchmark coordinator uses 8 preparation workers; the library default and the Sui deployment keep 2. Change 4: timeline stages `live_frame_encoded` and `live_io_submitted` split the write interval; a sampled group pays one more `io_uring` call, so its interval can differ from an unsampled group. No wire, persisted-format or acknowledgement change. Workstation fixture (regular file, 64 KiB, 16 callers, 1,024 calls, one repetition, interference flagged; functional evidence only): page-cache p50 981 µs with 1 worker and 484 µs with 8; synced 1,199 µs and 1,029 µs.
+
+1. **Prepare scalar puts in parallel.** The batch header holds the version, and both the member CRC32 and the BLAKE2b digest cover it (`codec.rs:224-258,674-707`), so the caller cannot encode before the owner assigns the version. Without a format change: the owner thread drains the waiting puts, assigns their versions in order, gives encoding, CRC and digest to a worker pool, and admits the results in version order. `submit_many` already does this with `preparation_workers` (`remote_db/preparation.rs`); the scalar path of `ConcurrentRemoteDatabase` does not use it. [INFERENCE] The 984 µs serial span becomes about 61 µs plus hand-off with 16 workers, or about 250 µs with 4; cycle about 0.85 to 1.0 ms in class P, about twice the rate.
+2. **Overlap preparation and write.** With step 1 the pipeline still writes one group and waits. With 16 closed-loop callers every caller is in the group in flight, so overlap needs smaller groups in flight at the same time: several outstanding leased writes with ordered positions, and replies in prefix order. This changes failure handling of the lease cursor and needs a design review.
+3. **One pass less over the payload.** The value is copied three times and read by four integrity passes (two CRC32 and BLAKE2b in preparation and frame build, one CRC32 over the padded group). Workstation measurement of the three primitives alone (i7-12700H, same crate versions, not the cluster CPU): 64 KiB copy 2.3 µs, `crc32fast` 2.2 µs, BLAKE2b-256 44.8 µs (1.4 GiB/s); 1 MiB: 33, 29 and 703 µs. [INFERENCE] The digest is most of the 61 µs of preparation; copies and CRC passes are a few µs per put and about 90 µs of the write interval per group. A faster digest changes the persisted format and the retry identity; ask first.
+4. **The write interval** (720 µs for 1 MiB in P; 1,112 µs with `RWF_DSYNC`). Split the interval into encode, submit and completion wait before any change. Not attributable today.
+
+Native page cache at 64 KiB with 16 callers is 155 µs per put: its writers prepare in parallel and copy into a mapped file. The distributed class P result is 11 times that; the cycle above accounts for the difference in structure, not in device speed.
+
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.
 

@@ -1309,3 +1309,15 @@ Two post-run harness corrections (not in deployed revision `e0af084`):
 - The partial-export collector compared terminal provenance field `descriptor` with download inventory entries that contain only object identity, causing `KeyError`. It now compares generation, size and SHA-256; the existing retention regression also covers the partial Sui archive. GCP 396 and Sui 188 (1 skipped) checks passed after both corrections.
 
 Both result archives were preserved and SHA-256 verified: KV `a4ab4dedb82e2e2622de1e57e3a7b81ceee4fb22666c1064827635b17ed2d1d2`; partial Sui `29ac3071ce4c950524ab15c66488afe86005cfc9e04a8841e657d5d4a92a274c`. Evidence: `checkpoint-work/combined-launch-20261113-firstput1/analysis/output/`, `results-top/`, and `fleet-output/`. A further cloud run requires new authorization; no Sui hardware performance claim is made.
+
+### Run A result (`sui_nvmeof_with_contracts`, 13 November 2026)
+
+Revision `941afcd`; fleet `bench-633e5e4bb53d4cbe`; two VMs created at 01:42:19 and 01:43:10 UTC. Instances, disks and placement policy verified absent by 02:04:05 UTC; `cleanup_verified: true`. Compute upper bound `$2.39`, excluding storage and network. No replacement fleet launched.
+
+KV selection `nvmeof_contracts` (matrix SHA-256 `cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208`): 34 of 34 cases, 551,552 measured calls, all successful, three canaries passed, device reads qualified. One repetition per case. Values by acknowledgement class and the 64 KiB cycle: `PERFORMANCE_PLAN_2026-11-10.md`, "Run A". No first call reached 5 ms; 68 later calls did (64 KiB cases; cause not established).
+
+Sui: cell r01 (owner RPC verbs, `original_default`, owner tier `native`) failed; r02 to r04 did not run. The producer started and the native replay reached checkpoint 1,775. The remote node then stopped at database open with `unexpected authenticated response`.
+
+Cause (found after the run from the archive and the sealed package): `gcp_sui.py` prepared the owners of every cell with the key-space shapes of the packaged local verification, which ran only the `harness` contract. Under `original_default` the Sui node selects other shapes (for example 1,024 mutexes instead of 1 and another `max_dirty_keys` in several key spaces). The owner reported its shape in the status reply, the client compared it with its own and rejected it. The local `original_default` replay did not show this because a local run prepares its owners from the shapes of its own native replay. The error text named no cause, and the owner logs of the failed cell were not exported.
+
+Both archives are preserved and SHA-256 verified: KV `ee959ac44360e06875481c72a5c39946f262c86d3c77e2e13dec7547cedce39e`; partial Sui `5b010718b26314e708045760bd7bd9430d666142e29dd76da29b3bac6244f36b`. Evidence: `checkpoint-work/contracts-launch-20261113-a1/analysis/output/`, `results-top/`, `fleet-output/`. No Sui hardware result exists. A further cloud run requires new authorization.

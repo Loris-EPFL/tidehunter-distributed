@@ -1046,6 +1046,9 @@ def summarize_write_timeline(samples, evidence):
         "live_reserve_ns": ("live_reserve_started", "live_reserve_completed"),
         "live_namespace_setup_ns": ("live_namespace_setup_started", "live_namespace_setup_completed"),
         "live_io_ns": ("live_io_started", "live_io_completed"),
+        "live_frame_encode_ns": ("live_io_started", "live_frame_encoded"),
+        "live_io_submit_ns": ("live_frame_encoded", "live_io_submitted"),
+        "live_io_wait_ns": ("live_io_submitted", "live_io_completed"),
         "live_complete_ns": ("live_complete_started", "live_complete_completed"),
     }
     durations = {name: [] for name in pairs}
@@ -1397,6 +1400,7 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
               "live_group_build_started", "live_group_built", "live_reserve_started", "live_reserve_completed",
               "live_namespace_setup_started", "live_namespace_setup_completed", "live_io_started",
               "live_io_completed", "live_complete_started", "live_complete_completed", "live_receipts_validated",
+              "live_frame_encoded", "live_io_submitted",
               "live_extent_switch_started", "live_extent_switch_completed"}
     ids, owner_keys = set(), set()
     owner_success = {}

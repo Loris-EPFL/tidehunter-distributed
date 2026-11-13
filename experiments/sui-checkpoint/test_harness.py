@@ -271,6 +271,8 @@ class NvmeDeploymentContract(unittest.TestCase):
                     prepare_external.main()
                 result = json.loads((output/'external-manifest.json').read_text())
                 self.assertEqual(result['schema'], 3 if index == 0 else 2)
+                self.assertEqual(result['shape_sha256'],
+                                 {name: build.digest(schema_dir/name/'shape.yaml') for name in schema})
                 if index == 0:
                     self.assertEqual(len(result['hosts']), 1)
                     with tarfile.open(result['hosts'][0]['archive']) as archive:
@@ -279,6 +281,23 @@ class NvmeDeploymentContract(unittest.TestCase):
                     self.assertEqual(len(result['hosts'][0]['commands']), 15)
                 else:
                     self.assertEqual([x['partition'] for x in result['hosts']], list(range(5)))
+
+    def test_external_shapes_reject_other_contract_before_remote_start(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root/'db').mkdir()
+            shape = root/'db/shape.yaml'
+            shape.write_text('mutexes: 1024\nmax_dirty_keys: 16384\n')
+            native = build.digest(shape)
+            manifest = {'shape_sha256': {'db': native}}
+            run.validate_external_shapes(manifest, root, ['db'])
+            for bad in ({}, {'shape_sha256': {}}, {'shape_sha256': {'other': native}}):
+                with self.assertRaisesRegex(ValueError, 'coverage differs'):
+                    run.validate_external_shapes(bad, root, ['db'])
+            owner = hashlib.sha256(b'mutexes: 1\nmax_dirty_keys: 2048\n').hexdigest()
+            manifest['shape_sha256']['db'] = owner
+            with self.assertRaisesRegex(ValueError, f'owner SHA-256={owner}, native SHA-256={native}'):
+                run.validate_external_shapes(manifest, root, ['db'])
 
 
 class SoftwareFabricGeometry(unittest.TestCase):

@@ -453,6 +453,21 @@ mode remain Unsupported/errors. No HA, failover or unbounded-epoch claim is made
 After a source-identical local run has exported native shapes, prepare a fresh
 external namespace (no hosts are launched):
 
+Use the native schema from the **same measured contract**. `harness` and
+`original_default` can have different mutex counts and keyspace settings.
+The GCP package now requires two complete local replay proofs:
+`verification/` for `harness` and `verification-original-default/` for
+`original_default`. Both retain their native schemas and bound audit evidence.
+The GCP launcher selects the proof by the cell contract. A missing proof is an
+error; the launcher does not use the other contract's schema.
+
+The external manifest records `shape_sha256` for each database. After the
+native replay, the runner checks these hashes before it starts the remote
+replay. A mismatch reports the database and both SHA-256 values. The client
+also reports the request and failed status check, with both shape hashes.
+Failed GCP cells retain the stopped owners' logs in `owner-N-logs.tar.gz`
+beside the replay evidence.
+
 ```sh
 python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experiments/sui-checkpoint/prepare_external.py \
   --build /absolute/owned/checkpoint-build \

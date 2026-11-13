@@ -147,6 +147,56 @@ fn collect(
     completed
 }
 
+#[test]
+fn status_shape_mismatch_names_request_and_both_sha256_values() {
+    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
+    let different = KeyShape::new_single(4, 1024, KeyType::uniform(1));
+    let error = match Client::connect(
+        &server.endpoint,
+        &server.tls,
+        Duration::from_secs(2),
+        server.config.partition.clone(),
+        &different,
+    ) {
+        Ok(_) => panic!("owner with a different key shape was accepted"),
+        Err(error) => error,
+    };
+    let owner = Client::shape_sha256(&shape().to_yaml().unwrap());
+    let client = Client::shape_sha256(&different.to_yaml().unwrap());
+    assert_ne!(owner, client);
+    assert_eq!(
+        error.to_string(),
+        format!("Status reply failed check: shape_yaml SHA-256 owner={owner} client={client}")
+    );
+    assert_eq!(
+        Client::shape_sha256(""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+#[test]
+fn invalid_status_bounds_and_wrong_variants_name_the_failure() {
+    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
+    let mut client = server.client();
+    let mut status = client.status().unwrap();
+    status.max_read_bytes = 0;
+    assert_eq!(
+        client
+            .check_status("Fence", status)
+            .unwrap_err()
+            .to_string(),
+        "Fence reply failed check: max_read_bytes=0; expected 1..=268435456"
+    );
+    assert!(client.broken);
+    let error = client
+        .wrong_variant::<()>("Seal", &Response::Retired, "Sealed")
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Seal reply failed check: expected Sealed, received Retired"
+    );
+}
+
 fn observe_idle_readiness_wait(client: &mut Client) {
     client.connection_profile(true, true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);

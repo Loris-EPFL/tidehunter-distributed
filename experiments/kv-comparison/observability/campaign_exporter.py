@@ -1461,6 +1461,9 @@ CORRELATED_WRITE_PAIRS = {
     "live_reserve": ("live_reserve_started", "live_reserve_completed"),
     "live_namespace_setup": ("live_namespace_setup_started", "live_namespace_setup_completed"),
     "live_io": ("live_io_started", "live_io_completed"),
+    "live_frame_encode": ("live_io_started", "live_frame_encoded"),
+    "live_io_submit": ("live_frame_encoded", "live_io_submitted"),
+    "live_io_wait": ("live_io_submitted", "live_io_completed"),
     "live_complete": ("live_complete_started", "live_complete_completed"),
 }
 VALKEY_STAGES = ("mutex_wait", "blocking_enqueue_to_start", "blocking_return_to_wake",

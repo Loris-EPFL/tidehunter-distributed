@@ -534,6 +534,18 @@ def validate_external_hosts(manifest, config, coordinator_cache):
             raise ValueError('external coordinator cache differs')
 
 
+def validate_external_shapes(manifest, schema_root, namespaces):
+    """Bind the fresh native key shapes to the shapes installed on every owner."""
+    expected = manifest.get('shape_sha256')
+    if not isinstance(expected, dict) or set(expected) != set(namespaces):
+        raise ValueError('external owner shape SHA-256 coverage differs from native namespaces')
+    for namespace in namespaces:
+        actual = build.digest(schema_root/namespace/'shape.yaml')
+        if expected[namespace] != actual:
+            raise ValueError(f'external owner key shape differs for {namespace}: '
+                             f'owner SHA-256={expected[namespace]}, native SHA-256={actual}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -679,6 +691,7 @@ def main():
             if (external_manifest['config_sha256'] != build.digest(config_path)
                     or external_manifest['build_manifest_sha256'] != result['build_manifest_sha256']):
                 raise ValueError('external storage source/config binding differs')
+            validate_external_shapes(external_manifest, output/'native-schema', schema)
             result['external_manifest']=external_manifest
             nodes=read_json(config_path.parent/'nodes.json')
         else:

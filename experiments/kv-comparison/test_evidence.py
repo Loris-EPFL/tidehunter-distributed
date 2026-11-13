@@ -53,6 +53,16 @@ class LiveTimelineAdmission(unittest.TestCase):
             self.assertEqual(summary["live_group_observations"]["linked_memberships"], 2)
             self.assertEqual(len(summary["live_group_observations"]["owner_persistence"]), 1)
             self.assertEqual(summary["stage_summaries_ns"]["live_io_ns"]["p50"], 3)
+            split = copy.deepcopy(data)
+            for record in split["timeline"]["records"]:
+                record["events"][1:1] = [
+                    dict(stage="live_frame_encoded", elapsed_ns=3, owner=0, envelope_id=None),
+                    dict(stage="live_io_submitted", elapsed_ns=4, owner=0, envelope_id=None)]
+            self.assertEqual(admit(split)["coverage"]["live_groups"], 1)
+            split_summary = analyze.summarize_write_timeline(
+                list(analyze.read_samples(result / "samples.csv")), split)
+            for stage in ("live_frame_encode_ns", "live_io_submit_ns", "live_io_wait_ns"):
+                self.assertEqual(split_summary["stage_summaries_ns"][stage]["p50"], 1)
             retry = copy.deepcopy(data)
             retry["timeline"]["live_groups"].append(copy.deepcopy(group))
             self.assertEqual(admit(retry)["coverage"]["live_groups"], 2)

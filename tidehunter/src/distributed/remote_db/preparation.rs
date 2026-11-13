@@ -9,6 +9,16 @@
 use super::*;
 use rayon::prelude::*;
 
+type PreparationPlan<'a> = (
+    BatchId,
+    BatchVersion,
+    super::super::codec::ValidatedMutations<'a>,
+);
+type EncodedPreparation = Result<(CompleteBatch, u64), LocalDbError>;
+
+// Below 128 KiB the worker hand-off costs more than the digest computation.
+pub(super) const PARALLEL_PREPARATION_MIN_BYTES: usize = 128 * 1024;
+
 impl RemoteDatabase {
     /// Prepare a bounded borrowed window in parallel, then admit in input order.
     /// Caller-owned inputs are borrowed only until this synchronous call returns.
@@ -117,34 +127,103 @@ impl RemoteDatabase {
             .pipeline_stats
             .prepare_reserved_bytes_peak
             .max(reserved);
-        type PlannedInput<'a> = &'a (
-            BatchId,
-            BatchVersion,
-            super::super::codec::ValidatedMutations<'a>,
-        );
-        let prepare = |(id, version, validated): PlannedInput<'_>| {
+        let prepared = self
+            .encode_preparation_plans(&plans, true)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let prepared = prepared
+            .into_iter()
+            .map(|(batch, _)| self.prepare_admission(batch))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Check ALL conflicts and reservations before allocating any logical slot.
+        // Distinct equal retries share their original version, including within
+        // this window. Distinct contents under one identity are always rejected.
+        let mut seen = HashMap::new();
+        let mut index_bytes = self.reserved_index_bytes;
+        let mut additional_index_bytes = 0usize;
+        let mut pending_bytes = self.pending_bytes;
+        for prepared in &prepared {
+            let batch = &prepared.batch;
+            let id = batch.id();
+            let old = self
+                .existing_identity(id)?
+                .map(|(_, digest)| digest)
+                .or_else(|| seen.get(&id).copied());
+            if let Some(digest) = old {
+                if digest != batch.digest() {
+                    return Err(LocalDbError::new("retry changed original batch"));
+                }
+                continue;
+            }
+            seen.insert(id, batch.digest());
+            pending_bytes = pending_bytes
+                .checked_add(prepared.credit)
+                .filter(|bytes| *bytes <= self.config.max_pending_bytes)
+                .ok_or_else(|| LocalDbError::new("pending byte budget reached"))?;
+            self.check_storage_group_capacity(1, batch.mutations().len())?;
+            additional_index_bytes = additional_index_bytes
+                .checked_add(prepared.metadata_bytes)
+                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
+            index_bytes = index_bytes
+                .checked_add(prepared.metadata_bytes)
+                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
+        }
+        if self.index.check_capacity(index_bytes).is_err() {
+            self.ensure_admission_pressure(AdmissionPressure::Index {
+                additional_bytes: additional_index_bytes,
+            })?;
+            index_bytes = self
+                .reserved_index_bytes
+                .checked_add(additional_index_bytes)
+                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
+        }
+        self.index
+            .check_capacity(index_bytes)
+            .map_err(LocalDbError::component)?;
+        self.check_checkpoint_capacity(seen.len())?;
+        let nested = (self.stats.storage_wait_ns - validation_before.storage_wait_ns)
+            .saturating_add(self.stats.publication_ns - validation_before.publication_ns)
+            .saturating_add(self.stats.dispatch_ns - validation_before.dispatch_ns);
+        self.stats.validation_ns += elapsed(validation_started).saturating_sub(nested);
+        prepared
+            .into_iter()
+            .map(|prepared| self.admit_prepared(prepared))
+            .collect()
+    }
+
+    /// Encode borrowed inputs without allocating logical slots. Each result is
+    /// independent so scalar callers retain their own errors and reply credits.
+    pub(super) fn encode_preparation_plans(
+        &mut self,
+        plans: &[PreparationPlan<'_>],
+        parallel: bool,
+    ) -> Result<Vec<EncodedPreparation>, LocalDbError> {
+        let prepare = |(id, version, validated): &PreparationPlan<'_>| {
             let began = Instant::now();
-            let batch = validated
+            let result = validated
                 .encode(*id, *version)
-                .map_err(LocalDbError::component)?
-                .into_canonical_owned();
-            Ok::<_, LocalDbError>((batch, elapsed(began)))
+                .map_err(LocalDbError::component)
+                .map(CompleteBatch::into_canonical_owned);
+            result.map(|batch| (batch, elapsed(began)))
         };
         let began = Instant::now();
         #[cfg(test)]
         let gate = self.before_preparation.take();
-        let prepared: Vec<_> = if let Some(pool) = self
+        let pool = self
             .preparation_pool
             .as_ref()
-            .and_then(|owner| owner.pool.clone())
-        {
+            .filter(|_| parallel && plans.len() > 1)
+            .and_then(|owner| owner.pool.clone());
+        let parallel = pool.is_some();
+        let prepared = if let Some(pool) = pool {
             let build = || {
                 #[cfg(test)]
                 if let Some((entered, resume)) = gate {
                     let _ = entered.send(());
                     let _ = resume.recv();
                 }
-                plans.par_iter().map(prepare).collect::<Result<Vec<_>, _>>()
+                Ok::<_, LocalDbError>(plans.par_iter().map(prepare).collect::<Vec<_>>())
             };
             if self.config.pipelined_writes && !self.submissions.is_empty() {
                 // TiKV-style stage separation: preparation of this window must
@@ -189,78 +268,17 @@ impl RemoteDatabase {
                 pool.install(build)?
             }
         } else {
-            plans.iter().map(prepare).collect::<Result<Vec<_>, _>>()?
+            plans.iter().map(prepare).collect()
         };
         self.pipeline_stats.prepare_calls += 1;
         self.pipeline_stats.prepare_wall_ns += elapsed(began);
-        self.pipeline_stats.prepare_task_ns += prepared.iter().map(|(_, ns)| ns).sum::<u64>();
-        if self.preparation_pool.is_some() && batches.len() > 1 {
-            self.pipeline_stats.parallel_prepared_batches += batches.len() as u64;
+        self.pipeline_stats.prepare_task_ns += prepared
+            .iter()
+            .filter_map(|result| result.as_ref().ok().map(|(_, ns)| ns))
+            .sum::<u64>();
+        if parallel {
+            self.pipeline_stats.parallel_prepared_batches += plans.len() as u64;
         }
-        let prepared = prepared
-            .into_iter()
-            .map(|(batch, _)| self.prepare_admission(batch))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Check ALL conflicts and reservations before allocating any logical slot.
-        // Distinct equal retries share their original version, including within
-        // this window. Distinct contents under one identity are always rejected.
-        let mut seen = HashMap::new();
-        let mut index_bytes = self.reserved_index_bytes;
-        let mut additional_index_bytes = 0usize;
-        let mut pending_bytes = self.pending_bytes;
-        for prepared in &prepared {
-            let batch = &prepared.batch;
-            let id = batch.id();
-            let old = self
-                .existing_identity(id)?
-                .map(|(_, digest)| digest)
-                .or_else(|| seen.get(&id).copied());
-            if let Some(digest) = old {
-                if digest != batch.digest() {
-                    return Err(LocalDbError::new("retry changed original batch"));
-                }
-                continue;
-            }
-            seen.insert(id, batch.digest());
-            pending_bytes = pending_bytes
-                .checked_add(prepared.credit)
-                .filter(|bytes| *bytes <= self.config.max_pending_bytes)
-                .ok_or_else(|| LocalDbError::new("pending byte budget reached"))?;
-            // A window may span successive spillable groups on one node. Check
-            // every indivisible batch now; actual group construction enforces
-            // the combined fresh-window count/descriptor budget before I/O.
-            self.check_storage_group_capacity(1, batch.mutations().len())?;
-            additional_index_bytes = additional_index_bytes
-                .checked_add(prepared.metadata_bytes)
-                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-            index_bytes = index_bytes
-                .checked_add(prepared.metadata_bytes)
-                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-        }
-        if self.index.check_capacity(index_bytes).is_err() {
-            self.ensure_admission_pressure(AdmissionPressure::Index {
-                additional_bytes: additional_index_bytes,
-            })?;
-            index_bytes = self
-                .reserved_index_bytes
-                .checked_add(additional_index_bytes)
-                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-        }
-        self.index
-            .check_capacity(index_bytes)
-            .map_err(LocalDbError::component)?;
-        self.check_checkpoint_capacity(seen.len())?;
-        // Progress may publish older work while preparation is running.
-        let nested = (self.stats.storage_wait_ns - validation_before.storage_wait_ns)
-            .saturating_add(self.stats.publication_ns - validation_before.publication_ns)
-            .saturating_add(self.stats.dispatch_ns - validation_before.dispatch_ns);
-        self.stats.validation_ns += elapsed(validation_started).saturating_sub(nested);
-        // Move results one by one; do not keep extra owners after publication
-        // refunds credit. Input order is retained regardless of worker schedule.
-        prepared
-            .into_iter()
-            .map(|prepared| self.admit_prepared(prepared))
-            .collect()
+        Ok(prepared)
     }
 }

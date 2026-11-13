@@ -692,7 +692,7 @@ impl Receipt {
         DurableBatch::from_validated_parts(self.id, self.version, self.digest, self.address)
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, strum::AsRefStr)]
 enum Response {
     Checkpoint(checkpoint::CheckpointProof),
     CheckpointPosition {
@@ -1516,7 +1516,7 @@ impl Client {
                 self.ram_probe_bytes = Some(value_bytes);
                 Ok(())
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("PrepareRamProbe", &response, "RamProbePrepared"),
         }
     }
 
@@ -1548,7 +1548,11 @@ impl Client {
                 }
                 Ok(bytes.into_bytes())
             }
-            _ => self.wrong_response(),
+            Response::RamProbe(_) => self.wrong_response(
+                "ReadRamProbe",
+                "payload length or byte pattern differs from the prepared probe",
+            ),
+            response => self.wrong_variant("ReadRamProbe", &response, "RamProbe"),
         }
     }
 
@@ -1556,7 +1560,7 @@ impl Client {
     pub fn read_io_stats(&mut self) -> Result<ReadExecutorStats, TcpError> {
         match self.request(Request::ReadIoStats)? {
             Response::ReadIoStats(stats) => Ok(stats),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("ReadIoStats", &response, "ReadIoStats"),
         }
     }
     /// Nonblocking read-only owner counters for operational metrics.
@@ -1565,11 +1569,18 @@ impl Client {
             Response::OperationalReadIoStats(snapshot) => {
                 let (partition, stats) = *snapshot;
                 if partition != self.expected {
-                    return self.wrong_response();
+                    return self.wrong_response(
+                        "OperationalReadIoStats",
+                        "partition differs from the client partition configuration",
+                    );
                 }
                 Ok(stats)
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant(
+                "OperationalReadIoStats",
+                &response,
+                "OperationalReadIoStats",
+            ),
         }
     }
     pub fn connect(
@@ -1865,13 +1876,13 @@ impl Client {
                 profile.client_transport = client_transport;
                 Ok(*profile)
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("ConnectionProfile", &response, "ConnectionProfile"),
         }
     }
     pub(crate) fn owner_timeline_arm(&mut self, limit: usize) -> Result<(), TcpError> {
         match self.request(Request::OwnerTimelineArm { limit })? {
             Response::OwnerTimelineArmed => Ok(()),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("OwnerTimelineArm", &response, "OwnerTimelineArmed"),
         }
     }
 
@@ -1972,7 +1983,7 @@ impl Client {
                 }
                 Ok((records, dropped, incomplete, more))
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("OwnerTimelineFetch", &response, "OwnerTimelinePage"),
         }
     }
 
@@ -1986,7 +1997,7 @@ impl Client {
     ) -> Result<crate::read_probe::ReadEvidence, TcpError> {
         match self.request(Request::ReadEvidence { epoch, evict })? {
             Response::ReadEvidence(evidence) => Ok(evidence),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("ReadEvidence", &response, "ReadEvidence"),
         }
     }
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -1998,36 +2009,139 @@ impl Client {
     ) -> Result<crate::read_probe::ProcessResources, TcpError> {
         match self.request(Request::ProcessResources { epoch })? {
             Response::ProcessResources(resources) => Ok(resources),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("ProcessResources", &response, "ProcessResources"),
         }
     }
-    fn wrong_response<T>(&mut self) -> Result<T, TcpError> {
+    fn wrong_response<T>(
+        &mut self,
+        request: &str,
+        detail: impl std::fmt::Display,
+    ) -> Result<T, TcpError> {
         self.broken = true;
-        Err(TcpError::new("unexpected authenticated response"))
+        Err(TcpError::new(format!(
+            "{request} reply failed check: {detail}"
+        )))
     }
-    fn check_status(&mut self, status: NodeStatus) -> Result<NodeStatus, TcpError> {
-        if status.partition != self.expected
-            || status.shape_yaml != self.shape.to_yaml().map_err(TcpError::component)?
-            || status.max_epochs == 0
-            || status.max_epochs > 1024
-            || !(1024..=HARD_FRAME_LIMIT).contains(&status.max_frame_bytes)
-            || !(1..=256).contains(&status.max_reads)
-            || !(1..=256 * 1024 * 1024).contains(&status.max_read_bytes)
-            || !(1..=1024).contains(&status.recovery_page_batches)
-            || status.epochs.len() > status.max_epochs
-            || status.epochs.iter().any(|e| e.epoch == 0)
-            || status.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch)
-            || status.epochs.iter().filter(|e| !e.sealed).count()
-                != usize::from(status.active_epoch.is_some())
-            || status.active_epoch.is_some_and(|epoch| {
-                status.epochs.last()
-                    != Some(&NodeEpoch {
-                        epoch,
-                        sealed: false,
-                    })
-            })
+    fn wrong_variant<T>(
+        &mut self,
+        request: &str,
+        response: &Response,
+        expected: &str,
+    ) -> Result<T, TcpError> {
+        self.wrong_response(
+            request,
+            format_args!("expected {expected}, received {}", response.as_ref()),
+        )
+    }
+    fn shape_sha256(yaml: &str) -> String {
+        // This named TLS 1.3 suite always supplies SHA-256. Rustls/ring is
+        // enabled by experimental-distributed, including no-test-utils clients.
+        let hash = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .expect("TLS13_AES_128_GCM_SHA256 is a TLS 1.3 suite")
+            .common
+            .hash_provider
+            .hash(yaml.as_bytes());
+        let mut hex = String::with_capacity(64);
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        for byte in hash.as_ref() {
+            hex.push(char::from(DIGITS[(byte >> 4) as usize]));
+            hex.push(char::from(DIGITS[(byte & 15) as usize]));
+        }
+        hex
+    }
+    fn check_status(&mut self, request: &str, status: NodeStatus) -> Result<NodeStatus, TcpError> {
+        if status.partition != self.expected {
+            return self.wrong_response(
+                request,
+                "partition differs from the client partition configuration",
+            );
+        }
+        let expected_shape = self.shape.to_yaml().map_err(TcpError::component)?;
+        if status.shape_yaml != expected_shape {
+            return self.wrong_response(
+                request,
+                format_args!(
+                    "shape_yaml SHA-256 owner={} client={}",
+                    Self::shape_sha256(&status.shape_yaml),
+                    Self::shape_sha256(&expected_shape)
+                ),
+            );
+        }
+        if !(1..=1024).contains(&status.max_epochs) {
+            return self.wrong_response(
+                request,
+                format_args!("max_epochs={}; expected 1..=1024", status.max_epochs),
+            );
+        }
+        if !(1024..=HARD_FRAME_LIMIT).contains(&status.max_frame_bytes) {
+            return self.wrong_response(
+                request,
+                format_args!(
+                    "max_frame_bytes={}; expected 1024..={HARD_FRAME_LIMIT}",
+                    status.max_frame_bytes
+                ),
+            );
+        }
+        if !(1..=256).contains(&status.max_reads) {
+            return self.wrong_response(
+                request,
+                format_args!("max_reads={}; expected 1..=256", status.max_reads),
+            );
+        }
+        if !(1..=256 * 1024 * 1024).contains(&status.max_read_bytes) {
+            return self.wrong_response(
+                request,
+                format_args!(
+                    "max_read_bytes={}; expected 1..=268435456",
+                    status.max_read_bytes
+                ),
+            );
+        }
+        if !(1..=1024).contains(&status.recovery_page_batches) {
+            return self.wrong_response(
+                request,
+                format_args!(
+                    "recovery_page_batches={}; expected 1..=1024",
+                    status.recovery_page_batches
+                ),
+            );
+        }
+        if status.epochs.len() > status.max_epochs {
+            return self.wrong_response(
+                request,
+                format_args!(
+                    "epochs.len()={} exceeds max_epochs={}",
+                    status.epochs.len(),
+                    status.max_epochs
+                ),
+            );
+        }
+        if status.epochs.iter().any(|e| e.epoch == 0) {
+            return self.wrong_response(request, "epochs contains epoch zero");
+        }
+        if status.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch) {
+            return self.wrong_response(request, "epochs are not strictly increasing");
+        }
+        if status.epochs.iter().filter(|e| !e.sealed).count()
+            != usize::from(status.active_epoch.is_some())
         {
-            return self.wrong_response();
+            return self.wrong_response(request, "unsealed epoch count differs from active_epoch");
+        }
+        if status.active_epoch.is_some_and(|epoch| {
+            status.epochs.last()
+                != Some(&NodeEpoch {
+                    epoch,
+                    sealed: false,
+                })
+        }) {
+            return self.wrong_response(
+                request,
+                format_args!(
+                    "active_epoch={:?} is not the last unsealed epoch",
+                    status.active_epoch
+                ),
+            );
         }
         self.frame_limit = status.max_frame_bytes;
         self.max_reads = status.max_reads;
@@ -2038,16 +2152,20 @@ impl Client {
     }
     pub fn status(&mut self) -> Result<NodeStatus, TcpError> {
         match self.request(Request::Status { protocol: PROTOCOL })? {
-            Response::Status(status) => self.check_status(status),
-            _ => self.wrong_response(),
+            Response::Status(status) => self.check_status("Status", status),
+            response => self.wrong_variant("Status", &response, "Status"),
         }
     }
     pub fn fence_to(&mut self, epoch: u64) -> Result<NodeStatus, TcpError> {
         match self.request(Request::Fence { epoch })? {
             Response::Status(status) if status.active_epoch == Some(epoch) => {
-                self.check_status(status)
+                self.check_status("Fence", status)
             }
-            _ => self.wrong_response(),
+            Response::Status(status) => self.wrong_response(
+                "Fence",
+                format_args!("active_epoch={:?}, expected {epoch}", status.active_epoch),
+            ),
+            response => self.wrong_variant("Fence", &response, "Status"),
         }
     }
     fn check_receipt(
@@ -2174,7 +2292,7 @@ impl Client {
             {
                 Ok(locations)
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant("ValidateRecordReferences", &response, "ValidatedRecordReferences with matching count, references, WAL file size and partition"),
         }
     }
     /// Acquire an owner-pinned namespace admission before validating its catalog.
@@ -2191,7 +2309,9 @@ impl Client {
             reference,
         })? {
             Response::NvmeofExportRegistered(token) => Ok(token),
-            _ => self.wrong_response(),
+            response => {
+                self.wrong_variant("RegisterNvmeofExport", &response, "NvmeofExportRegistered")
+            }
         }
     }
 
@@ -2204,7 +2324,9 @@ impl Client {
     ) -> Result<(), TcpError> {
         match self.request(Request::ReleaseNvmeofExport { epoch, token })? {
             Response::NvmeofExportReleased => Ok(()),
-            _ => self.wrong_response(),
+            response => {
+                self.wrong_variant("ReleaseNvmeofExport", &response, "NvmeofExportReleased")
+            }
         }
     }
 
@@ -2212,7 +2334,9 @@ impl Client {
     pub(crate) fn register_nvmeof_epoch_pin(&mut self, epoch: u64) -> Result<[u8; 16], TcpError> {
         match self.request(Request::RegisterNvmeofEpochPin { epoch })? {
             Response::NvmeofEpochPinned(token) => Ok(token),
-            _ => self.wrong_response(),
+            response => {
+                self.wrong_variant("RegisterNvmeofEpochPin", &response, "NvmeofEpochPinned")
+            }
         }
     }
 
@@ -2224,7 +2348,9 @@ impl Client {
     ) -> Result<(), TcpError> {
         match self.request(Request::ReleaseNvmeofEpochPin { epoch, token })? {
             Response::NvmeofEpochReleased => Ok(()),
-            _ => self.wrong_response(),
+            response => {
+                self.wrong_variant("ReleaseNvmeofEpochPin", &response, "NvmeofEpochReleased")
+            }
         }
     }
     pub fn read_records(
@@ -2338,7 +2464,10 @@ impl Client {
                     )
                     .map_err(TcpError::component)?;
                     if batch.version().epoch != epoch {
-                        return self.wrong_response();
+                        return self.wrong_response(
+                            "Recover",
+                            format_args!("batch epoch={}, expected {epoch}", batch.version().epoch),
+                        );
                     }
                     let durable = self.check_receipt(&batch, receipt)?;
                     result.push((batch, durable));
@@ -2349,13 +2478,17 @@ impl Client {
                     next,
                 })
             }
-            _ => self.wrong_response(),
+            response => self.wrong_variant(
+                "Recover",
+                &response,
+                "Recovery within the page limit with a contiguous, nonempty next cursor",
+            ),
         }
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
         match self.request(Request::Seal { epoch })? {
             Response::Sealed => Ok(()),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("Seal", &response, "Sealed"),
         }
     }
     pub fn stats(&mut self) -> Result<PartitionStats, TcpError> {
@@ -2379,7 +2512,7 @@ impl Client {
                 registered_records: records,
                 reference_metadata_bytes: metadata,
             }),
-            _ => self.wrong_response(),
+            response => self.wrong_variant("StatsDetailed", &response, "StatsDetailed"),
         }
     }
 }

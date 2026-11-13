@@ -104,6 +104,111 @@ struct DeferredWrite {
     fresh_generation: Option<u64>,
 }
 
+type QueuedWrite = ([u8; 16], Vec<Mutation>, WriteReply);
+
+fn prepare_window(
+    db: &mut RemoteDatabase,
+    writes: &[QueuedWrite],
+) -> Result<Vec<Result<PreparedAdmission, LocalDbError>>, LocalDbError> {
+    let started = Instant::now();
+    let before = db.authority_write_stats();
+    let mut planned = HashMap::with_capacity(writes.len());
+    let mut next = db.submission_next();
+    let mut encoded_bytes = 0usize;
+    let mut plans = Vec::with_capacity(writes.len());
+    let mut slots = Vec::with_capacity(writes.len());
+    let mut results: Vec<_> = (0..writes.len()).map(|_| None).collect();
+    for (index, (operation, mutations, _)) in writes.iter().enumerate() {
+        let plan = (|| {
+            let id = BatchId {
+                database: db.config.storage.database,
+                operation: *operation,
+            };
+            let existing = db.existing_identity(id)?;
+            let validated = CompleteBatch::validated_mutations(
+                &db.shape,
+                mutations,
+                db.config.storage.batch_limits,
+            )
+            .map_err(LocalDbError::component)?;
+            let version = if let Some((version, _)) = existing {
+                version
+            } else if let Some(version) = planned.get(&id) {
+                *version
+            } else {
+                let version = BatchVersion {
+                    epoch: db.epoch,
+                    sequence: next,
+                };
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| LocalDbError::new("version overflow"))?;
+                planned.insert(id, version);
+                version
+            };
+            encoded_bytes = encoded_bytes.saturating_add(validated.encoded_len());
+            Ok((id, version, validated))
+        })();
+        match plan {
+            Ok(plan) => {
+                slots.push(index);
+                plans.push(plan);
+            }
+            Err(error) => results[index] = Some(Err(error)),
+        }
+    }
+    let prepared = db.encode_preparation_plans(
+        &plans,
+        encoded_bytes >= super::preparation::PARALLEL_PREPARATION_MIN_BYTES,
+    )?;
+    for (index, result) in slots.into_iter().zip(prepared) {
+        results[index] = Some(result.and_then(|(batch, _)| {
+            let prepared = db.prepare_admission(batch)?;
+            let batch = &prepared.batch;
+            db.write_timeline
+                .batch(batch.id().operation, batch.version());
+            // The timeline has no timestamp insertion API. Prepared is recorded
+            // on the owner after join; prepare_task_ns sums per-put encode spans.
+            db.write_timeline.batch_event(
+                batch.version(),
+                WriteTimelineStage::Prepared,
+                None,
+                None,
+            );
+            Ok(prepared)
+        }));
+    }
+    let after = db.authority_write_stats();
+    let nested = (after.storage_wait_ns - before.storage_wait_ns)
+        .saturating_add(after.publication_ns - before.publication_ns)
+        .saturating_add(after.dispatch_ns - before.dispatch_ns);
+    db.stats.validation_ns += elapsed(started).saturating_sub(nested);
+    db.record_admission_span(started, before);
+    Ok(results.into_iter().map(Option::unwrap).collect())
+}
+
+fn reject_preparation(
+    db: &RemoteDatabase,
+    reply: WriteReply,
+    error: LocalDbError,
+) -> Result<(), LocalDbError> {
+    let poisoned = !db.healthy || db.ensure_healthy().is_err();
+    if poisoned {
+        record_first_failure(
+            &db.first_failure,
+            None,
+            error.uncertain_version,
+            "prepare_submit",
+            &error,
+        );
+    }
+    reply.finish(Err(error));
+    if poisoned {
+        return Err(LocalDbError::new("write failed; recovery required"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Default)]
 struct Snapshot {
     stats: LocalDbStats,
@@ -1106,8 +1211,16 @@ fn drive_owner(
     admission: &Admission,
     snapshot: &Mutex<Snapshot>,
 ) -> Result<(), LocalDbError> {
+    #[cfg(test)]
+    if let Some(resume) = db.owner_start_pause.take() {
+        let _ = resume.recv();
+    }
     let mut pending: VecDeque<WriteReply> = VecDeque::new();
-    let mut head: Option<DeferredWrite> = None;
+    // At most one ready-input window is retained. Reply credits cover its
+    // detached inputs and encodings; a deferred front blocks all later writes.
+    let window_bound = admission.max_requests.min(db.config.max_pending_batches);
+    let mut prepared_writes = VecDeque::with_capacity(window_bound);
+    let mut held_command = None;
     let mut barrier: Option<Reply<()>> = None;
     let mut disconnected = false;
     let mut finish_profiles = false;
@@ -1209,74 +1322,101 @@ fn drive_owner(
         if let Some(events) = db.concurrent_progress.lock().as_ref() {
             let _ = events.try_send(db.pipeline_stats());
         }
-        if disconnected && head.is_none() && db.submissions.is_empty() {
+        if disconnected && prepared_writes.is_empty() && db.submissions.is_empty() {
             return Ok(());
         }
         let mut admitted = false;
+        // Retained prepared writes consume this pass's budget too.
+        let mut receive_budget = admission.max_requests - prepared_writes.len();
         if barrier.is_none() && !disconnected {
-            for _ in 0..admission.max_requests {
-                let command = if head.is_some() {
-                    None
-                } else {
-                    match receiver.try_recv() {
-                        Ok(OwnerCommand::Write {
-                            operation,
-                            mutations,
-                            reply,
-                        }) => {
-                            db.write_timeline
-                                .wait_leave(WriteWait::OwnerEnqueueToDequeue, 1);
-                            db.write_timeline
-                                .operation_event(operation, WriteTimelineStage::OwnerDequeued);
-                            let started = Instant::now();
-                            let before = db.authority_write_stats();
-                            let prepared = db.prepare_submit(operation, mutations);
-                            if let Ok(prepared) = &prepared {
-                                db.write_timeline.batch_event(
-                                    prepared.batch.version(),
-                                    WriteTimelineStage::Prepared,
-                                    None,
-                                    None,
-                                );
-                            }
-                            db.record_admission_span(started, before);
-                            match prepared {
-                                Ok(prepared) => {
-                                    head = Some(DeferredWrite {
-                                        prepared,
-                                        reply,
-                                        since: None,
-                                        drained_generation: None,
-                                        fresh_generation: None,
-                                    })
-                                }
-                                Err(error) => {
-                                    let poisoned = !db.healthy || db.ensure_healthy().is_err();
-                                    if poisoned {
-                                        record_first_failure(
-                                            &db.first_failure,
-                                            None,
-                                            error.uncertain_version,
-                                            "prepare_submit",
-                                            &error,
-                                        );
-                                    }
-                                    reply.finish(Err(error));
-                                    if poisoned {
-                                        return Err(LocalDbError::new(
-                                            "write failed; recovery required",
-                                        ));
-                                    }
-                                    admitted = true;
-                                    continue;
-                                }
-                            }
-                            None
-                        }
-                        other => Some(other),
+            for pass in 0..admission.max_requests {
+                if prepared_writes.is_empty() && held_command.is_none() {
+                    if receive_budget == 0 {
+                        break;
                     }
-                };
-                if let Some(mut write) = head.take() {
+                    let mut writes = Vec::new();
+                    let mut bytes = 0usize;
+                    for _ in 0..window_bound
+                        .min(admission.max_requests - pass)
+                        .min(receive_budget)
+                    {
+                        match receiver.try_recv() {
+                            Ok(OwnerCommand::Write {
+                                operation,
+                                mutations,
+                                reply,
+                            }) => {
+                                db.write_timeline
+                                    .wait_leave(WriteWait::OwnerEnqueueToDequeue, 1);
+                                db.write_timeline
+                                    .operation_event(operation, WriteTimelineStage::OwnerDequeued);
+                                bytes += reply._credit.bytes;
+                                receive_budget -= 1;
+                                writes.push((operation, mutations, reply));
+                                // All these requests already own byte credits;
+                                // their sum cannot exceed the admission bound.
+                                if bytes >= admission.max_bytes {
+                                    break;
+                                }
+                            }
+                            other => {
+                                held_command = Some(other);
+                                break;
+                            }
+                        }
+                    }
+                    if !writes.is_empty() {
+                        let prepared = prepare_window(db, &writes)?;
+                        for ((_, _, reply), result) in writes.into_iter().zip(prepared) {
+                            match result {
+                                Ok(prepared) => prepared_writes.push_back(DeferredWrite {
+                                    prepared,
+                                    reply,
+                                    since: None,
+                                    drained_generation: None,
+                                    fresh_generation: None,
+                                }),
+                                Err(error) => reject_preparation(db, reply, error)?,
+                            }
+                        }
+                        admitted = true;
+                    }
+                }
+                if let Some(mut write) = prepared_writes.pop_front() {
+                    let id = write.prepared.batch.id();
+                    let version = write.prepared.batch.version();
+                    let next = BatchVersion {
+                        epoch: db.epoch,
+                        sequence: db.submission_next(),
+                    };
+                    let expected = if version == next {
+                        next
+                    } else {
+                        db.existing_identity(id)?
+                            .map(|(version, _)| version)
+                            .unwrap_or(next)
+                    };
+                    if version != expected {
+                        // An earlier prepare/admission failed, or a checkpoint
+                        // changed the epoch. No slot was allocated for this
+                        // batch: re-encode with the next reachable version.
+                        db.write_timeline.forget_version(id.operation, version);
+                        let started = Instant::now();
+                        let before = db.authority_write_stats();
+                        let result = db.prepare_submit(
+                            id.operation,
+                            write.prepared.batch.mutations().to_vec(),
+                        );
+                        db.record_admission_span(started, before);
+                        match result {
+                            Ok(prepared) => write.prepared = prepared,
+                            Err(error) => {
+                                reject_preparation(db, write.reply, error)?;
+                                admitted = true;
+                                continue;
+                            }
+                        }
+                    }
                     let trace_identity = db.write_timeline.enabled().then(|| {
                         (
                             write.prepared.batch.id().operation,
@@ -1330,7 +1470,7 @@ fn drive_owner(
                                             Err(LocalDbError::new("admission capacity reached"))
                                         }))
                                     } else {
-                                        head = Some(write);
+                                        prepared_writes.push_front(write);
                                         break;
                                     }
                                 } else if db.background_checkpoint.is_none() {
@@ -1345,7 +1485,7 @@ fn drive_owner(
                                     })?;
                                     if db.background_checkpoint.is_some() {
                                         write.fresh_generation = Some(db.snapshot_generation);
-                                        head = Some(write);
+                                        prepared_writes.push_front(write);
                                         break;
                                     }
                                     let error = match pressure {
@@ -1358,11 +1498,11 @@ fn drive_owner(
                                         Err(LocalDbError::new("admission capacity reached"))
                                     }))
                                 } else {
-                                    head = Some(write);
+                                    prepared_writes.push_front(write);
                                     break;
                                 }
                             } else {
-                                head = Some(write);
+                                prepared_writes.push_front(write);
                                 break;
                             }
                         }
@@ -1409,7 +1549,11 @@ fn drive_owner(
                     admitted = true;
                     continue;
                 }
-                match command.expect("command or deferred write") {
+                let Some(command) = held_command.take() else {
+                    // Every member of a full window may fail validation.
+                    continue;
+                };
+                match command {
                     Ok(OwnerCommand::Write { .. }) => {
                         unreachable!("write commands are prepared above")
                     }

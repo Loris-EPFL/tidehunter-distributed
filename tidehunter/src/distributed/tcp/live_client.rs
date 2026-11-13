@@ -1760,6 +1760,10 @@ impl super::Client {
         offset: u64,
         len: usize,
         encode: impl FnOnce(&mut [u8]) -> Result<(), super::TcpError>,
+        trace: Option<(
+            &crate::distributed::write_timeline::WriteTimeline,
+            crate::distributed::write_timeline::LiveGroupSample,
+        )>,
     ) -> Result<(), super::TcpError> {
         use crate::distributed::nvmeof::live_io::{
             LiveIoError, LiveIoResult, LiveSubmitOutcome, LiveWriteSync,
@@ -1804,6 +1808,12 @@ impl super::Client {
             let mut buffer = io.write_buffer(len)?;
             encode(&mut buffer)
                 .map_err(|error| LiveIoError::Io(std::io::Error::other(error.to_string())))?;
+            if let Some((timeline, sample)) = trace {
+                timeline.live_group_event(
+                    Some(sample),
+                    crate::distributed::write_timeline::WriteTimelineStage::LiveFrameEncoded,
+                );
+            }
             buffer.submit_write_buffer(1, offset, sync, deadline)
         })();
         match outcome {
@@ -1837,12 +1847,31 @@ impl super::Client {
         }
         let mut timed_out = false;
         let mut completed_at = None;
+        let mut submission_recorded = false;
         let result = (|| {
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     timed_out = true;
                     return Err(super::TcpError::new("leased write deadline expired"));
+                }
+                if trace.is_some() && !submission_recorded {
+                    // Sampled groups pay one extra submit syscall to expose
+                    // this boundary. Their CQE-wait interval and total can
+                    // differ from untraced submit_with_args(1) writes.
+                    if !io
+                        .submit_pending_write()
+                        .map_err(super::TcpError::component)?
+                    {
+                        continue;
+                    }
+                    if let Some((timeline, sample)) = trace {
+                        timeline.live_group_event(
+                            Some(sample),
+                            crate::distributed::write_timeline::WriteTimelineStage::LiveIoSubmitted,
+                        );
+                    }
+                    submission_recorded = true;
                 }
                 io.wait(remaining).map_err(super::TcpError::component)?;
                 let completion = io.progress_one().map_err(super::TcpError::component)?;
@@ -1914,11 +1943,16 @@ impl super::Client {
             return Ok(());
         }
         let offset = current.cursor % current.lease.extent.segment.bytes;
-        self.write_leased_block(offset, 4096, |block| {
-            block.fill(0);
-            block[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
-            Ok(())
-        })?;
+        self.write_leased_block(
+            offset,
+            4096,
+            |block| {
+                block.fill(0);
+                block[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+                Ok(())
+            },
+            None,
+        )?;
         if let Some(counters) = &self.live_counters {
             counters.record_leased_skip();
         }
@@ -2123,11 +2157,16 @@ impl super::Client {
             .prefixes
             .push_back(prefix);
         timeline.live_group_event(sample, Stage::LiveIoStarted);
-        self.write_leased_block(offset, frame_len, |buffer| {
-            group
-                .encode_into(buffer)
-                .map_err(super::TcpError::component)
-        })?;
+        self.write_leased_block(
+            offset,
+            frame_len,
+            |buffer| {
+                group
+                    .encode_into(buffer)
+                    .map_err(super::TcpError::component)
+            },
+            sample.map(|sample| (timeline, sample)),
+        )?;
         timeline.live_group_event(sample, Stage::LiveIoCompleted);
         let current = self
             .live_leased
@@ -2997,6 +3036,53 @@ pub(crate) mod leased_tests {
     }
 
     #[test]
+    fn leased_traced_failed_and_short_completions_keep_unknown_write_contract() {
+        use crate::distributed::write_timeline::WriteTimelineStage as Stage;
+        for result in [-libc::EIO, 2048] {
+            let fixture = Fixture::new(DurabilityTier::Native, 16384);
+            let mut client = fixture.writer();
+            client.leased_test_fail_write(result);
+            let timeline = WriteTimeline::default();
+            timeline.arm(1).unwrap();
+            let batch = fixture.batch(0);
+            let sample = timeline.begin(0).unwrap();
+            timeline.operation(sample, batch.id().operation);
+            timeline.batch(batch.id().operation, batch.version());
+            assert!(
+                client
+                    .write_leased_group(1, vec![batch], &timeline, 2)
+                    .is_err()
+            );
+            assert!(client.live_write_failed);
+            let export = timeline.finish().unwrap();
+            let stages: Vec<_> = export.records[0]
+                .events
+                .iter()
+                .map(|event| event.stage)
+                .collect();
+            let start = stages
+                .iter()
+                .position(|stage| *stage == Stage::LiveIoStarted)
+                .unwrap();
+            assert_eq!(
+                &stages[start..],
+                &[
+                    Stage::LiveIoStarted,
+                    Stage::LiveFrameEncoded,
+                    Stage::LiveIoSubmitted
+                ]
+            );
+            assert_eq!(fixture.metrics.snapshot().counts.unknown_writes, 1);
+            let mut failed = client.take_failed_live_writer().unwrap();
+            failed.drain_failed().unwrap();
+            assert_eq!(failed.io.outstanding(), 0);
+            let counts = fixture.metrics.snapshot().counts;
+            assert_eq!(counts.failed_write_ops, u64::from(result < 0));
+            assert_eq!(counts.short_write_ops, u64::from(result == 2048));
+        }
+    }
+
+    #[test]
     fn leased_failed_short_and_timed_out_writes_are_unknown_and_never_retried() {
         for (result, timeout) in [
             (Some(-libc::EIO), false),
@@ -3695,6 +3781,7 @@ pub(crate) mod leased_tests {
                 timeline.complete(sample, None);
             }
             let export = serde_json::to_value(timeline.finish().unwrap()).unwrap();
+            assert_eq!(export["dropped_events"], 0);
             for row in export["records"].as_array().unwrap() {
                 let stages: Vec<_> = row["events"]
                     .as_array()
@@ -3714,6 +3801,16 @@ pub(crate) mod leased_tests {
                         .position(|s| *s == "live_extent_switch_completed")
                         .unwrap();
                     assert!(start < end);
+                    let io = stages.iter().position(|s| *s == "live_io_started").unwrap();
+                    assert_eq!(
+                        &stages[io..io + 4],
+                        &[
+                            "live_io_started",
+                            "live_frame_encoded",
+                            "live_io_submitted",
+                            "live_io_completed",
+                        ]
+                    );
                 }
             }
             let counts = fixture.metrics.snapshot().counts;

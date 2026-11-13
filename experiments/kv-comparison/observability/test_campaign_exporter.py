@@ -1301,6 +1301,18 @@ class CorrelatedTimingTests(unittest.TestCase):
         self.assertNotIn(("live_owner_persistence", "persist_wal_file"), stages)
         self.assertEqual(stages["live_owner_persistence", "persist_total"]["sum_ns"], 80)
 
+    def test_leased_write_io_substages_keep_local_intervals(self):
+        names = ['live_io_started', 'live_frame_encoded', 'live_io_submitted', 'live_io_completed']
+        record = dict(completed=True, error=None, events=[
+            dict(stage=name, elapsed_ns=index * 10, owner=0, envelope_id=None)
+            for index, name in enumerate(names)])
+        summary = campaign.summarize_correlated_timings(
+            "write", {"timeline": {"records": [record]}}, "tidehunter_live_nvmeof")
+        stages = {s["stage"]: s for s in summary["stages"]}
+        for stage in ("live_frame_encode", "live_io_submit", "live_io_wait"):
+            self.assertEqual((stages[stage]["sum_ns"], stages[stage]["count"]), (10, 1))
+        self.assertEqual(stages["live_io"]["sum_ns"], 30)
+
     def test_invalid_summaries_and_absence(self):
         self.assertEqual(campaign.correlated_timing_metrics(None, {}), "")
         self.assertEqual(campaign.summarize_correlated_timings("valkey", {"profile": None},

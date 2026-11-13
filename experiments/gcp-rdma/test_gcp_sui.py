@@ -18,6 +18,21 @@ def put(path, data):
     path.write_text(json.dumps(data) if isinstance(data, dict) else data)
 
 
+def write_verification(root, contract, shape='shape'):
+    directory = root / ('verification' if contract == 'harness' else 'verification-original-default')
+    audit = {'all_equal': True}
+    result = dict(contract=contract, complete=True, checkpoint_digest=gcp_sui.CHECKPOINT,
+                  native={'completed_checkpoint_digest': gcp_sui.CHECKPOINT},
+                  remote={'completed_checkpoint_digest': gcp_sui.CHECKPOINT}, audit=audit)
+    put(directory/'experiment/results.json', result)
+    put(directory/'experiment/audit.json', audit)
+    put(directory/'experiment/native-schema/db/shape.yaml', shape)
+    with tarfile.open(directory/'evidence.tar.gz', 'w:gz') as archive:
+        archive.add(directory/'experiment', arcname='experiment')
+    put(directory/'receipt.json', dict(complete=True, evidence_sha256=gcp_sui.sha(directory/'evidence.tar.gz')))
+    return directory
+
+
 class Store:
     def __init__(self, data):
         self.data = data
@@ -166,6 +181,29 @@ class SuiAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'audit is incomplete'):
                 gcp_sui.admit_fixture(fixture, verification, manifest, build)
 
+    def test_contract_schema_selection_has_no_harness_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            harness = write_verification(root, 'harness', 'mutexes: 1')
+            self.assertEqual(gcp_sui.verification_for_contract(root, 'harness'), harness)
+            with self.assertRaisesRegex(ValueError, 'schema missing.*original_default'):
+                gcp_sui.verification_for_contract(root, 'original_default')
+            original = write_verification(root, 'original_default', 'mutexes: 1024')
+            self.assertEqual(gcp_sui.verification_for_contract(root, 'original_default'), original)
+            put(original/'experiment/native-schema/db/shape.yaml', 'mutexes: 1')
+            with self.assertRaisesRegex(ValueError, 'schema is not bound'):
+                gcp_sui.verification_for_contract(root, 'original_default')
+
+    def test_original_default_rejects_harness_replay_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = write_verification(root, 'original_default')
+            result = gcp_sui.load(original/'experiment/results.json')
+            result['contract'] = 'harness'
+            put(original/'experiment/results.json', result)
+            with self.assertRaisesRegex(ValueError, 'differs.*original_default'):
+                gcp_sui.verification_for_contract(root, 'original_default')
+
     def test_remote_failure_does_not_qualify(self):
         with self.assertRaises(RuntimeError):
             gcp_sui.check_receipt({'exit_code': 1, 'stderr': 'audit failed'})
@@ -185,7 +223,7 @@ class ReviewedCompactSuiCells(unittest.TestCase):
         self.assertEqual(live['addresses'], ['10.2.0.2'] * 5)
         self.assertEqual(live['export_mode'], 'per_owner')
 
-    def test_four_cells_complete_with_one_owner_mailbox(self):
+    def test_four_cells_complete_with_one_owner_mailbox(self, remote_failure=False):
         import copy
         from unittest.mock import Mock
         import manual_sui
@@ -222,6 +260,9 @@ class ReviewedCompactSuiCells(unittest.TestCase):
                 if target.name == 'fixture':
                     (target/'fixture').mkdir()
                     (target/'fixture/distributed.yaml').write_text('db-path: distributed/db\n')
+                if target.name == 'verification':
+                    for contract in ('harness', 'original_default'):
+                        write_verification(target, contract)
             def load(path):
                 path = Path(path)
                 name = path.name
@@ -247,6 +288,10 @@ class ReviewedCompactSuiCells(unittest.TestCase):
                     return dict(complete=True, evidence_sha256='a'*64)
                 raise AssertionError(str(path))
             def popen(argv, **kwargs):
+                if remote_failure:
+                    child = Mock()
+                    child.poll.return_value = 1
+                    return child
                 stage = Path(argv[argv.index('--external-stage-dir')+1])
                 (stage/'resources-required.json').write_text('{}')
                 child = Mock()
@@ -257,16 +302,35 @@ class ReviewedCompactSuiCells(unittest.TestCase):
                 child.wait.side_effect = finish
                 return child
             with patch.object(gcp_sui, 'storage_root', return_value=data), \
-                 patch.object(gcp_sui, 'fetch'), patch.object(gcp_sui, 'extract', side_effect=extract), \
+                 patch.object(gcp_sui, 'fetch') as fetch, patch.object(gcp_sui, 'extract', side_effect=extract), \
                  patch.object(gcp_sui, 'load', side_effect=load), patch.object(gcp_sui, 'sha', return_value='a'*64), \
                  patch.object(gcp_sui, 'admit_build', return_value=manifest), patch.object(gcp_sui, 'admit_fixture'), \
-                 patch.object(gcp_sui, 'command'), patch.object(gcp_sui.shutil, 'copy2'), \
-                 patch.object(gcp_sui.subprocess, 'Popen', side_effect=popen):
+                 patch.object(gcp_sui, 'command') as command, patch.object(gcp_sui.shutil, 'copy2'), \
+                 patch.object(gcp_sui.subprocess, 'Popen', side_effect=popen), \
+                 patch.object(gcp_sui, 'verification_for_contract',
+                     side_effect=lambda root, contract: root/('verification' if contract == 'harness' else 'verification-original-default')):
+                if remote_failure:
+                    with self.assertRaisesRegex(RuntimeError, 'replay exited before resource handshake'):
+                        gcp_sui.run_suite(config, mailbox, package, desc, output_root=root/'results')
+                    self.assertTrue((root/'results/r01-tidehunter_verbs_native/owner-1.json').is_file())
+                    self.assertTrue(any(call.args[1][3] == 'collect' for call in mailbox.submit.call_args_list))
+                    self.assertTrue(any(Path(call.args[2]).name == 'owner-1-logs.tar.gz'
+                                        for call in fetch.call_args_list))
+                    return
                 result = gcp_sui.run_suite(config, mailbox, package, desc, output_root=root/'results')
+                prepares = [call.args[0] for call in command.call_args_list if str(call.args[0][1]).endswith('prepare_external.py')]
+                self.assertEqual(len(prepares), 4)
+                for argv, cell in zip(prepares, spec['sui_cells']):
+                    schema = Path(argv[argv.index('--schema')+1])
+                    self.assertEqual(schema.parts[-3],
+                        'verification' if cell['contract'] == 'harness' else 'verification-original-default')
             self.assertTrue(result['complete'])
             self.assertEqual([{k: c[k] for k in ('transport','contract','owner_tier','owner_wal')}
                               for c in result['cells']], spec['sui_cells'])
             self.assertEqual(mailbox.submit.call_count, 16)
+
+    def test_failed_replay_retains_owner_logs(self):
+        self.test_four_cells_complete_with_one_owner_mailbox(remote_failure=True)
 
 
 if __name__ == '__main__':

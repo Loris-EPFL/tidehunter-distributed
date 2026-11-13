@@ -451,6 +451,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     let mut remote: tidehunter::distributed::remote_db::RemoteDatabaseConfig =
         serde_yaml::from_slice(&fs::read(&remote_path)?)?;
     remote.history_persistence = input.history_persistence;
+    remote.preparation_workers = 8;
     remote.read_cache_bytes = input.coordinator_cache_bytes;
     remote.read_memory_allowance_bytes = input.coordinator_read_memory_allowance_bytes;
     #[cfg(all(feature = "nvmeof", target_os = "linux"))]
@@ -984,6 +985,7 @@ async fn open_for(
             let config = cluster.config.clone();
             (Some(cluster), config)
         };
+    remote_config.preparation_workers = 8;
     if !remote_config.tls.transport.same_protocol(&transport) {
         return Err(format!(
             "{} requires transport {}",
@@ -2471,6 +2473,7 @@ mod tests {
             prepare_external_case_file(&input, &output).unwrap();
             let remote: RemoteDatabaseConfig =
                 serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
+            assert_eq!(remote.preparation_workers, 8);
             if geometry == Some("research") {
                 assert_eq!(
                     OwnerWalGeometry::from_layout(

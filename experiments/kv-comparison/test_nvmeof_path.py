@@ -52,6 +52,22 @@ class NvmeofPathTests(unittest.TestCase):
         self.assertEqual([float(row['p50_us']) for row in rows], [2, 4])
         self.assertAlmostEqual(sum(float(row['share']) for row in rows), 1)
 
+    def test_leased_write_stages_are_consecutive_csv_intervals(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G21W', selection='nvmeof_contracts')
+        names = ['caller_start', 'live_io_started', 'live_frame_encoded',
+                 'live_io_submitted', 'live_io_completed', 'caller_finished']
+        records = [dict(caller_sample_id=0, events=[dict(stage=name, elapsed_ns=index * 1000)
+                                for index, name in enumerate(names)])]
+        (directory / 'write-timeline.json').write_text(json.dumps(dict(timeline=dict(records=records))))
+        rows = analysis.stage_rows(directory.parent)
+        self.assertEqual([row['stage_pair'] for row in rows],
+                         [start + ' -> ' + end for start, end in zip(names, names[1:])])
+        self.assertEqual([row['mean_us'] for row in rows], [1] * 5)
+        self.generate()
+        with (self.output / 'stages.csv').open() as stream:
+            self.assertEqual([row['stage_pair'] for row in csv.DictReader(stream)],
+                             [row['stage_pair'] for row in rows])
+
     def test_stalls_join_switch_checkpoint_and_unattributed_calls(self):
         directory = self.add('tidehunter_nvme_rdma', group='G19W')
         samples = []

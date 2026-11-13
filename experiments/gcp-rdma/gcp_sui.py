@@ -172,6 +172,55 @@ def admit_build(root, package, engine_revision):
     return manifest
 
 
+def verification_for_contract(root, contract):
+    if contract not in ('harness', 'original_default'):
+        raise ValueError('unsupported Sui verification contract')
+    verification = root / ('verification' if contract == 'harness' else 'verification-original-default')
+    if not (verification/'experiment/native-schema').is_dir():
+        raise ValueError(f'local verification schema missing for contract {contract}')
+    result = load(verification/'experiment/results.json')
+    audit = load(verification/'experiment/audit.json')
+    receipt = load(verification/'receipt.json')
+    if (result.get('contract') != contract or result.get('complete') is not True
+            or result.get('failure') or receipt.get('complete') is not True
+            or result.get('checkpoint_digest') != CHECKPOINT
+            or any(result.get(mode, {}).get('completed_checkpoint_digest') != CHECKPOINT
+                   for mode in ('native', 'remote'))
+            or audit != result.get('audit') or audit.get('all_equal') is not True
+            or sha(verification/'evidence.tar.gz') != receipt.get('evidence_sha256')):
+        raise ValueError(f'local verification differs or is incomplete for contract {contract}')
+    schema = verification/'experiment/native-schema'
+    schema_files = {str(p.relative_to(schema)): p for p in schema.rglob('*') if p.is_file()}
+    if not schema_files:
+        raise ValueError(f'local verification schema empty for contract {contract}')
+    with tarfile.open(verification/'evidence.tar.gz', 'r:gz') as archive:
+        for name in ('results.json', 'audit.json'):
+            with archive.extractfile('experiment/'+name) as source:
+                if hashlib.sha256(source.read()).hexdigest() != sha(verification/'experiment'/name):
+                    raise ValueError(f'local verification {name} is not bound to evidence for contract {contract}')
+        bound = {member.name.removeprefix('experiment/native-schema/'): member
+                 for member in archive.getmembers()
+                 if member.isfile() and member.name.startswith('experiment/native-schema/')}
+        if set(bound) != set(schema_files):
+            raise ValueError(f'local verification schema coverage differs for contract {contract}')
+        for name, path in schema_files.items():
+            with archive.extractfile(bound[name]) as source:
+                if hashlib.sha256(source.read()).hexdigest() != sha(path):
+                    raise ValueError(f'local verification schema is not bound to evidence for contract {contract}')
+    return verification
+
+
+def retain_owner_evidence(store, receipt, output, index):
+    desc = descriptor(json.loads(receipt['stdout'].strip().splitlines()[-1]))
+    data = store.get(desc['key'], generation=desc['generation'], max_bytes=32 << 20)
+    if hashlib.sha256(data).hexdigest() != desc['sha256']:
+        raise ValueError('node evidence digest differs')
+    value = json.loads(data)
+    fetch(store, value['logs'], output / f'owner-{index}-logs.tar.gz', max_bytes=1 << 30)
+    save(output / f'owner-{index}.json', value)
+    return value
+
+
 def admit_fixture(fixture, verification, manifest, build_root):
     fm = load(fixture / 'fixture-manifest.json')
     expected = fm['files']
@@ -358,7 +407,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
     extract(wrapped / 'build-bundle.tar.gz', inputs / 'build-unpacked')
     build_root = inputs / 'build-unpacked'
     fixture_root = inputs / 'fixture/fixture'
-    verification = inputs / 'verification/verification'
+    verification_root = inputs / 'verification'
     engine_revision = load(Path(config['package_root']) / 'manifest.json')['revision']
     manifest = admit_build(build_root, package, engine_revision)
     if (sha(build_root / 'build-manifest.json') != build_receipt['build_manifest_sha256']
@@ -370,7 +419,10 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
         if name not in ('Cargo.lock', 'experiments/sui-checkpoint/audit/Cargo.lock'):
             if frozen.get(name, {}).get('sha256') != digest:
                 raise ValueError('Sui build engine source differs from sealed runtime: ' + name)
-    admit_fixture(fixture_root, verification, manifest, build_root)
+    verifications = {contract: verification_for_contract(verification_root, contract)
+                     for contract in ('harness', 'original_default')}
+    for verification in verifications.values():
+        admit_fixture(fixture_root, verification, manifest, build_root)
     scripts = build_root / 'sources/tidehunter-sharded-wal/experiments/sui-checkpoint'
     sys.path.insert(0, str(scripts.parent))
     from portable_transport import transport_for_case, select_transports
@@ -383,6 +435,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
     results = []
     for number, cell_settings in enumerate(cells, 1):
         label = cell_settings['transport']
+        verification = verifications[cell_settings['contract']]
         cell = f'r0{number}-{label}'
         cell_root = base / cell
         cell_root.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -426,6 +479,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
         references = []
         stop_attempted = set()
         owner_completions = []
+        collected_owners = set()
         cell_deadline = owner_deadline(config['deadline_utc'])
         def call(index, action, extra=(), timeout=180):
             argv = [GUEST_PYTHON, str(helper), 'node', action, '--project', config['project_id'], '--bucket', config['bucket'], '--run-id', config['run_id'], '--cell', cell, '--index', str(index), *map(str, extra)]
@@ -486,16 +540,11 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                     host_resources = {}
                     for index in range(1, len(external['hosts']) + 1):
                         rec = check_receipt(mailbox.wait(call(index, 'collect'), timeout_seconds=180))
-                        desc = descriptor(json.loads(rec['stdout'].strip().splitlines()[-1]))
-                        data = store.get(desc['key'], generation=desc['generation'], max_bytes=32 << 20)
-                        if hashlib.sha256(data).hexdigest() != desc['sha256']:
-                            raise ValueError('node evidence digest differs')
-                        value = json.loads(data)
+                        value = retain_owner_evidence(store, rec, out, index)
+                        collected_owners.add(index)
                         if value['receipt'].get('complete') is not True:
                             raise ValueError('node supervisor did not complete')
-                        fetch(store, value['logs'], out / f'owner-{index}-logs.tar.gz', max_bytes=1 << 30)
                         host_resources[hosts[index-1]] = value['resources']
-                        save(out / f'owner-{index}.json', value)
                     save(resources, dict(**binding, cell_id=cell, stages=stage_rows, hosts=host_resources))
                     save(stages / 'resources-ready', dict(**binding, unix_ns=time.time_ns()))
                     if child.wait(timeout=180) != 0:
@@ -552,6 +601,19 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                 except OSError as error:
                     retention_error = retention_error or error
                     print(f'could not retain cleanup evidence: {error}', file=sys.stderr)
+            # A replay can fail before the resource handshake. The node
+            # supervisor still retains logs; collect them after each stop.
+            for ref in references:
+                index = ref['index']
+                if index in collected_owners:
+                    continue
+                try:
+                    mailbox.wait(ref, timeout_seconds=180)
+                    rec = check_receipt(mailbox.wait(call(index, 'collect'), timeout_seconds=180))
+                    retain_owner_evidence(store, rec, out, index)
+                except Exception as error:
+                    retention_error = retention_error or error
+                    print(f'could not retain owner {index} evidence: {error}', file=sys.stderr)
             if retention_error is not None and not active_failure:
                 raise retention_error
     receipt = dict(complete=True, checkpoint_digest=CHECKPOINT, checkpoint_limit=TIP, fixture=fixture,

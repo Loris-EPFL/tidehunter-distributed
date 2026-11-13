@@ -246,7 +246,7 @@ fn checkpoint_pressure_defers_fifo_head_without_blocking_durable_replies() {
     let held = connection.lock();
     let (progress, events) = mpsc::sync_channel(64);
     *original.concurrent_progress.lock() = Some(progress);
-    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    let (db, resume_owner) = paused_owner(original);
     // Unwind releases both blockers before dropping the owner that joins them.
     let release_checkpoint = resume;
     let held_connection = held;
@@ -272,13 +272,17 @@ fn checkpoint_pressure_defers_fifo_head_without_blocking_durable_replies() {
         receiver
     };
     let fourth = enqueue(fixture.operation(3, 4), vec![put(4, 4)]);
-    let dispatched = wait_event(&events, |stats| stats.concurrent_admitted == 1);
     let fifth_operation = fixture.operation(4, 5);
     let fifth = enqueue(fifth_operation, vec![put(5, 5)]);
     let conflict = enqueue(fifth_operation, vec![put(5, 9)]);
     let sixth = enqueue(fixture.operation(0, 6), vec![put(6, 6)]);
-    let deferred = wait_event(&events, |_| {
-        db.snapshot.lock().authority.concurrent_checkpoint_deferrals != 0
+    // All four commands are ready before the owner runs. The deferred fifth
+    // write therefore has both the conflict and sixth write prepared behind it.
+    resume_owner.send(()).unwrap();
+    let deferred = wait_event(&events, |stats| {
+        stats.prepare_calls == 1
+            && stats.concurrent_admitted == 1
+            && db.snapshot.lock().authority.concurrent_checkpoint_deferrals != 0
     });
     drop(held_connection);
     let fourth_before_resume = fourth.recv_timeout(Duration::from_secs(5));
@@ -288,7 +292,6 @@ fn checkpoint_pressure_defers_fifo_head_without_blocking_durable_replies() {
     let fifth_result = fifth.recv_timeout(Duration::from_secs(10));
     let conflict_result = conflict.recv_timeout(Duration::from_secs(10));
     let sixth_result = sixth.recv_timeout(Duration::from_secs(10));
-    assert!(dispatched.is_ok());
     assert!(deferred.is_ok());
     let fourth_version = fourth_before_resume.unwrap().unwrap();
     assert!(matches!(
@@ -1503,4 +1506,281 @@ fn sui_timeline_finish_deadline_does_not_wait_for_shared_gate() {
     db.finish_write_timeline_until(Instant::now() + Duration::from_secs(5))
         .unwrap();
     db.wait_for_background_threads_to_finish().unwrap();
+}
+
+fn scalar_window_fixture(workers: usize) -> Fixture {
+    Fixture::new_with_config(
+        128,
+        KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
+        16,
+        |config| {
+            config.preparation_workers = workers;
+            config.storage.batch_limits.max_encoded_bytes = 128 * 1024;
+            config.storage.group_limits.max_encoded_bytes = 2 * 1024 * 1024 - 8;
+            config.storage.fragment_bytes = 2 * 1024 * 1024;
+            config.storage.wal_file_bytes = 4 * 1024 * 1024;
+            config.max_pending_bytes = 16 * 1024 * 1024;
+        },
+    )
+}
+
+fn large_put(key: u32) -> Mutation {
+    Mutation::Put {
+        keyspace: KeySpace(0),
+        key: key.to_be_bytes().to_vec().into(),
+        value: vec![key as u8; 64 * 1024].into(),
+    }
+}
+
+fn paused_owner(mut original: RemoteDatabase) -> (ConcurrentRemoteDatabase, mpsc::SyncSender<()>) {
+    let (resume, gate) = mpsc::sync_channel(1);
+    original.owner_start_pause = Some(gate);
+    (ConcurrentRemoteDatabase::new(original).unwrap(), resume)
+}
+
+fn enqueue_window_write(
+    db: &ConcurrentRemoteDatabase,
+    operation: [u8; 16],
+    mutations: Vec<Mutation>,
+) -> mpsc::Receiver<Result<BatchVersion, LocalDbError>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reply = WriteReply {
+        sender: Some(sender),
+        version: None,
+        _credit: db.reserve(256 * 1024).unwrap(),
+    };
+    assert!(
+        db.sender
+            .as_ref()
+            .unwrap()
+            .send(OwnerCommand::Write {
+                operation,
+                mutations,
+                reply,
+            })
+            .is_ok()
+    );
+    let _ = db.wake.try_send(());
+    receiver
+}
+
+#[test]
+fn concurrent_scalar_window_parallel_and_serial_keep_admission_order() {
+    for workers in [1, 8] {
+        let fixture = scalar_window_fixture(workers);
+        let (db, resume) = paused_owner(fixture.open());
+        let replies: Vec<_> = (0..16)
+            .map(|index| {
+                enqueue_window_write(
+                    &db,
+                    fixture.operation(0, u64::from(index)),
+                    vec![large_put(index)],
+                )
+            })
+            .collect();
+        resume.send(()).unwrap();
+        let versions: Vec<_> = replies
+            .into_iter()
+            .map(|reply| {
+                reply
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        for (index, version) in versions.iter().enumerate() {
+            assert_eq!(version.epoch, versions[0].epoch);
+            assert_eq!(version.sequence, versions[0].sequence + index as u64);
+            assert_eq!(get(&db, index as u32), Some(vec![index as u8; 64 * 1024]));
+        }
+        db.flush_index().unwrap();
+        let stats = db.pipeline_stats();
+        assert_eq!(stats.concurrent_admitted, 16);
+        assert_eq!(stats.prepare_calls, 1);
+        assert_eq!(
+            stats.parallel_prepared_batches,
+            if workers == 1 { 0 } else { 16 }
+        );
+        assert!(stats.prepare_task_ns > 0);
+        db.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn concurrent_scalar_window_middle_failure_leaves_no_version_hole() {
+    for injected in [false, true] {
+        let fixture = scalar_window_fixture(8);
+        let mut original = fixture.open();
+        let failed = fixture.operation(0, 2);
+        if injected {
+            original.fail_prepared_operation = Some(failed);
+        }
+        let (db, resume) = paused_owner(original);
+        let first = enqueue_window_write(&db, fixture.operation(0, 1), vec![large_put(1)]);
+        let bad = if injected {
+            large_put(2)
+        } else {
+            Mutation::Put {
+                keyspace: KeySpace(0),
+                key: vec![0; 3].into(),
+                value: vec![2; 64 * 1024].into(),
+            }
+        };
+        let middle = enqueue_window_write(&db, failed, vec![bad]);
+        let last = enqueue_window_write(&db, fixture.operation(0, 3), vec![large_put(3)]);
+        resume.send(()).unwrap();
+        let first = first
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        assert!(
+            middle
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .is_err()
+        );
+        let last = last.recv_timeout(Duration::from_secs(30)).unwrap().unwrap();
+        assert_eq!(last.epoch, first.epoch);
+        assert_eq!(last.sequence, first.sequence + 1);
+        assert_eq!(get(&db, 1), Some(vec![1; 64 * 1024]));
+        assert_eq!(get(&db, 3), Some(vec![3; 64 * 1024]));
+        db.ensure_healthy().unwrap();
+        db.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn concurrent_scalar_window_duplicate_identity_admits_once() {
+    let fixture = scalar_window_fixture(8);
+    let mut original = fixture.open();
+    let operation = fixture.operation(0, 1);
+    let original_version = original.write_batch(operation, vec![large_put(1)]).unwrap();
+    let (db, resume) = paused_owner(original);
+    let old = enqueue_window_write(&db, operation, vec![large_put(1)]);
+    let new_operation = fixture.operation(0, 2);
+    let first = enqueue_window_write(&db, new_operation, vec![large_put(2)]);
+    let duplicate = enqueue_window_write(&db, new_operation, vec![large_put(2)]);
+    let conflict = enqueue_window_write(&db, new_operation, vec![large_put(9)]);
+    let suffix = enqueue_window_write(&db, fixture.operation(0, 3), vec![large_put(3)]);
+    resume.send(()).unwrap();
+    assert_eq!(
+        old.recv_timeout(Duration::from_secs(30)).unwrap().unwrap(),
+        original_version
+    );
+    let version = first
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        duplicate
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap(),
+        version
+    );
+    assert!(
+        conflict
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .is_err()
+    );
+    let last = suffix
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.sequence, original_version.sequence + 1);
+    assert_eq!(last.sequence, version.sequence + 1);
+    assert_eq!(get(&db, 2), Some(vec![2; 64 * 1024]));
+    db.flush_index().unwrap();
+    // Retry acknowledgements are counted, but the next version proves only
+    // one logical slot was allocated to the duplicate identity.
+    assert_eq!(db.pipeline_stats().parallel_prepared_batches, 5);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn concurrent_scalar_window_does_not_move_writes_across_barrier() {
+    let fixture = scalar_window_fixture(8);
+    let (db, resume) = paused_owner(fixture.open());
+    db.write_timeline.arm(2).unwrap();
+    let before = enqueue_window_write(&db, fixture.operation(0, 1), vec![large_put(1)]);
+    let (sender, barrier) = mpsc::sync_channel(1);
+    assert!(
+        db.sender
+            .as_ref()
+            .unwrap()
+            .send(OwnerCommand::Flush(sender))
+            .is_ok()
+    );
+    let operation = fixture.operation(0, 2);
+    let sample = db.write_timeline.begin(1).unwrap();
+    db.write_timeline.operation(sample, operation);
+    let after = enqueue_window_write(&db, operation, vec![large_put(2)]);
+    resume.send(()).unwrap();
+    before
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    barrier
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    after
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    let export = db.write_timeline.finish().unwrap();
+    let dequeued = export.records[0]
+        .events
+        .iter()
+        .find(|event| event.stage == WriteTimelineStage::OwnerDequeued)
+        .unwrap()
+        .elapsed_ns;
+    let last_checkpoint = export
+        .checkpoint_events
+        .iter()
+        .map(|event| event.elapsed_ns)
+        .max()
+        .unwrap();
+    assert!(last_checkpoint < dequeued);
+    assert_eq!(get(&db, 2), Some(vec![2; 64 * 1024]));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn concurrent_scalar_window_all_invalid_releases_budget_and_keeps_owner_healthy() {
+    let mut fixture = scalar_window_fixture(8);
+    fixture.config.max_pending_batches = 4;
+    let original = fixture.open();
+    let next = original.submission_next();
+    let (db, resume) = paused_owner(original);
+    let replies: Vec<_> = (0..4)
+        .map(|index| {
+            enqueue_window_write(
+                &db,
+                fixture.operation(0, index),
+                vec![Mutation::Put {
+                    keyspace: KeySpace(0),
+                    key: vec![0; 3].into(),
+                    value: vec![1; 32].into(),
+                }],
+            )
+        })
+        .collect();
+    resume.send(()).unwrap();
+    for reply in replies {
+        assert!(
+            reply
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .is_err()
+        );
+    }
+    let version = db
+        .write_batch(fixture.operation(0, 5), vec![large_put(5)])
+        .unwrap();
+    assert_eq!(version.sequence, next);
+    assert_eq!(get(&db, 5), Some(vec![5; 64 * 1024]));
+    db.ensure_healthy().unwrap();
+    db.shutdown().unwrap();
 }
