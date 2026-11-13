@@ -1138,6 +1138,11 @@ mod tests {
                 "nr_io_queues=4,queue_size=128,nr_poll_queues=1"
             )
         );
+        let other = connect_options(&target, "nqn.2026-01.test:other-owner", [3; 16]);
+        assert!(other.contains(
+            "hostnqn=nqn.2026-01.test:other-owner,hostid=03030303-0303-0303-0303-030303030303"
+        ));
+        assert!(!other.contains("hostnqn=nqn.2026-01.test:host,"));
     }
 
     #[test]

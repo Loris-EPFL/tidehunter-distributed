@@ -462,6 +462,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             export_mode: live.export_mode,
             host_nqn: host_nqn.clone(),
             host_id: *host_id,
+            owner_identities: Default::default(),
             max_inflight_requests: live.max_inflight_requests,
             max_inflight_bytes: live.max_inflight_bytes,
             connect_timeout_ms: live.connect_timeout_ms,

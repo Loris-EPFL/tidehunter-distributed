@@ -123,8 +123,17 @@ pub struct LiveTargetManager {
 fn invalid(s: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, s)
 }
+fn path_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
 fn attribute(p: &Path) -> io::Result<String> {
-    Ok(fs::read_to_string(p)?.trim().to_owned())
+    Ok(fs::read_to_string(p)
+        .map_err(|e| path_error("read target attribute", p, e))?
+        .trim()
+        .to_owned())
 }
 fn nqn_valid(s: &str) -> bool {
     s.starts_with("nqn.")
@@ -167,7 +176,7 @@ fn uuid(id: [u8; 16]) -> String {
     )
 }
 fn object_id(path: &Path, kind: Kind) -> io::Result<(u64, u64)> {
-    let m = fs::symlink_metadata(path)?;
+    let m = fs::symlink_metadata(path).map_err(|e| path_error("inspect target object", path, e))?;
     if (kind == Kind::Directory && !m.file_type().is_dir())
         || (kind == Kind::Link && !m.file_type().is_symlink())
     {
@@ -184,17 +193,24 @@ fn check_path(path: &Path, private: bool) -> io::Result<()> {
         return Err(invalid("path must be absolute and canonical"));
     }
     for p in path.ancestors() {
-        let m = fs::symlink_metadata(p)?;
+        let m = fs::symlink_metadata(p)
+            .map_err(|e| path_error("inspect protected target path", p, e))?;
         if m.file_type().is_symlink() || m.uid() != 0 || m.mode() & 0o022 != 0 {
             return Err(invalid("path is not root protected"));
         }
     }
-    if private && fs::metadata(path)?.mode() & 0o077 != 0 {
+    if private
+        && fs::metadata(path)
+            .map_err(|e| path_error("inspect target state permissions", path, e))?
+            .mode()
+            & 0o077
+            != 0
+    {
         return Err(invalid("state directory is not private"));
     }
     Ok(())
 }
-fn validate_config(c: &LiveTargetConfig) -> io::Result<()> {
+pub(crate) fn validate_config(c: &LiveTargetConfig) -> io::Result<()> {
     if c.export_mode != LiveExportMode::OnDemand && c.spdk.is_some() {
         return Err(invalid("permanent live export requires the kernel target"));
     }
@@ -215,7 +231,8 @@ fn validate_config(c: &LiveTargetConfig) -> io::Result<()> {
 fn check_configfs() -> io::Result<()> {
     // The mount table is consulted on every production open; a normal directory
     // masquerading as nvmet must never turn a disable into a successful no-op.
-    let mounts = fs::read_to_string("/proc/self/mountinfo")?;
+    let mounts = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| path_error("read mount table", Path::new("/proc/self/mountinfo"), e))?;
     let mut covering: Option<(&str, &str)> = None;
     for line in mounts.lines() {
         let Some((before, after)) = line.split_once(" - ") else {
@@ -236,7 +253,11 @@ fn check_configfs() -> io::Result<()> {
             covering = Some((mount, kind));
         }
     }
-    if covering.is_none_or(|(_, kind)| kind != "configfs") || !fs::metadata(CONFIGFS)?.is_dir() {
+    if covering.is_none_or(|(_, kind)| kind != "configfs")
+        || !fs::metadata(CONFIGFS)
+            .map_err(|e| path_error("inspect nvmet configfs", Path::new(CONFIGFS), e))?
+            .is_dir()
+    {
         return Err(invalid("nvmet is not on mounted configfs"));
     }
     Ok(())
@@ -274,12 +295,16 @@ impl LiveTargetManager {
         expected: Option<LiveTargetIdentity>,
     ) -> io::Result<Self> {
         validate_config(&config)?;
-        let lock = DbLock::acquire(&config.state_dir, Duration::ZERO)?;
+        let lock = DbLock::acquire(&config.state_dir, Duration::ZERO)
+            .map_err(|e| path_error("lock target state directory", &config.state_dir, e))?;
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&config.state_dir)?;
-        let dir_meta = directory.metadata()?;
+            .open(&config.state_dir)
+            .map_err(|e| path_error("open target state directory", &config.state_dir, e))?;
+        let dir_meta = directory
+            .metadata()
+            .map_err(|e| path_error("inspect target state directory", &config.state_dir, e))?;
         if expected.is_some_and(|e| {
             e.directory_device != dir_meta.dev()
                 || e.directory_inode != dir_meta.ino()
@@ -331,9 +356,15 @@ impl LiveTargetManager {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound && expected.is_none() => {
                 let path = config.state_dir.join("sealed");
-                fs::DirBuilder::new().mode(0o700).create(&path)?;
-                directory.sync_all()?;
-                let meta = fs::symlink_metadata(&path)?;
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .map_err(|e| path_error("create sealed marker directory", &path, e))?;
+                directory
+                    .sync_all()
+                    .map_err(|e| path_error("sync target state directory", &config.state_dir, e))?;
+                let meta = fs::symlink_metadata(&path)
+                    .map_err(|e| path_error("inspect sealed marker directory", &path, e))?;
                 State {
                     version: 1,
                     config,
@@ -350,14 +381,17 @@ impl LiveTargetManager {
                     spdk_issued: Vec::new(),
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(path_error("open target state registry", &state_path, e)),
         };
         let sealed_path = state.config.state_dir.join("sealed");
         let sealed_directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&sealed_path)?;
-        let sealed_meta = sealed_directory.metadata()?;
+            .open(&sealed_path)
+            .map_err(|e| path_error("open sealed marker directory", &sealed_path, e))?;
+        let sealed_meta = sealed_directory
+            .metadata()
+            .map_err(|e| path_error("inspect sealed marker directory", &sealed_path, e))?;
         if sealed_meta.dev() != state.sealed_directory_device
             || sealed_meta.ino() != state.sealed_directory_inode
             || (!fixture && (sealed_meta.uid() != 0 || sealed_meta.mode() & 0o077 != 0))
@@ -398,7 +432,7 @@ impl LiveTargetManager {
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => manager.directory.sync_all()?,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-                Err(e) => return Err(e),
+                Err(e) => return Err(path_error("create commissioning directory", &path, e)),
             }
             check_path(&path, true)?;
             manager.commissioning = Some(LiveConnectionRegistry::open(&path)?);
@@ -429,12 +463,22 @@ impl LiveTargetManager {
             .truncate(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&temp)?;
-        file.write_all(&crc32fast::hash(&bytes).to_le_bytes())?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temp, self.state.config.state_dir.join(STATE))?;
-        self.directory.sync_all()
+            .open(&temp)
+            .map_err(|e| path_error("open pending target registry", &temp, e))?;
+        file.write_all(&crc32fast::hash(&bytes).to_le_bytes())
+            .and_then(|()| file.write_all(&bytes))
+            .map_err(|e| path_error("write pending target registry", &temp, e))?;
+        file.sync_all()
+            .map_err(|e| path_error("sync pending target registry", &temp, e))?;
+        let path = self.state.config.state_dir.join(STATE);
+        fs::rename(&temp, &path).map_err(|e| path_error("publish target registry", &path, e))?;
+        self.directory.sync_all().map_err(|e| {
+            path_error(
+                "sync target state directory",
+                &self.state.config.state_dir,
+                e,
+            )
+        })
     }
     fn full(&self, relative: &Path) -> io::Result<PathBuf> {
         if relative.as_os_str().is_empty()
@@ -455,7 +499,13 @@ impl LiveTargetManager {
     ) -> io::Result<()> {
         let full = self.full(path)?;
         match fs::symlink_metadata(&full) {
-            Ok(_) => return Err(invalid("refusing to share configfs object")),
+            Ok(_) => {
+                return Err(path_error(
+                    "create exclusive configfs object",
+                    &full,
+                    invalid("refusing to share configfs object"),
+                ));
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => return Err(e),
         }
@@ -468,11 +518,13 @@ impl LiveTargetManager {
         });
         self.save()?;
         match kind {
-            Kind::Directory => fs::create_dir(&full)?,
+            Kind::Directory => fs::create_dir(&full)
+                .map_err(|e| path_error("create configfs directory", &full, e))?,
             Kind::Link => symlink(
                 self.full(destination.ok_or_else(|| invalid("missing link destination"))?)?,
                 &full,
-            )?,
+            )
+            .map_err(|e| path_error("create configfs link", &full, e))?,
         }
         let identity = object_id(&full, kind)?;
         self.state
@@ -523,11 +575,13 @@ impl LiveTargetManager {
         let mut file = OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)?;
+            .open(&path)
+            .map_err(|e| path_error("open target attribute for write", &path, e))?;
         if self.fixture {
             file.set_len(0)?;
         }
-        file.write_all(value.as_bytes())?;
+        file.write_all(value.as_bytes())
+            .map_err(|e| path_error("write target attribute", &path, e))?;
         if attribute(&path)? != value {
             return Err(invalid("configfs attribute readback mismatch"));
         }

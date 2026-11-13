@@ -268,14 +268,7 @@ impl NodeInventory {
         Ok(evidence)
     }
     pub fn open(mut config: NodeConfig, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
-        config.partition.validate().map_err(TcpError::component)?;
-        if config.partition.inventory.epoch != 1
-            || config.partition.inventory.segment_generation != 1
-            || !(1..=1024).contains(&config.max_epochs)
-        {
-            return Err(TcpError::new("invalid node epoch/configuration template"));
-        }
-        let shape = KeyShape::from_yaml(&config.shape_yaml).map_err(TcpError::component)?;
+        let shape = config.validated_shape()?;
         config.shape_yaml = shape.to_yaml().map_err(TcpError::component)?;
         match fs::create_dir(&config.root) {
             Ok(()) => {

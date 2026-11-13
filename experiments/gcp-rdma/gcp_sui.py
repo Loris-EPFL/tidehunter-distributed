@@ -316,8 +316,8 @@ def sui_cells(spec):
     return [cell.copy() for cell in cells]
 
 
-def live_nvme_config(owner_hosts, settings):
-    identity = uuid.uuid4()
+def live_nvme_config(owner_hosts, settings, *, run_id, cell):
+    identity = uuid.uuid5(uuid.NAMESPACE_URL, f'tidehunter-live:{run_id}:{cell}')
     return dict(addresses=[host['rdma_ip'] for host in owner_hosts],
                 host_nqn='nqn.2014-08.org.nvmexpress:uuid:' + str(identity),
                 host_id=list(identity.bytes), queue_geometry=settings['sui_live_queue_geometry'],
@@ -467,7 +467,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
             prepare_args += ['--owner-tier', cell_settings['owner_tier']]
         if label == 'tidehunter_nvme_rdma':
             live_path = cell_root / 'live-nvme.json'
-            save(live_path, live_nvme_config(owner_hosts, settings))
+            save(live_path, live_nvme_config(owner_hosts, settings, run_id=config['run_id'], cell=cell))
             prepare_args += ['--live-nvme', live_path]
         command(prepare_args, 120)
         external = load(deployment / 'external-manifest.json')

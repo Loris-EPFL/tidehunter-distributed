@@ -24,6 +24,10 @@ import sys
 import time
 launch = json.loads(Path(sys.argv[2]).read_text())
 root = Path(launch['node']['root'])
+if 'live_target' in launch['node']:
+    state = Path(launch['node']['live_target']['state_dir'])
+    assert state.is_dir(), f'missing live target state directory: {state}'
+    assert state.stat().st_mode & 0o777 == 0o700
 root.mkdir()
 print('fixture stdout', flush=True)
 print('fixture stderr', file=sys.stderr, flush=True)
@@ -97,7 +101,7 @@ class CloudNodeContract(unittest.TestCase):
         self.assertEqual(cfg['storage_binary_sha256'], cloud_node.sha256(self.binary))
         self.assertEqual(cfg['cell_id'], 'r04-tcp')
 
-    def test_bench_nvme_target_validation(self):
+    def configure_live_payload(self):
         old_root = self.root
         self.run_id = 'bench-0123456789abcdef'
         self.root = self.base / self.run_id / 'checkpoint-cells/r02-tidehunter_nvme_rdma/storage'
@@ -109,12 +113,18 @@ class CloudNodeContract(unittest.TestCase):
         trusted = {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'}
         self.cfg.update(run_id=self.run_id, cell_id='r02-tidehunter_nvme_rdma',
                         transport='tidehunter_nvme_rdma', client_transport=trusted, owner_transport=trusted)
+        for command in self.cfg['commands']:
+            launch = Path(command[2])
+            value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
+            value['tls'] = dict(transport=trusted, ca='', cert='', key='')
+            value['node']['live_target'] = dict(state_dir=str(launch.parent/'live-nvmeof'), export_mode='per_owner')
+            value['durability'] = dict(tier='native')
+            launch.write_text(json.dumps(value))
+
+    def test_bench_nvme_target_validation(self):
+        self.configure_live_payload()
         launch = Path(self.cfg['commands'][0][2])
-        value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
-        value['tls'] = dict(transport=trusted, ca='', cert='', key='')
-        value['node']['live_target'] = dict(state_dir=str(launch.parent/'live-nvmeof'), export_mode='per_owner')
-        value['durability'] = dict(tier='native')
-        launch.write_text(json.dumps(value))
+        value = json.loads(launch.read_text())
         self.assertEqual(self.validate()['run_id'], self.run_id)
         for target in (None, 'bad'):
             value['node']['live_target'] = target
@@ -134,6 +144,29 @@ class CloudNodeContract(unittest.TestCase):
         launch.write_text(json.dumps(value))
         with self.assertRaisesRegex(ValueError, 'invalid owner durability tier'):
             self.validate()
+
+    def test_live_target_directories_exist_before_all_fifteen_children_start(self):
+        for _ in range(14):
+            self.add_namespace()
+        self.configure_live_payload()
+        cfg = self.validate()
+        for namespace in cfg['namespaces']:
+            self.assertFalse(Path(namespace['live_state_dir']).exists())
+        self.check_live_samples_and_normal_controller_shutdown()
+        for namespace in cfg['namespaces']:
+            state = Path(namespace['live_state_dir'])
+            self.assertTrue(state.is_dir())
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+
+    def test_live_target_directory_cannot_be_adopted_after_validation(self):
+        self.configure_live_payload()
+        owner = self.owner()
+        state = Path(owner.cfg['namespaces'][0]['live_state_dir'])
+        state.mkdir(mode=0o700)
+        with patch.object(cloud_node.subprocess, 'Popen') as start:
+            self.assertEqual(owner.run(), 1)
+        start.assert_not_called()
+        self.assertEqual(owner.failure, 'FileExistsError')
 
     def test_live_target_rejected_for_non_nvme_cell(self):
         launch = Path(self.cfg['commands'][0][2])

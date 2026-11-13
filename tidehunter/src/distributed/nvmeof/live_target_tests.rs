@@ -62,6 +62,111 @@ impl Fixture {
 }
 
 #[test]
+fn missing_state_directory_reports_operation_and_exact_path() {
+    let f = Fixture::new();
+    let path = f.config.state_dir.join("missing-live-nvmeof");
+    let error = check_path(&path, true).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let message = error.to_string();
+    assert!(message.contains("inspect protected target path"));
+    assert!(message.contains(path.to_str().unwrap()));
+    assert!(!path.exists());
+}
+
+#[test]
+fn missing_configfs_attribute_reports_operation_and_exact_path() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let relative = Path::new("ports/42/addr_traddr");
+    let path = f.configfs.join(relative);
+    fs::remove_file(&path).unwrap();
+    let error = manager.put(relative, "127.0.0.1").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let message = error.to_string();
+    assert!(message.contains("open target attribute for write"));
+    assert!(message.contains(path.to_str().unwrap()));
+    // Restore the fixture attribute so normal cleanup can verify ownership.
+    fs::write(path, "127.0.0.1").unwrap();
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn cohosted_targets_reject_shared_initiator_host_object() {
+    let f = Fixture::new();
+    let mut first = f.open().unwrap();
+    let mut second = f.config.clone();
+    second.state_dir = f._tmp.path().join("second-state");
+    second.port_id += 2;
+    second.commissioning_port_id += 2;
+    second.service += 2;
+    second.commissioning_service += 2;
+    fs::create_dir(&second.state_dir).unwrap();
+    let error = match LiveTargetManager::open_fixture(second, f.configfs.clone()) {
+        Ok(_) => panic!("shared host object was accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    let message = error.to_string();
+    assert!(message.contains("refusing to share configfs object"));
+    assert!(
+        message.contains(
+            f.configfs
+                .join("hosts")
+                .join(&f.config.host_nqn)
+                .to_str()
+                .unwrap()
+        )
+    );
+    first.shutdown().unwrap();
+}
+
+#[test]
+fn fifteen_exclusive_owners_share_configfs_without_sharing_objects() {
+    let f = Fixture::new();
+    let mut managers = Vec::new();
+    let mut subsystems = std::collections::BTreeSet::new();
+    for index in 0..15u32 {
+        let mut config = f.config.clone();
+        config.state_dir = f._tmp.path().join(format!("owner-{index}"));
+        config.host_nqn = format!("nqn.2026-01.test:owner-{index}");
+        config.port_id += 2 * index as u16;
+        config.commissioning_port_id += 2 * index as u16;
+        config.service += 2 * index as u16;
+        config.commissioning_service += 2 * index as u16;
+        config.export_mode = LiveExportMode::PerOwner;
+        fs::create_dir(&config.state_dir).unwrap();
+        let path = f._tmp.path().join(format!("wal-{index}"));
+        fs::write(&path, [0; 4096]).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let file = LiveFileIdentity {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            block_size: 4096,
+        };
+        let mut manager = LiveTargetManager::open_fixture(config, f.configfs.clone()).unwrap();
+        let name = super::super::live_storage::wal_export_name(
+            1024,
+            [index as u8 / 5 + 1; 16],
+            index % 5,
+            1,
+            0,
+        );
+        let binding = manager.export_permanent(&name, file).unwrap();
+        assert!(subsystems.insert(binding.nqn));
+        managers.push(manager);
+    }
+    assert_eq!(subsystems.len(), 15);
+    for manager in &mut managers {
+        manager.shutdown().unwrap();
+    }
+    for name in ["hosts", "ports", "subsystems"] {
+        assert_eq!(fs::read_dir(f.configfs.join(name)).unwrap().count(), 0);
+    }
+}
+
+#[test]
 fn rollover_and_retained_readonly_use_new_capabilities() {
     let f = Fixture::new();
     let mut manager = f.open().unwrap();

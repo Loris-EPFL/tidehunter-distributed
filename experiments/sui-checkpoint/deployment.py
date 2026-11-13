@@ -72,6 +72,14 @@ def schemas(directory, expected_backend=None):
         raise ValueError('schema must describe 1..16 selected Tidehunter databases')
     return result
 
+def live_owner_identity(live_nvme, namespace, database, partition):
+    """One stable initiator identity per cell/database/partition, not per VM."""
+    base = uuid.UUID(bytes=bytes(live_nvme['host_id']))
+    owner = uuid.uuid5(base, f'{namespace}:{bytes(database).hex()}:{partition}')
+    return dict(host_nqn='nqn.2014-08.org.nvmexpress:uuid:' + str(owner),
+                host_id=list(owner.bytes))
+
+
 
 def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, guest_root=None, write_profile_limit=0, owner_transports=None, owner_tier=None, owner_wal="harness", live_nvme=None):
     if owner_tier not in (None, 'native', 'synchronous'):
@@ -128,6 +136,8 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             fragment_bytes=(128 if owner_wal == 'engine_default' else 16)*MIB,
             wal_file_bytes=(10240 if owner_wal == 'engine_default' else 256)*MIB, max_batches_per_partition=1000000,
             max_reference_metadata_bytes=256*MIB, max_epochs=32)
+        owner_identities = ({partition: live_owner_identity(live_nvme, namespace, identity, partition)
+                             for partition in range(5)} if live_nvme is not None else {})
         endpoints = []
         for partition, host in enumerate(hosts):
             address = f'{host}:{port + number * 5 + partition}'
@@ -147,7 +157,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             if live_nvme is not None:
                 k = number * 5 + partition
                 node['live_target'] = dict(address=addresses[partition], service=4420 + 2*k,
-                    transport='rdma', host_nqn=nqn, port_id=1000 + 2*k,
+                    transport='rdma', host_nqn=owner_identities[partition]['host_nqn'], port_id=1000 + 2*k,
                     state_dir=str(runtime_node / 'live-nvmeof'), commissioning_port_id=1001 + 2*k,
                     commissioning_service=4421 + 2*k, export_mode=live_nvme['export_mode'])
             # Adaptive parks drained TCP on readiness and keeps fabric CQ
@@ -176,8 +186,12 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             preparation_workers=2, scan_prefetch_pages=2, read_lanes=2,
             max_pending_reads=256, max_pending_read_bytes=64*MIB)
         if live_nvme is not None:
+            write_frame = (storage['group_limits']['max_encoded_bytes'] + 8 + 4095) & ~4095
+            recovery_bytes = 2 * (storage['batch_limits']['max_encoded_bytes'] + 8) + 3 * 4095
+            live_bytes = (max(write_frame + 4095, recovery_bytes) + 4095) & ~4095
             databases[namespace]['live_nvme'] = dict(host_nqn=nqn, host_id=host_id,
-                max_inflight_requests=32, max_inflight_bytes=16*MIB, connect_timeout_ms=30000,
+                owner_identities=owner_identities,
+                max_inflight_requests=32, max_inflight_bytes=live_bytes, connect_timeout_ms=30000,
                 io_timeout_ms=30000, write_mode='leased', leased_durability=owner_tier or 'native',
                 inline_reads=True, queue_geometry=geometry, export_mode=live_nvme['export_mode'])
     config = dict(root=str(db_root), databases=databases)

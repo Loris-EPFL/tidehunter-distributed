@@ -421,7 +421,46 @@ fn qualified_live_target_shutdown(
 /// Must run before normal CLI parsing in either example executable.
 pub fn maybe_run_storage_node() -> Result<bool> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("--experimental-storage-node") {
+    let mode = args.next();
+    if mode.as_deref() == Some("--experimental-validate-config") {
+        let config = args
+            .next()
+            .ok_or_else(|| io::Error::other("missing coordinator config"))?;
+        #[derive(Deserialize)]
+        struct Deployment {
+            databases: std::collections::BTreeMap<String, RemoteDatabaseConfig>,
+        }
+        let deployment: Deployment = serde_json::from_slice(&fs::read(config)?)?;
+        if deployment.databases.is_empty() || deployment.databases.len() > 16 {
+            return Err(io::Error::other("expected 1..16 coordinator databases").into());
+        }
+        for (namespace, database) in deployment.databases {
+            database
+                .validate()
+                .map_err(|e| io::Error::other(format!("{namespace}: {e}")))?;
+            database.tls.transport.validate()?;
+        }
+        let mut count = 0;
+        for file in args.take(81) {
+            count += 1;
+            if count > 80 {
+                return Err(io::Error::other("too many owner configurations").into());
+            }
+            let launch: NodeLaunch = serde_yaml::from_slice(&fs::read(&file)?)?;
+            launch
+                .node
+                .validate()
+                .map_err(|e| io::Error::other(format!("{file}: {e}")))?;
+            launch.limits.validate()?;
+            launch.tls.transport.validate()?;
+        }
+        if count == 0 {
+            return Err(io::Error::other("missing owner configurations").into());
+        }
+        println!("validated coordinator and {count} owner configurations; no resources opened");
+        return Ok(true);
+    }
+    if mode.as_deref() != Some("--experimental-storage-node") {
         return Ok(false);
     }
     let file = args

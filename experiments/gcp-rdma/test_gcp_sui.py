@@ -112,7 +112,12 @@ class SuiAdmissionTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'invalid Sui cell setting: ' + key):
                 gcp_sui.sui_cell_settings({key: value})
         self.assertIsNotNone(re.fullmatch(gcp_sui.CELL_PATTERN, 'r02-tidehunter_nvme_rdma'))
-        live = gcp_sui.live_nvme_config([{'rdma_ip': '10.2.0.1'}]*5, settings)
+        hosts = [{'rdma_ip': '10.2.0.1'}]*5
+        identity = dict(run_id='bench-0123456789abcdef', cell='r02-tidehunter_nvme_rdma')
+        live = gcp_sui.live_nvme_config(hosts, settings, **identity)
+        self.assertEqual(live, gcp_sui.live_nvme_config(hosts, settings, **identity))
+        self.assertNotEqual(live['host_id'], gcp_sui.live_nvme_config(
+            hosts, settings, **dict(identity, cell='r04-tidehunter_nvme_rdma'))['host_id'])
         self.assertEqual(live['addresses'], ['10.2.0.1']*5)
         self.assertEqual(live['host_id'], list(uuid.UUID(live['host_nqn'].rsplit(':', 1)[1]).bytes))
 
@@ -219,7 +224,8 @@ class ReviewedCompactSuiCells(unittest.TestCase):
         self.assertEqual(len(cells), 4)
         self.assertEqual(cells, spec['sui_cells'])
         settings = gcp_sui.sui_cell_settings(spec)
-        live = gcp_sui.live_nvme_config([{'rdma_ip': '10.2.0.2'}] * 5, settings)
+        live = gcp_sui.live_nvme_config([{'rdma_ip': '10.2.0.2'}] * 5, settings,
+            run_id='bench-0123456789abcdef', cell='r02-tidehunter_nvme_rdma')
         self.assertEqual(live['addresses'], ['10.2.0.2'] * 5)
         self.assertEqual(live['export_mode'], 'per_owner')
 

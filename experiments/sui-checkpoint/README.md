@@ -468,6 +468,28 @@ also reports the request and failed status check, with both shape hashes.
 Failed GCP cells retain the stopped owners' logs in `owner-N-logs.tar.gz`
 beside the replay evidence.
 
+For live NVMe-oF cells, `cloud_node.py` creates each validated target state
+directory with mode `0700` before it starts that storage process. The target
+requires this directory to exist; it does not create or adopt it. A directory
+that appears after validation fails the launch. The local paired replay does
+not run kernel nvmet, so its success does not test this external startup step.
+Each (database, partition) also gets its own initiator NQN and host UUID.
+The coordinator selects that pair from `live_nvme.owner_identities` when it
+configures the owner connection. Ports, services, state directories and WAL
+roots stay exclusive. This allows 15 owner processes on one storage VM without
+sharing a configfs host entry. The base identity and the owner map are pinned
+in the authority manifest; a changed map cannot reopen that authority.
+The live byte allowance covers the configured write-frame and recovery limits,
+rounded up to 4 KiB. It is not a global library default.
+
+Before sealing, `prepare.py` runs `validate_deployment.py` with the built
+storage binary. It generates both contracts, both owner WAL layouts, verbs
+and live NVMe-oF, and two-VM and six-VM layouts. The binary's
+`--experimental-validate-config CONFIG.json LAUNCH.yaml...` mode deserializes
+and validates the coordinator and owner settings without starting servers,
+creating WAL files or opening nvmet. This gate does not prove kernel target
+commissioning, RDMA connectivity or checkpoint completion.
+
 ```sh
 python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experiments/sui-checkpoint/prepare_external.py \
   --build /absolute/owned/checkpoint-build \

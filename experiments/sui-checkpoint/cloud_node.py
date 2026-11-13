@@ -183,6 +183,8 @@ def validate_config(config_path, owned_base=None):
         storage_roots.append(data)
         namespaces.append(dict(index=index, command=command, launch=str(launch),
                                storage_root=str(data), ready=str(ready), stop=str(stop)))
+        if live_target is not None:
+            namespaces[-1]['live_state_dir'] = str(state)
     if len(set(outputs + storage_roots)) != len(outputs + storage_roots):
         raise ValueError('owned paths must not alias')
     for output in outputs + storage_roots:
@@ -427,6 +429,10 @@ class NodeOwner:
         ready_end = time.monotonic() + min(30, self.remaining() - CLEANUP_RESERVE)
         for namespace in self.cfg['namespaces']:
             self.check_running()
+            if 'live_state_dir' in namespace:
+                # The target checks this private directory before it opens its
+                # registry. Never adopt a directory created by another owner.
+                Path(namespace['live_state_dir']).mkdir(mode=0o700)
             stdout_path = Path(self.cfg['logs_path']) / f"namespace-{namespace['index']:02d}.stdout.log"
             stderr_path = stdout_path.with_name(stdout_path.name.replace('.stdout.', '.stderr.'))
             with stdout_path.open('xb') as stdout, stderr_path.open('xb') as stderr:

@@ -32,6 +32,7 @@ fn live_config(mode: LiveWriteMode, tier: DurabilityTier) -> LiveClientConfig {
         polled_writes: false,
         host_nqn: "nqn.2026-01.test:p11-bench".into(),
         host_id: [1; 16],
+        owner_identities: Default::default(),
         max_inflight_requests: 32,
         max_inflight_bytes: 4 * MIB,
         connect_timeout_ms: 10000,
@@ -261,6 +262,65 @@ impl Drop for Fixture {
             server.join().unwrap();
         }
     }
+}
+
+#[test]
+fn owner_initiator_map_is_pinned_across_authority_reopen() {
+    use crate::distributed::tcp::LiveInitiatorIdentity;
+    let base = tempdir::TempDir::new("live-owner-identities").unwrap();
+    let mut f = Fixture::new(base.path(), "owner-map", DurabilityTier::Native, "B");
+    let identity = LiveInitiatorIdentity {
+        host_nqn: f.config.live_nvme.as_ref().unwrap().host_nqn.clone(),
+        host_id: [2; 16],
+    };
+    f.config
+        .live_nvme
+        .as_mut()
+        .unwrap()
+        .owner_identities
+        .insert(0, identity.clone());
+    let root = f.root.path().join("authority");
+    let open = |config| RemoteDatabase::open(&root, &f.shape, config, metrics());
+    let first = open(f.config.clone()).unwrap();
+    super::tests::fail_stop_without_checkpoint(first);
+    let same = open(f.config.clone()).unwrap();
+    super::tests::fail_stop_without_checkpoint(same);
+    for change in 0..4 {
+        let mut config = f.config.clone();
+        let live = config.live_nvme.as_mut().unwrap();
+        match change {
+            0 => live.owner_identities.get_mut(&0).unwrap().host_id = [3; 16],
+            1 => live
+                .owner_identities
+                .get_mut(&0)
+                .unwrap()
+                .host_nqn
+                .push_str("-changed"),
+            2 => live.owner_identities.clear(),
+            _ => {
+                live.owner_identities.insert(1, identity.clone());
+            }
+        }
+        assert!(open(config).is_err(), "accepted changed map {change}");
+    }
+    let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
+    manifest.live_nvme_owner_identities.clear();
+    persist_manifest(&root, &manifest).unwrap();
+    assert!(
+        open(f.config.clone())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("authority configuration/history differs")
+    );
+    f.config
+        .live_nvme
+        .as_mut()
+        .unwrap()
+        .owner_identities
+        .clear();
+    let legacy = open(f.config.clone()).unwrap();
+    super::tests::fail_stop_without_checkpoint(legacy);
 }
 
 #[derive(Serialize)]

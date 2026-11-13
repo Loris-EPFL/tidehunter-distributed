@@ -58,6 +58,14 @@ impl LiveWriteMode {
     }
 }
 
+/// Stable identity for one storage owner when several owners share a target VM.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveInitiatorIdentity {
+    pub host_nqn: String,
+    pub host_id: [u8; 16],
+}
+
 /// Bounded initiator resources. On-demand namespace identity comes from the
 /// owner. Permanent active-epoch identity is computed from the WAL file index.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -66,6 +74,9 @@ pub struct LiveClientConfig {
     pub host_nqn: String,
     /// Stable initiator UUID; must remain the same across authority reopen.
     pub host_id: [u8; 16],
+    /// Empty retains the base identity. Otherwise every partition needs an entry.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub owner_identities: std::collections::BTreeMap<u32, LiveInitiatorIdentity>,
     pub max_inflight_requests: usize,
     pub max_inflight_bytes: usize,
     pub connect_timeout_ms: u64,
@@ -95,8 +106,55 @@ fn default_inline_reads() -> bool {
 }
 
 impl LiveClientConfig {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn for_owner(&self, partition: u32) -> Result<std::borrow::Cow<'_, Self>, &'static str> {
+        if self.owner_identities.is_empty() {
+            return Ok(std::borrow::Cow::Borrowed(self));
+        }
+        let identity = self
+            .owner_identities
+            .get(&partition)
+            .ok_or("missing live NVMe-oF owner initiator identity")?;
+        // Copy only scalar settings, not the map of other owners' identities.
+        Ok(std::borrow::Cow::Owned(Self {
+            host_nqn: identity.host_nqn.clone(),
+            host_id: identity.host_id,
+            owner_identities: Default::default(),
+            max_inflight_requests: self.max_inflight_requests,
+            max_inflight_bytes: self.max_inflight_bytes,
+            connect_timeout_ms: self.connect_timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
+            write_mode: self.write_mode,
+            leased_durability: self.leased_durability,
+            lease_ahead: self.lease_ahead,
+            polled_writes: self.polled_writes,
+            inline_reads: self.inline_reads,
+            queue_geometry: self.queue_geometry,
+            export_mode: self.export_mode,
+        }))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         self.queue_geometry.validate()?;
+        for (partition, identity) in &self.owner_identities {
+            if identity.host_id == [0; 16]
+                || !identity.host_nqn.starts_with("nqn.")
+                || identity.host_nqn.len() > 223
+                || !identity
+                    .host_nqn
+                    .bytes()
+                    .all(|b| b.is_ascii_graphic() && b != b',' && b != b'=')
+                || self
+                    .owner_identities
+                    .range(..partition)
+                    .any(|(_, previous)| {
+                        previous.host_nqn == identity.host_nqn
+                            || previous.host_id == identity.host_id
+                    })
+            {
+                return Err("invalid or duplicate live NVMe-oF owner initiator identity");
+            }
+        }
         if self.polled_writes && self.queue_geometry.poll_queues == 0 {
             return Err("polled live writes require a poll queue");
         }
@@ -520,6 +578,10 @@ impl super::Client {
         config: &LiveClientConfig,
     ) -> Result<(), super::TcpError> {
         config.validate().map_err(super::TcpError::new)?;
+        let selected = config
+            .for_owner(self.expected.partition)
+            .map_err(super::TcpError::new)?;
+        let config = selected.as_ref();
         if self.live_writer_closing {
             return Err(super::TcpError::new("live writer admission is closed"));
         }
@@ -539,7 +601,7 @@ impl super::Client {
         }
         if self.live_config.as_ref() != Some(config) {
             self.drain_live_writer()?;
-            self.live_config = Some(config.clone());
+            self.live_config = Some(selected.into_owned());
         }
         Ok(())
     }
@@ -1067,6 +1129,7 @@ mod tests {
             polled_writes: false,
             host_nqn: "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
             host_id: [1; 16],
+            owner_identities: Default::default(),
             max_inflight_requests: 32,
             max_inflight_bytes: 4096,
             connect_timeout_ms: 1000,
@@ -1081,9 +1144,11 @@ mod tests {
         let mut old = serde_json::to_value(&config).unwrap();
         old.as_object_mut().unwrap().remove("queue_geometry");
         old.as_object_mut().unwrap().remove("export_mode");
+        assert!(!old.as_object().unwrap().contains_key("owner_identities"));
         let restored: LiveClientConfig = serde_json::from_value(old).unwrap();
         assert_eq!(restored.queue_geometry, LiveQueueGeometry::default());
         assert_eq!(restored.export_mode, LiveExportMode::OnDemand);
+        assert!(restored.owner_identities.is_empty());
         for mode in [LiveExportMode::PerFile, LiveExportMode::PerOwner] {
             config.export_mode = mode;
             assert_eq!(
@@ -1120,6 +1185,25 @@ mod tests {
         assert!(config.validate().is_err());
         config.max_inflight_requests = 1;
         config.io_timeout_ms = 0;
+        assert!(config.validate().is_err());
+        let first = LiveInitiatorIdentity {
+            host_nqn: "nqn.2026-01.test:owner-0".into(),
+            host_id: [2; 16],
+        };
+        let second = LiveInitiatorIdentity {
+            host_nqn: "nqn.2026-01.test:owner-1".into(),
+            host_id: [3; 16],
+        };
+        config.io_timeout_ms = 1000;
+        config.owner_identities = [(0, first.clone()), (1, second.clone())].into();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.for_owner(0).unwrap().host_nqn, first.host_nqn);
+        assert_eq!(config.for_owner(1).unwrap().host_id, second.host_id);
+        assert!(config.for_owner(2).is_err());
+        config.owner_identities.get_mut(&1).unwrap().host_nqn = first.host_nqn;
+        assert!(config.validate().is_err());
+        config.owner_identities.get_mut(&1).unwrap().host_nqn = second.host_nqn;
+        config.owner_identities.get_mut(&1).unwrap().host_id = first.host_id;
         assert!(config.validate().is_err());
     }
 }
@@ -2364,6 +2448,7 @@ pub(crate) mod leased_tests {
                     polled_writes: false,
                     host_nqn: "nqn.2026-01.test:leased".into(),
                     host_id: [1; 16],
+                    owner_identities: Default::default(),
                     max_inflight_requests: 4,
                     max_inflight_bytes: (self.config.partition.group_limits.max_encoded_bytes
                         + 4096)
@@ -2411,6 +2496,32 @@ pub(crate) mod leased_tests {
                 server.join().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn configured_client_installs_its_partition_identity() {
+        let f = Fixture::single_partition(DurabilityTier::Native, 16384);
+        let mut client = f.writer();
+        let mut config = client.live_config.clone().unwrap();
+        let identity = super::LiveInitiatorIdentity {
+            host_nqn: "nqn.2026-01.test:owner-specific".into(),
+            host_id: [2; 16],
+        };
+        config
+            .owner_identities
+            .insert(client.expected.partition, identity.clone());
+        let json = serde_json::to_value(&config).unwrap();
+        let key = client.expected.partition.to_string();
+        assert_eq!(
+            json["owner_identities"][&key]["host_id"],
+            serde_json::json!(vec![2; 16])
+        );
+        let decoded: LiveClientConfig = serde_json::from_value(json).unwrap();
+        client.configure_live_nvme(&decoded).unwrap();
+        let selected = client.live_config.as_ref().unwrap();
+        assert_eq!(selected.host_nqn, identity.host_nqn);
+        assert_eq!(selected.host_id, identity.host_id);
+        assert!(selected.owner_identities.is_empty());
     }
 
     pub(crate) fn leased_latencies(

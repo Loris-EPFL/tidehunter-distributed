@@ -122,6 +122,33 @@ class SuiNvmePreparationTest(unittest.TestCase):
             self.assertEqual(captured[3][captured[3].index('--output')+1], root/'sui/replay-original-default')
             self.assertEqual(captured[3][captured[3].index('--contract')+1], 'original_default')
 
+    def test_static_config_gate_runs_before_packaging(self):
+        revision = 'ef6701911cc07d9102f55e52f5a0632e5ddb0a86'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root/'package-receipt.json').write_text(json.dumps({'source_revision': 'engine'}))
+            ci = SimpleNamespace(unpack_fixture=lambda fixture, output: root/'fixture',
+                local_replay_transport=lambda: {}, write_local_replay_transport=lambda path: None,
+                verification_bundle=lambda replay, destination, transport: destination)
+            spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
+            captured = []
+            def capture(command, deadline):
+                captured.append(command)
+                if len(captured) == 5:
+                    raise RuntimeError('static config gate captured')
+            with patch.object(prepare, 'checkout'), patch.object(gcp_sui, 'inspect_archive'), \
+                 patch.object(gcp_sui, 'verification_for_contract'), \
+                 patch.object(prepare.importlib.util, 'spec_from_file_location', return_value=spec), \
+                 patch.object(prepare.importlib.util, 'module_from_spec', return_value=ci), \
+                 patch.object(prepare.ci_prepare, 'bounded', side_effect=capture):
+                with self.assertRaisesRegex(RuntimeError, 'static config gate captured'):
+                    prepare.prepare_sui(root, root, revision, root/'fixture.tar.gz', root/'target', 1800, nvmeof=True)
+            gate = captured[4]
+            self.assertEqual(gate[1].name, 'validate_deployment.py')
+            self.assertEqual(gate[gate.index('--verification-root')+1], root/'sui')
+            self.assertIn('--nvmeof', gate)
+            self.assertFalse((root/'sui/sui-package.tar.gz').exists())
+
     def test_package_admission_requires_both_contract_schemas(self):
         from test_gcp_sui import write_verification
         with tempfile.TemporaryDirectory() as temp:

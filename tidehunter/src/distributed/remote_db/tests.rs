@@ -52,6 +52,49 @@ fn recorded_live_identity_cannot_reopen_as_tcp() {
 }
 
 #[test]
+fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
+    // Exact field order and representations of the pre-owner-map manifest.
+    #[derive(Serialize, Deserialize)]
+    struct LegacyManifest {
+        format: u32,
+        storage: LocalInventoryConfig,
+        history_persistence: HistoryPersistence,
+        endpoints: Vec<RemoteEndpoint>,
+        shape_yaml: String,
+        replay_limits: ReplayLimits,
+        live_nvme_identity: Option<(String, [u8; 16])>,
+        epochs: Vec<AuthorityEpoch>,
+        checkpoint: Option<CheckpointCommit>,
+        checkpoint_staging: Option<CheckpointFiles>,
+        checkpoint_obsolete: Option<CheckpointCommit>,
+    }
+    let f = Fixture::new();
+    let db = f.open();
+    let manifest = &db.manifest;
+    let legacy = LegacyManifest {
+        format: manifest.format,
+        storage: manifest.storage.clone(),
+        history_persistence: manifest.history_persistence,
+        endpoints: manifest.endpoints.clone(),
+        shape_yaml: manifest.shape_yaml.clone(),
+        replay_limits: manifest.replay_limits,
+        live_nvme_identity: manifest.live_nvme_identity.clone(),
+        epochs: manifest.epochs.clone(),
+        checkpoint: manifest.checkpoint.clone(),
+        checkpoint_staging: manifest.checkpoint_staging.clone(),
+        checkpoint_obsolete: manifest.checkpoint_obsolete.clone(),
+    };
+    assert_eq!(
+        encode_metadata(manifest).unwrap(),
+        encode_metadata(&legacy).unwrap()
+    );
+    let old: AuthorityManifest =
+        serde_yaml::from_str(&serde_yaml::to_string(&legacy).unwrap()).unwrap();
+    assert!(old.live_nvme_owner_identities.is_empty());
+    drop(db);
+}
+
+#[test]
 fn sui_read_evidence_samples_configured_owners_at_boundaries() {
     use crate::distributed::sui::Db;
 
@@ -885,6 +928,7 @@ fn live_frame_can_fill_one_fragment() {
         export_mode: Default::default(),
         host_nqn: "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
         host_id: [1; 16],
+        owner_identities: Default::default(),
         max_inflight_requests: 8,
         max_inflight_bytes: 64 * 1024,
         connect_timeout_ms: 1000,

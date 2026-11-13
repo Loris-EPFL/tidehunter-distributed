@@ -526,6 +526,18 @@ impl RemoteDatabaseConfig {
         }
         if let Some(live) = &self.live_nvme {
             live.validate().map_err(LocalDbError::new)?;
+            if !live.owner_identities.is_empty()
+                && (live.owner_identities.len() != self.storage.partitions.len()
+                    || self
+                        .storage
+                        .partitions
+                        .iter()
+                        .any(|p| !live.owner_identities.contains_key(p)))
+            {
+                return Err(LocalDbError::new(
+                    "live owner identities must cover every partition",
+                ));
+            }
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
             return Err(LocalDbError::new(
                 "live NVMe-oF requires the Linux experimental-nvmeof feature",
@@ -698,6 +710,8 @@ struct AuthorityManifest {
     /// The data-plane mode and initiator identity survive authority reopen.
     #[serde(default)]
     live_nvme_identity: Option<(String, [u8; 16])>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    live_nvme_owner_identities: BTreeMap<u32, super::tcp::LiveInitiatorIdentity>,
     epochs: Vec<AuthorityEpoch>,
     #[serde(default)]
     checkpoint: Option<CheckpointCommit>,
@@ -1685,6 +1699,11 @@ impl RemoteDatabase {
                     .live_nvme
                     .as_ref()
                     .map(|live| (live.host_nqn.clone(), live.host_id)),
+                live_nvme_owner_identities: config
+                    .live_nvme
+                    .as_ref()
+                    .map(|live| live.owner_identities.clone())
+                    .unwrap_or_default(),
                 epochs: Vec::new(),
                 checkpoint: None,
                 checkpoint_staging: None,
@@ -1710,6 +1729,12 @@ impl RemoteDatabase {
                     .live_nvme
                     .as_ref()
                     .map(|live| (live.host_nqn.as_str(), live.host_id))
+            || config
+                .live_nvme
+                .as_ref()
+                .map(|live| &live.owner_identities)
+                .is_some_and(|identities| identities != &manifest.live_nvme_owner_identities)
+            || (config.live_nvme.is_none() && !manifest.live_nvme_owner_identities.is_empty())
             || manifest.epochs.len() >= config.storage.max_epochs
             || manifest
                 .epochs

@@ -183,6 +183,46 @@ pub(super) fn config(root: &Path) -> NodeConfig {
 }
 
 #[test]
+fn static_node_validation_opens_no_runtime_resources() {
+    let temp = tempdir::TempDir::new("static-node-config").unwrap();
+    let mut config = config(&temp.path().join("absent-node-root"));
+    assert!(config.validate().is_ok());
+    for fault in 0..5 {
+        let mut invalid = config.clone();
+        match fault {
+            0 => invalid.read_workers = 0,
+            1 => invalid.partition.inventory.epoch = 2,
+            2 => invalid.max_epochs = 0,
+            3 => invalid.read_max_inflight_bytes = usize::MAX,
+            _ => invalid.shape_yaml = "invalid shape".into(),
+        }
+        assert!(invalid.validate().is_err());
+    }
+    config.live_target = Some(crate::distributed::nvmeof::LiveTargetConfig {
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
+        host_nqn: "nqn.2026-01.test:static".into(),
+        port_id: 42,
+        state_dir: temp.path().join("absent-target-state"),
+        commissioning_port_id: 43,
+        commissioning_service: 4421,
+        spdk: None,
+        export_mode: Default::default(),
+    });
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    {
+        assert!(config.validate().is_ok());
+        config.live_target.as_mut().unwrap().commissioning_port_id = 42;
+        assert!(config.validate().is_err());
+    }
+    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+    assert!(config.validate().is_err());
+    assert!(!config.root.exists());
+    assert!(!config.live_target.unwrap().state_dir.exists());
+}
+
+#[test]
 fn old_owner_launch_target_defaults_to_on_demand() {
     let temp = tempdir::TempDir::new("old-live-launch").unwrap();
     let config = config(&temp.path().join("node"));

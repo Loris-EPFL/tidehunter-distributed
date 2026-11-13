@@ -187,17 +187,23 @@ class NvmeDeploymentContract(unittest.TestCase):
                 targets = [x['node']['live_target'] for x in launches]
                 self.assertEqual(len({x[k] for x in targets for k in ('service', 'commissioning_service')}), 30)
                 self.assertEqual(len({x[k] for x in targets for k in ('port_id', 'commissioning_port_id')}), 30)
+                self.assertEqual(len({x['host_nqn'] for x in targets}), 15)
+                owner_ids = [identity for db in config['databases'].values()
+                             for identity in db['live_nvme']['owner_identities'].values()]
+                self.assertEqual(len({tuple(x['host_id']) for x in owner_ids}), 15)
                 for k, (node, launch) in enumerate(zip(nodes, launches)):
                     self.assertEqual(launch['durability'], {'tier': 'synchronous'})
                     runtime_node = Path(node['ready']).parent
+                    owner = config['databases'][node['namespace']]['live_nvme']['owner_identities'][node['partition']]
                     self.assertEqual(launch['node']['live_target'], dict(
                         address='10.0.0.1', service=4420+2*k, transport='rdma',
-                        host_nqn='nqn.test', port_id=1000+2*k, state_dir=str(runtime_node/'live-nvmeof'),
+                        host_nqn=owner['host_nqn'], port_id=1000+2*k, state_dir=str(runtime_node/'live-nvmeof'),
                         commissioning_port_id=1001+2*k, commissioning_service=4421+2*k,
                         export_mode='per_owner'))
                 for db in config['databases'].values():
                     self.assertEqual(db['live_nvme'], dict(host_nqn='nqn.test', host_id=[1]*16,
-                        max_inflight_requests=32, max_inflight_bytes=16*deployment.MIB,
+                        owner_identities=db['live_nvme']['owner_identities'],
+                        max_inflight_requests=32, max_inflight_bytes=16*deployment.MIB+4*4096,
                         connect_timeout_ms=30000, io_timeout_ms=30000, write_mode='leased',
                         leased_durability='synchronous', inline_reads=True,
                         queue_geometry=live['queue_geometry'], export_mode='per_owner'))
@@ -219,6 +225,52 @@ class NvmeDeploymentContract(unittest.TestCase):
                                         ('live_nvme', {}, 'invalid live NVMe-oF')]:
                 with self.assertRaisesRegex(ValueError, message):
                     deployment.prepare(root/'bad', schema, root/'db', **common, **{key: value})
+
+    def test_live_deployment_exclusive_resources_for_two_and_six_vms(self):
+        import uuid
+        schema = {f'live/db-{i}': {} for i in range(3)}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for grouped in (True, False):
+                for wal in ('engine_default', 'harness'):
+                    with self.subTest(grouped=grouped, wal=wal):
+                        hosts = ['10.0.0.1']*5 if grouped else [f'10.0.0.{i+1}' for i in range(5)]
+                        seed = uuid.uuid5(uuid.NAMESPACE_URL, f'fleet:cell:{grouped}:{wal}')
+                        live = dict(addresses=hosts, host_nqn='nqn.2014-08.org.nvmexpress:uuid:'+str(seed),
+                                    host_id=list(seed.bytes), export_mode='per_owner',
+                                    queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0))
+                        config, nodes = deployment.prepare(root/f'config-{grouped}-{wal}', schema, root/'db',
+                            shape_yamls={name: 'shape' for name in schema}, hosts=hosts, port=24000,
+                            transport=transport_for_case('tidehunter_verbs_native'), coordinator_cache=0,
+                            guest_root=root/'guest', live_nvme=live, owner_wal=wal)
+                        launches = [yaml.safe_load(Path(n['launch']).read_text()) for n in nodes]
+                        self.assertEqual(len(launches), 15)
+                        targets = [x['node']['live_target'] for x in launches]
+                        for field in ('host_nqn', 'state_dir'):
+                            self.assertEqual(len({x[field] for x in targets}), 15)
+                        for fields in (('port_id', 'commissioning_port_id'), ('service', 'commissioning_service')):
+                            self.assertEqual(len({x[f] for x in targets for f in fields}), 30)
+                        self.assertEqual(len({x['node']['root'] for x in launches}), 15)
+                        self.assertEqual(len({x['listen'] for x in launches}), 15)
+                        self.assertEqual(len({tuple(x['storage']['database']) for x in config['databases'].values()}), 3)
+                        identities = []
+                        for node, launch in zip(nodes, launches):
+                            db = config['databases'][node['namespace']]
+                            owners = db['live_nvme']['owner_identities']
+                            self.assertEqual(set(owners), set(range(5)))
+                            owner = owners[node['partition']]
+                            identities.append(owner)
+                            self.assertEqual(owner, deployment.live_owner_identity(
+                                live, node['namespace'], db['storage']['database'], node['partition']))
+                            self.assertEqual(owner['host_nqn'], launch['node']['live_target']['host_nqn'])
+                            self.assertEqual(list(uuid.UUID(owner['host_nqn'].rsplit(':', 1)[1]).bytes), owner['host_id'])
+                        self.assertEqual(len({tuple(x['host_id']) for x in identities}), 15)
+                        for db in config['databases'].values():
+                            storage = db['storage']
+                            frame = (storage['group_limits']['max_encoded_bytes'] + 8 + 4095) & ~4095
+                            required = max(frame + 4095, 2*(storage['batch_limits']['max_encoded_bytes']+8)+3*4095)
+                            self.assertEqual(db['live_nvme']['max_inflight_bytes'], (required+4095)&~4095)
+                            self.assertGreater(db['live_nvme']['max_inflight_bytes'], 16*deployment.MIB)
 
     def test_external_manifest_grouping(self):
         import prepare_external

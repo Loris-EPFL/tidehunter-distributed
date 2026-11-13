@@ -350,6 +350,12 @@ def prepare_sui(output, sui, revision, fixture, target, deadline_seconds, nvmeof
         work / 'replay-original-default', work / 'verification-original-default', transport)
     for contract in ('harness', 'original_default'):
         gcp_sui.verification_for_contract(work, contract)
+    static_gate = [sys.executable,
+        build / 'sources/tidehunter-sharded-wal/experiments/sui-checkpoint/validate_deployment.py',
+        '--build', build, '--verification-root', work, '--output', work / 'config-admission']
+    if nvmeof:
+        static_gate.append('--nvmeof')
+    ci_prepare.bounded(static_gate, deadline)
     source = json.loads((build / 'source-manifest.json').read_text())
     if source['sui']['revision'] != revision or source['tidehunter-sharded-wal']['revision'] != json.loads((output / 'package-receipt.json').read_text())['source_revision']:
         raise ValueError('Sui build source revisions differ from admitted checkouts')

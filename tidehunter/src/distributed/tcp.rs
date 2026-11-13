@@ -35,7 +35,7 @@ pub use super::nvmeof::{LiveExportMode, LiveQueueGeometry};
 pub(super) use live_client::LiveGroupBudget;
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use live_client::leased_tests;
-pub use live_client::{LiveClientConfig, LiveWriteMode};
+pub use live_client::{LiveClientConfig, LiveInitiatorIdentity, LiveWriteMode};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_control;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -173,6 +173,56 @@ pub struct NodeConfig {
     pub live_target: Option<super::nvmeof::LiveTargetConfig>,
 }
 
+impl NodeConfig {
+    /// Validate static owner settings without opening files, sockets or nvmet.
+    pub fn validate(&self) -> Result<(), TcpError> {
+        self.validated_shape()?;
+        self.read_config()?
+            .validate()
+            .map_err(TcpError::component)?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Some(target) = &self.live_target {
+            super::nvmeof::live_target::validate_config(target).map_err(TcpError::component)?;
+        }
+        Ok(())
+    }
+
+    fn validated_shape(&self) -> Result<KeyShape, TcpError> {
+        self.partition.validate().map_err(TcpError::component)?;
+        if self.partition.inventory.epoch != 1
+            || self.partition.inventory.segment_generation != 1
+            || !(1..=1024).contains(&self.max_epochs)
+        {
+            return Err(TcpError::new("invalid node epoch/configuration template"));
+        }
+        KeyShape::from_yaml(&self.shape_yaml).map_err(TcpError::component)
+    }
+
+    fn read_config(&self) -> Result<read_executor::ReadExecutorConfig, TcpError> {
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        if self.live_target.is_some() {
+            return Err(TcpError::new(
+                "live NVMe-oF target requires experimental-nvmeof on Linux",
+            ));
+        }
+        if !(1..=8).contains(&self.read_workers) {
+            return Err(TcpError::new("read_workers must be in 1..=8"));
+        }
+        if self.read_resident_first
+            && self.wal_member_read != super::storage::WalMemberReadPolicy::Async
+        {
+            return Err(TcpError::new("resident-first reads require async reads"));
+        }
+        Ok(read_executor::ReadExecutorConfig {
+            memory_allowance_bytes: self.read_memory_allowance_bytes,
+            max_requests: self.read_max_inflight_requests,
+            max_bytes: self.read_max_inflight_bytes,
+            max_device_reads: self.read_max_device_reads,
+            resident_first: self.read_resident_first,
+        })
+    }
+}
+
 fn default_read_workers() -> usize {
     2
 }
@@ -250,7 +300,7 @@ impl Default for TcpLimits {
     }
 }
 impl TcpLimits {
-    fn validate(self) -> Result<(), TcpError> {
+    pub fn validate(self) -> Result<(), TcpError> {
         if !(1024..=HARD_FRAME_LIMIT).contains(&self.max_frame_bytes)
             || !(1..=256).contains(&self.max_connections)
             || !(1..=256).contains(&self.max_reads)
@@ -826,33 +876,13 @@ pub struct StorageNode {
 }
 impl StorageNode {
     pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>, TcpError> {
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        if config.live_target.is_some() {
-            return Err(TcpError::new(
-                "live NVMe-oF target requires experimental-nvmeof on Linux",
-            ));
-        }
-        if !(1..=8).contains(&config.read_workers) {
-            return Err(TcpError::new("read_workers must be in 1..=8"));
-        }
-        if config.read_resident_first
-            && config.wal_member_read != super::storage::WalMemberReadPolicy::Async
-        {
-            return Err(TcpError::new("resident-first reads require async reads"));
-        }
+        let read_config = config.read_config()?;
         let read_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(config.read_workers)
             .thread_name(|i| format!("wal-record-read-{i}"))
             .build()
             .map_err(TcpError::component)?;
         let wal_member_read = config.wal_member_read;
-        let read_config = read_executor::ReadExecutorConfig {
-            memory_allowance_bytes: config.read_memory_allowance_bytes,
-            max_requests: config.read_max_inflight_requests,
-            max_bytes: config.read_max_inflight_bytes,
-            max_device_reads: config.read_max_device_reads,
-            resident_first: config.read_resident_first,
-        };
         let read_admission =
             Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
         let inventory = NodeInventory::open(config, metrics)?;
