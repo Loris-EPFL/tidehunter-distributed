@@ -8,6 +8,22 @@ import nvmeof_path as analysis
 
 
 class NvmeofPathTests(unittest.TestCase):
+    def test_crossing2_report_keeps_contracts_separate(self):
+        for selection, tier in (('nvmeof_contracts_crossing', 'synchronous'),
+                                ('nvmeof_contracts_crossing2', 'native')):
+            self.add('tidehunter_nvme_rdma', group='G22W', selection=selection,
+                     durability_tier=tier, owner_wal_file_bytes=268435456)
+        matrix = self.publish()
+        matrix.write_text(json.dumps(self.jobs))
+        rows = analysis.generate(self.export, self.report, self.output)
+        self.assertEqual([row['contract_class'] for row in rows], ['S', 'P'])
+        text = (self.output / 'nvmeof_path.md').read_text()
+        self.assertIn('NVMe-oF data path — nvmeof_contracts_crossing2', text)
+        self.assertIn('## Puts — class S', text)
+        self.assertIn('## Puts — class P', text)
+        with (self.output / 'puts.csv').open() as stream:
+            self.assertEqual(len(list(csv.DictReader(stream))), 2)
+
     def test_crossing_effective_geometry_and_puts(self):
         self.add('tidehunter_nvme_rdma', group='G22W',
                  selection='nvmeof_contracts_crossing', owner_wal_file_bytes=268435456)

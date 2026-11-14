@@ -292,8 +292,54 @@ struct OpenLiveExtent {
     allocation: crate::wal::ExternalWalAllocation,
     adoption: super::nvmeof::live_storage::LiveAdoption,
     closing: bool,
-    // Reused buffer: legal-frame bound for adoption, 1 MiB chunks for close.
+    // Independent scratch for close and the revoked-tail seal scan.
     buffer: Vec<u8>,
+    round: Arc<Mutex<AdoptionRound>>,
+}
+
+// Lock order: round gate -> state. Clone the gate under state, then release
+// state BEFORE taking it. Each hold spans one bounded background round, never
+// pressure work or persistence. Grants, close and position proofs do not take
+// it; read/maintenance/seal scans enter without state or persistence held.
+// Lifecycle FIFO ordering stays unchanged: a queued fence can wait for the
+// active request, bounded by the extent's frames and retry count.
+#[cfg(feature = "experimental-nvmeof")]
+#[derive(Default)]
+struct AdoptionRound {
+    buffers: [Vec<u8>; 2],
+    #[cfg(test)]
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    maximum_active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+const ADOPTION_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(feature = "experimental-nvmeof")]
+const ADOPTION_ROUND_FRAMES: usize = 32;
+#[cfg(feature = "experimental-nvmeof")]
+const ADOPTION_ROUND_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(feature = "experimental-nvmeof")]
+const ADOPTION_PARALLEL_BYTES: u64 = 256 * 1024;
+
+#[cfg(feature = "experimental-nvmeof")]
+struct PlannedLiveFrame {
+    start: u64,
+    len: u64,
+    probe: Result<u32, StorageError>,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+struct ValidatedLiveFrame {
+    group: CompleteGroup,
+    crc: u32,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+struct PreparedLiveFrame {
+    start: u64,
+    len: u64,
+    validated: Result<ValidatedLiveFrame, StorageError>,
 }
 
 #[cfg(feature = "experimental-nvmeof")]
@@ -327,6 +373,8 @@ enum LiveFrameStep {
 pub(crate) enum LivePausePoint {
     ScanSnapshot,
     FrameProbe,
+    ValidateUnlocked,
+    ValidatedBeforePublish,
     CloseSuffix,
     AfterFrame,
     PressureObserved,
@@ -448,6 +496,19 @@ pub(crate) struct LiveTestDiagnostics {
     lease: LiveTestLeaseTiming,
     exports: Vec<LiveTestExport>,
     dropped_exports: u64,
+    pub adoption: LiveTestAdoption,
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct LiveTestAdoption {
+    pub bytes: u64,
+    pub frames: u64,
+    pub rounds: u64,
+    pub parallel_rounds: u64,
+    pub validate_worker_ns: u64,
+    pub validate_wall_ns: u64,
+    pub publish_state_ns: u64,
 }
 
 /// Opt-in diagnostic timings. Ordinary reads do not take these timestamps.
@@ -2021,6 +2082,7 @@ impl PartitionLog {
             closing: false,
             allocation,
             buffer: Vec::new(),
+            round: Arc::new(Mutex::new(AdoptionRound::default())),
         };
         if prelease {
             state.next_live_extent = Some(open);
@@ -2109,139 +2171,265 @@ impl PartitionLog {
             if authority.epoch != self.config().inventory.epoch {
                 return Err(StorageError::Fenced);
             }
-            // At most one frame per 4 KiB, plus two metadata drains per frame.
+            // A round publishes up to 32 frames or drains pressure. Larger
+            // rounds reduce attempts; each successful frame still advances by
+            // at least 4 KiB. Retain three attempts per minimum-size frame for
+            // drains/rechecks, including stale rounds, and the fatal loop bound.
             let steps = self.config().fragment_bytes / 4096 * 3 + 3;
-            for _ in 0..steps {
-                let mut state = self.state.lock();
-                if state.poison.is_some() || state.references.background_failed() {
-                    return Err(StorageError::Poisoned);
-                }
-                if state.sealing && opportunistic.is_none() {
-                    return Err(StorageError::Invalid("live stream is sealing"));
-                }
-                if let Some(observed) = &opportunistic {
-                    match state.open_live_extent.as_ref() {
-                        Some(open) if open.extent.token == token => {
-                            if open.closing {
-                                return Ok(open.adoption.clone());
-                            }
-                        }
-                        _ => return Ok(observed.clone()),
+            'rounds: for _ in 0..steps {
+                let gate = {
+                    let state = self.state.lock();
+                    if let Some(summary) = Self::adoption_status(
+                        &state,
+                        token,
+                        through,
+                        close,
+                        opportunistic.as_ref(),
+                    )? {
+                        return Ok(summary);
                     }
-                }
-                if let Some(previous) = &state.last_live_adoption
-                    && previous.token == token
+                    Arc::clone(
+                        &state
+                            .open_live_extent
+                            .as_ref()
+                            .ok_or(StorageError::Poisoned)?
+                            .round,
+                    )
+                };
+                // Callers enter without state or persistence. The extent gate
+                // preserves complete-prefix scans for reads and maintenance.
+                let mut round = gate.lock();
+                let (file, cursor, end, file_bytes) = {
+                    let state = self.state.lock();
+                    if let Some(summary) = Self::adoption_status(
+                        &state,
+                        token,
+                        through,
+                        close,
+                        opportunistic.as_ref(),
+                    )? {
+                        return Ok(summary);
+                    }
+                    let open = state
+                        .open_live_extent
+                        .as_ref()
+                        .ok_or(StorageError::Poisoned)?;
+                    if through <= open.adoption.adopted_end {
+                        let summary = open.adoption.clone();
+                        drop(state);
+                        drop(round);
+                        return if close {
+                            self.close_live_extent(token, through, &mut profile)
+                        } else {
+                            Ok(summary)
+                        };
+                    }
+                    (
+                        Arc::clone(&open.allocation.file),
+                        open.adoption.adopted_end,
+                        open.extent.end,
+                        open.extent.segment.bytes,
+                    )
+                };
+                // Two reusable read buffers: 2 x 64 MiB maximum capacity.
+                // At most 32 results are held, whose encoded-frame bytes total
+                // <= 8 MiB, or one oversized frame <= 64 MiB. Existing detached
+                // group/batch decode storage is bounded by that same input.
+                #[cfg(test)]
+                let wall_started = Instant::now();
+                #[cfg(test)]
                 {
-                    return if through <= previous.adopted_end {
-                        Ok(previous.clone())
-                    } else {
-                        Err(StorageError::Invalid("closed live extent"))
-                    };
+                    let active = round.active.fetch_add(1, Ordering::Relaxed) + 1;
+                    round.maximum_active.fetch_max(active, Ordering::Relaxed);
                 }
-                let open = state
-                    .open_live_extent
-                    .as_ref()
-                    .ok_or(StorageError::Invalid("no live extent"))?;
-                if open.extent.token != token {
-                    return Err(StorageError::Invalid("foreign live extent"));
-                }
-                if open.closing {
-                    return if close || through > open.adoption.adopted_end {
-                        Err(StorageError::Invalid("live extent is closing"))
-                    } else {
-                        Ok(open.adoption.clone())
-                    };
-                }
-                if through < open.extent.start || through > open.extent.end {
-                    return Err(StorageError::Invalid("adoption outside live extent"));
-                }
-                let mut open = state
-                    .open_live_extent
-                    .take()
-                    .ok_or(StorageError::Poisoned)?;
-                let result = self.adopt_live_frame(&mut state, &mut open, through);
-                match result {
-                    Ok(LiveFrameStep::Adopted) => {
-                        profile.frames += 1;
-                        state.open_live_extent = Some(open);
-                        drop(state);
-                        #[cfg(test)]
-                        self.pause_live_at(LivePausePoint::AfterFrame);
-                        continue;
-                    }
-                    Ok(LiveFrameStep::Pressure(demand)) => {
-                        let cursor = open.adoption.adopted_end;
-                        state.open_live_extent = Some(open);
-                        if state.references.windowed() {
-                            let files = state.appended_end.saturating_sub(1)
-                                / self.config().wal_file_bytes
-                                + 1;
-                            state.references.persist_pending(files)?;
-                            if !demand.fits(&state, self.references.root().end) {
-                                return Err(StorageError::Capacity);
+                let mut plans = self.plan_adoption_round(
+                    &file,
+                    &mut round.buffers[0],
+                    cursor,
+                    through,
+                    end,
+                    file_bytes,
+                );
+                #[cfg(test)]
+                let probe_ns = duration_ns(wall_started.elapsed());
+                let (count, bytes) = plans
+                    .iter()
+                    .flatten()
+                    .fold((0usize, 0u64), |(count, bytes), plan| {
+                        (count + 1, bytes + plan.len)
+                    });
+                let parallel = plans[1].as_ref().is_some_and(|frame| frame.probe.is_ok())
+                    && bytes >= ADOPTION_PARALLEL_BYTES;
+                let split = if parallel {
+                    let mut prefix_bytes = 0;
+                    plans[..count - 1]
+                        .iter()
+                        .position(|plan| {
+                            prefix_bytes += plan.as_ref().map_or(0, |frame| frame.len);
+                            prefix_bytes >= bytes.div_ceil(2)
+                        })
+                        .map_or(count - 1, |index| index + 1)
+                } else {
+                    count
+                };
+                let mut prepared: [Option<PreparedLiveFrame>; ADOPTION_ROUND_FRAMES] =
+                    std::array::from_fn(|_| None);
+                #[cfg(test)]
+                self.pause_live_at(LivePausePoint::ValidateUnlocked);
+                let [first_buffer, second_buffer] = &mut round.buffers;
+                let (first_plans, second_plans) = plans[..count].split_at_mut(split);
+                let (first_results, second_results) = prepared[..count].split_at_mut(split);
+                let validate = |plans: &mut [Option<PlannedLiveFrame>],
+                                results: &mut [Option<PreparedLiveFrame>],
+                                buffer: &mut Vec<u8>| {
+                    #[cfg(test)]
+                    let started = Instant::now();
+                    for (plan, result) in plans.iter_mut().zip(results) {
+                        let Some(plan) = plan.take() else {
+                            break;
+                        };
+                        let validated = plan.probe.and_then(|probe_crc| {
+                            let validated = self.validate_planned_frame(
+                                &file, buffer, plan.start, plan.len, file_bytes, 0,
+                            )?;
+                            // Re-read the full frame, but never attach authority
+                            // to a different CRC than the boundary probe saw.
+                            if validated.crc != probe_crc {
+                                return Err(StorageError::IncompleteLiveFrame);
                             }
-                            continue;
+                            Ok(validated)
+                        });
+                        let failed = validated.is_err();
+                        *result = Some(PreparedLiveFrame {
+                            start: plan.start,
+                            len: plan.len,
+                            validated,
+                        });
+                        if failed {
+                            break;
                         }
-                        #[cfg(test)]
-                        self.pause_live_at(LivePausePoint::PressureObserved);
-                        let old_root = self.references.root();
-                        drop(state);
-                        // Only the already validated prefix may sync here.
-                        self.persist_scope(PersistScope::Appended, None)?;
-                        let mut state = self.state.lock();
-                        let durable_end = state.durable_end;
-                        let files = durable_end.div_ceil(self.config().wal_file_bytes);
-                        if let Err(error) =
-                            state
-                                .references
-                                .start_background(durable_end, files, &self.path)
-                        {
-                            state.poison = Some(WriterPoison::Fatal);
+                    }
+                    #[cfg(test)]
+                    {
+                        duration_ns(started.elapsed())
+                    }
+                    #[cfg(not(test))]
+                    {
+                        0u64
+                    }
+                };
+                let (first_ns, second_ns) = if parallel {
+                    std::thread::scope(|scope| {
+                        let worker =
+                            scope.spawn(|| validate(second_plans, second_results, second_buffer));
+                        let first = validate(first_plans, first_results, first_buffer);
+                        let second = match worker.join() {
+                            Ok(result) => result,
+                            Err(panic) => std::panic::resume_unwind(panic),
+                        };
+                        (first, second)
+                    })
+                } else {
+                    (validate(first_plans, first_results, first_buffer), 0)
+                };
+                #[cfg(test)]
+                {
+                    round.active.fetch_sub(1, Ordering::Relaxed);
+                    let mut state = self.state.lock();
+                    let diagnostics = &mut state.live_test_diagnostics.adoption;
+                    diagnostics.rounds += 1;
+                    diagnostics.parallel_rounds += u64::from(parallel);
+                    diagnostics.validate_wall_ns += duration_ns(wall_started.elapsed());
+                    diagnostics.validate_worker_ns += probe_ns + first_ns + second_ns;
+                }
+                #[cfg(not(test))]
+                let _ = (first_ns, second_ns);
+                #[cfg(test)]
+                self.pause_live_at(LivePausePoint::ValidatedBeforePublish);
+                let mut pressure = None;
+                let mut incomplete_summary = None;
+                #[cfg(test)]
+                let frames_before = profile.frames;
+                for PreparedLiveFrame {
+                    start,
+                    len,
+                    validated,
+                } in prepared.into_iter().flatten()
+                {
+                    let mut state = self.state.lock();
+                    #[cfg(test)]
+                    let publish_started = Instant::now();
+                    if let Some(summary) = Self::adoption_status(
+                        &state,
+                        token,
+                        through,
+                        close,
+                        opportunistic.as_ref(),
+                    )? {
+                        return Ok(summary);
+                    }
+                    let open = state
+                        .open_live_extent
+                        .as_ref()
+                        .ok_or(StorageError::Poisoned)?;
+                    if open.adoption.adopted_end != start {
+                        continue 'rounds;
+                    }
+                    let mut open = state
+                        .open_live_extent
+                        .take()
+                        .ok_or(StorageError::Poisoned)?;
+                    let result = validated.and_then(|validated| {
+                        self.publish_adoption_frame(&mut state, &mut open, start, len, validated)
+                    });
+                    let cursor = open.adoption.adopted_end;
+                    let summary = open.adoption.clone();
+                    state.open_live_extent = Some(open);
+                    #[cfg(test)]
+                    {
+                        let diagnostics = &mut state.live_test_diagnostics.adoption;
+                        diagnostics.publish_state_ns += duration_ns(publish_started.elapsed());
+                        if matches!(result, Ok(LiveFrameStep::Adopted)) {
+                            diagnostics.frames += 1;
+                            diagnostics.bytes += len;
+                        }
+                    }
+                    match result {
+                        Ok(LiveFrameStep::Adopted) => {
+                            profile.frames += 1;
+                            drop(state);
+                        }
+                        Ok(LiveFrameStep::Pressure(demand)) => {
+                            pressure = Some((state, cursor, demand));
+                            break;
+                        }
+                        Err(StorageError::IncompleteLiveFrame) if opportunistic.is_some() => {
+                            incomplete_summary = Some(summary);
+                            break;
+                        }
+                        Err(error) => {
+                            state.poison =
+                                Some(if matches!(error, StorageError::IncompleteLiveFrame) {
+                                    WriterPoison::IncompleteLiveFrame
+                                } else {
+                                    WriterPoison::Fatal
+                                });
                             return Err(error);
                         }
-                        drop(state);
-                        self.wait_history()?;
-                        let mut state = self.state.lock();
-                        // A concurrent adopter/close can obsolete this demand.
-                        // History drains without state; recheck this frame BEFORE
-                        // treating an unchanged root as a failed progress attempt.
-                        let same_frame = state.open_live_extent.as_ref().is_some_and(|open| {
-                            open.extent.token == token
-                                && !open.closing
-                                && open.adoption.adopted_end == cursor
-                        });
-                        let fits = demand.fits(&state, self.references.root().end);
-                        let root = self.references.root();
-                        if same_frame
-                            && !fits
-                            && root.count == old_root.count
-                            && root.end == old_root.end
-                        {
-                            state.poison = Some(WriterPoison::Fatal);
-                            return Err(StorageError::Capacity);
-                        }
-                        continue;
+                        Ok(LiveFrameStep::End) => return Ok(summary),
                     }
-                    Err(StorageError::IncompleteLiveFrame) if opportunistic.is_some() => {}
-                    Err(error) => {
-                        state.open_live_extent = Some(open);
-                        state.poison =
-                            Some(if matches!(error, StorageError::IncompleteLiveFrame) {
-                                WriterPoison::IncompleteLiveFrame
-                            } else {
-                                WriterPoison::Fatal
-                            });
-                        return Err(error);
-                    }
-                    Ok(LiveFrameStep::End) => {}
                 }
-                let summary = open.adoption.clone();
-                state.open_live_extent = Some(open);
-                if close {
-                    drop(state);
-                    return self.close_live_extent(token, through, &mut profile);
+                drop(round);
+                if let Some((state, cursor, demand)) = pressure {
+                    self.drain_adoption_pressure(state, token, cursor, demand)?;
                 }
-                return Ok(summary);
+                #[cfg(test)]
+                if profile.frames > frames_before {
+                    self.pause_live_at(LivePausePoint::AfterFrame);
+                }
+                if let Some(summary) = incomplete_summary {
+                    return Ok(summary);
+                }
             }
             self.state.lock().poison = Some(WriterPoison::Fatal);
             Err(StorageError::Invalid(
@@ -2252,12 +2440,229 @@ impl PartitionLog {
         result.map(|adoption| (adoption, profile))
     }
 
-    // Keep read/validate/publish atomic at the CURRENT cursor. Reserved
-    // completion already reads one frame under this lock; a leased stream has
-    // no concurrent appender, and registered reads never take this lock.
-    // Buffered-target frames are normally page-cached; eviction can require
-    // disk I/O. The bound is one frame (at most 64 MiB), not elapsed time.
-    // Atomic read/validate/publish makes concurrent adopters safe.
+    #[cfg(feature = "experimental-nvmeof")]
+    fn adoption_status(
+        state: &State,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+        opportunistic: Option<&super::nvmeof::live_storage::LiveAdoption>,
+    ) -> Result<Option<super::nvmeof::live_storage::LiveAdoption>, StorageError> {
+        if state.poison.is_some() || state.references.background_failed() {
+            return Err(StorageError::Poisoned);
+        }
+        if state.sealing && opportunistic.is_none() {
+            return Err(StorageError::Invalid("live stream is sealing"));
+        }
+        if let Some(observed) = opportunistic {
+            match state.open_live_extent.as_ref() {
+                Some(open) if open.extent.token == token => {
+                    if open.closing {
+                        return Ok(Some(open.adoption.clone()));
+                    }
+                }
+                _ => return Ok(Some(observed.clone())),
+            }
+        }
+        if let Some(previous) = &state.last_live_adoption
+            && previous.token == token
+        {
+            return if through <= previous.adopted_end {
+                Ok(Some(previous.clone()))
+            } else {
+                Err(StorageError::Invalid("closed live extent"))
+            };
+        }
+        let open = state
+            .open_live_extent
+            .as_ref()
+            .ok_or(StorageError::Invalid("no live extent"))?;
+        if open.extent.token != token {
+            return Err(StorageError::Invalid("foreign live extent"));
+        }
+        if open.closing {
+            return if close || through > open.adoption.adopted_end {
+                Err(StorageError::Invalid("live extent is closing"))
+            } else {
+                Ok(Some(open.adoption.clone()))
+            };
+        }
+        if through < open.extent.start || through > open.extent.end {
+            return Err(StorageError::Invalid("adoption outside live extent"));
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn drain_adoption_pressure(
+        &self,
+        mut state: parking_lot::MutexGuard<'_, State>,
+        token: [u8; 16],
+        cursor: u64,
+        demand: LiveFrameDemand,
+    ) -> Result<(), StorageError> {
+        if state.references.windowed() {
+            let files = state.appended_end.saturating_sub(1) / self.config().wal_file_bytes + 1;
+            state.references.persist_pending(files)?;
+            return if demand.fits(&state, self.references.root().end) {
+                Ok(())
+            } else {
+                Err(StorageError::Capacity)
+            };
+        }
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::PressureObserved);
+        let old_root = self.references.root();
+        drop(state);
+        self.persist_scope(PersistScope::Appended, None)?;
+        let mut state = self.state.lock();
+        let durable_end = state.durable_end;
+        let files = durable_end.div_ceil(self.config().wal_file_bytes);
+        if let Err(error) = state
+            .references
+            .start_background(durable_end, files, &self.path)
+        {
+            state.poison = Some(WriterPoison::Fatal);
+            return Err(error);
+        }
+        drop(state);
+        self.wait_history()?;
+        let mut state = self.state.lock();
+        let same_frame = state.open_live_extent.as_ref().is_some_and(|open| {
+            open.extent.token == token && !open.closing && open.adoption.adopted_end == cursor
+        });
+        let root = self.references.root();
+        if same_frame
+            && !demand.fits(&state, root.end)
+            && root.count == old_root.count
+            && root.end == old_root.end
+        {
+            state.poison = Some(WriterPoison::Fatal);
+            return Err(StorageError::Capacity);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn plan_adoption_round(
+        &self,
+        file: &File,
+        buffer: &mut Vec<u8>,
+        mut cursor: u64,
+        through: u64,
+        end: u64,
+        file_bytes: u64,
+    ) -> [Option<PlannedLiveFrame>; ADOPTION_ROUND_FRAMES] {
+        let mut plans = std::array::from_fn(|_| None);
+        let mut bytes = 0;
+        for slot in &mut plans {
+            if cursor >= through || bytes >= ADOPTION_ROUND_BYTES {
+                break;
+            }
+            let start = cursor;
+            let probe = self.probe_adoption_frame(file, buffer, start, through, end, file_bytes);
+            let len = probe.as_ref().copied().unwrap_or(0);
+            let failed = probe.is_err();
+            if bytes != 0 && len > ADOPTION_ROUND_BYTES - bytes {
+                break;
+            }
+            *slot = Some(PlannedLiveFrame {
+                start,
+                len,
+                probe: probe
+                    .map(|_| u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]])),
+            });
+            if failed {
+                break;
+            }
+            cursor += len;
+            bytes += len;
+        }
+        plans
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn probe_adoption_frame(
+        &self,
+        file: &File,
+        buffer: &mut Vec<u8>,
+        start: u64,
+        through: u64,
+        end: u64,
+        file_bytes: u64,
+    ) -> Result<u64, StorageError> {
+        if through - start < 4096 || end - start < 4096 {
+            return Err(StorageError::IncompleteLiveFrame);
+        }
+        if buffer.len() < 4096 {
+            buffer.resize(4096, 0);
+        }
+        file.read_exact_at(&mut buffer[..4096], start % file_bytes)
+            .map_err(Self::adoption_read_error)?;
+        let len = u64::from(u32::from_be_bytes([
+            buffer[0], buffer[1], buffer[2], buffer[3],
+        ])) + 8;
+        let max_frame =
+            (self.config().group_limits.max_encoded_bytes as u64 + 8).div_ceil(4096) * 4096;
+        if !len.is_multiple_of(4096)
+            || len > max_frame.min(ADOPTION_MAX_FRAME_BYTES as u64)
+            || len > through - start
+            || len > end - start
+        {
+            return Err(StorageError::IncompleteLiveFrame);
+        }
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::FrameProbe);
+        Ok(len)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn validate_planned_frame(
+        &self,
+        file: &File,
+        buffer: &mut Vec<u8>,
+        start: u64,
+        len: u64,
+        file_bytes: u64,
+        prefix_bytes: usize,
+    ) -> Result<ValidatedLiveFrame, StorageError> {
+        // Retain initialized high-water length. Requests re-read the whole frame;
+        // the locked seal fallback retains its already-probed first block.
+        if buffer.capacity() < len as usize {
+            // Keep geometric reuse without allocating past the hard frame cap.
+            let capacity = (len as usize)
+                .max(buffer.capacity() * 2)
+                .min(ADOPTION_MAX_FRAME_BYTES);
+            buffer.reserve_exact(capacity - buffer.len());
+        }
+        if buffer.len() < len as usize {
+            buffer.resize(len as usize, 0);
+        }
+        if len as usize > prefix_bytes {
+            file.read_exact_at(
+                &mut buffer[prefix_bytes..len as usize],
+                start % file_bytes + prefix_bytes as u64,
+            )
+            .map_err(Self::adoption_read_error)?;
+        }
+        let group = self.decode_live_frame(&buffer[..len as usize])?;
+        let crc = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+        Ok(ValidatedLiveFrame { group, crc })
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn adoption_read_error(error: io::Error) -> StorageError {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            StorageError::IncompleteLiveFrame
+        } else {
+            StorageError::Io(error)
+        }
+    }
+
+    // Request adoption reads and validates immutable bytes below declared through
+    // without state. Ordered publication rechecks token, lifecycle and cursor;
+    // concurrent adopters cannot publish the same frame twice. The revoked-tail
+    // seal scan below retains its existing single-frame locked read semantics.
     #[cfg(feature = "experimental-nvmeof")]
     fn adopt_live_frame(
         &self,
@@ -2265,71 +2670,40 @@ impl PartitionLog {
         open: &mut OpenLiveExtent,
         through: u64,
     ) -> Result<LiveFrameStep, StorageError> {
-        use super::nvmeof::live_storage::extend_live_receipt_digest;
         let start = open.adoption.adopted_end;
         if through <= start {
             return Ok(LiveFrameStep::End);
         }
-        if through - start < 4096 || open.extent.end - start < 4096 {
-            return Err(StorageError::IncompleteLiveFrame);
-        }
-        // Keep the initialized high-water length. A smaller following frame
-        // must not make the next larger read zero-fill this buffer again.
-        if open.buffer.len() < 4096 {
-            open.buffer.resize(4096, 0);
-        }
-        let offset = start % open.extent.segment.bytes;
-        open.allocation
-            .file
-            .read_exact_at(&mut open.buffer[..4096], offset)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::UnexpectedEof {
-                    StorageError::IncompleteLiveFrame
-                } else {
-                    StorageError::Io(error)
-                }
-            })?;
-        let len = u64::from(u32::from_be_bytes([
-            open.buffer[0],
-            open.buffer[1],
-            open.buffer[2],
-            open.buffer[3],
-        ])) + 8;
-        let max_frame =
-            (self.config().group_limits.max_encoded_bytes as u64 + 8).div_ceil(4096) * 4096;
-        if !len.is_multiple_of(4096)
-            || len > max_frame.min(64 * 1024 * 1024)
-            || len > through - start
-            || len > open.extent.end - start
-        {
-            return Err(StorageError::IncompleteLiveFrame);
-        }
-        #[cfg(test)]
-        self.pause_live_at(LivePausePoint::FrameProbe);
-        if open.buffer.len() < len as usize {
-            open.buffer.resize(len as usize, 0);
-        }
-        // The first block contains the complete header and often the entire
-        // frame. Read only the suffix of a larger frame, under the same lock.
-        if len > 4096 {
-            open.allocation
-                .file
-                .read_exact_at(&mut open.buffer[4096..len as usize], offset + 4096)
-                .map_err(|error| {
-                    if error.kind() == io::ErrorKind::UnexpectedEof {
-                        StorageError::IncompleteLiveFrame
-                    } else {
-                        StorageError::Io(error)
-                    }
-                })?;
-        }
-        let crc = u32::from_be_bytes([
-            open.buffer[4],
-            open.buffer[5],
-            open.buffer[6],
-            open.buffer[7],
-        ]);
-        let group = self.decode_live_frame(&open.buffer[..len as usize])?;
+        let len = self.probe_adoption_frame(
+            &open.allocation.file,
+            &mut open.buffer,
+            start,
+            through,
+            open.extent.end,
+            open.extent.segment.bytes,
+        )?;
+        let validated = self.validate_planned_frame(
+            &open.allocation.file,
+            &mut open.buffer,
+            start,
+            len,
+            open.extent.segment.bytes,
+            4096,
+        )?;
+        self.publish_adoption_frame(state, open, start, len, validated)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn publish_adoption_frame(
+        &self,
+        state: &mut State,
+        open: &mut OpenLiveExtent,
+        start: u64,
+        len: u64,
+        validated: ValidatedLiveFrame,
+    ) -> Result<LiveFrameStep, StorageError> {
+        use super::nvmeof::live_storage::extend_live_receipt_digest;
+        let ValidatedLiveFrame { group, crc } = validated;
         for batch in group.batches() {
             if !matches!(
                 self.references.lookup_conflict(

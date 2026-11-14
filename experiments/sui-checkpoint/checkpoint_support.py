@@ -155,6 +155,37 @@ def wait_rpc(child, address):
     raise TimeoutError("Sui RPC readiness exceeded five minutes")
 
 
+def listen_ports(config):
+    """TCP ports that the Sui node binds from its configuration."""
+    ports = [config.get("admin-interface-port")]
+    for key, pattern in (("metrics-address", r":(\d+)$"), ("json-rpc-address", r":(\d+)$"),
+                         ("network-address", r"/tcp/(\d+)")):
+        found = re.search(pattern, str(config.get(key, "")))
+        if found:
+            ports.append(int(found.group(1)))
+    return sorted({port for port in ports if isinstance(port, int) and port})
+
+
+def wait_listen_ports_free(config, seconds=60):
+    """The fixture ports are in the ephemeral range: a client socket can hold one for a short time."""
+    import socket
+    deadline = time.monotonic() + seconds
+    for _ in range(seconds * 10 + 1):
+        busy = []
+        for port in listen_ports(config):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.bind(("127.0.0.1", port))
+                except OSError:
+                    busy.append(port)
+        if not busy:
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    raise TimeoutError(f"Sui listen ports stayed in use: {busy}")
+
+
 def source_environment(previous):
     # The reviewed frozen producer uses one default mutex and a 32 MiB
     # asynchronous WAL. Its layout must not inherit the measured contract.

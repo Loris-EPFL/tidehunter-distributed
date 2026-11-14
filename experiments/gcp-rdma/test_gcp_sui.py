@@ -316,7 +316,7 @@ class ReviewedCompactSuiCells(unittest.TestCase):
                  patch.object(gcp_sui, 'verification_for_contract',
                      side_effect=lambda root, contract: root/('verification' if contract == 'harness' else 'verification-original-default')):
                 if remote_failure:
-                    with self.assertRaisesRegex(RuntimeError, 'replay exited before resource handshake'):
+                    with self.assertRaisesRegex(RuntimeError, 'run.py exited with status 1 before resources-required; last stage: none; see replay.log'):
                         gcp_sui.run_suite(config, mailbox, package, desc, output_root=root/'results')
                     self.assertTrue((root/'results/r01-tidehunter_verbs_native/owner-1.json').is_file())
                     self.assertTrue(any(call.args[1][3] == 'collect' for call in mailbox.submit.call_args_list))
@@ -337,6 +337,30 @@ class ReviewedCompactSuiCells(unittest.TestCase):
 
     def test_failed_replay_retains_owner_logs(self):
         self.test_four_cells_complete_with_one_owner_mailbox(remote_failure=True)
+
+
+class KernelSnapshot(unittest.TestCase):
+    def test_snapshot_keeps_controller_and_target_state_and_never_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            controller = root/'sys/nvme7'
+            controller.mkdir(parents=True)
+            (controller/'state').write_text('connecting\n')
+            (controller/'subsysnqn').write_text('nqn.test:wal\n')
+            target = root/'nvmet/subsystems/nqn.test:wal/allowed_hosts'
+            target.mkdir(parents=True)
+            (target.parent/'attr_allow_any_host').write_text('0\n')
+            with patch.object(gcp_sui.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='nvme nvme7: Property Set error: 880\n', stderr='')):
+                gcp_sui.kernel_snapshot(root/'out', 'at-failure', sysfs=root/'sys', configfs=root/'nvmet')
+            rows = json.loads((root/'out/kernel-at-failure.json').read_text())
+            self.assertEqual(rows['controllers']['nvme7']['state'], 'connecting')
+            self.assertEqual(rows['controllers']['nvme7']['subsysnqn'], 'nqn.test:wal')
+            self.assertIn('unreadable', rows['controllers']['nvme7']['hostnqn'])
+            self.assertEqual(rows['target']['subsystems/nqn.test:wal/attr_allow_any_host'], '0')
+            self.assertIn('Property Set error', (root/'out/dmesg-at-failure.txt').read_text())
+            with patch.object(gcp_sui.subprocess, 'run', side_effect=OSError('no dmesg')):
+                gcp_sui.kernel_snapshot(root/'out', 'second', sysfs=root/'sys', configfs=root/'nvmet')
+            self.assertFalse((root/'out/kernel-second.json').exists())
 
 
 if __name__ == '__main__':

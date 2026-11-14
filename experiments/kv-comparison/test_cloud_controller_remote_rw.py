@@ -52,6 +52,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
         cases.append(next(j for j in controller.cloud_campaign.make_focused_matrix('nvmeof_contracts')
                           if j['measurement_operations'] == 200000 and j['durability_tier'] == 'synchronous'))
         cases.append(controller.cloud_campaign.make_focused_matrix('nvmeof_contracts_crossing')[-1])
+        cases.append(controller.cloud_campaign.make_focused_matrix('nvmeof_contracts_crossing2')[-1])
         nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
         for job in cases:
             with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as tmp:

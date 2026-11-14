@@ -134,7 +134,7 @@ class ManualCampaignTest(unittest.TestCase):
 
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36}[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
@@ -147,6 +147,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
                     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
                     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
+                    'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
                     'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
                     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
                 }[selection])
@@ -2213,7 +2214,7 @@ class CombinedSuiSuiteTests(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_half_preserves_both_result_archives(self):
         import manual_sui
         from unittest.mock import Mock
-        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing'):
+        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing', 'sui_nvmeof_with_contracts_crossing2'):
             spec=manual_sui.REVIEWED_SUI_SPECS[name]
             for incomplete in ('kv','sui'):
                 with self.subTest(spec=name,incomplete=incomplete), tempfile.TemporaryDirectory() as tmp:
@@ -2245,7 +2246,7 @@ class CombinedSuiRunGateTests(SuiRunGateTests):
     async def test_run_forwards_staged_copy_focused_spec_and_both_abis(self):
         import manual_sui
         # Reuse the full launcher gate test with the exact combined reviewed spec.
-        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing'):
+        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing', 'sui_nvmeof_with_contracts_crossing2'):
             with self.subTest(spec=name):
                 with patch.dict(manual_sui.REVIEWED_SUI_SPECS,
                                 sui_nvmeof_compact=manual_sui.REVIEWED_SUI_SPECS[name]):
@@ -2259,6 +2260,10 @@ class ContractsSuiAdmissionTests(CombinedSuiAdmissionTests):
 
 class CrossingSuiTests(CombinedSuiAdmissionTests):
     spec_name = 'sui_nvmeof_with_contracts_crossing'
+
+
+class Crossing2SuiTests(CombinedSuiAdmissionTests):
+    spec_name = 'sui_nvmeof_with_contracts_crossing2'
 
 
 if __name__ == '__main__':

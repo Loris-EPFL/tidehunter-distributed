@@ -1496,6 +1496,301 @@ mod live_fencing {
         }
     }
 
+    fn leased_history(node: &StorageNode, config: &NodeConfig, extents: usize) -> u64 {
+        node.set_history_persistence(crate::distributed::storage::HistoryPersistence::WalReplay)
+            .unwrap();
+        let Response::LiveLeased(mut leased) =
+            extent_exchange(node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected leased extent")
+        };
+        for sequence in 0..extents {
+            let group = CompleteGroup::new_live(
+                &node.control_context.append_shape,
+                vec![batch(config, 1, sequence as u64)],
+                config.partition.batch_limits,
+                config.partition.group_limits,
+            )
+            .unwrap();
+            let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&leased.extent.segment.path)
+                .unwrap();
+            let offset = leased.extent.start % leased.extent.segment.bytes;
+            file.write_all_at(&frame, offset).unwrap();
+            let mut skip = [0; 4096];
+            skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+            file.write_all_at(&skip, offset + frame.len() as u64)
+                .unwrap();
+            let Response::LiveAdopted(adopted) = extent_exchange(
+                node,
+                Request::AdoptLiveExtent {
+                    epoch: 1,
+                    token: leased.extent.token,
+                    through: leased.extent.start + frame.len() as u64,
+                    close: true,
+                    lease_next: sequence + 1 < extents,
+                },
+            ) else {
+                panic!("expected adopted history")
+            };
+            if let Some(next) = adopted.next {
+                leased = next;
+            }
+        }
+        let end = node.inventory.lock().active(1).unwrap().appended_frontier();
+        fence(node, 2).unwrap();
+        end
+    }
+
+    fn history_page(
+        node: &StorageNode,
+        config: &NodeConfig,
+        from: u64,
+        end: u64,
+        sequence: u64,
+    ) -> live_control::LiveRecoveryWire {
+        let Response::LiveRecovery(page) = extent_exchange(
+            node,
+            Request::ReplayLiveWal {
+                authority_epoch: 2,
+                source_epoch: 1,
+                from,
+                limit: 1,
+                require_end: end,
+            },
+        ) else {
+            panic!("expected WAL history page")
+        };
+        assert_eq!(page.entries.len(), 1);
+        let entry = &page.entries[0];
+        assert!(entry.binding.readonly);
+        assert!(!entry.binding.permanent);
+        let mut bytes = vec![0; entry.len as usize];
+        fs::File::open(&entry.segment.path)
+            .unwrap()
+            .read_exact_at(&mut bytes, entry.offset)
+            .unwrap();
+        assert_eq!(&bytes[8..], batch(config, 1, sequence).encoded().as_ref());
+        page
+    }
+
+    fn release_history_page(node: &StorageNode, page: &live_control::LiveRecoveryWire) {
+        assert!(matches!(
+            extent_exchange(
+                node,
+                Request::ReleaseLiveEpochPin {
+                    epoch: 2,
+                    token: page.epoch_pin_token,
+                },
+            ),
+            Response::NvmeofEpochReleased
+        ));
+        assert!(node.inventory.lock().live_pins.is_empty());
+    }
+
+    fn target_stats(node: &StorageNode) -> crate::distributed::nvmeof::LiveTargetStats {
+        node.inventory
+            .lock()
+            .live_target
+            .as_ref()
+            .unwrap()
+            .stats()
+            .unwrap()
+    }
+
+    #[test]
+    fn history_pages_reuse_readonly_exports_only_in_permanent_modes() {
+        for mode in [
+            LiveExportMode::OnDemand,
+            LiveExportMode::PerFile,
+            LiveExportMode::PerOwner,
+        ] {
+            let temp = tempdir::TempDir::new("retained-history-pages").unwrap();
+            let (config, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
+            let end = leased_history(&node, &config, 2);
+            assert_eq!(target_stats(&node).owned_namespace_count, 0);
+            let first = history_page(&node, &config, 0, end, 0);
+            let exposed = target_stats(&node).namespaces_exposed;
+            release_history_page(&node, &first);
+            node.inventory.lock().reap_idle_live_segments(2).unwrap();
+            let retained = mode != LiveExportMode::OnDemand;
+            assert_eq!(
+                target_stats(&node).owned_namespace_count,
+                u64::from(retained)
+            );
+            let second = history_page(&node, &config, first.next.unwrap() as u64, end, 1);
+            assert_eq!(first.entries[0].segment, second.entries[0].segment);
+            assert_eq!(
+                first.entries[0].binding == second.entries[0].binding,
+                retained
+            );
+            assert_eq!(
+                target_stats(&node).namespaces_exposed,
+                exposed + u64::from(!retained)
+            );
+            release_history_page(&node, &second);
+            // A higher-epoch reopen's replayed history remains readable, but
+            // no export survives the following authority cut.
+            fence(&node, 3).unwrap();
+            assert_eq!(target_stats(&node).owned_namespace_count, 0);
+            shutdown(&node, 3);
+        }
+    }
+
+    #[test]
+    fn retained_history_stays_readonly_and_lifecycle_revocation_allows_retirement() {
+        for lifecycle in ["seal", "retire", "final"] {
+            let temp = tempdir::TempDir::new("retained-history-lifecycle").unwrap();
+            let (config, node) = open_live_mode(
+                temp.path(),
+                DurabilityTier::Synchronous,
+                LiveExportMode::PerOwner,
+            );
+            let end = leased_history(&node, &config, 1);
+            let page = history_page(&node, &config, 0, end, 0);
+            let segment = &page.entries[0].segment;
+            release_history_page(&node, &page);
+            assert_eq!(target_stats(&node).owned_namespace_count, 1);
+            {
+                let mut inventory = node.inventory.lock();
+                assert_eq!(
+                    inventory
+                        .publish_live_segment(segment, true)
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    "live segment identity or access changed"
+                );
+                assert_eq!(
+                    inventory
+                        .publish_permanent_segment(segment)
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    "live segment identity or access changed"
+                );
+            }
+            assert_eq!(
+                fence(&node, 1).err().unwrap().to_string(),
+                "epoch already fenced/sealed; cannot reactivate"
+            );
+            match lifecycle {
+                "seal" => {
+                    assert!(matches!(
+                        extent_exchange(&node, Request::Seal { epoch: 2 }),
+                        Response::Sealed
+                    ));
+                    assert_eq!(target_stats(&node).owned_namespace_count, 0);
+                    fence(&node, 3).unwrap();
+                    assert!(matches!(
+                        extent_exchange(
+                            &node,
+                            Request::RetireWalFiles {
+                                authority_epoch: 3,
+                                epoch: 1,
+                                files: vec![0],
+                            }
+                        ),
+                        Response::Retired
+                    ));
+                    shutdown(&node, 3);
+                }
+                "retire" => {
+                    assert!(matches!(
+                        extent_exchange(
+                            &node,
+                            Request::RetireWalFiles {
+                                authority_epoch: 2,
+                                epoch: 1,
+                                files: vec![0],
+                            }
+                        ),
+                        Response::Retired
+                    ));
+                    shutdown(&node, 2);
+                }
+                "final" => {
+                    // Exercise final teardown directly, rather than letting
+                    // the preceding Seal request do the only revocation.
+                    let stats = node.control.finish_live_target_shutdown().unwrap();
+                    assert_eq!(stats.owned_namespace_count, 0);
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(target_stats(&node).owned_namespace_count, 0);
+            if lifecycle != "final" {
+                assert!(!segment.path.exists(), "retirement must unlink the WAL");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_history_cache_evicts_oldest_unpinned_export_not_an_inflight_page() {
+        let temp = tempdir::TempDir::new("retained-history-bound").unwrap();
+        let (config, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        let bound = inventory::MAX_IDLE_HISTORY_EXPORTS;
+        let end = leased_history(&node, &config, (bound + 2) * 2);
+        let mut from = 0;
+        let mut first_binding = None;
+        let mut second_binding = None;
+        for sequence in 0..bound * 2 {
+            let page = history_page(&node, &config, from, end, sequence as u64);
+            from = page.next.unwrap() as u64;
+            if sequence == 0 {
+                first_binding = Some(page.entries[0].binding.clone());
+            }
+            if sequence == 2 {
+                second_binding = Some(page.entries[0].binding.clone());
+            }
+            release_history_page(&node, &page);
+            assert!(target_stats(&node).owned_namespace_count <= bound as u64);
+        }
+        // Repin the oldest file and keep that page in flight while a new
+        // history file needs cache space. It must not be an eviction victim.
+        let pinned = history_page(&node, &config, 0, end, 0);
+        assert_eq!(Some(&pinned.entries[0].binding), first_binding.as_ref());
+        let new = history_page(&node, &config, from, end, (bound * 2) as u64);
+        from = new.next.unwrap() as u64;
+        node.inventory
+            .lock()
+            .release_live_pin(2, new.epoch_pin_token)
+            .unwrap();
+        assert_eq!(
+            target_stats(&node).owned_namespace_count,
+            (bound + 1) as u64
+        );
+        release_history_page(&node, &pinned);
+        assert_eq!(target_stats(&node).owned_namespace_count, bound as u64);
+        assert!(
+            !temp
+                .path()
+                .join("configfs/subsystems")
+                .join(&second_binding.unwrap().nqn)
+                .exists(),
+            "the oldest unpinned history export must be revoked"
+        );
+        // One more new file evicts file 2 (file 1 was evicted when the pinned
+        // page joined the idle cache); the recently pinned file 0 survives.
+        let skip = history_page(&node, &config, from, end, (bound * 2 + 1) as u64);
+        from = skip.next.unwrap() as u64;
+        release_history_page(&node, &skip);
+        let next = history_page(&node, &config, from, end, (bound * 2 + 2) as u64);
+        release_history_page(&node, &next);
+        assert_eq!(target_stats(&node).owned_namespace_count, bound as u64);
+        let reread = history_page(&node, &config, 0, end, 0);
+        assert_eq!(Some(&reread.entries[0].binding), first_binding.as_ref());
+        release_history_page(&node, &reread);
+        fence(&node, 3).unwrap();
+        assert_eq!(target_stats(&node).owned_namespace_count, 0);
+        shutdown(&node, 3);
+    }
+
     fn assert_recovered(node: &StorageNode, config: &NodeConfig, receipts: &[Receipt]) {
         let log = node
             .inventory
@@ -1947,6 +2242,115 @@ mod live_fencing {
             );
             drop(log);
             shutdown(&node, 1);
+        }
+    }
+
+    #[test]
+    fn queued_live_fence_waits_for_unlocked_adoption_then_rejects_old_authority() {
+        use crate::distributed::storage::LivePausePoint;
+
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let temp = tempdir::TempDir::new("live-fence-adoption-round").unwrap();
+            let (config, node) = open_live(temp.path(), tier);
+            let Response::LiveLeased(leased) =
+                extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+            else {
+                panic!("expected leased extent")
+            };
+            let group = CompleteGroup::new_live(
+                &node.control_context.append_shape,
+                vec![batch(&config, 1, 0)],
+                config.partition.batch_limits,
+                config.partition.group_limits,
+            )
+            .unwrap();
+            let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&leased.extent.segment.path)
+                .unwrap()
+                .write_all_at(&frame, 0)
+                .unwrap();
+            let log = node.inventory.lock().active(1).unwrap();
+            let (entered, resume) = log.pause_live(LivePausePoint::ValidateUnlocked);
+            // No test-owned log Arc may survive the fence's recovery cut.
+            drop(log);
+            let (completed, completions) = mpsc::sync_channel(2);
+            assert!(
+                command(
+                    &node,
+                    1,
+                    Request::AdoptLiveExtent {
+                        epoch: 1,
+                        token: leased.extent.token,
+                        through: frame.len() as u64,
+                        close: false,
+                        lease_next: false,
+                    },
+                    4096,
+                    &completed
+                )
+                .is_ok()
+            );
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(command(&node, 2, Request::Fence { epoch: 2 }, 1, &completed).is_ok());
+            {
+                let queue = node.control.shared.queue.lock();
+                // Positive queue state: the accepted fence waits behind the
+                // active one-frame round, rather than timing a sleeping thread.
+                assert!(queue.active_appends >= 1);
+                assert!(queue.work.iter().any(
+                    |work| work.id == 2 && matches!(work.request, Request::Fence { epoch: 2 })
+                ));
+            }
+            assert!(matches!(
+                completions.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            resume.send(()).unwrap();
+            let Response::LiveAdopted(adopted) = receive(&completions, 1).response.unwrap() else {
+                panic!("expected old-epoch adoption completion")
+            };
+            assert_eq!(adopted.adoption.receipt_count, 1);
+            assert_eq!(adopted.adoption.adopted_end, frame.len() as u64);
+            let Response::Status(status) = receive(&completions, 2).response.unwrap() else {
+                panic!("expected higher-epoch fence")
+            };
+            assert_eq!(status.active_epoch, Some(2));
+            let old = node
+                .inventory
+                .lock()
+                .live_recovery_log(2, 1)
+                .unwrap()
+                .unwrap();
+            let published = old.receipt_count();
+            assert_eq!(published, 1);
+            assert!(
+                command(
+                    &node,
+                    3,
+                    Request::AdoptLiveExtent {
+                        epoch: 1,
+                        token: leased.extent.token,
+                        through: frame.len() as u64,
+                        close: false,
+                        lease_next: false,
+                    },
+                    4096,
+                    &completed
+                )
+                .is_ok()
+            );
+            assert_eq!(
+                receive(&completions, 3).response.err().unwrap().to_string(),
+                "stale or sealed request authority"
+            );
+            assert_eq!(old.receipt_count(), published);
+            assert_eq!(old.appended_frontier(), frame.len() as u64);
+            assert_eq!(node.control.preparer_count(), 0);
+            assert!(node.control.shared.syncers.lock().is_empty());
+            drop(old);
+            shutdown(&node, 2);
         }
     }
 

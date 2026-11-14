@@ -70,7 +70,7 @@ class ObserverMatrixQualification(unittest.TestCase):
 
     def test_nvmeof_path_observer_qualifies_exact_matrix(self):
         for selection in qualification.cloud_campaign.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36}[selection]
             with self.subTest(selection=selection):
                 import manual_campaign
                 spec = manual_campaign.REVIEWED_SPECS[selection]

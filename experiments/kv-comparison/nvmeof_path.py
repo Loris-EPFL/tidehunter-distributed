@@ -347,8 +347,9 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
     data = json.loads(source.read_text())
     jobs = data if isinstance(data, list) else data['jobs']
     selection = jobs[0].get('selection', NVMEOF_PATH_SELECTIONS[0]) if jobs else NVMEOF_PATH_SELECTIONS[0]
-    if any(j.get('selection') == 'nvmeof_contracts_crossing' for j in jobs):
-        selection = 'nvmeof_contracts_crossing'
+    for crossing in ('nvmeof_contracts_crossing', 'nvmeof_contracts_crossing2'):
+        if any(j.get('selection') == crossing for j in jobs):
+            selection = crossing
     if isinstance(data, dict):
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:

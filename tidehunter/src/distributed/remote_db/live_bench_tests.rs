@@ -1390,6 +1390,7 @@ fn leased_checkpoint_tail_workstation() {
                 "live_file_prepare_failures": preparation.live_file_prepare_failures,
                 "grant_profiles": fixture.node.bench_live_grant_profiles(),
                 "live_file_diagnostics": fixture.node.log_for_test(1).live_test_diagnostics(),
+                "adoption": fixture.node.log_for_test(1).live_test_diagnostics().adoption,
                 "target_dir": fixture.target_root.as_ref().map_or(fixture.root.path(), |directory| directory.path()),
                 "checkpoint_started": checkpoint_started,
                 "completed_checkpoint_lifetime_ns": completed_checkpoint_lifetime_ns,

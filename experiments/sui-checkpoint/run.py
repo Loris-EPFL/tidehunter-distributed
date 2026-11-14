@@ -181,6 +181,7 @@ def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, d
 
 def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline):
     config = checkpoint.configuration(root, mode)
+    checkpoint.wait_listen_ports_free(config)
     start = time.monotonic()
     child = owned.start(mode, [binary, '--config-path', root / f'{mode}.yaml',
                               '--run-with-range-checkpoint', tip+1], extra)

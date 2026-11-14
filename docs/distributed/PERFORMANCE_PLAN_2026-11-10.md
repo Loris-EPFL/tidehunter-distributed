@@ -1079,6 +1079,87 @@ Options not implemented: validate outside `state` on two threads with ordered pu
 
 Evidence: first run `/tmp/grant-fast/{disk,tmpfs}/run-{1,2,3}/`; second run `/tmp/grant-fast/v3b/` with `report-isolated.md` and `isolation-checks.json`. The ignored fixture `leased_checkpoint_tail_workstation` prints bounded grant/component and background-export records. Earlier runs overlapping builds are retained as contaminated observations, not gate results. These are workstation measurements, not NVMe-oF hardware results.
 
+## Run A4: prepared grants and file crossings (14 November 2026)
+
+Revision `3ed8f4d`; fleet `bench-07d5e4bccf064ea2`; one coordinator and one owner, both `z4m-highmem-16` in `us-central1-a`, cluster placement. One selected local SSD per VM, RF1. This is one fleet and one repetition, not a statistical comparison or a device-capacity result.
+
+KV selection `nvmeof_contracts_crossing`: **35 of 35 completed; 567,936 measured API calls, all successful.** Both unchanged 64 KiB, 16-caller timeline cases have no call at or above 5 ms and no cluster in `worker_dequeued -> live_group_build_started`. Their timelines retain control requests; absence of stalls is not absence of checkpoint/adoption work.
+
+| Leased NVMe-oF put, 64 KiB, 16 callers | Measured calls | p50 ms | p99 ms | p99.9 ms | Calls/s | Mean in-flight API calls |
+|---|---:|---:|---:|---:|---:|---:|
+| Page-cache, G21W `a0f43b2526801841f91f` | 4,096 | 0.737262 | 1.200258 | 1.446783 | 19,409 | 14.986 |
+| FUA/data-sync, G21W `e48025c5b86a96f2053d` | 4,096 | 1.207972 | 1.555235 | 1.959159 | 12,575 | 15.333 |
+| FUA/data-sync, G22W `7f7a98332d0f40636315`, 256 MiB WAL files | 16,384 | 1.195648 | 1.836558 | 21.225913 | 11,988 | 15.366 |
+
+Matched Run A2 timeline cases had p99.9 of 86.534584 ms (page-cache) and 23.340372 ms (synced), with 64 and 32 calls at or above 5 ms. A4 has none in either case. These are different fleets and binaries; the observed change does not isolate a causal speedup.
+
+**File-crossing proof.** G22W has eight measured extent switches, no switch wait, and eight grant profiles with aggregate namespace-sync time zero. Four new-file transitions during measurement are derived from adoption cursors, the contiguous-extent contract and the configured 128 MiB fragments / 256 MiB files:
+
+| Target file, derived | Prelease request ID | Owner handler µs | Coordinator grant round trip ms | First group built to I/O started µs | Extent switch µs |
+|---|---:|---:|---:|---:|---:|
+| 2 | 118 | 15.670 | 1.374163 | 168.607 | 162.091 |
+| 3 | 301 | 13.262 | 1.232797 | 165.004 | 158.997 |
+| 4 | 483 | 13.960 | 1.215216 | 124.496 | 121.466 |
+| 5 | 636 | 10.703 | 1.212985 | 112.852 | 106.717 |
+
+The built-to-I/O interval includes skip/switch/setup; it is not an isolated namespace-open measurement. Owner handler and coordinator round-trip clocks are independent and are not subtracted. Owner preparation counters are not present in this hardware export; zero preparation failures cannot be claimed from it. The zero namespace-sync grant profiles and actual crossings establish that the measured crossings did not perform namespace sync in the grant.
+
+**Remaining tail.** G22W retains 64 calls at or above 5 ms, maximum 27.417987 ms, in nine reported clusters. Their largest adjacent stage is either `live_io_submitted -> live_io_completed` or `append_enqueue_started -> worker_dequeued`. They overlap adoption requests of 27.436, 21.3 and 12.1 ms. No cluster is in `worker_dequeued -> live_group_build_started`; no extent switch waited. Overlap is not proof that adoption caused the I/O delay. The full cluster list is in `analysis/stalls-G22W-r0-7f7a98332d0f40636315.txt`.
+
+Process-wide `live.prom`, including warmup/drain, records 38 switches across 13 leased cases, with zero waits. G22W contributes ten of those switches; its measurement window has eight. Do not mix these populations. Raw counters are in `analysis/live-switch-counters.json`.
+
+**Sui.** r01 (owner RPC verbs, `original_default`, native tier) is complete and independently passes `analyze.py --verify-only`: equal checkpoint digests and full state audit. Its sampled completion window is 604.89 checkpoints/s native over 2.934 s and 571.40 remote over 3.106 s; 250 ms sampling, not steady state or per-checkpoint latency. Startup-inclusive times are not a performance comparison.
+
+r02 (live NVMe-oF, `original_default`) reached checkpoint 1,775 in both replays with equal checkpoint digests, but **failed its post-replay state audit**. The failed operation is `state-audit remote .../remote/full_node_db/94970e38de08/live/checkpoints .../native-schema/live/checkpoints/shape.json .../deployment/config.json live/checkpoints`. `audit-0-remote.stderr` reports `live controller pool deadline`. Its replay log reports that audit subprocess exiting 1. The outer campaign instead reports `replay exited before resource handshake`; that generic error does not describe the stage reached by the archived replay. The operator also observed NVMe Property Set error 880 and reconnect/failed-I/O loops; the root cause is not established. r02 is not a valid performance result. r03 and r04 did not run because the campaign stopped. Owner logs were retained for both reached cells.
+
+**Retrieval and teardown.** The normal launcher exited after collection. Independent Google MCP listings found both VMs, both boot disks and the placement policy absent; state has `cleanup_verified: true`, `cleanup_errors: []`. Delete subprocesses timed out, but subsequent resource inventories confirmed removal. Conservative compute upper bound **$3.306**, excluding storage/network, charging both hosts from earliest creation at 00:35:30 UTC through 01:05:40 UTC. No replacement fleet was started.
+
+Both retrieved archives match retained provenance: controller SHA-256 `aa7f11c5c0fcf583cd2f7b8ea4773f9177ec75507bb8cd4b960e5fa138870785`; partial Sui SHA-256 `6cc481eb79ca145610e907d19255d7dbec169f247044f318a1face36e4255b79`, object generation `1794618068239227`. Both nested Sui evidence archives also match their cell receipts. Evidence root: `checkpoint-work/contracts-launch-20261113-a4/`, with `results-top/`, `analysis/output/`, `analysis/cycle.txt`, the three `analysis/stalls-*.txt`, `early/crossing-intervals.json`, `sui-extract/`, and `fleet-output/`. No code fix or further cloud run is included in this result.
+
+## After Run A4: adoption outside `state` and the Sui NVMe-oF reopen (14 November 2026, local only)
+
+Not measured on cloud hardware. Engine check after both changes: 1,456 passed, 16 ignored; formatting, both clippy configurations and the fabric build pass.
+
+### Owner adoption validates outside `state`
+
+Run A4 left two facts: the page-cache writer wrote 1,214 MiB/s while the owner adopted about 720 MiB/s (`a0f43b2526801841f91f`), and the slow calls of the crossing case overlap adoption requests. Adoption held `state` while it read and validated each frame on one thread.
+
+Change: one adoption round per extent at a time (an extent-local gate that owns two read buffers). A round plans up to 32 frames or 8 MiB by a sequential header scan, reads and validates them without `state` on the caller and one scoped worker (halves by bytes, from 256 KiB and two frames), then publishes in frame order under `state` with the earlier token, closing, sealing, poison and cursor checks. The gate is never held with `state` or `persistence`; pressure work runs after the gate is released. Lease grants, close, seal and position proofs do not take the gate. A queued fence waits for the active adoption request, as before. No acknowledgement, recovery, wire or persisted-format change.
+
+Workstation fixture, same geometry and isolation as the grant gate, three invocations per layout (first fixture line per run, native tier):
+
+| Disk target, native tier | Before | Rounds of 2 frames | Rounds of 32 frames / 8 MiB |
+|---|---:|---:|---:|
+| Largest prelease handler (ms) | 3.376 | 0.035 | 0.067 |
+| Adoption rounds on two threads | not applicable | 60 of 748 | 71 of 72 |
+| Adoption rate, bytes / unlocked wall time (MiB/s) | about 780 | 777 | 930 to 1,146 |
+| Extent-switch waits per run | 2 to 3 | 3 | 2 to 3 |
+
+The first round shape (2 frames, 1 MiB threshold) removed the `state` wait of grants but almost never used the second thread, because real frames are about 365 KiB. The second shape raises the adoption rate by 20 to 47 % on this machine. It is not a factor of two: the summed worker time grew from 0.69 s to 0.81 to 0.95 s for the same bytes [INFERENCE: memory and page-cache contention with the writer on one machine]. Extent-switch waits remain on the workstation, where the writer and the owner share the machine. Whether two validation threads give enough margin on hardware is not known; the page-cache crossing case of the next fleet measures it. Options if they do not: more validation threads, or adoption of coordinator descriptors without an owner read (contract change, not implemented).
+
+Evidence: `/tmp/grant-fast/v4a/` and `/tmp/grant-fast/v4b/`; copies of the reports and counters in `checkpoint-work/research/adoption-gate-v4-20261114/`.
+
+### Sui r02: cause of the failed reopen over NVMe-oF
+
+Correction of the Run A4 seal record: the two local Sui replays of the package build did not configure live NVMe-oF (`live_nvme` null; owner RPC on loopback). The Sui NVMe-oF route with reopen and audit had never passed anywhere.
+
+Reproduction on the workstation with a real kernel `nvmet-tcp` target and `nvme-tcp` initiator on loopback (privileged container, 15 owners, the sealed `3ed8f4d` binaries, cloud timeouts of 30 s, cloud byte budget, 256 MiB WAL files): the remote replay passes; the audit reopens the database, which reserves a new epoch, fences the owners and recovers sealed WAL history through NVMe-oF. For each recovery page the owner commissioned and exported the immutable WAL file read-only, the coordinator connected a controller, and the owner revoked the export at the last page pin. The page size is the worst-case quotient `floor(16,793,600 / 8,388,616)`, 2 batches.
+
+| Local kernel NVMe-oF/TCP run, cloud settings | Sealed `3ed8f4d` (2 runs) | With the fix (3 runs) |
+|---|---:|---:|
+| Remote database audits | failed at the first, after about 440 s (`ENXIO` at a namespace open) | 9 of 9 equal; RocksDB comparisons equal |
+| Controllers created per run | 6,514 and 6,407 | 45 |
+| Kernel `Property Set error: 880` per run | 3,248 and 3,194 | 0 |
+| Checkpoints audit (s) | no result | 4.0 to 9.6 |
+
+With an audit connect limit of 5 ms the sealed binaries return the exact cloud error `live controller pool deadline`. Which pool branch returned it on the cloud after 30 s is not proved, and an RDMA-only fault is not excluded: the local transport is TCP. Stale controllers of the exited Sui node are ruled out as a necessary cause (no TCP controller exists before the audit).
+
+Fix: in the permanent export modes the owner keeps the read-only export of an immutable history file after its last page pin. At most 16 idle history exports per owner; the least recently released one is revoked first; an in-flight page is never evicted. Fence, seal, retirement and target shutdown revoke as before; `on_demand` keeps revoke-on-last-pin. An owner process that dies abruptly leaves kernel exports until its restart drains the target journal (existing limit). The worst-case page size is unchanged: a byte-accurate page needs a protocol field and is not implemented. A proposed `ENXIO` retry was not added (not validated, and not needed for the three passing runs).
+
+Harness changes: the campaign error names the last stage and the exit status instead of `replay exited before resource handshake`; a Sui node start waits until its fixed listen ports are free (a seal build failed once with `AddrInUse` on the admin port; the wait reduces the race, it does not remove it); a failed Sui cell retains kernel evidence from both VMs (kernel log, NVMe controller state, target configuration before the owners stop). New selection `nvmeof_contracts_crossing2` adds a page-cache crossing case `G22W-r0-f5566538e6cc790734f0` to the unchanged 35 cases (matrix SHA-256 `8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295`).
+
+Evidence: `checkpoint-work/r02-local-20261114/` (run evidence, kernel logs, cleanup proof, patches).
+
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.
 

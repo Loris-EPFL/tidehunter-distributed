@@ -28,6 +28,41 @@ TRANSPORTS = {'tcp', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_
 CELL_PATTERN = r'r0[1-4]-(?:tcp|tidehunter_verbs(?:_native)?|tidehunter_nvme_rdma)'
 
 
+def kernel_snapshot(directory, label, *, sysfs=Path('/sys/class/nvme'), configfs=Path('/sys/kernel/config/nvmet')):
+    """Retain bounded kernel NVMe evidence for a failed cell. It never raises: evidence is best effort."""
+    def tree(root, depth, limit=4096):
+        rows = {}
+        for path in sorted(root.rglob('*')) if root.is_dir() else ():
+            if len(rows) >= limit or len(path.relative_to(root).parts) > depth:
+                continue
+            try:
+                if path.is_symlink():
+                    rows[str(path.relative_to(root))] = '-> ' + os.readlink(path)
+                elif path.is_file():
+                    rows[str(path.relative_to(root))] = path.read_text(errors='replace')[:256].strip()
+            except OSError as error:
+                rows[str(path.relative_to(root))] = f'unreadable: {error.strerror}'
+        return rows
+    try:
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        controllers = {}
+        for controller in sorted(sysfs.glob('nvme*')) if sysfs.is_dir() else ():
+            controllers[controller.name] = {}
+            for name in ('state', 'transport', 'address', 'subsysnqn', 'hostnqn', 'hostid', 'cntlid', 'queue_count', 'sqsize'):
+                try:
+                    controllers[controller.name][name] = (controller / name).read_text().strip()
+                except OSError as error:
+                    controllers[controller.name][name] = f'unreadable: {error.strerror}'
+        log = subprocess.run(['dmesg', '--time-format', 'iso'], capture_output=True, text=True, timeout=10, check=False)
+        rows = dict(unix=time.time(), controllers=controllers, target=tree(configfs, 6),
+                    dmesg_exit=log.returncode, dmesg_error=log.stderr[-2000:])
+        (directory / f'kernel-{label}.json').write_text(json.dumps(rows, sort_keys=True, indent=1) + '\n')
+        (directory / f'dmesg-{label}.txt').write_text(log.stdout[-(4 << 20):])
+    except Exception as error:  # evidence only; the caller's failure must stay visible
+        print(f'could not retain kernel evidence {label}: {error}', file=sys.stderr)
+
+
 def owner_deadline(fleet_deadline, now=None):
     now = time.time() if now is None else now
     fleet_end = datetime.fromisoformat(fleet_deadline.replace('Z', '+00:00'))
@@ -358,6 +393,8 @@ def node_action(args):
             time.sleep(.2)
         raise TimeoutError('node readiness timed out')
     if args.action == 'stop':
+        # The stop removes the live targets; keep their state and the kernel log first.
+        kernel_snapshot(base / 'cloud-node-logs', 'before-stop')
         (base / 'stop').touch(exist_ok=False)
         return 0
     if args.action == 'collect':
@@ -368,6 +405,7 @@ def node_action(args):
         logs = base / 'cloud-node-logs'
         if not logs.is_dir():
             raise ValueError('node logs missing')
+        kernel_snapshot(logs, 'at-collect')
         log_archive = base.parent / 'node-logs.tar.gz'
         with tarfile.open(log_archive, 'w:gz') as archive:
             archive.add(logs, arcname='cloud-node-logs')
@@ -527,7 +565,10 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                             raise TimeoutError('replay exceeded the owner deadline reserve')
                         time.sleep(.2)
                     if child.poll() is not None:
-                        raise RuntimeError('replay exited before resource handshake')
+                        # The marker follows the state audit; name the last stage that was reached.
+                        reached = [name for name in ('remote-starting', 'remote-finished') if (stages / (name + '.json')).is_file()]
+                        raise RuntimeError(f'run.py exited with status {child.poll()} before resources-required; '
+                                           f'last stage: {reached[-1] if reached else "none"}; see replay.log')
                     stage_rows = {name: load(stages / (name + '.json')) for name in ('remote-starting', 'remote-finished', 'resources-required')}
                     binding = dict(config_sha256=sha(deployment / 'config.json'), build_manifest_sha256=sha(build_root / 'build-manifest.json'), checkpoint_digest=CHECKPOINT)
                     if any(any(row.get(k) != v for k, v in binding.items()) or row.get('stage') != name for name, row in stage_rows.items()):
@@ -575,6 +616,8 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
             # run.py writes its failure receipt/evidence in its own finally.
             # Keep any completed files even when replay or qualification fails.
             active_failure = sys.exc_info()[0] is not None
+            if active_failure:
+                kernel_snapshot(out / 'coordinator-kernel', 'at-failure')
             retention_error = None
             for name in ('evidence.tar.gz', 'receipt.json'):
                 source = replay / name

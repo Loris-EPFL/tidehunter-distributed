@@ -12,6 +12,25 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_crossing2_preserves_reviewed_jobs_and_pairs_contracts(self):
+        old = campaign.make_focused_matrix("nvmeof_contracts_crossing")
+        jobs = campaign.make_focused_matrix("nvmeof_contracts_crossing2")
+        self.assertEqual(jobs[:35], old)
+        self.assertEqual(json.dumps(jobs[:35], sort_keys=True), json.dumps(old, sort_keys=True))
+        self.assertEqual(len(jobs), 36)
+        self.assertEqual(Counter(j["group"] for j in jobs), {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 2})
+        self.assertEqual(jobs[-1]["case_id"], "G22W-r0-f5566538e6cc790734f0")
+        self.assertEqual(jobs[-1]["durability_tier"], "native")
+        expected = dict(old[-1], selection="nvmeof_contracts_crossing2", durability_tier="native",
+                        case_id=jobs[-1]["case_id"])
+        self.assertEqual(jobs[-1], expected)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                         "8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295")
+        campaign.validate_focused_job(jobs[-1])
+        for changed in (dict(jobs[-1], durability_tier="synchronous"), dict(jobs[-1], owner_wal_file_bytes=True)):
+            with self.assertRaises(ValueError):
+                campaign.validate_focused_job(changed)
+
     def test_crossing_preserves_contracts_and_exact_admission(self):
         old = campaign.make_focused_matrix("nvmeof_contracts")
         jobs = campaign.make_focused_matrix("nvmeof_contracts_crossing")
@@ -170,7 +189,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}

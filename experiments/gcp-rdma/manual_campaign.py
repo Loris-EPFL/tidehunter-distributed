@@ -102,6 +102,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
     'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
+    'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
 }
 REVIEWED_SPECS = {
@@ -146,6 +147,7 @@ REVIEWED_SPECS = {
         ('nvmeof_first_put', FOCUSED_MATRIX_SHA256['nvmeof_first_put'], 12),
         ('nvmeof_contracts', FOCUSED_MATRIX_SHA256['nvmeof_contracts'], 34),
         ('nvmeof_contracts_crossing', FOCUSED_MATRIX_SHA256['nvmeof_contracts_crossing'], 35),
+        ('nvmeof_contracts_crossing2', FOCUSED_MATRIX_SHA256['nvmeof_contracts_crossing2'], 36),
     )
 }
 

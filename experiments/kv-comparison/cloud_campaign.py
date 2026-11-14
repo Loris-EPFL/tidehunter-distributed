@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2")
 
 
 
@@ -720,7 +720,8 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "fair_native": 168, "parity": 216, "parity_compact": 177, "fair_five_owner": 39,
                   "remote_rw_compact": 342, "fabric_ab_compact": 80, "leased_ab_compact": 72,
                   "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
-                  "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35}
+                  "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35,
+                  "nvmeof_contracts_crossing2": 36}
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -760,6 +761,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_first_put": {"G20W": 9, "G20R": 1, "G20N": 2},
     "nvmeof_contracts": {"G21W": 16, "G21R": 8, "G21N": 10},
     "nvmeof_contracts_crossing": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 1},
+    "nvmeof_contracts_crossing2": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 2},
 }
 
 
@@ -1628,6 +1630,14 @@ def _nvmeof_contracts_crossing(path):
     return result
 
 
+def _nvmeof_contracts_crossing2(path):
+    """Retain the synced crossing and append its page-cache contract pair."""
+    result = _nvmeof_contracts_crossing(path)
+    _clone_job(result, "nvmeof_contracts_crossing2", result[-1], "G22W",
+               durability_tier="native")
+    return result
+
+
 def _nvmeof_first_put(sources):
     """Keep the reviewed first-put checks in their canary-first order."""
     result = []
@@ -1796,6 +1806,8 @@ def make_focused_matrix(selection):
             return _nvmeof_path_fix(path, make_focused_matrix("fabric_ab_compact"))
         if selection == "nvmeof_first_put":
             return _nvmeof_first_put(make_focused_matrix("nvmeof_path_fix"))
+        if selection == "nvmeof_contracts_crossing2":
+            return _nvmeof_contracts_crossing2(path)
         if selection == "nvmeof_contracts_crossing":
             return _nvmeof_contracts_crossing(path)
         if selection == "nvmeof_contracts":

@@ -28,6 +28,12 @@ storage configuration; reports show the effective size. The combined reviewed
 spec is `sui_nvmeof_with_contracts_crossing` (35 KV cases and four Sui cells).
 The existing selection and its matrix hash do not change.
 
+`nvmeof_contracts_crossing2` retains those 35 jobs and appends the same `G22W`
+file-crossing workload with the owner tier `native` (page-cache acknowledgement).
+Both crossing cases retain their full write timelines. The combined reviewed spec
+`sui_nvmeof_with_contracts_crossing2` has 36 KV cases and the same four Sui cells
+(40 cases total). All earlier selections, case IDs and pins remain unchanged.
+
 ## Linux page-cache owner branch
 
 On `experiment/linux-pagecache-nvme-rdma`, the coordinator value cache remains,

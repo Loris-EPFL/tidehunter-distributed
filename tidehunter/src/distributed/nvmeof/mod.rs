@@ -115,9 +115,11 @@ impl LiveQueueGeometry {
     }
 }
 
-/// Live WAL export scope. Permanent modes cover only the active epoch.
-/// `OnDemand` keeps file grants. `PerFile` and `PerOwner` export active-epoch
-/// files until seal, fencing, or retirement. Sealed reads still use grants.
+/// Live WAL export scope. `OnDemand` revokes a file grant after its last pin.
+/// `PerFile` and `PerOwner` export active-epoch files until seal or fencing,
+/// and cache a bounded number of idle readonly immutable-history exports
+/// between page pins. Seal, fencing, retirement and target shutdown revoke them.
+/// Page pins still protect in-flight reads; idle exports hold no read pins.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveExportMode {

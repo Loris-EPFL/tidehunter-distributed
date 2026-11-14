@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MANIFEST: &str = "tcp-node-inventory-v1";
 const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
+// Bound idle history namespaces, subsystem objects and pinned target FDs
+// independently of WAL history size. In-flight pages keep their separate pins.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 enum EpochState {
     Preparing,
@@ -69,6 +73,9 @@ pub struct NodeInventory {
             bool,
         ),
     >,
+    // Least recently released first; only unpinned readonly bindings enter.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    idle_history_exports: std::collections::VecDeque<(u64, u64)>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) live_pins: BTreeMap<
         [u8; 16],
@@ -518,6 +525,8 @@ impl NodeInventory {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_bindings: BTreeMap::new(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            idle_history_exports: std::collections::VecDeque::new(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pins: BTreeMap::new(),
             lock,
         })
@@ -870,6 +879,7 @@ impl NodeInventory {
             if existing != segment || (writable && !was_writable) {
                 return Err(TcpError::new("live segment identity or access changed"));
             }
+            self.idle_history_exports.retain(|idle| *idle != key);
             return Ok(binding.clone());
         }
         let target = self
@@ -948,6 +958,7 @@ impl NodeInventory {
             target.revoke(binding).map_err(TcpError::component)?;
         }
         self.live_bindings.clear();
+        self.idle_history_exports.clear();
         Ok(())
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -962,6 +973,8 @@ impl NodeInventory {
         }
         self.live_bindings
             .retain(|(binding_epoch, _), _| *binding_epoch != epoch);
+        self.idle_history_exports
+            .retain(|(binding_epoch, _)| *binding_epoch != epoch);
         Ok(())
     }
 
@@ -974,11 +987,15 @@ impl NodeInventory {
             return Err(TcpError::new("live pin belongs to another authority epoch"));
         }
         let mut revoke = std::collections::BTreeSet::new();
+        let mut retain = std::collections::BTreeSet::new();
         for lease in leases {
             let key = (lease.segment.epoch, lease.segment.file_index);
             let releasable = match self.live_bindings.get(&key) {
                 Some((_, binding, _)) if binding.permanent => false,
-                Some((_, _, false)) => true,
+                Some((_, _, false)) => self
+                    .live_target
+                    .as_ref()
+                    .is_none_or(|target| target.export_mode().files_per_subsystem().is_none()),
                 Some((_, _, true)) => self
                     .logs
                     .get(&key.0)
@@ -987,15 +1004,21 @@ impl NodeInventory {
                     .map_err(TcpError::component)?,
                 None => false,
             };
-            if releasable
-                && !self.live_pins.iter().any(|(other, (_, leases))| {
-                    *other != token
-                        && leases
-                            .iter()
-                            .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
-                })
-            {
-                revoke.insert(key);
+            if !self.live_pins.iter().any(|(other, (_, leases))| {
+                *other != token
+                    && leases
+                        .iter()
+                        .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
+            }) {
+                if releasable {
+                    revoke.insert(key);
+                } else if self
+                    .live_bindings
+                    .get(&key)
+                    .is_some_and(|(_, binding, writable)| !binding.permanent && !writable)
+                {
+                    retain.insert(key);
+                }
             }
         }
         for key in revoke {
@@ -1014,7 +1037,38 @@ impl NodeInventory {
             }
             self.live_bindings.remove(&key);
         }
+        for key in retain {
+            self.retain_idle_history_export(key)?;
+        }
         self.live_pins.remove(&token);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn retain_idle_history_export(&mut self, key: (u64, u64)) -> Result<(), TcpError> {
+        self.idle_history_exports.retain(|idle| *idle != key);
+        if self.idle_history_exports.len() == MAX_IDLE_HISTORY_EXPORTS {
+            let oldest = *self
+                .idle_history_exports
+                .front()
+                .ok_or_else(|| TcpError::new("idle history queue disappeared"))?;
+            let (_, binding, _) = self
+                .live_bindings
+                .get(&oldest)
+                .ok_or_else(|| TcpError::new("idle history binding disappeared"))?;
+            if let Err(error) = self
+                .live_target
+                .as_mut()
+                .ok_or_else(|| TcpError::new("live target disappeared"))?
+                .revoke(binding)
+            {
+                self.healthy = false;
+                return Err(TcpError::component(error));
+            }
+            self.live_bindings.remove(&oldest);
+            self.idle_history_exports.pop_front();
+        }
+        self.idle_history_exports.push_back(key);
         Ok(())
     }
 
@@ -1146,6 +1200,7 @@ impl NodeInventory {
             return Err(TcpError::new("live target shutdown left owned namespaces"));
         }
         self.live_bindings.clear();
+        self.idle_history_exports.clear();
         Ok(stats)
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

@@ -269,5 +269,19 @@ class LocalStoreAuditContract(unittest.TestCase):
                 support.local_rocksdb_paths(live)
 
 
+class ListenPortTest(unittest.TestCase):
+    def test_node_start_waits_for_a_port_that_another_socket_holds(self):
+        import socket
+        with socket.socket() as holder:
+            holder.bind(("127.0.0.1", 0))
+            port = holder.getsockname()[1]
+            config = {"admin-interface-port": port, "metrics-address": f"127.0.0.1:{port}",
+                      "network-address": f"/ip4/127.0.0.1/tcp/{port}/https"}
+            self.assertEqual(support.listen_ports(config), [port])
+            with self.assertRaisesRegex(TimeoutError, str(port)):
+                support.wait_listen_ports_free(config, seconds=0)
+        support.wait_listen_ports_free(config, seconds=0)
+
+
 if __name__ == "__main__":
     unittest.main()
