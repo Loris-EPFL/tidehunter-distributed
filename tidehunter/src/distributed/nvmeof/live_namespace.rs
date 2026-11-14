@@ -155,6 +155,11 @@ impl LiveNamespace {
             && bytes.is_multiple_of(u64::from(block_size))
     }
     pub fn open(binding: &LiveNamespaceBinding) -> io::Result<Self> {
+        Self::verify_opened_device(binding, Self::open_device(binding)?)
+    }
+
+    /// Open separately so readiness retries cannot swallow verification errors.
+    pub(crate) fn open_device(binding: &LiveNamespaceBinding) -> io::Result<File> {
         if !Self::valid_geometry(binding.bytes, binding.block_size)
             || binding.uuid == [0; 16]
             || binding.nsid == 0
@@ -163,11 +168,17 @@ impl LiveNamespace {
         {
             return Err(invalid("invalid namespace binding"));
         }
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .read(true)
             .write(binding.access == LiveNamespaceAccess::ReadWrite)
             .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
-            .open(&binding.namespace_path)?;
+            .open(&binding.namespace_path)
+    }
+
+    pub(crate) fn verify_opened_device(
+        binding: &LiveNamespaceBinding,
+        file: File,
+    ) -> io::Result<Self> {
         let meta = file.metadata()?;
         if !meta.file_type().is_block_device() {
             return Err(invalid("not a block namespace"));

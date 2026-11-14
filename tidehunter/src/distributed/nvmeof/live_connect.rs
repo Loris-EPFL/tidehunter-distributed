@@ -229,37 +229,80 @@ fn with_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
     )
 }
 
-// A missing or torn-down device is transient here. Other errors, including
-// permission failures and EIO, are returned immediately.
+fn connect_error_after_cleanup(primary: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => primary,
+        Err(error) => io::Error::new(
+            primary.kind(),
+            format!("{primary}; controller cleanup failed: {error}"),
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeviceNode {
+    Namespace,
+    Controller,
+}
+
+// ENXIO can mean a namespace has not been scanned yet, but must never mean
+// confirmed disappearance during cleanup, or be retried for controller admin I/O.
 fn wait_for_device<T>(
     operation: &str,
     path: &Path,
+    controller: &str,
+    node: DeviceNode,
     deadline: Instant,
+    mut verify: impl FnMut() -> io::Result<()>,
     mut open: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
+    let mut last_error: Option<io::Error> = None;
     loop {
         if remaining(deadline).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "{operation} {}: device node did not appear before deadline",
+            let reason = if last_error
+                .as_ref()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ENXIO))
+            {
+                "ENXIO persisted until namespace readiness deadline"
+            } else {
+                "device node did not appear before deadline"
+            };
+            let message = match last_error {
+                Some(error) => format!(
+                    "{operation} {} (controller {controller}): {reason}: {error}",
                     path.display()
                 ),
-            ));
+                None => format!(
+                    "{operation} {} (controller {controller}): {reason}",
+                    path.display()
+                ),
+            };
+            return Err(io::Error::new(io::ErrorKind::TimedOut, message));
         }
-        match open() {
+        // Recheck the pinned controller before EVERY open. Preserve the existing
+        // ENOENT/ENODEV wait, but do not retry ENXIO from identity verification.
+        let attempt = match verify() {
+            Ok(()) => open(),
+            Err(error) if vanished(&error) => Err(error),
+            Err(error) => {
+                return Err(with_context(
+                    "verify controller before device open",
+                    path,
+                    error,
+                ));
+            }
+        };
+        match attempt {
             Ok(value) => return Ok(value),
-            Err(error) if vanished(&error) => {
-                std::thread::sleep(
-                    remaining(deadline)
-                        .map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                format!("{operation} {}: {error}", path.display()),
-                            )
-                        })?
-                        .min(Duration::from_millis(20)),
-                );
+            Err(error)
+                if vanished(&error)
+                    || (matches!(node, DeviceNode::Namespace)
+                        && error.raw_os_error() == Some(libc::ENXIO)) =>
+            {
+                last_error = Some(error);
+                if let Ok(delay) = remaining(deadline) {
+                    std::thread::sleep(delay.min(Duration::from_millis(20)));
+                }
             }
             Err(error) => return Err(with_context(operation, path, error)),
         }
@@ -625,10 +668,10 @@ impl LiveController {
             .and_then(|()| controller.resolve_verified(access, deadline))
         {
             Ok(binding) => Ok((controller, binding)),
-            Err(error) => {
-                controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT)?;
-                Err(error)
-            }
+            Err(error) => Err(connect_error_after_cleanup(
+                error,
+                controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT),
+            )),
         }
     }
     fn create(
@@ -837,10 +880,15 @@ impl LiveNamespaceResolver {
                 return Err(invalid("ambiguous namespace"));
             }
             if let Some((path, dev)) = candidates.pop() {
-                let file = wait_for_device("open namespace device", &path, deadline, || {
-                    self.verify()?;
-                    OpenOptions::new().read(true).open(&path)
-                })?;
+                let file = wait_for_device(
+                    "open namespace device",
+                    &path,
+                    &self.name,
+                    DeviceNode::Namespace,
+                    deadline,
+                    || self.verify(),
+                    || OpenOptions::new().read(true).open(&path),
+                )?;
                 let meta = file.metadata()?;
                 if !meta.file_type().is_block_device()
                     || format!("{}:{}", libc::major(meta.rdev()), libc::minor(meta.rdev())) != dev
@@ -870,16 +918,16 @@ impl LiveNamespaceResolver {
                     spdk: self.target.spdk.clone(),
                     access,
                 };
-                let ns = wait_for_device(
+                let file = wait_for_device(
                     "open verified namespace",
                     &binding.namespace_path,
+                    &self.name,
+                    DeviceNode::Namespace,
                     deadline,
-                    || {
-                        self.verify()?;
-                        LiveNamespace::open(&binding)
-                    },
+                    || self.verify(),
+                    || LiveNamespace::open_device(&binding),
                 )?;
-                drop(ns);
+                drop(LiveNamespace::verify_opened_device(&binding, file)?);
                 self.verify()?;
                 return Ok(binding);
             }
@@ -928,9 +976,11 @@ impl LiveController {
         let file = wait_for_device(
             "open controller admin device",
             &controller_path,
+            &self.resolver.name,
+            DeviceNode::Controller,
             deadline,
+            || self.verify(),
             || {
-                self.verify()?;
                 OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -1152,6 +1202,7 @@ mod tests {
         assert!(vanished(&io::Error::from_raw_os_error(libc::ENODEV)));
         assert!(!vanished(&io::Error::from(io::ErrorKind::PermissionDenied)));
         assert!(!vanished(&io::Error::from_raw_os_error(libc::EIO)));
+        assert!(!vanished(&io::Error::from_raw_os_error(libc::ENXIO)));
     }
 
     #[test]
@@ -1424,7 +1475,10 @@ mod tests {
         let file = wait_for_device(
             "open test device",
             &path,
+            "nvme5",
+            DeviceNode::Namespace,
             Instant::now() + Duration::from_secs(2),
+            || Ok(()),
             || File::open(&path),
         )
         .unwrap();
@@ -1434,7 +1488,10 @@ mod tests {
         wait_for_device(
             "open test device",
             &path,
+            "nvme5",
+            DeviceNode::Namespace,
             Instant::now() + Duration::from_secs(2),
+            || Ok(()),
             || {
                 calls += 1;
                 if calls == 1 {
@@ -1450,7 +1507,10 @@ mod tests {
         let error = wait_for_device::<()>(
             "open test device",
             &path,
+            "nvme5",
+            DeviceNode::Namespace,
             Instant::now() + Duration::from_secs(2),
+            || Ok(()),
             || {
                 calls += 1;
                 Err(io::Error::from_raw_os_error(libc::EIO))
@@ -1461,6 +1521,193 @@ mod tests {
         assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
         assert!(error.to_string().contains("open test device"));
         assert!(error.to_string().contains(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn namespace_enxio_retries_reverify_the_controller_before_each_open() {
+        let temp = tempdir::TempDir::new("namespace-enxio").unwrap();
+        let path = temp.path().join("nvme5n1");
+        File::create(&path).unwrap();
+        let mut verifies = 0;
+        let mut opens = 0;
+        let file = wait_for_device(
+            "open namespace device",
+            &path,
+            "nvme5",
+            DeviceNode::Namespace,
+            Instant::now() + Duration::from_secs(2),
+            || {
+                verifies += 1;
+                Ok(())
+            },
+            || {
+                opens += 1;
+                if opens <= 2 {
+                    Err(io::Error::from_raw_os_error(libc::ENXIO))
+                } else {
+                    File::open(&path)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            file.metadata().unwrap().ino(),
+            path.metadata().unwrap().ino()
+        );
+        assert_eq!(opens, 3);
+        assert_eq!(verifies, 3);
+    }
+
+    #[test]
+    fn namespace_enxio_deadline_names_the_device_and_owned_controller() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(40);
+        let mut opens = 0;
+        let mut verifies = 0;
+        let error = wait_for_device::<()>(
+            "open namespace device",
+            Path::new("/dev/nvme5n1"),
+            "nvme5",
+            DeviceNode::Namespace,
+            deadline,
+            || {
+                verifies += 1;
+                Ok(())
+            },
+            || {
+                opens += 1;
+                Err(io::Error::from_raw_os_error(libc::ENXIO))
+            },
+        )
+        .unwrap_err();
+        assert!(Instant::now() >= deadline);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(opens > 0);
+        assert_eq!(verifies, opens);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        assert!(message.contains("/dev/nvme5n1"));
+        assert!(message.contains("controller nvme5"));
+        assert!(message.contains("ENXIO persisted"));
+    }
+
+    #[test]
+    fn namespace_retry_rejects_reused_controller_identity_before_foreign_open() {
+        let temp = tempdir::TempDir::new("namespace-reused-controller").unwrap();
+        let controller = temp.path().join("nvme5");
+        std::fs::create_dir(&controller).unwrap();
+        for (name, value) in [
+            ("subsysnqn", "nqn.2026-01.test:owned"),
+            ("hostnqn", "nqn.2026-01.test:host"),
+            ("hostid", "02020202-0202-0202-0202-020202020202"),
+        ] {
+            std::fs::write(controller.join(name), value).unwrap();
+        }
+        let directory = File::open(&controller).unwrap();
+        let original = directory.metadata().unwrap();
+        let mut opens = 0;
+        let mut verifies = 0;
+        let error = wait_for_device::<()>(
+            "open namespace device",
+            Path::new("/dev/nvme5n1"),
+            "nvme5",
+            DeviceNode::Namespace,
+            Instant::now() + Duration::from_secs(2),
+            || {
+                verifies += 1;
+                let current = controller.metadata()?;
+                if current.dev() != original.dev()
+                    || current.ino() != original.ino()
+                    || controller_attribute(&controller, &directory, "subsysnqn")?.as_deref()
+                        != Some("nqn.2026-01.test:owned")
+                    || controller_attribute(&controller, &directory, "hostnqn")?.as_deref()
+                        != Some("nqn.2026-01.test:host")
+                    || controller_attribute(&controller, &directory, "hostid")?.as_deref()
+                        != Some("02020202-0202-0202-0202-020202020202")
+                {
+                    return Err(invalid("controller identity changed"));
+                }
+                Ok(())
+            },
+            || {
+                opens += 1;
+                assert_eq!(opens, 1, "must never open a foreign controller's device");
+                std::fs::rename(&controller, temp.path().join("old-controller"))?;
+                std::fs::create_dir(&controller)?;
+                Err(io::Error::from_raw_os_error(libc::ENXIO))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(opens, 1);
+        assert_eq!(verifies, 2);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("controller identity changed"));
+    }
+
+    #[test]
+    fn namespace_open_io_and_permission_errors_and_admin_enxio_do_not_retry() {
+        for (node, errno) in [
+            (DeviceNode::Namespace, libc::EIO),
+            (DeviceNode::Namespace, libc::EACCES),
+            (DeviceNode::Controller, libc::ENXIO),
+        ] {
+            let mut opens = 0;
+            let error = wait_for_device::<()>(
+                "open test device",
+                Path::new("/dev/nvme5n1"),
+                "nvme5",
+                node,
+                Instant::now() + Duration::from_secs(2),
+                || Ok(()),
+                || {
+                    opens += 1;
+                    Err(io::Error::from_raw_os_error(errno))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(opens, 1);
+            assert_eq!(error.kind(), io::Error::from_raw_os_error(errno).kind());
+        }
+    }
+
+    #[test]
+    fn namespace_identity_enxio_is_not_a_retryable_device_open_error() {
+        let mut verifies = 0;
+        let error = wait_for_device::<()>(
+            "open namespace device",
+            Path::new("/dev/nvme5n1"),
+            "nvme5",
+            DeviceNode::Namespace,
+            Instant::now() + Duration::from_secs(2),
+            || {
+                verifies += 1;
+                Err(io::Error::from_raw_os_error(libc::ENXIO))
+            },
+            || panic!("identity check failed: device must not open"),
+        )
+        .unwrap_err();
+        assert_eq!(verifies, 1);
+        assert_eq!(
+            error.kind(),
+            io::Error::from_raw_os_error(libc::ENXIO).kind()
+        );
+    }
+
+    #[test]
+    fn failed_connect_cleanup_preserves_the_primary_readiness_diagnostic() {
+        let primary = "open namespace device /dev/nvme5n1 (controller nvme5): ENXIO persisted";
+        let error = connect_error_after_cleanup(
+            io::Error::new(io::ErrorKind::TimedOut, primary),
+            Err(io::Error::from_raw_os_error(libc::EACCES)),
+        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        assert!(message.starts_with(primary));
+        assert!(message.contains("; controller cleanup failed: "));
+        assert!(message.contains(&io::Error::from_raw_os_error(libc::EACCES).to_string()));
+        // Successful cleanup preserves even the original OS error representation.
+        let error = connect_error_after_cleanup(io::Error::from_raw_os_error(libc::EIO), Ok(()));
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
     }
 
     #[test]
