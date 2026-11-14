@@ -569,7 +569,7 @@ device-served.
 
 ### Sui replay over NVMe-oF on the compact fleet (`sui_nvmeof_compact`, manual only)
 
-The manual launcher admits one reviewed Sui specification (`manual_sui.REVIEWED_SUI_SPECS`): two hosts,
+The manual launcher admits reviewed Sui specifications (`manual_sui.REVIEWED_SUI_SPECS`). The original compact spec uses two hosts,
 four cells (owner RPC verbs and live NVMe/RDMA, each with the `original_default` and the `harness`
 contract), `per_owner` export, default queue geometry, owner history `wal_replay`. The package is the
 focused KV package plus the Sui archive and the verification archive. Seal order: stage 1 (KV build),
@@ -579,6 +579,16 @@ The launcher uploads the fixture (`checkpoint-fixtures/sui-genesis-1775/fixture.
 `7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15`) at staging and pins its generation
 in the runtime copy of the specification. Both guests load the NVMe and RDMA modules and revalidate the
 live pair proof before a replay. The result object is `<fleet run id>/results/sui-results.tar.gz`.
+
+The Sui-only retry spec `sui_nvmeof_harness_synchronous` keeps the same layout,
+fixture, export mode, queue geometry, deadlines and package qualification. It
+selects only the `harness` / `synchronous` / `engine_default` cells: r01 owner
+RPC verbs, then r02 live NVMe/RDMA. It has no KV selection, KV matrix or KV
+controller archive. The exact reviewed spec binds admission; there is no separate
+Sui matrix hash pin. Each cell exports `cell-spec.json`, and owner receipts retain
+the explicit contract and tier. Never infer the contract from the cell number.
+The local seal still verifies both contracts when it builds the Sui package;
+that qualification is not an extra cloud replay.
 
 For an explicitly manual dirty checkout, keep preparation output and the
 specification outside the checkout. Generate the exact reviewed specification,

@@ -483,6 +483,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
         cell_root.mkdir(parents=True, exist_ok=False, mode=0o700)
         out = output / cell
         out.mkdir()
+        save(out / 'cell-spec.json', dict(cell=cell, **cell_settings))
         replay = cell_root / 'replay'
         import yaml
         suffix = Path(yaml.safe_load((fixture_root / 'distributed.yaml').read_text())['db-path']).relative_to('distributed')
@@ -538,6 +539,8 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                 shutil.copy2(scripts.parent / 'portable_transport.py', payload / 'runner/portable_transport.py')
                 node = {k: host[k] for k in ('commands', 'ready_files', 'stop_files')}
                 node.update(run_id=config['run_id'], cell_id=cell, transport=label, client_transport=transport, owner_transport=owners[index-1],
+                            contract=cell_settings['contract'], owner_tier=cell_settings['owner_tier'],
+                            owner_wal=cell_settings['owner_wal'],
                             deadline_utc=cell_deadline, storage_binary_sha256=manifest['binaries']['storage-node'],
                             build_manifest_sha256=sha(build_root / 'build-manifest.json'), config_sha256=sha(deployment / 'config.json'),
                             checkpoint_digest=CHECKPOINT, root=str(cell_root / 'storage'), resource_path=str(cell_root / 'storage/resources.json'),

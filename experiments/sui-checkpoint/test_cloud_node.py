@@ -101,6 +101,13 @@ class CloudNodeContract(unittest.TestCase):
         self.assertEqual(cfg['storage_binary_sha256'], cloud_node.sha256(self.binary))
         self.assertEqual(cfg['cell_id'], 'r04-tcp')
 
+    def test_receipt_retains_explicit_cell_contract(self):
+        settings = dict(contract='harness', owner_tier='synchronous', owner_wal='engine_default')
+        self.cfg.update(settings)
+        receipt = self.owner().receipt()
+        self.assertEqual(receipt['cell_id'], self.cfg['cell_id'])
+        self.assertEqual({key: receipt[key] for key in settings}, settings)
+
     def configure_live_payload(self):
         old_root = self.root
         self.run_id = 'bench-0123456789abcdef'

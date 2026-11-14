@@ -29,6 +29,9 @@ def _specs():
         sui_live_queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0),
         sui_fixture=dict(sha256=FIXTURE_SHA256), hard_deadline_seconds=FLEET_SECONDS,
         export_reserve_seconds=EXPORT_RESERVE_SECONDS)}
+    retry = copy.deepcopy(specs['sui_nvmeof_compact'])
+    retry['sui_cells'] = retry['sui_cells'][2:]
+    specs['sui_nvmeof_harness_synchronous'] = retry
     for name, selection in (('sui_nvmeof_with_kv', 'nvmeof_first_put'),
                             ('sui_nvmeof_with_contracts', 'nvmeof_contracts'),
                             ('sui_nvmeof_with_contracts_crossing', 'nvmeof_contracts_crossing'),
@@ -114,7 +117,7 @@ def sui_complete(result, spec):
     sui = result.get('sui', {})
     cells = sui.get('cells', [])
     keys = ('transport', 'contract', 'owner_tier', 'owner_wal')
-    return (sui.get('complete') is True and len(cells) == 4
+    return (sui.get('complete') is True and len(cells) == len(spec['sui_cells'])
             and [{key: cell.get(key) for key in keys} for cell in cells] == spec['sui_cells']
             and _descriptor(result.get('sui_archive')))
 

@@ -222,6 +222,8 @@ class SuiAdmissionTests(unittest.TestCase):
 
 
 class ReviewedCompactSuiCells(unittest.TestCase):
+    spec_name = 'sui_nvmeof_compact'
+
     def test_four_reviewed_cells_use_compact_owner_addresses(self):
         import manual_sui
         spec = manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact']
@@ -238,7 +240,7 @@ class ReviewedCompactSuiCells(unittest.TestCase):
         import copy
         from unittest.mock import Mock
         import manual_sui
-        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS[self.spec_name])
         desc = dict(key='object', generation='1', sha256='a'*64)
         spec['sui_verification'] = desc
         manifest = dict(fabric=True, nvmeof=True, source_archive_sha256='a'*64,
@@ -330,7 +332,7 @@ class ReviewedCompactSuiCells(unittest.TestCase):
                     return
                 result = gcp_sui.run_suite(config, mailbox, package, desc, output_root=root/'results')
                 prepares = [call.args[0] for call in command.call_args_list if str(call.args[0][1]).endswith('prepare_external.py')]
-                self.assertEqual(len(prepares), 4)
+                self.assertEqual(len(prepares), len(spec['sui_cells']))
                 for argv, cell in zip(prepares, spec['sui_cells']):
                     schema = Path(argv[argv.index('--schema')+1])
                     self.assertEqual(schema.parts[-3],
@@ -338,10 +340,16 @@ class ReviewedCompactSuiCells(unittest.TestCase):
             self.assertTrue(result['complete'])
             self.assertEqual([{k: c[k] for k in ('transport','contract','owner_tier','owner_wal')}
                               for c in result['cells']], spec['sui_cells'])
-            self.assertEqual(mailbox.submit.call_count, 16)
+            self.assertEqual(mailbox.submit.call_count, 4 * len(spec['sui_cells']))
+            self.assertEqual([c['cell'] for c in result['cells']],
+                             [f'r0{i}-{c["transport"]}' for i, c in enumerate(spec['sui_cells'], 1)])
 
     def test_failed_replay_retains_owner_logs(self):
         self.test_four_cells_complete_with_one_owner_mailbox(remote_failure=True)
+
+
+class ReviewedHarnessSynchronousCells(ReviewedCompactSuiCells):
+    spec_name = 'sui_nvmeof_harness_synchronous'
 
 
 class KernelSnapshot(unittest.TestCase):

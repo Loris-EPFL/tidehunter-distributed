@@ -313,6 +313,8 @@ class NodeOwner:
         self.identities = {key: cfg[key] for key in ('run_id', 'root', 'deadline_utc',
             'storage_binary_sha256', 'build_manifest_sha256', 'config_sha256',
             'checkpoint_digest', 'node_config_sha256', 'cell_id', 'transport')}
+        self.identities.update({key: cfg[key] for key in ('contract', 'owner_tier', 'owner_wal')
+                                if key in cfg})
 
     def remaining(self):
         return min(self.cfg['deadline_unix'] - time.time(),

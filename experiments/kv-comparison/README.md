@@ -34,6 +34,14 @@ Both crossing cases retain their full write timelines. The combined reviewed spe
 `sui_nvmeof_with_contracts_crossing2` has 36 KV cases and the same four Sui cells
 (40 cases total). All earlier selections, case IDs and pins remain unchanged.
 
+`sui_nvmeof_harness_synchronous` is a reviewed Sui-only retry specification:
+no KV selection or jobs; only owner RPC verbs and live NVMe/RDMA, in that order,
+with contract `harness`, owner tier `synchronous`, and owner WAL `engine_default`.
+These are r01 and r02 in the retry (r03 and r04 in the original four-cell suite).
+The fixture, export mode, queue geometry and deadlines match `sui_nvmeof_compact`.
+Admission compares the complete specification, not a KV matrix hash; all existing
+specifications and matrix pins remain unchanged.
+
 ## Linux page-cache owner branch
 
 On `experiment/linux-pagecache-nvme-rdma`, the coordinator value cache remains,

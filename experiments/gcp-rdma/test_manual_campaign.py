@@ -1893,7 +1893,7 @@ class ManualSuiTests(unittest.TestCase):
                 self.assertFalse(self.sui.reviewed_sui_spec(changed))
                 with self.assertRaises(ValueError):
                     manual._reviewed_jobs(changed)
-        for i in range(4):
+        for i in range(len(self.spec['sui_cells'])):
             for key in self.spec['sui_cells'][i]:
                 changed = copy.deepcopy(self.spec)
                 changed['sui_cells'][i][key] = 'bad'
@@ -2264,6 +2264,43 @@ class CrossingSuiTests(CombinedSuiAdmissionTests):
 
 class Crossing2SuiTests(CombinedSuiAdmissionTests):
     spec_name = 'sui_nvmeof_with_contracts_crossing2'
+
+
+class HarnessSynchronousSuiTests(ManualSuiTests):
+    def setUp(self):
+        super().setUp()
+        self.spec = copy.deepcopy(self.sui.REVIEWED_SUI_SPECS['sui_nvmeof_harness_synchronous'])
+
+    def test_exact_retry_scope_and_other_cell_lists_rejected(self):
+        original = self.sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact']
+        self.assertEqual(self.spec, dict(original, sui_cells=original['sui_cells'][2:]))
+        self.assertNotIn('selection', self.spec)
+        self.assertNotIn('job_count', self.spec)
+        self.assertEqual(manual._reviewed_jobs(self.spec), [])
+        # Empty, truncated, duplicated, reordered, extended and changed cells
+        # must not turn this retry into a different reviewed campaign.
+        variants = [[], self.spec['sui_cells'][:1], self.spec['sui_cells'] * 2,
+                    list(reversed(self.spec['sui_cells'])),
+                    original['sui_cells'][:1] + self.spec['sui_cells']]
+        for index, cell in enumerate(self.spec['sui_cells']):
+            for key in cell:
+                changed = copy.deepcopy(self.spec['sui_cells'])
+                changed[index][key] = 'unreviewed'
+                variants.append(changed)
+        for cells in variants:
+            with self.subTest(cells=cells), self.assertRaises(ValueError):
+                manual._reviewed_jobs(dict(self.spec, sui_cells=cells))
+        descriptor = dict(key='run/results/sui-results.tar.gz', generation='1', sha256='a' * 64)
+        for name, spec in self.sui.REVIEWED_SUI_SPECS.items():
+            result = dict(sui=dict(complete=True, cells=copy.deepcopy(spec['sui_cells'])),
+                          sui_archive=descriptor)
+            with self.subTest(spec=name):
+                self.assertTrue(self.sui.sui_complete(result, spec))
+                result['sui']['cells'] = result['sui']['cells'][:-1]
+                self.assertFalse(self.sui.sui_complete(result, spec))
+        import risk_order
+        jobs = manual._reviewed_jobs(self.spec)
+        self.assertTrue(risk_order.validate_order(jobs, risk_order.generate_order(jobs)))
 
 
 if __name__ == '__main__':
