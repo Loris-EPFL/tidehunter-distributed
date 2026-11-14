@@ -1115,7 +1115,9 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
         workload_error = RuntimeError('coordinator failed; see campaign-receipt.json')
     else:
         try:
-            result = json.loads(terminal['stdout'])
+            # The runtime prints the result as its last line; earlier lines are
+            # output of verification subprocesses (for example `verified: true` blocks).
+            result = json.loads(terminal['stdout'].strip().splitlines()[-1])
             if spec.get('suite') == 'sui':
                 import manual_sui
                 if not manual_sui.sui_complete(result, spec):

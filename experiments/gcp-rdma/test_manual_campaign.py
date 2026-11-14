@@ -1748,7 +1748,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                     response = {'request_sha256': hashlib.sha256(data).hexdigest(),
                                 'instance_id': request['instance_id'], 'operation_id': 'campaign',
                                 'source_sha256': source, 'exit_code': 0, 'stderr': '',
-                                'stdout': json.dumps({'kv': {'complete': True, 'planned_cases': expected_cases,
+                                'stdout': '/mnt/checkpoint-cells/r01/deployment/external-manifest.json\n{\n  "verified": true\n}\n' + json.dumps({'kv': {'complete': True, 'planned_cases': expected_cases,
                                                              'completed_cases': expected_cases,
                                                              'native_valkey_reproduction': {
                                                                  'complete': True, 'planned_cases': 4, 'completed_cases': 4,

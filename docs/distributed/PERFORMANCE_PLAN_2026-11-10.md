@@ -1190,6 +1190,23 @@ r03: the embedded RPC indexer of the stock native node could not ingest checkpoi
 
 Evidence: `checkpoint-work/contracts-launch-20261114-a6/` (`results-top/`, `analysis/`, `sui-extract/`, `serial/`, `fleet-output/`, `*-attempt1-network`, `*-attempt2-network`).
 
+## Run A7: the two Sui cells that did not complete in Run A6 (14 November 2026, revision `81c0c14`, Sui-only spec `sui_nvmeof_harness_synchronous`)
+
+Only the failed cells ran; the 36 KV cases and the two passing cells were not repeated. Fleet `bench-0ea1ec7bd9bd4f73`; two `z4m-highmem-16` VMs, first created 20:02:42 UTC; cleanup verified and absence of VMs, disks and placement policy confirmed through the Google MCP at 20:14:43 UTC; compute upper bound 1.32 USD excluding storage and network. One fleet, one repetition. Archive SHA-256 `29f19cb64e6bc0e9970ced50a1b7c70564f547e10f52a06fdccaeb1b190bcdab` (generation `1794686969363785`), verified.
+
+| Cell (harness contract, synchronous owner tier, engine-default WAL) | Result | Native / distributed checkpoints per second (250 ms resolution, window about 3 s) |
+|---|---|---|
+| A7 r01 owner RPC (was r03) | complete; digests and state audit equal; `analyze.py --verify-only` passes | 217 / 530 |
+| A7 r02 live NVMe-oF over RDMA (was r04) | **complete; digests and state audit equal** | 553 / 492 |
+
+Both native baselines completed on the first attempt (`native_attempts` one entry, `native_retried` false): the A6 r03 indexer failure did not recur, so the retry added after it was not exercised on hardware. The cause of that failure stays unproved; a rate cannot be derived from one fleet. The native baseline of r01 ran at 217 checkpoints per second against 553 in r02 (same contract, same VM class, one replay each); the cause of this spread is not explained, so the 217 / 530 pair is not a performance comparison. Windows are about 3 s and not steady state.
+
+With A6 (r01, r02 original_default) the four Sui cells of the reviewed suite have each completed once on hardware with equal digests and audits, over two fleets.
+
+Orchestration defect found in this run: the launcher exited 1 after both cells had completed, because `manual_campaign.py` parsed the whole coordinator stdout as JSON while that stdout starts with output of verification subprocesses. Every earlier Sui run had ended before this line, so it was never reached. Fixed afterwards: the result is the last line of stdout; the test fixture now carries noise lines before the result. The fix has not run on a fleet.
+
+Evidence: `checkpoint-work/contracts-launch-20261114-a7/` (`results-top/`, `sui-extract/`, `serial/`, `fleet-output/`, `launcher.log`).
+
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.
 
