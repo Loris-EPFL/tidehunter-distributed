@@ -8,6 +8,8 @@ use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
+#[cfg(feature = "experimental-nvmeof")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
@@ -19,11 +21,68 @@ pub(crate) enum WalMapperMessage {
     DeleteFiles(Vec<WalFileId>, mpsc::SyncSender<()>),
     #[cfg(feature = "experimental-nvmeof")]
     EnsureExternalFile(WalFileId, mpsc::SyncSender<std::io::Result<()>>),
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    PauseMap(
+        MapId,
+        mpsc::SyncSender<()>,
+        mpsc::Receiver<()>,
+        mpsc::SyncSender<()>,
+    ),
 }
 
 pub(crate) struct WalMapper {
     jh: Option<JoinHandle<()>>,
     sender: Option<mpsc::SyncSender<WalMapperMessage>>,
+    #[cfg(feature = "experimental-nvmeof")]
+    external_preallocated: Arc<AtomicU64>,
+    #[cfg(feature = "experimental-nvmeof")]
+    files: Arc<ArcSwap<WalFiles>>,
+}
+
+/// Cold external-file requests share the mapper's bounded five-message queue.
+/// Sending waits for capacity; dropping this handle releases its sender.
+#[cfg(feature = "experimental-nvmeof")]
+#[derive(Clone)]
+pub(crate) struct ExternalFilePreparer {
+    sender: mpsc::SyncSender<WalMapperMessage>,
+    external_preallocated: Arc<AtomicU64>,
+    files: Arc<ArcSwap<WalFiles>>,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+impl ExternalFilePreparer {
+    /// Check allocation coverage and current registration without a mapper request.
+    pub(crate) fn is_ready(&self, id: WalFileId) -> bool {
+        // Acquire pairs with the mapper's Release after allocation. An existing
+        // id is never replaced (with_file rejects collisions), and
+        // extend_to_map_id only grows files. Deleted ids must use the fallback.
+        self.external_preallocated.load(Ordering::Acquire) > id.0
+            && self.files.load().get_checked(id).is_some()
+    }
+
+    pub(crate) fn ensure(&self, id: WalFileId) -> std::io::Result<()> {
+        if self.is_ready(id) {
+            return Ok(());
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(WalMapperMessage::EnsureExternalFile(id, tx))
+            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?;
+        rx.recv()
+            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_map(&self, map: MapId) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered, entry) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        let (ack, ready) = mpsc::sync_channel(1);
+        self.sender
+            .send(WalMapperMessage::PauseMap(map, entered, resume, ack))
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        (entry, release)
+    }
 }
 
 struct WalMapperThread {
@@ -36,7 +95,9 @@ struct WalMapperThread {
     metrics: Arc<Metrics>,
     unlinker: UnlinkWorker,
     #[cfg(feature = "experimental-nvmeof")]
-    external_preallocated: Option<WalFileId>,
+    external_preallocated: Arc<AtomicU64>,
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    map_pause: Option<(MapId, mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
 }
 /// Number of fragments past the writer's current one that the mapper keeps
 /// mmapped ahead of time so the writer never waits for a map to appear.
@@ -172,8 +233,12 @@ impl WalMapper {
             );
         }
         let maps = WalMaps::clone(&maps);
+        #[cfg(feature = "experimental-nvmeof")]
+        let this_files = files.clone();
         let (sender, receiver) = mpsc::sync_channel(5);
         let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name());
+        #[cfg(feature = "experimental-nvmeof")]
+        let external_preallocated = Arc::new(AtomicU64::new(0));
         let this = WalMapperThread {
             maps,
             maps_arc,
@@ -184,7 +249,9 @@ impl WalMapper {
             syncer,
             unlinker,
             #[cfg(feature = "experimental-nvmeof")]
-            external_preallocated: None,
+            external_preallocated: external_preallocated.clone(),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            map_pause: None,
         };
         let jh = thread::Builder::new()
             .name("wal-mapper".to_string())
@@ -192,7 +259,14 @@ impl WalMapper {
             .expect("failed to start wal-mapper thread");
         let sender = Some(sender);
         let jh = Some(jh);
-        Self { jh, sender }
+        Self {
+            jh,
+            sender,
+            #[cfg(feature = "experimental-nvmeof")]
+            external_preallocated,
+            #[cfg(feature = "experimental-nvmeof")]
+            files: this_files,
+        }
     }
 
     /// Returns `true` while the mapper thread is still running. Flips
@@ -212,6 +286,13 @@ impl WalMapper {
             Self {
                 jh: None,
                 sender: Some(sender),
+                #[cfg(feature = "experimental-nvmeof")]
+                external_preallocated: Arc::new(AtomicU64::new(0)),
+                #[cfg(feature = "experimental-nvmeof")]
+                files: Arc::new(ArcSwap::from_pointee(WalFiles {
+                    base_path: PathBuf::new(),
+                    files: BTreeMap::new(),
+                })),
             },
             receiver,
         )
@@ -259,15 +340,17 @@ impl WalMapper {
     }
 
     #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn external_file_preparer(&self) -> ExternalFilePreparer {
+        ExternalFilePreparer {
+            sender: self.sender.as_ref().expect("WAL mapper dropped").clone(),
+            external_preallocated: self.external_preallocated.clone(),
+            files: self.files.clone(),
+        }
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn ensure_external_file(&self, id: WalFileId) -> std::io::Result<()> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.sender
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("WAL mapper stopped"))?
-            .send(WalMapperMessage::EnsureExternalFile(id, tx))
-            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?;
-        rx.recv()
-            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?
+        self.external_file_preparer().ensure(id)
     }
 }
 
@@ -335,16 +418,31 @@ impl WalMapperThread {
                     let result = self.ensure_external_file(id);
                     let _ = reply.send(result);
                 }
+                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                WalMapperMessage::PauseMap(map, entered, resume, ack) => {
+                    self.map_pause = Some((map, entered, resume));
+                    let _ = ack.send(());
+                }
             }
         }
     }
 
     #[cfg(feature = "experimental-nvmeof")]
     fn ensure_external_file(&mut self, id: WalFileId) -> std::io::Result<()> {
-        if self.external_preallocated == Some(id) {
+        // Relaxed is sufficient on the sole writer; readers use Acquire below.
+        if self.external_preallocated.load(Ordering::Relaxed) > id.0
+            && self.files.load().get_checked(id).is_some()
+        {
             return Ok(());
         }
-        let files = self.files.load();
+        let mut files = self.files.load();
+        if files.get_checked(id).is_none() && id == WalFileId(files.current_file_id().0 + 1) {
+            let path = self.layout.wal_file_name(&files.base_path, id);
+            let file = Wal::open_file(&path, &self.layout)?;
+            self.files
+                .store(Arc::new(files.with_file(id, Arc::new(file))));
+            files = self.files.load();
+        }
         let file = files
             .get_checked(id)
             .ok_or_else(|| std::io::Error::other("WAL file missing"))?;
@@ -373,7 +471,10 @@ impl WalMapperThread {
         ));
         #[cfg(target_os = "linux")]
         {
-            self.external_preallocated = Some(id);
+            // Release publishes the registry entry and successful allocation to
+            // external request handles. File ids increase on this sole writer.
+            self.external_preallocated
+                .fetch_max(id.0 + 1, Ordering::Release);
             Ok(())
         }
     }
@@ -461,6 +562,16 @@ impl WalMapperThread {
     }
 
     fn make_map(&mut self, map_id: MapId) {
+        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        if self
+            .map_pause
+            .as_ref()
+            .is_some_and(|pause| pause.0 == map_id)
+        {
+            let (_, entered, resume) = self.map_pause.take().unwrap();
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
         let file_id = self.layout.file_for_map(map_id);
         let mut files = self.files.load();
         if file_id > files.current_file_id() {

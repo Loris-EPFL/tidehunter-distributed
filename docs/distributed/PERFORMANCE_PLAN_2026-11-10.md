@@ -1042,6 +1042,43 @@ Second workstation fixture with a geometry closer to the hardware cases (128 MiB
 
 Reading [INFERENCE]: B lets the lease-ahead request start during a proof, but the grant itself can be slow on this fixture. A grant takes the persistence mutex and, when the extent starts a new WAL file, syncs that file and the directory (`storage.rs`, `lease_live_extent_impl`); the fixture starts a new WAL file every second extent, the hardware cases never did (10 GiB WAL files), and the hardware cases had no extent-switch wait. Both syncs also go through one file system on one laptop SSD. So this fixture measures the cost of a grant under a concurrent sync, not the defect seen on hardware, and it does not show that the hardware pause is gone. Open follow-up, not started: keep the next WAL file created and synced in the background before it is needed, as the original engine keeps a buffer of pre-allocated maps (paper, section 3.1), so that a grant never waits for a file sync; and request lease-ahead early enough for the measured grant time.
 
+### Prepared-file grant gate (13 November 2026, local only)
+
+Implemented after the scheduling changes above, not measured on hardware: background allocation and durable namespace witnesses; background target publication for permanent exports; map-free external reservations with a checked allocated-file fast path; a grant into a prepared file that takes only the `state` mutex. Native writes and on-demand export publication retain their paths. No acknowledgement, wire or persisted-format change.
+
+Final engine check: 1,439 passed, 16 ignored; formatting, NVMe-oF clippy, fabric build and fabric clippy passed. The new crossing selection retains the earlier 34 jobs unchanged and appends one instrumented 64 KiB put case with smaller WAL files. Its 35 KV cases and four Sui cells have not run on hardware.
+
+Three isolated fixture invocations per target layout exercised both tiers with 128 MiB fragments, 256 MiB WAL files and 8,192 puts. All crossings avoided namespace sync in the grant; preparation failures were zero. Each case crossed two files. Moving only fixture target/configfs state to tmpfs separated its filesystem cost from owner WAL persistence. These are workstation measurements, not NVMe-oF hardware results.
+
+| Largest prelease per target layout | Handler ms | Persistence-lock wait ms | State-lock wait ms | Reservation ms | Publication-lock wait ms | Publication call ms |
+|---|---:|---:|---:|---:|---:|---:|
+| Disk target, run 3, synchronous | 129.309661 | 127.872171 | 0.501277 | 0.009584 | 0.000410 | 0.002511 |
+| Tmpfs target, run 2, native | 53.861789 | 51.343368 | 2.102954 | 0.008370 | 0.000248 | 0.002589 |
+
+This first gate run failed. The grant took `persistence` before it checked whether its file was prepared, and waited behind unrelated durable metadata work. Disk-backed background exports also blocked inventory: one prelease waited 20.919 ms to acquire it.
+
+**Prepared-file grant without `persistence`.** `lease_live_extent_impl` now validates under `state`. If the durable namespace highwater covers the target file and the mapper proves the file is allocated and registered, it reserves and installs the extent in the same `state` hold. An unprepared file releases `state`, takes `persistence` then `state`, repeats the validation and uses the earlier serialized path. Receipt sync, namespace witnesses, root installation, seal and retirement keep `persistence`. A fast grant changes no durable fact.
+
+Second gate run, same geometry and isolation, three invocations per layout:
+
+| Prelease handler, disk target | First run | Second run | Limit |
+|---|---:|---:|---:|
+| Median, synchronous, range over 3 runs (ms) | 0.032 to 8.010 | 0.022 to 0.041 | < 2 |
+| Maximum, synchronous (ms) | 129.310 | 0.915 | < 20 |
+| Median, native, range over 3 runs (ms) | 1.276 to 2.727 | 0.019 to 0.023 | < 2 |
+| Maximum, native (ms) | 32.206 | 3.376 | < 20 |
+| Largest `persistence` wait (ms) | 127.872 | 0 | |
+
+All six synchronous run-tiers pass on both layouts. Namespace sync in grants and preparation failures remain zero. The largest remaining native prelease waits 0.7 to 1.4 ms for `state`: adoption holds `state` while it reads and validates one frame.
+
+**Remaining failed predicate: native extent-switch waits (2 to 3 per run, limit 0).** The grant is not the cause. The coordinator keeps at most one closing extent (`tcp/live_client.rs`, `wait_closing_extent`). Owner adoption reads each frame again and validates it on one thread; its handler time is in proportion to bytes (42 ms for 24 MiB, 190 ms for 149 MiB, about 780 MiB/s). The workstation writer fills the page cache at about 770 MiB/s on the same machine, so adoption has no rate margin and the writer waits 36 to 107 ms at a switch. The synchronous tier writes more slowly and has no such wait. Both leased tiers acknowledge at write completion; adoption is asynchronous in both.
+
+Run A2 on hardware had 26 extent switches in 12 leased cases with `extent_switch_waits_total` 0 and at most 0.64 ms total switch time per case. In its 64 KiB, 16-caller page-cache case the owner adopted about 975 MiB/s against 679 MiB/s written. Each case had only 2 to 4 switches, so this does not prove sufficient margin for a longer or faster run. The owner accepted the native switch wait as a known workstation limit for the next fleet; the crossing case measures it on hardware.
+
+Options not implemented: validate outside `state` on two threads with ordered publication (no contract change); or adopt coordinator descriptors without an owner read of the payload, as the single-node design and several remote-write systems do (changes what an owner receipt proves, the wire protocol and recovery rules). Survey: `checkpoint-work/research/owner-adoption-research.md` (outside this repository).
+
+Evidence: first run `/tmp/grant-fast/{disk,tmpfs}/run-{1,2,3}/`; second run `/tmp/grant-fast/v3b/` with `report-isolated.md` and `isolation-checks.json`. The ignored fixture `leased_checkpoint_tail_workstation` prints bounded grant/component and background-export records. Earlier runs overlapping builds are retained as contaminated observations, not gate results. These are workstation measurements, not NVMe-oF hardware results.
+
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.
 

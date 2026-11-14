@@ -51,6 +51,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
                   for inline in (False, True)]
         cases.append(next(j for j in controller.cloud_campaign.make_focused_matrix('nvmeof_contracts')
                           if j['measurement_operations'] == 200000 and j['durability_tier'] == 'synchronous'))
+        cases.append(controller.cloud_campaign.make_focused_matrix('nvmeof_contracts_crossing')[-1])
         nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
         for job in cases:
             with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as tmp:
@@ -70,7 +71,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
                 runtime.remaining = MagicMock(return_value=600)
                 runtime.cleanup_deadline = MagicMock(return_value=100)
                 runtime.cleanup_timeout = MagicMock(return_value=30)
-                runtime.request = MagicMock(return_value={'complete': True})
+                runtime.request = MagicMock(return_value={'complete': True, 'history_maintenance': {}})
                 case_dir = root / job['case_id']
                 case_dir.mkdir()
                 def fake_command(argv, **kwargs):
@@ -84,7 +85,9 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     client.update(queue_geometry=live['queue_geometry'], export_mode=live['export_mode'])
                     client.update(host_nqn=nqn, host_id=controller.live_host_identity(nqn),
                                   leased_durability=prep['durability_tier'] if live['write_mode'] == 'leased' else None)
-                    controller.dump(out / 'remote.json', {'tls': {}, 'live_nvme': client})
+                    controller.dump(out / 'remote.json', {'tls': {}, 'live_nvme': client,
+                        'storage': {'fragment_bytes': 134217728 if prep['owner_wal_geometry'] == 'native_default' else 4194304,
+                                    'wal_file_bytes': prep.get('owner_wal_file_bytes', 10737418240 if prep['owner_wal_geometry'] == 'native_default' else 1073741824)}})
                     controller.dump(out / 'external_owner_read_config.json', [])
                     node = out / 'node-0'
                     node.mkdir()
@@ -93,6 +96,8 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     fragment, wal_file = ((134217728, 10737418240)
                                           if prep['owner_wal_geometry'] == 'native_default'
                                           else (4194304, 1073741824))
+                    wal_file = prep.get('owner_wal_file_bytes', wal_file)
+                    self.assertEqual(prep.get('owner_wal_file_bytes'), job.get('owner_wal_file_bytes'))
                     (node / 'launch.yaml').write_text(yaml.safe_dump({
                         'tls': {}, 'history_persistence': prep['history_persistence'],
                         'node': {'live_target': target,
@@ -254,7 +259,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
                 def fake_command(argv, **kwargs):
                     if '--prepare-external-case' in argv:
                         directory = Path(argv[-1]); directory.mkdir()
-                        (directory / 'remote.json').write_text(json.dumps({'tls': {}}))
+                        (directory / 'remote.json').write_text(json.dumps({'tls': {}, 'storage': {'fragment_bytes': 4194304, 'wal_file_bytes': 1073741824}}))
                         (directory / 'external_owner_read_config.json').write_text('[]')
                         node = directory / 'node-0'; node.mkdir()
                         (node / 'launch.yaml').write_text('tls: {}\nnode:\n  partition:\n    fragment_bytes: 4194304\n    wal_file_bytes: 1073741824\n')

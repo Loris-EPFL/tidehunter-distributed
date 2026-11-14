@@ -898,11 +898,14 @@ impl NodeInventory {
     pub(super) fn publish_permanent_segment(
         &mut self,
         segment: &super::super::nvmeof::live_storage::LiveWalSegment,
-    ) -> Result<super::super::nvmeof::live_target::LiveTargetBinding, TcpError> {
+    ) -> Result<(super::super::nvmeof::live_target::LiveTargetBinding, bool), TcpError> {
         use super::super::nvmeof::{live_storage::wal_export_name, live_target::LiveFileIdentity};
         let key = (segment.epoch, segment.file_index);
-        if let Some((_, binding, _)) = self.live_bindings.get(&key) {
-            return Ok(binding.clone());
+        if let Some((existing, binding, writable)) = self.live_bindings.get(&key) {
+            if existing != segment || !writable {
+                return Err(TcpError::new("live segment identity or access changed"));
+            }
+            return Ok((binding.clone(), false));
         }
         let target = self
             .live_target
@@ -933,7 +936,7 @@ impl NodeInventory {
             .map_err(TcpError::component)?;
         self.live_bindings
             .insert(key, (segment.clone(), binding.clone(), true));
-        Ok(binding)
+        Ok((binding, true))
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1034,6 +1037,14 @@ impl NodeInventory {
             .ok_or_else(|| TcpError::new("sealed export source is absent"))
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
+        self.seal_draining(epoch, |_| Ok(()))
+    }
+
+    pub(super) fn seal_draining(
+        &mut self,
+        epoch: u64,
+        _drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
+    ) -> Result<(), TcpError> {
         self.ensure_healthy()?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if !self.live_pins.is_empty() {
@@ -1050,6 +1061,7 @@ impl NodeInventory {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.live_target.is_some() {
             self.revoke_live_targets()?;
+            _drain_log(&log)?;
             log.seal_live_epoch(RequestAuthority { epoch }, || Ok(()))
                 .map_err(TcpError::component)?;
         } else {

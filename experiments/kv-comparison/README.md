@@ -20,6 +20,14 @@ Linux Docker Engine with Compose v2 is required; host networking and distinct
 loopback addresses are deliberate. Docker Desktop is not supported by this layout.
 The local helpers require no credential, OIDC role, cloud account, subscription or paid workflow.
 
+`nvmeof_contracts_crossing` keeps the 34 reviewed `nvmeof_contracts` jobs and
+appends one instrumented synchronous leased-write case (`G22W`). It uses
+128 MiB fragments, 256 MiB owner WAL files and 16,384 measured 64 KiB puts.
+The optional `owner_wal_file_bytes` applies to both owner and coordinator
+storage configuration; reports show the effective size. The combined reviewed
+spec is `sui_nvmeof_with_contracts_crossing` (35 KV cases and four Sui cells).
+The existing selection and its matrix hash do not change.
+
 ## Linux page-cache owner branch
 
 On `experiment/linux-pagecache-nvme-rdma`, the coordinator value cache remains,

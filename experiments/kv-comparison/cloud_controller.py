@@ -3317,6 +3317,8 @@ class Controller:
                 "owner_read_memory_allowance_bytes": allowance,
                 "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research"),
                 "history_persistence": job.get("history_persistence", "on_disk")}
+        if "owner_wal_file_bytes" in job:
+            prep["owner_wal_file_bytes"] = job["owner_wal_file_bytes"]
         tier = cloud_campaign.durability_tier(job)
         prep["durability_tier"] = tier
         receipts, nonces = {}, {}
@@ -3347,6 +3349,11 @@ class Controller:
                 timeout=min(60, self.remaining()), env=environment(self.config))
         geometry = {"native_default": (134217728, 10737418240), "research": (4194304, 1073741824),
                     "sui_harness": (16777216, 268435456)}.get(prep["owner_wal_geometry"])
+        if geometry is not None and "owner_wal_file_bytes" in prep:
+            size = prep["owner_wal_file_bytes"]
+            if type(size) is not int or size < 2 * geometry[0] or size > geometry[1] or size % geometry[0] or size % 4096:
+                raise SafetyError("invalid owner WAL file size override")
+            geometry = (geometry[0], size)
         for index in range(owner_count):
             launch = yaml.safe_load((prepared / f"node-{index}" / "launch.yaml").read_text())
             partition = (launch or {}).get("node", {}).get("partition", {})
@@ -3356,6 +3363,8 @@ class Controller:
                 raise SafetyError("prepared owner history persistence differs from the planned case")
         self.active_tide = (job, directory, [])
         remote = json.loads((prepared / "remote.json").read_text())
+        if (remote.get("storage", {}).get("fragment_bytes"), remote.get("storage", {}).get("wal_file_bytes")) != geometry:
+            raise SafetyError("prepared coordinator WAL geometry differs from the planned case")
         if job.get("nvmeof_route") == "live":
             host_nqn = admit_prepared_live_client(remote.get("live_nvme"), prep["live_nvmeof"], tier)
         elif remote.get("live_nvme") is not None:
@@ -4227,7 +4236,7 @@ class Controller:
                      host_count == 1 and (
                          self.config["spec"].get("selection") == "leased_ab_compact"
                          or self.config["spec"].get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)
-                     and job.get("selection") == self.config["spec"].get("selection"))) and (
+                     and cloud_campaign._focused_exact(job, expected))) and (
                 job.get("case_kind") not in cloud_campaign.ONE_OWNER_CASE_KINDS
                 or job.get("backend") not in ("tidehunter_tcp", "tidehunter_verbs_native")
                 or job.get("durability_tier") != "synchronous"

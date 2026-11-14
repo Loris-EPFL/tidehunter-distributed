@@ -707,5 +707,9 @@ class ReviewedContractsRuntimeTests(ReviewedCombinedRuntimeTests):
     spec_name = 'sui_nvmeof_with_contracts'
 
 
+class CrossingSuiTests(ReviewedCombinedRuntimeTests):
+    spec_name = 'sui_nvmeof_with_contracts_crossing'
+
+
 if __name__ == '__main__':
     unittest.main()

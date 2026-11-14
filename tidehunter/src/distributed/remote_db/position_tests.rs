@@ -225,7 +225,7 @@ fn failed_position_proof_poison_is_published_before_more_commands() {
 }
 
 #[test]
-fn prelease_waits_only_for_the_serialized_root_install() {
+fn prepared_prelease_completes_during_serialized_root_install() {
     let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
     let mut client = fixture.writer_without_ahead();
     let first = client
@@ -234,10 +234,12 @@ fn prelease_waits_only_for_the_serialized_root_install() {
     client.submit_leased_adoption().unwrap();
     client.wait_leased_control().unwrap();
     client.leased_test_enable_ahead();
-    let (entered, release) = fixture
-        .node
-        .log_for_test(1)
-        .pause_live(LivePausePoint::PositionRootLocked);
+    // The first grant has already allocated and durably named this file;
+    // its next fragment must not depend on an unrelated root transaction.
+    let log = fixture.node.log_for_test(1);
+    let root_before = log.position_root_for_test();
+    let receipt_before = log.synced_frontier();
+    let (entered, release) = log.pause_live(LivePausePoint::PositionRootLocked);
     let deadline = Instant::now() + Duration::from_secs(5);
     client
         .submit_checkpoint_position(1, 1, through(first), deadline)
@@ -250,39 +252,46 @@ fn prelease_waits_only_for_the_serialized_root_install() {
         assert!(Instant::now() < deadline);
         thread::yield_now();
     }
-    let (lease_entered, lease_release) = fixture
-        .node
-        .log_for_test(1)
-        .pause_live(LivePausePoint::LeaseWaitingForPersistence);
-    client.submit_leased_adoption().unwrap(); // Prelease needs persistence.
-    let observed = loop {
+    client.submit_leased_adoption().unwrap();
+    let completed = loop {
         client.progress_appends().unwrap();
-        if lease_entered.try_recv().is_ok() {
+        if client.harvest_leased_adoption().unwrap() {
             break true;
         }
-        if client.harvest_leased_adoption().unwrap()
-            || Instant::now() >= deadline - Duration::from_secs(1)
-        {
+        if Instant::now() >= deadline - Duration::from_secs(1) {
             break false;
         }
         thread::yield_now();
     };
-    // Release both hooks before asserting, including on a broken exclusion.
-    drop(lease_release);
+    let root_during = log.position_root_for_test();
+    let receipt_during = log.synced_frontier();
+    let proof_pending = client.take_checkpoint_position(1, through(first)).is_none();
     let pending = client.leased_adoption_pending();
+    // Release the hook before asserting, including on a broken fast path.
     release.send(()).unwrap();
-    assert!(observed, "prelease must reach the held persistence mutex");
-    assert!(pending);
+    assert!(
+        completed,
+        "prepared prelease must finish before root install resumes"
+    );
+    assert!(!pending);
+    assert_eq!(root_during, root_before);
+    assert_eq!(receipt_during, receipt_before);
+    assert!(proof_pending);
     client.wait_leased_control().unwrap();
     assert!(client.leased_test_ahead_state().1);
     loop {
         client.progress_appends().unwrap();
         if let Some(proof) = client.take_checkpoint_position(1, through(first)) {
-            proof.unwrap();
+            assert_eq!(proof.unwrap().durable_end, through(first));
             break;
         }
         assert!(Instant::now() < deadline);
         thread::yield_now();
     }
+    assert_eq!(
+        log.position_root_for_test(),
+        (root_before.0 + 1, root_before.1, through(first))
+    );
+    assert_eq!(log.synced_frontier(), receipt_before);
     client.close_leased_extent().unwrap();
 }

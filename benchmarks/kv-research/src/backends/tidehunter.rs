@@ -185,6 +185,8 @@ struct ExternalPreparationInput {
     max_batches_per_partition: usize,
     #[serde(default)]
     owner_wal_geometry: OwnerWalGeometry,
+    #[serde(default)]
+    owner_wal_file_bytes: Option<u64>,
     #[serde(default = "default_external_max_epochs")]
     max_epochs: usize,
     max_admitted_batches: usize,
@@ -329,6 +331,14 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     {
         return Err("external case requires one, two or five nodes, absolute guest_root, supported positive limits, and budgets including the 64MiB in-flight allowance".into());
     }
+    if input.owner_wal_file_bytes.is_some_and(|bytes| {
+        bytes < 2 * input.owner_wal_geometry.fragment_bytes()
+            || bytes > input.owner_wal_geometry.wal_file_bytes()
+            || bytes % input.owner_wal_geometry.fragment_bytes() != 0
+            || bytes % 4096 != 0
+    }) {
+        return Err("invalid owner WAL file size override".into());
+    }
     if let Some(live) = &input.live_nvmeof {
         if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
             return Err(format!(
@@ -389,7 +399,9 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             max_encoded_bytes: RESEARCH_FRAGMENT_BYTES - 8,
         },
         fragment_bytes: input.owner_wal_geometry.fragment_bytes(),
-        wal_file_bytes: input.owner_wal_geometry.wal_file_bytes(),
+        wal_file_bytes: input
+            .owner_wal_file_bytes
+            .unwrap_or_else(|| input.owner_wal_geometry.wal_file_bytes()),
         max_batches_per_partition: input.max_batches_per_partition,
         max_reference_metadata_bytes: 64 * 1024 * 1024,
         max_epochs: input.max_epochs,
@@ -2461,20 +2473,32 @@ mod tests {
             "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
             "polling": "adaptive"
         });
-        for (geometry, fragment_bytes, wal_file_bytes) in [
-            (None, 134217728_u64, 10737418240_u64),
-            (Some("research"), 4194304, 1073741824),
-            (Some("sui_harness"), 16777216, 268435456),
+        for (geometry, override_bytes, fragment_bytes, wal_file_bytes) in [
+            (None, None, 134217728_u64, 10737418240_u64),
+            (
+                Some("native_default"),
+                Some(268435456_u64),
+                134217728,
+                268435456,
+            ),
+            (Some("research"), None, 4194304, 1073741824),
+            (Some("sui_harness"), None, 16777216, 268435456),
         ] {
             if let Some(geometry) = geometry {
                 config["owner_wal_geometry"] = serde_json::json!(geometry);
             }
+            config["owner_wal_file_bytes"] = serde_json::json!(override_bytes);
             fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
-            let output = root.join(geometry.unwrap_or("native_default"));
+            let output = root.join(format!(
+                "{}-{wal_file_bytes}",
+                geometry.unwrap_or("native_default")
+            ));
             prepare_external_case_file(&input, &output).unwrap();
             let remote: RemoteDatabaseConfig =
                 serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
             assert_eq!(remote.preparation_workers, 8);
+            assert_eq!(remote.storage.fragment_bytes, fragment_bytes);
+            assert_eq!(remote.storage.wal_file_bytes, wal_file_bytes);
             if geometry == Some("research") {
                 assert_eq!(
                     OwnerWalGeometry::from_layout(
@@ -2493,6 +2517,23 @@ mod tests {
                 assert_eq!(storage["fragment_bytes"].as_u64(), Some(fragment_bytes));
                 assert_eq!(storage["wal_file_bytes"].as_u64(), Some(wal_file_bytes));
             }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_preparation_rejects_invalid_owner_file_sizes() {
+        let root = std::env::temp_dir().join(format!("kv-invalid-wal-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        let input = root.join("input.json");
+        let mut config = controller_live_preparation_input();
+        config.as_object_mut().unwrap().remove("live_nvmeof");
+        config["transport"] = serde_json::json!({"kind": "tcp"});
+        for bytes in [0, 134217728, 268435457, 10871635968_u64] {
+            config["owner_wal_file_bytes"] = serde_json::json!(bytes);
+            fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert!(prepare_external_case_file(&input, &root.join("output")).is_err());
+            assert!(!root.join("output").exists());
         }
         fs::remove_dir_all(root).unwrap();
     }

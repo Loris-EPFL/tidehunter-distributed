@@ -29,6 +29,7 @@ def validate_order(jobs, document):
         raise ValueError('order must be an exact matrix permutation')
     if jobs and jobs[0].get('selection') == 'fair_native' and ordered[0] != original[0]:
         raise ValueError('fair native canary must run first')
+    # Membership includes mixed contracts/crossing jobs: they retain one exact reviewed order.
     if jobs and all(job.get('selection') in ('fabric_ab_compact', 'leased_ab_compact', *cloud_campaign.NVMEOF_PATH_SELECTIONS) for job in jobs) and ordered != original:
         raise ValueError('reviewed A/B order must match the reviewed matrix')
     blocks = {}

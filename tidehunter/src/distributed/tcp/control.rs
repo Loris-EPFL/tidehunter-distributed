@@ -116,6 +116,9 @@ struct Shared {
     // One syncer thread per log that received appends. Live fencing retires the
     // old log's worker before recovery; shutdown joins any remaining workers.
     syncers: Mutex<Vec<SyncerSlot>>,
+    // Leaf lock: never hold with `durability` or `syncers`; join off-lock.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    preparers: Mutex<Vec<PreparerSlot>>,
     // Next append ticket allowed to reach the WAL. Never held with `queue`.
     // Waiting is bounded by the tickets ahead, which always progress.
     order: Mutex<u64>,
@@ -124,6 +127,10 @@ struct Shared {
     before_ack: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     #[cfg(test)]
     session_barrier_waits: std::sync::atomic::AtomicU64,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    grant_profiles: Mutex<(Vec<TestGrantProfile>, u64)>,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    before_target_shutdown: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
 }
 
 struct DurabilityState {
@@ -138,7 +145,110 @@ struct SyncerSlot {
     syncer: Syncer,
 }
 
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+struct PreparerSlot {
+    log: Arc<super::super::storage::PartitionLog>,
+    trigger: mpsc::SyncSender<()>,
+    stopping: Arc<AtomicBool>,
+    #[cfg(test)]
+    waiting_for_inventory: Arc<AtomicBool>,
+    worker: JoinHandle<()>,
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[derive(Clone, serde::Serialize)]
+struct TestGrantProfile {
+    envelope_id: u64,
+    file_index: u64,
+    new_file: bool,
+    profile: LeaseProfile,
+    prepared: u64,
+    published: u64,
+    timing: super::super::storage::LiveTestLeaseTiming,
+    prelog_inventory_ns: u64,
+    prelog_frontier_ns: u64,
+    prelog_tier_ns: u64,
+}
+
 impl Shared {
+    /// One worker owns each log's preparation triggers. Capacity one: a full
+    /// queue coalesces triggers because the worker recomputes the target.
+    /// Shutdown sets stopping, wakes publication retries, drops the sender and joins.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn trigger_file_preparation(&self, log: &Arc<super::super::storage::PartitionLog>) {
+        let mut slots = self.preparers.lock();
+        let slot = if let Some(index) = slots.iter().position(|slot| Arc::ptr_eq(&slot.log, log)) {
+            &slots[index]
+        } else {
+            let (trigger, receiver) = mpsc::sync_channel::<()>(1);
+            let owner = log.clone();
+            let context = self.context.clone();
+            let stopping = Arc::new(AtomicBool::new(false));
+            let worker_stopping = stopping.clone();
+            #[cfg(test)]
+            let waiting_for_inventory = Arc::new(AtomicBool::new(false));
+            #[cfg(test)]
+            let worker_waiting = waiting_for_inventory.clone();
+            let worker = match thread::Builder::new()
+                .name("value-wal-file-prep".into())
+                .spawn(move || {
+                    // Intended receive loop: sender closure terminates it.
+                    while receiver.recv().is_ok() {
+                        // Acquire observes shutdown before any new preparation.
+                        if worker_stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // Fatal I/O errors poison the log in this method.
+                        // Allocation errors leave the grant path as the retry.
+                        if let Ok(Some(file)) = owner.prepare_next_live_file() {
+                            context.publish_prepared_file(
+                                &owner,
+                                file,
+                                &worker_stopping,
+                                #[cfg(test)]
+                                &worker_waiting,
+                            );
+                        }
+                    }
+                }) {
+                Ok(worker) => worker,
+                // Preparation is optional; the grant still performs the work.
+                Err(_) => return,
+            };
+            slots.push(PreparerSlot {
+                log: log.clone(),
+                trigger,
+                stopping,
+                #[cfg(test)]
+                waiting_for_inventory,
+                worker,
+            });
+            &slots[slots.len() - 1]
+        };
+        let _ = slot.trigger.try_send(());
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn join_preparer(&self, slot: PreparerSlot) -> Result<(), TcpError> {
+        let PreparerSlot {
+            log,
+            trigger,
+            stopping,
+            worker,
+            ..
+        } = slot;
+        // Release hands shutdown to the worker; unpark interrupts its retry wait.
+        stopping.store(true, Ordering::Release);
+        worker.thread().unpark();
+        drop(trigger);
+        let result = worker.join();
+        drop(log);
+        result.map_err(|_| {
+            self.context.poison_readers();
+            TcpError::new("log file preparer panicked; restart required")
+        })
+    }
+
     /// The log's frontier, creating it and its syncer on the first append.
     fn frontier_for(
         &self,
@@ -198,6 +308,19 @@ impl Shared {
         &self,
         log: &Arc<super::super::storage::PartitionLog>,
     ) -> Result<(), TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            let slot = {
+                let mut slots = self.preparers.lock();
+                slots
+                    .iter()
+                    .position(|slot| Arc::ptr_eq(&slot.log, log))
+                    .map(|index| slots.swap_remove(index))
+            };
+            if let Some(slot) = slot {
+                self.join_preparer(slot)?;
+            }
+        }
         let slot = {
             let mut slots = self.syncers.lock();
             slots
@@ -284,6 +407,12 @@ impl ControlOwner {
                 started: false,
             }),
             syncers: Mutex::new(Vec::new()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            preparers: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            grant_profiles: Mutex::new((Vec::new(), 0)),
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            before_target_shutdown: Mutex::new(None),
             order: Mutex::new(0),
             order_cv: Condvar::new(),
             #[cfg(test)]
@@ -450,8 +579,66 @@ impl ControlOwner {
         completed
             .recv()
             .map_err(|_| TcpError::new("log flusher stopped before shutdown"))?;
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.shared.before_target_shutdown.lock().take() {
+            let _ = entered.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(5));
+        }
+        let slots = std::mem::take(&mut *self.shared.preparers.lock());
+        let mut join_error = None;
+        for slot in slots {
+            if let Err(error) = self.shared.join_preparer(slot) {
+                join_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = join_error {
+            return Err(error);
+        }
         inventory.finish_live_target_shutdown()
     }
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+impl ControlOwner {
+    pub(super) fn grant_profiles(&self) -> serde_json::Value {
+        let profiles = self.shared.grant_profiles.lock();
+        serde_json::json!({"records": profiles.0, "dropped": profiles.1})
+    }
+
+    pub(super) fn preparer_count(&self) -> usize {
+        self.shared.preparers.lock().len()
+    }
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn preparation_triggers_coalesce_when_the_worker_is_busy() {
+    use crate::distributed::storage::LivePausePoint;
+    use crate::distributed::tcp::leased_tests::Fixture;
+    let fixture = Fixture::new(DurabilityTier::Native, 16 * 1024);
+    let _client = fixture.writer_without_ahead();
+    let log = fixture.node.log_for_test(1);
+    log.lease_live_extent(RequestAuthority { epoch: 1 })
+        .unwrap();
+    let (entered, release) = log.pause_live(LivePausePoint::PrepareBeforePublish);
+    let shared = &fixture.node.control.shared;
+    shared.trigger_file_preparation(&log);
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    for _ in 0..128 {
+        shared.trigger_file_preparation(&log);
+    }
+    {
+        let slots = shared.preparers.lock();
+        assert_eq!(slots.len(), 1);
+        assert!(matches!(
+            slots[0].trigger.try_send(()),
+            Err(mpsc::TrySendError::Full(()))
+        ));
+    }
+    release.send(()).unwrap();
+    shared.retire_syncer(&log).unwrap();
+    assert!(shared.preparers.lock().is_empty());
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
 }
 impl Drop for ControlOwner {
     fn drop(&mut self) {
@@ -460,6 +647,13 @@ impl Drop for ControlOwner {
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {
                 self.shared.context.poison_readers();
+            }
+        }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            let slots = std::mem::take(&mut *self.shared.preparers.lock());
+            for slot in slots {
+                let _ = self.shared.join_preparer(slot);
             }
         }
         let _ = self.shared.flush.send(FlushCommand::Stop);
@@ -737,15 +931,62 @@ fn run(shared: &Shared) {
                     _ => unreachable!("matched live extent request"),
                 };
                 let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    let prelog_started = Instant::now();
                     let log = shared.context.inventory.lock().active(epoch)?;
+                    #[cfg(test)]
+                    let prelog_inventory_ns = prelog_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    #[cfg(test)]
+                    let prelog_started = Instant::now();
                     let frontier = shared.frontier_for(&log)?;
+                    #[cfg(test)]
+                    let prelog_frontier_ns = prelog_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     let adoption = matches!(&request, Request::AdoptLiveExtent { .. });
                     let closes_extent =
                         matches!(&request, Request::AdoptLiveExtent { close: true, .. });
                     // frontier_for freezes this authoritative policy before
                     // any extent can be returned to the coordinator.
+                    #[cfg(test)]
+                    let prelog_started = Instant::now();
                     let tier = shared.durability.lock().config.tier;
+                    #[cfg(test)]
+                    let prelog_tier_ns = prelog_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     let reply = shared.context.handle_live_extent(request, tier)?;
+                    #[cfg(test)]
+                    {
+                        let lease = match &reply {
+                            Response::LiveLeased(leased) => Some(leased),
+                            Response::LiveAdopted(adopted) => adopted.next.as_ref(),
+                            _ => None,
+                        };
+                        if let Some(leased) = lease {
+                            let stats = log.live_file_preparation_stats();
+                            let mut profiles = shared.grant_profiles.lock();
+                            if profiles.0.len() < 64 {
+                                let file_index = leased.extent.segment.file_index;
+                                let new_file = profiles.0.last().is_none_or(|last| last.file_index != file_index);
+                                profiles.0.push(TestGrantProfile {
+                                    envelope_id: id,
+                                    file_index,
+                                    new_file,
+                                    profile: leased.profile,
+                                    prepared: stats.live_files_prepared,
+                                    published: stats.live_files_published,
+                                    timing: log.live_test_lease_timing(),
+                                    prelog_inventory_ns,
+                                    prelog_frontier_ns,
+                                    prelog_tier_ns,
+                                });
+                            } else {
+                                profiles.1 += 1;
+                            }
+                        }
+                    }
+                    if matches!(&reply, Response::LiveLeased(_))
+                        || matches!(&reply, Response::LiveAdopted(adopted) if adopted.next.is_some())
+                    {
+                        shared.trigger_file_preparation(&log);
+                    }
                     // Native keeps its fragment-boundary/on-demand policy;
                     // only synchronous adoption requests a per-prefix root sync.
                     if adoption && (tier == DurabilityTier::Synchronous || closes_extent) {
@@ -1614,6 +1855,74 @@ impl ControlContext {
             })?;
         Ok((log, receipts, validation_ns, validation_samples))
     }
+    /// The preparer never waits for inventory: fence/seal can hold it while
+    /// joining us. Retry at most 30,000 times, parking 1 ms between attempts.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn publish_prepared_file(
+        &self,
+        log: &Arc<super::super::storage::PartitionLog>,
+        file: u64,
+        stopping: &AtomicBool,
+        #[cfg(test)] waiting_for_inventory: &AtomicBool,
+    ) {
+        let segment = match log.live_segment(file) {
+            Ok(segment) => segment,
+            Err(_) => {
+                log.poison_writer();
+                self.poison_readers();
+                return;
+            }
+        };
+        for _attempt in 0..30_000 {
+            // Acquire observes retirement before trying the inventory lock.
+            if stopping.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(mut inventory) = self.inventory.try_lock() else {
+                #[cfg(test)]
+                // Release lets the test observe a real failed lock attempt.
+                waiting_for_inventory.store(true, Ordering::Release);
+                thread::park_timeout(Duration::from_millis(1));
+                continue;
+            };
+            if inventory
+                .live_target
+                .as_ref()
+                .is_none_or(|target| target.export_mode().files_per_subsystem().is_none())
+            {
+                return;
+            }
+            // Acquire observes authority loss during unlocked file preparation.
+            if self.poison_pending.load(Ordering::Acquire)
+                || self.terminal.load(Ordering::Acquire)
+                || !inventory
+                    .active(segment.epoch)
+                    .is_ok_and(|current| Arc::ptr_eq(&current, log))
+            {
+                return;
+            }
+            #[cfg(test)]
+            let export_started = Instant::now();
+            let result = inventory.publish_permanent_segment(&segment);
+            #[cfg(test)]
+            log.record_test_file_export(
+                file,
+                _attempt + 1,
+                export_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                result.is_ok(),
+            );
+            if result.is_err() {
+                drop(inventory);
+                log.poison_writer();
+                self.poison_readers();
+            } else if matches!(result, Ok((_, true))) {
+                log.live_file_published();
+            }
+            return;
+        }
+        // Optional preparation timed out; a later grant publishes the file.
+    }
+
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn lease_live_published(
         &self,
@@ -1621,7 +1930,12 @@ impl ControlContext {
         tier: DurabilityTier,
         after: Option<[u8; 16]>,
     ) -> Result<LiveLeased, TcpError> {
+        #[cfg(test)]
+        let lookup_started = Instant::now();
         let log = self.inventory.lock().active(epoch)?;
+        #[cfg(test)]
+        let lookup_inventory_wait_ns =
+            lookup_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let leased = match after {
             Some(after) => log.prelease_live_extent(RequestAuthority { epoch }, after),
             None => log.lease_live_extent(RequestAuthority { epoch }),
@@ -1634,6 +1948,10 @@ impl ControlContext {
         })?;
         let publish_started = Instant::now();
         let mut inventory = self.inventory.lock();
+        #[cfg(test)]
+        let inventory_wait_ns = publish_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        #[cfg(test)]
+        let publication_started = Instant::now();
         let binding = inventory.active(epoch).and_then(|current| {
             // Acquire observes terminal authority published during unlocked I/O.
             if self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire)
@@ -1651,13 +1969,26 @@ impl ControlContext {
                 .as_ref()
                 .is_some_and(|target| target.export_mode().files_per_subsystem().is_some())
             {
-                inventory.publish_permanent_segment(&extent.segment)
+                inventory
+                    .publish_permanent_segment(&extent.segment)
+                    .map(|(binding, _created)| binding)
             } else {
                 inventory.publish_live_segment(&extent.segment, true)
             }
         });
+        #[cfg(test)]
+        let publication_call_ns = publication_started
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
         drop(inventory);
         profile.publish_ns = publish_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        #[cfg(test)]
+        log.record_test_lease_publication(
+            inventory_wait_ns,
+            publication_call_ns,
+            lookup_inventory_wait_ns,
+        );
         let binding = binding.map_err(|error| {
             log.poison_writer();
             self.poison_readers();
@@ -2500,7 +2831,7 @@ impl ControlContext {
                     }
                     leases
                 };
-                self.inventory.lock().seal(epoch)?;
+                self.inventory.lock().seal_draining(epoch, _drain_log)?;
                 Ok(Response::Sealed)
             }
             Request::StatsDetailed => {

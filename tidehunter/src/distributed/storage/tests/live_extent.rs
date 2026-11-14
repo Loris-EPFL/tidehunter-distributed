@@ -62,6 +62,655 @@ fn expected(
         .collect()
 }
 
+fn close_for_preparation(
+    log: &PartitionLog,
+    config: &PartitionConfig,
+    extent: &LiveWriteExtent,
+    sequence: u64,
+) {
+    let (_, frame) = encoded(config, vec![batch(config, sequence)]);
+    write(extent, extent.start, &frame);
+    skip(extent, extent.start + frame.len() as u64);
+    log.adopt_live_extent(
+        authority(config),
+        extent.token,
+        extent.start + frame.len() as u64,
+        true,
+    )
+    .unwrap();
+}
+
+/// Leave the second extent open with an adopted frame and file 1 ready.
+fn prepared_boundary() -> (
+    tempdir::TempDir,
+    PartitionConfig,
+    Arc<PartitionLog>,
+    LiveWriteExtent,
+) {
+    let (temp, config, log) = fixture();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    close_for_preparation(&log, &config, &first, 0);
+    let current = log.lease_live_extent(authority(&config)).unwrap().0;
+    assert_eq!(log.prepare_next_live_file().unwrap(), Some(1));
+    let (_, frame) = encoded(&config, vec![batch(&config, 1)]);
+    write(&current, current.start, &frame);
+    log.adopt_live_extent(
+        authority(&config),
+        current.token,
+        current.start + frame.len() as u64,
+        false,
+    )
+    .unwrap();
+    (temp, config, Arc::new(log), current)
+}
+
+#[test]
+fn prepared_prelease_bypasses_receipt_sync_and_preserves_its_capture() {
+    for fail in [false, true] {
+        let (_temp, config, log, current) = prepared_boundary();
+        let end = log.appended_frontier();
+        let namespace = log.state.lock().namespace_synced_file;
+        let stats = log.stats();
+        let (entered, resume) = log.pause_next_persist();
+        let owner = log.clone();
+        let sync = std::thread::spawn(move || {
+            let mut profile = StorageWriteProfile::default();
+            let result = owner.persist_appended_profiled(&mut profile);
+            (result, profile)
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(log.persistence.is_locked());
+        let owner = log.clone();
+        let auth = authority(&config);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let grant = std::thread::spawn(move || {
+            tx.send(owner.prelease_live_extent(auth, current.token))
+                .unwrap();
+        });
+        let granted = rx.recv_timeout(Duration::from_secs(5));
+        let before_resume = (log.synced_frontier(), log.appended_frontier(), log.stats());
+        if fail {
+            log.fail_live_frontier.store(1, Ordering::Release);
+        }
+        resume.send(()).unwrap();
+        grant.join().unwrap();
+        let (result, profile) = sync.join().unwrap();
+        let (next, lease_profile) = granted.unwrap().unwrap();
+        assert_eq!(next.segment.file_index, 1);
+        assert_eq!(
+            (next.start, next.end),
+            (
+                config.wal_file_bytes,
+                config.wal_file_bytes + config.fragment_bytes
+            )
+        );
+        assert_ne!(next.token, current.token);
+        assert_eq!(lease_profile.namespace_sync_ns, 0);
+        assert_eq!(
+            log.state
+                .lock()
+                .live_test_diagnostics
+                .lease
+                .persistence_wait_ns,
+            0
+        );
+        assert_eq!(before_resume, (0, end, stats));
+        assert_eq!(log.state.lock().namespace_synced_file, namespace);
+        let capture = profile.persistence_capture.unwrap();
+        assert_eq!(capture.durable_end, 0);
+        assert_eq!(capture.captured_appended_end, end);
+        if fail {
+            assert!(result.is_err());
+            assert_eq!(log.synced_frontier(), 0);
+            assert!(matches!(
+                log.prelease_live_extent(auth, current.token),
+                Err(StorageError::Poisoned)
+            ));
+        } else {
+            assert_eq!(result.unwrap(), end);
+            assert_eq!(log.synced_frontier(), end);
+        }
+    }
+}
+
+#[test]
+fn prepared_prelease_bypasses_position_root_install_without_changing_cut() {
+    let (_temp, config, log, current) = prepared_boundary();
+    let through = log.appended_frontier();
+    let old_root = fs::read(log.path.join(super::super::wal_replay::ROOT)).unwrap();
+    let old_frontier = log.synced_frontier();
+    let (entered, resume) = log.pause_live(LivePausePoint::PositionRootLocked);
+    let owner = log.clone();
+    let proof = std::thread::spawn(move || owner.persist_wal_through(through));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(log.persistence.is_locked());
+    let owner = log.clone();
+    let auth = authority(&config);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let grant = std::thread::spawn(move || {
+        tx.send(owner.prelease_live_extent(auth, current.token))
+            .unwrap();
+    });
+    let granted = rx.recv_timeout(Duration::from_secs(5));
+    let root_before_resume = fs::read(log.path.join(super::super::wal_replay::ROOT)).unwrap();
+    let cut_before_resume = log.position_frontier_for_test();
+    let receipt_before_resume = log.synced_frontier();
+    resume.send(()).unwrap();
+    grant.join().unwrap();
+    granted.unwrap().unwrap();
+    assert_eq!(root_before_resume, old_root);
+    assert_eq!(cut_before_resume, 0);
+    assert_eq!(receipt_before_resume, old_frontier);
+    assert_eq!(proof.join().unwrap().unwrap(), through);
+    assert_eq!(log.position_frontier_for_test(), through);
+    assert_eq!(log.synced_frontier(), old_frontier);
+    assert!(log.state.lock().writer.as_ref().unwrap().position() > through);
+}
+
+#[test]
+fn unprepared_prelease_waits_for_persistence_and_namespace_witness() {
+    for fail_witness in [false, true] {
+        let (temp, config, log) = fixture();
+        let first = log.lease_live_extent(authority(&config)).unwrap().0;
+        close_for_preparation(&log, &config, &first, 0);
+        let current = log.lease_live_extent(authority(&config)).unwrap().0;
+        let log = Arc::new(log);
+        let persistence = log.persistence.lock();
+        let (waiting, release_wait) = log.pause_live(LivePausePoint::LeaseWaitingForPersistence);
+        let (syncing, release_sync) = log.pause_next_persist();
+        let owner = log.clone();
+        let auth = authority(&config);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let grant = std::thread::spawn(move || {
+            tx.send(owner.prelease_live_extent(auth, current.token))
+                .unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(log.state.lock().next_live_extent.is_none());
+        release_wait.send(()).unwrap();
+        drop(persistence);
+        syncing.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(log.state.lock().namespace_synced_file.unwrap().as_u64(), 0);
+        let witness = temp
+            .path()
+            .join("stream/partition-required-wal-v1-0000000000000001");
+        assert!(!witness.exists());
+        if fail_witness {
+            log.fail_next_inventory_witness(false);
+        }
+        release_sync.send(()).unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        grant.join().unwrap();
+        if fail_witness {
+            assert!(matches!(result, Err(StorageError::Unknown(_))));
+            assert!(!witness.exists());
+            assert!(matches!(log.state.lock().poison, Some(WriterPoison::Fatal)));
+            assert!(matches!(
+                log.prelease_live_extent(auth, current.token),
+                Err(StorageError::Poisoned)
+            ));
+        } else {
+            let (next, profile) = result.unwrap();
+            assert_eq!(next.segment.file_index, 1);
+            assert!(profile.namespace_sync_ns > 0);
+            assert!(witness.is_file());
+        }
+    }
+}
+
+#[test]
+fn concurrent_preleases_share_validation_and_never_overlap() {
+    let (_temp, config, log, current) = prepared_boundary();
+    let persistence = log.persistence.lock();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let owner = log.clone();
+        let start = barrier.clone();
+        let done = tx.clone();
+        let auth = authority(&config);
+        workers.push(std::thread::spawn(move || {
+            start.wait();
+            done.send(owner.prelease_live_extent(auth, current.token))
+                .unwrap();
+        }));
+    }
+    barrier.wait();
+    let first = rx.recv_timeout(Duration::from_secs(5));
+    let second = rx.recv_timeout(Duration::from_secs(5));
+    drop(persistence);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let next = &results
+        .iter()
+        .find_map(|result| result.as_ref().ok())
+        .unwrap()
+        .0;
+    assert_eq!(
+        (next.start, next.end),
+        (
+            config.wal_file_bytes,
+            config.wal_file_bytes + config.fragment_bytes
+        )
+    );
+    assert!(current.end <= next.start);
+    assert!(results.iter().any(|result| matches!(
+        result,
+        Err(StorageError::Invalid("live extent already preleased"))
+    )));
+    assert_eq!(
+        log.state.lock().writer.as_ref().unwrap().position(),
+        next.end
+    );
+}
+
+#[test]
+fn prepared_fast_validation_rejects_stale_terminal_and_wrong_epoch_requests() {
+    let (_temp, config, log, current) = prepared_boundary();
+    let persistence = log.persistence.lock();
+    let owner = log.clone();
+    let auth = authority(&config);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        assert!(matches!(
+            owner.prelease_live_extent(auth, [0; 16]),
+            Err(StorageError::Invalid(
+                "prelease requires the open live extent"
+            ))
+        ));
+        assert!(matches!(
+            owner.prelease_live_extent(
+                RequestAuthority {
+                    epoch: auth.epoch + 1
+                },
+                current.token
+            ),
+            Err(StorageError::Fenced)
+        ));
+        owner.state.lock().sealing = true;
+        assert!(matches!(
+            owner.prelease_live_extent(auth, current.token),
+            Err(StorageError::Invalid("live stream is sealing"))
+        ));
+        owner.state.lock().sealing = false;
+        owner.state.lock().sealed = true;
+        assert!(matches!(
+            owner.prelease_live_extent(auth, current.token),
+            Err(StorageError::Sealed)
+        ));
+        owner.state.lock().sealed = false;
+        owner.state.lock().poison = Some(WriterPoison::Fatal);
+        assert!(matches!(
+            owner.prelease_live_extent(auth, current.token),
+            Err(StorageError::Poisoned)
+        ));
+        tx.send(()).unwrap();
+    });
+    let complete = rx.recv_timeout(Duration::from_secs(5));
+    drop(persistence);
+    worker.join().unwrap();
+    complete.unwrap();
+    assert_eq!(
+        log.state.lock().writer.as_ref().unwrap().position(),
+        config.wal_file_bytes
+    );
+    assert!(log.state.lock().next_live_extent.is_none());
+}
+
+#[test]
+fn prepared_live_file_grant_does_no_namespace_work() {
+    let (temp, config, log) = fixture();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    assert_eq!(log.prepare_next_live_file().unwrap(), Some(1));
+    assert_eq!(log.state.lock().namespace_synced_file.unwrap().as_u64(), 1);
+    assert!(
+        temp.path()
+            .join("stream/partition-required-wal-v1-0000000000000001")
+            .is_file()
+    );
+    close_for_preparation(&log, &config, &first, 0);
+    let second = log.lease_live_extent(authority(&config)).unwrap().0;
+    close_for_preparation(&log, &config, &second, 1);
+    let syncs = log.stats().namespace_syncs;
+    let (entered, resume) = log.pause_next_persist();
+    let log = Arc::new(log);
+    let owner = log.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let auth = authority(&config);
+    let worker = std::thread::spawn(move || tx.send(owner.lease_live_extent(auth)).unwrap());
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    let hook_entered = entered.try_recv().is_ok();
+    drop(resume); // Unblock a broken implementation before reporting failure.
+    worker.join().unwrap();
+    let (third, profile) = result.unwrap().unwrap();
+    assert!(!hook_entered);
+    assert_eq!(third.segment.file_index, 1);
+    assert_eq!(profile.namespace_sync_ns, 0);
+    assert_eq!(log.stats().namespace_syncs, syncs);
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
+}
+
+#[test]
+fn live_file_preparation_waits_until_near_file_end() {
+    let temp = tempdir::TempDir::new("live-preparation-distance").unwrap();
+    let mut config = live_config();
+    config.fragment_bytes = 16 * 1024;
+    config.wal_file_bytes = 8 * config.fragment_bytes;
+    let log = PartitionLog::create_live(
+        &temp.path().join("stream"),
+        config.clone(),
+        &shape(),
+        metrics(),
+    )
+    .unwrap();
+    log.lease_live_extent(authority(&config)).unwrap();
+    let before = log.state.lock().namespace_synced_file;
+    assert_eq!(log.prepare_next_live_file().unwrap(), None);
+    assert_eq!(log.state.lock().namespace_synced_file, before);
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 0);
+}
+
+#[test]
+fn live_file_preparation_is_idempotent() {
+    let (_temp, config, log) = fixture();
+    log.lease_live_extent(authority(&config)).unwrap();
+    assert_eq!(log.prepare_next_live_file().unwrap(), Some(1));
+    let before = log.stats();
+    assert_eq!(log.prepare_next_live_file().unwrap(), None);
+    assert_eq!(log.stats(), before);
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
+}
+
+#[test]
+fn same_file_prelease_completes_during_file_preparation() {
+    let (_temp, config, log) = fixture();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    let log = Arc::new(log);
+    let (entered, resume) = log.pause_live(LivePausePoint::PrepareBeforePublish);
+    let owner = log.clone();
+    let preparation = std::thread::spawn(move || owner.prepare_next_live_file());
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let owner = log.clone();
+    let auth = authority(&config);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let grant = std::thread::spawn(move || {
+        tx.send(owner.prelease_live_extent(auth, first.token))
+            .unwrap()
+    });
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    resume.send(()).unwrap();
+    grant.join().unwrap();
+    result.unwrap().unwrap();
+    // The same-file prelease moves the writer to the target's start, but does
+    // not publish that target's namespace. Preparation must still finish.
+    assert_eq!(preparation.join().unwrap().unwrap(), Some(1));
+    assert_eq!(log.state.lock().namespace_synced_file.unwrap().as_u64(), 1);
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
+}
+
+#[test]
+fn live_file_preparation_starts_at_unpublished_file_boundary() {
+    let (_temp, config, log) = fixture();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    log.prelease_live_extent(authority(&config), first.token)
+        .unwrap();
+    assert_eq!(log.prepare_next_live_file().unwrap(), Some(1));
+    assert_eq!(log.state.lock().namespace_synced_file.unwrap().as_u64(), 1);
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
+}
+
+#[test]
+fn late_file_preparation_does_not_republish_after_a_grant() {
+    let (_temp, config, log) = fixture();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    let log = Arc::new(log);
+    let (entered, resume) = log.pause_live(LivePausePoint::PrepareBeforePublish);
+    let owner = log.clone();
+    let preparation = std::thread::spawn(move || owner.prepare_next_live_file());
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = log
+        .prelease_live_extent(authority(&config), first.token)
+        .unwrap()
+        .0;
+    close_for_preparation(&log, &config, &first, 0);
+    close_for_preparation(&log, &config, &second, 1);
+    let (third, profile) = log.lease_live_extent(authority(&config)).unwrap();
+    assert_eq!(third.segment.file_index, 1);
+    assert!(profile.namespace_sync_ns > 0);
+    let stats = log.stats();
+    resume.send(()).unwrap();
+    assert_eq!(preparation.join().unwrap().unwrap(), None);
+    assert_eq!(log.state.lock().namespace_synced_file.unwrap().as_u64(), 1);
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 0);
+    assert_eq!(log.stats(), stats);
+}
+
+#[test]
+fn seal_during_file_preparation_prevents_publication() {
+    let (_temp, config, log) = fixture();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    close_for_preparation(&log, &config, &first, 0);
+    log.persist_appended().unwrap();
+    let log = Arc::new(log);
+    let (entered, resume) = log.pause_live(LivePausePoint::PrepareBeforePublish);
+    let owner = log.clone();
+    let preparation = std::thread::spawn(move || owner.prepare_next_live_file());
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let owner = log.clone();
+    let auth = authority(&config);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let seal = std::thread::spawn(move || tx.send(owner.seal_live_epoch(auth, || Ok(()))).unwrap());
+    let sealed = rx.recv_timeout(Duration::from_secs(5));
+    resume.send(()).unwrap();
+    seal.join().unwrap();
+    sealed.unwrap().unwrap();
+    assert_eq!(preparation.join().unwrap().unwrap(), None);
+    let state = log.state.lock();
+    assert!(state.sealed);
+    assert!(state.poison.is_none());
+    assert_eq!(state.live_file_preparation.live_files_prepared, 0);
+}
+
+#[test]
+fn prepared_file_crash_cuts_recover_acknowledged_state_in_both_tiers() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        for cut in 0..6 {
+            let (temp, config, log) = fixture();
+            let log = Arc::new(log);
+            log.attach_frontier(&DurabilityConfig::with_tier(tier))
+                .unwrap();
+            let first = log.lease_live_extent(authority(&config)).unwrap().0;
+            let (group, frame) = encoded(&config, vec![batch(&config, 0)]);
+            write(&first, first.start, &frame);
+            log.adopt_live_extent(authority(&config), first.token, frame.len() as u64, false)
+                .unwrap();
+            if tier == DurabilityTier::Synchronous && cut != 5 {
+                log.persist_appended().unwrap();
+            }
+            let mut receipts = expected(&config, &group, 0, frame.len());
+            let mut acknowledged_end = frame.len() as u64;
+            let mut paused_sync = None;
+            match cut {
+                0 => {
+                    let preparer = log
+                        .state
+                        .lock()
+                        .writer
+                        .as_ref()
+                        .unwrap()
+                        .external_file_preparer();
+                    preparer
+                        .ensure(crate::wal::position::WalFileId::from_u64(1))
+                        .unwrap();
+                }
+                1 => {
+                    // File synced; no namespace/witness work has started.
+                    let preparer = log
+                        .state
+                        .lock()
+                        .writer
+                        .as_ref()
+                        .unwrap()
+                        .external_file_preparer();
+                    preparer
+                        .ensure(crate::wal::position::WalFileId::from_u64(1))
+                        .unwrap();
+                    log.wal
+                        .persist_frame_file(WalPosition::new(config.wal_file_bytes, 1))
+                        .unwrap();
+                }
+                2 | 3 => {
+                    // Cut after namespace sync, before or after the witness,
+                    // without publishing the prepared highwater in memory.
+                    log.fail_next_inventory_witness(cut == 3);
+                    assert!(log.prepare_next_live_file().is_err());
+                    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 0);
+                }
+                4 => assert_eq!(log.prepare_next_live_file().unwrap(), Some(1)),
+                _ => {
+                    skip(&first, first.start + frame.len() as u64);
+                    log.adopt_live_extent(
+                        authority(&config),
+                        first.token,
+                        first.start + frame.len() as u64,
+                        true,
+                    )
+                    .unwrap();
+                    let current = log.lease_live_extent(authority(&config)).unwrap().0;
+                    let (group, bytes) = encoded(&config, vec![batch(&config, 1)]);
+                    write(&current, current.start, &bytes);
+                    acknowledged_end = current.start + bytes.len() as u64;
+                    skip(&current, acknowledged_end);
+                    log.adopt_live_extent(
+                        authority(&config),
+                        current.token,
+                        acknowledged_end,
+                        false,
+                    )
+                    .unwrap();
+                    receipts.extend(expected(&config, &group, current.start, bytes.len()));
+                    if tier == DurabilityTier::Synchronous {
+                        // Both direct-write acknowledgements have completed the
+                        // initiator's file sync, not the owner's receipt sync.
+                        OpenOptions::new()
+                            .write(true)
+                            .open(&current.segment.path)
+                            .unwrap()
+                            .sync_data()
+                            .unwrap();
+                    }
+                    assert_eq!(log.prepare_next_live_file().unwrap(), Some(1));
+                    let (entered, resume) = log.pause_next_persist();
+                    let owner = log.clone();
+                    let sync = std::thread::spawn(move || owner.persist_appended());
+                    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(log.persistence.is_locked());
+                    let owner = log.clone();
+                    let auth = authority(&config);
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    let grant = std::thread::spawn(move || {
+                        tx.send(owner.prelease_live_extent(auth, current.token))
+                            .unwrap();
+                    });
+                    let granted = rx.recv_timeout(Duration::from_secs(5));
+                    if granted.is_err() {
+                        // Unblock a broken serialized implementation before failure.
+                        resume.send(()).unwrap();
+                        grant.join().unwrap();
+                        sync.join().unwrap().unwrap();
+                        panic!("prepared grant waited for receipt sync");
+                    }
+                    grant.join().unwrap();
+                    let (next, profile) = granted.unwrap().unwrap();
+                    assert_eq!(next.segment.file_index, 1);
+                    assert_eq!(next.start, config.wal_file_bytes);
+                    assert_eq!(next.end, config.wal_file_bytes + config.fragment_bytes);
+                    assert_eq!(profile.namespace_sync_ns, 0);
+                    assert_eq!(log.synced_frontier(), 0);
+                    // Preserve only a frame prefix and leave the unwritten body
+                    // zero. Force a bad CRC for this exact torn body so rejection
+                    // does not depend on the checksum of omitted bytes.
+                    let (_, bytes) = encoded(&config, vec![batch(&config, 2)]);
+                    let mut torn = vec![0; bytes.len()];
+                    torn[..128].copy_from_slice(&bytes[..128]);
+                    let crc = crc32fast::hash(&torn[8..]) ^ 1;
+                    torn[4..8].copy_from_slice(&crc.to_be_bytes());
+                    write(&next, next.start, &torn);
+                    paused_sync = Some((resume, sync));
+                }
+            }
+            let image = temp.path().join("crash-image");
+            fs::create_dir(&image).unwrap();
+            for entry in fs::read_dir(temp.path().join("stream")).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    fs::copy(entry.path(), image.join(entry.file_name())).unwrap();
+                }
+            }
+            if let Some((resume, sync)) = paused_sync {
+                resume.send(()).unwrap();
+                assert_eq!(sync.join().unwrap().unwrap(), acknowledged_end);
+            }
+            let recovered =
+                PartitionLog::recover_live_sealed(&image, &config, metrics(), || Ok(())).unwrap();
+            assert_eq!(
+                recovered.receipt_page(0, 16).unwrap(),
+                receipts,
+                "cut {cut}, tier {tier}"
+            );
+            if cut == 5 {
+                assert_eq!(recovered.appended_frontier(), acknowledged_end);
+                assert!(recovered.appended_frontier() < config.wal_file_bytes);
+                assert!(recovered.lookup(batch(&config, 2).id()).unwrap().is_none());
+                for (sequence, receipt) in receipts.iter().copied().enumerate() {
+                    assert_eq!(
+                        recovered.read_batch(receipt).unwrap().mutations(),
+                        batch(&config, sequence as u64).mutations()
+                    );
+                }
+            }
+            let mut next_config = config.clone();
+            next_config.inventory.epoch += 1;
+            let next = PartitionLog::create_live(
+                &temp.path().join("next-epoch"),
+                next_config.clone(),
+                &shape(),
+                metrics(),
+            )
+            .unwrap();
+            assert!(next.lease_live_extent(authority(&next_config)).is_ok());
+        }
+    }
+}
+
+#[test]
+fn live_file_preparation_namespace_failure_poison_fences_leases() {
+    let (_temp, config, log) = fixture();
+    log.lease_live_extent(authority(&config)).unwrap();
+    log.fail_namespace_persist.store(true, Ordering::Release);
+    assert!(matches!(
+        log.prepare_next_live_file(),
+        Err(StorageError::Unknown(_))
+    ));
+    assert!(matches!(log.state.lock().poison, Some(WriterPoison::Fatal)));
+    assert!(matches!(
+        log.lease_live_extent(authority(&config)),
+        Err(StorageError::Poisoned)
+    ));
+}
+
 #[test]
 fn leased_two_step_adoption_matches_reserved_receipts_and_frontier_rules() {
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {

@@ -233,6 +233,11 @@ impl WalTracker {
         self.mapper.ensure_external_file(id)
     }
 
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn external_file_preparer(&self) -> super::mapper::ExternalFilePreparer {
+        self.mapper.external_file_preparer()
+    }
+
     pub fn last_processed(&self) -> LastProcessed {
         LastProcessed::new(self.last_processed.load(Ordering::SeqCst))
     }

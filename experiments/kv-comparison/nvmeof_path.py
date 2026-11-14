@@ -80,7 +80,11 @@ def settings(jobs):
                 errors.extend(member.get('case_id', '?') + ': ' + k for k in sorted(required - member.keys()))
         get = lambda k: j.get(k, LIVE_DEFAULTS[k] if k in ('live_lease_ahead', 'live_polled_writes') else MISSING)
         geometry = GEOMETRY.get(get('native_wal_geometry' if native else 'owner_wal_geometry'), (MISSING,) * 3)
+        if not native and 'owner_wal_file_bytes' in j:
+            geometry = (geometry[0], j['owner_wal_file_bytes'], geometry[2])
         differences = '; '.join(k + '=' + (str(get(k)).lower() if isinstance(get(k), bool) else str(get(k))) for k, default in defaults.items() if get(k) != default)
+        if not native and 'owner_wal_file_bytes' in j and geometry[1] != GEOMETRY['native_default'][1]:
+            differences = '; '.join(filter(None, (differences, 'owner_wal_file_bytes=' + str(geometry[1]))))
         cache = '; '.join(k + '=' + str(j[k]).lower() for k in ('drop_os_caches', 'evict_mapped_wal_before_measurement', 'warmup_key_sweep') if k in j)
         if 'media' in j:
             cache += '; media.expected=' + str(j['media'].get('expected', MISSING))
@@ -343,11 +347,13 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
     data = json.loads(source.read_text())
     jobs = data if isinstance(data, list) else data['jobs']
     selection = jobs[0].get('selection', NVMEOF_PATH_SELECTIONS[0]) if jobs else NVMEOF_PATH_SELECTIONS[0]
+    if any(j.get('selection') == 'nvmeof_contracts_crossing' for j in jobs):
+        selection = 'nvmeof_contracts_crossing'
     if isinstance(data, dict):
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -386,7 +392,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
-    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W') and r['operation'] in ('put', 'put_batch')]
+    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W') and r['operation'] in ('put', 'put_batch')]
     tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']
     write_csv(output / 'stalls.csv', STALL_FIELDS,

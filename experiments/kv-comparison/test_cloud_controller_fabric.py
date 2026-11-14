@@ -56,7 +56,7 @@ class FabricControllerTests(unittest.TestCase):
                     self.assertEqual(prep['transport'], controller.cloud_campaign.TRANSPORTS[expected])
                     prepared = directory / 'prepared'
                     (prepared / 'node-0').mkdir(parents=True)
-                    (prepared / 'remote.json').write_text(json.dumps({'tls': {'ca': '', 'cert': '', 'key': ''}}))
+                    (prepared / 'remote.json').write_text(json.dumps({'tls': {'ca': '', 'cert': '', 'key': ''}, 'storage': {'fragment_bytes': 4194304, 'wal_file_bytes': 1073741824}}))
                     (prepared / 'external_owner_read_config.json').write_text('[]')
                     (prepared / 'node-0' / 'launch.yaml').write_text(yaml.safe_dump({'tls': {}, 'node': {'partition': {'fragment_bytes': 4194304, 'wal_file_bytes': 1073741824}}}))
                 with patch.object(controller, 'controller_matrix', return_value=[]), \
@@ -113,7 +113,7 @@ class FabricControllerTests(unittest.TestCase):
                     def prepare(argv, **kwargs):
                         prepared = directory / 'prepared'
                         (prepared / 'node-0').mkdir(parents=True)
-                        (prepared / 'remote.json').write_text(json.dumps({'tls': {'ca': '', 'cert': '', 'key': ''}}))
+                        (prepared / 'remote.json').write_text(json.dumps({'tls': {'ca': '', 'cert': '', 'key': ''}, 'storage': {'fragment_bytes': 4194304, 'wal_file_bytes': 1073741824}}))
                         (prepared / 'external_owner_read_config.json').write_text('[]')
                         (prepared / 'node-0' / 'launch.yaml').write_text(yaml.safe_dump({'tls': {}, 'node': {'partition': {'fragment_bytes': 4194304, 'wal_file_bytes': 1073741824}}}))
                     with patch.object(controller, 'controller_matrix', return_value=[]), \

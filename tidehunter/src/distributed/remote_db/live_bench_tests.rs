@@ -68,6 +68,7 @@ struct Fixture {
     tier: DurabilityTier,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
+    target_root: Option<tempdir::TempDir>,
     // Drop the owner and its WAL mapper before removing the fixture directory.
     root: tempdir::TempDir,
 }
@@ -95,6 +96,29 @@ impl Fixture {
         fragment_bytes: u64,
         wal_file_bytes: u64,
         replay_limits: ReplayLimits,
+    ) -> Self {
+        Self::with_export_mode(
+            base,
+            case,
+            tier,
+            arm,
+            fragment_bytes,
+            wal_file_bytes,
+            replay_limits,
+            Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_export_mode(
+        base: &Path,
+        case: &str,
+        tier: DurabilityTier,
+        arm: &str,
+        fragment_bytes: u64,
+        wal_file_bytes: u64,
+        replay_limits: ReplayLimits,
+        export_mode: crate::distributed::nvmeof::LiveExportMode,
     ) -> Self {
         let directory = tempdir::TempDir::new_in(base, case).unwrap();
         let root = directory.path();
@@ -157,6 +181,9 @@ impl Fixture {
                 )
             }),
         };
+        if let Some(live) = &mut config.live_nvme {
+            live.export_mode = export_mode;
+        }
         let node = StorageNode::open(
             NodeConfig {
                 root: root.join("owner"),
@@ -179,9 +206,14 @@ impl Fixture {
             .unwrap();
         node.set_durability(DurabilityConfig::with_tier(tier))
             .unwrap();
+        let target_root = std::env::var_os("TH_TAIL_TARGET_DIR")
+            .map(|path| tempdir::TempDir::new_in(path, "tail-target").unwrap());
         if arm != "A" {
-            let state_dir = root.join("target");
-            let configfs = root.join("configfs");
+            let target_path = target_root
+                .as_ref()
+                .map_or(root, |directory| directory.path());
+            let state_dir = target_path.join("target");
+            let configfs = target_path.join("configfs");
             fs::create_dir(&state_dir).unwrap();
             for name in ["hosts", "ports", "subsystems"] {
                 fs::create_dir_all(configfs.join(name)).unwrap();
@@ -197,7 +229,7 @@ impl Fixture {
                     commissioning_port_id: 43,
                     commissioning_service: 4421,
                     spdk: None,
-                    export_mode: Default::default(),
+                    export_mode,
                 },
                 configfs,
             )
@@ -235,6 +267,7 @@ impl Fixture {
             tier,
             stop,
             server: Some(server),
+            target_root,
         }
     }
     fn open(&self, arm: &str) -> RemoteDatabase {
@@ -1238,6 +1271,11 @@ fn leased_checkpoint_tail_workstation() {
     let wal_file_bytes = setting("TH_TAIL_WAL_FILE_BYTES", 256 * MIB);
     let replay_max_batches = setting("TH_TAIL_REPLAY_MAX_BATCHES", 256);
     let replay_max_bytes = setting("TH_TAIL_REPLAY_MAX_BYTES", 16 * MIB);
+    let export_mode = match std::env::var("TH_TAIL_EXPORT_MODE").as_deref() {
+        Err(_) | Ok("on_demand") => crate::distributed::nvmeof::LiveExportMode::OnDemand,
+        Ok("per_owner") => crate::distributed::nvmeof::LiveExportMode::PerOwner,
+        Ok(other) => panic!("invalid TH_TAIL_EXPORT_MODE: {other}"),
+    };
     let default_geometry = calls == 4096
         && fragment_bytes == 8 * MIB
         && wal_file_bytes == 256 * MIB
@@ -1247,7 +1285,7 @@ fn leased_checkpoint_tail_workstation() {
     let base = tempdir::TempDir::new("leased-checkpoint-tail").unwrap();
     let value: Bytes = vec![0x5a; 65536].into();
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
-        let mut fixture = Fixture::with_limits(
+        let mut fixture = Fixture::with_export_mode(
             base.path(),
             "tail",
             tier,
@@ -1258,6 +1296,7 @@ fn leased_checkpoint_tail_workstation() {
                 max_batches: replay_max_batches,
                 max_encoded_bytes: replay_max_bytes,
             },
+            export_mode,
         );
         fixture.config.preparation_workers = 8;
         let db = ConcurrentRemoteDatabase::new(fixture.open("C-buf")).unwrap();
@@ -1337,6 +1376,7 @@ fn leased_checkpoint_tail_workstation() {
             )
             .unwrap();
         }
+        let preparation = fixture.node.log_for_test(1).live_file_preparation_stats();
         println!(
             "checkpoint_tail_workstation {}",
             json!({
@@ -1344,6 +1384,13 @@ fn leased_checkpoint_tail_workstation() {
                 "slow_calls_ge_5ms": slow, "max_api_ns": maximum, "elapsed_ns": elapsed.as_nanos(),
                 "checkpoints": checkpoints, "extent_switches": counts.extent_switch_samples,
                 "extent_switch_waits": counts.extent_switch_waits,
+                "live_files_prepared": preparation.live_files_prepared,
+                "live_files_published": preparation.live_files_published,
+                "export_mode": export_mode,
+                "live_file_prepare_failures": preparation.live_file_prepare_failures,
+                "grant_profiles": fixture.node.bench_live_grant_profiles(),
+                "live_file_diagnostics": fixture.node.log_for_test(1).live_test_diagnostics(),
+                "target_dir": fixture.target_root.as_ref().map_or(fixture.root.path(), |directory| directory.path()),
                 "checkpoint_started": checkpoint_started,
                 "completed_checkpoint_lifetime_ns": completed_checkpoint_lifetime_ns,
                 "timeline_enabled": timeline_output.is_some(),

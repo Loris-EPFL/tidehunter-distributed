@@ -1020,6 +1020,10 @@ impl StorageNode {
         log.export_sealed_readset(directory, references, config)
             .map_err(TcpError::component)
     }
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn bench_live_grant_profiles(&self) -> serde_json::Value {
+        self.control.grant_profiles()
+    }
     /// Replace an empty owner registry with an explicit file-backed test fixture.
     #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn set_nvmeof_lease_fixture(

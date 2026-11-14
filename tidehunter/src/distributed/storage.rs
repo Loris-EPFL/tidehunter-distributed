@@ -335,6 +335,7 @@ pub(crate) enum LivePausePoint {
     PositionRootLocked,
     PositionAfterRoot,
     LeaseWaitingForPersistence,
+    PrepareBeforePublish,
 }
 
 #[cfg(all(test, feature = "experimental-nvmeof"))]
@@ -385,6 +386,10 @@ struct State {
     poison: Option<WriterPoison>,
     sealed: bool,
     stats: PartitionStats,
+    #[cfg(feature = "experimental-nvmeof")]
+    live_file_preparation: LiveFilePreparationStats,
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    live_test_diagnostics: LiveTestDiagnostics,
 }
 
 /// Counters for this open handle, not recovered durability or publication proof.
@@ -394,10 +399,10 @@ pub struct PartitionStats {
     /// Completed explicit per-group file persistence calls. Creation and sealing
     /// also perform I/O, and background native syncs are not counted here.
     pub persistence_barriers: u64,
-    /// Successful explicit WAL-directory syncs on first use of each file.
+    /// Successful explicit WAL-directory syncs for used or prepared files.
     /// Creation, sealing and recovery namespace I/O are excluded.
     pub namespace_syncs: u64,
-    /// Completed immutable per-used-file inventory witness file+namespace pairs.
+    /// Completed immutable used/prepared-file inventory witness file+namespace pairs.
     /// Separate from native WAL barriers; first-file ACKs pay this extra cost.
     pub inventory_witnesses: u64,
     /// Successful live-frontier file and directory syncs, including attempts
@@ -407,6 +412,42 @@ pub struct PartitionStats {
     /// Currently charged resident/cache/read-CQ descriptor records, not disk total.
     pub registered_records: usize,
     pub reference_metadata_bytes: usize,
+}
+
+/// Owner-local preparation counters; not carried by the statistics protocol.
+#[cfg(feature = "experimental-nvmeof")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiveFilePreparationStats {
+    pub live_files_prepared: u64,
+    pub live_files_published: u64,
+    pub live_file_prepare_failures: u64,
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub(crate) struct LiveTestLeaseTiming {
+    pub persistence_wait_ns: u64,
+    pub state_wait_ns: u64,
+    pub inventory_wait_ns: u64,
+    pub publication_call_ns: u64,
+    pub lookup_inventory_wait_ns: u64,
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct LiveTestExport {
+    file_index: u64,
+    inventory_attempts: u64,
+    export_ns: u64,
+    success: bool,
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct LiveTestDiagnostics {
+    lease: LiveTestLeaseTiming,
+    exports: Vec<LiveTestExport>,
+    dropped_exports: u64,
 }
 
 /// Opt-in diagnostic timings. Ordinary reads do not take these timestamps.
@@ -965,6 +1006,10 @@ impl PartitionLog {
                 poison: None,
                 sealed: false,
                 stats: PartitionStats::default(),
+                #[cfg(feature = "experimental-nvmeof")]
+                live_file_preparation: LiveFilePreparationStats::default(),
+                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                live_test_diagnostics: LiveTestDiagnostics::default(),
             }),
             references,
             durable_frontier: AtomicU64::new(0),
@@ -1456,6 +1501,10 @@ impl PartitionLog {
                 poison: None,
                 sealed: true,
                 stats: PartitionStats::default(),
+                #[cfg(feature = "experimental-nvmeof")]
+                live_file_preparation: LiveFilePreparationStats::default(),
+                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                live_test_diagnostics: LiveTestDiagnostics::default(),
             }),
             references,
             durable_frontier: AtomicU64::new(physical_end),
@@ -1639,6 +1688,96 @@ impl PartitionLog {
         self.lease_live_extent_impl(authority, Some(after))
     }
 
+    /// Prepare after the durable namespace highwater: at most one file beyond the
+    /// allocator-position file (two beyond the last grant with two-fragment files).
+    /// Allocation/file sync run unlocked; publication uses persistence -> state.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn prepare_next_live_file(&self) -> Result<Option<u64>, StorageError> {
+        use crate::wal::position::WalFileId;
+        let config = self.config();
+        let live = |state: &State| {
+            state.live
+                && !state.sealed
+                && !state.sealing
+                && state.poison.is_none()
+                && !state.references.background_failed()
+                && state.writer.is_some()
+        };
+        let eligible_target = |state: &State| {
+            if !live(state) {
+                return None;
+            }
+            let target = state.namespace_synced_file?.as_u64() + 1;
+            let position = state.writer.as_ref()?.position();
+            let file = position / config.wal_file_bytes;
+            let near_end = file == target - 1
+                && target * config.wal_file_bytes - position <= 2 * config.fragment_bytes;
+            (near_end || file == target).then_some(target)
+        };
+        // State alone; never wait for the mapper while holding either owner lock.
+        let (target, preparer) = {
+            let state = self.state.lock();
+            let Some(target) = eligible_target(&state) else {
+                return Ok(None);
+            };
+            let Some(writer) = state.writer.as_ref() else {
+                return Ok(None);
+            };
+            (target, writer.external_file_preparer())
+        };
+        let allocated = preparer.ensure(WalFileId::from_u64(target));
+        // Release the sender before seal drops the writer and joins the mapper.
+        drop(preparer);
+        if allocated.is_err() {
+            self.state
+                .lock()
+                .live_file_preparation
+                .live_file_prepare_failures += 1;
+            return Ok(None);
+        }
+        if let Err(error) = self
+            .wal
+            .persist_frame_file(WalPosition::new(target * config.wal_file_bytes, 1))
+        {
+            self.state.lock().poison = Some(WriterPoison::Fatal);
+            return Err(StorageError::Unknown(WalError::Io(error)));
+        }
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::PrepareBeforePublish);
+        let _persistence = self.persistence.lock();
+        {
+            let state = self.state.lock();
+            // A prelease can move position into target while its name remains
+            // unpublished. Only a newer durable namespace publication obsoletes us.
+            if !live(&state) || state.namespace_synced_file != Some(WalFileId::from_u64(target - 1))
+            {
+                return Ok(None);
+            }
+        }
+        let mut timing = WriteTiming::new(None, false);
+        let mut witnesses = 0;
+        if let Err(error) =
+            self.persist_namespace_witnesses(target, Some(target - 1), &mut timing, &mut witnesses)
+        {
+            self.state.lock().poison = Some(WriterPoison::Fatal);
+            return Err(StorageError::Unknown(WalError::Io(error)));
+        }
+        let mut state = self.state.lock();
+        if !live(&state) || state.namespace_synced_file != Some(WalFileId::from_u64(target - 1)) {
+            return Ok(None);
+        }
+        state.namespace_synced_file = Some(WalFileId::from_u64(target));
+        state.stats.namespace_syncs += 1;
+        state.stats.inventory_witnesses += witnesses;
+        state.live_file_preparation.live_files_prepared += 1;
+        Ok(Some(target))
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn live_file_published(&self) {
+        self.state.lock().live_file_preparation.live_files_published += 1;
+    }
+
     #[cfg(feature = "experimental-nvmeof")]
     fn lease_live_extent_impl(
         &self,
@@ -1651,17 +1790,116 @@ impl PartitionLog {
         ),
         StorageError,
     > {
-        use super::nvmeof::live_storage::{LiveAdoption, LiveWalSegment, LiveWriteExtent};
-        let config = self.config();
-        if authority.epoch != config.inventory.epoch {
-            return Err(StorageError::Fenced);
+        #[cfg(test)]
+        let state_started = Instant::now();
+        let mut state = self.state.lock();
+        #[cfg(test)]
+        let initial_state_wait_ns = duration_ns(state_started.elapsed());
+        let (range, ready) = self.validate_live_extent_grant(&state, authority, after)?;
+        if ready {
+            #[cfg(test)]
+            {
+                state.live_test_diagnostics.lease = LiveTestLeaseTiming {
+                    persistence_wait_ns: 0,
+                    state_wait_ns: initial_state_wait_ns,
+                    ..Default::default()
+                };
+            }
+            // Readiness proves reserve_external needs no mapper request.
+            // The pinned allocator range cannot retire while this state owns it.
+            return self.reserve_live_extent_grant(&mut state, range, after.is_some());
         }
+        drop(state);
         #[cfg(test)]
         if self.persistence.is_locked() {
             self.pause_live_at(LivePausePoint::LeaseWaitingForPersistence);
         }
+        #[cfg(test)]
+        let persistence_started = Instant::now();
         let _persistence = self.persistence.lock();
+        #[cfg(test)]
+        let persistence_wait_ns = duration_ns(persistence_started.elapsed());
+        #[cfg(test)]
+        let state_started = Instant::now();
         let mut state = self.state.lock();
+        #[cfg(test)]
+        {
+            state.live_test_diagnostics.lease = LiveTestLeaseTiming {
+                persistence_wait_ns,
+                state_wait_ns: initial_state_wait_ns + duration_ns(state_started.elapsed()),
+                ..Default::default()
+            };
+        }
+        // State may have changed while waiting for persistence. Recheck authority,
+        // lifecycle, token, geometry and readiness before any allocator mutation.
+        let (range, _ready) = self.validate_live_extent_grant(&state, authority, after)?;
+        let start = range.start;
+        let previous_namespace = state.namespace_synced_file.map(|file| file.as_u64());
+        let (extent, mut profile) =
+            self.reserve_live_extent_grant(&mut state, range, after.is_some())?;
+        let last_file = extent.segment.file_index;
+        drop(state);
+        let mut timing = WriteTiming::new(None, false);
+        let mut witnesses = 0;
+        let namespace_sync = previous_namespace.is_none_or(|file| last_file > file);
+        let namespace_started = Instant::now();
+        let result = (|| {
+            if namespace_sync {
+                #[cfg(test)]
+                if let Some((entered, resume)) = self.before_persist.lock().take() {
+                    let _ = entered.send(());
+                    let _ = resume.recv();
+                }
+                // No bytes have been granted yet. Persist preallocation and the
+                // final inode size before making its directory witness durable.
+                self.wal.persist_frame_file(WalPosition::new(start, 1))?;
+                self.persist_namespace_witnesses(
+                    last_file,
+                    previous_namespace,
+                    &mut timing,
+                    &mut witnesses,
+                )?;
+            }
+            Ok::<(), io::Error>(())
+        })();
+        profile.namespace_sync_ns = if namespace_sync {
+            duration_ns(namespace_started.elapsed())
+        } else {
+            0
+        };
+        let mut state = self.state.lock();
+        state.stats.inventory_witnesses += witnesses;
+        result.map_err(|error| {
+            state.poison = Some(WriterPoison::Fatal);
+            StorageError::Unknown(WalError::Io(error))
+        })?;
+        if state.sealing || state.sealed {
+            return Err(StorageError::Invalid("live stream is sealing"));
+        }
+        if state.poison.is_some() || state.references.background_failed() {
+            return Err(StorageError::Poisoned);
+        }
+        if namespace_sync {
+            state.namespace_synced_file =
+                Some(crate::wal::position::WalFileId::from_u64(last_file));
+            state.stats.namespace_syncs += 1;
+        }
+        state.poison = None;
+        Ok((extent, profile))
+    }
+
+    /// Validate without changing the allocator; both grant paths use this check.
+    #[cfg(feature = "experimental-nvmeof")]
+    fn validate_live_extent_grant(
+        &self,
+        state: &State,
+        authority: RequestAuthority,
+        after: Option<[u8; 16]>,
+    ) -> Result<(std::ops::Range<u64>, bool), StorageError> {
+        let config = self.config();
+        if authority.epoch != config.inventory.epoch {
+            return Err(StorageError::Fenced);
+        }
         if state.poison.is_some() || state.references.background_failed() {
             return Err(StorageError::Poisoned);
         }
@@ -1706,13 +1944,43 @@ impl PartitionLog {
             return Err(StorageError::Invalid("invalid live extent geometry"));
         }
         let end = start.checked_add(len).ok_or(StorageError::Capacity)?;
+        let file = crate::wal::position::WalFileId::from_u64(start / config.wal_file_bytes);
+        let ready = state.namespace_synced_file.is_some_and(|last| last >= file)
+            && state
+                .writer
+                .as_ref()
+                .ok_or(StorageError::Sealed)?
+                .external_file_preparer()
+                .is_ready(file);
+        Ok((start..end, ready))
+    }
+
+    /// Reserve/install atomically under state. Any uncertain reservation leaves
+    /// fatal poison; successful transient poison never escapes this lock hold.
+    #[cfg(feature = "experimental-nvmeof")]
+    fn reserve_live_extent_grant(
+        &self,
+        state: &mut State,
+        range: std::ops::Range<u64>,
+        prelease: bool,
+    ) -> Result<
+        (
+            super::nvmeof::live_storage::LiveWriteExtent,
+            super::tcp::LeaseProfile,
+        ),
+        StorageError,
+    > {
+        use super::nvmeof::live_storage::{LiveAdoption, LiveWalSegment, LiveWriteExtent};
+        let config = self.config();
+        let start = range.start;
+        let end = range.end;
         state.poison = Some(WriterPoison::Fatal);
         let reserve_started = Instant::now();
         let allocation = state
             .writer
             .as_ref()
             .ok_or(StorageError::Sealed)?
-            .reserve_external(len as u32)
+            .reserve_external((end - start) as u32)
             .map_err(|error| StorageError::Unknown(WalError::Io(error)))?;
         let reserve_ns = duration_ns(reserve_started.elapsed());
         let metadata = allocation
@@ -1754,65 +2022,17 @@ impl PartitionLog {
             allocation,
             buffer: Vec::new(),
         };
-        if after.is_some() {
+        if prelease {
             state.next_live_extent = Some(open);
         } else {
             state.open_live_extent = Some(open);
-        }
-        let previous_namespace = state.namespace_synced_file.map(|file| file.as_u64());
-        let last_file = extent.segment.file_index;
-        // Allocation succeeded and its range is pinned. Do not expose transient
-        // poison to a syncer validating its earlier prefix before it takes the
-        // persistence mutex. No lease/retry can return before this mutex drops.
-        state.poison = None;
-        drop(state);
-        let mut timing = WriteTiming::new(None, false);
-        let mut witnesses = 0;
-        let namespace_sync = previous_namespace.is_none_or(|file| last_file > file);
-        let namespace_started = Instant::now();
-        let result = (|| {
-            if namespace_sync {
-                #[cfg(test)]
-                if let Some((entered, resume)) = self.before_persist.lock().take() {
-                    let _ = entered.send(());
-                    let _ = resume.recv();
-                }
-                // No bytes have been granted yet. Persist preallocation and the
-                // final inode size before making its directory witness durable.
-                self.wal.persist_frame_file(WalPosition::new(start, 1))?;
-                self.persist_namespace_witnesses(
-                    last_file,
-                    previous_namespace,
-                    &mut timing,
-                    &mut witnesses,
-                )?;
-            }
-            Ok::<(), io::Error>(())
-        })();
-        let namespace_sync_ns = duration_ns(namespace_started.elapsed());
-        let mut state = self.state.lock();
-        state.stats.inventory_witnesses += witnesses;
-        result.map_err(|error| {
-            state.poison = Some(WriterPoison::Fatal);
-            StorageError::Unknown(WalError::Io(error))
-        })?;
-        if state.sealing || state.sealed {
-            return Err(StorageError::Invalid("live stream is sealing"));
-        }
-        if state.poison.is_some() || state.references.background_failed() {
-            return Err(StorageError::Poisoned);
-        }
-        if namespace_sync {
-            state.namespace_synced_file =
-                Some(crate::wal::position::WalFileId::from_u64(last_file));
-            state.stats.namespace_syncs += 1;
         }
         state.poison = None;
         Ok((
             extent,
             super::tcp::LeaseProfile {
                 reserve_ns,
-                namespace_sync_ns,
+                namespace_sync_ns: 0,
                 publish_ns: 0,
             },
         ))
@@ -3216,6 +3436,14 @@ impl PartitionLog {
         self.state.lock().wal_root.as_ref().unwrap().synced_end
     }
 
+    /// Generation, scan origin and fixed cut for root/lease interleaving tests.
+    #[cfg(test)]
+    pub(crate) fn position_root_for_test(&self) -> (u64, u64, u64) {
+        let state = self.state.lock();
+        let root = state.wal_root.as_ref().unwrap();
+        (root.generation, root.scan_from, root.synced_end)
+    }
+
     /// The durability layer's frontier, once the node attached it.
     pub fn frontier(&self) -> Option<&Arc<super::durability::frontier::Frontier>> {
         self.frontier.get()
@@ -3294,7 +3522,7 @@ impl PartitionLog {
     }
 
     /// Persist the final names and inventory witnesses after their inodes have
-    /// been synced. Both leases and covering barriers use this same sequence.
+    /// been synced. Preparation, leases and covering barriers share this sequence.
     fn persist_namespace_witnesses(
         &self,
         last_file: u64,
@@ -4127,6 +4355,56 @@ impl PartitionLog {
         stats.registered_records = references.retained_descriptors;
         stats.reference_metadata_bytes = references.charged_metadata_bytes;
         stats
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn live_file_preparation_stats(&self) -> LiveFilePreparationStats {
+        self.state.lock().live_file_preparation
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    pub(crate) fn live_test_lease_timing(&self) -> LiveTestLeaseTiming {
+        self.state.lock().live_test_diagnostics.lease
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    pub(crate) fn record_test_lease_publication(
+        &self,
+        inventory_wait_ns: u64,
+        publication_call_ns: u64,
+        lookup_inventory_wait_ns: u64,
+    ) {
+        let mut state = self.state.lock();
+        state.live_test_diagnostics.lease.inventory_wait_ns = inventory_wait_ns;
+        state.live_test_diagnostics.lease.publication_call_ns = publication_call_ns;
+        state.live_test_diagnostics.lease.lookup_inventory_wait_ns = lookup_inventory_wait_ns;
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    pub(crate) fn record_test_file_export(
+        &self,
+        file_index: u64,
+        inventory_attempts: u64,
+        export_ns: u64,
+        success: bool,
+    ) {
+        let mut state = self.state.lock();
+        let diagnostics = &mut state.live_test_diagnostics;
+        if diagnostics.exports.len() < 64 {
+            diagnostics.exports.push(LiveTestExport {
+                file_index,
+                inventory_attempts,
+                export_ns,
+                success,
+            });
+        } else {
+            diagnostics.dropped_exports += 1;
+        }
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    pub(crate) fn live_test_diagnostics(&self) -> LiveTestDiagnostics {
+        self.state.lock().live_test_diagnostics.clone()
     }
 
     /// Metadata residency counters, not value-cache hits or physical read IOPS.

@@ -790,6 +790,364 @@ mod live_fencing {
         (config, node)
     }
 
+    fn wait_prepared(log: &crate::distributed::storage::PartitionLog, published: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = log.live_file_preparation_stats();
+            if stats.live_files_prepared >= 1 && stats.live_files_published >= published {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "preparation did not finish: {stats:?}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn prepared_permanent_export_is_reused_and_identity_checked() {
+        let temp = tempdir::TempDir::new("prepared-permanent").unwrap();
+        let (_, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        let Response::LiveLeased(first) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("lease")
+        };
+        let log = node.inventory.lock().active(1).unwrap();
+        wait_prepared(&log, 1);
+        let segment = log.live_segment(1).unwrap();
+        let (binding, created) = node
+            .inventory
+            .lock()
+            .publish_permanent_segment(&segment)
+            .unwrap();
+        assert!(!created);
+        let published = log.live_file_preparation_stats().live_files_published;
+        // A worker that loses the race to an existing export must not report
+        // that it published the binding before the grant.
+        node.control_context.publish_prepared_file(
+            &log,
+            1,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            log.live_file_preparation_stats().live_files_published,
+            published
+        );
+        let exports = node
+            .inventory
+            .lock()
+            .live_target
+            .as_ref()
+            .unwrap()
+            .stats()
+            .unwrap()
+            .namespaces_exposed;
+        let mut changed = segment.clone();
+        changed.inode += 1;
+        assert_eq!(
+            node.inventory
+                .lock()
+                .publish_permanent_segment(&changed)
+                .unwrap_err()
+                .to_string(),
+            "live segment identity or access changed"
+        );
+        let second = node
+            .control_context
+            .lease_live_published(1, DurabilityTier::Native, Some(first.extent.token))
+            .unwrap();
+        // Close both empty extents with their skip markers before crossing.
+        for extent in [&first.extent, &second.extent] {
+            let mut skip = [0; 4096];
+            skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&extent.segment.path)
+                .unwrap()
+                .write_all_at(&skip, extent.start % extent.segment.bytes)
+                .unwrap();
+            extent_exchange(
+                &node,
+                Request::AdoptLiveExtent {
+                    epoch: 1,
+                    token: extent.token,
+                    through: extent.start,
+                    close: true,
+                    lease_next: false,
+                },
+            );
+        }
+        let third = node
+            .control_context
+            .lease_live_published(1, DurabilityTier::Native, None)
+            .unwrap();
+        assert_eq!(third.extent.segment.file_index, 1);
+        assert_eq!(third.binding, binding);
+        assert_eq!(third.profile.namespace_sync_ns, 0);
+        // Call the same grant handler directly to exclude a later preparation
+        // from the export-count assertion.
+        assert_eq!(
+            node.inventory
+                .lock()
+                .live_target
+                .as_ref()
+                .unwrap()
+                .stats()
+                .unwrap()
+                .namespaces_exposed,
+            exports
+        );
+        drop(log);
+        shutdown(&node, 1);
+    }
+
+    #[test]
+    fn prepared_never_granted_exports_are_revoked_on_fence_and_seal() {
+        for seal in [false, true] {
+            let temp = tempdir::TempDir::new("prepared-retirement").unwrap();
+            let (_, node) = open_live_mode(
+                temp.path(),
+                DurabilityTier::Native,
+                LiveExportMode::PerOwner,
+            );
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 });
+            let log = node.inventory.lock().active(1).unwrap();
+            wait_prepared(&log, 1);
+            assert_eq!(
+                node.inventory
+                    .lock()
+                    .live_target
+                    .as_ref()
+                    .unwrap()
+                    .stats()
+                    .unwrap()
+                    .owned_namespace_count,
+                2
+            );
+            drop(log);
+            if seal {
+                shutdown(&node, 1);
+            } else {
+                fence(&node, 2).unwrap();
+            }
+            assert_eq!(node.control.preparer_count(), 0);
+            assert_eq!(
+                node.inventory
+                    .lock()
+                    .live_target
+                    .as_ref()
+                    .unwrap()
+                    .stats()
+                    .unwrap()
+                    .owned_namespace_count,
+                0
+            );
+        }
+    }
+
+    fn wait_inventory_retry(node: &StorageNode) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // Acquire observes the worker's positive failed-lock signal.
+            if node
+                .control
+                .shared
+                .preparers
+                .lock()
+                .iter()
+                .any(|slot| slot.waiting_for_inventory.load(Ordering::Acquire))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not reach inventory retry"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn final_target_shutdown_joins_a_preparer_parked_on_inventory() {
+        let temp = tempdir::TempDir::new("prepared-final-shutdown").unwrap();
+        let (_, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        let log = node.inventory.lock().active(1).unwrap();
+        log.lease_live_extent(RequestAuthority { epoch: 1 })
+            .unwrap();
+        let (entered, entry) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        *node.control.shared.before_target_shutdown.lock() = Some((entered, resume));
+        let owner = node.clone();
+        let shutdown = thread::spawn(move || owner.control.finish_live_target_shutdown());
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Teardown owns inventory before preparation begins, so the worker
+        // cannot expose any capability after teardown starts.
+        node.control.shared.trigger_file_preparation(&log);
+        wait_inventory_retry(&node);
+        release.send(()).unwrap();
+        let stats = shutdown.join().unwrap().unwrap();
+        assert_eq!(node.control.preparer_count(), 0);
+        assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
+        assert_eq!(stats.namespaces_exposed, 0);
+        assert_eq!(stats.owned_namespace_count, 0);
+    }
+
+    #[test]
+    fn final_target_shutdown_drains_preparers_after_a_join_error() {
+        let temp = tempdir::TempDir::new("prepared-shutdown-error").unwrap();
+        let (_, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        let log = node.inventory.lock().active(1).unwrap();
+        log.lease_live_extent(RequestAuthority { epoch: 1 })
+            .unwrap();
+        let (entered, entry) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        *node.control.shared.before_target_shutdown.lock() = Some((entered, resume));
+        let owner = node.clone();
+        let shutdown = thread::spawn(move || owner.control.finish_live_target_shutdown());
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        node.control.shared.trigger_file_preparation(&log);
+        wait_inventory_retry(&node);
+        let remaining_stopping = {
+            let mut slots = node.control.shared.preparers.lock();
+            let stopping = slots[0].stopping.clone();
+            let (trigger, _receiver) = mpsc::sync_channel(1);
+            // Inject a failed earlier worker. The real parked worker must still
+            // be stopped and joined before teardown returns that first error.
+            slots.insert(
+                0,
+                PreparerSlot {
+                    log: log.clone(),
+                    trigger,
+                    stopping: Arc::new(AtomicBool::new(false)),
+                    waiting_for_inventory: Arc::new(AtomicBool::new(false)),
+                    worker: thread::spawn(|| panic!("injected preparer failure")),
+                },
+            );
+            stopping
+        };
+        release.send(()).unwrap();
+        let error = shutdown.join().unwrap().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "log file preparer panicked; restart required"
+        );
+        assert!(remaining_stopping.load(Ordering::Acquire));
+        assert_eq!(node.control.preparer_count(), 0);
+        assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
+        assert_eq!(
+            node.inventory
+                .lock()
+                .live_target
+                .as_ref()
+                .unwrap()
+                .stats()
+                .unwrap()
+                .namespaces_exposed,
+            0
+        );
+    }
+
+    #[test]
+    fn preparer_retirement_joins_while_inventory_is_held() {
+        for seal in [false, true] {
+            let temp = tempdir::TempDir::new("prepared-try-lock").unwrap();
+            let (_, node) = open_live_mode(
+                temp.path(),
+                DurabilityTier::Native,
+                LiveExportMode::PerOwner,
+            );
+            let log = node.inventory.lock().active(1).unwrap();
+            log.lease_live_extent(RequestAuthority { epoch: 1 })
+                .unwrap();
+            let inventory = node.inventory.lock();
+            node.control.shared.trigger_file_preparation(&log);
+            wait_prepared(&log, 0);
+            wait_inventory_retry(&node);
+            // At this point the worker cannot acquire inventory. Retirement
+            // holds the same lock in the real fence and seal paths.
+            node.control.shared.retire_syncer(&log).unwrap();
+            assert_eq!(node.control.preparer_count(), 0);
+            assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
+            drop(inventory);
+            drop(log);
+            if seal {
+                shutdown(&node, 1);
+            } else {
+                fence(&node, 2).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn on_demand_preparer_does_not_publish_and_export_failure_poison_fences() {
+        for failure in [false, true] {
+            let temp = tempdir::TempDir::new("prepared-publication-error").unwrap();
+            let mode = if failure {
+                LiveExportMode::PerOwner
+            } else {
+                LiveExportMode::OnDemand
+            };
+            let (_, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
+            let log = node.inventory.lock().active(1).unwrap();
+            log.lease_live_extent(RequestAuthority { epoch: 1 })
+                .unwrap();
+            if failure {
+                // The registry's pending path must be a regular file.
+                fs::create_dir(temp.path().join("target/.live-target.pending")).unwrap();
+            }
+            node.control.shared.trigger_file_preparation(&log);
+            wait_prepared(&log, 0);
+            if failure {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !node.control_context.poison_pending.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "publication failure did not poison readers"
+                    );
+                    thread::yield_now();
+                }
+            }
+            node.control.shared.retire_syncer(&log).unwrap();
+            if failure {
+                assert!(node.control_context.poison_pending.load(Ordering::Acquire));
+                assert!(
+                    log.lease_live_extent(RequestAuthority { epoch: 1 })
+                        .is_err()
+                );
+            } else {
+                assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
+                assert_eq!(
+                    node.inventory
+                        .lock()
+                        .live_target
+                        .as_ref()
+                        .unwrap()
+                        .stats()
+                        .unwrap()
+                        .owned_namespace_count,
+                    0
+                );
+                drop(log);
+                shutdown(&node, 1);
+            }
+        }
+    }
+
     #[test]
     fn permanent_export_survives_read_pin_release_and_idle_reaping() {
         let temp = tempdir::TempDir::new("permanent-pin").unwrap();
@@ -881,6 +1239,16 @@ mod live_fencing {
             };
             let permanent = mode != LiveExportMode::OnDemand;
             let expected_namespaces = if permanent { 2 } else { 1 };
+            let pause =
+                if permanent {
+                    let log = node.inventory.lock().active(1).unwrap();
+                    wait_prepared(&log, 1);
+                    Some(log.pause_live(
+                        crate::distributed::storage::LivePausePoint::PrepareBeforePublish,
+                    ))
+                } else {
+                    None
+                };
             if permanent {
                 let mut current = leased.clone();
                 for _ in 0..2 {
@@ -952,8 +1320,45 @@ mod live_fencing {
                     .owned_namespace_count,
                 expected_namespaces
             );
+            if let Some((_, release)) = pause {
+                let _ = release.send(());
+            }
             shutdown(&node, 1);
         }
+    }
+
+    #[test]
+    fn prepared_namespace_is_not_advertised_as_a_granted_file() {
+        let temp = tempdir::TempDir::new("prepared-export-info").unwrap();
+        let (_, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 });
+        let log = node.inventory.lock().active(1).unwrap();
+        wait_prepared(&log, 1);
+        let Response::LiveExports(info) =
+            extent_exchange(&node, Request::OpenLiveExports { authority_epoch: 1 })
+        else {
+            panic!("exports")
+        };
+        // OpenLiveExports counts files up to the allocator position, not every
+        // namespace. File 1 exists on the target but has never had a lease.
+        assert_eq!(info.exported_files, 1);
+        assert_eq!(
+            node.inventory
+                .lock()
+                .live_target
+                .as_ref()
+                .unwrap()
+                .stats()
+                .unwrap()
+                .owned_namespace_count,
+            2
+        );
+        drop(log);
+        shutdown(&node, 1);
     }
 
     #[test]

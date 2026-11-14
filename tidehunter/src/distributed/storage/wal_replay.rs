@@ -771,6 +771,10 @@ impl PartitionLog {
                 poison: None,
                 sealed: true,
                 stats: PartitionStats::default(),
+                #[cfg(feature = "experimental-nvmeof")]
+                live_file_preparation: LiveFilePreparationStats::default(),
+                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                live_test_diagnostics: LiveTestDiagnostics::default(),
             }),
             references,
             durable_frontier: AtomicU64::new(physical_end),

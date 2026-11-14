@@ -30,7 +30,8 @@ def _specs():
         sui_fixture=dict(sha256=FIXTURE_SHA256), hard_deadline_seconds=FLEET_SECONDS,
         export_reserve_seconds=EXPORT_RESERVE_SECONDS)}
     for name, selection in (('sui_nvmeof_with_kv', 'nvmeof_first_put'),
-                            ('sui_nvmeof_with_contracts', 'nvmeof_contracts')):
+                            ('sui_nvmeof_with_contracts', 'nvmeof_contracts'),
+                            ('sui_nvmeof_with_contracts_crossing', 'nvmeof_contracts_crossing')):
         combined = copy.deepcopy(REVIEWED_SPECS[selection])
         combined.update({key: copy.deepcopy(value) for key, value in specs['sui_nvmeof_compact'].items()
                          if key.startswith('sui_')})

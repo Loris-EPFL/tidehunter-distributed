@@ -8,6 +8,17 @@ import nvmeof_path as analysis
 
 
 class NvmeofPathTests(unittest.TestCase):
+    def test_crossing_effective_geometry_and_puts(self):
+        self.add('tidehunter_nvme_rdma', group='G22W',
+                 selection='nvmeof_contracts_crossing', owner_wal_file_bytes=268435456)
+        self.generate()
+        with (self.output / 'settings.csv').open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row['owner WAL file bytes'], '268435456')
+        self.assertIn('owner_wal_file_bytes=268435456', row['differs from engine default'])
+        with (self.output / 'puts.csv').open() as stream:
+            self.assertEqual(next(csv.DictReader(stream))['group'], 'G22W')
+
     def test_contract_classes_and_separate_markdown_tables(self):
         for tier, expected in (('value_wal_barrier', 'S'), ('page_cache', 'P')):
             self.add(group='G21N', native_durability=tier, selection='nvmeof_contracts')

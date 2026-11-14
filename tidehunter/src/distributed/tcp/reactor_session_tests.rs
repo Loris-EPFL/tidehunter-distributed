@@ -423,3 +423,57 @@ fn position_and_control_admission_keep_the_existing_session_bound() {
     }
     assert!(bytes <= SESSION_BYTES);
 }
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn lease_triggers_file_preparation_and_fence_joins_its_worker() {
+    use crate::distributed::durability::DurabilityTier;
+    use crate::distributed::storage::LivePausePoint;
+    use crate::distributed::tcp::leased_tests::Fixture;
+    for paused in [false, true] {
+        let fixture = Fixture::new(DurabilityTier::Native, 16 * 1024);
+        let mut client = fixture.writer_without_ahead();
+        let log = fixture.node.log_for_test(1);
+        let pause = paused.then(|| log.pause_live(LivePausePoint::PrepareBeforePublish));
+        assert!(matches!(
+            client
+                .request(Request::LeaseLiveExtent { epoch: 1 })
+                .unwrap(),
+            Response::LiveLeased(_)
+        ));
+        if let Some((entered, _)) = &pause {
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while log.live_file_preparation_stats().live_files_prepared == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "grant did not trigger preparation"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
+            assert_eq!(
+                log.live_file_preparation_stats().live_file_prepare_failures,
+                0
+            );
+        }
+        assert_eq!(fixture.node.control.preparer_count(), 1);
+        drop(log); // Fence recovery requires no test-owned log handles.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let fence = thread::spawn(move || tx.send(client.fence_to(2)).unwrap());
+        if let Some((_, release)) = pause {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fixture.node.control.preparer_count() != 0 {
+                assert!(Instant::now() < deadline, "fence did not retire preparer");
+                thread::yield_now();
+            }
+            assert!(rx.try_recv().is_err(), "fence must join the paused worker");
+            release.send(()).unwrap();
+        }
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        fence.join().unwrap();
+        result.unwrap().unwrap();
+        assert_eq!(fixture.node.control.preparer_count(), 0);
+    }
+}

@@ -31,6 +31,8 @@ use crate::wal::mapper::WalMaps;
 use crate::wal_allocator::WalAllocator;
 use files::WalFiles;
 use layout::WalLayout;
+#[cfg(feature = "experimental-nvmeof")]
+pub(crate) use mapper::ExternalFilePreparer;
 use mapper::{INITIAL_MAPS_BUFFER, WalMapper};
 use position::{LastProcessed, MapId, WalPosition};
 use syncer::WalSyncer;
@@ -110,6 +112,11 @@ pub(crate) struct ExternalWalAllocation {
 
 impl WalWriter {
     #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn external_file_preparer(&self) -> ExternalFilePreparer {
+        self.wal_tracker.external_file_preparer()
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn reserve_external(&self, frame_len: u32) -> io::Result<ExternalWalAllocation> {
         let len = u64::from(frame_len);
         if len == 0
@@ -130,13 +137,11 @@ impl WalWriter {
             self.write_skip_marker(skip);
         }
         let position = allocation.allocated_position();
-        // Wait until the mapper has registered the final backing inode.
-        let _ = self.get_writeable_map(position);
-        let files = self.wal.files.load_full();
         let file_id = self.wal.layout.locate_file(position);
         // The mapper owns all file growth. Preallocate there before enqueueing
         // the tracker hold, so no stale fragment extension can shrink the file.
         self.wal_tracker.ensure_external_file(file_id)?;
+        let files = self.wal.files.load_full();
         let file = files
             .get_checked(file_id)
             .cloned()
@@ -1317,6 +1322,220 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use std::collections::HashSet;
 
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[test]
+    fn external_reservation_reads_without_map_and_resumes_native_writes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir::TempDir::new("external-no-map").unwrap();
+        let layout = WalLayout {
+            frag_size: 4096,
+            max_maps: 4,
+            direct_io: false,
+            wal_file_size: 8 * 4096,
+            kind: WalKind::Replay,
+        };
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
+        let preparer = writer.external_file_preparer();
+        preparer.ensure(WalFileId(0)).unwrap();
+        let (entered, resume) = preparer.pause_map(MapId(3));
+        for _ in 0..2 {
+            writer
+                .reserve_external(4096)
+                .unwrap()
+                .guard
+                .release()
+                .unwrap();
+        }
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let allocations: Vec<_> = (0..2)
+                    .map(|_| writer.reserve_external(4096).unwrap())
+                    .collect();
+                tx.send(allocations).unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            if result.is_err() {
+                resume.send(()).unwrap();
+                panic!("covered reservation waited for map creation");
+            }
+            let allocations = result.unwrap();
+            let allocation = allocations.last().unwrap();
+            assert_eq!(allocation.position.offset(), 3 * 4096);
+            assert!(wal.get_map(MapId(3)).is_none());
+            assert_eq!(
+                allocation.path,
+                layout.wal_file_name(dir.path(), WalFileId(0))
+            );
+            let metadata = std::fs::metadata(&allocation.path).unwrap();
+            assert_eq!(allocation.file.metadata().unwrap().ino(), metadata.ino());
+            assert_eq!(metadata.len(), layout.wal_file_size);
+            let data = PreparedWalWrite::new(&vec![0x5a; 100]);
+            allocation
+                .file
+                .write_all_at(data.frame.as_ref(), allocation.position.offset())
+                .unwrap();
+            let position = WalPosition::new(allocation.position.offset(), data.len() as u32);
+            assert_eq!(wal.read(position).unwrap().0, ReadType::Syscall);
+            assert_eq!(
+                wal.read(position).unwrap().1.unwrap().as_ref(),
+                &[0x5a; 100]
+            );
+            let (done, completion) = std::sync::mpsc::sync_channel(1);
+            let uncovered = preparer.clone();
+            scope.spawn(move || done.send(uncovered.ensure(WalFileId(1))).unwrap());
+            assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+            resume.send(()).unwrap();
+            completion
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            writer.get_writeable_map(position.offset());
+            assert_eq!(wal.read(position).unwrap().0, ReadType::Mapped);
+            assert_eq!(
+                wal.read(position).unwrap().1.unwrap().as_ref(),
+                &[0x5a; 100]
+            );
+            for allocation in allocations {
+                allocation.guard.release().unwrap();
+            }
+        });
+        let native = writer.write(&PreparedWalWrite::new(&vec![7; 100])).unwrap();
+        assert_eq!(native.wal_position().offset(), 4 * 4096);
+        drop(native);
+        let latch = writer.latch();
+        assert!(latch.position().as_u64() > 4 * 4096);
+        writer.release_latch(latch);
+        drop(preparer);
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[test]
+    fn external_unmapped_reservation_survives_watermark_at_its_file_start() {
+        let dir = tempdir::TempDir::new("external-watermark").unwrap();
+        let layout = WalLayout {
+            frag_size: 4096,
+            max_maps: 3,
+            direct_io: false,
+            wal_file_size: 8 * 4096,
+            kind: WalKind::Replay,
+        };
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
+        let preparer = writer.external_file_preparer();
+        preparer.ensure(WalFileId(0)).unwrap();
+        preparer.ensure(WalFileId(1)).unwrap();
+        let allocations: Vec<_> = (0..9)
+            .map(|_| writer.reserve_external(4096).unwrap())
+            .collect();
+        let pending = allocations.last().unwrap();
+        assert_eq!(pending.position.offset(), layout.wal_file_size);
+        assert!(wal.get_map(MapId(8)).is_none());
+        writer
+            .wal_tracker
+            .min_wal_position_updated(layout.wal_file_size);
+        assert!(wal.files.load().get_checked(WalFileId(1)).is_some());
+        assert!(pending.path.exists());
+        assert_eq!(writer.last_processed().as_u64(), 0);
+        for allocation in allocations {
+            allocation.guard.release().unwrap();
+        }
+        let latch = writer.latch();
+        writer.release_latch(latch);
+        writer.get_writeable_map(9 * 4096);
+        writer
+            .wal_tracker
+            .min_wal_position_updated(layout.wal_file_size);
+        assert!(wal.files.load().get_checked(WalFileId(0)).is_none());
+        assert_eq!(
+            preparer.ensure(WalFileId(0)).unwrap_err().to_string(),
+            "WAL file missing"
+        );
+        drop(preparer);
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[test]
+    fn external_preparer_creates_only_the_next_file_and_preserves_writes() {
+        for external in [false, true] {
+            let dir = tempdir::TempDir::new("wal-external-preparer").unwrap();
+            let layout = WalLayout {
+                frag_size: 4096,
+                max_maps: 4,
+                direct_io: false,
+                wal_file_size: 8 * 4096,
+                kind: WalKind::Replay,
+            };
+            let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+            let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
+            // FIFO barrier also waits for initial lookahead map creation.
+            let preparer = writer.external_file_preparer();
+            preparer.ensure(WalFileId(0)).unwrap();
+            let current = wal.files.load().current_file_id();
+            assert!(
+                !layout
+                    .wal_file_name(dir.path(), WalFileId(current.0 + 1))
+                    .exists()
+            );
+            let error = preparer.ensure(WalFileId(current.0 + 2)).unwrap_err();
+            assert_eq!(error.to_string(), "WAL file missing");
+            let next = WalFileId(current.0 + 1);
+            preparer.ensure(next).unwrap();
+            assert_eq!(
+                std::fs::metadata(layout.wal_file_name(dir.path(), next))
+                    .unwrap()
+                    .len(),
+                layout.wal_file_size
+            );
+            // An older request must not invalidate the prepared highwater.
+            preparer.ensure(current).unwrap();
+            if external {
+                for _ in 0..8 {
+                    writer
+                        .reserve_external(4096)
+                        .unwrap()
+                        .guard
+                        .release()
+                        .unwrap();
+                }
+                let allocation = writer.reserve_external(4096).unwrap();
+                assert_eq!(allocation.position.offset(), layout.wal_file_size);
+                assert_eq!(
+                    allocation.file.metadata().unwrap().len(),
+                    layout.wal_file_size
+                );
+                let bytes = [0x5a; 4096];
+                allocation.file.write_all_at(&bytes, 0).unwrap();
+                let mut actual = [0; 4096];
+                allocation.file.read_exact_at(&mut actual, 0).unwrap();
+                assert_eq!(actual, bytes);
+                allocation.guard.release().unwrap();
+            } else {
+                let value = vec![0x5a; 4080];
+                let mut last = None;
+                for _ in 0..9 {
+                    last = Some(
+                        writer
+                            .write(&PreparedWalWrite::new(&value))
+                            .unwrap()
+                            .into_wal_position(),
+                    );
+                }
+                let last = last.unwrap();
+                assert_eq!(last.offset(), layout.wal_file_size);
+                assert_eq!(wal.read(last).unwrap().1.unwrap().as_ref(), value);
+                assert_eq!(
+                    std::fs::metadata(layout.wal_file_name(dir.path(), next))
+                        .unwrap()
+                        .len(),
+                    layout.wal_file_size
+                );
+            }
+            drop(preparer); // Writer shutdown joins the mapper.
+        }
+    }
     #[test]
     fn test_wal() {
         let dir = tempdir::TempDir::new("test-wal").unwrap();

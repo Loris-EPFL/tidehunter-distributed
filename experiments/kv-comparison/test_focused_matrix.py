@@ -12,6 +12,22 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_crossing_preserves_contracts_and_exact_admission(self):
+        old = campaign.make_focused_matrix("nvmeof_contracts")
+        jobs = campaign.make_focused_matrix("nvmeof_contracts_crossing")
+        self.assertEqual(jobs[:34], old)
+        self.assertEqual(len(jobs), 35)
+        self.assertEqual(Counter(j["group"] for j in jobs), {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 1})
+        job = jobs[-1]
+        self.assertEqual(job["owner_wal_file_bytes"], 268435456)
+        self.assertEqual(job["measurement_operations"], 16384)
+        self.assertEqual(job["diagnostics"], {"write_timeline_limit": 16384})
+        self.assertTrue(job["owner_history_diagnostics"])
+        campaign.validate_focused_job(job)
+        for value in (True, 0, 268435457, 134217728, 10737418241):
+            with self.assertRaises(ValueError):
+                campaign.validate_focused_job(dict(job, owner_wal_file_bytes=value))
+
     def test_nvmeof_contracts_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_contracts")
         groups = {"G21W": 16, "G21R": 8, "G21N": 10}
@@ -154,7 +170,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}

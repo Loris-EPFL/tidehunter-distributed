@@ -208,7 +208,7 @@ class OwnerCountTests(unittest.TestCase):
                         host["address"] + ":9400" for host in config["fleet"]["nodes"][:count]])
                     prepared = directory / "prepared"
                     prepared.mkdir()
-                    (prepared / "remote.json").write_text(json.dumps({"tls": {}}))
+                    (prepared / "remote.json").write_text(json.dumps({"tls": {}, "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}))
                     (prepared / "external_owner_read_config.json").write_text("[]")
                     for index in range(count):
                         node = prepared / f"node-{index}"
@@ -224,7 +224,7 @@ class OwnerCountTests(unittest.TestCase):
                     "path": str(directory / "database"), "evidence": str(directory / "read-evidence"),
                     "owners": count, "key_count": 1048576, "max_batches_per_partition": 16384,
                     "coordinator_read_cache_bytes": 0, "owner_read_resident_first": False,
-                    "external_remote_config": {"tls": {}}, "durability_tier": "native",
+                    "external_remote_config": {"tls": {}, "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}, "durability_tier": "native",
                     "external_owner_durability_receipts": [
                         str((directory / "owner-durability" / f"node-{i}.durability.json").absolute())
                         for i in range(count)], "external_owner_read_config": []})
