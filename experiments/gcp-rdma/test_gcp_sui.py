@@ -169,9 +169,14 @@ class SuiAdmissionTests(unittest.TestCase):
                 'source_range': prior['verified_source_range'], 'topology': 'loopback', 'audit': audit,
                 'fixture_files': expected, 'native': {'completed_checkpoint_digest': gcp_sui.CHECKPOINT},
                 'remote': {'completed_checkpoint_digest': gcp_sui.CHECKPOINT}}
+            result.update(native_retried=True, native_attempts=[
+                {'attempt': 1, 'outcome': 'rpc_index_catchup_timeout'}, {'attempt': 2, 'outcome': 'ok'}])
             put(verification / 'experiment/results.json', result)
             put(verification / 'experiment/audit.json', audit)
             put(verification / 'experiment/native-schema/db/shape.yaml', 'schema')
+            for name in ('native.log', 'native-samples.jsonl', 'native-foreground.prom', 'native-final.prom',
+                         'native-schema/db/shape.yaml', 'catchup.json'):
+                put(verification / ('experiment/native-attempt1-' + name), 'retained failed attempt')
             with tarfile.open(verification / 'evidence.tar.gz', 'w:gz') as tar:
                 tar.add(verification / 'experiment', arcname='experiment')
             put(verification / 'receipt.json', {'complete': True, 'evidence_sha256': gcp_sui.sha(verification / 'evidence.tar.gz'),

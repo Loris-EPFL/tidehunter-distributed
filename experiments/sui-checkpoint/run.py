@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import shutil
 import sys
 sys.dont_write_bytecode = True
 import tarfile
@@ -185,6 +186,19 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline):
     start = time.monotonic()
     child = owned.start(mode, [binary, '--config-path', root / f'{mode}.yaml',
                               '--run-with-range-checkpoint', tip+1], extra)
+    try:
+        result = replay_started(owned, root, mode, tip, digest, extra, shards, deadline,
+                                config, start, child)
+    finally:
+        # stop_group also reaps a child that exited on its own, including descendants.
+        owned.stop(child)
+    if child.returncode not in (0, -signal.SIGTERM):
+        raise RuntimeError(f'{mode}: shutdown required forced kill or failed')
+    result['exit_code'] = child.returncode
+    return result
+
+
+def replay_started(owned, root, mode, tip, digest, extra, shards, deadline, config, start, child):
     progress, samples, final_count = [], [], 0
     metrics = ''
     with (owned.root / f'{mode}-samples.jsonl').open('x') as stream:
@@ -233,10 +247,7 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline):
     namespaces = live_metric_namespaces(schema, int(certified['epoch']))
     metrics, freshness = wait_for_final_metrics(child, shards, config['metrics-address'], namespaces,
         remote=mode == 'remote', end=start + deadline, destination=owned.root / f'{mode}-final.prom')
-    # SIGTERM only after committed indexer frontiers; audit subsequently reopens all stores.
-    owned.stop(child)
-    if child.returncode not in (0, -signal.SIGTERM):
-        raise RuntimeError(f'{mode}: shutdown required forced kill or failed')
+    # The caller stops the child only after committed frontiers and the final cut.
     return dict(elapsed_seconds_including_startup=elapsed, completed_checkpoint_digest=digest,
         completed_checkpoint_epoch=int(certified['epoch']),
         checkpoint_limit=tip, completed_window=checkpoint.completion_window(progress), progress=progress,
@@ -244,6 +255,62 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline):
         rpc_index_catchup=catchup, final_metrics_freshness=freshness, exit_code=child.returncode,
         peak_sampled_rss_bytes=max(sum(p.get('VmRSS', 0) for p in [r['node'], *r['shards']]) for r in samples),
         process_io_final=samples[-1], host_before=samples[0]['host'], host_after=samples[-1]['host'])
+
+
+NATIVE_REPLAY_ATTEMPTS = 3
+
+
+def replay_native(owned, binary, root, tip, digest, extra, deadline, result):
+    """Retry only typed native index catch-up failures, never the remote replay."""
+    attempts = result['native_attempts'] = []
+    result['native_retried'] = False
+    for number in range(1, NATIVE_REPLAY_ATTEMPTS + 1):
+        started, clock = time.time(), time.monotonic()
+        before = set(owned.root.iterdir())
+        error = None
+        try:
+            selected = replay(owned, binary, root, 'native', tip, digest, extra, [], deadline)
+        except BaseException as caught:
+            error = caught
+        retryable = isinstance(error, checkpoint.RpcIndexCatchupError)
+        finished, elapsed = time.time(), time.monotonic() - clock
+        log = owned.root / 'native.log'
+        missing_object = log.exists() and 'unable to load object' in log.read_text()
+        created = sorted(set(owned.root.iterdir()) - before)
+        evidence = []
+        if retryable:
+            # Retain all output from this attempt, not a fixed list of known suffixes.
+            prefix = f'native-attempt{number}-'
+            for path in created:
+                destination = path.with_name(prefix + path.name)
+                path.rename(destination)
+                evidence.extend(str(p.relative_to(owned.root)) for p in
+                    ([destination] if destination.is_file() else sorted(destination.rglob('*'))) if p.is_file())
+            catchup = owned.root / f'{prefix}catchup.json'
+            build.save(catchup, dict(exception=str(error), observations=error.observations,
+                                    metrics=error.metrics))
+            evidence.append(catchup.name)
+        else:
+            evidence = [str(p.relative_to(owned.root)) for path in created for p in
+                ([path] if path.is_file() else sorted(path.rglob('*'))) if p.is_file()]
+        outcome = 'rpc_index_catchup_timeout' if retryable else ('error' if error is not None else 'ok')
+        attempts.append(dict(attempt=number, outcome=outcome,
+            started_unix=started, finished_unix=finished, elapsed_seconds=elapsed,
+            exception=str(error) if error else None, unable_to_load_object=missing_object,
+            evidence_files=evidence))
+        if error is None:
+            return selected
+        if not retryable:
+            raise error
+        # Failed databases can be very large. Preserve evidence first, then discard state.
+        if (root / 'native').exists():
+            shutil.rmtree(root / 'native')
+        checkpoint.wait_listen_ports_free(checkpoint.configuration(root, 'native'))
+        if number == NATIVE_REPLAY_ATTEMPTS:
+            error.add_note('Native replay exhausted attempts: ' + ', '.join(
+                f"native-attempt{row['attempt']}" for row in attempts))
+            raise error
+        result['native_retried'] = True
 
 
 def command_json(command, destination, env, deadline=600):
@@ -679,7 +746,8 @@ def main():
         if result['source_range'] != prior['verified_source_range']:
             raise ValueError('complete source digest range differs')
         native_extra=dict(SUI_SHARDED_WAL_ROOT=str(native_root), SUI_SHARDED_WAL_SCHEMA_OUTPUT=str(output/'native-schema'))
-        result['native']=replay(owned,bins/'sui-node-native',root,'native',tip,expected_digest,native_extra,[],args.deadline)
+        result['native']=replay_native(owned,bins/'sui-node-native',root,tip,expected_digest,
+            native_extra,args.deadline,result)
         schema=deployment.schemas(output/'native-schema', 'native')
         shards=[]
         if args.external_config:

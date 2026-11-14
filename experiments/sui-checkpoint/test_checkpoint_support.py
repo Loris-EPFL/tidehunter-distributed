@@ -163,14 +163,37 @@ class ProgressContract(unittest.TestCase):
             self.assertEqual(len(evidence["observations"]), 2)
             self.assertEqual(evidence["status"], "all-ten-committed-at-frozen-tip")
             with patch.object(support.urllib.request, "urlopen", side_effect=lambda *a, **k: io.BytesIO(index_metrics(3).encode())) as opened:
-                with self.assertRaisesRegex(RuntimeError, "fixed sample budget"):
+                with self.assertRaisesRegex(RuntimeError, "fixed sample budget") as raised:
                     support.wait_for_rpc_indexes(child, "source:1", 4, index_metrics(3))
-                self.assertEqual(opened.call_count, 480)
-        with self.assertRaisesRegex(RuntimeError, "did not commit"):
+                self.assertEqual(opened.call_count, support.RPC_INDEX_SAMPLE_BUDGET)
+                self.assertIs(type(raised.exception), RuntimeError)
+        with self.assertRaisesRegex(support.RpcIndexCatchupError, "did not commit") as raised:
             support.wait_for_rpc_indexes(SimpleNamespace(poll=lambda: 1), "source:1", 4, partial)
-        with patch.object(support.time, "monotonic", side_effect=[0, 120, 120]):
-            with self.assertRaisesRegex(RuntimeError, "did not commit"):
+        self.assertEqual(raised.exception.metrics, partial)
+        self.assertEqual(raised.exception.observations[-1]['frontiers'],
+                         support.rpc_index_frontiers(partial, 4))
+        # The total limit fails even for a pipeline set that is still advancing.
+        with patch.object(support.time, "monotonic", side_effect=[0, support.RPC_INDEX_TOTAL_SECONDS, 0]):
+            with self.assertRaisesRegex(support.RpcIndexCatchupError, "did not commit") as raised:
                 support.wait_for_rpc_indexes(child, "source:1", 4, partial)
+        self.assertEqual(raised.exception.metrics, partial)
+        self.assertEqual(len(raised.exception.observations), 1)
+        # Slow but advancing commits are waited for beyond the old 120 s limit, then complete.
+        steps = iter(range(100, 10_000, 100))
+        with patch.object(support.time, "sleep"), patch.object(support.time, "monotonic", side_effect=lambda: next(steps)), \
+                patch.object(support.urllib.request, "urlopen", side_effect=[io.BytesIO(index_metrics(n).encode()) for n in (2, 3, 4)]):
+            _, evidence = support.wait_for_rpc_indexes(child, "source:1", 4, index_metrics(1))
+        self.assertEqual(evidence["status"], "all-ten-committed-at-frozen-tip")
+        self.assertGreater(evidence["seconds"], 120)
+        # A stall after progress fails at the stall limit, long before the total limit.
+        steps = iter(range(0, 10_000, 50))
+        with patch.object(support.time, "sleep"), patch.object(support.time, "monotonic", side_effect=lambda: next(steps)), \
+                patch.object(support.urllib.request, "urlopen", side_effect=lambda *a, **k: io.BytesIO(index_metrics(2).encode())):
+            with self.assertRaisesRegex(support.RpcIndexCatchupError, "did not commit") as raised:
+                support.wait_for_rpc_indexes(child, "source:1", 4, index_metrics(1))
+        self.assertEqual(raised.exception.metrics, index_metrics(2))
+        self.assertGreater(len(raised.exception.observations), 1)
+        self.assertLess(next(steps), support.RPC_INDEX_TOTAL_SECONDS)
 
     def test_replay_phase_bounds_are_not_completion_latency(self):
         text = "\n".join(("2026-10-18T00:00:00+00:00 INFO startup",

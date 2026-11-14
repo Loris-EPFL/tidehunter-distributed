@@ -342,6 +342,21 @@ the frozen producer.
 The native control runs first because it exports the authoritative complete
 namespace/key-shape inventory. This fixed order is recorded, not randomized.
 
+Native replay permits at most three fresh attempts, only for the typed RPC-index
+catch-up failure (120 seconds without committed-frontier progress, 1,200 seconds
+total, or node exit during catch-up). The all-ten-at-tip gate and full audit stay
+strict. Any other error fails immediately; remote replay is never retried.
+Before a native retry the child is stopped, all attempt output is renamed with
+`native-attempt<N>-`, and observations plus the last metrics are saved in
+`native-attempt<N>-catchup.json`. The failed native database is deleted and listen
+ports must be free. The producer, inputs and canonical paths do not change.
+`native_attempts` and `native_retried` disclose the selection in results and
+analysis. Only the successful attempt supplies the canonical schema, final
+metrics and foreground timing. First-attempt failures are reported separately;
+a retried timing is not a first-attempt sample. This is an operational mitigation,
+not a proved fix for the missing-object failure inside Sui. Remote replay can
+hit the same stall and will fail without retry; existing fleet deadlines remain.
+
 For every native-exported database the runner allocates a fresh UUID and starts
 five independent physical shard processes, each with its own WAL root, bounded
 read workers and port. TLS modes also assign each node its own authenticated

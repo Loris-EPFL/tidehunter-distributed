@@ -523,6 +523,8 @@ def summarize_verified(verified):
         read_profile_limit=result.get('read_profile_limit', 0),
         write_profile_limit=result.get('write_profile_limit', 0),modes={},table_counts={})
     summary['native_write_profile_limit'] = result.get('native_write_profile_limit', 0)
+    summary['native_retried'] = result.get('native_retried', False)
+    summary['native_attempts'] = result.get('native_attempts', [])
     for mode in ('native','remote'):
         replay=result[mode]
         foreground=foreground_by_mode[mode]
@@ -548,6 +550,7 @@ def summarize_verified(verified):
     for namespace, comparison in audit['databases'].items():
         summary['table_counts'][namespace]={name:entry['records'] for name,entry in comparison['native']['tables'].items()}
     summary['limits']=[
+        'First-attempt native failures are reported separately; timing of a retried attempt is not a first-attempt sample.',
         'Foreground watermark sampling is 250ms resolution, not individual checkpoint latency.',
         'Execution-start log spacing is scheduling/start timing, never completion/service p99.',
         'execution_cache_db_read_calls counts AuthorityStore fallback API calls; execution_cache_requests counts keys, neither means transport RPCs.',
@@ -1115,6 +1118,7 @@ def compare_campaign(root):
                    native_seconds=summary['modes']['native']['foreground_seconds'],
                    remote_seconds=summary['modes']['remote']['foreground_seconds'],
                    remote_over_native=summary['remote_over_native'],
+                   native_retried=summary['native_retried'], native_attempts=summary['native_attempts'],
                    replay_evidence_sha256=identity['replay_evidence_sha256'],
                    resources_sha256=identity['resources_sha256'], efa_activity=identity['efa'],
                    node_archives=identity['node_archives'], source_range=summary['source_range'],
@@ -1197,6 +1201,8 @@ def write_campaign_report(root, report):
     for cell in report['cells']:
         identity = binding | {k: cell[k] for k in ('cell_id', 'transport', 'repetition', 'ordinal',
                               'population', 'read_profile_limit', 'write_profile_limit', 'native_write_profile_limit', 'replay_evidence_sha256')}
+        identity['native_retried'] = cell.get('native_retried', False)
+        identity['native_attempts'] = json.dumps(cell.get('native_attempts', []), sort_keys=True)
         identity['coordinator_cache_bytes'] = cell['cache']['coordinator_bytes']
         if 'shard_bytes' in cell['cache']:
             identity['shard_cache_bytes'] = cell['cache']['shard_bytes']

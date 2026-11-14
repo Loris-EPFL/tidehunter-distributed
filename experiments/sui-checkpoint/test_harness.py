@@ -959,6 +959,187 @@ class CheckpointSourceBoundaries(unittest.TestCase):
             self.assertFalse((root / 'binaries').exists())
 
 
+class NativeReplayRetry(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.output = self.root / 'experiment'
+        self.output.mkdir()
+        (self.root / 'native.yaml').write_text('metrics-address: unused\n')
+        self.extra = dict(SUI_SHARDED_WAL_ROOT=str(self.root / 'native' / 'db'),
+                          SUI_SHARDED_WAL_SCHEMA_OUTPUT=str(self.output / 'native-schema'))
+        self.producer = object()
+        self.children, self.started, self.stopped = [self.producer], [], []
+        self.owner = SimpleNamespace(root=self.output, start=self.start, stop=self.stop)
+        self.result = {}
+        self.calls = []
+        self.ports = patch.object(run.checkpoint, 'wait_listen_ports_free', side_effect=self.ports_free)
+        self.port_check = self.ports.start()
+        self.addCleanup(self.ports.stop)
+
+    def ports_free(self, config):
+        self.assertEqual(self.children, [self.producer])
+
+    def start(self, mode, command, extra):
+        self.assertFalse((self.root / 'native').exists())
+        self.assertFalse((self.output / 'native-schema').exists())
+        self.started.append((mode, command, extra))
+        (self.output / 'native.log').write_text('unable to load object' if len(self.started) == 1 else 'started')
+        child = SimpleNamespace(returncode=None)
+        self.children.append(child)
+        return child
+
+    def stop(self, child):
+        self.children.remove(child)
+        child.returncode = 0
+        self.stopped.append(child)
+
+    def attempt(self, *args):
+        number = len(self.started)
+        self.calls.append(args)
+        db = self.root / 'native' / 'db'
+        db.mkdir(parents=True)
+        (db / f'attempt{number}').write_text('bulk database')
+        schema = self.output / 'native-schema' / 'db'
+        schema.mkdir(parents=True)
+        build.save(schema / 'manifest.json', dict(namespace='db', backend='native'))
+        build.save(schema / 'shape.json', dict(attempt=number))
+        (schema / 'shape.yaml').write_text(f'shape for attempt {number}')
+        for name in ('native-samples.jsonl', 'native-foreground.prom', 'native-final.prom'):
+            (self.output / name).write_text(str(number))
+        outcome = self.outcomes[number - 1]
+        if outcome is not None:
+            raise outcome
+        return dict(elapsed_seconds_including_startup=1, exit_code=None)
+
+    def catchup(self):
+        return run.checkpoint.RpcIndexCatchupError([dict(seconds=120, frontiers={'balance': 0})], 'last scrape')
+
+    def replay(self, outcomes):
+        self.outcomes = outcomes
+        with patch.object(run, 'replay_started', side_effect=self.attempt):
+            return run.replay_native(self.owner, 'native-binary', self.root, 1, 'digest',
+                                     self.extra, 900, self.result)
+
+    def assert_retained(self, number):
+        prefix = f'native-attempt{number}-'
+        for name in ('native.log', 'native-samples.jsonl', 'native-foreground.prom', 'native-final.prom',
+                     'native-schema/db/manifest.json', 'native-schema/db/shape.json',
+                     'native-schema/db/shape.yaml', 'catchup.json'):
+            self.assertTrue((self.output / (prefix + name)).is_file(), name)
+            self.assertIn(prefix + name, self.result['native_attempts'][number - 1]['evidence_files'])
+        caught = run.read_json(self.output / (prefix + 'catchup.json'))
+        self.assertEqual(caught['observations'], [dict(seconds=120, frontiers={'balance': 0})])
+        self.assertEqual(caught['metrics'], 'last scrape')
+
+    def test_fresh_second_attempt_selects_only_successful_schema(self):
+        selected = self.replay([self.catchup(), None])
+        self.result['native'] = selected
+        self.assertEqual(selected['exit_code'], 0)
+        self.assertTrue(self.result['native_retried'])
+        self.assertEqual([row['outcome'] for row in self.result['native_attempts']],
+                         ['rpc_index_catchup_timeout', 'ok'])
+        self.assertTrue(self.result['native_attempts'][0]['unable_to_load_object'])
+        self.assertFalse(self.result['native_attempts'][1]['unable_to_load_object'])
+        for row in self.result['native_attempts']:
+            self.assertLessEqual(row['started_unix'], row['finished_unix'])
+            self.assertGreaterEqual(row['elapsed_seconds'], 0)
+        self.assert_retained(1)
+        self.assertEqual(len(self.stopped), 2)
+        self.assertEqual(self.started[0], self.started[1])
+        self.assertEqual(self.calls[0][1:-2], self.calls[1][1:-2])
+        self.assertFalse((self.root / 'native/db/attempt1').exists())
+        self.assertTrue((self.root / 'native/db/attempt2').exists())
+        self.assertEqual(deployment.schemas(self.output / 'native-schema', 'native'), {'db': {'attempt': 2}})
+        _, nodes = deployment.prepare(self.output / 'deployment',
+            deployment.schemas(self.output / 'native-schema', 'native'), self.root / 'remote',
+            shape_yamls={'db': (self.output / 'native-schema/db/shape.yaml').read_text()},
+            hosts=['127.0.0.1'] * 5, port=24000, transport=transport_for_case('tcp'),
+            coordinator_cache=0)
+        for node in nodes:
+            self.assertEqual(yaml.safe_load(Path(node['launch']).read_text())['node']['shape_yaml'], 'shape for attempt 2')
+        self.assertEqual((self.output / 'native-final.prom').read_text(), '2')
+        self.assertEqual(self.children, [self.producer])
+        self.assertEqual(self.port_check.call_count, 3)
+
+    def test_three_failures_preserve_all_attempts_and_remove_databases(self):
+        failures = [self.catchup() for _ in range(3)]
+        with self.assertRaises(run.checkpoint.RpcIndexCatchupError) as raised:
+            self.replay(failures)
+        self.assertIs(raised.exception, failures[-1])
+        self.assertIn('native-attempt1, native-attempt2, native-attempt3', raised.exception.__notes__[-1])
+        self.assertEqual(len(self.result['native_attempts']), 3)
+        self.assertTrue(self.result['native_retried'])
+        for number in range(1, 4):
+            self.assert_retained(number)
+        self.assertEqual(len(self.stopped), 3)
+        self.assertFalse((self.root / 'native').exists())
+        self.assertFalse((self.output / 'native-schema').exists())
+        self.assertEqual(self.children, [self.producer])
+        self.assertEqual(self.port_check.call_count, 6)
+        # The runner's archive uses this complete recursive file inventory, not a whitelist.
+        with tarfile.open(self.root / 'evidence.tar.gz', 'w:gz') as archive:
+            for path in sorted(self.output.rglob('*')):
+                if path.is_file() and not any(part in ('tls', 'storage') for part in path.relative_to(self.output).parts):
+                    archive.add(path, arcname=str(path.relative_to(self.root)))
+        with tarfile.open(self.root / 'evidence.tar.gz') as archive:
+            for row in self.result['native_attempts']:
+                for name in row['evidence_files']:
+                    self.assertTrue(archive.getmember('experiment/' + name).isfile())
+
+    def test_other_errors_stop_child_without_retry(self):
+        for error in (RuntimeError('foreground child exited'), TimeoutError('foreground deadline')):
+            with self.subTest(error=type(error).__name__):
+                # Each subcase needs the same clean first-attempt paths as a new invocation.
+                for path in self.output.iterdir():
+                    shutil.rmtree(path) if path.is_dir() else path.unlink()
+                if (self.root / 'native').exists():
+                    shutil.rmtree(self.root / 'native')
+                self.started.clear()
+                self.stopped.clear()
+                with self.assertRaises(type(error)) as raised:
+                    self.replay([error])
+                self.assertIs(raised.exception, error)
+                self.assertEqual(len(self.started), 1)
+                self.assertEqual(len(self.stopped), 1)
+                self.assertFalse(self.result['native_retried'])
+                self.assertEqual(self.children, [self.producer])
+                self.assertEqual(len(self.result['native_attempts']), 1)
+                self.assertEqual(self.result['native_attempts'][0]['outcome'], 'error')
+                self.assertEqual(self.result['native_attempts'][0]['exception'], str(error))
+                self.assertFalse(list(self.output.glob('native-attempt*')))
+
+    def test_first_success_keeps_original_names(self):
+        self.replay([None])
+        self.assertFalse(self.result['native_retried'])
+        self.assertEqual(len(self.result['native_attempts']), 1)
+        self.assertEqual(self.result['native_attempts'][0]['outcome'], 'ok')
+        self.assertTrue((self.output / 'native.log').is_file())
+        self.assertTrue((self.output / 'native-schema').is_dir())
+        self.assertFalse(list(self.output.glob('native-attempt*')))
+        self.assertEqual(len(self.stopped), 1)
+
+    def test_flat_analysis_exports_disclose_retries(self):
+        keys = ('run_id', 'source_archive_sha256', 'source_manifest_sha256',
+                'build_manifest_sha256', 'checkpoint_digest', 'controller_archive_sha256',
+                'closure_sha256', 'analyzer_sha256')
+        report = dict.fromkeys(keys, 'bound')
+        cell = dict.fromkeys(('cell_id', 'transport', 'repetition', 'ordinal', 'population',
+                             'read_profile_limit', 'write_profile_limit', 'native_write_profile_limit',
+                             'replay_evidence_sha256'), 'selected')
+        cell.update(native_seconds=1, remote_seconds=2, remote_over_native=2,
+                    native_retried=True, native_attempts=[{'attempt': 1, 'outcome': 'rpc_index_catchup_timeout'},
+                                                        {'attempt': 2, 'outcome': 'ok'}],
+                    cache={'coordinator_bytes': 0}, modes={})
+        report['cells'] = [cell]
+        analyze.write_campaign_report(self.output, report)
+        text = (self.output / 'cell-summary.csv').read_text()
+        self.assertIn('native_retried,native_attempts', text)
+        self.assertIn('True', text)
+        self.assertIn('rpc_index_catchup_timeout', text)
+
+
 class ReplaySamplingLifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1057,7 +1238,7 @@ class ReplaySamplingLifecycle(unittest.TestCase):
         self.assertNotIn('io', rows[1]['node'])
         self.assertEqual((self.root/'remote-foreground.prom').read_text(), metrics)
         self.assertIn('actual child failure: operation deadline expired', (self.root/'remote.log').read_text())
-        self.assertFalse(self.child.reaped)
+        self.assertTrue(self.child.reaped)
 
 
 class PassiveMetricFreshness(unittest.TestCase):
@@ -1560,6 +1741,9 @@ class EvidenceBoundaries(unittest.TestCase):
             result = dict(complete=True, checkpoint_limit=1, checkpoint_digest='tip', audit=audit,
                           source_range={}, source_archive_sha256='source-archive', build_manifest_sha256=build_hash,
                           topology='loopback', durability='durable', cache={}, native=replay, remote=replay)
+            result.update(native_retried=True, native_attempts=[
+                dict(attempt=1, outcome='rpc_index_catchup_timeout'),
+                dict(attempt=2, outcome='ok')])
             build.save(evidence/'results.json', result)
             build.save(evidence/'audit.json', audit)
             (evidence/'native-foreground.prom').write_text('last_executed_checkpoint 1\n')
@@ -1578,6 +1762,9 @@ class EvidenceBoundaries(unittest.TestCase):
             self.assertEqual(analyze.summarize(root), before)
             self.assertEqual(before['modes']['native']['foreground_seconds'], 2)
             self.assertEqual(before['table_counts']['live/db']['objects'], 5)
+            self.assertTrue(before['native_retried'])
+            self.assertEqual(before['native_attempts'], result['native_attempts'])
+            self.assertIn('timing of a retried attempt is not a first-attempt sample', before['limits'][0])
             with (root/'evidence.tar.gz').open('ab') as stream:
                 stream.write(b'tampered archive')
             with self.assertRaisesRegex(ValueError, 'archive binding'):

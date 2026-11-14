@@ -62,18 +62,38 @@ def rpc_index_frontiers(metrics, checkpoint):
     return frontiers
 
 
+# Tolerate slow but advancing committed frontiers after foreground replay.
+# Fail after a stall, after the total limit, or when the node exits.
+RPC_INDEX_STALL_SECONDS = 120
+RPC_INDEX_TOTAL_SECONDS = 1200
+RPC_INDEX_SAMPLE_BUDGET = 8 * RPC_INDEX_TOTAL_SECONDS
+
+
+class RpcIndexCatchupError(RuntimeError):
+    def __init__(self, observations, metrics):
+        super().__init__("RPC indexers did not commit all ten pipelines at frozen tip")
+        self.observations = observations
+        self.metrics = metrics
+
+
 def wait_for_rpc_indexes(child, address, checkpoint, metrics):
     start = time.monotonic()
+    last_progress, best = start, -1
     observations = []
-    for _ in range(480):
+    for _ in range(RPC_INDEX_SAMPLE_BUDGET):
         frontiers = rpc_index_frontiers(metrics, checkpoint)
-        observations.append({"seconds": time.monotonic() - start, "frontiers": frontiers})
+        now = time.monotonic()
+        observations.append({"seconds": now - start, "frontiers": frontiers})
         if set(frontiers) == RPC_INDEX_PIPELINES and all(value == checkpoint for value in frontiers.values()):
-            return metrics, {"status": "all-ten-committed-at-frozen-tip", "seconds": time.monotonic() - start,
+            return metrics, {"status": "all-ten-committed-at-frozen-tip", "seconds": now - start,
                              "checkpoint": checkpoint, "observations": observations,
                              "scope": "after foreground replay timer; excluded from replay elapsed"}
-        if child.poll() is not None or time.monotonic() - start >= 120:
-            raise RuntimeError("RPC indexers did not commit all ten pipelines at frozen tip")
+        total = sum(frontiers.values())
+        if total > best:
+            best, last_progress = total, now
+        if (child.poll() is not None or now - last_progress >= RPC_INDEX_STALL_SECONDS
+                or now - start >= RPC_INDEX_TOTAL_SECONDS):
+            raise RpcIndexCatchupError(observations, metrics)
         time.sleep(0.25)
         with urllib.request.urlopen(f"http://{address}/metrics", timeout=1) as response:
             metrics = response.read(32 << 20).decode()

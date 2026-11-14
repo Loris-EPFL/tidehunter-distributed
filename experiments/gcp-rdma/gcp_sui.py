@@ -295,7 +295,11 @@ def admit_fixture(fixture, verification, manifest, build_root):
     for path in files:
         rel = path.relative_to(supplied)
         bound = evidence / 'experiment' / rel
-        if rel.parts[0] not in {'results.json', 'audit.json', 'native-schema'} or not bound.is_file() or sha(path) != sha(bound):
+        retry_evidence = re.fullmatch(
+            r'native-attempt[1-3]-(?:native\.log|native-samples\.jsonl|native-(?:foreground|final)\.prom|native-schema|catchup\.json)',
+            rel.parts[0])
+        if ((rel.parts[0] not in {'results.json', 'audit.json', 'native-schema'} and not retry_evidence)
+                or not bound.is_file() or sha(path) != sha(bound)):
             raise ValueError('local schema/results not bound to evidence')
     schema = supplied / 'native-schema'
     bound_schema = evidence / 'experiment/native-schema'

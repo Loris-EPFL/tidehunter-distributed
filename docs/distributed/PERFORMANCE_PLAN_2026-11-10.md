@@ -1162,6 +1162,34 @@ Harness changes: the campaign error names the last stage and the exit status ins
 
 Evidence: `checkpoint-work/r02-local-20261114/` (run evidence, kernel logs, cleanup proof, patches).
 
+## Run A6 (14 November 2026, revision `57037a2`, KV 36 of 36, Sui r01 and r02 pass, r03 failed)
+
+Fleet `bench-78e1c1b3c91245be` (attempt 3: attempts 1 and 2 failed before any VM existed, each with an upload write timeout from the workstation, 0 USD of compute). Two `z4m-highmem-16` VMs created 18:21:58 and 18:22:41 UTC, cleanup verified; compute upper bound 2.93 USD excluding storage and network. Both archives are retained and hash-verified (controller `d90445535dcfd69ac5034370524dcc709743b097e922af7348032a016b4b1847`, partial Sui `62309f0721a25cabd023d67d977eaaf5eb928d908a59e32bc110112eebf66660`). One fleet, one repetition.
+
+**KV:** 36 of 36 cases completed; 584,320 measured calls, all successful. Matched cases against Run A4 (same IDs, 25 matched): p50 ratio 0.92 to 1.07 (median 0.99), p99.9 ratio 0.72 to 1.40 (median 0.99). Adoption outside `state` and the history export change do not change the put cycle on this fleet.
+
+| 64 KiB, 16 callers, leased NVMe-oF | Calls | p50 (µs) | p99 (µs) | p99.9 (µs) | Calls/s | Calls ≥ 5 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| Page-cache, G21W `a0f43b2526801841f91f` | 4,096 | 753 | 1,079 | 1,373 | 19,430 | 0 |
+| FUA/data-sync, G21W `e48025c5b86a96f2053d` | 4,096 | 1,197 | 1,482 | 2,000 | 12,557 | 0 |
+| FUA/data-sync, crossing G22W `7f7a98332d0f40636315` | 16,384 | 1,182 | 2,017 | 19,721 | 12,071 | 87 |
+| Page-cache, crossing G22W `f5566538e6cc790734f0` (new) | 16,384 | 727 | 1,638 | 25,377 | 17,836 | 87 |
+
+Extent switches never waited: 10 switches in each crossing case, `extent_switch_waits_total` 0 in all 14 instrumented cases. Owner adoption ran at 1,205 MiB/s (new page-cache crossing case), 1,934 MiB/s (synced crossing case) and 888 MiB/s (page-cache G21W), per leased bytes over adoption seconds. The page-cache writer wrote 1,215 MiB/s in the cycle analysis. Both crossing cases keep 87 calls of 5 ms or more in 11 clusters, each overlapping an owner adoption request of 12 to 27 ms; the stages are `live_io_submitted -> live_io_completed` and `append_enqueue_started -> worker_dequeued`, none in `worker_dequeued -> live_group_build_started`. Overlap is not proof of cause [INFERENCE: owner reads of the file that the target writes, or coordinator worker work for the same adoption]. This tail remains open.
+
+**Sui:**
+
+| Cell | Result | Native / distributed checkpoints per second (250 ms resolution, about 3 s window) |
+|---|---|---|
+| r01 owner RPC, `original_default`, native tier | complete; digests and state audit equal | 605 / 529 |
+| r02 live NVMe-oF over RDMA, `original_default`, native tier | **complete; digests and state audit equal** (first pass of this route anywhere) | 552 / 530 |
+| r03 owner RPC, `harness`, synchronous tier | failed in the native baseline replay | not available |
+| r04 live NVMe-oF over RDMA, `harness`, synchronous tier | not reached | not available |
+
+r03: the embedded RPC indexer of the stock native node could not ingest checkpoint 0 (`unable to load object 0x...06 version 1`, repeated), so its ten committed frontiers stayed 0 and the 120 s catch-up wait raised `RPC indexers did not commit all ten pipelines at frozen tip`. No distributed code had run. The cause inside Sui is not established; a startup timing race is plausible (r01 and r02 on the same fleet and about ten local harness replays passed). The 10 s subscription warnings in that log are not committed index progress. Mitigation (not yet run on hardware): a bounded retry of the native replay, three attempts at most, only for this typed error, in fresh paths, with every attempt's evidence retained and the retry disclosed in the result and in the analyzer; the strict all-ten-at-tip gate and the state audit are unchanged. The distributed replay is not retried. A retried native baseline is not a first-attempt timing sample.
+
+Evidence: `checkpoint-work/contracts-launch-20261114-a6/` (`results-top/`, `analysis/`, `sui-extract/`, `serial/`, `fleet-output/`, `*-attempt1-network`, `*-attempt2-network`).
+
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.
 
