@@ -507,6 +507,13 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
     let partition = config.node.partition.partition;
     let database = config.node.partition.inventory.database;
+    let owner_events =
+        if std::env::var_os("TIDEHUNTER_OWNER_EVENTS").is_some_and(|value| value == "1") {
+            tidehunter::distributed::owner_events::enable(65_536);
+            Some(Path::new(&file).with_extension("owner-events.json"))
+        } else {
+            None
+        };
     let node = StorageNode::open(config.node, metrics)?;
     // Applied before the listener exists, so no client request can see another tier.
     node.set_durability(config.durability)?;
@@ -645,6 +652,9 @@ pub fn maybe_run_storage_node() -> Result<bool> {
                 "snapshot_boundary": "after serving stops, before handle drop; in-flight maintenance can finish after this snapshot"
             }))?,
         )?;
+    }
+    if let Some(path) = owner_events {
+        tidehunter::distributed::owner_events::write_json(&path)?;
     }
     Ok(true)
 }

@@ -178,7 +178,7 @@ fn session_and_node_use_the_same_stream_class_for_every_wal_request() {
         let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
         let mut client = fixture.writer_without_ahead();
         let receipt = client
-            .write_leased_group(
+            .submit_and_drain_leased_group(
                 1,
                 vec![fixture.batch(0)],
                 &crate::distributed::write_timeline::WriteTimeline::default(),
@@ -294,7 +294,7 @@ fn seal_fence_and_retirement_wait_for_active_position_proofs() {
         let mut client = fixture.writer_without_ahead();
         let mut other = fixture.client();
         let receipt = client
-            .write_leased_group(
+            .submit_and_drain_leased_group(
                 1,
                 vec![fixture.batch(0)],
                 &crate::distributed::write_timeline::WriteTimeline::default(),
@@ -304,7 +304,7 @@ fn seal_fence_and_retirement_wait_for_active_position_proofs() {
         let through =
             receipt.appended().address().offset + u64::from(receipt.appended().address().len);
         if variant == 2 {
-            client.close_leased_extent().unwrap();
+            client.close_leased_extent(&mut Vec::new(), None).unwrap();
             client.seal(1).unwrap();
             client.fence_to(2).unwrap();
         }

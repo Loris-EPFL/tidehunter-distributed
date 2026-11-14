@@ -37,6 +37,8 @@ class ObserverMatrixQualification(unittest.TestCase):
         for selection in ('recommended', 'full', 'device', 'floors', 'stages', 'unified', 'append_floors', 'fair_native', 'parity'):
             with self.subTest(selection=selection):
                 spec = manual_campaign.REVIEWED_SPECS[selection]
+                if selection == 'nvmeof_parallel_writes':
+                    self.assertEqual(spec['matrix_sha256'], 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
                 jobs = qualification.cloud_campaign.make_focused_matrix(selection)
                 direct = [job for job in jobs if job.get('target_io') == 'direct']
                 if selection not in ('stages', 'unified'):
@@ -70,14 +72,16 @@ class ObserverMatrixQualification(unittest.TestCase):
 
     def test_nvmeof_path_observer_qualifies_exact_matrix(self):
         for selection in qualification.cloud_campaign.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44}[selection]
             with self.subTest(selection=selection):
                 import manual_campaign
                 spec = manual_campaign.REVIEWED_SPECS[selection]
+                if selection == 'nvmeof_parallel_writes':
+                    self.assertEqual(spec['matrix_sha256'], 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
                 jobs = qualification.cloud_campaign.make_focused_matrix(selection)
                 self.assertEqual(len(jobs), expected_count)
                 self.assertEqual({job['backend'] for job in jobs},
-                                 {'native', 'tidehunter_nvme_rdma'} if selection == 'nvmeof_first_put' else
+                                 {'native', 'tidehunter_nvme_rdma'} if selection in ('nvmeof_first_put', 'nvmeof_parallel_writes') else
                                  {'native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'})
                 receipt = qualification.qualify_jobs(jobs)
                 self.assertEqual((receipt['planned_cases'], receipt['matrix_sha256']),

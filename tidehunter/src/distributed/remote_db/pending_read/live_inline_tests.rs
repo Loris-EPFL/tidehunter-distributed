@@ -58,6 +58,7 @@ impl Case {
             host_nqn: "nqn.2026-01.test:inline".into(),
             host_id: [1; 16],
             owner_identities: Default::default(),
+            leased_write_window: Some(4),
             max_inflight_requests: 4,
             max_inflight_bytes: 128 * 1024,
             connect_timeout_ms: 1000,

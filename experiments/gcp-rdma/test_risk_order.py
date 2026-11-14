@@ -78,12 +78,14 @@ class RiskOrderTests(unittest.TestCase):
             risk_order.validate_order(jobs, order)
     def test_nvmeof_path_preserves_canaries_and_group_order(self):
         for selection in risk_order.cloud_campaign.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44}[selection]
             with self.subTest(selection=selection):
                 jobs = risk_order.cloud_campaign.make_focused_matrix(selection)
                 self.assertEqual(len(jobs), expected_count)
                 original = [job['case_id'] for job in jobs]
                 order = risk_order.generate_order(jobs)
+                if selection == 'nvmeof_parallel_writes':
+                    self.assertEqual(order['matrix_sha256'], 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
                 self.assertEqual(order['case_ids'][:12], original[:12])
                 self.assertEqual(order['case_ids'], original)
                 for left, right in ((0, 1), (min(12, len(jobs)//2), min(13, len(jobs)//2+1)), (len(jobs) - 2, len(jobs) - 1)):

@@ -457,7 +457,7 @@ pub async fn run<B: KvBackend>(
             }
         }
         let evidence = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "requested_limit": config.diagnostics.write_timeline_limit,
             "measurement_attempted": measurement_attempted,
             "measurement_drained": measurement_drained,
@@ -1082,6 +1082,7 @@ fn measurement_read_evidence(
                 "complete_exchanges",
                 "lease_exchanges",
                 "leased_frames",
+                "leased_eventfd_unavailable",
                 "leased_bytes",
                 "leased_skip_markers",
                 "extents_leased",
@@ -1135,19 +1136,23 @@ fn measurement_read_evidence(
     };
     // Lifetime maxima are not monotonic counters: a delta would be meaningless, so both
     // boundary values are recorded and the maximum is not attributed to the measurement window.
-    let live_peaks = ["lane_inflight_request_max", "lane_inflight_op_max"]
-        .iter()
-        .map(|field| {
-            (
-                (*field).to_owned(),
-                serde_json::json!({
-                    "at_start": start["live_nvmeof"].get(field),
-                    "at_end": end["live_nvmeof"].get(field),
-                    "scope": "lifetime maximum, not a measurement-window maximum",
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
+    let live_peaks = [
+        "lane_inflight_request_max",
+        "lane_inflight_op_max",
+        "max_leased_in_flight",
+    ]
+    .iter()
+    .map(|field| {
+        (
+            (*field).to_owned(),
+            serde_json::json!({
+                "at_start": start["live_nvmeof"].get(field),
+                "at_end": end["live_nvmeof"].get(field),
+                "scope": "lifetime maximum, not a measurement-window maximum",
+            }),
+        )
+    })
+    .collect::<serde_json::Map<_, _>>();
     serde_json::json!({
         "schema_version": 1, "scope": "measurement_boundary",
         "start_boundary": "after warmup, aging and measurement gate; before measurement run_phase",
@@ -6148,6 +6153,7 @@ mod tests {
             "complete_exchanges",
             "lease_exchanges",
             "leased_frames",
+            "leased_eventfd_unavailable",
             "leased_bytes",
             "leased_skip_markers",
             "extents_leased",

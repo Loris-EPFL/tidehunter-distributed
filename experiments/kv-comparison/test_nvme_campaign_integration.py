@@ -96,6 +96,10 @@ class CampaignModeTests(unittest.TestCase):
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
                 'live_write': {'write_mode': 'leased',
                                'acknowledgement_contract': 'leased extent: page-cache write'}}}
+        if job['selection'] == 'nvmeof_parallel_writes':
+            window = job.get('live_leased_write_window')
+            info['configuration'].update(live_leased_write_window=window,
+                live_leased_write_window_bound=31 if window is None else window)
         cloud_campaign.admit_live_write_contract(job, info)
         for field in ('live_export_mode', 'live_queue_geometry'):
             bad = copy.deepcopy(info)
@@ -114,6 +118,42 @@ class CampaignModeTests(unittest.TestCase):
             explicit_info = copy.deepcopy(info)
             explicit_info['configuration'][field] = default
             cloud_campaign.admit_live_write_contract(explicit_job, explicit_info)
+
+    def test_parallel_c64_run_configuration_admits_all_callers(self):
+        jobs = cloud_campaign.make_focused_matrix('nvmeof_parallel_writes')
+        cases = [j for j in jobs if j['concurrency'] == 64]
+        self.assertEqual(len(cases), 6)
+        for job in cases:
+            config = cloud_campaign.make_run_config(job, '/tmp/parallel-c64', {}, 'revision', 600)
+            self.assertEqual(config['execution']['concurrency'], 64)
+            self.assertEqual(config['execution']['mode'], 'closed_loop')
+            self.assertGreaterEqual(config['execution']['queue_capacity'], 64)
+            self.assertEqual(config['execution']['request_timeout_ms'], 10000)
+            self.assertEqual(config['limits']['deadline_seconds'], 600)
+            self.assertEqual(config['measurement_gate']['timeout_seconds'], 240)
+
+    def test_parallel_write_window_and_resource_bound_admission(self):
+        jobs = cloud_campaign.make_focused_matrix('nvmeof_parallel_writes')
+        for window in (None, 1, 4):
+            job = next(j for j in jobs if j.get('live_leased_write_window') == window
+                       and j.get('live_write_mode') == 'leased' and j['durability_tier'] == 'native')
+            configuration = dict(live_export_mode=job['live_export_mode'],
+                live_queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0),
+                live_lease_ahead=True, live_polled_writes=False,
+                live_leased_write_window=window, live_leased_write_window_bound=31 if window is None else window,
+                live_write=dict(write_mode='leased', acknowledgement_contract='leased extent: page-cache write'))
+            cloud_campaign.admit_live_write_contract(job, dict(configuration=configuration))
+            for field, value in (('live_leased_write_window', 2), ('live_leased_write_window', False),
+                                 ('live_leased_write_window_bound', None), ('live_leased_write_window_bound', True),
+                                 ('live_leased_write_window_bound', 0)):
+                bad = dict(configuration, **{field: value})
+                with self.subTest(window=window, field=field, value=value), self.assertRaises(ValueError):
+                    cloud_campaign.admit_live_write_contract(job, dict(configuration=bad))
+            for field in ('live_leased_write_window', 'live_leased_write_window_bound'):
+                bad = dict(configuration)
+                del bad[field]
+                with self.assertRaises(ValueError):
+                    cloud_campaign.admit_live_write_contract(job, dict(configuration=bad))
 
     def test_prepared_live_client_exact_contract(self):
         host_nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'

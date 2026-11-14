@@ -16,6 +16,7 @@ pub mod local_inventory;
 pub mod native_index;
 pub mod native_publication;
 pub mod nvmeof;
+pub mod owner_events;
 pub mod publication;
 pub mod reference_directory;
 pub mod remote_db;

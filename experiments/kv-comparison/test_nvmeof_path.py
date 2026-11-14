@@ -169,6 +169,28 @@ class NvmeofPathTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]['first_measured_call'])
 
+    def test_parallel_writer_measurements_keep_native_and_leased_scopes(self):
+        native = self.add(group='G23N', selection='nvmeof_parallel_writes', concurrency=64)
+        leased = self.add('tidehunter_nvme_rdma', group='G23W', selection='nvmeof_parallel_writes', concurrency=64)
+        self.jobs[-1].pop('live_leased_write_window', None)
+        (leased / 'measurement-read-evidence.json').write_text(json.dumps(dict(
+            live_nvmeof_peaks=dict(max_leased_in_flight=dict(at_start=4, at_end=31,
+                scope='lifetime maximum, not a measurement-window maximum')))))
+        (leased / 'manifest.json').write_text(json.dumps(dict(backend_info=dict(configuration=dict(
+            live_leased_write_window=None, live_leased_write_window_bound=31)))))
+        rows = self.generate()
+        self.assertAlmostEqual(rows[0]['mean_inflight_calls'], 4 / 3)
+        self.assertAlmostEqual(rows[1]['mean_inflight_calls'], 4 / 3)
+        self.assertIsNone(rows[0]['max_leased_in_flight'])
+        self.assertEqual(rows[1]['max_leased_in_flight'], 31)
+        self.assertIn('lifetime maximum', rows[1]['max_leased_in_flight_scope'])
+        self.assertIsNone(rows[1]['live_leased_write_window'])
+        self.assertEqual(rows[1]['live_leased_write_window_bound'], 31)
+        with (self.output / 'puts.csv').open() as stream:
+            output = list(csv.DictReader(stream))
+        self.assertEqual(output[1]['max_leased_in_flight'], '31')
+        self.assertEqual(output[1]['live_leased_write_window_bound'], '31')
+
     def test_profile_means_and_history_default(self):
         directory = self.add('tidehunter_nvme_rdma', group='G19W', history_persistence='wal_replay')
         counters = dict(lease_reserve_ns=120, lease_namespace_sync_ns=240,

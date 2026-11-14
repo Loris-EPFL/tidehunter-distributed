@@ -41,6 +41,19 @@ class WriteTimelineAdmissionTests(unittest.TestCase):
         path.write_text(json.dumps(data))
         return job, config, data, path
 
+    def test_next_schema_requires_monotonic_origin_and_keeps_legacy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job, config, data, path = self.fixture(root)
+            cloud.admit_write_timeline(root, job, config, completed=True)
+            data["schema_version"] = 2
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "monotonic origin"):
+                cloud.admit_write_timeline(root, job, config, completed=True)
+            data["timeline"]["origin_monotonic_ns"] = 123
+            path.write_text(json.dumps(data))
+            cloud.admit_write_timeline(root, job, config, completed=True)
+
     def test_completed_timeline_requires_real_matched_case_and_bounded_records(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

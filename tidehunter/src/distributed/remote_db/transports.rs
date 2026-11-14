@@ -177,7 +177,7 @@ pub(super) fn connect(
                     .set_live_metrics(metrics.clone())
                     .map_err(LocalDbError::component)?;
                 client
-                    .configure_live_nvme(live)
+                    .configure_live_nvme(live, config.effective_owner_append_occupancy())
                     .map_err(LocalDbError::component)?;
             }
             client

@@ -78,6 +78,10 @@ pub struct LiveClientConfig {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub owner_identities: std::collections::BTreeMap<u32, LiveInitiatorIdentity>,
     pub max_inflight_requests: usize,
+    /// Optional software window. None uses queue credit and owner append occupancy only.
+    /// Receipts always release in frame order.
+    #[serde(default)]
+    pub leased_write_window: Option<usize>,
     pub max_inflight_bytes: usize,
     pub connect_timeout_ms: u64,
     pub io_timeout_ms: u64,
@@ -121,6 +125,7 @@ impl LiveClientConfig {
             host_id: identity.host_id,
             owner_identities: Default::default(),
             max_inflight_requests: self.max_inflight_requests,
+            leased_write_window: self.leased_write_window,
             max_inflight_bytes: self.max_inflight_bytes,
             connect_timeout_ms: self.connect_timeout_ms,
             io_timeout_ms: self.io_timeout_ms,
@@ -179,6 +184,9 @@ impl LiveClientConfig {
                 .bytes()
                 .all(|b| b.is_ascii_graphic() && b != b',' && b != b'=')
             || !(1..=32768).contains(&self.max_inflight_requests)
+            || self
+                .leased_write_window
+                .is_some_and(|window| window == 0 || window > self.max_inflight_requests)
             || self.max_inflight_bytes == 0
             || !(1..=300_000).contains(&self.connect_timeout_ms)
             || !(1..=300_000).contains(&self.io_timeout_ms)
@@ -339,10 +347,31 @@ struct ExtentState {
     cursor: u64,
     written_end: u64,
     acknowledged: LeasedPrefix,
+    reserved: LeasedPrefix,
     adopted: LeasedPrefix,
     declared_through: u64,
     /// At most 1024 boundaries; full current history settles before submission.
     prefixes: std::collections::VecDeque<LeasedPrefix>,
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+struct LeasedFlight {
+    id: u64,
+    start: u64,
+    end: u64,
+    prefix: LeasedPrefix,
+    receipts: Vec<super::DurableBatch>,
+    deadline: Instant,
+    submitted_at: Instant,
+    completed: bool,
+    sample: Option<crate::distributed::write_timeline::LiveGroupSample>,
+    frame_len: usize,
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(crate) enum LeasedSubmit {
+    Submitted(u64),
+    Deferred(Vec<super::CompleteBatch>),
 }
 
 /// The existing per-owner worker owns this state, with no additional lock.
@@ -357,6 +386,13 @@ pub(super) struct LeasedWriter {
     pending_started: Option<Instant>,
     /// Two deques, allocated at configuration and recycled after validated close.
     prefix_buffers: [std::collections::VecDeque<LeasedPrefix>; 2],
+    flights: std::collections::VecDeque<LeasedFlight>,
+    completions: Vec<crate::distributed::nvmeof::live_io::LiveCompletion>,
+    flight_bound: usize,
+    next_flight_id: u64,
+    worker_wake: Option<std::os::fd::RawFd>,
+    worker_wake_registered: bool,
+    queue_rebound: bool,
     #[cfg(test)]
     next_write_result: Option<i32>,
     #[cfg(test)]
@@ -535,9 +571,13 @@ impl super::Client {
 
     /// Drain accepted DMA before dropping the cached queue and controller lease.
     /// An error retains the queue so its buffers and namespace remain owned.
-    pub(crate) fn drain_live_writer(&mut self) -> Result<(), super::TcpError> {
+    pub(crate) fn drain_live_writer(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
         if !self.live_write_failed {
-            self.close_leased_extent()?;
+            self.close_leased_extent(released, timeline)?;
         }
         self.drain_live_queue()
     }
@@ -582,14 +622,19 @@ impl super::Client {
 
     /// Stop admission under the same client mutex used by the owner worker.
     /// A queued append cannot recreate a queue after shutdown drains this one.
-    pub(crate) fn close_live_writer(&mut self) -> Result<(), super::TcpError> {
+    pub(crate) fn close_live_writer(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
         self.live_writer_closing = true;
-        self.drain_live_writer()
+        self.drain_live_writer(released, timeline)
     }
 
     pub(crate) fn configure_live_nvme(
         &mut self,
         config: &LiveClientConfig,
+        owner_append_occupancy: usize,
     ) -> Result<(), super::TcpError> {
         config.validate().map_err(super::TcpError::new)?;
         let selected = config
@@ -605,6 +650,10 @@ impl super::Client {
             ));
         }
         if config.write_mode == LiveWriteMode::Leased {
+            let capacity = config.max_inflight_requests.min(owner_append_occupancy);
+            self.live_leased.flight_bound = capacity;
+            self.live_leased.flights.reserve(capacity);
+            self.live_leased.completions.reserve(capacity);
             for buffer in &mut self.live_leased.prefix_buffers {
                 if buffer.capacity() == 0 {
                     buffer
@@ -614,7 +663,13 @@ impl super::Client {
             }
         }
         if self.live_config.as_ref() != Some(config) {
-            self.drain_live_writer()?;
+            {
+                assert!(
+                    self.live_leased.flights.is_empty(),
+                    "queue change has waiting leased replies"
+                );
+                self.drain_live_writer(&mut Vec::new(), None)?;
+            }
             self.live_config = Some(selected.into_owned());
         }
         Ok(())
@@ -731,7 +786,13 @@ impl super::Client {
                     .is_some_and(|writer| writer.matches(binding))
                 {
                     timeline.live_group_event(sample, Stage::LiveNamespaceSetupStarted);
-                    self.drain_live_writer()?;
+                    {
+                        assert!(
+                            self.live_leased.flights.is_empty(),
+                            "queue change has waiting leased replies"
+                        );
+                        self.drain_live_writer(&mut Vec::new(), None)?;
+                    }
                     let target = LiveConnectTarget {
                         nqn: binding.nqn.clone(),
                         uuid: binding.uuid,
@@ -1144,6 +1205,7 @@ mod tests {
             host_nqn: "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
             host_id: [1; 16],
             owner_identities: Default::default(),
+            leased_write_window: Some(4),
             max_inflight_requests: 32,
             max_inflight_bytes: 4096,
             connect_timeout_ms: 1000,
@@ -1158,10 +1220,12 @@ mod tests {
         let mut old = serde_json::to_value(&config).unwrap();
         old.as_object_mut().unwrap().remove("queue_geometry");
         old.as_object_mut().unwrap().remove("export_mode");
+        old.as_object_mut().unwrap().remove("leased_write_window");
         assert!(!old.as_object().unwrap().contains_key("owner_identities"));
         let restored: LiveClientConfig = serde_json::from_value(old).unwrap();
         assert_eq!(restored.queue_geometry, LiveQueueGeometry::default());
         assert_eq!(restored.export_mode, LiveExportMode::OnDemand);
+        assert_eq!(restored.leased_write_window, None);
         assert!(restored.owner_identities.is_empty());
         for mode in [LiveExportMode::PerFile, LiveExportMode::PerOwner] {
             config.export_mode = mode;
@@ -1176,6 +1240,15 @@ mod tests {
             config.leased_durability = None;
         }
         config.export_mode = LiveExportMode::OnDemand;
+        config.leased_write_window = None;
+        assert!(config.validate().is_ok());
+        config.leased_write_window = Some(0);
+        assert!(config.validate().is_err());
+        config.leased_write_window = Some(config.max_inflight_requests + 1);
+        assert!(config.validate().is_err());
+        config.leased_write_window = Some(config.max_inflight_requests);
+        assert!(config.validate().is_ok());
+        config.leased_write_window = Some(4);
         config.queue_geometry.poll_queues = 1;
         assert!(config.validate().is_ok());
         config.inline_reads = false;
@@ -1198,6 +1271,7 @@ mod tests {
         config.max_inflight_requests = 32769;
         assert!(config.validate().is_err());
         config.max_inflight_requests = 1;
+        config.leased_write_window = Some(1);
         config.io_timeout_ms = 0;
         assert!(config.validate().is_err());
         let first = LiveInitiatorIdentity {
@@ -1242,6 +1316,11 @@ impl LeasedWriter {
             cursor: start,
             written_end: start,
             acknowledged: LeasedPrefix {
+                end: start,
+                count: 0,
+                digest: [0; 32],
+            },
+            reserved: LeasedPrefix {
                 end: start,
                 count: 0,
                 digest: [0; 32],
@@ -1630,19 +1709,30 @@ impl super::Client {
         Ok(())
     }
 
-    pub(crate) fn wait_leased_control(&mut self) -> Result<(), super::TcpError> {
-        let result = self.wait_leased_adoption();
+    pub(crate) fn wait_leased_control(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
+        let result = self
+            .drain_leased_flights(released, timeline)
+            .and_then(|()| self.wait_leased_adoption());
         if result.is_err() {
             self.live_write_failed = true;
         }
         result
     }
 
-    pub(crate) fn settle_leased_extent(&mut self) -> Result<(), super::TcpError> {
+    pub(crate) fn settle_leased_extent(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
         let started = Instant::now();
         let has_extent = self.live_leased.current.is_some();
         let result = self
-            .wait_closing_extent(false)
+            .drain_leased_flights(released, timeline)
+            .and_then(|()| self.wait_closing_extent(false))
             .and_then(|()| self.adopt_leased_sync(false, false));
         if result.is_err() {
             self.live_write_failed = true;
@@ -1656,9 +1746,14 @@ impl super::Client {
         result
     }
 
-    pub(crate) fn close_leased_extent(&mut self) -> Result<(), super::TcpError> {
+    pub(crate) fn close_leased_extent(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
         let result = (|| {
             self.ensure_leased_healthy()?;
+            self.drain_leased_flights(released, timeline)?;
             self.wait_closing_extent(false)?;
             self.wait_leased_adoption()?;
             if self.live_leased.current.is_none() {
@@ -1697,6 +1792,13 @@ impl super::Client {
         {
             return Ok(());
         }
+        debug_assert!(self.live_leased.flights.is_empty());
+        if !self.live_leased.flights.is_empty() {
+            return Err(super::TcpError::new(
+                "leased queue rebind with writes in flight",
+            ));
+        }
+        self.live_leased.queue_rebound = self.live_writer.is_some();
         self.drain_live_queue()?;
         let leased = self
             .live_leased
@@ -1744,6 +1846,7 @@ impl super::Client {
                 failed_accounting: None,
                 drain_pause: None,
             });
+            self.register_leased_worker_wake();
             return Ok(());
         }
         let pool = self
@@ -1850,10 +1953,60 @@ impl super::Client {
             #[cfg(test)]
             drain_pause: None,
         });
+        self.register_leased_worker_wake();
         Ok(())
     }
 
-    fn write_leased_block(
+    #[cfg(test)]
+    pub(crate) fn submit_and_drain_leased_group(
+        &mut self,
+        epoch: u64,
+        batches: Vec<super::CompleteBatch>,
+        timeline: &crate::distributed::write_timeline::WriteTimeline,
+        owner: u32,
+    ) -> Result<Vec<super::DurableBatch>, super::TcpError> {
+        let LeasedSubmit::Submitted(id) =
+            self.submit_leased_group(epoch, batches, timeline, owner)?
+        else {
+            return Err(super::TcpError::new("test group unexpectedly deferred"));
+        };
+        let mut released = Vec::new();
+        self.drain_leased_flights(&mut released, Some(timeline))?;
+        if released.len() != 1 || released[0].0 != id {
+            return Err(super::TcpError::new("test group release differs"));
+        }
+        Ok(released.remove(0).1)
+    }
+
+    pub(crate) fn set_worker_wake(&mut self, fd: std::os::fd::RawFd) {
+        self.live_leased.worker_wake = Some(fd);
+        self.register_leased_worker_wake();
+    }
+
+    pub(crate) fn clear_worker_wake(&mut self) {
+        self.live_leased.worker_wake = None;
+        self.live_leased.worker_wake_registered = false;
+    }
+
+    fn register_leased_worker_wake(&mut self) {
+        self.live_leased.worker_wake_registered = false;
+        if self
+            .live_config
+            .as_ref()
+            .is_some_and(|config| config.polled_writes)
+        {
+            return;
+        }
+        if let (Some(fd), Some(writer)) = (self.live_leased.worker_wake, &self.live_writer) {
+            if writer.io.register_worker_wake(fd).is_ok() {
+                self.live_leased.worker_wake_registered = true;
+            } else if let Some(counters) = &self.live_counters {
+                counters.record_leased_eventfd_unavailable();
+            }
+        }
+    }
+
+    fn submit_leased_frame(
         &mut self,
         offset: u64,
         len: usize,
@@ -1862,186 +2015,384 @@ impl super::Client {
             &crate::distributed::write_timeline::WriteTimeline,
             crate::distributed::write_timeline::LiveGroupSample,
         )>,
-    ) -> Result<(), super::TcpError> {
-        use crate::distributed::nvmeof::live_io::{
-            LiveIoError, LiveIoResult, LiveSubmitOutcome, LiveWriteSync,
-        };
-        use crate::distributed::nvmeof::live_metrics::{LiveTimingStage, LiveWriteFailure};
-        use std::time::{Duration, Instant};
+    ) -> Result<(u64, Instant, Instant), super::TcpError> {
+        use crate::distributed::nvmeof::live_io::{LiveIoError, LiveSubmitOutcome, LiveWriteSync};
+        use crate::distributed::nvmeof::live_metrics::LiveWriteFailure;
         self.ensure_leased_healthy()?;
         self.ensure_leased_queue()?;
-        let io_timeout_ms = self
+        let config = self
             .live_config
             .as_ref()
-            .ok_or_else(|| super::TcpError::new("live config missing"))?
-            .io_timeout_ms;
+            .ok_or_else(|| super::TcpError::new("live config missing"))?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(config.io_timeout_ms);
+        let id = self
+            .live_leased
+            .next_flight_id
+            .checked_add(1)
+            .ok_or_else(|| super::TcpError::new("leased flight ID exhausted"))?;
         let tier = self
             .live_leased
             .current
             .as_ref()
-            .ok_or_else(|| super::TcpError::new("leased extent missing its durability tier"))?
+            .ok_or_else(|| super::TcpError::new("leased extent missing"))?
             .lease
             .tier;
         let sync = match tier {
             crate::distributed::durability::DurabilityTier::Native => LiveWriteSync::None,
             crate::distributed::durability::DurabilityTier::Synchronous => LiveWriteSync::Data,
         };
-        let counters = self.live_counters.as_deref();
-        let mut unknown = UnknownWriteOnError {
-            counters,
-            armed: false,
-        };
-        let io = &mut self
+        let writer = self
             .live_writer
             .as_mut()
-            .ok_or_else(|| super::TcpError::new("live queue missing"))?
-            .io;
+            .ok_or_else(|| super::TcpError::new("live queue missing"))?;
         #[cfg(test)]
         if let Some(result) = self.live_leased.next_write_result.take() {
-            io.override_next_completion_result(result);
+            writer.io.override_completion_result(id, result);
         }
-        let before = io.stats();
-        let deadline = Instant::now() + Duration::from_millis(io_timeout_ms);
-        let outcome = (|| {
-            let mut buffer = io.write_buffer(len)?;
-            encode(&mut buffer)
-                .map_err(|error| LiveIoError::Io(std::io::Error::other(error.to_string())))?;
-            if let Some((timeline, sample)) = trace {
-                timeline.live_group_event(
-                    Some(sample),
-                    crate::distributed::write_timeline::WriteTimelineStage::LiveFrameEncoded,
-                );
+        let before = writer.io.stats();
+        let mut buffer = writer.io.write_buffer(len).map_err(|error| {
+            if let Some(counters) = &self.live_counters {
+                counters.record_leased_write_failure(match error {
+                    crate::distributed::nvmeof::live_io::LiveIoError::Full => {
+                        crate::distributed::nvmeof::live_metrics::LiveWriteFailure::Full
+                    }
+                    _ => crate::distributed::nvmeof::live_metrics::LiveWriteFailure::Failed,
+                });
             }
-            buffer.submit_write_buffer(1, offset, sync, deadline)
-        })();
-        match outcome {
-            Ok(LiveSubmitOutcome::Submitted) => unknown.armed = true,
+            super::TcpError::component(error)
+        })?;
+        encode(&mut buffer).inspect_err(|_| {
+            if let Some(counters) = &self.live_counters {
+                counters.record_leased_write_failure(LiveWriteFailure::Failed);
+            }
+        })?;
+        if let Some((timeline, sample)) = trace {
+            timeline.live_group_event(
+                Some(sample),
+                crate::distributed::write_timeline::WriteTimelineStage::LiveFrameEncoded,
+            );
+        }
+        match buffer.submit_write_buffer(id, offset, sync, deadline) {
+            Ok(LiveSubmitOutcome::Submitted) => {}
             outcome => {
-                let failure = match &outcome {
-                    Ok(LiveSubmitOutcome::Full) | Err(LiveIoError::Full) => LiveWriteFailure::Full,
-                    Err(LiveIoError::Timeout) => LiveWriteFailure::TimedOut,
-                    _ => LiveWriteFailure::Failed,
-                };
-                if let Some(counters) = counters {
-                    counters.record_leased_write_failure(failure);
+                if let Some(counters) = &self.live_counters {
+                    counters.record_leased_write_failure(match &outcome {
+                        Ok(LiveSubmitOutcome::Full) | Err(LiveIoError::Full) => {
+                            LiveWriteFailure::Full
+                        }
+                        Err(LiveIoError::Timeout) => LiveWriteFailure::TimedOut,
+                        _ => LiveWriteFailure::Failed,
+                    });
                 }
-                return match outcome {
-                    Err(error) => Err(super::TcpError::component(error)),
-                    _ => Err(super::TcpError::new("live leased write admission full")),
-                };
+                return Err(match outcome {
+                    Err(error) => super::TcpError::component(error),
+                    _ => super::TcpError::new("live leased write admission full"),
+                });
             }
         }
-        // Successful admission is the timing origin; encoding and rejected
-        // submissions are not part of the successful completion population.
         let submitted_at = Instant::now();
-        if sync == LiveWriteSync::Data
-            && let Some(counters) = counters
+        self.live_leased.next_flight_id = id;
+        if writer.failed_accounting.is_none()
+            && let Some(counters) = &self.live_counters
         {
-            counters.record_fua_write();
-        }
-        #[cfg(test)]
-        if std::mem::take(&mut self.live_leased.delay_write) {
-            std::thread::sleep(Duration::from_millis(io_timeout_ms + 1));
-        }
-        let mut timed_out = false;
-        let mut completed_at = None;
-        let mut submission_recorded = false;
-        let result = (|| {
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    timed_out = true;
-                    return Err(super::TcpError::new("leased write deadline expired"));
-                }
-                if trace.is_some() && !submission_recorded {
-                    // Sampled groups pay one extra submit syscall to expose
-                    // this boundary. Their CQE-wait interval and total can
-                    // differ from untraced submit_with_args(1) writes.
-                    if !io
-                        .submit_pending_write()
-                        .map_err(super::TcpError::component)?
-                    {
-                        continue;
-                    }
-                    if let Some((timeline, sample)) = trace {
-                        timeline.live_group_event(
-                            Some(sample),
-                            crate::distributed::write_timeline::WriteTimelineStage::LiveIoSubmitted,
-                        );
-                    }
-                    submission_recorded = true;
-                }
-                io.wait(remaining).map_err(super::TcpError::component)?;
-                let completion = io.progress_one().map_err(super::TcpError::component)?;
-                let Some(completion) = completion else {
-                    continue;
-                };
-                if completion.id != 1 {
-                    return Err(super::TcpError::new("unexpected leased write completion"));
-                }
-                return match completion.result.map_err(super::TcpError::component)? {
-                    LiveIoResult::Written => {
-                        completed_at = Some(completion.completed_at);
-                        Ok(())
-                    }
-                    LiveIoResult::Reads(_) => {
-                        Err(super::TcpError::new("unexpected leased read completion"))
-                    }
-                };
-            }
-        })();
-        let after = io.stats();
-        if let Some(counters) = counters {
-            if let Some(completed_at) = completed_at {
-                record_write_io(counters, &before, &after);
-                counters.record_timing(
-                    LiveTimingStage::LeasedWrite,
-                    completed_at
-                        .saturating_duration_since(submitted_at)
-                        .as_nanos()
-                        .min(u64::MAX as u128) as u64,
-                    1,
-                );
-            } else {
-                let failure = if after.short_write_ops > before.short_write_ops {
-                    LiveWriteFailure::Short
-                } else if after.failed_write_ops > before.failed_write_ops {
-                    LiveWriteFailure::Failed
-                } else if timed_out || after.timeouts > before.timeouts {
-                    LiveWriteFailure::TimedOut
-                } else {
-                    LiveWriteFailure::Failed
-                };
-                counters.record_leased_write_failure(failure);
-            }
-        }
-        if result.is_ok() {
-            unknown.armed = false;
-        } else if let Some(counters) = &self.live_counters
-            && let Some(writer) = &mut self.live_writer
-        {
-            // A timeout may precede the terminal CQE. Keep the pre-submit
-            // snapshot with its unique queue owner, including on direct Drop.
             writer.failed_accounting = Some(FailedWriteAccounting {
                 before,
                 counters: counters.clone(),
             });
         }
-        // Return failures immediately. The worker detaches this queue and drains
-        // outside its mutex; the queue Drop also preserves terminal DMA ownership.
+        if sync == LiveWriteSync::Data
+            && let Some(counters) = &self.live_counters
+        {
+            counters.record_fua_write();
+        }
+        if let Some((timeline, sample)) = trace {
+            // Sampled groups pay one extra submit syscall to expose this boundary.
+            // Their completion interval can differ from untraced writes.
+            if writer.io.submit_pending_write().map_err(|error| {
+                if let Some(counters) = &self.live_counters {
+                    counters.record_unknown_write();
+                    counters.record_leased_write_failure(LiveWriteFailure::Failed);
+                }
+                super::TcpError::component(error)
+            })? {
+                timeline.live_group_event(
+                    Some(sample),
+                    crate::distributed::write_timeline::WriteTimelineStage::LiveIoSubmitted,
+                );
+            }
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.live_leased.delay_write) {
+            std::thread::sleep(std::time::Duration::from_millis(config.io_timeout_ms + 1));
+        }
+        Ok((id, deadline, submitted_at))
+    }
+
+    pub(crate) fn leased_write_window(&self) -> usize {
+        self.live_config.as_ref().map_or(1, |config| {
+            config
+                .leased_write_window
+                .unwrap_or(self.live_leased.flight_bound)
+        })
+    }
+
+    pub(crate) fn leased_flights_in_flight(&self) -> usize {
+        self.live_leased.flights.len()
+    }
+
+    pub(crate) fn progress_leased_flights(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
+        let result = self.progress_leased_flights_inner(released, timeline);
+        if result.is_err() {
+            self.live_write_failed = true;
+        }
         result
     }
 
+    fn progress_leased_flights_inner(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
+        use crate::distributed::nvmeof::live_io::LiveIoResult;
+        use crate::distributed::nvmeof::live_metrics::LiveWriteFailure;
+        use crate::distributed::write_timeline::WriteTimelineStage as Stage;
+        self.ensure_leased_healthy()?;
+        if self.live_leased.flights.is_empty() {
+            return Ok(());
+        }
+        if self
+            .live_leased
+            .flights
+            .iter()
+            .find(|flight| !flight.completed)
+            .is_some_and(|flight| Instant::now() >= flight.deadline)
+        {
+            if let Some(counters) = &self.live_counters {
+                counters.record_leased_write_failure(LiveWriteFailure::TimedOut);
+                counters.record_unknown_write();
+            }
+            return Err(super::TcpError::new("leased write deadline expired"));
+        }
+        let writer = self
+            .live_writer
+            .as_mut()
+            .ok_or_else(|| super::TcpError::new("live queue missing"))?;
+        let before = writer
+            .failed_accounting
+            .as_ref()
+            .map_or_else(|| writer.io.stats(), |accounting| accounting.before.clone());
+        self.live_leased.completions.clear();
+        writer
+            .io
+            .progress_into(&mut self.live_leased.completions)
+            .map_err(|error| {
+                if let Some(counters) = &self.live_counters {
+                    counters.record_leased_write_failure(LiveWriteFailure::Failed);
+                    counters.record_unknown_write();
+                }
+                super::TcpError::component(error)
+            })?;
+        let after = writer.io.stats();
+        let harvested = !self.live_leased.completions.is_empty();
+        for completion in self.live_leased.completions.drain(..) {
+            let Some(flight) = self
+                .live_leased
+                .flights
+                .iter_mut()
+                .find(|flight| flight.id == completion.id && !flight.completed)
+            else {
+                if let Some(counters) = &self.live_counters {
+                    counters.record_leased_write_failure(LiveWriteFailure::Failed);
+                    counters.record_unknown_write();
+                }
+                return Err(super::TcpError::new("leased write failed"));
+            };
+            if let Some(timeline) = timeline {
+                timeline.live_group_event(flight.sample, Stage::LiveIoCompleted);
+            }
+            if !matches!(completion.result, Ok(LiveIoResult::Written)) {
+                if let Some(counters) = &self.live_counters {
+                    let failure = if after.timeouts > before.timeouts {
+                        LiveWriteFailure::TimedOut
+                    } else if after.short_write_ops > before.short_write_ops {
+                        LiveWriteFailure::Short
+                    } else {
+                        LiveWriteFailure::Failed
+                    };
+                    counters.record_leased_write_failure(failure);
+                    counters.record_unknown_write();
+                }
+                return Err(super::TcpError::new("leased write failed"));
+            }
+            if let Some(counters) = &self.live_counters {
+                counters.record_timing(
+                    LiveTimingStage::LeasedWrite,
+                    completion
+                        .completed_at
+                        .saturating_duration_since(flight.submitted_at)
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64,
+                    1,
+                );
+            }
+            flight.completed = true;
+        }
+        if self
+            .live_leased
+            .flights
+            .iter()
+            .find(|flight| !flight.completed)
+            .is_some_and(|flight| Instant::now() >= flight.deadline)
+        {
+            if let Some(counters) = &self.live_counters {
+                counters.record_leased_write_failure(LiveWriteFailure::TimedOut);
+                counters.record_unknown_write();
+            }
+            return Err(super::TcpError::new("leased write deadline expired"));
+        }
+        if harvested {
+            if let Some(counters) = &self.live_counters {
+                record_write_io(counters, &before, &after);
+            }
+            if let Some(accounting) = &mut writer.failed_accounting {
+                accounting.before = after;
+            }
+        }
+        while self
+            .live_leased
+            .flights
+            .front()
+            .is_some_and(|flight| flight.completed)
+        {
+            let Some(flight) = self.live_leased.flights.pop_front() else {
+                break;
+            };
+            let current = self
+                .live_leased
+                .current
+                .as_mut()
+                .ok_or_else(|| super::TcpError::new("lease missing"))?;
+            debug_assert_eq!(current.written_end, flight.start);
+            current.written_end = flight.end;
+            current.acknowledged = flight.prefix;
+            if flight.frame_len != 0 {
+                if let Some(counters) = &self.live_counters {
+                    counters.record_leased_frame(flight.frame_len as u64);
+                }
+                if let Some(timeline) = timeline {
+                    timeline.live_group_event(flight.sample, Stage::LiveReceiptsValidated);
+                }
+                released.push((flight.id, flight.receipts));
+            }
+        }
+        if self.live_leased.flights.is_empty() {
+            writer.failed_accounting = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn drain_leased_flights(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
+        let result = (|| {
+            while !self.live_leased.flights.is_empty() {
+                self.wait_leased_flights(false)?;
+                self.progress_leased_flights(released, timeline)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.live_write_failed = true;
+        }
+        result
+    }
+
+    pub(crate) fn wait_leased_flights(&mut self, worker_wake: bool) -> Result<(), super::TcpError> {
+        let Some(front) = self
+            .live_leased
+            .flights
+            .iter()
+            .find(|flight| !flight.completed)
+        else {
+            return Ok(());
+        };
+        let remaining = front
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(std::time::Duration::from_millis(1));
+        let polled = self
+            .live_config
+            .as_ref()
+            .is_some_and(|config| config.polled_writes);
+        if worker_wake
+            && self.live_leased.worker_wake_registered
+            && !polled
+            && let Some(fd) = self.live_leased.worker_wake
+        {
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: descriptor points to one valid pollfd; poll does not retain it.
+            let result = unsafe { libc::poll(&mut descriptor, 1, i32::from(!remaining.is_zero())) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(super::TcpError::component(error));
+                }
+            }
+            let mut value = 0u64;
+            // SAFETY: value is writable for eight bytes and fd stays owned by the worker.
+            let result = unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) {
+                    return Err(super::TcpError::component(error));
+                }
+            }
+            return Ok(());
+        }
+        let io = &mut self
+            .live_writer
+            .as_mut()
+            .ok_or_else(|| super::TcpError::new("live queue missing"))?
+            .io;
+        io.wait(if polled {
+            std::time::Duration::ZERO
+        } else {
+            remaining
+        })
+        .map_err(super::TcpError::component)?;
+        Ok(())
+    }
+
     fn write_leased_skip(&mut self) -> Result<(), super::TcpError> {
-        let state = &self.live_leased;
-        let Some(current) = &state.current else {
+        debug_assert!(self.live_leased.flights.is_empty());
+        if !self.live_leased.flights.is_empty() {
+            return Err(super::TcpError::new(
+                "leased queue rebind with writes in flight",
+            ));
+        }
+        let Some(current) = &self.live_leased.current else {
             return Ok(());
         };
         if current.cursor == current.lease.extent.end {
             return Ok(());
         }
-        let offset = current.cursor % current.lease.extent.segment.bytes;
-        self.write_leased_block(
+        let cursor = current.cursor;
+        let prefix = current.acknowledged;
+        let offset = cursor % current.lease.extent.segment.bytes;
+        let (id, deadline, submitted_at) = self.submit_leased_frame(
             offset,
             4096,
             |block| {
@@ -2051,33 +2402,46 @@ impl super::Client {
             },
             None,
         )?;
+        self.live_leased.flights.push_back(LeasedFlight {
+            id,
+            start: cursor,
+            end: cursor,
+            prefix,
+            receipts: Vec::new(),
+            deadline,
+            submitted_at,
+            completed: false,
+            sample: None,
+            frame_len: 0,
+        });
+        self.drain_leased_flights(&mut Vec::new(), None)?;
         if let Some(counters) = &self.live_counters {
             counters.record_leased_skip();
         }
         Ok(())
     }
 
-    pub(crate) fn write_leased_group(
+    pub(crate) fn submit_leased_group(
         &mut self,
         epoch: u64,
         batches: Vec<super::CompleteBatch>,
         timeline: &crate::distributed::write_timeline::WriteTimeline,
         owner: u32,
-    ) -> Result<Vec<super::DurableBatch>, super::TcpError> {
-        let result = self.write_leased_group_inner(epoch, batches, timeline, owner);
+    ) -> Result<LeasedSubmit, super::TcpError> {
+        let result = self.submit_leased_group_inner(epoch, batches, timeline, owner);
         if result.is_err() {
             self.live_write_failed = true;
         }
         result
     }
 
-    fn write_leased_group_inner(
+    fn submit_leased_group_inner(
         &mut self,
         epoch: u64,
         batches: Vec<super::CompleteBatch>,
         timeline: &crate::distributed::write_timeline::WriteTimeline,
         owner: u32,
-    ) -> Result<Vec<super::DurableBatch>, super::TcpError> {
+    ) -> Result<LeasedSubmit, super::TcpError> {
         use crate::distributed::group::LiveFrame;
         use crate::distributed::nvmeof::live_storage::extend_live_receipt_digest;
         use crate::distributed::write_timeline::WriteTimelineStage as Stage;
@@ -2092,8 +2456,7 @@ impl super::Client {
                 "leased batch epoch differs from stream",
             ));
         }
-        let sample = timeline.live_group(owner, batches.iter().map(|batch| batch.version()));
-        timeline.live_group_event(sample, Stage::LiveGroupBuildStarted);
+        let build_started = timeline.enabled().then(Instant::now);
         // Keep ownership of immutable members, but encode only in the queue buffer.
         let group = LiveFrame::new(
             &self.shape,
@@ -2103,7 +2466,7 @@ impl super::Client {
         )
         .map_err(super::TcpError::component)?;
         let frame_len = group.len();
-        timeline.live_group_event(sample, Stage::LiveGroupBuilt);
+        let build_completed = build_started.map(|_| Instant::now());
         let config = self
             .live_config
             .as_ref()
@@ -2118,13 +2481,33 @@ impl super::Client {
                 "leased frame exceeds queue, fragment or live frame budget",
             ));
         }
+        if self.live_leased.flights.len() == self.leased_write_window()
+            || (!self.live_leased.flights.is_empty()
+                && (self
+                    .live_writer
+                    .as_ref()
+                    .is_some_and(|writer| !writer.io.has_credit(frame_len))
+                    || self.live_leased.current.as_ref().is_some_and(|current| {
+                        frame_len as u64 > current.lease.extent.end - current.cursor
+                            || current.prefixes.len() == 1024
+                    })))
+        {
+            return Ok(LeasedSubmit::Deferred(group.into_batches()));
+        }
+        // Deferred attempts do not consume timeline membership or group capacity.
+        let sample =
+            timeline.live_group(owner, group.batches().iter().map(|batch| batch.version()));
+        if let (Some(started), Some(completed)) = (build_started, build_completed) {
+            timeline.live_group_event_at(sample, Stage::LiveGroupBuildStarted, started);
+            timeline.live_group_event_at(sample, Stage::LiveGroupBuilt, completed);
+        }
         if self
             .live_leased
             .current
             .as_ref()
             .is_some_and(|current| current.prefixes.len() == 1024)
         {
-            self.settle_leased_extent()?;
+            self.settle_leased_extent(&mut Vec::new(), Some(timeline))?;
             if let Some(counters) = &self.live_counters {
                 counters.record_adoption_history_full_settle();
             }
@@ -2213,7 +2596,7 @@ impl super::Client {
             .checked_add(frame_len as u64)
             .ok_or_else(|| super::TcpError::new("leased write offset overflow"))?;
         let position = crate::WalPosition::new(cursor, frame_len as u32);
-        let mut prefix = current.acknowledged;
+        let mut prefix = current.reserved;
         prefix.end = end;
         let mut receipts = Vec::with_capacity(group.batches().len());
         let receipt_config = self
@@ -2255,7 +2638,7 @@ impl super::Client {
             .prefixes
             .push_back(prefix);
         timeline.live_group_event(sample, Stage::LiveIoStarted);
-        self.write_leased_block(
+        let (id, deadline, submitted_at) = self.submit_leased_frame(
             offset,
             frame_len,
             |buffer| {
@@ -2265,26 +2648,51 @@ impl super::Client {
             },
             sample.map(|sample| (timeline, sample)),
         )?;
-        timeline.live_group_event(sample, Stage::LiveIoCompleted);
         let current = self
             .live_leased
             .current
             .as_mut()
             .ok_or_else(|| super::TcpError::new("lease missing"))?;
+        timeline.live_group_position(
+            sample,
+            cursor,
+            offset,
+            frame_len as u32,
+            cursor / current.lease.extent.segment.bytes,
+            self.live_writer
+                .as_ref()
+                .ok_or_else(|| super::TcpError::new("live queue missing"))?
+                .io
+                .namespace()
+                .block_size,
+        );
         current.cursor = end;
-        current.written_end = end;
-        current.acknowledged = prefix;
+        current.reserved = prefix;
+        self.live_leased.flights.push_back(LeasedFlight {
+            id,
+            start: cursor,
+            end,
+            prefix,
+            receipts,
+            deadline,
+            submitted_at,
+            completed: false,
+            sample,
+            frame_len,
+        });
+        if let Some(counters) = &self.live_counters {
+            counters.record_max_leased_in_flight(self.live_leased.flights.len() as u64);
+        }
+        if std::mem::take(&mut self.live_leased.queue_rebound) {
+            timeline.live_group_event(sample, Stage::LiveQueueRebound);
+        }
         #[cfg(test)]
         if std::mem::take(&mut self.live_leased.invalidate_adoption_token)
             && let Some(current) = &mut self.live_leased.current
         {
             current.lease.extent.token[0] ^= 1;
         }
-        if let Some(counters) = &self.live_counters {
-            counters.record_leased_frame(frame_len as u64);
-        }
-        timeline.live_group_event(sample, Stage::LiveReceiptsValidated);
-        Ok(receipts)
+        Ok(LeasedSubmit::Submitted(id))
     }
 }
 
@@ -2451,30 +2859,39 @@ pub(crate) mod leased_tests {
             let mut client = self.writer();
             let mut config = client.live_config.clone().unwrap();
             config.lease_ahead = false;
-            client.configure_live_nvme(&config).unwrap();
+            client
+                .configure_live_nvme(
+                    &config,
+                    crate::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY,
+                )
+                .unwrap();
             client
         }
 
         fn configure_writer(&self, client: &mut Client, tier: DurabilityTier) {
             client
-                .configure_live_nvme(&LiveClientConfig {
-                    lease_ahead: true,
-                    polled_writes: false,
-                    host_nqn: "nqn.2026-01.test:leased".into(),
-                    host_id: [1; 16],
-                    owner_identities: Default::default(),
-                    max_inflight_requests: 4,
-                    max_inflight_bytes: (self.config.partition.group_limits.max_encoded_bytes
-                        + 4096)
-                        .max(128 * 1024),
-                    connect_timeout_ms: 1000,
-                    io_timeout_ms: 1000,
-                    write_mode: LiveWriteMode::Leased,
-                    leased_durability: Some(tier),
-                    inline_reads: true,
-                    queue_geometry: Default::default(),
-                    export_mode: Default::default(),
-                })
+                .configure_live_nvme(
+                    &LiveClientConfig {
+                        lease_ahead: true,
+                        polled_writes: false,
+                        host_nqn: "nqn.2026-01.test:leased".into(),
+                        host_id: [1; 16],
+                        owner_identities: Default::default(),
+                        leased_write_window: Some(4),
+                        max_inflight_requests: 4,
+                        max_inflight_bytes: (self.config.partition.group_limits.max_encoded_bytes
+                            + 4096)
+                            .max(128 * 1024),
+                        connect_timeout_ms: 1000,
+                        io_timeout_ms: 1000,
+                        write_mode: LiveWriteMode::Leased,
+                        leased_durability: Some(tier),
+                        inline_reads: true,
+                        queue_geometry: Default::default(),
+                        export_mode: Default::default(),
+                    },
+                    crate::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY,
+                )
                 .unwrap();
             client.live_write_local_fixture = true;
             client.set_live_metrics(self.metrics.clone()).unwrap();
@@ -2531,7 +2948,12 @@ pub(crate) mod leased_tests {
             serde_json::json!(vec![2; 16])
         );
         let decoded: LiveClientConfig = serde_json::from_value(json).unwrap();
-        client.configure_live_nvme(&decoded).unwrap();
+        client
+            .configure_live_nvme(
+                &decoded,
+                crate::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY,
+            )
+            .unwrap();
         let selected = client.live_config.as_ref().unwrap();
         assert_eq!(selected.host_nqn, identity.host_nqn);
         assert_eq!(selected.host_id, identity.host_id);
@@ -2552,7 +2974,7 @@ pub(crate) mod leased_tests {
 
     fn write(client: &mut Client, batch: &tcp::CompleteBatch) -> tcp::DurableBatch {
         client
-            .write_leased_group(1, vec![batch.clone()], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, vec![batch.clone()], &WriteTimeline::default(), 2)
             .unwrap()[0]
     }
 
@@ -2573,7 +2995,12 @@ pub(crate) mod leased_tests {
             let mut config = client.live_config.clone().unwrap();
             config.polled_writes = true;
             config.queue_geometry.poll_queues = 1;
-            client.configure_live_nvme(&config).unwrap();
+            client
+                .configure_live_nvme(
+                    &config,
+                    crate::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY,
+                )
+                .unwrap();
             let leased = client.lease_live_extent(1).unwrap();
             let path = leased.extent.segment.path.clone();
             let namespace = LiveNamespace::open_local_file(
@@ -2597,10 +3024,13 @@ pub(crate) mod leased_tests {
             };
             client.live_writer.as_mut().unwrap().io = io;
             let batch = fixture.batch(0);
-            if let Err(error) =
-                client.write_leased_group(1, vec![batch.clone()], &WriteTimeline::default(), 2)
-            {
-                assert!(error.to_string().contains("UnknownWrite"), "{error}");
+            if let Err(error) = client.submit_and_drain_leased_group(
+                1,
+                vec![batch.clone()],
+                &WriteTimeline::default(),
+                2,
+            ) {
+                assert_eq!(error.to_string(), "leased write failed");
                 let io = &mut client.live_writer.as_mut().unwrap().io;
                 unsupported(io.last_write_errno());
                 assert_eq!(io.outstanding(), 0);
@@ -2615,7 +3045,7 @@ pub(crate) mod leased_tests {
             let mut marker = [0; 8];
             std::os::unix::fs::FileExt::read_exact_at(&file, &mut marker, cursor).unwrap();
             assert_eq!(&marker, crate::crc::CrcFrame::skip_marker().as_ref());
-            client.close_live_writer().unwrap();
+            client.close_live_writer(&mut Vec::new(), None).unwrap();
             let log = fixture.node.inventory.lock().active(1).unwrap();
             assert_eq!(log.receipt_count(), 1);
         }
@@ -2634,7 +3064,7 @@ pub(crate) mod leased_tests {
                 .to_string(),
             "mapped residency probe unavailable during live writes"
         );
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         assert!(log.read_evidence_for_benchmark(true).is_ok());
     }
 
@@ -2682,7 +3112,7 @@ pub(crate) mod leased_tests {
                     batch.mutations()
                 );
                 cache.close(&mut owner_reader, 1).unwrap();
-                client.settle_leased_extent().unwrap();
+                client.settle_leased_extent(&mut Vec::new(), None).unwrap();
                 let adopted = client.live_leased.current.as_mut().unwrap().adopted;
                 assert_eq!(
                     adopted.end,
@@ -2716,7 +3146,7 @@ pub(crate) mod leased_tests {
                 }
             );
             assert_eq!(counts.leased_write_samples, 3);
-            client.close_leased_extent().unwrap();
+            client.close_leased_extent(&mut Vec::new(), None).unwrap();
             assert!(client.live_leased.current.is_none());
         }
     }
@@ -2759,7 +3189,12 @@ pub(crate) mod leased_tests {
         let batch = fixture.batch(0);
         assert!(
             client
-                .write_leased_group(1, vec![batch.clone(), batch], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![batch.clone(), batch],
+                    &WriteTimeline::default(),
+                    2
+                )
                 .is_err()
         );
         let counts = fixture.metrics.snapshot().counts;
@@ -2774,7 +3209,12 @@ pub(crate) mod leased_tests {
         client.expected.group_limits.max_encoded_bytes = 32;
         assert!(
             client
-                .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(0)],
+                    &WriteTimeline::default(),
+                    2
+                )
                 .is_err()
         );
         assert!(client.live_writer.is_none());
@@ -2833,7 +3273,7 @@ pub(crate) mod leased_tests {
             client.live_leased.current.as_mut().unwrap().prefixes.len(),
             1
         );
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -2903,7 +3343,7 @@ pub(crate) mod leased_tests {
                 batch.mutations()
             );
         }
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -2931,7 +3371,7 @@ pub(crate) mod leased_tests {
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -2940,17 +3380,22 @@ pub(crate) mod leased_tests {
         let mut client = fixture.writer();
         write(&mut client, &fixture.batch(0));
         client.live_leased.current.as_mut().unwrap().prefixes[0].digest[0] ^= 1;
-        assert!(client.settle_leased_extent().is_err());
+        assert!(client.settle_leased_extent(&mut Vec::new(), None).is_err());
         let before = fixture.metrics.snapshot().counts;
         assert_eq!(before.adoption_async_samples, 0);
         assert_eq!(before.adoption_settle_samples, 0);
         assert_eq!(before.adoption_history_full_settles, 0);
         assert!(
             client
-                .write_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(1)],
+                    &WriteTimeline::default(),
+                    2
+                )
                 .is_err()
         );
-        assert!(client.close_leased_extent().is_err());
+        assert!(client.close_leased_extent(&mut Vec::new(), None).is_err());
         let after = fixture.metrics.snapshot().counts;
         assert_eq!(after.completed_write_ops, before.completed_write_ops);
         assert_eq!(after.metadata_requests, before.metadata_requests);
@@ -2987,7 +3432,12 @@ pub(crate) mod leased_tests {
             let before = fixture.metrics.snapshot().counts.completed_write_ops;
             assert!(
                 client
-                    .write_leased_group(1, vec![fixture.batch(2)], &WriteTimeline::default(), 2)
+                    .submit_and_drain_leased_group(
+                        1,
+                        vec![fixture.batch(2)],
+                        &WriteTimeline::default(),
+                        2
+                    )
                     .is_err()
             );
             assert_eq!(
@@ -3067,11 +3517,11 @@ pub(crate) mod leased_tests {
         let submitted = fixture.metrics.snapshot().counts;
         assert_eq!(submitted.adoption_async_exchanges, 1);
         assert_eq!(submitted.adoption_async_samples, 0);
-        client.wait_leased_control().unwrap();
+        client.wait_leased_control(&mut Vec::new(), None).unwrap();
         let completed = fixture.metrics.snapshot().counts;
         assert_eq!(completed.adoption_async_samples, 1);
         assert!(completed.adoption_async_ns > 0);
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 0);
     }
 
@@ -3088,7 +3538,7 @@ pub(crate) mod leased_tests {
         for sequence in 0..3 * 1024 {
             write(&mut client, &fixture.batch(sequence));
         }
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         let log = fixture.node.inventory.lock().active(1).unwrap();
         assert_eq!(log.receipt_count(), 3 * 1024);
         assert_eq!(log.history_maintenance_stats().waits, 0);
@@ -3123,9 +3573,9 @@ pub(crate) mod leased_tests {
             client.live_leased.current.as_mut().unwrap().prefixes.len(),
             1
         );
-        client.settle_leased_extent().unwrap();
+        client.settle_leased_extent(&mut Vec::new(), None).unwrap();
         assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 2);
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         assert_eq!(
             fixture
                 .metrics
@@ -3175,7 +3625,7 @@ pub(crate) mod leased_tests {
             timeline.batch(batch.id().operation, batch.version());
             assert!(
                 client
-                    .write_leased_group(1, vec![batch], &timeline, 2)
+                    .submit_and_drain_leased_group(1, vec![batch], &timeline, 2)
                     .is_err()
             );
             assert!(client.live_write_failed);
@@ -3194,7 +3644,8 @@ pub(crate) mod leased_tests {
                 &[
                     Stage::LiveIoStarted,
                     Stage::LiveFrameEncoded,
-                    Stage::LiveIoSubmitted
+                    Stage::LiveIoSubmitted,
+                    Stage::LiveIoCompleted,
                 ]
             );
             assert_eq!(fixture.metrics.snapshot().counts.unknown_writes, 1);
@@ -3226,7 +3677,12 @@ pub(crate) mod leased_tests {
             }
             assert!(
                 client
-                    .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                    .submit_and_drain_leased_group(
+                        1,
+                        vec![fixture.batch(0)],
+                        &WriteTimeline::default(),
+                        2
+                    )
                     .is_err()
             );
             assert!(client.live_write_failed);
@@ -3240,10 +3696,15 @@ pub(crate) mod leased_tests {
             assert_eq!(submitted, 1);
             assert!(
                 client
-                    .write_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
+                    .submit_and_drain_leased_group(
+                        1,
+                        vec![fixture.batch(1)],
+                        &WriteTimeline::default(),
+                        2
+                    )
                     .is_err()
             );
-            assert!(client.settle_leased_extent().is_err());
+            assert!(client.settle_leased_extent(&mut Vec::new(), None).is_err());
             assert_eq!(
                 client
                     .live_writer
@@ -3299,7 +3760,12 @@ pub(crate) mod leased_tests {
         client.leased_test_timeout_write();
         assert!(
             client
-                .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2,)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(0)],
+                    &WriteTimeline::default(),
+                    2,
+                )
                 .is_err()
         );
         assert_eq!(client.live_writer.as_ref().unwrap().io.outstanding(), 1);
@@ -3326,7 +3792,12 @@ pub(crate) mod leased_tests {
             assert!(client.live_write_failed);
             assert!(
                 client
-                    .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                    .submit_and_drain_leased_group(
+                        1,
+                        vec![fixture.batch(0)],
+                        &WriteTimeline::default(),
+                        2
+                    )
                     .is_err()
             );
             assert_eq!(fixture.metrics.snapshot().counts.completed_write_ops, 0);
@@ -3367,7 +3838,12 @@ pub(crate) mod leased_tests {
         let before = fixture.metrics.snapshot().counts.completed_write_ops;
         assert!(
             client
-                .write_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(1)],
+                    &WriteTimeline::default(),
+                    2
+                )
                 .is_err()
         );
         assert_eq!(
@@ -3382,7 +3858,12 @@ pub(crate) mod leased_tests {
         let mut client = fixture.writer();
         assert!(
             client
-                .write_leased_group(2, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    2,
+                    vec![fixture.batch(0)],
+                    &WriteTimeline::default(),
+                    2
+                )
                 .is_err()
         );
         assert_eq!(fixture.metrics.snapshot().counts.metadata_requests, 0);
@@ -3446,7 +3927,12 @@ pub(crate) mod leased_tests {
             client.fence_to(1).unwrap();
             fixture.configure_writer(&mut client, requested);
             let error = client
-                .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(0)],
+                    &WriteTimeline::default(),
+                    2,
+                )
                 .unwrap_err();
             assert!(error.to_string().contains(&format!("{actual:?}")));
             assert!(error.to_string().contains(&format!("{requested:?}")));
@@ -3486,7 +3972,12 @@ pub(crate) mod leased_tests {
         assert!(client.install_leased_extent(next).is_err());
         assert!(
             client
-                .write_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(1)],
+                    &WriteTimeline::default(),
+                    2
+                )
                 .is_err()
         );
         assert_eq!(
@@ -3520,7 +4011,7 @@ pub(crate) mod leased_tests {
                 fixture.metrics.snapshot().counts.fua_writes,
                 u64::from(after == DurabilityTier::Synchronous)
             );
-            client.close_leased_extent().unwrap();
+            client.close_leased_extent(&mut Vec::new(), None).unwrap();
         }
     }
 
@@ -3565,13 +4056,18 @@ pub(crate) mod leased_tests {
         }
         assert!(
             client
-                .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(0)],
+                    &WriteTimeline::default(),
+                    2
+                )
                 .is_err()
         );
         let counts = fixture.metrics.snapshot().counts;
         assert_eq!(counts.leased_full_writes, 1);
         assert_eq!(leased_latencies(&counts), [(0, 0); 5]);
-        assert!(client.drain_live_writer().is_err());
+        assert!(client.drain_live_writer(&mut Vec::new(), None).is_err());
         let mut failed = client.take_failed_live_writer().unwrap();
         assert_eq!(failed.io.outstanding(), 4);
         failed.drain_failed().unwrap();
@@ -3592,7 +4088,7 @@ pub(crate) mod leased_tests {
             }
             assert!(
                 client
-                    .write_leased_group(
+                    .submit_and_drain_leased_group(
                         1,
                         vec![
                             fixture.big_batch(1),
@@ -3627,7 +4123,7 @@ pub(crate) mod leased_tests {
             .token[0] ^= 1;
         assert!(
             client
-                .write_leased_group(
+                .submit_and_drain_leased_group(
                     1,
                     vec![
                         fixture.big_batch(1),
@@ -3672,7 +4168,7 @@ pub(crate) mod leased_tests {
             fixture.big_batch(3),
         ];
         let receipts = client
-            .write_leased_group(1, group.clone(), &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, group.clone(), &WriteTimeline::default(), 2)
             .unwrap();
         assert_eq!(
             client
@@ -3703,7 +4199,7 @@ pub(crate) mod leased_tests {
                 batch.mutations()
             );
         }
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -3712,7 +4208,7 @@ pub(crate) mod leased_tests {
         let mut client = fixture.writer_without_ahead();
         write(&mut client, &fixture.batch(0));
         write(&mut client, &fixture.batch(1));
-        client.settle_leased_extent().unwrap();
+        client.settle_leased_extent(&mut Vec::new(), None).unwrap();
         assert!(
             client
                 .live_leased
@@ -3757,7 +4253,7 @@ pub(crate) mod leased_tests {
                 .prefixes
                 .is_empty()
         );
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -3768,7 +4264,7 @@ pub(crate) mod leased_tests {
         client.wait_closing_extent(true).unwrap();
         let before = fixture.metrics.snapshot().counts;
         let receipts = client
-            .write_leased_group(
+            .submit_and_drain_leased_group(
                 1,
                 vec![
                     fixture.big_batch(1),
@@ -3790,7 +4286,7 @@ pub(crate) mod leased_tests {
             client.live_leased.current.as_ref().unwrap().adopted.count,
             0
         );
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         let mut reader = fixture.client();
         for (sequence, receipt) in (1..=3).zip(receipts) {
             let batch = fixture.big_batch(sequence);
@@ -3811,7 +4307,7 @@ pub(crate) mod leased_tests {
         write(&mut client, &fixture.batch(0));
         assert!(client.live_leased.next.is_none());
         client
-            .write_leased_group(
+            .submit_and_drain_leased_group(
                 1,
                 vec![
                     fixture.big_batch(1),
@@ -3824,7 +4320,7 @@ pub(crate) mod leased_tests {
             .unwrap();
         assert_eq!(fixture.metrics.snapshot().counts.extent_switch_waits, 1);
         assert_eq!(fixture.metrics.snapshot().counts.adoption_sync_exchanges, 0);
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         assert_eq!(fixture.node.log_for_test(1).receipt_count(), 4);
     }
 
@@ -3834,7 +4330,7 @@ pub(crate) mod leased_tests {
         let mut client = fixture.writer();
         write(&mut client, &fixture.batch(0));
         client.wait_closing_extent(true).unwrap();
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         assert!(client.live_leased.current.is_none());
         assert!(client.live_leased.closing.is_none());
         assert!(client.live_leased.next.is_none());
@@ -3848,7 +4344,7 @@ pub(crate) mod leased_tests {
         let next = client.lease_live_extent(1).unwrap();
         assert_eq!(next.extent.start, 32768);
         client.install_leased_extent(next).unwrap();
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -3857,7 +4353,7 @@ pub(crate) mod leased_tests {
         let mut client = fixture.writer_without_ahead();
         write(&mut client, &fixture.batch(0));
         client
-            .write_leased_group(
+            .submit_and_drain_leased_group(
                 1,
                 vec![
                     fixture.big_batch(1),
@@ -3875,7 +4371,7 @@ pub(crate) mod leased_tests {
         assert_eq!(counts.extent_preleases, 0);
         assert_eq!(counts.extent_switch_waits, 0);
         assert!(client.live_leased.closing.is_none());
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -3900,7 +4396,7 @@ pub(crate) mod leased_tests {
                     sample
                 })
                 .collect();
-            let result = client.write_leased_group(1, batches, &timeline, 2);
+            let result = client.submit_and_drain_leased_group(1, batches, &timeline, 2);
             assert_eq!(result.is_err(), fail);
             for sample in samples {
                 timeline.complete(sample, None);
@@ -3952,7 +4448,7 @@ pub(crate) mod leased_tests {
             } else {
                 assert!(counts.adopt_owner_ns > 0);
                 assert_eq!(counts.adopt_close_scan_bytes, 12288);
-                client.close_leased_extent().unwrap();
+                client.close_leased_extent(&mut Vec::new(), None).unwrap();
             }
         }
     }
@@ -3985,7 +4481,8 @@ pub(crate) mod leased_tests {
         let (mut client, result) = thread::scope(|scope| {
             let (finished, done) = std::sync::mpsc::sync_channel(1);
             let work = scope.spawn(move || {
-                let result = client.write_leased_group(1, group, &WriteTimeline::default(), 2);
+                let result =
+                    client.submit_and_drain_leased_group(1, group, &WriteTimeline::default(), 2);
                 let _ = finished.send(());
                 (client, result)
             });
@@ -4014,7 +4511,7 @@ pub(crate) mod leased_tests {
                 .start,
             16384
         );
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -4026,14 +4523,14 @@ pub(crate) mod leased_tests {
         client.owner_timeline_arm(32).unwrap();
         timeline.arm(32).unwrap();
         let first = client
-            .write_leased_group(1, vec![fixture.batch(0)], &timeline, 2)
+            .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &timeline, 2)
             .unwrap()[0];
-        client.wait_leased_control().unwrap();
+        client.wait_leased_control(&mut Vec::new(), None).unwrap();
         client.submit_leased_adoption().unwrap();
-        client.wait_leased_control().unwrap();
+        client.wait_leased_control(&mut Vec::new(), None).unwrap();
         let through = first.appended().address().offset + u64::from(first.appended().address().len);
         client.checkpoint_position(1, 1, through).unwrap();
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         let (records, dropped, incomplete, error) = client.owner_timeline_fetch_partial();
         assert!(error.is_none());
         assert_eq!((dropped, incomplete), (0, 0));
@@ -4073,6 +4570,381 @@ pub(crate) mod leased_tests {
             }
         }
     }
+    #[test]
+    fn leased_eventfd_registration_failure_keeps_bounded_io_wait() {
+        let fixture = Fixture::new(DurabilityTier::Native, 32768);
+        let mut client = fixture.writer_without_ahead();
+        client.leased_test_hold_completions(&[]);
+        client.set_worker_wake(-1);
+        assert!(!client.live_leased.worker_wake_registered);
+        assert_eq!(
+            fixture.metrics.snapshot().counts.leased_eventfd_unavailable,
+            1
+        );
+        let timeline = WriteTimeline::default();
+        assert!(matches!(
+            client
+                .submit_leased_group(1, vec![fixture.batch(0)], &timeline, 2)
+                .unwrap(),
+            LeasedSubmit::Submitted(1)
+        ));
+        let mut released = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while released.is_empty() {
+            assert!(Instant::now() < deadline);
+            client.wait_leased_flights(true).unwrap();
+            client.progress_leased_flights(&mut released, None).unwrap();
+        }
+        assert_eq!(released[0].0, 1);
+        client.clear_worker_wake();
+    }
+
+    fn progress_until(
+        client: &mut Client,
+        released: &mut Vec<(u64, Vec<tcp::DurableBatch>)>,
+        timeline: &WriteTimeline,
+        ready: impl Fn(&Client) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready(client) {
+            assert!(
+                Instant::now() < deadline,
+                "leased test progress deadline expired"
+            );
+            client.wait_leased_flights(false).unwrap();
+            client
+                .progress_leased_flights(released, Some(timeline))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn leased_window_deferred_attempts_do_not_consume_timeline_groups() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let fixture = Fixture::new(tier, 32768);
+            let mut client = fixture.writer_without_ahead();
+            client.leased_test_set_window(1);
+            let timeline = WriteTimeline::default();
+            timeline.arm(1).unwrap();
+            assert!(matches!(
+                client
+                    .submit_leased_group(1, vec![fixture.batch(0)], &timeline, 2)
+                    .unwrap(),
+                LeasedSubmit::Submitted(1)
+            ));
+            let batch = fixture.batch(1);
+            let call = timeline.begin(1).unwrap();
+            timeline.operation(call, batch.id().operation);
+            timeline.batch(batch.id().operation, batch.version());
+            let mut batches = vec![batch];
+            for _ in 0..3 {
+                let LeasedSubmit::Deferred(returned) = client
+                    .submit_leased_group(1, batches, &timeline, 2)
+                    .unwrap()
+                else {
+                    panic!("full window admitted another frame");
+                };
+                batches = returned;
+            }
+            client
+                .drain_leased_flights(&mut Vec::new(), Some(&timeline))
+                .unwrap();
+            client
+                .submit_and_drain_leased_group(1, batches, &timeline, 2)
+                .unwrap();
+            timeline.complete(call, None);
+            let export = timeline.finish().unwrap();
+            assert_eq!(export.live_groups.len(), 1);
+            assert_eq!(export.dropped_live_groups, 0);
+            assert_eq!(export.live_groups[0].wal_position, Some(4096));
+            assert!(
+                export.records[0]
+                    .events
+                    .windows(2)
+                    .all(|events| events[0].elapsed_ns <= events[1].elapsed_ns)
+            );
+        }
+    }
+
+    #[test]
+    fn leased_window_releases_receipts_in_frame_order_when_completions_reorder() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let fixture = Fixture::new(tier, 32768);
+            let mut client = fixture.writer_without_ahead();
+            client.leased_test_set_window(4);
+            client.leased_test_hold_completions(&[1]);
+            let timeline = WriteTimeline::default();
+            timeline.arm(4).unwrap();
+            let mut calls = Vec::new();
+            for sequence in 0..4 {
+                let batch = fixture.batch(sequence);
+                let call = timeline.begin(sequence).unwrap();
+                timeline.operation(call, batch.id().operation);
+                timeline.batch(batch.id().operation, batch.version());
+                calls.push(call);
+                assert!(
+                    matches!(client.submit_leased_group(1, vec![batch], &timeline, 2).unwrap(),
+                    LeasedSubmit::Submitted(id) if id == sequence + 1)
+                );
+            }
+            let mut released = Vec::new();
+            progress_until(&mut client, &mut released, &timeline, |client| {
+                client
+                    .live_leased
+                    .flights
+                    .iter()
+                    .skip(1)
+                    .all(|flight| flight.completed)
+            });
+            assert!(released.is_empty());
+            let current = client.live_leased.current.as_ref().unwrap();
+            assert_eq!((current.cursor, current.written_end), (16384, 0));
+            assert!(
+                matches!(client.submit_leased_group(1, vec![fixture.batch(4)], &timeline, 2).unwrap(),
+                LeasedSubmit::Deferred(batches) if batches.len() == 1)
+            );
+            client.leased_test_release_held();
+            client
+                .drain_leased_flights(&mut released, Some(&timeline))
+                .unwrap();
+            assert_eq!(
+                released.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4]
+            );
+            assert_eq!(
+                client.live_leased.current.as_ref().unwrap().written_end,
+                16384
+            );
+            client
+                .settle_leased_extent(&mut Vec::new(), Some(&timeline))
+                .unwrap();
+            let owner = fixture.node.log_for_test(1);
+            assert_eq!(owner.receipt_count(), 4);
+            let mut reader = fixture.client();
+            for (sequence, (_, receipts)) in released.iter().enumerate() {
+                let batch = fixture.batch(sequence as u64);
+                let reference = batch
+                    .record_reference(receipts[0].appended().address(), 0)
+                    .unwrap();
+                assert_eq!(
+                    reader.read_records(1, &[reference]).unwrap(),
+                    batch.mutations()
+                );
+            }
+            for call in calls {
+                timeline.complete(call, None);
+            }
+            let export = timeline.finish().unwrap();
+            for (sequence, group) in export.live_groups.iter().enumerate() {
+                assert_eq!(group.wal_position, Some(sequence as u64 * 4096));
+                assert_eq!(group.file_offset, group.wal_position);
+                assert_eq!(group.frame_len, Some(4096));
+                assert_eq!(group.wal_file, Some(0));
+                assert_eq!(group.namespace_block_size, Some(4096));
+            }
+        }
+    }
+
+    #[test]
+    fn leased_window_crash_recovers_only_contiguous_prefix() {
+        use std::os::unix::fs::FileExt;
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let fixture = Fixture::new(tier, 32768);
+            let mut client = fixture.writer_without_ahead();
+            let timeline = WriteTimeline::default();
+            client.leased_test_hold_completions(&[2]);
+            client.leased_test_fail_flight(2, -libc::EIO);
+            for sequence in 0..4 {
+                assert!(matches!(
+                    client
+                        .submit_leased_group(1, vec![fixture.batch(sequence)], &timeline, 2)
+                        .unwrap(),
+                    LeasedSubmit::Submitted(_)
+                ));
+            }
+            let mut released = Vec::new();
+            progress_until(&mut client, &mut released, &timeline, |client| {
+                client
+                    .live_leased
+                    .flights
+                    .iter()
+                    .skip(1)
+                    .all(|flight| flight.completed)
+                    && client.live_writer.as_ref().unwrap().io.outstanding() == 0
+            });
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0].0, 1);
+            let first = released[0].1[0];
+            let current = client.live_leased.current.as_ref().unwrap();
+            assert_eq!(current.written_end, 4096);
+            // The injected failed CQE does not alter real DMA. Tear the retired frame's CRC.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&current.lease.extent.segment.path)
+                .unwrap();
+            file.write_all_at(&[0xff; 4], 4100).unwrap();
+            file.sync_data().unwrap();
+            drop(file);
+            drop(client); // No adoption, close, or receipt release for frames 2..4.
+            let mut recovery = fixture.client();
+            recovery.fence_to(2).unwrap();
+            let log = fixture
+                .node
+                .inventory
+                .lock()
+                .live_recovery_log(2, 1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(log.receipt_count(), 1);
+            let batch = fixture.batch(0);
+            let reference = batch
+                .record_reference(first.appended().address(), 0)
+                .unwrap();
+            assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]);
+        }
+    }
+
+    #[test]
+    fn leased_window_extent_switch_drains_before_skip_marker() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let fixture = Fixture::new(tier, 6 * 4096);
+            let mut client = fixture.writer_without_ahead();
+            let timeline = WriteTimeline::default();
+            let mut released = Vec::new();
+            client.leased_test_hold_completions(&[1]);
+            for sequence in 0..4 {
+                assert!(matches!(
+                    client
+                        .submit_leased_group(1, vec![fixture.batch(sequence)], &timeline, 2)
+                        .unwrap(),
+                    LeasedSubmit::Submitted(_)
+                ));
+            }
+            progress_until(&mut client, &mut released, &timeline, |client| {
+                client
+                    .live_leased
+                    .flights
+                    .iter()
+                    .skip(1)
+                    .all(|flight| flight.completed)
+            });
+            assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
+            client.leased_test_release_held();
+            client.drain_leased_flights(&mut released, None).unwrap();
+            // A two-block frame leaves one block. The next two-block frame needs a skip.
+            for sequence in 4..7 {
+                let batch = if sequence < 5 {
+                    fixture.batch(sequence)
+                } else {
+                    fixture.big_batch(sequence)
+                };
+                loop {
+                    match client
+                        .submit_leased_group(1, vec![batch.clone()], &timeline, 2)
+                        .unwrap()
+                    {
+                        LeasedSubmit::Submitted(_) => break,
+                        LeasedSubmit::Deferred(_) => {
+                            if sequence == 5 {
+                                assert_eq!(
+                                    fixture.metrics.snapshot().counts.leased_skip_markers,
+                                    0
+                                );
+                            }
+                            client.drain_leased_flights(&mut released, None).unwrap();
+                        }
+                    }
+                }
+            }
+            client.drain_leased_flights(&mut released, None).unwrap();
+            for sequence in 7..10 {
+                let batch = fixture.big_batch(sequence);
+                loop {
+                    match client
+                        .submit_leased_group(1, vec![batch.clone()], &timeline, 2)
+                        .unwrap()
+                    {
+                        LeasedSubmit::Submitted(_) => break,
+                        LeasedSubmit::Deferred(_) => {
+                            client.drain_leased_flights(&mut released, None).unwrap()
+                        }
+                    }
+                }
+            }
+            client.close_leased_extent(&mut released, None).unwrap();
+            assert_eq!(released.len(), 10);
+            let log = fixture.node.log_for_test(1);
+            assert_eq!(log.receipt_count(), 10);
+            let mut reader = fixture.client();
+            assert!(fixture.metrics.snapshot().counts.leased_skip_markers > 0);
+            for (sequence, (_, receipts)) in released.into_iter().enumerate() {
+                let batch = if sequence < 5 {
+                    fixture.batch(sequence as u64)
+                } else {
+                    fixture.big_batch(sequence as u64)
+                };
+                let reference = batch
+                    .record_reference(receipts[0].appended().address(), 0)
+                    .unwrap();
+                assert_eq!(
+                    reader.read_records(1, &[reference]).unwrap(),
+                    batch.mutations()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leased_window_checkpoint_position_does_not_cover_a_completion_hole() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let fixture = Fixture::new(tier, 32768);
+            let mut client = fixture.writer_without_ahead();
+            let timeline = WriteTimeline::default();
+            client.leased_test_hold_completions(&[1]);
+            for sequence in 0..2 {
+                assert!(matches!(
+                    client
+                        .submit_leased_group(1, vec![fixture.batch(sequence)], &timeline, 2)
+                        .unwrap(),
+                    LeasedSubmit::Submitted(_)
+                ));
+            }
+            let mut released = Vec::new();
+            progress_until(&mut client, &mut released, &timeline, |client| {
+                client.live_leased.flights[1].completed
+            });
+            assert!(released.is_empty());
+            client.prepare_leased_position().unwrap();
+            let written_end = client.live_leased.current.as_ref().unwrap().written_end;
+            assert_eq!(written_end, 0);
+            assert!(
+                client
+                    .submit_checkpoint_position(
+                        1,
+                        1,
+                        written_end,
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                    .unwrap()
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let proof = loop {
+                assert!(Instant::now() < deadline);
+                client.progress_appends().unwrap();
+                if let Some(proof) = client.take_checkpoint_position(1, written_end) {
+                    break proof.unwrap();
+                }
+                thread::yield_now();
+            };
+            assert!(proof.durable_end >= written_end);
+            assert_eq!(
+                client.live_leased.current.as_ref().unwrap().written_end,
+                written_end
+            );
+            client.leased_test_release_held();
+            client.drain_leased_flights(&mut released, None).unwrap();
+        }
+    }
 }
 
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
@@ -4103,6 +4975,42 @@ impl super::Client {
     }
     pub(crate) fn leased_test_largest_close_profile(&self) -> super::live_control::AdoptProfile {
         self.live_leased.largest_close_profile
+    }
+    pub(crate) fn leased_test_set_window(&mut self, window: usize) {
+        self.live_config.as_mut().unwrap().leased_write_window = Some(window);
+        self.live_leased.flights.reserve(window);
+        self.live_leased.completions.reserve(window);
+    }
+    pub(crate) fn leased_test_no_window(&mut self, max_inflight_requests: usize) {
+        let mut config = self.live_config.clone().unwrap();
+        config.leased_write_window = None;
+        config.max_inflight_requests = max_inflight_requests;
+        self.configure_live_nvme(
+            &config,
+            crate::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY,
+        )
+        .unwrap();
+    }
+    pub(crate) fn leased_test_single_batch_groups(&mut self) {
+        self.expected.group_limits.max_batches = 1;
+    }
+    pub(crate) fn leased_test_hold_completions(&mut self, ids: &[u64]) {
+        if self.live_leased.current.is_none() {
+            let leased = self.lease_live_extent(1).unwrap();
+            self.install_leased_extent(leased).unwrap();
+        }
+        self.ensure_leased_queue().unwrap();
+        self.live_writer.as_mut().unwrap().io.hold_completions(ids);
+    }
+    pub(crate) fn leased_test_release_held(&mut self) {
+        self.live_writer.as_mut().unwrap().io.release_held();
+    }
+    pub(crate) fn leased_test_fail_flight(&mut self, id: u64, result: i32) {
+        self.live_writer
+            .as_mut()
+            .unwrap()
+            .io
+            .override_completion_result(id, result);
     }
     pub(crate) fn leased_test_fail_write(&mut self, result: i32) {
         self.live_leased.next_write_result = Some(result);
@@ -4156,26 +5064,35 @@ mod leased_rollover_tests {
         for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
             let fixture = leased_tests::Fixture::new(tier, 16384);
             let mut client = fixture.writer();
-            let mut receipts = Vec::with_capacity(9);
+            client.leased_test_set_window(4);
+            let mut released = Vec::with_capacity(9);
             let mut first_binding = None;
+            let timeline = WriteTimeline::default();
             for sequence in 0..9 {
-                receipts.push(
-                    client
-                        .write_leased_group(
-                            1,
-                            vec![fixture.batch(sequence)],
-                            &WriteTimeline::default(),
-                            2,
-                        )
-                        .unwrap()[0],
-                );
+                let mut batches = vec![fixture.batch(sequence)];
+                loop {
+                    match client
+                        .submit_leased_group(1, batches, &timeline, 2)
+                        .unwrap()
+                    {
+                        LeasedSubmit::Submitted(_) => break,
+                        LeasedSubmit::Deferred(deferred) => {
+                            batches = deferred;
+                            client.drain_leased_flights(&mut released, None).unwrap();
+                            client.wait_closing_extent(true).unwrap();
+                        }
+                    }
+                }
                 if sequence == 0 {
                     first_binding = Some(client.live_writer.as_ref().unwrap().target.uuid);
                 }
-                if sequence < 8 {
-                    client.wait_closing_extent(true).unwrap();
-                }
             }
+            client.drain_leased_flights(&mut released, None).unwrap();
+            let receipts: Vec<_> = released
+                .into_iter()
+                .map(|(_, receipts)| receipts[0])
+                .collect();
+            assert_eq!(fixture.metrics.snapshot().counts.max_leased_in_flight, 4);
             let current = client.live_leased.current.as_ref().unwrap();
             assert_eq!(current.lease.extent.segment.file_index, 1);
             assert_eq!(current.lease.extent.start, 32768);
@@ -4203,7 +5120,7 @@ mod leased_rollover_tests {
                     batch.mutations()
                 );
             }
-            client.close_leased_extent().unwrap();
+            client.close_leased_extent(&mut Vec::new(), None).unwrap();
             assert_eq!(fixture.node.log_for_test(1).receipt_count(), 9);
         }
     }
@@ -4217,7 +5134,7 @@ mod leased_rollover_tests {
             let batch = fixture.batch(sequence);
             receipts.push(
                 client
-                    .write_leased_group(1, vec![batch], &WriteTimeline::default(), 2)
+                    .submit_and_drain_leased_group(1, vec![batch], &WriteTimeline::default(), 2)
                     .unwrap()[0],
             );
         }
@@ -4244,7 +5161,7 @@ mod leased_rollover_tests {
                 batch.mutations()
             );
         }
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 
     #[test]
@@ -4253,16 +5170,16 @@ mod leased_rollover_tests {
         let mut client = fixture.writer();
         let first = fixture.batch(0);
         client
-            .write_leased_group(1, vec![first], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, vec![first], &WriteTimeline::default(), 2)
             .unwrap();
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
         client.fence_to(2).unwrap();
         let batch = super::super::tests::batch(&fixture.config, 2, 0);
         let receipts = client
-            .write_leased_group(2, vec![batch.clone()], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(2, vec![batch.clone()], &WriteTimeline::default(), 2)
             .unwrap();
         assert_eq!(receipts[0].appended().address().segment_generation, 2);
-        client.settle_leased_extent().unwrap();
+        client.settle_leased_extent(&mut Vec::new(), None).unwrap();
         assert_eq!(
             client.live_leased.current.as_mut().unwrap().adopted.count,
             1
@@ -4278,6 +5195,6 @@ mod leased_rollover_tests {
                 .unwrap(),
             batch.mutations()[0]
         );
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 }

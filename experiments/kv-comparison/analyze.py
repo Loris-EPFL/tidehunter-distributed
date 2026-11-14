@@ -1349,7 +1349,7 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
         raise ValueError("write timeline lacks executed manifest")
     data = json.loads(path.read_text())
     if (not isinstance(data, dict) or type(data.get("schema_version")) is not int
-            or data["schema_version"] != 1 or type(data.get("requested_limit")) is not int
+            or data["schema_version"] not in (1, 2) or type(data.get("requested_limit")) is not int
             or data["requested_limit"] != limit
             or type(data.get("measurement_attempted")) is not bool
             or type(data.get("measurement_drained")) is not bool
@@ -1367,6 +1367,9 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
                              "owner_captured_connections": None, "error": data["error"]}}
     if not isinstance(trace, dict) or type(trace.get("limit")) is not int or trace["limit"] != limit:
         raise ValueError("write timeline payload limit differs")
+    if data["schema_version"] == 2 and (type(trace.get("origin_monotonic_ns")) is not int
+                                        or not 0 <= trace["origin_monotonic_ns"] < 2**64):
+        raise ValueError("invalid write timeline monotonic origin")
     live = (expected_backend == "tidehunter_live_nvmeof"
             or (manifest_path.is_file() and manifest.get("backend_info", {}).get("name") == "tidehunter_live_nvmeof"))
     groups = trace.get("live_groups")
@@ -1400,7 +1403,7 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
               "live_group_build_started", "live_group_built", "live_reserve_started", "live_reserve_completed",
               "live_namespace_setup_started", "live_namespace_setup_completed", "live_io_started",
               "live_io_completed", "live_complete_started", "live_complete_completed", "live_receipts_validated",
-              "live_frame_encoded", "live_io_submitted",
+              "live_frame_encoded", "live_io_submitted", "live_queue_rebound",
               "live_extent_switch_started", "live_extent_switch_completed"}
     ids, owner_keys = set(), set()
     owner_success = {}

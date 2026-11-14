@@ -112,6 +112,7 @@ counter_fields!(
     complete_exchanges,
     lease_exchanges,
     leased_frames,
+    leased_eventfd_unavailable,
     leased_bytes,
     leased_skip_markers,
     extents_leased,
@@ -199,6 +200,8 @@ counter_fields!(
     // Member bytes delivered as slices of the I/O block instead of a copy.
     copy_bytes_avoided;
     max:
+    // Peak over each producer's lifetime; aggregation keeps the largest peak.
+    max_leased_in_flight,
     lane_inflight_request_max,
     lane_inflight_op_max,
 );
@@ -298,6 +301,16 @@ impl LiveNvmeCounters {
         // Relaxed: these independent evidence counters publish no stream state.
         self.leased_frames.fetch_add(1, Ordering::Relaxed);
         self.leased_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub(crate) fn record_max_leased_in_flight(&self, count: u64) {
+        // Relaxed: this peak is evidence, not publication of flight state.
+        self.max_leased_in_flight
+            .fetch_max(count, Ordering::Relaxed);
+    }
+    pub(crate) fn record_leased_eventfd_unavailable(&self) {
+        // Relaxed: this count does not publish queue ownership.
+        self.leased_eventfd_unavailable
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_leased_skip(&self) {
         // Relaxed: evidence only, not a stream ordering barrier.

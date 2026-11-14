@@ -1650,7 +1650,7 @@ def live_nvme_preparation(config, case, transport):
             "transport": transport, "service": 4420, "port_id": 1000,
             "commissioning_service": 4421, "commissioning_port_id": 1001,
             "max_inflight_requests": 32, "max_inflight_bytes": 16 * 1024**2,
-            "connect_timeout_ms": 30000, "io_timeout_ms": 30000}
+            "leased_write_window": None, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}
 
 
 def live_host_identity(host_nqn):
@@ -1677,7 +1677,7 @@ def admit_prepared_live_client(live_client, prep, tier):
                     leased_durability=tier if prep["write_mode"] == "leased" else None,
                     inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"],
                     export_mode=prep["export_mode"])
-    for key, default in (("lease_ahead", True), ("polled_writes", False)):
+    for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
     if live_client != expected:
@@ -2048,6 +2048,19 @@ def floor_client_attempts(argv, deadline, *, perftest):
     raise AssertionError("bounded floor attempts exhausted")
 
 
+def store_owner_ftrace(directory, traces):
+    """Keep owner trace payloads beside the case, not only in guest receipts."""
+    for index, trace in enumerate(traces):
+        if index == 0 or trace.get("inactive"):
+            continue  # all_hosts starts with the coordinator.
+        trace = dict(trace)
+        text = trace.pop("trace", "")
+        target = Path(directory) if index == 1 else Path(directory) / "owner-ftrace" / f"node-{index - 1}"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "owner-ftrace.txt").write_text(text)
+        dump(target / "owner-ftrace.json", trace)
+
+
 def guest_operation(config, request, clients, *, local_mode=None):
     index = request["index"]
     if type(index) is not int or index not in range(-1, len(config["fleet"]["nodes"])):
@@ -2057,7 +2070,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
     root = guarded(config["fleet"]["data_root"], Path("/mnt/tidehunter-kv-comparison"), must_exist=True)
     action = request["action"]
     if local_mode is not None and action in ("cold_trace_probe", "cold_trace_start", "cold_trace_stop",
-                                             "nvme_trace_start", "nvme_trace_stop"):
+                                             "nvme_trace_start", "nvme_trace_stop", "owner_ftrace_start", "owner_ftrace_stop"):
         raise SafetyError("local physical-device tracing is not permitted")
     if local_mode is not None and action in ("monitor_start", "monitor_stop", "snapshot", "tide_start", "tide_stop"):
         return local_mode.request(index, request, case=request.get("case_id", "startup"),
@@ -2626,6 +2639,22 @@ def guest_operation(config, request, clients, *, local_mode=None):
                 result["live_spdk_state"] = {"available": False, "reason": type(exc).__name__ + ": " + str(exc)}
         result["kernel_errors"] = {"available": False, "reason": "no safe exact-owner kernel log filter"}
         return result
+    if action in ("owner_ftrace_start", "owner_ftrace_stop"):
+        import owner_ftrace
+        if index < 0:
+            return {"available": False, "reason": "coordinator has no owner WAL"}
+        state_path = capsule_root / "owner-ftrace-state.json"
+        instance = Path("/sys/kernel/tracing/instances") / ("th-" + case)
+        if action == "owner_ftrace_start":
+            instance = owner_ftrace.start(case)
+            state = owner_ftrace.START_STATES.pop(str(instance))
+            dump(state_path, state)
+            return state
+        state = json.loads(state_path.read_text()) if state_path.exists() else None
+        result = owner_ftrace.stop(instance, capsule_root, state)
+        result["trace"] = ((capsule_root / "owner-ftrace.txt").read_text(errors="replace")
+                           if (capsule_root / "owner-ftrace.txt").exists() else "")
+        return result
     if action in ("cold_trace_start", "cold_trace_stop"):
         if index < 0:
             return {"available": False, "reason": "coordinator has no owner WAL"}
@@ -2681,7 +2710,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
         command(systemd_argv(config, case, "storage-" + str(index), config["fleet"]["server_cpus"],
                              config["fleet"]["server_memory_mib"], seconds,
                              [config["binary"], "--experimental-storage-node", capsule_root / "launch.yaml"],
-                             setenv={"TIDEHUNTER_HISTORY_DIAGNOSTICS": "1"} if request.get("owner_history_diagnostics") else None), timeout=20)
+                             setenv={**({"TIDEHUNTER_HISTORY_DIAGNOSTICS": "1"} if request.get("owner_history_diagnostics") else {}),
+                                     **({"TIDEHUNTER_OWNER_EVENTS": "1"} if request.get("owner_trace") else {})}), timeout=20)
         deadline = time.monotonic() + min(90, seconds)
         while time.monotonic() < deadline:
             ready = Path(launch["ready_file"])
@@ -2732,6 +2762,9 @@ def guest_operation(config, request, clients, *, local_mode=None):
         if request.get("owner_history_diagnostics"):
             history_path = (capsule_root / "launch.yaml").with_suffix(".history-maintenance.json")
             result["history_maintenance"] = json.loads(guarded(history_path, guest_root, must_exist=True).read_text())
+        if request.get("owner_trace"):
+            owner_path = (capsule_root / "launch.yaml").with_suffix(".owner-events.json")
+            result["owner_events"] = json.loads(guarded(owner_path, guest_root, must_exist=True).read_text())
         if launch["node"].get("live_target") is not None:
             import nvme_campaign_owner
             try:
@@ -3330,6 +3363,7 @@ class Controller:
                                        export_mode=job.get("live_export_mode", "on_demand"),
                                        lease_ahead=job.get("live_lease_ahead", True),
                                        polled_writes=job.get("live_polled_writes", False),
+                                       leased_write_window=job.get("live_leased_write_window"),
                                        queue_geometry={"io_queues": job.get("live_io_queues", 1),
                                                        "queue_size": job.get("live_io_queue_size", 32),
                                                        "poll_queues": job.get("live_poll_queues", 0)})
@@ -3427,7 +3461,8 @@ class Controller:
                     600 if job["keys"] > 65536 else 0) + 300))
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
                 "sha256": digest(archive), "files": list(files), "timeout": service_seconds,
-                "owner_history_diagnostics": job.get("owner_history_diagnostics", False)}, case=case, timeout=120)
+                "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
+                "owner_trace": job.get("owner_trace", False)}, case=case, timeout=120)
             dump(directory / "server-proofs" / f"start-{index}.json", proof)
             receipts[index] = confirm_owner_durability(proof, tier, index, nonces[index])
         with ThreadPoolExecutor(max_workers=5) as pool:
@@ -3466,9 +3501,12 @@ class Controller:
         def stop(index):
             result = self.request(index, {"action": "tide_stop", "case_id": job["case_id"],
                                           "initiator_drained": True,
-                                          "owner_history_diagnostics": job.get("owner_history_diagnostics", False)},
+                                          "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
+                                          "owner_trace": job.get("owner_trace", False)},
                                   case=job["case_id"], timeout=self.cleanup_timeout(deadline), export=True)
             dump(directory / "server-proofs" / f"stop-{index}.json", result)
+            if job.get("owner_trace"):
+                dump(directory / "owner-events" / f"node-{index}.json", result["owner_events"])
             if job.get("owner_history_diagnostics"):
                 dump(directory / "owner-durability" / f"node-{index}.history-maintenance.json", result["history_maintenance"])
 
@@ -4275,6 +4313,7 @@ class Controller:
         tracer_attempted = False
         tracer_stopped = False
         tracer_clean = True
+        owner_ftrace_active = False
         nvme_trace_attempted = False
         nvme_trace_stopped = False
         live_observation_attempted = False
@@ -4313,6 +4352,12 @@ class Controller:
                 return json.loads(command(argv, timeout=45, env=environment(self.config)))
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 return {"available": False, "reason": type(exc).__name__ + ": " + str(exc)}
+        def collect_owner_ftrace():
+            nonlocal owner_ftrace_active
+            traces = self.all_hosts({"action": "owner_ftrace_stop", "case_id": job["case_id"]},
+                case=job["case_id"], owner_count=owner_count, timeout=60, export=True)
+            store_owner_ftrace(directory, traces)
+            owner_ftrace_active = False
         self.select_monitoring(job, directory)
         try:
             require_supported_nvme_route(job)
@@ -4539,12 +4584,19 @@ class Controller:
                 if job.get("nvmeof_target") == "spdk":
                     receipt["spdk_target_measurement"] = {"start": self.spdk_boundary(directory, "start", job),
                         "scope": "owner-local bdev counters around the drained measurement; not pure fabric or NAND latency"}
+                if job.get("owner_trace"):
+                    owner_ftrace_active = True
+                    receipt["owner_ftrace_start"] = self.all_hosts(
+                        {"action": "owner_ftrace_start", "case_id": job["case_id"]},
+                        case=job["case_id"], owner_count=owner_count, timeout=60)
                 (directory / "measurement.release").touch(exist_ok=False)
                 gate_released = True
                 while True:
                     self.remaining()
                     completed = directory / "measurement.complete"
                     if completed.exists() and not completion_observed:
+                        if owner_ftrace_active:
+                            collect_owner_ftrace()
                         ended = self.all_hosts({"action": "snapshot", "drop": False,
                             "resource_job": job, **({"resource_owner_case": self.shared_tide["job"]["case_id"]}
                             if "sealed_dataset" in job and backend != "native" else {}),
@@ -4829,6 +4881,11 @@ class Controller:
                     failure.__cause__ = error
                 else:
                     failure = error
+            if owner_ftrace_active:
+                try:
+                    collect_owner_ftrace()
+                except Exception as exc:
+                    record_cleanup_error("owner_ftrace_stop", exc)
             if failure is not None and job.get("backend") in cloud_campaign.NVME_BACKENDS:
                 try:
                     frame = initiator_failure_frame(self.config, job["case_id"], case_started_utc,

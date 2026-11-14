@@ -155,6 +155,8 @@ struct ExternalLiveNvmeof {
     commissioning_service: u16,
     commissioning_port_id: u16,
     max_inflight_requests: usize,
+    #[serde(default)]
+    leased_write_window: Option<usize>,
     max_inflight_bytes: usize,
     connect_timeout_ms: u64,
     io_timeout_ms: u64,
@@ -476,6 +478,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             host_id: *host_id,
             owner_identities: Default::default(),
             max_inflight_requests: live.max_inflight_requests,
+            leased_write_window: live.leased_write_window,
             max_inflight_bytes: live.max_inflight_bytes,
             connect_timeout_ms: live.connect_timeout_ms,
             io_timeout_ms: live.io_timeout_ms,
@@ -1166,6 +1169,24 @@ async fn open_for(
         },
         "coordinator_path": coordinator_path
     });
+    effective_configuration["live_leased_write_window"] = serde_json::json!(
+        remote_config
+            .live_nvme
+            .as_ref()
+            .map(|live| live.leased_write_window)
+    );
+    effective_configuration["live_leased_write_window_bound"] =
+        serde_json::json!(remote_config.live_nvme.as_ref().map(|live| {
+            let occupancy = if live.write_mode
+                == tidehunter::distributed::tcp::LiveWriteMode::Leased
+                && live.leased_write_window.is_none()
+            {
+                tidehunter::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY
+            } else {
+                remote_config.owner_append_occupancy
+            };
+            live.max_inflight_requests.min(occupancy)
+        }));
     effective_configuration["live_lease_ahead"] = serde_json::json!(
         remote_config
             .live_nvme
@@ -2578,10 +2599,12 @@ mod tests {
         let mut value = controller_live_preparation_input();
         value["live_nvmeof"]["lease_ahead"] = serde_json::json!(false);
         value["live_nvmeof"]["polled_writes"] = serde_json::json!(true);
+        value["live_nvmeof"]["leased_write_window"] = serde_json::json!(8);
         let input: ExternalPreparationInput = serde_json::from_value(value).unwrap();
         let live = input.live_nvmeof.unwrap();
         assert!(!live.lease_ahead);
         assert!(live.polled_writes);
+        assert_eq!(live.leased_write_window, Some(8));
         assert_eq!(input.history_persistence, HistoryPersistence::WalReplay);
     }
 
@@ -2595,6 +2618,7 @@ mod tests {
         let live = input.live_nvmeof.unwrap();
         assert!(live.lease_ahead);
         assert!(!live.polled_writes);
+        assert_eq!(live.leased_write_window, None);
     }
 
     #[cfg(all(feature = "fabric", feature = "nvmeof", target_os = "linux"))]

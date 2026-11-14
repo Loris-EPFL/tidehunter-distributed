@@ -19,11 +19,11 @@ PAGE_CACHE = 'A put is acknowledged from the page cache of the owner. Its latenc
 DEVICE_WINDOW = 'Device counters cover the window between the two controller snapshots on the whole SSD. The window is longer than the measured calls and includes other writes (run 12, first launch: about 1 GiB in each 1 KiB put case on both routes; the data file system is made with default `mkfs.ext4`). `device_write_payload_ratio` is therefore an upper bound, not a write amplification.'
 SETTINGS = ('group', 'arm', 'backend', 'route', 'write mode', 'acknowledgement contract', 'target I/O', 'live export mode', 'inline reads', 'read lanes', 'I/O queues', 'queue size', 'poll queues', 'owner fragment bytes', 'owner WAL file bytes', 'mapped fragments', 'history persistence', 'coordinator cache bytes', 'cache procedure', 'keys', 'key distribution', 'value bytes', 'concurrency', 'repetitions', 'cases', 'differs from engine default')
 REMOTE_DEFAULTS = dict(owner_wal_geometry='native_default', history_persistence='wal_replay', coordinator_cache_bytes=8388608, read_lanes=2)
-LIVE_DEFAULTS = dict(live_export_mode='on_demand', live_write_mode='reserved', live_inline_reads=True, live_io_queues=1, live_io_queue_size=32, live_poll_queues=0, target_io='buffered', live_lease_ahead=True, live_polled_writes=False)
+LIVE_DEFAULTS = dict(live_export_mode='on_demand', live_write_mode='reserved', live_inline_reads=True, live_io_queues=1, live_io_queue_size=32, live_poll_queues=0, target_io='buffered', live_lease_ahead=True, live_polled_writes=False, live_leased_write_window=None)
 GEOMETRY = {'native_default': (134217728, 10737418240, 16), 'research': (4194304, 1073741824, 3), 'sui_harness': (16777216, 268435456, 3)}
 # The arm columns identify a row without the settings table: several arms share operation, size and concurrency.
 ARM = ('route', 'tier', 'history_persistence', 'lease_ahead', 'polled_writes', 'media_expected', 'keys', 'read_lanes', 'io_queues', 'queue_size', 'poll_queues', 'inline_reads', 'diagnostic')
-RESULTS = ('case_id', 'group', 'backend', 'operation', 'value_size', 'concurrency', 'repetition', 'contract', *ARM, 'status', 'p50_us', 'p99_us', 'p999_us', 'mean_us', 'calls_per_second', 'mean_inflight_calls', 'native_p50_ratio', 'calls_ge_5ms', 'time_ge_5ms_share', 'device_write_payload_ratio', 'history_waits', 'read_ops_per_success', 'device_bytes_per_read', 'media_status', 'reason_codes', 'cache_label', 'grant_misses', 'metadata_requests', 'namespace_connects', 'Control_mean_us', 'NamespaceSetup_mean_us', 'ControllerConnect_mean_us', 'coordinator_hits', 'coordinator_misses', 'owner_wal_file_count')
+RESULTS = ('case_id', 'group', 'backend', 'operation', 'value_size', 'concurrency', 'repetition', 'contract', *ARM, 'status', 'p50_us', 'p99_us', 'p999_us', 'mean_us', 'calls_per_second', 'mean_inflight_calls', 'max_leased_in_flight', 'max_leased_in_flight_scope', 'live_leased_write_window', 'live_leased_write_window_bound', 'native_p50_ratio', 'calls_ge_5ms', 'time_ge_5ms_share', 'device_write_payload_ratio', 'history_waits', 'read_ops_per_success', 'device_bytes_per_read', 'media_status', 'reason_codes', 'cache_label', 'grant_misses', 'metadata_requests', 'namespace_connects', 'Control_mean_us', 'NamespaceSetup_mean_us', 'ControllerConnect_mean_us', 'coordinator_hits', 'coordinator_misses', 'owner_wal_file_count')
 PROFILE_COUNTERS = {'lease_reserve_ns': 'lease_profile_samples',
                     'lease_namespace_sync_ns': 'lease_profile_samples',
                     'lease_publish_ns': 'lease_profile_samples',
@@ -74,11 +74,11 @@ def settings(jobs):
         native = j.get('backend') == 'native'
         floor = j.get('group') == 'G18F'
         defaults = dict(native_wal_geometry='native_default', native_shards=1) if native else REMOTE_DEFAULTS | (LIVE_DEFAULTS if live(j) else {})
-        required = (set(defaults) - {'live_lease_ahead', 'live_polled_writes'}) | {'backend', 'keys', 'distribution', 'value_size', 'concurrency', 'repeat', 'native_durability' if native else 'durability_tier'}
+        required = (set(defaults) - {'live_lease_ahead', 'live_polled_writes', 'live_leased_write_window'}) | {'backend', 'keys', 'distribution', 'value_size', 'concurrency', 'repeat', 'native_durability' if native else 'durability_tier'}
         if not floor:
             for member in members:
                 errors.extend(member.get('case_id', '?') + ': ' + k for k in sorted(required - member.keys()))
-        get = lambda k: j.get(k, LIVE_DEFAULTS[k] if k in ('live_lease_ahead', 'live_polled_writes') else MISSING)
+        get = lambda k: j.get(k, LIVE_DEFAULTS[k] if k in ('live_lease_ahead', 'live_polled_writes', 'live_leased_write_window') else MISSING)
         geometry = GEOMETRY.get(get('native_wal_geometry' if native else 'owner_wal_geometry'), (MISSING,) * 3)
         if not native and 'owner_wal_file_bytes' in j:
             geometry = (geometry[0], j['owner_wal_file_bytes'], geometry[2])
@@ -158,6 +158,14 @@ def result_row(case, export):
         row.update(calls_ge_5ms=len(slow), time_ge_5ms_share=sum(slow) / sum(good) if sum(good) else None)
     boundary = load(directory / 'measurement-read-evidence.json')
     counters = (boundary.get('live_nvmeof') or {}).get('counters') or {}
+    if live(j) and j.get('live_write_mode') == 'leased':
+        peak = boundary.get('live_nvmeof_peaks', {}).get('max_leased_in_flight', {})
+        row['max_leased_in_flight'] = nonnegative(peak.get('at_end'))
+        row['max_leased_in_flight_scope'] = peak.get('scope')
+        manifest = load(directory / 'manifest.json')
+        configuration = manifest.get('backend_info', {}).get('configuration', {})
+        row['live_leased_write_window'] = configuration.get('live_leased_write_window')
+        row['live_leased_write_window_bound'] = nonnegative(configuration.get('live_leased_write_window_bound'))
     for name in ('grant_misses', 'metadata_requests', 'namespace_connects'):
         row[name] = nonnegative(counters.get(name))
     for name, denominator in PROFILE_COUNTERS.items():
@@ -354,7 +362,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -393,7 +401,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
-    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W') and r['operation'] in ('put', 'put_batch')]
+    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N') and r['operation'] in ('put', 'put_batch')]
     tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']
     write_csv(output / 'stalls.csv', STALL_FIELDS,

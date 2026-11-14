@@ -112,6 +112,10 @@ impl LiveFrame {
         &self.batches
     }
 
+    pub(crate) fn into_batches(self) -> Vec<CompleteBatch> {
+        self.batches
+    }
+
     /// Same payload-relative offsets as CompleteGroup, without an offset Vec.
     pub(crate) fn batch_offsets(&self) -> impl Iterator<Item = u32> + '_ {
         self.batches.iter().scan(GROUP_HEADER_LEN, |offset, batch| {

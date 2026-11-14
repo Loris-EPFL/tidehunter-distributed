@@ -47,6 +47,23 @@ Benchmark backend kind is unified as `tidehunter`; case identities such as
 aliases. Preserve provider/security distinctions in any new labels and never
 compare trusted and mutual-TLS cohorts as security-equivalent.
 
+### Leased write concurrency
+
+Live NVMe-oF leased writes default to `leased_write_window: null` (or an
+absent field): there is no extra software window. Queue request/byte credit
+and an owner append occupancy of 31 bound outstanding work. Owner RPC keeps
+its configured occupancy (default 8). An integer window must be positive,
+fit the queue request limit, and not exceed configured owner occupancy.
+Receipts release only in admission order, even when I/O completes out of order.
+
+Effective configuration reports `live_leased_write_window` and
+`live_leased_write_window_bound` (the minimum of request slots and effective
+occupancy). Byte credit, frame sizes, and extent boundaries can lower the
+observed peak. The workstation fixture accepts `TH_TAIL_LEASED_WINDOW=none`
+or an integer; absent means none. Owner event `*_end` marks span exit,
+including failure, and does not by itself prove success.
+
+
 ### Security parity and the trusted TCP mode
 
 Standard `{"kind":"tcp"}` always uses mutual TLS. `{"kind":"tcp-trusted"}` is an

@@ -327,6 +327,12 @@ pub struct LiveIo {
     next_completion_result: Option<i32>,
     #[cfg(test)]
     last_write_errno: Option<i32>,
+    #[cfg(test)]
+    held_ids: Vec<u64>,
+    #[cfg(test)]
+    completion_results: Vec<(u64, i32)>,
+    #[cfg(test)]
+    held_completions: Vec<LiveCompletion>,
 }
 impl LiveIo {
     /// Polled queues require kernel and device IOPOLL support. A setup or I/O
@@ -381,8 +387,29 @@ impl LiveIo {
             next_completion_result: None,
             #[cfg(test)]
             last_write_errno: None,
+            #[cfg(test)]
+            held_ids: Vec::new(),
+            #[cfg(test)]
+            completion_results: Vec::new(),
+            #[cfg(test)]
+            held_completions: Vec::new(),
         })
     }
+    pub(crate) fn register_worker_wake(&self, fd: std::os::fd::RawFd) -> io::Result<()> {
+        self.ring.submitter().register_eventfd(fd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_completions(&mut self, ids: &[u64]) {
+        self.held_ids.clear();
+        self.held_ids.extend_from_slice(ids);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_held(&mut self) {
+        self.held_ids.clear();
+    }
+
     pub(crate) fn attach(
         &mut self,
         namespace: Arc<LiveNamespace>,
@@ -441,6 +468,10 @@ impl LiveIo {
     #[cfg(test)]
     pub(crate) fn override_next_completion_result(&mut self, result: i32) {
         self.next_completion_result = Some(result);
+    }
+    #[cfg(test)]
+    pub(crate) fn override_completion_result(&mut self, id: u64, result: i32) {
+        self.completion_results.push((id, result));
     }
     #[cfg(test)]
     pub(crate) fn last_write_errno(&self) -> Option<i32> {
@@ -631,6 +662,15 @@ impl LiveIo {
         self.allocated_bytes += b.data.len();
         Ok(b)
     }
+    /// Tests slot and byte credit without borrowing a buffer.
+    pub(crate) fn has_credit(&self, len: usize) -> bool {
+        self.operations.len() < self.slots
+            && len
+                .checked_add((self.namespace.block_size as usize).max(4096) - 1)
+                .and_then(|charge| self.used_bytes.checked_add(charge))
+                .is_some_and(|bytes| bytes <= self.max_bytes)
+    }
+
     /// Borrows one exact-charge aligned buffer, or returns Full without taking
     /// memory. Bytes are initialized but may hold a prior write. Callers must
     /// fill the whole frame, including padding, before submitting the loan.
@@ -1018,7 +1058,18 @@ impl LiveIo {
         Ok(out)
     }
 
+    /// Appends completions to the caller's reusable buffer.
+    pub(crate) fn progress_into(
+        &mut self,
+        out: &mut Vec<LiveCompletion>,
+    ) -> Result<usize, LiveIoError> {
+        let before = out.len();
+        self.progress_with(|completion| out.push(completion))?;
+        Ok(out.len() - before)
+    }
+
     /// Scalar retirement without allocating a completion Vec.
+    #[cfg(test)]
     pub(crate) fn progress_one(&mut self) -> Result<Option<LiveCompletion>, LiveIoError> {
         let mut out = None;
         let mut multiple = false;
@@ -1036,6 +1087,17 @@ impl LiveIo {
         &mut self,
         mut on_completion: impl FnMut(LiveCompletion),
     ) -> Result<(), LiveIoError> {
+        #[cfg(test)]
+        {
+            let mut index = 0;
+            while index < self.held_completions.len() {
+                if self.held_ids.contains(&self.held_completions[index].id) {
+                    index += 1;
+                } else {
+                    on_completion(self.held_completions.remove(index));
+                }
+            }
+        }
         let _ = self.flush_submissions();
         for _ in 0..self.operations.len() {
             let Some(cqe) = self.ring.completion().next() else {
@@ -1064,7 +1126,15 @@ impl LiveIo {
                 self.last_write_errno = (result < 0).then_some(-result);
             }
             #[cfg(test)]
-            let result = self.next_completion_result.take().unwrap_or(result);
+            let result = if let Some(index) = self
+                .completion_results
+                .iter()
+                .position(|entry| entry.0 == request)
+            {
+                self.completion_results.swap_remove(index).1
+            } else {
+                self.next_completion_result.take().unwrap_or(result)
+            };
             self.stats.completions += 1;
             if let Some(started) = submitted {
                 self.stats.submit_to_cq_ns += started.elapsed().as_nanos();
@@ -1148,11 +1218,17 @@ impl LiveIo {
                         None => Err(LiveIoError::Invalid("missing read result")),
                     }
                 };
-                on_completion(LiveCompletion {
+                let completion = LiveCompletion {
                     id: request,
                     completed_at: Instant::now(),
                     result,
-                });
+                };
+                #[cfg(test)]
+                if self.held_ids.contains(&request) {
+                    self.held_completions.push(completion);
+                    continue;
+                }
+                on_completion(completion);
             }
         }
         let now = Instant::now();

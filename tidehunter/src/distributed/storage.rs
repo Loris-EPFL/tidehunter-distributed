@@ -1786,7 +1786,15 @@ impl PartitionLog {
             };
             (target, writer.external_file_preparer())
         };
+        let prepare_ensure_span = super::owner_events::OwnerEventSpan::new(
+            super::owner_events::OwnerEventKind::PrepareEnsureStart,
+            super::owner_events::OwnerEventKind::PrepareEnsureEnd,
+            config.partition,
+            target,
+            0,
+        );
         let allocated = preparer.ensure(WalFileId::from_u64(target));
+        prepare_ensure_span.end_at(target);
         // Release the sender before seal drops the writer and joins the mapper.
         drop(preparer);
         if allocated.is_err() {
@@ -1796,6 +1804,13 @@ impl PartitionLog {
                 .live_file_prepare_failures += 1;
             return Ok(None);
         }
+        let prepare_file_sync_span = super::owner_events::OwnerEventSpan::new(
+            super::owner_events::OwnerEventKind::PrepareFileSyncStart,
+            super::owner_events::OwnerEventKind::PrepareFileSyncEnd,
+            config.partition,
+            target,
+            0,
+        );
         if let Err(error) = self
             .wal
             .persist_frame_file(WalPosition::new(target * config.wal_file_bytes, 1))
@@ -1803,6 +1818,7 @@ impl PartitionLog {
             self.state.lock().poison = Some(WriterPoison::Fatal);
             return Err(StorageError::Unknown(WalError::Io(error)));
         }
+        prepare_file_sync_span.end_at(target);
         #[cfg(test)]
         self.pause_live_at(LivePausePoint::PrepareBeforePublish);
         let _persistence = self.persistence.lock();
@@ -1817,12 +1833,20 @@ impl PartitionLog {
         }
         let mut timing = WriteTiming::new(None, false);
         let mut witnesses = 0;
+        let prepare_witness_span = super::owner_events::OwnerEventSpan::new(
+            super::owner_events::OwnerEventKind::PrepareWitnessStart,
+            super::owner_events::OwnerEventKind::PrepareWitnessEnd,
+            config.partition,
+            target,
+            0,
+        );
         if let Err(error) =
             self.persist_namespace_witnesses(target, Some(target - 1), &mut timing, &mut witnesses)
         {
             self.state.lock().poison = Some(WriterPoison::Fatal);
             return Err(StorageError::Unknown(WalError::Io(error)));
         }
+        prepare_witness_span.end_at(target);
         let mut state = self.state.lock();
         if !live(&state) || state.namespace_synced_file != Some(WalFileId::from_u64(target - 1)) {
             return Ok(None);
@@ -1831,6 +1855,12 @@ impl PartitionLog {
         state.stats.namespace_syncs += 1;
         state.stats.inventory_witnesses += witnesses;
         state.live_file_preparation.live_files_prepared += 1;
+        super::owner_events::record(
+            super::owner_events::OwnerEventKind::PreparePublished,
+            config.partition,
+            target,
+            0,
+        );
         Ok(Some(target))
     }
 
@@ -1857,6 +1887,13 @@ impl PartitionLog {
         #[cfg(test)]
         let initial_state_wait_ns = duration_ns(state_started.elapsed());
         let (range, ready) = self.validate_live_extent_grant(&state, authority, after)?;
+        let lease_grant_span = super::owner_events::OwnerEventSpan::new(
+            super::owner_events::OwnerEventKind::LeaseGrantStart,
+            super::owner_events::OwnerEventKind::LeaseGrantEnd,
+            self.config().partition,
+            range.start,
+            0,
+        );
         if ready {
             #[cfg(test)]
             {
@@ -1868,7 +1905,9 @@ impl PartitionLog {
             }
             // Readiness proves reserve_external needs no mapper request.
             // The pinned allocator range cannot retire while this state owns it.
-            return self.reserve_live_extent_grant(&mut state, range, after.is_some());
+            let granted = self.reserve_live_extent_grant(&mut state, range, after.is_some())?;
+            lease_grant_span.end_at(granted.0.start);
+            return Ok(granted);
         }
         drop(state);
         #[cfg(test)]
@@ -1906,6 +1945,13 @@ impl PartitionLog {
         let namespace_started = Instant::now();
         let result = (|| {
             if namespace_sync {
+                let lease_namespace_sync_span = super::owner_events::OwnerEventSpan::new(
+                    super::owner_events::OwnerEventKind::LeaseNamespaceSyncStart,
+                    super::owner_events::OwnerEventKind::LeaseNamespaceSyncEnd,
+                    self.config().partition,
+                    last_file,
+                    0,
+                );
                 #[cfg(test)]
                 if let Some((entered, resume)) = self.before_persist.lock().take() {
                     let _ = entered.send(());
@@ -1920,6 +1966,7 @@ impl PartitionLog {
                     &mut timing,
                     &mut witnesses,
                 )?;
+                lease_namespace_sync_span.end_at(last_file);
             }
             Ok::<(), io::Error>(())
         })();
@@ -1946,6 +1993,7 @@ impl PartitionLog {
             state.stats.namespace_syncs += 1;
         }
         state.poison = None;
+        lease_grant_span.end_at(extent.start);
         Ok((extent, profile))
     }
 
@@ -2242,6 +2290,13 @@ impl PartitionLog {
                     let active = round.active.fetch_add(1, Ordering::Relaxed) + 1;
                     round.maximum_active.fetch_max(active, Ordering::Relaxed);
                 }
+                let mut adoption_round_span = super::owner_events::OwnerEventSpan::new(
+                    super::owner_events::OwnerEventKind::AdoptionRoundStart,
+                    super::owner_events::OwnerEventKind::AdoptionRoundEnd,
+                    self.config().partition,
+                    cursor,
+                    0,
+                );
                 let mut plans = self.plan_adoption_round(
                     &file,
                     &mut round.buffers[0],
@@ -2350,6 +2405,7 @@ impl PartitionLog {
                 let mut incomplete_summary = None;
                 #[cfg(test)]
                 let frames_before = profile.frames;
+                let mut adopted_end = cursor;
                 for PreparedLiveFrame {
                     start,
                     len,
@@ -2366,6 +2422,7 @@ impl PartitionLog {
                         close,
                         opportunistic.as_ref(),
                     )? {
+                        adoption_round_span.end_at(summary.adopted_end);
                         return Ok(summary);
                     }
                     let open = state
@@ -2373,6 +2430,7 @@ impl PartitionLog {
                         .as_ref()
                         .ok_or(StorageError::Poisoned)?;
                     if open.adoption.adopted_end != start {
+                        adoption_round_span.end_at(open.adoption.adopted_end);
                         continue 'rounds;
                     }
                     let mut open = state
@@ -2383,6 +2441,8 @@ impl PartitionLog {
                         self.publish_adoption_frame(&mut state, &mut open, start, len, validated)
                     });
                     let cursor = open.adoption.adopted_end;
+                    adopted_end = cursor;
+                    adoption_round_span.set_end_a(cursor);
                     let summary = open.adoption.clone();
                     state.open_live_extent = Some(open);
                     #[cfg(test)]
@@ -2414,11 +2474,16 @@ impl PartitionLog {
                                 } else {
                                     WriterPoison::Fatal
                                 });
+                            adoption_round_span.end_at(adopted_end);
                             return Err(error);
                         }
-                        Ok(LiveFrameStep::End) => return Ok(summary),
+                        Ok(LiveFrameStep::End) => {
+                            adoption_round_span.end_at(summary.adopted_end);
+                            return Ok(summary);
+                        }
                     }
                 }
+                adoption_round_span.end_at(adopted_end);
                 drop(round);
                 if let Some((state, cursor, demand)) = pressure {
                     self.drain_adoption_pressure(state, token, cursor, demand)?;
@@ -5582,6 +5647,13 @@ impl PartitionLog {
         timing: &mut WriteTiming<'_>,
         syncs: &mut (u64, u64),
     ) -> io::Result<()> {
+        let frontier_sync_span = super::owner_events::OwnerEventSpan::new(
+            super::owner_events::OwnerEventKind::FrontierSyncStart,
+            super::owner_events::OwnerEventKind::FrontierSyncEnd,
+            self.config().partition,
+            frontier.end,
+            0,
+        );
         let path = &self.path;
         let bytes = encode_metadata(frontier).map_err(io::Error::other)?;
         let temporary = path.join(format!(".{LIVE_FRONTIER}.pending"));
@@ -5629,6 +5701,7 @@ impl PartitionLog {
                 profile.live_frontier_namespace_successes.saturating_add(1)
         });
         timing.stage(None);
+        frontier_sync_span.end_at(frontier.end);
         Ok(())
     }
 }

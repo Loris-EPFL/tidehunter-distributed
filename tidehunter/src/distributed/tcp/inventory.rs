@@ -853,15 +853,23 @@ impl NodeInventory {
             }
         }
         for key in revoke {
-            let (_, binding, _) = self
+            let (segment, binding, _) = self
                 .live_bindings
                 .get(&key)
                 .ok_or_else(|| TcpError::new("live binding disappeared"))?;
+            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
+                super::super::owner_events::OwnerEventKind::RevokeStart,
+                super::super::owner_events::OwnerEventKind::RevokeEnd,
+                segment.partition,
+                segment.file_index,
+                segment.inode,
+            );
             self.live_target
                 .as_mut()
                 .ok_or_else(|| TcpError::new("live target disappeared"))?
                 .revoke(binding)
                 .map_err(TcpError::component)?;
+            revoke_span.end_at(segment.file_index);
             self.live_bindings.remove(&key);
         }
         Ok(())
@@ -893,12 +901,20 @@ impl NodeInventory {
             bytes: segment.bytes,
             block_size: segment.block_size,
         };
+        let export_span = super::super::owner_events::OwnerEventSpan::new(
+            super::super::owner_events::OwnerEventKind::ExportStart,
+            super::super::owner_events::OwnerEventKind::ExportEnd,
+            segment.partition,
+            segment.file_index,
+            segment.inode,
+        );
         let binding = if writable {
             target.export_writable(file)
         } else {
             target.export_readonly(file)
         }
         .map_err(TcpError::component)?;
+        export_span.end_at(segment.file_index);
         self.live_bindings
             .insert(key, (segment.clone(), binding.clone(), writable));
         Ok(binding)
@@ -932,6 +948,13 @@ impl NodeInventory {
             segment.epoch,
             segment.file_index,
         );
+        let export_span = super::super::owner_events::OwnerEventSpan::new(
+            super::super::owner_events::OwnerEventKind::ExportStart,
+            super::super::owner_events::OwnerEventKind::ExportEnd,
+            segment.partition,
+            segment.file_index,
+            segment.inode,
+        );
         let binding = target
             .export_permanent(
                 &name,
@@ -944,6 +967,7 @@ impl NodeInventory {
                 },
             )
             .map_err(TcpError::component)?;
+        export_span.end_at(segment.file_index);
         self.live_bindings
             .insert(key, (segment.clone(), binding.clone(), true));
         Ok((binding, true))
@@ -954,8 +978,16 @@ impl NodeInventory {
         let Some(target) = self.live_target.as_mut() else {
             return Ok(());
         };
-        for (_, binding, _) in self.live_bindings.values() {
+        for (segment, binding, _) in self.live_bindings.values() {
+            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
+                super::super::owner_events::OwnerEventKind::RevokeStart,
+                super::super::owner_events::OwnerEventKind::RevokeEnd,
+                segment.partition,
+                segment.file_index,
+                segment.inode,
+            );
             target.revoke(binding).map_err(TcpError::component)?;
+            revoke_span.end_at(segment.file_index);
         }
         self.live_bindings.clear();
         self.idle_history_exports.clear();
@@ -966,9 +998,17 @@ impl NodeInventory {
         let Some(target) = self.live_target.as_mut() else {
             return Ok(());
         };
-        for ((binding_epoch, _), (_, binding, _)) in &self.live_bindings {
+        for ((binding_epoch, _), (segment, binding, _)) in &self.live_bindings {
             if *binding_epoch == epoch {
+                let revoke_span = super::super::owner_events::OwnerEventSpan::new(
+                    super::super::owner_events::OwnerEventKind::RevokeStart,
+                    super::super::owner_events::OwnerEventKind::RevokeEnd,
+                    segment.partition,
+                    segment.file_index,
+                    segment.inode,
+                );
                 target.revoke(binding).map_err(TcpError::component)?;
+                revoke_span.end_at(segment.file_index);
             }
         }
         self.live_bindings
@@ -1022,15 +1062,23 @@ impl NodeInventory {
             }
         }
         for key in revoke {
-            let (_, binding, _) = self
+            let (segment, binding, _) = self
                 .live_bindings
                 .get(&key)
                 .ok_or_else(|| TcpError::new("live binding disappeared"))?;
+            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
+                super::super::owner_events::OwnerEventKind::RevokeStart,
+                super::super::owner_events::OwnerEventKind::RevokeEnd,
+                segment.partition,
+                segment.file_index,
+                segment.inode,
+            );
             let result = self
                 .live_target
                 .as_mut()
                 .ok_or_else(|| TcpError::new("live target disappeared"))?
                 .revoke(binding);
+            revoke_span.end_at(segment.file_index);
             if let Err(error) = result {
                 self.healthy = false;
                 return Err(TcpError::component(error));
@@ -1052,10 +1100,17 @@ impl NodeInventory {
                 .idle_history_exports
                 .front()
                 .ok_or_else(|| TcpError::new("idle history queue disappeared"))?;
-            let (_, binding, _) = self
+            let (segment, binding, _) = self
                 .live_bindings
                 .get(&oldest)
                 .ok_or_else(|| TcpError::new("idle history binding disappeared"))?;
+            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
+                super::super::owner_events::OwnerEventKind::RevokeStart,
+                super::super::owner_events::OwnerEventKind::RevokeEnd,
+                segment.partition,
+                segment.file_index,
+                segment.inode,
+            );
             if let Err(error) = self
                 .live_target
                 .as_mut()
@@ -1065,6 +1120,7 @@ impl NodeInventory {
                 self.healthy = false;
                 return Err(TcpError::component(error));
             }
+            revoke_span.end_at(segment.file_index);
             self.live_bindings.remove(&oldest);
             self.idle_history_exports.pop_front();
         }

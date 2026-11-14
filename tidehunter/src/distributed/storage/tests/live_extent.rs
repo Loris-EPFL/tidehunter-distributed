@@ -6,8 +6,14 @@ use crate::distributed::nvmeof::live_storage::{
 };
 
 fn fixture() -> (tempdir::TempDir, PartitionConfig, PartitionLog) {
+    fixture_in_partition(live_config().partition)
+}
+
+fn fixture_in_partition(partition: u32) -> (tempdir::TempDir, PartitionConfig, PartitionLog) {
     let temp = tempdir::TempDir::new("live-leased-extent").unwrap();
     let mut config = live_config();
+    config.partition = partition;
+    config.inventory.partitions = vec![partition];
     config.fragment_bytes = 16 * 1024;
     config.wal_file_bytes = 32 * 1024;
     let log = PartitionLog::create_live(
@@ -102,6 +108,96 @@ fn prepared_boundary() -> (
     )
     .unwrap();
     (temp, config, Arc::new(log), current)
+}
+
+#[test]
+fn owner_events_trace_preparation_and_position_proof_in_order() {
+    use crate::distributed::owner_events::{self, OwnerEventKind::*};
+    let _capture = owner_events::OWNER_EVENTS_TEST_LOCK.lock();
+    owner_events::enable(65_536);
+    let (temp, config, log) = fixture_in_partition(u32::MAX - 1);
+    owner_events::drain_json(&temp.path().join("prior-owner-events.json")).unwrap();
+    log.attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Native))
+        .unwrap();
+    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+    let (before, dropped) = owner_events::snapshot();
+    assert_eq!(dropped, 0);
+    let before = before.len();
+    assert_eq!(log.prepare_next_live_file().unwrap(), Some(1));
+    let (_, frame) = encoded(&config, vec![batch(&config, 0)]);
+    write(&extent, extent.start, &frame);
+    let through = extent.start + frame.len() as u64;
+    assert!(log.persist_wal_through(through).unwrap() >= through);
+    let (events, dropped) = owner_events::snapshot();
+    assert_eq!(dropped, 0);
+    let actual: Vec<_> = events[before..]
+        .iter()
+        .filter(|event| event.partition == config.partition)
+        .map(|event| (event.kind, event.a, event.b))
+        .collect();
+    let expected = [
+        (PrepareEnsureStart, 1),
+        (PrepareEnsureEnd, 1),
+        (PrepareFileSyncStart, 1),
+        (PrepareFileSyncEnd, 1),
+        (PrepareWitnessStart, 1),
+        (PrepareWitnessEnd, 1),
+        (PreparePublished, 1),
+        (ProofStart, through),
+        (ProofFileSyncStart, 0),
+        (ProofFileSyncEnd, 0),
+        (ProofNamespaceSyncStart, 0),
+        (ProofNamespaceSyncEnd, 0),
+        (ProofEnd, through),
+    ]
+    .map(|(kind, a)| (kind, a, 0));
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn owner_events_close_proof_and_lease_spans_on_failure() {
+    use crate::distributed::owner_events::{self, OwnerEventKind::*};
+    let _capture = owner_events::OWNER_EVENTS_TEST_LOCK.lock();
+    owner_events::enable(65_536);
+    let (temp, config, log) = fixture_in_partition(u32::MAX - 2);
+    owner_events::drain_json(&temp.path().join("prior-owner-events.json")).unwrap();
+    log.attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Native))
+        .unwrap();
+
+    let (before, dropped) = owner_events::snapshot();
+    assert_eq!(dropped, 0);
+    let before = before.len();
+    assert!(log.persist_wal_through(u64::MAX).is_err());
+    let (events, dropped) = owner_events::snapshot();
+    assert_eq!(dropped, 0);
+    let proof: Vec<_> = events[before..]
+        .iter()
+        .filter(|event| event.partition == config.partition && event.a == u64::MAX)
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(proof, [ProofStart, ProofEnd]);
+
+    log.fail_namespace_persist.store(true, Ordering::Release);
+    let (before, dropped) = owner_events::snapshot();
+    assert_eq!(dropped, 0);
+    let before = before.len();
+    assert!(log.lease_live_extent(authority(&config)).is_err());
+    let (events, dropped) = owner_events::snapshot();
+    assert_eq!(dropped, 0);
+    let actual: Vec<_> = events[before..]
+        .iter()
+        .filter(|event| event.partition == config.partition)
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            LeaseGrantStart,
+            LeaseNamespaceSyncStart,
+            LeaseNamespaceSyncEnd,
+            LeaseGrantEnd,
+        ]
+    );
 }
 
 #[test]

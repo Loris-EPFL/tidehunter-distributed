@@ -439,7 +439,7 @@ def client_pool_metrics(evidence, labels):
 def live_nvmeof_peak_metrics(evidence, labels):
     if evidence is None:
         return ""
-    if not isinstance(evidence, dict) or set(evidence) - {"lane_inflight_request_max", "lane_inflight_op_max"}:
+    if not isinstance(evidence, dict) or set(evidence) - {"lane_inflight_request_max", "lane_inflight_op_max", "max_leased_in_flight"}:
         raise ValueError("invalid live NVMe-oF peaks")
     result = ""
     for field, row in evidence.items():
@@ -523,7 +523,7 @@ def live_nvmeof_metrics(evidence, labels):
                     # the existing events family (the counter label names the unit); no new metric family.
                     "lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns", "lease_profile_samples",
                     "adopt_owner_ns", "adopt_close_scan_ns", "adopt_close_scan_bytes", "adopt_profile_samples",
-                    "extent_preleases", "extent_switch_waits")
+                    "extent_preleases", "extent_switch_waits", "leased_eventfd_unavailable")
     extra_stages = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
                     "extent_switch", "adoption_async", "adoption_settle")
     expected = set(fields) | {stage + suffix for stage in stages for suffix in ("_ns", "_samples")}
@@ -862,7 +862,7 @@ LIVE_NVME_WRITE_COUNTERS = {
     "leased_skip_markers", "extents_leased", "adoption_async_exchanges", "adoption_sync_exchanges",
     "fua_writes", "leased_failed_writes", "leased_short_writes", "leased_timed_out_writes",
     "leased_full_writes", "failed_write_ops", "short_write_ops", "short_write_bytes",
-    "adoption_history_full_settles",
+    "adoption_history_full_settles", "leased_eventfd_unavailable",
     *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
                                    "allocation", "publication", "namespace_setup", "read_io",
                                    "owner_completion", "wal_persistence", "wal_namespace",

@@ -33,6 +33,7 @@ fn live_config(mode: LiveWriteMode, tier: DurabilityTier) -> LiveClientConfig {
         host_nqn: "nqn.2026-01.test:p11-bench".into(),
         host_id: [1; 16],
         owner_identities: Default::default(),
+        leased_write_window: Some(4),
         max_inflight_requests: 32,
         max_inflight_bytes: 4 * MIB,
         connect_timeout_ms: 10000,
@@ -65,7 +66,6 @@ struct Fixture {
     config: RemoteDatabaseConfig,
     shape: KeyShape,
     live: Arc<LiveNvmeMetrics>,
-    tier: DurabilityTier,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
     target_root: Option<tempdir::TempDir>,
@@ -264,7 +264,6 @@ impl Fixture {
             config,
             shape,
             live: LiveNvmeMetrics::new(),
-            tier,
             stop,
             server: Some(server),
             target_root,
@@ -282,14 +281,10 @@ impl Fixture {
             for worker in &db.clients {
                 let mut client = worker.client.lock();
                 client
-                    .configure_live_nvme(&live_config(
-                        if arm == "B" {
-                            LiveWriteMode::Reserved
-                        } else {
-                            LiveWriteMode::Leased
-                        },
-                        self.tier,
-                    ))
+                    .configure_live_nvme(
+                        self.config.live_nvme.as_ref().unwrap(),
+                        self.config.effective_owner_append_occupancy(),
+                    )
                     .unwrap();
                 client.bench_local_live_fixture(arm == "C-buf");
                 client.set_live_metrics(self.live.clone()).unwrap();
@@ -1269,6 +1264,14 @@ fn leased_checkpoint_tail_workstation() {
     let calls = setting("TH_TAIL_CALLS", 4096);
     let fragment_bytes = setting("TH_TAIL_FRAGMENT_BYTES", 8 * MIB);
     let wal_file_bytes = setting("TH_TAIL_WAL_FILE_BYTES", 256 * MIB);
+    let leased_write_window = match std::env::var("TH_TAIL_LEASED_WINDOW").as_deref() {
+        Err(_) | Ok("none") => None,
+        Ok(value) => Some(
+            value
+                .parse::<usize>()
+                .expect("invalid TH_TAIL_LEASED_WINDOW"),
+        ),
+    };
     let replay_max_batches = setting("TH_TAIL_REPLAY_MAX_BATCHES", 256);
     let replay_max_bytes = setting("TH_TAIL_REPLAY_MAX_BYTES", 16 * MIB);
     let export_mode = match std::env::var("TH_TAIL_EXPORT_MODE").as_deref() {
@@ -1282,6 +1285,12 @@ fn leased_checkpoint_tail_workstation() {
         && replay_max_batches == 256
         && replay_max_bytes == 16 * MIB;
     let timeline_output = std::env::var_os("TH_TAIL_TIMELINE_DIR").map(PathBuf::from);
+    let owner_events = std::env::var_os("TH_TAIL_OWNER_EVENTS").is_some_and(|value| value == "1");
+    let _capture =
+        owner_events.then(|| crate::distributed::owner_events::OWNER_EVENTS_TEST_LOCK.lock());
+    if owner_events {
+        crate::distributed::owner_events::enable(65_536);
+    }
     let base = tempdir::TempDir::new("leased-checkpoint-tail").unwrap();
     let value: Bytes = vec![0x5a; 65536].into();
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
@@ -1299,6 +1308,23 @@ fn leased_checkpoint_tail_workstation() {
             export_mode,
         );
         fixture.config.preparation_workers = 8;
+        fixture.config.owner_append_occupancy = fixture
+            .config
+            .owner_append_occupancy
+            .max(leased_write_window.unwrap_or(1));
+        fixture
+            .config
+            .live_nvme
+            .as_mut()
+            .unwrap()
+            .leased_write_window = leased_write_window;
+        let leased_write_window_bound = fixture
+            .config
+            .live_nvme
+            .as_ref()
+            .unwrap()
+            .max_inflight_requests
+            .min(fixture.config.effective_owner_append_occupancy());
         let db = ConcurrentRemoteDatabase::new(fixture.open("C-buf")).unwrap();
         let (samples, elapsed) = if timeline_output.is_some() {
             db.arm_write_timeline(calls).unwrap();
@@ -1339,6 +1365,14 @@ fn leased_checkpoint_tail_workstation() {
             write_phase(&db, 16, 0, calls, &value)
         };
         let counts = fixture.live.snapshot().counts;
+        assert!(counts.max_leased_in_flight > 0);
+        assert!(
+            counts.max_leased_in_flight
+                <= leased_write_window.unwrap_or(leased_write_window_bound) as u64
+        );
+        if leased_write_window == Some(1) {
+            assert_eq!(counts.max_leased_in_flight, 1);
+        }
         let manifest: AuthorityManifest =
             read_metadata(&fixture.root.path().join("authority").join(MANIFEST)).unwrap();
         let checkpoints = manifest
@@ -1366,13 +1400,20 @@ fn leased_checkpoint_tail_workstation() {
         sorted.sort_unstable();
         let quantile = |p: usize, scale: usize| sorted[(p * sorted.len()).div_ceil(scale) - 1];
         if let Some(output) = &timeline_output {
-            fs::create_dir_all(output).unwrap();
+            let result = output.join(tier.to_string()).join("result");
+            fs::create_dir_all(&result).unwrap();
             let export = db
                 .finish_write_timeline_until(Instant::now() + Duration::from_secs(60))
                 .unwrap();
             fs::write(
-                output.join(format!("{tier}-timeline.json")),
-                serde_json::to_vec(&export).unwrap(),
+                result.join("write-timeline.json"),
+                serde_json::to_vec(&json!({
+                    "schema_version": 2,
+                    "available": true,
+                    "status": "complete",
+                    "timeline": export,
+                }))
+                .unwrap(),
             )
             .unwrap();
         }
@@ -1384,9 +1425,13 @@ fn leased_checkpoint_tail_workstation() {
                 "slow_calls_ge_5ms": slow, "max_api_ns": maximum, "elapsed_ns": elapsed.as_nanos(),
                 "checkpoints": checkpoints, "extent_switches": counts.extent_switch_samples,
                 "extent_switch_waits": counts.extent_switch_waits,
+                "leased_write_window": leased_write_window,
+                "max_leased_in_flight": counts.max_leased_in_flight,
                 "live_files_prepared": preparation.live_files_prepared,
                 "live_files_published": preparation.live_files_published,
                 "export_mode": export_mode,
+                "live_leased_write_window": leased_write_window,
+                "live_leased_write_window_bound": leased_write_window_bound,
                 "live_file_prepare_failures": preparation.live_file_prepare_failures,
                 "grant_profiles": fixture.node.bench_live_grant_profiles(),
                 "live_file_diagnostics": fixture.node.log_for_test(1).live_test_diagnostics(),
@@ -1416,5 +1461,19 @@ fn leased_checkpoint_tail_workstation() {
             assert_eq!(log.read_record(&reference).unwrap(), put(sequence, &value));
         }
         db.shutdown().unwrap();
+        drop(log);
+        drop(fixture);
+        if owner_events && let Some(output) = &timeline_output {
+            let output = output.join(tier.to_string()).join("owner-events");
+            fs::create_dir_all(&output).unwrap();
+            crate::distributed::owner_events::drain_json(&output.join("node-0.json")).unwrap();
+        }
     }
+    let data_path = base.path().to_owned();
+    drop(base);
+    assert!(!data_path.exists(), "workstation fixture data remains");
+    println!(
+        "checkpoint_tail_workstation_cleanup {}",
+        data_path.display()
+    );
 }

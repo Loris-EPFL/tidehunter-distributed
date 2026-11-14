@@ -473,6 +473,17 @@ fn default_index_shards() -> usize {
 impl RemoteDatabaseConfig {
     pub const MAX_OWNER_APPEND_OCCUPANCY: usize = super::tcp::APPEND_COMMAND_WINDOW;
     pub const DEFAULT_OWNER_APPEND_OCCUPANCY: usize = DEFAULT_OWNER_APPEND_OCCUPANCY;
+
+    fn effective_owner_append_occupancy(&self) -> usize {
+        if self.live_nvme.as_ref().is_some_and(|live| {
+            live.write_mode == super::tcp::LiveWriteMode::Leased
+                && live.leased_write_window.is_none()
+        }) {
+            Self::MAX_OWNER_APPEND_OCCUPANCY
+        } else {
+            self.owner_append_occupancy
+        }
+    }
     /// Fixed handle, tag and history arrays, already included in the cache budget.
     pub fn read_cache_metadata_bytes(&self) -> usize {
         ReadCache::metadata_bytes(self.read_cache_bytes)
@@ -584,6 +595,17 @@ impl RemoteDatabaseConfig {
         }
         self.replay_limits.validate().map_err(LocalDbError::new)?;
         OwnerDispatchPolicy::new(self.owner_append_occupancy).map_err(LocalDbError::new)?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_nvme.as_ref().is_some_and(|live| {
+            live.write_mode == super::tcp::LiveWriteMode::Leased
+                && live
+                    .leased_write_window
+                    .is_some_and(|window| window > self.owner_append_occupancy)
+        }) {
+            return Err(LocalDbError::new(
+                "leased write window exceeds owner append occupancy",
+            ));
+        }
         self.inventory(1)
             .validate()
             .map_err(LocalDbError::component)?;
@@ -2002,7 +2024,9 @@ impl RemoteDatabase {
             workers.push(
                 ClientWorker::start(
                     client,
-                    config.max_pending_batches,
+                    config
+                        .max_pending_batches
+                        .max(config.effective_owner_append_occupancy()),
                     wake_sender.clone(),
                     concurrent_failure.clone(),
                     WorkerDiagnostics {
@@ -2068,7 +2092,7 @@ impl RemoteDatabase {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics,
             inventory: config.inventory(epoch),
-            owner_dispatch: OwnerDispatchPolicy::new(config.owner_append_occupancy)
+            owner_dispatch: OwnerDispatchPolicy::new(config.effective_owner_append_occupancy())
                 .map_err(LocalDbError::new)?,
             append_byte_budget: config.append_byte_budget()?,
             config,
@@ -4189,7 +4213,17 @@ impl RemoteDatabase {
                     {
                         client.record_live_write_error();
                     }
-                    let closed = client.close_live_writer();
+                    if !self
+                        .concurrent_failure
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        assert_eq!(
+                            client.leased_flights_in_flight(),
+                            0,
+                            "shutdown has waiting leased replies"
+                        );
+                    }
+                    let closed = client.close_live_writer(&mut Vec::new(), None);
                     let failed_writer = if closed.is_err() {
                         client.take_failed_live_writer()
                     } else {
@@ -5154,8 +5188,19 @@ struct ControlHandle {
     #[cfg(any(test, feature = "experimental-fabric"))]
     client: Arc<Mutex<Client>>,
     sender: std::sync::Weak<mpsc::SyncSender<Command>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    worker_wake: std::sync::Weak<std::os::fd::OwnedFd>,
 }
 impl ControlHandle {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn wake_worker(&self) -> Result<(), LocalDbError> {
+        let fd = self
+            .worker_wake
+            .upgrade()
+            .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?;
+        signal_worker_wake(&fd)
+    }
+
     fn read_io_stats(&self) -> Result<super::tcp::ReadExecutorStats, LocalDbError> {
         let (reply, pending) = mpsc::sync_channel(1);
         self.sender
@@ -5163,6 +5208,8 @@ impl ControlHandle {
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
             .send(Command::ReadIoStats(reply))
             .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        self.wake_worker()?;
         receive(pending)
     }
     fn owner_timeline_arm(&self, limit: usize) -> Result<(), LocalDbError> {
@@ -5172,6 +5219,8 @@ impl ControlHandle {
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
             .send(Command::OwnerTimelineArm(limit, reply))
             .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        self.wake_worker()?;
         receive(pending)
     }
     fn control<T: Send + 'static>(
@@ -5187,6 +5236,8 @@ impl ControlHandle {
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
             .send(command)
             .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        self.wake_worker()?;
         receive(pending)
     }
     fn control_until<T: Send + 'static>(
@@ -5209,7 +5260,11 @@ impl ControlHandle {
                 return Err(LocalDbError::new("owner timeline control deadline expired"));
             }
             match sender.try_send(command) {
-                Ok(()) => break,
+                Ok(()) => {
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    self.wake_worker()?;
+                    break;
+                }
                 Err(mpsc::TrySendError::Full(returned)) => {
                     command = returned;
                     thread::sleep(
@@ -5227,9 +5282,59 @@ impl ControlHandle {
             .map_err(|_| LocalDbError::new("owner timeline control deadline expired"))?
     }
 }
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+type LeasedMembers = Vec<(BatchVersion, usize, Reply<Vec<DurableBatch>>)>;
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn release_leased_replies(
+    released: &mut Vec<(u64, Vec<DurableBatch>)>,
+    replies: &mut VecDeque<(u64, LeasedMembers)>,
+) -> Result<(), super::tcp::TcpError> {
+    for (id, receipts) in released.drain(..) {
+        if replies.front().is_none_or(|entry| entry.0 != id) {
+            return Err(std::io::Error::other("leased receipt release order differs").into());
+        }
+        let Some((_, mut members)) = replies.pop_front() else {
+            unreachable!();
+        };
+        if members.len() == 1 {
+            if let Some((_, _, reply)) = members.pop() {
+                let _ = reply.send(Ok(receipts));
+            }
+        } else {
+            let mut receipts = receipts.into_iter();
+            for (_, len, reply) in members {
+                let _ = reply.send(Ok(receipts.by_ref().take(len).collect()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn signal_worker_wake(fd: &std::os::fd::OwnedFd) -> Result<(), LocalDbError> {
+    use std::os::fd::AsRawFd;
+    let value = 1u64;
+    // SAFETY: value has eight readable bytes. The borrowed OwnedFd stays open.
+    let result = unsafe { libc::write(fd.as_raw_fd(), (&value as *const u64).cast(), 8) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(LocalDbError::new(format!(
+                "worker wake failed after command admission: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct ClientWorker {
     client: Arc<Mutex<Client>>,
     sender: Option<Arc<mpsc::SyncSender<Command>>>,
+    /// The worker owns this fd. Command senders and CQEs add to its counter.
+    /// The worker reads it after poll; drop closes it after the queue stops.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    worker_wake: Arc<std::os::fd::OwnedFd>,
     thread: Option<JoinHandle<()>>,
 }
 struct WorkerDiagnostics {
@@ -5255,12 +5360,31 @@ impl ClientWorker {
             partition,
         } = diagnostics;
         client.trace_controls(Arc::clone(&write_timeline), partition);
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let worker_wake = {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            // SAFETY: eventfd has plain value arguments. Check its result before taking ownership.
+            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: fd is a new, valid descriptor and has no other owner.
+            let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+            client.set_worker_wake(fd.as_raw_fd());
+            fd
+        };
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let thread_wake = Arc::clone(&worker_wake);
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let leased_write_window = client.leased_write_window();
         let client = Arc::new(Mutex::new(client));
         let worker_client = Arc::clone(&client);
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let thread = thread::Builder::new()
             .name("value-wal-tcp".into())
             .spawn(move || {
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let _thread_wake = thread_wake;
                 let mut write_profile_limit = write_profile_limit;
                 let mut profile_attempted = false;
                 let mut profile_enabled = false;
@@ -5285,45 +5409,64 @@ impl ClientWorker {
                 let mut position: Option<(u64, u64, Reply<CheckpointPositionProof>)> = None;
                 let mut disconnected = false;
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let mut leased_members = Vec::new();
+                let mut leased_replies: VecDeque<(u64, LeasedMembers)> =
+                    VecDeque::with_capacity(leased_write_window);
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let prepare_leased_command = |client: &mut Client, command: &Command| {
-                    if !client.live_leased_mode() {
-                        return true;
-                    }
-                    // Acquire observes a fatal checkpoint or another owner's
-                    // failure immediately before dispatching another command.
-                    if failure.load(std::sync::atomic::Ordering::Acquire) {
-                        client.record_live_write_error();
-                        return false;
-                    }
-                    let result = match command {
-                        Command::Checkpoint(..) => client.settle_leased_extent(),
-                        Command::CheckpointPosition(..) => Ok(()),
-                        Command::ReadIoStats(_) => client.wait_leased_control(),
-                        Command::Seal(..) | Command::Control(_) => client.close_leased_extent(),
-                        Command::Stats(_)
-                        | Command::ArmProfile(..)
-                        | Command::OwnerTimelineArm(..)
-                        | Command::FinishProfile(_) => client.wait_leased_control(),
-                        Command::Append(..) => Ok(()),
+                let mut deferred: Option<(u64, Vec<CompleteBatch>, LeasedMembers)> = None;
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let mut released = Vec::with_capacity(leased_write_window);
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let prepare_leased_command =
+                    |client: &mut Client,
+                     command: &Command,
+                     released: &mut Vec<(u64, Vec<DurableBatch>)>,
+                     replies: &mut VecDeque<(u64, LeasedMembers)>| {
+                        if !client.live_leased_mode() {
+                            return true;
+                        }
+                        // Acquire observes a fatal checkpoint or another owner's
+                        // failure immediately before dispatching another command.
+                        if failure.load(std::sync::atomic::Ordering::Acquire) {
+                            client.record_live_write_error();
+                            return false;
+                        }
+                        let result = match command {
+                            Command::Checkpoint(..) => {
+                                client.settle_leased_extent(released, Some(&write_timeline))
+                            }
+                            Command::CheckpointPosition(..) => Ok(()),
+                            Command::ReadIoStats(_) => {
+                                client.wait_leased_control(released, Some(&write_timeline))
+                            }
+                            Command::Seal(..) | Command::Control(_) => {
+                                client.close_leased_extent(released, Some(&write_timeline))
+                            }
+                            Command::Stats(_)
+                            | Command::ArmProfile(..)
+                            | Command::OwnerTimelineArm(..)
+                            | Command::FinishProfile(_) => {
+                                client.wait_leased_control(released, Some(&write_timeline))
+                            }
+                            Command::Append(..) => Ok(()),
+                        };
+                        let result =
+                            result.and_then(|()| release_leased_replies(released, replies));
+                        if let Err(error) = result {
+                            client.record_live_write_error();
+                            record_first_failure(
+                                &first_failure,
+                                Some(partition),
+                                None,
+                                "leased_command",
+                                &error,
+                            );
+                            // Release publishes the failure before any queued command runs.
+                            failure.store(true, std::sync::atomic::Ordering::Release);
+                            let _ = wake.try_send(());
+                            return false;
+                        }
+                        true
                     };
-                    if let Err(error) = result {
-                        client.record_live_write_error();
-                        record_first_failure(
-                            &first_failure,
-                            Some(partition),
-                            None,
-                            "leased_command",
-                            &error,
-                        );
-                        // Release publishes the failure before any queued command runs.
-                        failure.store(true, std::sync::atomic::Ordering::Release);
-                        let _ = wake.try_send(());
-                        return false;
-                    }
-                    true
-                };
                 loop {
                     let mut client = worker_client.lock();
                     while !disconnected && queued.len() < queue_capacity {
@@ -5344,7 +5487,26 @@ impl ClientWorker {
                             client.record_live_write_error();
                             break;
                         }
+                        let mut leased_failure_stage = "live_group";
                         let result = (|| {
+                            client.progress_leased_flights(&mut released, Some(&write_timeline))?;
+                            let has_released = !released.is_empty();
+                            if let Err(error) =
+                                release_leased_replies(&mut released, &mut leased_replies)
+                            {
+                                record_first_failure(
+                                    &first_failure,
+                                    Some(partition),
+                                    None,
+                                    "leased_release_order",
+                                    &error,
+                                );
+                                return Err(error);
+                            }
+                            if has_released {
+                                let _ = wake.try_send(());
+                            }
+                            leased_failure_stage = "leased_adoption";
                             if client.leased_adoption_pending() {
                                 client.progress_appends()?;
                                 client.harvest_leased_adoption()?;
@@ -5389,7 +5551,7 @@ impl ClientWorker {
                                 &first_failure,
                                 Some(partition),
                                 None,
-                                "leased_adoption",
+                                leased_failure_stage,
                                 &error,
                             );
                             // Release publishes the fatal outcome to the authority.
@@ -5436,6 +5598,16 @@ impl ClientWorker {
                         && parked_checkpoint.is_none()
                         && appends.is_empty()
                         && !client.has_pending_io()
+                        && {
+                            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                            {
+                                client.leased_flights_in_flight() == 0 && deferred.is_none()
+                            }
+                            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+                            {
+                                true
+                            }
+                        }
                     {
                         drop(client);
                         match receiver.recv() {
@@ -5447,16 +5619,71 @@ impl ClientWorker {
                         }
                         continue;
                     }
-                    // Several queued groups for this owner share ONE reservation, one
-                    // NVMe write, one completion RPC and one persistence sequence.
-                    // The merged group stays within the owner's group limits, keeps the
-                    // admission order, and never reorders across a non-append command.
-                    // A stream still has one unresolved reservation at a time.
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    if let Some((epoch, batches, members)) = deferred.take() {
+                        match client.submit_leased_group(epoch, batches, &write_timeline, partition)
+                        {
+                            Ok(super::tcp::LeasedSubmit::Submitted(id)) => {
+                                leased_replies.push_back((id, members));
+                                if position.is_none() {
+                                    continue;
+                                }
+                            }
+                            Ok(super::tcp::LeasedSubmit::Deferred(batches)) => {
+                                deferred = Some((epoch, batches, members));
+                            }
+                            Err(error) => {
+                                deferred = Some((epoch, Vec::new(), members));
+                                client.record_live_write_error();
+                                record_first_failure(
+                                    &first_failure,
+                                    Some(partition),
+                                    None,
+                                    "live_group",
+                                    &error,
+                                );
+                                failure.store(true, std::sync::atomic::Ordering::Release);
+                                let _ = wake.try_send(());
+                                break;
+                            }
+                        }
+                    }
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    if client.leased_flights_in_flight() != 0
+                        && (deferred.is_some()
+                            || !matches!(queued.front(), Some(Command::Append(..)))
+                            || client.leased_flights_in_flight() >= client.leased_write_window())
+                        && !matches!(queued.front(), Some(Command::CheckpointPosition(..)))
+                    {
+                        if let Err(error) = client.wait_leased_flights(true) {
+                            client.record_live_write_error();
+                            record_first_failure(
+                                &first_failure,
+                                Some(partition),
+                                None,
+                                "live_group",
+                                &error,
+                            );
+                            failure.store(true, std::sync::atomic::Ordering::Release);
+                            let _ = wake.try_send(());
+                            break;
+                        }
+                        if position.is_none() {
+                            continue;
+                        }
+                    }
+                    // Merge ready same-epoch appends without crossing a control
+                    // barrier. Reserved writes keep one reservation in flight.
+                    // Leased frames use the configured completion window.
                     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if client.live_nvme_configured()
                         && appends.is_empty()
                         && checkpoint.is_none()
                         && (position.is_none() || client.live_leased_mode())
+                        && (!client.live_leased_mode()
+                            || (deferred.is_none()
+                                && client.leased_flights_in_flight()
+                                    < client.leased_write_window()))
                         && let Some(Command::Append(epoch, _, _)) = queued.front()
                     {
                         let epoch = *epoch;
@@ -5508,12 +5735,7 @@ impl ClientWorker {
                             } else {
                                 Vec::with_capacity(count.max(1))
                             };
-                            let mut members: Vec<(BatchVersion, usize, Reply<Vec<DurableBatch>>)> =
-                                if leased {
-                                    std::mem::take(&mut leased_members)
-                                } else {
-                                    Vec::with_capacity(take)
-                                };
+                            let mut members: LeasedMembers = Vec::with_capacity(take);
                             for _ in 0..take {
                                 let Some(Command::Append(_, batches, reply)) = queued.pop_front()
                                 else {
@@ -5528,66 +5750,70 @@ impl ClientWorker {
                                 }
                             }
                             let first = members[0].0;
-                            let result = if leased {
-                                client.write_leased_group(epoch, merged, &write_timeline, partition)
+                            if leased {
+                                match client.submit_leased_group(
+                                    epoch,
+                                    merged,
+                                    &write_timeline,
+                                    partition,
+                                ) {
+                                    Ok(super::tcp::LeasedSubmit::Submitted(id)) => {
+                                        leased_replies.push_back((id, members));
+                                    }
+                                    Ok(super::tcp::LeasedSubmit::Deferred(batches)) => {
+                                        deferred = Some((epoch, batches, members));
+                                    }
+                                    Err(error) => {
+                                        deferred = Some((epoch, Vec::new(), members));
+                                        client.record_live_write_error();
+                                        record_first_failure(
+                                            &first_failure,
+                                            Some(partition),
+                                            Some(first),
+                                            "live_group",
+                                            &error,
+                                        );
+                                        failure.store(true, std::sync::atomic::Ordering::Release);
+                                        let _ = wake.try_send(());
+                                        break;
+                                    }
+                                }
+                                if position.is_none() {
+                                    continue;
+                                }
                             } else {
-                                client.write_live_group(epoch, &merged, &write_timeline, partition)
-                            };
-                            let failed = result.is_err();
-                            match result {
-                                Ok(receipts) => {
-                                    if leased && members.len() == 1 {
-                                        if let Some((_, _, reply)) = members.pop() {
-                                            let _ = reply.send(Ok(receipts));
-                                        }
-                                    } else {
+                                match client.write_live_group(
+                                    epoch,
+                                    &merged,
+                                    &write_timeline,
+                                    partition,
+                                ) {
+                                    Ok(receipts) => {
                                         let mut receipts = receipts.into_iter();
                                         for (_, len, reply) in members.drain(..) {
-                                            let own: Vec<DurableBatch> =
-                                                receipts.by_ref().take(len).collect();
-                                            let _ = reply.send(Ok(own));
+                                            let _ = reply
+                                                .send(Ok(receipts.by_ref().take(len).collect()));
                                         }
                                     }
-                                }
-                                Err(error) => {
-                                    client.record_live_write_error();
-                                    record_first_failure(
-                                        &first_failure,
-                                        Some(partition),
-                                        Some(first),
-                                        "live_group",
-                                        &error,
-                                    );
-                                    failure.store(true, std::sync::atomic::Ordering::Release);
-                                    for (version, _, reply) in members.drain(..) {
-                                        let _ =
-                                            reply.send(Err(LocalDbError::unknown(version, &error)));
+                                    Err(error) => {
+                                        client.record_live_write_error();
+                                        record_first_failure(
+                                            &first_failure,
+                                            Some(partition),
+                                            Some(first),
+                                            "live_group",
+                                            &error,
+                                        );
+                                        failure.store(true, std::sync::atomic::Ordering::Release);
+                                        for (version, _, reply) in members.drain(..) {
+                                            let _ = reply
+                                                .send(Err(LocalDbError::unknown(version, &error)));
+                                        }
+                                        let _ = wake.try_send(());
+                                        break;
                                     }
                                 }
-                            }
-                            if leased {
-                                leased_members = members;
-                            }
-                            let _ = wake.try_send(());
-                            if failed {
-                                break;
-                            }
-                            if client.live_leased_mode()
-                                && parked_checkpoint.is_none()
-                                && let Err(error) = client.submit_leased_adoption()
-                            {
-                                client.record_live_write_error();
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    Some(first),
-                                    "leased_adoption_submit",
-                                    &error,
-                                );
-                                // Release publishes the fatal outcome to the authority.
-                                failure.store(true, std::sync::atomic::Ordering::Release);
                                 let _ = wake.try_send(());
-                                break;
                             }
                             // While a proof is pending, also drive its reply/deadline
                             // after each direct frame. A full append FIFO cannot starve it.
@@ -5672,7 +5898,12 @@ impl ClientWorker {
                     {
                         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if let Some(command) = queued.front()
-                            && !prepare_leased_command(&mut client, command)
+                            && !prepare_leased_command(
+                                &mut client,
+                                command,
+                                &mut released,
+                                &mut leased_replies,
+                            )
                         {
                             break;
                         }
@@ -5741,7 +5972,12 @@ impl ClientWorker {
                     {
                         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if let Some(command) = queued.front()
-                            && !prepare_leased_command(&mut client, command)
+                            && !prepare_leased_command(
+                                &mut client,
+                                command,
+                                &mut released,
+                                &mut leased_replies,
+                            )
                         {
                             break;
                         }
@@ -6027,7 +6263,12 @@ impl ClientWorker {
                             | Some(Command::Control(_)) => {
                                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                                 if let Some(command) = queued.front()
-                                    && !prepare_leased_command(&mut client, command)
+                                    && !prepare_leased_command(
+                                        &mut client,
+                                        command,
+                                        &mut released,
+                                        &mut leased_replies,
+                                    )
                                 {
                                     break;
                                 }
@@ -6112,7 +6353,8 @@ impl ClientWorker {
                     {
                         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if client.live_leased_mode()
-                            && let Err(error) = client.close_leased_extent()
+                            && let Err(error) =
+                                client.close_leased_extent(&mut released, Some(&write_timeline))
                         {
                             client.record_live_write_error();
                             record_first_failure(
@@ -6162,6 +6404,21 @@ impl ClientWorker {
                 }
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 {
+                    let message = failure_context(
+                        &first_failure,
+                        "leased worker stopped with unknown write outcome",
+                    );
+                    for (_, members) in leased_replies.drain(..) {
+                        for (version, _, reply) in members {
+                            let _ = reply.send(Err(LocalDbError::unknown(version, &message)));
+                        }
+                    }
+                    if let Some((_, _, members)) = deferred.take() {
+                        for (version, _, reply) in members {
+                            let _ = reply.send(Err(LocalDbError::unknown(version, &message)));
+                        }
+                    }
+                    let _ = wake.try_send(());
                     // Take only ownership under the lock. Terminal DMA drain
                     // stays on this worker, outside the mutex needed by shutdown.
                     let failed_writer = worker_client.lock().take_failed_live_writer();
@@ -6192,6 +6449,8 @@ impl ClientWorker {
         Ok(Self {
             client,
             sender: Some(Arc::new(sender)),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            worker_wake,
             thread: Some(thread),
         })
     }
@@ -6200,6 +6459,8 @@ impl ClientWorker {
             #[cfg(any(test, feature = "experimental-fabric"))]
             client: self.client.clone(),
             sender: self.sender.as_ref().map(Arc::downgrade).unwrap_or_default(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            worker_wake: Arc::downgrade(&self.worker_wake),
         }
     }
 
@@ -6218,7 +6479,10 @@ impl ClientWorker {
             .as_ref()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
             .send(command)
-            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))
+            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        signal_worker_wake(&self.worker_wake)?;
+        Ok(())
     }
     fn append(
         &self,
@@ -6256,6 +6520,8 @@ impl Drop for ClientWorker {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        self.client.lock().clear_worker_wake();
     }
 }
 fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {

@@ -394,6 +394,7 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
         pending.insert(
             id,
             ServerPending {
+                partition: 0,
                 deadline: Instant::now() + Duration::from_secs(2),
                 charge,
                 epoch: Some(1),
@@ -791,6 +792,7 @@ fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending>
     HashMap::from([(
         1,
         ServerPending {
+            partition: 0,
             deadline: Instant::now() + Duration::from_secs(2),
             charge: 4096,
             epoch: Some(1),

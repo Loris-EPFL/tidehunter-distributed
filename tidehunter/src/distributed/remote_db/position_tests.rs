@@ -9,11 +9,11 @@ use std::sync::atomic::Ordering;
 fn ready(fixture: &Fixture) -> (Client, DurableBatch) {
     let mut client = fixture.writer();
     let first = client
-        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
         .unwrap()[0];
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     client.submit_leased_adoption().unwrap();
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     (client, first)
 }
 
@@ -85,7 +85,7 @@ fn independent_position_slots_merge_roots_in_reverse_completion_order() {
         // Status is exclusive. Connect before pausing active stream work.
         let mut other = fixture.client();
         let second = client
-            .write_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
             .unwrap()[0];
         let log = fixture.node.log_for_test(1);
         let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeData);
@@ -127,7 +127,7 @@ fn independent_position_slots_merge_roots_in_reverse_completion_order() {
         };
         assert_eq!(older.durable_end, newer.durable_end);
         assert!(older.durable_end >= through(second));
-        client.close_leased_extent().unwrap();
+        client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 }
 
@@ -137,7 +137,7 @@ fn position_deadline_poison_clears_both_slots() {
         let fixture = Fixture::new(tier, 128 * 1024);
         let (mut client, first) = ready(&fixture);
         client
-            .write_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, vec![fixture.batch(1)], &WriteTimeline::default(), 2)
             .unwrap();
         let log = fixture.node.log_for_test(1);
         let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeData);
@@ -229,10 +229,10 @@ fn prepared_prelease_completes_during_serialized_root_install() {
     let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
     let mut client = fixture.writer_without_ahead();
     let first = client
-        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
         .unwrap()[0];
     client.submit_leased_adoption().unwrap();
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     client.leased_test_enable_ahead();
     // The first grant has already allocated and durably named this file;
     // its next fragment must not depend on an unrelated root transaction.
@@ -277,7 +277,7 @@ fn prepared_prelease_completes_during_serialized_root_install() {
     assert_eq!(root_during, root_before);
     assert_eq!(receipt_during, receipt_before);
     assert!(proof_pending);
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     assert!(client.leased_test_ahead_state().1);
     loop {
         client.progress_appends().unwrap();
@@ -293,5 +293,5 @@ fn prepared_prelease_completes_during_serialized_root_install() {
         (root_before.0 + 1, root_before.1, through(first))
     );
     assert_eq!(log.synced_frontier(), receipt_before);
-    client.close_leased_extent().unwrap();
+    client.close_leased_extent(&mut Vec::new(), None).unwrap();
 }

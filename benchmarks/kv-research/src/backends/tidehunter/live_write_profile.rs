@@ -60,6 +60,7 @@ const COUNTERS: &[&str] = &[
     "complete_exchanges",
     "lease_exchanges",
     "leased_frames",
+    "leased_eventfd_unavailable",
     "leased_bytes",
     "leased_skip_markers",
     "extents_leased",
@@ -96,7 +97,11 @@ const COUNTERS: &[&str] = &[
 
 /// Lifetime maxima kept across lanes. A gauge peak is not additive and a delta of it is
 /// meaningless, so both window boundaries are recorded and never subtracted.
-const PEAKS: &[&str] = &["lane_inflight_request_max", "lane_inflight_op_max"];
+const PEAKS: &[&str] = &[
+    "lane_inflight_request_max",
+    "lane_inflight_op_max",
+    "max_leased_in_flight",
+];
 
 fn counts(stats: Option<LiveNvmeStats>) -> Result<Value, String> {
     let stats = stats.ok_or("live NVMe counter snapshot unavailable")?;
@@ -458,6 +463,7 @@ mod tests {
             "complete_exchanges",
             "lease_exchanges",
             "leased_frames",
+            "leased_eventfd_unavailable",
             "leased_bytes",
             "leased_skip_markers",
             "extents_leased",

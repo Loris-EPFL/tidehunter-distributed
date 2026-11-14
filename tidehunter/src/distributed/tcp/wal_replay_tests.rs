@@ -270,7 +270,7 @@ fn replay_live_wal_page_reads_frames_through_namespace_fixture() {
     let mut client = fixture.writer_without_ahead();
     let batches: Vec<_> = (0..3).map(|n| fixture.batch(n)).collect();
     let receipts = client
-        .write_leased_group(1, batches.clone(), &WriteTimeline::default(), 1)
+        .submit_and_drain_leased_group(1, batches.clone(), &WriteTimeline::default(), 1)
         .unwrap();
     let last = receipts.last().unwrap().appended().address();
     let through = last.offset + u64::from(last.len);
@@ -287,7 +287,7 @@ fn replay_live_wal_page_reads_frames_through_namespace_fixture() {
         fixture.metrics.snapshot().counts.adoption_sync_exchanges,
         before
     );
-    client.close_leased_extent().unwrap();
+    client.close_leased_extent(&mut Vec::new(), None).unwrap();
     client.fence_to(2).unwrap();
     let pool_dir = tempdir::TempDir::new("replay-pool").unwrap();
     let registry = crate::distributed::nvmeof::live_connect::LiveConnectionRegistry::open(

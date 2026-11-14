@@ -31,10 +31,10 @@ mod inventory;
 mod live_client;
 mod payload;
 pub use super::nvmeof::{LiveExportMode, LiveQueueGeometry};
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-pub(super) use live_client::LiveGroupBudget;
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use live_client::leased_tests;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(super) use live_client::{LeasedSubmit, LiveGroupBudget};
 pub use live_client::{LiveClientConfig, LiveInitiatorIdentity, LiveWriteMode};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_control;

@@ -2517,6 +2517,7 @@ impl Client {
 }
 
 struct ServerPending {
+    partition: u32,
     deadline: Instant,
     charge: usize,
     epoch: Option<u64>,
@@ -3094,9 +3095,16 @@ pub(super) fn serve_session(
                 if let Some(profile) = diagnostics.as_mut() {
                     profile.requests += u64::from(measured);
                 }
+                super::super::owner_events::record(
+                    super::super::owner_events::OwnerEventKind::ControlReceived,
+                    node.control_context.partition.partition,
+                    envelope.id,
+                    request_kind_code(&envelope.body),
+                );
                 pending.insert(
                     envelope.id,
                     ServerPending {
+                        partition: node.control_context.partition.partition,
                         deadline,
                         charge,
                         epoch,
@@ -3623,6 +3631,75 @@ fn finish_read(
     queue_response(pending, id, response)
 }
 
+// Stable diagnostic codes, independent of bincode enum discriminants and features.
+// The table is documented in owner_events.rs.
+fn request_kind_code(request: &Request) -> u64 {
+    match request {
+        Request::Checkpoint { .. } => 1,
+        Request::RetirementFiles { .. } => 2,
+        Request::RetireFiles { .. } => 3,
+        Request::ReadIoStats => 4,
+        Request::Status { .. } => 5,
+        Request::Fence { .. } => 6,
+        Request::Append { .. } => 7,
+        Request::Read { .. } => 8,
+        Request::Recover { .. } => 9,
+        Request::Seal { .. } => 10,
+        Request::Stats => 11,
+        Request::ReadProfiled { .. } => 12,
+        Request::StatsDetailed => 13,
+        Request::ConnectionProfile { .. } => 14,
+        Request::OperationalReadIoStats => 15,
+        Request::OwnerTimelineArm { .. } => 16,
+        Request::OwnerTimelineFetch { .. } => 17,
+        Request::CheckpointPosition { .. } => 18,
+        Request::ReplayWal { .. } => 19,
+        Request::RetireWalFiles { .. } => 20,
+        #[cfg(feature = "experimental-nvmeof")]
+        Request::ValidateRecordReferences { .. } => 21,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::RegisterNvmeofExport { .. } => 22,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ReleaseNvmeofExport { .. } => 23,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::RegisterNvmeofEpochPin { .. } => 24,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ReleaseNvmeofEpochPin { .. } => 25,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ReleaseLiveEpochPin { .. } => 26,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ReserveLiveGroup { .. } => 27,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::CompleteLiveGroup { .. } => 28,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ResolveLiveRecords { .. } => 29,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::RecoverLiveMetadata { .. } => 30,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::LiveTargetStats => 31,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ShutdownLiveTarget { .. } => 32,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::LeaseLiveExtent { .. } => 33,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::AdoptLiveExtent { .. } => 34,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::OpenLiveExports { .. } => 35,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::PreleaseLiveExtent { .. } => 36,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ReplayLiveWal { .. } => 37,
+        #[cfg(all(target_os = "linux", feature = "test-utils"))]
+        Request::ReadEvidence { .. } => 38,
+        #[cfg(all(target_os = "linux", feature = "test-utils"))]
+        Request::ProcessResources { .. } => 39,
+        #[cfg(feature = "test-utils")]
+        Request::PrepareRamProbe { .. } => 40,
+        #[cfg(feature = "test-utils")]
+        Request::ReadRamProbe => 41,
+    }
+}
+
 fn queue_response(
     pending: &mut HashMap<u64, ServerPending>,
     id: u64,
@@ -3663,6 +3740,12 @@ fn queue_response(
         });
     }
     request.ready_response = Some(response);
+    super::super::owner_events::record(
+        super::super::owner_events::OwnerEventKind::ControlReplied,
+        request.partition,
+        id,
+        0,
+    );
     Ok(())
 }
 

@@ -929,6 +929,7 @@ fn live_frame_can_fill_one_fragment() {
         host_nqn: "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
         host_id: [1; 16],
         owner_identities: Default::default(),
+        leased_write_window: Some(4),
         max_inflight_requests: 8,
         max_inflight_bytes: 64 * 1024,
         connect_timeout_ms: 1000,
@@ -939,6 +940,29 @@ fn live_frame_can_fill_one_fragment() {
         queue_geometry: Default::default(),
     });
     assert!(config.validate().is_ok());
+    assert_eq!(
+        config.effective_owner_append_occupancy(),
+        config.owner_append_occupancy
+    );
+    config.owner_append_occupancy = 8;
+    let live = config.live_nvme.as_mut().unwrap();
+    live.write_mode = super::super::tcp::LiveWriteMode::Leased;
+    live.leased_durability = Some(super::super::durability::DurabilityTier::Native);
+    live.max_inflight_requests = 32;
+    live.leased_write_window = None;
+    assert!(config.validate().is_ok());
+    assert_eq!(config.effective_owner_append_occupancy(), 31);
+    config.live_nvme.as_mut().unwrap().leased_write_window = Some(9);
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("leased write window exceeds owner append occupancy")
+    );
+    config.live_nvme.as_mut().unwrap().leased_write_window = Some(8);
+    assert!(config.validate().is_ok());
+    assert_eq!(config.effective_owner_append_occupancy(), 8);
 }
 
 #[test]

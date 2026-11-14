@@ -169,9 +169,11 @@ pub enum WriteTimelineStage {
     LiveNamespaceSetupStarted,
     LiveNamespaceSetupCompleted,
     LiveIoStarted,
+    /// The CQE was observed. Leased groups can complete out of frame order.
     LiveIoCompleted,
     LiveCompleteStarted,
     LiveCompleteCompleted,
+    /// Leased receipts release only after all prior frames complete.
     LiveReceiptsValidated,
     /// The request has been queued in the local reactor, not necessarily sent on the wire.
     TxQueued,
@@ -185,6 +187,8 @@ pub enum WriteTimelineStage {
     LiveFrameEncoded,
     /// The kernel consumed the leased write SQE, before the CQE wait.
     LiveIoSubmitted,
+    /// The first sampled group after the writer queue changed its target.
+    LiveQueueRebound,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,6 +305,16 @@ pub struct LiveGroupTimeline {
     pub reservation_token: Option<[u8; 16]>,
     pub owner_validation_ns: Option<u64>,
     pub owner_persistence: Option<super::storage::StorageWriteProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wal_position: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_len: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wal_file: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace_block_size: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -313,6 +327,7 @@ pub struct OwnerTimelineError {
 
 #[derive(Debug, Serialize)]
 pub struct WriteTimelineExport {
+    pub origin_monotonic_ns: u64,
     pub limit: usize,
     pub records: Vec<WriteTimelineRecord>,
     pub dropped_calls: u64,
@@ -398,10 +413,13 @@ impl WriteTimeline {
                 .map_err(|_| "write timeline generation exhausted")?
                 + 1;
             self.waits.reset();
+            let origin = Instant::now();
+            let origin_monotonic_ns = super::owner_events::monotonic_now_ns();
             *session = Some(Session {
                 generation,
-                origin: Instant::now(),
+                origin,
                 export: WriteTimelineExport {
+                    origin_monotonic_ns,
                     write_wait_metrics: self.waits.snapshot(),
                     limit,
                     records: Vec::with_capacity(limit),
@@ -783,6 +801,11 @@ impl WriteTimeline {
             reservation_token: None,
             owner_validation_ns: None,
             owner_persistence: None,
+            wal_position: None,
+            file_offset: None,
+            frame_len: None,
+            wal_file: None,
+            namespace_block_size: None,
         });
         Some(LiveGroupSample {
             generation: s.generation,
@@ -791,7 +814,46 @@ impl WriteTimeline {
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn live_group_position(
+        &self,
+        group: Option<LiveGroupSample>,
+        wal_position: u64,
+        file_offset: u64,
+        frame_len: u32,
+        wal_file: u64,
+        namespace_block_size: u32,
+    ) {
+        let Some(group) = group else { return };
+        if let Some(row) = self
+            .session
+            .lock()
+            .as_mut()
+            .filter(|s| s.generation == group.generation)
+            .and_then(|s| s.export.live_groups.get_mut(group.index))
+        {
+            row.wal_position = Some(wal_position);
+            row.file_offset = Some(file_offset);
+            row.frame_len = Some(frame_len);
+            row.wal_file = Some(wal_file);
+            row.namespace_block_size = Some(namespace_block_size);
+        }
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_group_event(&self, group: Option<LiveGroupSample>, stage: WriteTimelineStage) {
+        if group.is_none() {
+            return;
+        }
+        self.live_group_event_at(group, stage, Instant::now());
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn live_group_event_at(
+        &self,
+        group: Option<LiveGroupSample>,
+        stage: WriteTimelineStage,
+        at: Instant,
+    ) {
         let Some(group) = group else { return };
         let mut guard = self.session.lock();
         if let Some(s) = guard.as_mut()
@@ -807,7 +869,7 @@ impl WriteTimeline {
                 .filter_map(|version| s.versions.get(version).copied())
                 .collect();
             for index in indexes {
-                Self::push(s, index, stage, Some(owner), None);
+                Self::push_at(s, index, stage, Some(owner), None, at);
             }
         }
     }
@@ -926,6 +988,17 @@ impl WriteTimeline {
         owner: Option<u32>,
         envelope_id: Option<u64>,
     ) {
+        Self::push_at(s, index, stage, owner, envelope_id, Instant::now());
+    }
+
+    fn push_at(
+        s: &mut Session,
+        index: usize,
+        stage: WriteTimelineStage,
+        owner: Option<u32>,
+        envelope_id: Option<u64>,
+        at: Instant,
+    ) {
         if let Some(record) = s.export.records.get_mut(index) {
             if record.events.len() >= MAX_EVENTS {
                 s.export.dropped_events += 1;
@@ -933,7 +1006,10 @@ impl WriteTimeline {
             }
             record.events.push(WriteTimelineEvent {
                 stage,
-                elapsed_ns: s.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                elapsed_ns: at
+                    .saturating_duration_since(s.origin)
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
                 owner,
                 envelope_id,
             });

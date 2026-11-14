@@ -134,7 +134,7 @@ class ManualCampaignTest(unittest.TestCase):
 
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44}[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
@@ -148,6 +148,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
                     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
                     'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
+                    'nvmeof_parallel_writes': 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70',
                     'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
                     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
                 }[selection])
@@ -2214,7 +2215,7 @@ class CombinedSuiSuiteTests(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_half_preserves_both_result_archives(self):
         import manual_sui
         from unittest.mock import Mock
-        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing', 'sui_nvmeof_with_contracts_crossing2'):
+        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing', 'sui_nvmeof_with_contracts_crossing2', 'sui_nvmeof_with_parallel_writes'):
             spec=manual_sui.REVIEWED_SUI_SPECS[name]
             for incomplete in ('kv','sui'):
                 with self.subTest(spec=name,incomplete=incomplete), tempfile.TemporaryDirectory() as tmp:
@@ -2246,7 +2247,7 @@ class CombinedSuiRunGateTests(SuiRunGateTests):
     async def test_run_forwards_staged_copy_focused_spec_and_both_abis(self):
         import manual_sui
         # Reuse the full launcher gate test with the exact combined reviewed spec.
-        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing', 'sui_nvmeof_with_contracts_crossing2'):
+        for name in ('sui_nvmeof_with_kv', 'sui_nvmeof_with_contracts', 'sui_nvmeof_with_contracts_crossing', 'sui_nvmeof_with_contracts_crossing2', 'sui_nvmeof_with_parallel_writes'):
             with self.subTest(spec=name):
                 with patch.dict(manual_sui.REVIEWED_SUI_SPECS,
                                 sui_nvmeof_compact=manual_sui.REVIEWED_SUI_SPECS[name]):
@@ -2301,6 +2302,23 @@ class HarnessSynchronousSuiTests(ManualSuiTests):
         import risk_order
         jobs = manual._reviewed_jobs(self.spec)
         self.assertTrue(risk_order.validate_order(jobs, risk_order.generate_order(jobs)))
+
+
+
+
+class ParallelWritesSuiTests(CombinedSuiAdmissionTests):
+    spec_name = 'sui_nvmeof_with_parallel_writes'
+
+    def test_parallel_writes_combined_count_and_digest(self):
+        spec = self.sui.REVIEWED_SUI_SPECS[self.spec_name]
+        self.assertEqual(spec['job_count'], 44)
+        self.assertEqual(spec['matrix_sha256'],
+                         'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual(len(jobs), 44)
+        self.assertEqual({group: sum(job['group'] == group for job in jobs)
+                          for group in ('G23W', 'G23X', 'G23N')},
+                         {'G23W': 32, 'G23X': 6, 'G23N': 6})
 
 
 if __name__ == '__main__':

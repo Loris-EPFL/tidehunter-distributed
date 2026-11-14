@@ -49,7 +49,9 @@ fn worker_with_failure_context(
 #[test]
 fn leased_worker_merges_ready_appends_and_splits_receipts_in_order() {
     let fixture = Fixture::new(DurabilityTier::Synchronous, 16384);
-    let (worker, failure) = worker(&fixture, fixture.writer());
+    let mut writer = fixture.writer();
+    writer.leased_test_set_window(1);
+    let (worker, failure) = worker(&fixture, writer);
     let batches: Vec<_> = (0..3).map(|n| fixture.batch(n)).collect();
     let client = worker.client.lock();
     let replies: Vec<_> = batches
@@ -243,12 +245,17 @@ fn leased_measurement_gate_observations_keep_warm_extent() {
                 fixture.writer_without_ahead()
             };
             let warmup = client
-                .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(0)],
+                    &WriteTimeline::default(),
+                    2,
+                )
                 .unwrap()[0];
             // Complete the warmup driver's prelease and adoption before the gate.
             for _ in 0..2 {
                 client.submit_leased_adoption().unwrap();
-                client.wait_leased_control().unwrap();
+                client.wait_leased_control(&mut Vec::new(), None).unwrap();
             }
             let (worker, failure) = worker(&fixture, client);
             if mode == HistoryPersistence::WalReplay {
@@ -484,7 +491,7 @@ fn leased_worker_timeout_detaches_dma_before_blocking_drain() {
         guard.take_failed_live_writer().is_none(),
         "worker must own the detached DMA queue"
     );
-    guard.close_live_writer().unwrap();
+    guard.close_live_writer(&mut Vec::new(), None).unwrap();
     assert_eq!(fixture.metrics.snapshot().counts.leased_write_samples, 0);
     assert_eq!(fixture.metrics.snapshot().counts.adoption_sync_exchanges, 0);
     drop(guard);
@@ -538,7 +545,7 @@ fn leased_worker_checkpoint_waits_for_adoption_without_holding_client_lock() {
         .unwrap();
     let mut client = fixture.writer();
     client
-        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
         .unwrap();
     let (entered, release) = fixture
         .node
@@ -640,6 +647,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 host_nqn: "nqn.2026-01.test:leased".into(),
                 host_id: [1; 16],
                 owner_identities: Default::default(),
+                leased_write_window: Some(1),
                 max_inflight_requests: 4,
                 max_inflight_bytes: 128 * 1024,
                 connect_timeout_ms: 1000,
@@ -716,7 +724,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 .try_lock_for(Duration::from_secs(1))
                 .expect("shutdown drain must release the client mutex");
             assert!(guard.take_failed_live_writer().is_none());
-            guard.close_live_writer().unwrap();
+            guard.close_live_writer(&mut Vec::new(), None).unwrap();
             assert_eq!(
                 leased_latencies(&metrics.snapshot().counts),
                 leased_latencies(&before)
@@ -840,7 +848,10 @@ fn leased_rotation_profile_native_geometry() {
         }
     }
     // Capture put-path counters before shutdown adds a final close exchange.
-    let settled = worker.client.lock().settle_leased_extent();
+    let settled = worker
+        .client
+        .lock()
+        .settle_leased_extent(&mut Vec::new(), None);
     settled.unwrap_or_else(|error| {
         panic!(
             "profile settle failed: {error}; first_failure={:?}; counters={:#?}",
@@ -929,7 +940,7 @@ fn wal_replay_leased_checkpoint_does_not_settle_the_extent() {
         let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
         let mut client = fixture.writer();
         let receipt = client
-            .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
             .unwrap()[0];
         let mut release_prelease = if pending_prelease {
             let (entered, release) = fixture.node.pause_inventory();
@@ -985,12 +996,12 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
     let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
     let mut client = fixture.writer();
     let first = client
-        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
         .unwrap()[0];
     // Finish initial prelease and adoption before holding the position sync.
     for _ in 0..2 {
         client.submit_leased_adoption().unwrap();
-        client.wait_leased_control().unwrap();
+        client.wait_leased_control(&mut Vec::new(), None).unwrap();
     }
     let before = fixture.metrics.snapshot().counts;
     let through = first.appended().address().offset + u64::from(first.appended().address().len);
@@ -1068,12 +1079,17 @@ fn wal_replay_leased_extent_control_progresses_during_position_sync() {
     for n in 0..4 {
         last = Some(
             client
-                .write_leased_group(1, vec![fixture.batch(n)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(n)],
+                    &WriteTimeline::default(),
+                    2,
+                )
                 .unwrap()[0],
         );
     }
     client.submit_leased_adoption().unwrap();
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     assert!(client.leased_append_needs_control(None));
     assert_eq!(client.leased_test_frontier().0, 16384);
     let last = last.unwrap().appended();
@@ -1120,9 +1136,9 @@ fn position_is_submitted_during_adoption_and_preserves_control_order() {
         let fixture = Fixture::new(tier, 128 * 1024);
         let mut client = fixture.writer();
         let first = client
-            .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
             .unwrap()[0];
-        client.wait_leased_control().unwrap(); // Initial prelease.
+        client.wait_leased_control(&mut Vec::new(), None).unwrap(); // Initial prelease.
         let log = fixture.node.log_for_test(1);
         let through = first.appended().address().offset + u64::from(first.appended().address().len);
         assert!(through > log.appended_frontier());
@@ -1221,7 +1237,7 @@ fn parked_position_requests_prelease_without_blocking_appends_or_shutdown() {
         let fixture = Fixture::new(tier, 128 * 1024);
         let mut client = fixture.writer_without_ahead();
         let first = client
-            .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+            .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
             .unwrap()[0];
         client.leased_test_enable_ahead();
         let (entered, release) = fixture.node.pause_inventory();
@@ -1267,9 +1283,9 @@ fn parked_receipt_checkpoint_keeps_its_captured_prefix() {
         .unwrap();
     let mut client = fixture.writer();
     let first = client
-        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
         .unwrap()[0];
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     let log = fixture.node.log_for_test(1);
     let (entered, release) = log.pause_live(LivePausePoint::FrameProbe);
     client.submit_leased_adoption().unwrap();
@@ -1297,9 +1313,9 @@ fn failed_append_poison_replies_to_inflight_position() {
     let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
     let mut client = fixture.writer();
     let first = client
-        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
         .unwrap()[0];
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     let (entered, release) = fixture
         .node
         .log_for_test(1)
@@ -1332,9 +1348,9 @@ fn failed_append_poison_replies_to_parked_receipt_checkpoint() {
         .unwrap();
     let mut client = fixture.writer();
     client
-        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
         .unwrap();
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     let (entered, release) = fixture
         .node
         .log_for_test(1)
@@ -1367,12 +1383,17 @@ fn actual_frame_can_use_runway_smaller_than_the_maximum_frame() {
     for n in 0..2 {
         first = Some(
             client
-                .write_leased_group(1, vec![fixture.batch(n)], &WriteTimeline::default(), 2)
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(n)],
+                    &WriteTimeline::default(),
+                    2,
+                )
                 .unwrap()[0],
         );
     }
     client.submit_leased_adoption().unwrap();
-    client.wait_leased_control().unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap();
     assert!(client.leased_append_needs_control(None));
     assert!(!client.leased_append_needs_control(Some(4096)));
     let last = first.unwrap().appended();
@@ -1393,4 +1414,191 @@ fn actual_frame_can_use_runway_smaller_than_the_maximum_frame() {
     assert!(proof.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
     drop(worker);
     assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_keeps_window_full_and_replies_in_admission_order() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let fixture = Fixture::new(tier, 64 * 1024);
+        let mut client = fixture.writer();
+        client.leased_test_set_window(4);
+        client.leased_test_single_batch_groups();
+        client.leased_test_hold_completions(&[1, 2, 3, 4]);
+        let (worker, failure) = worker(&fixture, client);
+        let guard = worker.client.lock();
+        let replies: Vec<_> = (0..8)
+            .map(|n| worker.append(1, vec![fixture.batch(n)]).unwrap())
+            .collect();
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.metrics.snapshot().counts.max_leased_in_flight < 4 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        for reply in &replies {
+            assert!(matches!(reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        worker.client.lock().leased_test_release_held();
+        for (sequence, reply) in replies.into_iter().enumerate() {
+            let receipts = reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(
+                receipts[0].appended().version(),
+                fixture.batch(sequence as u64).version()
+            );
+        }
+        let counts = fixture.metrics.snapshot().counts;
+        assert_eq!(counts.max_leased_in_flight, 4);
+        assert_eq!(counts.leased_frames, 8);
+        drop(worker);
+        assert!(!failure.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn leased_worker_without_window_reaches_credit_bound_and_preserves_admission_order() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let fixture = Fixture::new(tier, 128 * 1024);
+        let mut client = fixture.writer();
+        client.leased_test_no_window(16);
+        client.leased_test_single_batch_groups();
+        assert_eq!(client.leased_write_window(), 16);
+        client.leased_test_hold_completions(&(1..=16).collect::<Vec<_>>());
+        let (worker, failure) = worker(&fixture, client);
+        let guard = worker.client.lock();
+        let replies: Vec<_> = (0..16)
+            .map(|sequence| worker.append(1, vec![fixture.batch(sequence)]).unwrap())
+            .collect();
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.metrics.snapshot().counts.max_leased_in_flight < 16 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        for reply in &replies {
+            assert!(matches!(reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        worker.client.lock().leased_test_release_held();
+        let mut previous_end = 0;
+        for (sequence, reply) in replies.into_iter().enumerate() {
+            let receipts = reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(
+                receipts[0].appended().version(),
+                fixture.batch(sequence as u64).version()
+            );
+            let position = receipts[0].appended().address();
+            assert!(position.offset >= previous_end);
+            previous_end = position.offset + u64::from(position.len);
+        }
+        let counts = fixture.metrics.snapshot().counts;
+        assert_eq!(counts.max_leased_in_flight, 16);
+        assert_eq!(counts.leased_frames, 16);
+        drop(worker);
+        assert!(!failure.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn leased_window_failed_middle_write_marks_every_flight_unknown() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let fixture = Fixture::new(tier, 32768);
+        let mut client = fixture.writer();
+        client.leased_test_set_window(4);
+        client.leased_test_single_batch_groups();
+        client.leased_test_hold_completions(&[1, 2, 3, 4]);
+        client.leased_test_fail_flight(2, -libc::EIO);
+        let (worker, failure) = worker(&fixture, client);
+        let guard = worker.client.lock();
+        let replies: Vec<_> = (0..4)
+            .map(|n| worker.append(1, vec![fixture.batch(n)]).unwrap())
+            .collect();
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.metrics.snapshot().counts.max_leased_in_flight < 4 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        worker.client.lock().leased_test_release_held();
+        let mut released_prefix = 0;
+        for (sequence, reply) in replies.into_iter().enumerate() {
+            let result = reply.recv_timeout(Duration::from_secs(5)).unwrap();
+            if sequence == 0
+                && let Ok(receipts) = &result
+            {
+                // Frame 1 may release before frame 2's failed CQE is observed.
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].appended().version(), fixture.batch(0).version());
+                released_prefix = 1;
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("unknown"), "{error}");
+            }
+        }
+        assert!(failure.load(Ordering::Acquire));
+        let client = Arc::clone(&worker.client);
+        drop(worker);
+        assert!(
+            client
+                .lock()
+                .submit_and_drain_leased_group(
+                    1,
+                    vec![fixture.batch(4)],
+                    &WriteTimeline::default(),
+                    2
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fixture.metrics.snapshot().counts.leased_frames,
+            released_prefix
+        );
+    }
+}
+
+#[test]
+fn leased_worker_position_proof_bypasses_an_unreleased_frame() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let fixture = Fixture::new(tier, 32768);
+        let mut client = fixture.writer_without_ahead();
+        client.leased_test_single_batch_groups();
+        client.leased_test_hold_completions(&[1]);
+        let (worker, failure) = worker(&fixture, client);
+        let guard = worker.client.lock();
+        let first = worker.append(1, vec![fixture.batch(0)]).unwrap();
+        let second = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.metrics.snapshot().counts.completed_write_ops < 2 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let through = worker.client.lock().leased_test_frontier().0;
+        assert_eq!(through, 0);
+        let (reply, proof) = mpsc::sync_channel(1);
+        worker
+            .send(Command::CheckpointPosition(1, 1, through, reply))
+            .unwrap();
+        proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(through <= worker.client.lock().leased_test_frontier().0);
+        assert!(matches!(first.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(second.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        worker.client.lock().leased_test_release_held();
+        assert_eq!(
+            first.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()[0]
+                .appended()
+                .version(),
+            fixture.batch(0).version()
+        );
+        assert_eq!(
+            second
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()[0]
+                .appended()
+                .version(),
+            fixture.batch(1).version()
+        );
+        drop(worker);
+        assert!(!failure.load(Ordering::Acquire));
+    }
 }

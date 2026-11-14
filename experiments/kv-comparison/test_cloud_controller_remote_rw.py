@@ -53,6 +53,9 @@ class CompactReadLifecycleTests(unittest.TestCase):
                           if j['measurement_operations'] == 200000 and j['durability_tier'] == 'synchronous'))
         cases.append(controller.cloud_campaign.make_focused_matrix('nvmeof_contracts_crossing')[-1])
         cases.append(controller.cloud_campaign.make_focused_matrix('nvmeof_contracts_crossing2')[-1])
+        parallel = controller.cloud_campaign.make_focused_matrix('nvmeof_parallel_writes')
+        cases += [next(j for j in parallel if j.get('live_leased_write_window') == 4),
+                  next(j for j in parallel if j.get('owner_trace'))]
         nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
         for job in cases:
             with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as tmp:
@@ -72,7 +75,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
                 runtime.remaining = MagicMock(return_value=600)
                 runtime.cleanup_deadline = MagicMock(return_value=100)
                 runtime.cleanup_timeout = MagicMock(return_value=30)
-                runtime.request = MagicMock(return_value={'complete': True, 'history_maintenance': {}})
+                runtime.request = MagicMock(return_value={'complete': True, 'history_maintenance': {}, 'owner_events': {'events': []}})
                 case_dir = root / job['case_id']
                 case_dir.mkdir()
                 def fake_command(argv, **kwargs):
@@ -82,7 +85,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     live = prep['live_nvmeof']
                     client = {key: live[key] for key in ('max_inflight_requests', 'max_inflight_bytes',
                               'connect_timeout_ms', 'io_timeout_ms', 'write_mode', 'inline_reads',
-                              'lease_ahead', 'polled_writes')}
+                              'lease_ahead', 'polled_writes', 'leased_write_window')}
                     client.update(queue_geometry=live['queue_geometry'], export_mode=live['export_mode'])
                     client.update(host_nqn=nqn, host_id=controller.live_host_identity(nqn),
                                   leased_durability=prep['durability_tier'] if live['write_mode'] == 'leased' else None)
@@ -121,6 +124,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     self.assertEqual(prep['history_persistence'], job.get('history_persistence', 'on_disk'))
                     self.assertTrue(prep['live_nvmeof']['lease_ahead'])
                     self.assertFalse(prep['live_nvmeof']['polled_writes'])
+                    self.assertEqual(prep['live_nvmeof']['leased_write_window'], job.get('live_leased_write_window'))
                     self.assertEqual(options['owners'], 1)
                     rows = runtime.live_boundaries(job['case_id'], 'begin', case_dir,
                                                    {'host_nqn': nqn, 'transport': 'rdma'})

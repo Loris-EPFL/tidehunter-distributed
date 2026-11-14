@@ -129,6 +129,13 @@ impl PartitionLog {
         through: u64,
         profile: Option<&mut StorageWriteProfile>,
     ) -> Result<u64, StorageError> {
+        let proof_span = super::super::owner_events::OwnerEventSpan::new(
+            super::super::owner_events::OwnerEventKind::ProofStart,
+            super::super::owner_events::OwnerEventKind::ProofEnd,
+            self.config().partition,
+            through,
+            0,
+        );
         let mut timing = WriteTiming::new(profile, false);
         timing.stage(Some(WriteStage::PersistValidation));
         let (snapshot, lifecycle) = {
@@ -182,14 +189,30 @@ impl PartitionLog {
                 if snapshot.retired.binary_search(&start).is_err() {
                     timing.stage(Some(WriteStage::PersistFile));
                     timing.record(|profile| profile.file_persist_calls += 1);
+                    let proof_file_sync_span = super::super::owner_events::OwnerEventSpan::new(
+                        super::super::owner_events::OwnerEventKind::ProofFileSyncStart,
+                        super::super::owner_events::OwnerEventKind::ProofFileSyncEnd,
+                        self.config().partition,
+                        id,
+                        0,
+                    );
                     self.wal.persist_frame_file(WalPosition::new(start, 1))?;
+                    proof_file_sync_span.end_at(id);
                     timing.record(|profile| profile.file_persist_successes += 1);
                     timing.stage(None);
                 }
             }
             timing.stage(Some(WriteStage::PersistNamespace));
             timing.record(|profile| profile.namespace_persist_calls += 1);
+            let proof_namespace_sync_span = super::super::owner_events::OwnerEventSpan::new(
+                super::super::owner_events::OwnerEventKind::ProofNamespaceSyncStart,
+                super::super::owner_events::OwnerEventKind::ProofNamespaceSyncEnd,
+                self.config().partition,
+                0,
+                0,
+            );
             self.wal.persist_namespace()?;
+            proof_namespace_sync_span.end_at(0);
             timing.record(|profile| profile.namespace_persist_successes += 1);
             timing.stage(None);
         }
@@ -234,9 +257,11 @@ impl PartitionLog {
             #[cfg(all(test, feature = "experimental-nvmeof"))]
             self.pause_live_at(LivePausePoint::PositionAfterRoot);
             timing.success(0);
+            proof_span.end_at(through);
             return Ok(synced_end);
         }
         timing.success(0);
+        proof_span.end_at(through);
         Ok(root.synced_end)
     }
 
