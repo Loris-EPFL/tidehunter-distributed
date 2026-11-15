@@ -1,6 +1,8 @@
+import base64
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -60,7 +62,7 @@ class SelectedBackendRuntimeTests(unittest.TestCase):
     def test_focused_package_profile_is_selection_specific(self):
         for selection, expected, rejected in (
                 ('valkey_rdma_reads', 'focused_valkey', 'focused'),
-                ('nvmeof_f7_highmem32', 'focused_valkey', 'focused'),
+                ('nvmeof_f7_highmem32', 'focused', 'focused_valkey'),
                 ('nvmeof_reads_geometry', 'focused', 'focused_valkey'),
                 ('nvmeof_reads_geometry_rest', 'focused', 'focused_valkey'),
                 ('nvmeof_reads_geometry_rest2', 'focused', 'focused_valkey')):
@@ -83,24 +85,52 @@ class SelectedBackendRuntimeTests(unittest.TestCase):
                     reservation_hours=3, hard_deadline_seconds=10800)
         manifest = dict(revision='b'*40, source_sha256='a'*64,
                         binary_sha256='c'*64, binary_blake2b512='d'*128,
-                        build_profile='focused_valkey', features=cloud_package.FOCUSED_VALKEY_FEATURES,
-                        files={name: {} for name in (
-                            'runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
-                            'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json',
-                            'source/experiments/kv-comparison/nvme_campaign_owner.py')})
+                        build_profile='focused', features=cloud_package.FOCUSED_FEATURES,
+                        files={'source/experiments/kv-comparison/nvme_campaign_owner.py': {}})
         expiry = deadline()
         config = dict(package_root='/package', package={'source_revision': 'b'*40},
                       source_sha256='a'*64, spec=spec, fleet=fleet()[:2],
                       run_id='bench-'+'1'*16, machine_type='z4m-highmem-32',
                       bucket='bucket', project_number='1', deadline_utc=expiry)
-        with patch.object(Path, 'read_text', return_value=json.dumps(manifest)):
+        with patch.object(Path, 'read_text', return_value=json.dumps(manifest)), \
+                patch('prepare.admit_selected_features') as valkey_admission:
             controller = runtime._controller_config(config)
+        valkey_admission.assert_not_called()
         self.assertNotIn('reservation_hours', controller['spec'])
         self.assertNotIn('suite', controller['spec'])
         self.assertEqual(controller['spec']['hard_deadline_seconds'], 10800)
         self.assertEqual(controller['deadline_utc'], expiry)
-        self.assertEqual(len(cloud_campaign.make_matrix(controller['spec'])), 10)
+        self.assertEqual(len(cloud_campaign.make_matrix(controller['spec'])), 8)
         self.assertEqual(config['spec']['reservation_hours'], 3)
+
+    def test_f7_preparation_requires_only_tidehunter_features(self):
+        import cloud_package
+        import manual_campaign
+        import prepare
+        spec = manual_campaign.REVIEWED_SPECS['nvmeof_f7_highmem32']
+        manifest = {'build_profile': 'focused', 'features': cloud_package.FOCUSED_FEATURES,
+                    'files': {'source/experiments/kv-comparison/nvme_campaign_owner.py': {}}}
+        prepare.admit_selected_features(spec, manifest)
+        with self.assertRaisesRegex(ValueError, 'exact selected build features'):
+            prepare.admit_selected_features(spec, {
+                **manifest, 'build_profile': 'focused_valkey',
+                'features': cloud_package.FOCUSED_VALKEY_FEATURES})
+
+    def test_f7_controller_rejects_valkey_build_features(self):
+        import cloud_package
+        import manual_campaign
+        config = {'package_root': '/package', 'source_sha256': 'a' * 64,
+                  'package': {'source_revision': 'b' * 40},
+                  'spec': manual_campaign.REVIEWED_SPECS['nvmeof_f7_highmem32']}
+        for profile, features in (
+                ('focused_valkey', cloud_package.FOCUSED_VALKEY_FEATURES),
+                ('focused', cloud_package.FOCUSED_VALKEY_FEATURES)):
+            manifest = {'source_sha256': 'a' * 64, 'revision': 'b' * 40,
+                        'build_profile': profile, 'features': features}
+            with self.subTest(profile=profile), \
+                    patch.object(Path, 'read_text', return_value=json.dumps(manifest)):
+                with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'exact TideHunter build features'):
+                    runtime._controller_config(config)
 
     def test_controller_rejects_each_missing_selected_store_feature(self):
         backends = ['tikv', 'cassandra', 'foundationdb', 'garnet', 'kvrocks']
@@ -136,6 +166,140 @@ class NvmetFixRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'loaded nvmet identity'):
                 runtime.admit_nvmet_fix(config, host, admission)
         self.assertIsNone(runtime.admit_nvmet_fix(config, host, {}))
+
+
+class RemoteOwnerTraceEnvelopeTests(unittest.TestCase):
+    def test_maximum_serialized_owner_trace_and_cpu_fit_unchanged_envelope(self):
+        import cloud_controller
+        import owner_ftrace
+
+        def encoded(value):
+            return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+        self.assertEqual(cloud_controller.MAX_JSON_BYTES, 32 * 1024**2)
+        self.assertEqual(owner_ftrace.TRACE_MAX_SERIALIZED_BYTES + owner_ftrace.CPU_MAX_BYTES
+                         + owner_ftrace.OWNER_TRACE_JSON_MARGIN_BYTES, cloud_controller.MAX_JSON_BYTES)
+        line = 'wal"\\\tλ-123 [000] .... 1.000000000: nvmet_req_complete: status=0\n'
+        line_bytes = len(encoded(line)) - 2
+        event_count, padding = divmod(owner_ftrace.TRACE_MAX_SERIALIZED_BYTES, line_bytes)
+        trace = line * (event_count - 1) + line[:-1] + 'x' * padding + '\n'
+        self.assertEqual(len(encoded(trace)) - 2, owner_ftrace.TRACE_MAX_SERIALIZED_BYTES)
+        self.assertLess(len(trace.encode()), owner_ftrace.TRACE_MAX_SERIALIZED_BYTES)
+        self.assertTrue(trace.endswith('\n'))
+
+        # Fill the conservative CPU wire budget with real-shaped per-CPU samples,
+        # not an opaque padding string. Both tick rows represent 100 total ticks.
+        cpu_count = min(256, owner_ftrace.CPU_MAX_CPUS)
+        idle = {'ticks': [1, 0, 0, 99, 0, 0, 0, 0], 'busy_pct': 1.0, 'softirq_pct': 0.0}
+        busy = {'ticks': [10, 0, 0, 90, 0, 0, 0, 0], 'busy_pct': 10.0, 'softirq_pct': 0.0}
+        cpus = {f'cpu{i}': idle for i in range(cpu_count)}
+        sample = {'elapsed_seconds': 1, 'cpus': cpus}
+        cpu = {'available': False, 'source': '/proc/stat', 'interval_seconds': 1,
+               'scope': 'owner trace start to stop; includes the final partial interval',
+               'samples': [], 'truncated': True, 'reason': 'owner CPU sampling deadline expired'}
+        empty_bytes, sample_bytes = len(encoded(cpu)), len(encoded(sample))
+        sample_count = (owner_ftrace.CPU_MAX_BYTES - empty_bytes + 1) // (sample_bytes + 1)
+        remaining = owner_ftrace.CPU_MAX_BYTES - (empty_bytes + sample_count * (sample_bytes + 1) - 1)
+        if remaining == 1:
+            sample_count -= 1
+            remaining += sample_bytes + 1
+        odd = remaining % 2
+        remaining -= 3 * odd  # A plausible 1.25-second interval adds three bytes.
+        scaled_rows = remaining // 2  # The busy row is exactly two bytes longer.
+        self.assertGreater(sample_count, 1)
+        self.assertLessEqual(sample_count, owner_ftrace.CPU_MAX_SAMPLES)
+        self.assertGreaterEqual(remaining, 0)
+        self.assertLessEqual(scaled_rows, sample_count * cpu_count)
+        for index in range(sample_count):
+            count = min(scaled_rows, cpu_count)
+            cpu['samples'].append({
+                'elapsed_seconds': 1.25 if odd and index == 0 else 1,
+                'cpus': {name: busy if number < count else idle
+                         for number, name in enumerate(cpus)} if count else cpus})
+            scaled_rows -= count
+        self.assertEqual(scaled_rows, 0)
+        self.assertEqual(len(encoded(cpu)), owner_ftrace.CPU_MAX_BYTES)
+
+        coverage = {'event_count': event_count, 'first_timestamp_ns': 1_000_000_000,
+                    'last_timestamp_ns': 1_000_000_000, 'duration_ns': 0,
+                    'scope': 'captured_complete_trace_events', 'clock': 'mono'}
+        result = {'trace': trace, 'cpu_samples': cpu, 'trace_coverage': coverage,
+                  'events_enabled': list(owner_ftrace.EVENTS), 'events_missing': [],
+                  'truncated': True, 'buffer_overruns': 7,
+                  'errors': ['output: bounded diagnostic "\\\tλ']}
+        request = {'action': 'owner_ftrace_stop', 'case': 'envelope', 'index': 0}
+        envelope = {'request': request, 'instance_id': '101', 'status': 'completed', 'result': result}
+        metadata = {**envelope, 'result': {**result, 'trace': '', 'cpu_samples': {}}}
+        metadata_bytes = len(encoded(metadata)) + 1 - len(encoded({}))
+        expected_bytes = (owner_ftrace.TRACE_MAX_SERIALIZED_BYTES
+                          + owner_ftrace.CPU_MAX_BYTES + metadata_bytes)
+        self.assertLess(metadata_bytes, owner_ftrace.OWNER_TRACE_JSON_MARGIN_BYTES)
+
+        class EnvelopeStore(Store):
+            def __init__(self):
+                super().__init__()
+                self.metadata = {}
+                self.reads = []
+
+            def put(self, key, data, **kwargs):
+                self.metadata[key] = kwargs.get('metadata', {})
+                return super().put(key, data, **kwargs)
+
+            def head(self, key):
+                return {**super().head(key), 'size': len(self.values[key][1]),
+                        'metadata': self.metadata[key]}
+
+            def get(self, key, *, generation=None, max_bytes=0):
+                self.reads.append((key, generation, max_bytes))
+                raw = super().get(key, generation=generation, max_bytes=max_bytes)
+                if len(raw) > max_bytes:
+                    raise ValueError('object exceeds retrieval bound')
+                return raw
+
+        store = EnvelopeStore()
+        config = {'prefix': 'run', 'deadline_utc': deadline(), 'repository_root': '/sealed/source'}
+        clients = {'objects': store}
+        exports = []
+
+        class Mailbox:
+            def submit(self, index, argv, *, operation_id, timeout_seconds):
+                payload = json.loads(base64.b64decode(argv[argv.index('--request-base64') + 1]))
+                receipt = {**envelope, 'request': payload['request']}
+                exports.append(cloud_controller.persist_json(clients, config, payload['key'], receipt))
+                return payload['key']
+
+            def wait(self, reference, *, timeout_seconds):
+                return {'exit_code': 0, 'stderr': ''}
+
+        clients['mailbox'] = Mailbox()
+        controller = SimpleNamespace(config=config, clients=clients, ids=['100', '101'],
+                                     remaining=lambda **kwargs: 180, guard=lambda: None,
+                                     sequence_lock=threading.Lock(), sequence=0)
+        for size in (expected_bytes, cloud_controller.MAX_JSON_BYTES):
+            with self.subTest(object_bytes=size):
+                received = runtime.request_remote(controller, 0, request, case='envelope')
+                exported = exports[-1]
+                raw = store.values[exported['key']][1]
+                self.assertEqual(raw, encoded(envelope) + b'\n')
+                self.assertEqual(len(raw), size)
+                self.assertEqual(exported['bytes'], size)
+                self.assertEqual(store.reads[-1], (exported['key'], exported['generation'],
+                                                  cloud_controller.MAX_JSON_BYTES))
+                self.assertEqual(received, result)
+                self.assertEqual(received['trace_coverage'], coverage)
+                self.assertNotIn('cpu_summary', received)
+                if size == expected_bytes:
+                    # Consume only the reserved metadata headroom, leaving both
+                    # maximum-sized evidence payloads unchanged.
+                    result['errors'][0] += 'x' * (cloud_controller.MAX_JSON_BYTES - size)
+                else:
+                    result['errors'][0] += 'x'
+
+        self.assertEqual(len(encoded(envelope)) + 1, cloud_controller.MAX_JSON_BYTES + 1)
+        with self.assertRaisesRegex(cloud_controller.SafetyError, 'bounded metadata budget'):
+            cloud_controller.persist_json(clients, config, 'run/results/oversized.json', envelope)
+        self.assertNotIn('run/results/oversized.json', store.values)
+        self.assertEqual(cloud_controller.MAX_JSON_BYTES, 32 * 1024**2)
 
 
 class MailboxTests(unittest.TestCase):

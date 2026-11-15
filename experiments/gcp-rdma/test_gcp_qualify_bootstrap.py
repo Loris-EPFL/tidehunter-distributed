@@ -395,6 +395,7 @@ class QualificationBootstrapTests(unittest.TestCase):
                 return (Path(directory) / Path(name).name).open(mode)
             for profile, build_profile, selection in (
                     ('focused', 'focused', 'tcp_reads'),
+                    ('focused', 'focused', 'nvmeof_f7_highmem32'),
                     ('full', None, None),
                     ('focused', 'focused_valkey', 'valkey_rdma_reads')):
                 with self.subTest(profile=profile, build_profile=build_profile), \
@@ -425,11 +426,13 @@ class QualificationBootstrapTests(unittest.TestCase):
                 self.assertEqual(guest.call_args.kwargs, {'qualification_profile': 'focused'} if profile == 'focused' else {})
             with self.assertRaisesRegex(ValueError, 'forbids'):
                 bootstrap._pair(Path(directory), {**cfg, 'qualification_profile': 'focused',
+                                                 'selection': 'nvmeof_f7_highmem32',
                                                  'valkey_qualification': True},
                                 time.time() + 1000, mock.Mock(), 'own', {})
             for build_profile, selection in (
                     ('focused_valkey', 'tcp_reads'),
                     ('focused_valkey', None),
+                    ('focused_valkey', 'nvmeof_f7_highmem32'),
                     ('focused', 'valkey_rdma_reads')):
                 with self.subTest(build_profile=build_profile, selection=selection), \
                         mock.patch.object(cloud_package, 'verify_directory',

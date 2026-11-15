@@ -190,23 +190,59 @@ class FocusedMatrixTests(unittest.TestCase):
     def test_f7_exact_reviewed_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_f7_highmem32")
         self.assertEqual(Counter(j["group"] for j in jobs),
-                         {"G30R": 4, "G30S": 2, "G30W": 2, "G30V": 2})
-        self.assertEqual(len({j["case_id"] for j in jobs}), 10)
+                         {"G30R": 4, "G30S": 2, "G30W": 2})
+        self.assertEqual(len({j["case_id"] for j in jobs}), 8)
+        self.assertEqual({j["backend"] for j in jobs}, {"tidehunter_nvme_rdma"})
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                         "3319cef697350c791476126a297d19f768ffb0690b6dd2fb4cef79978d9f6800")
+                         "25ef27bc334edc0d07a84061427893063e162f16f8f1a986ea99d758ca2c05dd")
         self.assertEqual([j["case_id"] for j in jobs[:3]],
-                         ["G30R-r0-8ddc735431d9a8936fc6", "G30R-r1-da5e2c1b69d61312518a",
-                          "G30R-r0-899d6aa918c7cb1fe633"])
+                         ["G30R-r0-1c7afe9b88938c65b1a9", "G30R-r1-190f295420561313babd",
+                          "G30R-r0-53c44157d53c72979377"])
         for job in jobs:
             campaign.validate_focused_job(job)
+            expected = {"G30R": (600000, 120000), "G30S": (1500000, 300000),
+                        "G30W": (350000, 70000)}[job["group"]]
+            self.assertEqual((job["measurement_operations"], job["warmup_operations"]), expected)
+            for field in ("measurement_operations", "warmup_operations", "keys"):
+                changed = copy.deepcopy(job)
+                changed[field] += 1
+                with self.subTest(group=job["group"], field=field), self.assertRaises(ValueError):
+                    campaign.validate_focused_job(changed)
             if job["group"] in ("G30R", "G30S"):
                 self.assertEqual((job["read_lanes"], job["live_io_queues"], job["live_io_queue_size"]),
                                  (4, 4, 128))
                 self.assertTrue(job["owner_trace"])
                 self.assertFalse(job["drop_os_caches"])
+                self.assertEqual(job["keys"], 65536)
+                self.assertTrue(job["warmup_key_sweep"])
+                self.assertGreaterEqual(job["warmup_operations"], job["keys"])
             if job["group"] == "G30W":
                 self.assertNotIn("live_leased_write_window", job)
                 self.assertEqual(job["durability_tier"], "native")
+
+    def test_f7_preserves_source_fields_outside_its_reviewed_windows(self):
+        reads = campaign.make_focused_matrix("nvmeof_reads_geometry")
+        writes = campaign.make_focused_matrix("nvmeof_parallel_writes")
+        changed = {"case_id", "selection", "group", "repeat", "owner_trace",
+                   "warmup_operations", "measurement_operations"}
+        for job in campaign.make_focused_matrix("nvmeof_f7_highmem32"):
+            if job["group"] == "G30W":
+                source = campaign._clone_source(writes, "G23W", "tidehunter_nvme_rdma",
+                                                65536, 64, durability_tier="native",
+                                                live_leased_write_window=None)
+                self.assertEqual((source["warmup_operations"], source["measurement_operations"]), (512, 4096))
+            else:
+                source = campaign._clone_source(reads, "G24Q", "tidehunter_nvme_rdma",
+                                                job["value_size"], job["concurrency"], operation="read",
+                                                drop_os_caches=False, live_io_queues=4, live_io_queue_size=128)
+                self.assertEqual((source["warmup_operations"], source["measurement_operations"]), (65536, 8192))
+            with self.subTest(case=job["case_id"]):
+                self.assertEqual({k: v for k, v in job.items() if k not in changed},
+                                 {k: v for k, v in source.items() if k not in changed})
+                legacy = copy.deepcopy(source)
+                legacy["measurement_operations"] = job["measurement_operations"]
+                with self.assertRaises(ValueError):
+                    campaign.validate_focused_job(legacy)
 
     def test_new_fleet_value_sizes_match_binary_validator(self):
         # Matches benchmarks/kv-research/src/config.rs, the dataset.value_size check.

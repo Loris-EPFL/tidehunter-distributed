@@ -90,6 +90,96 @@ def read_diagnostics():
                 "read_evidence": {}}}
 
 
+def owner_trace():
+    return {"truncated": True, "buffer_overruns": 7, "trace_coverage": {
+        "event_count": 100, "first_timestamp_ns": 10_000_000_000,
+        "last_timestamp_ns": 12_000_000_000, "duration_ns": 2_000_000_000,
+        "scope": "captured_complete_trace_events", "clock": "mono"}}
+
+
+class OwnerTraceTests(unittest.TestCase):
+    def test_truncated_observed_rate_uses_coverage_not_case_window(self):
+        measured = metrics() | {"elapsed_seconds": 100}
+        text = campaign.terminal_metrics({
+            "status": "completed", "metrics": measured,
+            "owner_trace_evidence": [owner_trace() | {"owner": "node-0"}]}, {})
+        suffix = '{owner="node-0",scope="captured_complete_trace_events",clock="mono"} '
+        for name, value in (("captured_events", 100), ("covered_seconds", 2.0),
+                            ("observed_events_per_second", 50.0), ("truncated", 1),
+                            ("buffer_overruns", 7), ("coverage_available", 1)):
+            self.assertIn("kv_owner_trace_" + name + suffix + str(value) + "\n", text)
+        self.assertIn('kv_case_measurement_seconds{} 100\n', text)
+
+    def test_missing_bad_or_zero_coverage_is_unavailable_without_fake_rate(self):
+        valid = owner_trace()["trace_coverage"]
+        broken = [None, {}, "bad"]
+        for key, value in (
+                ("event_count", True), ("event_count", -1), ("event_count", 1),
+                ("event_count", 0), ("first_timestamp_ns", None),
+                ("last_timestamp_ns", 9_000_000_000), ("duration_ns", 0),
+                ("duration_ns", 2_000_000_001), ("duration_ns", 2e9),
+                ("scope", "case"), ("clock", "wall")):
+            broken.append(valid | {key: value})
+        broken.extend([
+            valid | {"first_timestamp_ns": 12_000_000_000, "duration_ns": 0},
+            valid | {"event_count": 0, "first_timestamp_ns": None,
+                     "last_timestamp_ns": None, "duration_ns": None}])
+        for coverage in broken:
+            with self.subTest(coverage=coverage):
+                evidence = owner_trace() | {"owner": "node-0", "trace_coverage": coverage}
+                text = campaign.owner_trace_metrics([evidence], {})
+                self.assertNotIn("kv_owner_trace_observed_events_per_second", text)
+                self.assertNotIn("kv_owner_trace_covered_seconds", text)
+                self.assertRegex(text, r'kv_owner_trace_coverage_available\{[^\n]+\} 0\n')
+                self.assertRegex(text, r'kv_owner_trace_truncated\{[^\n]+\} 1\n')
+                self.assertRegex(text, r'kv_owner_trace_buffer_overruns\{[^\n]+\} 7\n')
+
+    def test_monitor_artifact_hook_keeps_owner_identity_and_only_metadata(self):
+        import campaign_monitor as monitor
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected_job = job()
+            result = root / "cases" / selected_job["case_id"] / "result"
+            result.mkdir(parents=True)
+            state = root / "observer"
+            (state / "benchmark").mkdir(parents=True)
+            selection_path = state / "benchmark/selection.json"
+            selection_path.write_text(json.dumps({
+                "job": selected_job, "results": str(result), "terminal": None}))
+            (state / "session.json").write_text(json.dumps({
+                "seen_case_ids": [], "terminal_observations": []}))
+            for index in (0, 1):
+                target = result.parent if index == 0 else result.parent / "owner-ftrace/node-1"
+                target.mkdir(parents=True, exist_ok=True)
+                artifact = owner_trace() | {"trace": "not selection data", "cpu_summary": {"busy": 99}}
+                artifact["trace_coverage"]["event_count"] += index
+                (target / "owner-ftrace.json").write_text(json.dumps(artifact))
+            corrupt = result.parent / "owner-ftrace/node-2/owner-ftrace.json"
+            corrupt.parent.mkdir(parents=True)
+            corrupt.write_text('{"trace_coverage":')
+            with patch.object(monitor, "validate_spec", side_effect=lambda spec: spec), \
+                    patch.object(monitor, "state_for", return_value=(state, {})), \
+                    patch.object(monitor, "validate_job"), \
+                    patch.object(monitor, "result_path", return_value=result), \
+                    patch.object(monitor, "budget", return_value=2.5), \
+                    patch.object(monitor, "query", return_value={
+                        "resultType": "vector", "result": [{"value": [1, "1"]}]}):
+                monitor.finish_case({"run_id": "proof"}, selected_job, result)
+            terminal = json.loads(selection_path.read_text())["terminal"]
+            evidence = terminal["owner_trace_evidence"]
+            self.assertEqual([item["owner"] for item in evidence], ["node-0", "node-1", "node-2"])
+            self.assertEqual(evidence[2], {"owner": "node-2"})
+            self.assertNotIn("trace", evidence[0])
+            self.assertNotIn("cpu_summary", evidence[0])
+            text = campaign.terminal_metrics(terminal, {})
+            self.assertRegex(text, r'kv_owner_trace_observed_events_per_second\{owner="node-0",[^\n]+\} 50.0\n')
+            self.assertRegex(text, r'kv_owner_trace_observed_events_per_second\{owner="node-1",[^\n]+\} 50.5\n')
+            self.assertRegex(text, r'kv_owner_trace_coverage_available\{owner="node-2",[^\n]+\} 0\n')
+            self.assertNotRegex(text, r'kv_owner_trace_observed_events_per_second\{owner="node-2",')
+            for name in re.findall(r"^(kv_owner_trace_\w+)\{", text, re.M):
+                self.assertIn(name, monitor.QUERY_METRICS)
+
+
 class CaseIdentityTests(unittest.TestCase):
     def test_scopes_quoted_labels_without_splitting_their_commas_or_braces(self):
         source = b'# TYPE observed counter\nobserved{op="read,brace}quote\\\""} 7\n'

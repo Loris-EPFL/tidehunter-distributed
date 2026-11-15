@@ -1725,6 +1725,45 @@ def correlated_timing_metrics(summaries, labels):
     return result
 
 
+def owner_trace_metrics(owners, labels):
+    """Observed captured-event rates, never read IOPS or case-window rates."""
+    if owners is None:
+        return ""
+    if not isinstance(owners, list) or len(owners) > max(SEALED_OWNER_COUNTS):
+        raise ValueError("invalid bounded owner trace population")
+    result, identities = "", set()
+    for owner in owners:
+        identity = token(owner["owner"])
+        if identity in identities:
+            raise ValueError("duplicate owner trace identity")
+        identities.add(identity)
+        context = labels | {"owner": identity, "scope": "captured_complete_trace_events", "clock": "mono"}
+        for key in ("truncated", "buffer_overruns"):
+            value = owner.get(key)
+            if (key == "truncated" and type(value) is bool) or (
+                    key == "buffer_overruns" and type(value) is int and value >= 0):
+                result += sample("kv_owner_trace_" + key, int(value), context)
+        coverage = owner.get("trace_coverage")
+        valid, events, duration = False, None, None
+        if isinstance(coverage, dict) and coverage.get("scope") == "captured_complete_trace_events" and coverage.get("clock") == "mono":
+            events = coverage.get("event_count")
+            first, last, duration = (coverage.get(key) for key in
+                                     ("first_timestamp_ns", "last_timestamp_ns", "duration_ns"))
+            if type(events) is int and events >= 0:
+                if events == 0:
+                    valid = first is last is duration is None
+                elif all(type(value) is int and value >= 0 for value in (first, last, duration)):
+                    valid = last >= first and duration == last - first and (events != 1 or duration == 0)
+        rate_available = valid and events > 0 and duration is not None and duration > 0
+        result += sample("kv_owner_trace_coverage_available", int(rate_available), context)
+        if valid:
+            result += sample("kv_owner_trace_captured_events", events, context)
+        if rate_available:
+            result += sample("kv_owner_trace_covered_seconds", duration / 1e9, context)
+            result += sample("kv_owner_trace_observed_events_per_second", events * 1e9 / duration, context)
+    return result
+
+
 def terminal_metrics(terminal, labels):
     if terminal is None:
         return sample("kv_observer_case_terminal", 0, labels)
@@ -1752,6 +1791,7 @@ def terminal_metrics(terminal, labels):
     result += correlated_timing_metrics(terminal.get("correlation_summaries"), labels)
     result += nvmeof_target_metrics(terminal.get("nvmeof_target_evidence"), labels)
     result += nvmeof_trace_metrics(terminal.get("nvmeof_trace_evidence"), labels)
+    result += owner_trace_metrics(terminal.get("owner_trace_evidence"), labels)
     metrics = terminal.get("metrics")
     if metrics is None:
         return result

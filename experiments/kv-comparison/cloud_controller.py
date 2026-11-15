@@ -57,14 +57,13 @@ import physical_storage
 import rdma_diagnostics
 import resource_accounting
 from portable_transport import is_trusted, protocol_key, validate_transport
-from control_execution import execute_at_most_once
+from control_execution import MAX_JSON_BYTES, execute_at_most_once
 
 ACCOUNT = "354775971805"
 TAGS = {"Project": "TideHunter", "ManagedBy": "sharded-wal-benchmark",
         "Repository": "Loris-EPFL/tidehunter-distributed", "Campaign": "kv-comparison",
         "BenchmarkBranch": "bench/aws-efa", "SourceBranch": "feat/cloud-kv-comparison"}
 RAW_FILES = ("manifest.json", "summary.json", "samples.csv", "metrics.prom")
-MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_AMBIGUOUS_REPLAYS = 2
 
 
@@ -1014,7 +1013,7 @@ def verify_package(config):
         raise SafetyError("sealed package differs from externally admitted runtime hashes")
     focused = config["spec"].get("mode") == "focused"
     if focused:
-        expected_profile = "focused_valkey" if config["spec"].get("selection") in ("valkey_rdma_reads", "nvmeof_f7_highmem32") else "focused"
+        expected_profile = "focused_valkey" if config["spec"].get("selection") == "valkey_rdma_reads" else "focused"
         if admission.get("build_profile") != expected_profile:
             raise SafetyError("focused campaign requires the focused package profile")
         fdb = None
@@ -1627,6 +1626,16 @@ def require_zero_owner_history_waits(directory, owner_count):
             raise RuntimeError("owner history diagnostics missing or invalid") from exc
         if any(stats["waits"] != 0 for _, stats in epochs):
             raise RuntimeError("memory-only owner waited for history")
+
+
+def planned_write_batches_per_partition(job):
+    """Reserve a per-owner write-batch ceiling, with fixed history slack."""
+    owners = job["owner_count"]
+    writes = job["keys"]  # At most one preload batch per key.
+    if any(job["mix"].get(kind, 0) for kind in ("put", "delete", "put_batch")):
+        # Mixed phases reserve the all-write ceiling, not an expected fraction.
+        writes += job["warmup_operations"] + job["measurement_operations"]
+    return (writes + owners - 1) // owners + 4096
 
 
 def owner_control_settings(job):
@@ -3444,9 +3453,12 @@ class Controller:
         polling = job.get("owner_polling", "adaptive")
         if polling not in ("adaptive", "busy"):
             raise ValueError("owner_polling must be adaptive or busy")
+        storage_batches = (planned_write_batches_per_partition(job)
+                           if job.get("selection") == "nvmeof_f7_highmem32"
+                           else job["keys"] + job["warmup_operations"] + job["measurement_operations"])
         prep = {"guest_root": guest_root, "addresses": [h["address"] + ":9400" for h in self.config["fleet"]["nodes"][:owner_count]],
                 "transport": owner_control_settings(job)["owner_transport"],
-                "max_batches_per_partition": max(16384, job["keys"] + job["warmup_operations"] + job["measurement_operations"]),
+                "max_batches_per_partition": max(16384, storage_batches),
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"], "owner_read_workers": 4,
                 "owner_wal_member_read": "async",

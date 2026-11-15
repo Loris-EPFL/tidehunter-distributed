@@ -144,7 +144,7 @@ def validate_runtime(config):
             if mode != 'focused' or config['spec'].get('suite') != 'kv':
                 raise RuntimeSafetyError('compact fleet requires a focused KV selection')
             forbidden = {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'garnet', 'kvrocks'}
-            if config['spec'].get('selection') not in ('valkey_rdma_reads', 'nvmeof_f7_highmem32'):
+            if config['spec'].get('selection') != 'valkey_rdma_reads':
                 forbidden.add('valkey_rdma')
             if set(backends) & forbidden:
                 raise RuntimeSafetyError('backend requires five owner hosts')
@@ -250,7 +250,7 @@ def live_mode(spec):
 def admit_package_profile(spec, package):
     expected = None
     if spec.get('mode') == 'focused':
-        expected = 'focused_valkey' if spec.get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32') else 'focused'
+        expected = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
     if package.get('build_profile') != expected:
         raise RuntimeSafetyError('package build profile differs from campaign')
 
@@ -565,7 +565,7 @@ def request_remote(controller, index, request, *, case='startup', timeout=180, e
         raise RuntimeSafetyError('guest RPC process failed: ' + receipt['stderr'])
     store = controller.clients['objects']
     head = store.head(key)
-    result = json.loads(store.get(key, generation=head['generation'], max_bytes=32 * 1024 * 1024))
+    result = json.loads(store.get(key, generation=head['generation'], max_bytes=cloud_controller.MAX_JSON_BYTES))
     if (result.get('request') != request or result.get('instance_id') != controller.ids[index + 1]
         or result.get('status') != 'completed' or 'result' not in result):
         raise RuntimeSafetyError('guest RPC failed or receipt identity mismatch: ' + str(result.get('error')))
@@ -773,7 +773,7 @@ def _controller_config(runtime):
     package = runtime['package']
     if manifest['source_sha256'] != runtime['source_sha256'] or manifest['revision'] != package['source_revision']:
         raise RuntimeSafetyError('runtime manifest source mismatch')
-    if runtime['spec'].get('mode') == 'focused' and runtime['spec'].get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32'):
+    if runtime['spec'].get('mode') == 'focused' and runtime['spec'].get('selection') == 'valkey_rdma_reads':
         import prepare
         prepare.admit_selected_features(runtime['spec'], manifest)
     elif runtime['spec'].get('mode') == 'focused':

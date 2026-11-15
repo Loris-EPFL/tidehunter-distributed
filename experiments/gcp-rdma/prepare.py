@@ -32,7 +32,7 @@ def checkout(repo, revision, allow_dirty=False):
 def admit_selected_features(spec, manifest):
     if spec.get('suite') == 'sui':
         return
-    profile = 'focused_valkey' if spec.get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32') else 'focused'
+    profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
     if spec.get('mode') == 'focused':
         features = (cloud_package.FOCUSED_VALKEY_FEATURES if profile == 'focused_valkey'
                     else cloud_package.FOCUSED_FEATURES)
@@ -146,7 +146,7 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     spec = json.loads(Path(spec_path).read_text()) if spec_path is not None else {}
     import manual_sui
     focused = manual_sui.focused_qualification(spec)
-    focused_valkey = spec.get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32')
+    focused_valkey = spec.get('selection') == 'valkey_rdma_reads'
     focused = focused or focused_valkey
     profile_args = {'focused_valkey': True} if focused_valkey else ({'focused': True} if focused else {})
     if focused:

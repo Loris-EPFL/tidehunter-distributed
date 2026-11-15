@@ -726,7 +726,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
 FOCUSED_COUNTS["nvmeof_f6"] = 42
 FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
-FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 10
+FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -776,7 +776,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_f6": {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4},
     "nvmeof_f6b": {"G31W": 24, "G31H": 8, "G31S": 2, "G31X": 6, "G31G": 18},
     "nvmeof_f8": {"G32W": 16, "G32H": 8, "G32S": 4, "G32N": 8},
-    "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2, "G30V": 2},
+    "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -1932,28 +1932,26 @@ def _nvmeof_f8(path):
 
 
 def _nvmeof_f7_highmem32(path):
-    """Keep matched -16 controls while measuring the reviewed -32 shape."""
+    """Keep -16 workload controls with roughly ten-second measurement windows."""
     result = []
     selection = "nvmeof_f7_highmem32"
     reads = _nvmeof_reads_geometry(path)
-    for group, size, concurrencies in (("G30R", 65536, (16, 64)),
-                                       ("G30S", 1024, (64,))):
+    for group, size, concurrencies, operations in (("G30R", 65536, (16, 64), 600000),
+                                                   ("G30S", 1024, (64,), 1500000)):
         for concurrency in concurrencies:
             source = _clone_source(reads, "G24Q", "tidehunter_nvme_rdma",
                                    size, concurrency, operation="read", drop_os_caches=False,
                                    live_io_queues=4, live_io_queue_size=128)
             for repeat in (0, 1):
                 _clone_job(result, selection, source, group, repeat=repeat,
-                           owner_trace=True)
+                           owner_trace=True, measurement_operations=operations,
+                           warmup_operations=operations // 5)
     source = _clone_source(_nvmeof_parallel_writes(path), "G23W",
                            "tidehunter_nvme_rdma", 65536, 64,
                            durability_tier="native", live_leased_write_window=None)
     for repeat in (0, 1):
-        _clone_job(result, selection, source, "G30W", repeat=repeat)
-    for concurrency in (16, 64):
-        source = _clone_source(_valkey_rdma_reads(), "G25R", "valkey_rdma",
-                               65536, concurrency, repeat=0, operation="read")
-        _clone_job(result, selection, source, "G30V")
+        _clone_job(result, selection, source, "G30W", repeat=repeat,
+                   measurement_operations=350000, warmup_operations=70000)
     return result
 
 

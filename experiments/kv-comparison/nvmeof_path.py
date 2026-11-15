@@ -52,6 +52,10 @@ AUTHORITY_COUNTERS = ('write_authority_prepare_ns', 'write_authority_admit_ns',
 AUTHORITY_COLUMNS = ('authority_prepare_us_per_put', 'authority_admit_us_per_put',
                      'batches_per_window', 'authority_interval_source', 'authority_interval_scope')
 RESULTS += AUTHORITY_COLUMNS
+OWNER_TRACE_COLUMNS = ('owner_trace_scope', 'owner_trace_captured_events',
+                       'owner_trace_covered_seconds', 'owner_trace_observed_events_per_second',
+                       'owner_trace_truncated', 'owner_trace_buffer_overruns')
+RESULTS += OWNER_TRACE_COLUMNS
 STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
 STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share', 'calls_with_pair', 'cond_mean_us', 'cond_p50_us', 'cond_p99_us')
 
@@ -237,6 +241,40 @@ def authority_columns(boundary, diagnostics):
     return columns
 
 
+def owner_trace_columns(artifact):
+    """Describe primary-owner captured events, independently of CPU/case windows."""
+    columns = dict.fromkeys(OWNER_TRACE_COLUMNS)
+    columns['owner_trace_scope'] = 'primary_owner'
+    if not isinstance(artifact, dict):
+        return columns
+    if type(artifact.get('truncated')) is bool:
+        columns['owner_trace_truncated'] = artifact['truncated']
+    overruns = artifact.get('buffer_overruns')
+    if type(overruns) is int and overruns >= 0:
+        columns['owner_trace_buffer_overruns'] = overruns
+    coverage = artifact.get('trace_coverage')
+    if not isinstance(coverage, dict) or coverage.get('scope') != 'captured_complete_trace_events' or coverage.get('clock') != 'mono':
+        return columns
+    count = coverage.get('event_count')
+    first, last, duration = (coverage.get(key) for key in
+                             ('first_timestamp_ns', 'last_timestamp_ns', 'duration_ns'))
+    if type(count) is not int or count < 0:
+        return columns
+    if count == 0:
+        if first is last is duration is None:
+            columns['owner_trace_captured_events'] = 0
+        return columns
+    if any(type(value) is not int or value < 0 for value in (first, last, duration)):
+        return columns
+    if last < first or duration != last - first or (count == 1 and duration != 0):
+        return columns
+    columns['owner_trace_captured_events'] = count
+    if duration > 0:
+        columns['owner_trace_covered_seconds'] = duration / 1e9
+        columns['owner_trace_observed_events_per_second'] = count * 1e9 / duration
+    return columns
+
+
 def result_row(case, export):
     j = case['job']; op = operation(j)
     directory = export / 'cases' / case['case_id'] / 'result'
@@ -256,6 +294,7 @@ def result_row(case, export):
                live_leased_flush_min_frame_bytes=executed_minimum,
                live_pin_read_lanes=j.get('live_pin_read_lanes', False) if live(j) else None)
     row.update(thread_cpu_columns(load(directory.parent / 'thread-cpu.json')))
+    row.update(owner_trace_columns(load(directory.parent / 'owner-ftrace.json')))
     cpu = load(directory.parent / 'owner-cpu.json')
     if cpu.get('available') is True:
         summary = cpu.get('summary', {})
@@ -546,7 +585,8 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         if len(refs) == 1 and refs[0]['p50_us'] > 0 and row['p50_us'] is not None:
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
-    lines.extend(['Owner CPU columns use time-weighted /proc/stat deltas per CPU across the owner trace window (one-second intervals plus the final partial interval). Max and mean busy are across CPUs; softirq is the maximum per-CPU percentage; the count uses per-CPU busy > 90%. Missing or truncated samples remain unavailable.', ''])
+    lines.extend(['Owner CPU columns use time-weighted /proc/stat deltas per CPU across the full owner CPU sampling window from trace start to stop (one-second intervals plus the final partial interval), not the captured-event coverage window. Max and mean busy are across CPUs; softirq is the maximum per-CPU percentage; the count uses per-CPU busy > 90%. Missing or truncated CPU samples remain unavailable.', '',
+                  'Owner trace columns describe only the primary owner (owner-ftrace.json), not a fleet aggregate. Captured events and covered seconds use validated mono trace_coverage timestamps; observed events/s is captured event_count divided by duration_ns, never by case elapsed time. Zero duration or missing/invalid coverage leaves the rate unavailable. This observed event rate is not read IOPS: event types include non-read work, and truncation or buffer overruns can omit events. Truncation and buffer overruns are reported independently; partial captures remain diagnostic. CPU columns retain their separate full sampling window.', ''])
     lines.extend(['Thread CPU columns use /proc/PID/task/*/stat at one-second intervals around the measurement gate. One logical CPU is 100%; max and mean are across per-thread window-average utilization in each class, not across machines or sampling peaks. Coordinator and owner columns are separate; owner means are weighted by thread count. The other-thread name identifies its busiest thread. Linux comm truncation is accounted for; missing, churning or incomplete classes remain unavailable. Start/stop includes boundary RPC overlap and the final partial interval.', '',
                   'wal_bytes_per_payload uses live completed_write_bytes (aligned NVMe-oF frames) divided by measured successful scalar puts times value_size; puts_per_frame uses that put count divided by leased_frames. Native logical_wal_bytes_per_payload uses the gate-boundary delta of native wal_written_bytes_type counters, including background WAL records but excluding preload/warmup. Neither is physical SSD write amplification. Device/payload ratios still cover the whole device observation window; F8 disables ext4 lazy initialization, but the remaining background-write scope must still be checked.', ''])
     lines.extend(['Authority preparation/admission columns are exclusive coordinator wall elapsed time per attempted input batch (called per put for scalar F8), not CPU time, device time or latency quantiles. They divide the nanosecond counter deltas by write_authority_batches and 1000; batches_per_window divides batches by write_authority_windows. Missing counters, invalid/reset/saturated boundaries and zero denominators remain unavailable. The validated measurement-read-evidence.json start/end/deltas.coordinator counters take precedence; write-profile intervals are a fallback only when read observations contain no authority counters. authority_interval_source and authority_interval_scope identify the selected population/window; no intervals are added together.', ''])

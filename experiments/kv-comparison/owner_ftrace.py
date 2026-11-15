@@ -7,13 +7,17 @@ import subprocess
 import sys
 import time
 
+from control_execution import MAX_JSON_BYTES
+
 EVENTS = ('jbd2/jbd2_start_commit', 'jbd2/jbd2_end_commit', 'jbd2/jbd2_run_stats',
           'writeback/balance_dirty_pages', 'ext4/ext4_fallocate_enter',
           'ext4/ext4_fallocate_exit', 'ext4/ext4_sync_file_enter',
           'ext4/ext4_sync_file_exit', 'nvmet/nvmet_req_init', 'nvmet/nvmet_req_complete')
-MAX_BYTES = 64 * 1024**2
-START_STATES = {}
 CPU_MAX_BYTES = 16 * 1024**2
+OWNER_TRACE_JSON_MARGIN_BYTES = 1024**2
+# Budget JSON-escaped trace content, not raw bytes: task names can need escapes.
+TRACE_MAX_SERIALIZED_BYTES = MAX_JSON_BYTES - CPU_MAX_BYTES - OWNER_TRACE_JSON_MARGIN_BYTES
+START_STATES = {}
 CPU_MAX_SAMPLES = 7200
 CPU_MAX_CPUS = 256
 
@@ -334,12 +338,47 @@ def start(case_id, tracefs=Path('/sys/kernel/tracing'), cpu_directory=None, dura
     return instance
 
 
+TRACE_EVENT = re.compile(r'^\s*.*?\[\d+\].*?\s(\d+)\.(\d{1,9}):\s+\w+:')
+
+
+def _capture_trace(source, target):
+    """Copy complete lines within the receipt's JSON-escaped text budget."""
+    coverage = {'event_count': 0, 'first_timestamp_ns': None, 'last_timestamp_ns': None,
+                'duration_ns': None, 'scope': 'captured_complete_trace_events', 'clock': 'mono'}
+    remaining = TRACE_MAX_SERIALIZED_BYTES
+    truncated = False
+    while remaining:
+        raw = source.readline(remaining + 1)
+        if not raw:
+            break
+        text = raw.decode('utf-8', errors='replace')
+        serialized_bytes = len(json.dumps(text, ensure_ascii=True)) - 2
+        if not raw.endswith(b'\n') or serialized_bytes > remaining:
+            truncated = True
+            break
+        target.write(text.encode('utf-8'))
+        remaining -= serialized_bytes
+        event = TRACE_EVENT.match(text)
+        if event:
+            timestamp = int(event[1]) * 1_000_000_000 + int(event[2].ljust(9, '0'))
+            if coverage['event_count'] == 0:
+                coverage['first_timestamp_ns'] = coverage['last_timestamp_ns'] = timestamp
+            else:
+                coverage['first_timestamp_ns'] = min(coverage['first_timestamp_ns'], timestamp)
+                coverage['last_timestamp_ns'] = max(coverage['last_timestamp_ns'], timestamp)
+            coverage['event_count'] += 1
+    else:
+        truncated = True
+    if coverage['event_count']:
+        coverage['duration_ns'] = coverage['last_timestamp_ns'] - coverage['first_timestamp_ns']
+    return {'truncated': truncated, 'trace_coverage': coverage}
+
+
 def stop(instance, output_dir, state=None):
     instance, output_dir = Path(instance), Path(output_dir)
     state = dict(state or {'events_enabled': [], 'events_missing': list(EVENTS), 'errors': []})
-    state.update(truncated=False, buffer_overruns=0)
+    state.update(truncated=False, buffer_overruns=0, trace_coverage=None)
     cpu = stop_cpu(state.pop('cpu_sampling', None))
-    state['cpu_summary'] = {key: value for key, value in cpu.items() if key != 'samples'}
     try:
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -352,15 +391,9 @@ def stop(instance, output_dir, state=None):
             state['errors'].append('stop: ' + str(error))
         try:
             with (instance / 'trace').open('rb') as source, (output_dir / 'owner-ftrace.txt').open('wb') as target:
-                remaining = MAX_BYTES
-                while remaining:
-                    block = source.read(min(1024**2, remaining))
-                    if not block:
-                        break
-                    target.write(block)
-                    remaining -= len(block)
-                state['truncated'] = bool(source.read(1))
+                state.update(_capture_trace(source, target))
         except OSError as error:
+            state['truncated'] = True
             state['errors'].append('trace: ' + str(error))
         for stats in instance.glob('per_cpu/cpu*/stats'):
             try:

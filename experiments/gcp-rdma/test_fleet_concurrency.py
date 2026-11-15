@@ -300,7 +300,7 @@ class ReservationWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manual.reservation_quote(spec, 'z4m-highmem-32'), (21600, 7890, 9668))
         spec['reservation_hours'] = 3
         self.assertEqual(manual.reservation_quote(spec, 'z4m-highmem-32'), (10800, 3945, 4834))
-        self.assertEqual(len(manual._reviewed_jobs(spec)), 10)
+        self.assertEqual(len(manual._reviewed_jobs(spec)), 8)
         manual._check_config(dict(CONFIG, machine_type='z4m-highmem-32'), spec, 889)
         with self.assertRaisesRegex(ValueError, 'non-compute quote'):
             manual._check_config(dict(CONFIG, machine_type='z4m-highmem-32'), spec, 890)

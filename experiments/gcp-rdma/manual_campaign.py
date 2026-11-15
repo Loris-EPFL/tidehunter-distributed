@@ -112,7 +112,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_f6': '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7',
     'nvmeof_f6b': 'f5e680e6959f3a74369bae97c21354b6dc2911f0b6e15f048c6e7172e4c823de',
     'nvmeof_f8': '30e7121a926003ebe18e691425db063c4093a942efdf5528913003720b9d5e1a',
-    'nvmeof_f7_highmem32': '3319cef697350c791476126a297d19f768ffb0690b6dd2fb4cef79978d9f6800',
+    'nvmeof_f7_highmem32': '25ef27bc334edc0d07a84061427893063e162f16f8f1a986ea99d758ca2c05dd',
     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
@@ -167,7 +167,7 @@ REVIEWED_SPECS = {
         ('nvmeof_f6', FOCUSED_MATRIX_SHA256['nvmeof_f6'], 42),
         ('nvmeof_f6b', FOCUSED_MATRIX_SHA256['nvmeof_f6b'], 58),
         ('nvmeof_f8', FOCUSED_MATRIX_SHA256['nvmeof_f8'], 36),
-        ('nvmeof_f7_highmem32', FOCUSED_MATRIX_SHA256['nvmeof_f7_highmem32'], 10),
+        ('nvmeof_f7_highmem32', FOCUSED_MATRIX_SHA256['nvmeof_f7_highmem32'], 8),
         ('nvmeof_reads_geometry', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry'], 74),
         ('nvmeof_reads_geometry_rest', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest'], 20),
         ('nvmeof_reads_geometry_rest2', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest2'], 18),
@@ -183,7 +183,7 @@ REVIEWED_SPECS['nvmeof_f6']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f6b']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f8']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f7_highmem32'].update(
-    machine_type='z4m-highmem-32', backends=['valkey_rdma', 'tidehunter_nvme_rdma'])
+    machine_type='z4m-highmem-32', backends=['tidehunter_nvme_rdma'])
 
 
 def _utc(seconds):
@@ -385,7 +385,7 @@ def _admit_package(package_dir, revision, spec):
     verified = package.verify_directory(root)
     import manual_sui
     focused = manual_sui.focused_qualification(spec)
-    expected_profile = 'focused_valkey' if spec.get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32') else 'focused'
+    expected_profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
     if focused and verified.get('build_profile') != expected_profile:
         raise ValueError('focused campaign requires its exact package profile')
     if not focused and verified.get('build_profile') is not None:

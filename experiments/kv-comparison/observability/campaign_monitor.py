@@ -104,6 +104,9 @@ QUERY_METRICS = LEGACY_QUERY_METRICS + (
     'kv_observer_cgroup_available', 'kv_observer_cgroup_memory_current_bytes',
     'kv_observer_cgroup_memory_peak_bytes', 'kv_observer_cgroup_oom_kills_total',
     'kv_observer_host_selection_available', 'kv_observer_info_section_available',
+    'kv_owner_trace_coverage_available', 'kv_owner_trace_captured_events',
+    'kv_owner_trace_covered_seconds', 'kv_owner_trace_observed_events_per_second',
+    'kv_owner_trace_truncated', 'kv_owner_trace_buffer_overruns',
     'kv_observer_info_counter_total', 'kv_observer_info_gauge')
 CAPS = {'prometheus': ('1', '1g'), 'grafana': ('0.5', '768m'),
         'benchmark': ('0.25', '256m'), 'host': ('0.1', '128m'), 'node': ('0.1', '128m')}
@@ -832,6 +835,23 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
     if nvmeof_trace_evidence is not None:
         terminal['nvmeof_trace_evidence'] = nvmeof_trace_evidence
     import campaign_exporter
+    # Keep only compact metadata in the atomic selection, never trace text or CPU samples.
+    # The case-root artifact is owner 0; the remaining owners retain their node identity.
+    owner_traces = []
+    trace_paths = [('node-0', path.parent / 'owner-ftrace.json')]
+    trace_paths.extend((f'node-{index}', path.parent / 'owner-ftrace' / f'node-{index}' / 'owner-ftrace.json')
+                       for index in range(1, max(campaign_exporter.SEALED_OWNER_COUNTS)))
+    for identity, trace_path in trace_paths:
+        if trace_path.is_file():
+            try:
+                trace = load_json(trace_path)
+            except (OSError, ValueError):
+                trace = {}
+            metadata = {key: trace[key] for key in ('trace_coverage', 'truncated', 'buffer_overruns')
+                        if isinstance(trace, dict) and key in trace}
+            owner_traces.append({'owner': identity, **metadata})
+    if owner_traces:
+        terminal['owner_trace_evidence'] = owner_traces
     campaign_exporter.terminal_metrics(terminal, {})
     campaign_exporter.read_tier_metrics(job, {}, read_tier_effective)
     selected['terminal'] = terminal

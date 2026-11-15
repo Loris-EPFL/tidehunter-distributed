@@ -34,20 +34,24 @@ def config_fixture():
 
 
 class F7PackageTests(unittest.TestCase):
-    def test_f7_requires_focused_valkey_package(self):
-        config = config_fixture()
-        config["spec"] = {"mode": "focused", "selection": "nvmeof_f7_highmem32"}
-        admission = {key: config[key] for key in
-                     ("source_sha256", "binary_sha256", "binary_blake2b512")}
-        admission["build_profile"] = "focused_valkey"
-        with patch("cloud_package.verify_directory", return_value=admission), \
-                patch.object(controller, "platform_module", return_value=None), \
-                patch.object(Path, "read_text", return_value=json.dumps(
-                    {"revision": config["source_revision"]})):
-            self.assertIsNone(controller.verify_package(config)["fdb"])
-            admission["build_profile"] = "focused"
-            with self.assertRaisesRegex(controller.SafetyError, "package profile"):
-                controller.verify_package(config)
+    def test_focused_package_profile_is_selection_specific(self):
+        for selection, expected, rejected in (
+                ("nvmeof_f7_highmem32", "focused", "focused_valkey"),
+                ("valkey_rdma_reads", "focused_valkey", "focused")):
+            config = config_fixture()
+            config["spec"] = {"mode": "focused", "selection": selection}
+            admission = {key: config[key] for key in
+                         ("source_sha256", "binary_sha256", "binary_blake2b512")}
+            admission["build_profile"] = expected
+            with self.subTest(selection=selection), \
+                    patch("cloud_package.verify_directory", return_value=admission), \
+                    patch.object(controller, "platform_module", return_value=None), \
+                    patch.object(Path, "read_text", return_value=json.dumps(
+                        {"revision": config["source_revision"]})):
+                self.assertIsNone(controller.verify_package(config)["fdb"])
+                admission["build_profile"] = rejected
+                with self.assertRaisesRegex(controller.SafetyError, "package profile"):
+                    controller.verify_package(config)
 
 
 def instance_response(config):

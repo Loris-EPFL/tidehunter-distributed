@@ -1,3 +1,4 @@
+import io
 import json
 import subprocess
 import sys
@@ -90,25 +91,81 @@ class OwnerFtraceTests(unittest.TestCase):
             self.assertEqual(state['events_missing'], list(owner_ftrace.EVENTS))
             self.assertTrue(state['errors'])
 
+    def test_capture_budget_counts_escapes_and_keeps_only_complete_lines(self):
+        first = 'worker [001] .... 1.000001: nvmet_req_init: arg="é' + chr(92) + chr(0) + '"\n'
+        second = 'worker [001] .... 2.000002: nvmet_req_complete: value=1\n'
+        budget = len(json.dumps(first + second, ensure_ascii=True)) - 3
+        output = io.BytesIO()
+        with patch.object(owner_ftrace, 'TRACE_MAX_SERIALIZED_BYTES', budget):
+            state = owner_ftrace._capture_trace(io.BytesIO((first + second).encode()), output)
+        self.assertEqual(output.getvalue().decode(), first)
+        self.assertTrue(state['truncated'])
+        self.assertLessEqual(len(json.dumps(output.getvalue().decode())) - 2, budget)
+        self.assertEqual(state['trace_coverage']['event_count'], 1)
+        self.assertEqual(state['trace_coverage']['duration_ns'], 0)
+
+    def test_capture_coverage_uses_event_extrema_and_ignores_headers(self):
+        text = ('# a trace header\n'
+                'worker [001] .... 3.250000: nvmet_req_init: qid=1\n'
+                'worker [002] .... 3.125000: ext4_sync_file_enter: ino=2\n'
+                'worker [001] .... 3.500000: nvmet_req_complete: qid=1\n')
+        output = io.BytesIO()
+        state = owner_ftrace._capture_trace(io.BytesIO(text.encode()), output)
+        self.assertFalse(state['truncated'])
+        self.assertEqual(output.getvalue().decode(), text)
+        self.assertEqual(state['trace_coverage'], {
+            'event_count': 3, 'first_timestamp_ns': 3125000000, 'last_timestamp_ns': 3500000000,
+            'duration_ns': 375000000, 'scope': 'captured_complete_trace_events', 'clock': 'mono'})
+
+    def test_capture_partial_final_event_does_not_inflate_coverage(self):
+        first = b'worker [001] .... 1.000001: nvmet_req_init: qid=1\n'
+        partial = b'worker [001] .... 2.000002: nvmet_req_complete: qid='
+        output = io.BytesIO()
+        state = owner_ftrace._capture_trace(io.BytesIO(first + partial), output)
+        self.assertEqual(output.getvalue(), first)
+        self.assertTrue(state['truncated'])
+        self.assertEqual(state['trace_coverage']['event_count'], 1)
+        self.assertEqual(state['trace_coverage']['last_timestamp_ns'], 1000001000)
+
+    def test_empty_trace_and_replaced_utf8_preserve_the_serialized_bound(self):
+        empty = owner_ftrace._capture_trace(io.BytesIO(b'# no events\n'), io.BytesIO())
+        self.assertEqual(empty['trace_coverage']['event_count'], 0)
+        self.assertIsNone(empty['trace_coverage']['duration_ns'])
+        self.assertFalse(empty['truncated'])
+        raw = b'worker [001] .... 1.000001: nvmet_req_init: arg=\xff\n'
+        output = io.BytesIO()
+        state = owner_ftrace._capture_trace(io.BytesIO(raw), output)
+        text = output.getvalue().decode('utf-8')
+        self.assertIn('\ufffd', text)
+        self.assertLessEqual(len(json.dumps(text)) - 2, owner_ftrace.TRACE_MAX_SERIALIZED_BYTES)
+        self.assertEqual(state['trace_coverage']['event_count'], 1)
+
     def test_stop_cap_stats_and_removal_even_on_error(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             instance = root / 'instance'
             instance.mkdir()
             (instance / 'tracing_on').touch()
-            (instance / 'trace').write_bytes(b'123456')
+            first = b'worker [001] .... 1.000001: nvmet_req_init: qid=1\n'
+            second = b'worker [001] .... 1.000003: nvmet_req_complete: qid=1\n'
+            third = b'worker [001] .... 2.000000: nvmet_req_init: qid=2\n'
+            (instance / 'trace').write_bytes(first + second + third)
             stats = instance / 'per_cpu/cpu0'
             stats.mkdir(parents=True)
             (stats / 'stats').write_text('overrun: 7\n')
             def remove(path):
                 import shutil
                 shutil.rmtree(path)
-            with patch.object(owner_ftrace, 'MAX_BYTES', 4), patch.object(Path, 'rmdir', remove):
+            budget = len(json.dumps((first + second).decode())) - 2
+            with patch.object(owner_ftrace, 'TRACE_MAX_SERIALIZED_BYTES', budget), patch.object(Path, 'rmdir', remove):
                 state = owner_ftrace.stop(instance, root / 'out')
             self.assertFalse(instance.exists())
             self.assertTrue(state['truncated'])
             self.assertEqual(state['buffer_overruns'], 7)
-            self.assertEqual((root / 'out/owner-ftrace.txt').read_bytes(), b'1234')
+            self.assertEqual((root / 'out/owner-ftrace.txt').read_bytes(), first + second)
+            self.assertEqual(state['trace_coverage'], {
+                'event_count': 2, 'first_timestamp_ns': 1000001000, 'last_timestamp_ns': 1000003000,
+                'duration_ns': 2000, 'scope': 'captured_complete_trace_events', 'clock': 'mono'})
             self.assertEqual(json.loads((root / 'out/owner-ftrace.json').read_text()), state)
 
     def test_output_error_still_removes_instance(self):

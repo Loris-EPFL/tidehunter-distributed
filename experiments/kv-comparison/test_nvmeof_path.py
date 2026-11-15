@@ -190,6 +190,68 @@ class NvmeofPathTests(unittest.TestCase):
         self.cases[0]['status'] = 'not_run'
         self.assertIsNone(analysis.result_row(self.cases[0], self.export)['live_leased_sync'])
 
+    def test_owner_trace_coverage_reaches_csv_without_case_or_cpu_normalization(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G29R', selection='nvmeof_f6', op='read')
+        samples_path = directory / 'samples.csv'
+        with samples_path.open() as stream:
+            samples = list(csv.DictReader(stream))
+        samples[-1].update(completed_ns=100_000_000_001, api_ns=100_000_000_000,
+                           response_ns=100_000_000_000)
+        with samples_path.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=tuple(samples[0]))
+            writer.writeheader()
+            writer.writerows(samples)
+        artifact = {'truncated': True, 'buffer_overruns': 7, 'trace_coverage': {
+            'event_count': 100, 'first_timestamp_ns': 10_000_000_000,
+            'last_timestamp_ns': 12_000_000_000, 'duration_ns': 2_000_000_000,
+            'scope': 'captured_complete_trace_events', 'clock': 'mono'}}
+        (directory.parent / 'owner-ftrace.json').write_text(json.dumps(artifact))
+        (directory.parent / 'owner-cpu.json').write_text(json.dumps({
+            'available': True, 'elapsed_seconds': 100, 'summary': {
+                'max_busy_pct': 95, 'mean_busy_pct': 72.5, 'max_softirq_pct': 10,
+                'cpus_above_90_busy': 1}}))
+        rows = self.generate()
+        self.assertEqual(rows[0]['owner_trace_scope'], 'primary_owner')
+        self.assertEqual(rows[0]['owner_trace_captured_events'], 100)
+        self.assertEqual(rows[0]['owner_trace_covered_seconds'], 2)
+        self.assertEqual(rows[0]['owner_trace_observed_events_per_second'], 50)
+        self.assertAlmostEqual(rows[0]['calls_per_second'], 2 / 100)
+        self.assertEqual(rows[0]['owner_trace_truncated'], True)
+        self.assertEqual(rows[0]['owner_trace_buffer_overruns'], 7)
+        self.assertEqual(rows[0]['owner_cpu_mean_busy_pct'], 72.5)
+        with (self.output / 'reads.csv').open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(float(row['owner_trace_observed_events_per_second']), 50)
+        text = (self.output / 'nvmeof_path.md').read_text()
+        self.assertIn('not read IOPS', text)
+        self.assertIn('separate full sampling window', text)
+
+    def test_owner_trace_bad_missing_and_zero_coverage_never_invents_a_rate(self):
+        valid = {'event_count': 100, 'first_timestamp_ns': 10_000_000_000,
+                 'last_timestamp_ns': 12_000_000_000, 'duration_ns': 2_000_000_000,
+                 'scope': 'captured_complete_trace_events', 'clock': 'mono'}
+        broken = [None, {}, 'bad']
+        for key, value in (
+                ('event_count', True), ('event_count', -1), ('event_count', 1),
+                ('event_count', 0), ('first_timestamp_ns', None),
+                ('last_timestamp_ns', 9_000_000_000), ('duration_ns', 0),
+                ('duration_ns', 2_000_000_001), ('duration_ns', 2e9),
+                ('scope', 'case'), ('clock', 'wall')):
+            broken.append(valid | {key: value})
+        broken.extend([
+            valid | {'first_timestamp_ns': 12_000_000_000, 'duration_ns': 0},
+            valid | {'event_count': 0, 'first_timestamp_ns': None,
+                     'last_timestamp_ns': None, 'duration_ns': None}])
+        for coverage in broken:
+            with self.subTest(coverage=coverage):
+                row = analysis.owner_trace_columns({
+                    'trace_coverage': coverage, 'truncated': True, 'buffer_overruns': 3})
+                self.assertIsNone(row['owner_trace_observed_events_per_second'])
+                self.assertIsNone(row['owner_trace_covered_seconds'])
+                self.assertTrue(row['owner_trace_truncated'])
+                self.assertEqual(row['owner_trace_buffer_overruns'], 3)
+        self.assertIsNone(analysis.owner_trace_columns({})['owner_trace_observed_events_per_second'])
+
     def test_owner_cpu_summary_keeps_unavailable_distinct(self):
         directory = self.add('tidehunter_nvme_rdma', group='G29R', selection='nvmeof_f6', op='read')
         path = directory.parent / 'owner-cpu.json'

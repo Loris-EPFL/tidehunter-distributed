@@ -93,7 +93,7 @@ class RiskOrderTests(unittest.TestCase):
             risk_order.validate_order(jobs, order)
     def test_nvmeof_path_preserves_canaries_and_group_order(self):
         for selection in risk_order.cloud_campaign.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_f6b': 58, 'nvmeof_f8': 36, 'nvmeof_f7_highmem32': 10, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_f6b': 58, 'nvmeof_f8': 36, 'nvmeof_f7_highmem32': 8, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
             with self.subTest(selection=selection):
                 jobs = risk_order.cloud_campaign.make_focused_matrix(selection)
                 self.assertEqual(len(jobs), expected_count)

@@ -379,6 +379,52 @@ class CampaignModeTests(unittest.TestCase):
             explicit_info['configuration'][field] = default
             cloud_campaign.admit_live_write_contract(explicit_job, explicit_info)
 
+    def test_f7_sized_windows_admit_limits_and_keep_source_qualification(self):
+        for job in cloud_campaign.make_focused_matrix('nvmeof_f7_highmem32'):
+            config = cloud_campaign.make_run_config(job, '/tmp/f7-sized', {}, 'revision', 600)
+            self.assertEqual(config['phases']['warmup_operations'], job['warmup_operations'])
+            self.assertEqual(config['phases']['measurement_operations'], job['measurement_operations'])
+            self.assertEqual(config['limits']['max_operations'],
+                             job['keys'] + job['warmup_operations'] + job['measurement_operations'] + 4096)
+            self.assertLessEqual(config['dataset']['keys'], config['limits']['max_keys'])
+            self.assertLessEqual(job['keys'] * job['value_size'], config['limits']['max_bytes'])
+            capacity = controller.planned_write_batches_per_partition(job)
+            self.assertLessEqual(capacity, 1000000)
+            if job['mix']['read'] == 100:
+                self.assertEqual(capacity, 65536 + 4096)
+                self.assertTrue(config['phases']['warmup_key_sweep'])
+                self.assertGreaterEqual(config['phases']['warmup_operations'], config['dataset']['keys'])
+                evidence = self.f6_evidence(completed_read_ops=job['measurement_operations'],
+                    completed_read_bytes=job['measurement_operations'] * job['value_size'])
+            else:
+                self.assertEqual(capacity, 4096 + 70000 + 350000 + 4096)
+                evidence = self.f6_evidence(completed_write_ops=job['measurement_operations'],
+                    completed_write_bytes=job['measurement_operations'] * job['value_size'],
+                    leased_frames=job['measurement_operations'])
+            result = cloud_campaign.qualify_live_nvme_measurement(evidence, job, self.exported(job))
+            self.assertTrue(result['qualified'], (job['case_id'], result))
+            if job['mix']['read'] == 100:
+                del evidence['deltas']['coordinator']['counters']['read_profile_live_inline']
+                self.assertIn('live inline admission evidence differs',
+                    cloud_campaign.qualify_live_nvme_measurement(evidence, job, self.exported(job))['reasons'])
+            else:
+                evidence['end']['live_nvmeof']['fua_writes'] += 1
+                evidence['live_nvmeof']['counters']['fua_writes'] += 1
+                self.assertIn('leased FUA count differs from frames and skip markers',
+                    cloud_campaign.qualify_live_nvme_measurement(evidence, job, self.exported(job))['reasons'])
+
+    def test_planned_write_capacity_counts_writes_and_rounds_up_per_owner(self):
+        job = dict(owner_count=5, keys=11, warmup_operations=2, measurement_operations=8,
+                   mix=cloud_campaign.mix(read=100))
+        self.assertEqual(controller.planned_write_batches_per_partition(job), 4099)
+        for kind in ('put', 'delete', 'put_batch'):
+            changed = dict(job, mix=cloud_campaign.mix(**{kind: 100}))
+            self.assertEqual(controller.planned_write_batches_per_partition(changed), 4101)
+        mixed = dict(job, mix=cloud_campaign.mix(read=99, put=1))
+        self.assertEqual(controller.planned_write_batches_per_partition(mixed), 4101)
+        reads = dict(job, warmup_operations=300000, measurement_operations=1500000)
+        self.assertEqual(controller.planned_write_batches_per_partition(reads), 4099)
+
     def test_parallel_c64_run_configuration_admits_all_callers(self):
         jobs = cloud_campaign.make_focused_matrix('nvmeof_parallel_writes')
         cases = [j for j in jobs if j['concurrency'] == 64]

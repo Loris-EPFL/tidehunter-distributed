@@ -144,12 +144,12 @@ class ManualCampaignTest(unittest.TestCase):
 
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_f6b': 58, 'nvmeof_f8': 36, 'nvmeof_f7_highmem32': 10, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_f6b': 58, 'nvmeof_f8': 36, 'nvmeof_f7_highmem32': 8, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
                 self.assertEqual(spec['backends'],
-                                 ['valkey_rdma', 'tidehunter_nvme_rdma'] if selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
+                                 ['tidehunter_nvme_rdma'] if selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
                 self.assertFalse(spec['spdk_comparison'])
                 self.assertEqual(spec['matrix_sha256'], manual.FOCUSED_MATRIX_SHA256[selection])
                 self.assertEqual(spec['matrix_sha256'], {
@@ -163,7 +163,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_f6': '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7',
                     'nvmeof_f6b': 'f5e680e6959f3a74369bae97c21354b6dc2911f0b6e15f048c6e7172e4c823de',
                     'nvmeof_f8': '30e7121a926003ebe18e691425db063c4093a942efdf5528913003720b9d5e1a',
-                    'nvmeof_f7_highmem32': '3319cef697350c791476126a297d19f768ffb0690b6dd2fb4cef79978d9f6800',
+                    'nvmeof_f7_highmem32': '25ef27bc334edc0d07a84061427893063e162f16f8f1a986ea99d758ca2c05dd',
                     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
                     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
                     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',

@@ -384,7 +384,7 @@ def _pair(package, cfg, deadline, store, own, identity):
         raise ValueError('sealed manifest mismatch')
     focused_valkey = proof.get('build_profile') == 'focused_valkey'
     if profile == 'focused' and (
-            focused_valkey != (cfg.get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32'))):
+            focused_valkey != (cfg.get('selection') == 'valkey_rdma_reads')):
         raise ValueError('focused Valkey selection/package profile mismatch')
     api = gcp_api.GoogleApi(gcp_image_qualify.metadata('project/project-id'), token_provider=gcp_api.metadata_token)
     zone = gcp_image_qualify.metadata('instance/zone').rsplit('/', 1)[-1]
