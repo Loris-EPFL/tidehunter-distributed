@@ -1988,6 +1988,50 @@ fn pipelined_pool_reprepares_stale_suffix_after_middle_admission_failure() {
     reopened.shutdown().unwrap();
 }
 
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn parallel_frame_fill_shutdown_releases_pool_with_retained_transports() {
+    use crate::distributed::durability::DurabilityTier;
+    use crate::distributed::tcp::leased_tests::Fixture as LiveFixture;
+    let fixture = LiveFixture::preparation_geometry(DurabilityTier::Synchronous);
+    let mut client = fixture.writer();
+    let preparation = PreparationPool::build(2).unwrap();
+    client.set_preparation_pool(preparation.pool.clone());
+    let original = fixture.batch(0);
+    let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
+    let batch = CompleteBatch::new(
+        &shape,
+        original.id(),
+        original.version(),
+        vec![Mutation::Put {
+            keyspace: KeySpace(0),
+            key: b"key1"[..].into(),
+            value: vec![7; 128 * 1024].into(),
+        }],
+        fixture.config.partition.batch_limits,
+    )
+    .unwrap();
+    let (worker, failure) = super::super::leased_tests::worker(&fixture, client);
+    let retained = worker.client.clone();
+    receive(worker.append(1, vec![batch]).unwrap()).unwrap();
+    assert!(!failure.load(Ordering::Acquire));
+    assert_eq!(fixture.metrics.snapshot().counts.frame_fill_pool_count, 1);
+    assert!(fixture.metrics.snapshot().counts.frame_fill_pool_ns > 0);
+    // Match shutdown_with's retention order: a transport cache and monitor can
+    // keep the same client alive after its append worker has joined.
+    let transports = transports::RemoteTransportPool::new();
+    transports.retain(transports::IdleTransports {
+        key: [9; 32],
+        controls: vec![retained.clone()],
+        reads: Vec::new(),
+    });
+    drop(worker);
+    assert_eq!(Arc::strong_count(preparation.pool.as_ref().unwrap()), 1);
+    drop(preparation);
+    transports.clear();
+    drop(retained);
+}
+
 struct ReleasePreparation(mpsc::SyncSender<()>);
 
 impl Drop for ReleasePreparation {

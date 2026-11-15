@@ -8,6 +8,11 @@ use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use std::time::Instant;
 
+// Conservative hand-off threshold for frame copies only; J2 always uses the
+// pool. This is not a hardware performance claim or a fleet-tuned constant.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+const PARALLEL_FRAME_FILL_MIN_BYTES: usize = 128 * 1024;
+
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 static BENCH_LOCAL_BUFFERED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2848,14 +2853,36 @@ impl super::Client {
             .prefixes
             .push_back(prefix);
         timeline.live_group_event(sample, Stage::LiveIoStarted);
+        let preparation_pool = self.preparation_pool.clone();
+        let counters = self.live_counters.clone();
         let (id, deadline, submitted_at, durable_at_completion) = self.submit_leased_frame(
             offset,
             frame_len,
             queue_empty,
             |buffer| {
-                group
-                    .encode_into(buffer)
-                    .map_err(super::TcpError::component)
+                if let Some(pool) = preparation_pool.as_ref().filter(|_| {
+                    group
+                        .batches()
+                        .iter()
+                        .map(|batch| batch.encoded().len())
+                        .sum::<usize>()
+                        >= PARALLEL_FRAME_FILL_MIN_BYTES
+                }) {
+                    debug_assert!(pool.current_thread_index().is_none());
+                    debug_assert_eq!(std::thread::current().name(), Some("value-wal-tcp"));
+                    let started = Instant::now();
+                    let result = group.encode_into_parallel(buffer, pool);
+                    if let Some(counters) = &counters {
+                        counters.record_frame_fill_pool(
+                            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        );
+                    }
+                    result.map_err(super::TcpError::component)
+                } else {
+                    group
+                        .encode_into(buffer)
+                        .map_err(super::TcpError::component)
+                }
             },
             sample.map(|sample| (timeline, sample)),
         )?;
@@ -2956,6 +2983,19 @@ pub(crate) mod leased_tests {
             config.partition.wal_file_bytes = fragment * 2;
             config.partition.batch_limits.max_encoded_bytes = 8192;
             config.partition.group_limits.max_encoded_bytes = 16376.min(fragment as usize - 8);
+            config.partition.max_batches = 4096;
+            config.partition.max_reference_metadata_bytes = 64 * 1024 * 1024;
+            Self::open(tier, config, temp, Duration::from_secs(10))
+        }
+
+        pub(crate) fn preparation_geometry(tier: DurabilityTier) -> Self {
+            let temp = tempdir::TempDir::new("leased-preparation").unwrap();
+            let mut config = tcp::tests::config(&temp.path().join("node"));
+            config.partition.inventory.partitions = vec![2];
+            config.partition.fragment_bytes = 1024 * 1024;
+            config.partition.wal_file_bytes = 4 * 1024 * 1024;
+            config.partition.batch_limits.max_encoded_bytes = 256 * 1024;
+            config.partition.group_limits.max_encoded_bytes = 512 * 1024;
             config.partition.max_batches = 4096;
             config.partition.max_reference_metadata_bytes = 64 * 1024 * 1024;
             Self::open(tier, config, temp, Duration::from_secs(10))
