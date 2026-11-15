@@ -160,10 +160,11 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, q
     local_addresses = [nic.get('networkIP') for nic in info.get('networkInterfaces', []) if nic.get('nicType') == 'IRDMA']
     if len(local_addresses) != 1 or not local_addresses[0] or local_addresses[0] == peer:
         raise ValueError('exact distinct local IRDMA address required')
-    if not info.get('machineType', '').endswith('/z4m-highmem-16'):
+    machine_type = info.get('machineType', '').rsplit('/', 1)[-1]
+    if machine_type not in {'z4m-highmem-16', 'z4m-highmem-32'} or other.get('machineType') != info.get('machineType'):
         raise ValueError('qualification requires the reviewed Z4M machine shape')
     from gcp_worker import admit_scratch
-    scratch = admit_scratch({'machine_type': 'z4m-highmem-16'},
+    scratch = admit_scratch({'machine_type': machine_type},
                             {'name': instance, 'zone': zone, 'id': instance_id}, api)
     devices = {'local-ssd': scratch['device']}
     if not Path('/dev/infiniband/rdma_cm').is_char_device():

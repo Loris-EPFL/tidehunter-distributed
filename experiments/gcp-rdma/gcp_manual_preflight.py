@@ -57,7 +57,7 @@ def permission_preflight(config, *, api=None):
 async def infrastructure_preflight(config, base_image, execute):
     """Read the exact reviewed image, machine, subnets and Falcon profile."""
     if (config.get('project_id') != 'mysten-research'
-            or config.get('machine_type') != 'z4m-highmem-16'
+            or config.get('machine_type', 'z4m-highmem-16') not in {'z4m-highmem-16', 'z4m-highmem-32'}
             or config.get('max_distance') != 3):
         raise ValueError('unreviewed infrastructure configuration')
     candidate = {'zone': 'us-central1-a',
@@ -94,10 +94,11 @@ async def infrastructure_preflight(config, base_image, execute):
         raise ValueError('guest image identity differs from the reviewed base image')
     image['guest_image_read'] = {
         'service_account': GUEST_SERVICE_ACCOUNT, 'path': base_image, 'id': image['id']}
-    machine = await describe(['compute', 'machine-types', 'describe', 'z4m-highmem-16',
-                              '--zone=us-central1-a'], 'z4m-highmem-16')
+    machine_type = config.get('machine_type', 'z4m-highmem-16')
+    machine = await describe(['compute', 'machine-types', 'describe', machine_type,
+                              '--zone=us-central1-a'], machine_type)
     if not str(machine.get('selfLink', '')).endswith(
-            '/projects/mysten-research/zones/us-central1-a/machineTypes/z4m-highmem-16'):
+            '/projects/mysten-research/zones/us-central1-a/machineTypes/' + machine_type):
         raise ValueError('machine type identity mismatch')
     ordinary = await describe(['compute', 'networks', 'subnets', 'describe', 'default',
                                '--region=us-central1'], 'default')

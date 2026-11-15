@@ -16,6 +16,128 @@ use std::time::{Duration, Instant};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// CPUs serving each hardware queue, in numeric queue-index order.
+/// Native multipath heads have no `mq`: use the first per-path disk in sorted
+/// path-name order. Our connections normally have exactly one such path.
+pub(crate) fn queue_cpus(namespace_device: &Path) -> io::Result<Vec<Vec<usize>>> {
+    let device = std::fs::canonicalize(namespace_device)
+        .map_err(|error| with_context("resolve namespace", namespace_device, error))?;
+    queue_cpus_at(Path::new("/sys/block"), &device)
+}
+
+fn queue_cpus_at(block_root: &Path, namespace_device: &Path) -> io::Result<Vec<Vec<usize>>> {
+    let name = namespace_device.file_name().ok_or_else(|| {
+        with_context(
+            "namespace device name",
+            namespace_device,
+            invalid("missing device name"),
+        )
+    })?;
+    let mut path = block_root.join(name).join("mq");
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let multipath = block_root.join(name).join("multipath");
+            let paths = std::fs::read_dir(&multipath)
+                .map_err(|error| with_context("read namespace paths", &multipath, error))?;
+            let mut first: Option<PathBuf> = None;
+            for entry in paths {
+                let entry = entry
+                    .map_err(|error| with_context("read namespace path", &multipath, error))?;
+                let candidate = entry.path();
+                if first.as_ref().is_none_or(|path| candidate < *path) {
+                    first = Some(candidate);
+                }
+            }
+            path = first
+                .ok_or_else(|| with_context(
+                    "read namespace paths",
+                    &multipath,
+                    invalid("no namespace paths"),
+                ))?
+                .join("mq");
+            std::fs::read_dir(&path)
+                .map_err(|error| with_context("read hardware queues", &path, error))?
+        }
+        Err(error) => return Err(with_context("read hardware queues", &path, error)),
+    };
+    let mut queues = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| with_context("read hardware queue", &path, error))?;
+        let index = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<usize>().ok())
+            .ok_or_else(|| {
+                with_context("hardware queue index", &entry.path(), invalid("invalid index"))
+            })?;
+        let cpu_path = entry.path().join("cpu_list");
+        let list = std::fs::read_to_string(&cpu_path)
+            .map_err(|error| with_context("read queue CPUs", &cpu_path, error))?;
+        let cpus = parse_cpu_list(&list)
+            .map_err(|error| with_context("parse queue CPUs", &cpu_path, error))?;
+        queues.push((index, cpus));
+    }
+    if queues.is_empty() {
+        return Err(with_context(
+            "read hardware queues",
+            &path,
+            invalid("no hardware queues"),
+        ));
+    }
+    queues.sort_unstable_by_key(|(index, _)| *index);
+    Ok(queues.into_iter().map(|(_, cpus)| cpus).collect())
+}
+
+fn parse_cpu_list(list: &str) -> io::Result<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',') {
+        let (start, end) = part.split_once('-').map_or((part, part), |range| range);
+        let start = start
+            .parse::<usize>()
+            .map_err(|_| invalid("invalid CPU index"))?;
+        let end = end
+            .parse::<usize>()
+            .map_err(|_| invalid("invalid CPU index"))?;
+        // Bound expansion to the mask supported by pin_current_thread.
+        if start > end || end >= libc::CPU_SETSIZE as usize {
+            return Err(invalid("CPU range outside affinity mask"));
+        }
+        cpus.extend(start..=end);
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    Ok(cpus)
+}
+
+/// Pin only the calling thread. Failure leaves its existing affinity unchanged.
+pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    let path = Path::new("/proc/thread-self");
+    if cpu >= libc::CPU_SETSIZE as usize {
+        return Err(with_context(
+            "set thread affinity",
+            path,
+            invalid("CPU outside affinity mask"),
+        ));
+    }
+    // SAFETY: cpu is inside cpu_set_t's bounds; the initialized mask lives for
+    // the whole syscall. pid 0 changes only the calling thread's affinity.
+    let result = unsafe {
+        let mut mask: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut mask);
+        libc::CPU_SET(cpu, &mut mask);
+        libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask)
+    };
+    if result != 0 {
+        return Err(with_context(
+            "set thread affinity",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
 /// A sysfs attribute read during controller teardown can return ENODEV, which
 /// Rust does not map to NotFound. Keep each call site's existing NotFound
 /// semantics for both errors; ENODEV proves no more absence than NotFound does.
@@ -1113,6 +1235,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cpu_lists_parse_single_ranges_and_mixed_sets() {
+        assert_eq!(parse_cpu_list("7\n").unwrap(), vec![7]);
+        assert_eq!(parse_cpu_list("0-3").unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            parse_cpu_list("0-3,8,10-11\n").unwrap(),
+            vec![0, 1, 2, 3, 8, 10, 11]
+        );
+        for invalid in ["", "\n", "3-1", "a", "0,", "1-2-3"] {
+            assert!(parse_cpu_list(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(parse_cpu_list(&format!("0-{}", usize::MAX)).is_err());
+        assert!(parse_cpu_list(&libc::CPU_SETSIZE.to_string()).is_err());
+    }
+
+    #[test]
+    fn queue_cpus_reads_sysfs_in_numeric_queue_order_and_names_errors() {
+        let temp = tempdir::TempDir::new("queue-cpus").unwrap();
+        let root = temp.path();
+        let mq = root.join("nvme0n1/mq");
+        for (queue, cpus) in [("10", "8"), ("2", "0-3,8"), ("0", "4-5")] {
+            let path = mq.join(queue);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("cpu_list"), cpus).unwrap();
+        }
+        assert_eq!(
+            queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap(),
+            vec![vec![4, 5], vec![0, 1, 2, 3, 8], vec![8]]
+        );
+        let path = mq.join("2/cpu_list");
+        std::fs::write(&path, "").unwrap();
+        let error = queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+        std::fs::remove_file(&path).unwrap();
+        let error = queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn queue_cpus_follows_native_multipath_head_in_sorted_path_order() {
+        let temp = tempdir::TempDir::new("queue-cpus-multipath").unwrap();
+        let root = temp.path();
+        let paths = root.join("nvme0n1/multipath");
+        std::fs::create_dir_all(&paths).unwrap();
+        for (name, cpus) in [("nvme0c2n1", "8-9"), ("nvme0c1n1", "2-3")] {
+            let disk = root.join(name);
+            std::fs::create_dir_all(disk.join("mq/0")).unwrap();
+            std::fs::write(disk.join("mq/0/cpu_list"), cpus).unwrap();
+            std::os::unix::fs::symlink(&disk, paths.join(name)).unwrap();
+        }
+        assert_eq!(
+            queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap(),
+            vec![vec![2, 3]]
+        );
+    }
+
+    #[test]
+    fn live_queue_geometry_defaults_to_four_128_entry_queues() {
+        assert_eq!(
+            LiveQueueGeometry::default(),
+            LiveQueueGeometry {
+                io_queues: 4,
+                queue_size: 128,
+                poll_queues: 0
+            }
+        );
+    }
+
+    #[test]
     fn live_queue_geometry_validates_all_bounds() {
         assert!(LiveQueueGeometry::default().validate().is_ok());
         for io_queues in [1, 16] {
@@ -1171,21 +1363,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(target.geometry, LiveQueueGeometry::default());
-        let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,duplicate_connect,ctrl_loss_tmo=0,nr_io_queues=1,queue_size=32";
+        let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,duplicate_connect,ctrl_loss_tmo=0,nr_io_queues=4,queue_size=128";
         assert_eq!(
             connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
             expected
         );
         target.geometry = LiveQueueGeometry {
-            io_queues: 4,
-            queue_size: 128,
+            io_queues: 1,
+            queue_size: 32,
             poll_queues: 1,
         };
         assert_eq!(
             connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
             expected.replace(
-                "nr_io_queues=1,queue_size=32",
-                "nr_io_queues=4,queue_size=128,nr_poll_queues=1"
+                "nr_io_queues=4,queue_size=128",
+                "nr_io_queues=1,queue_size=32,nr_poll_queues=1"
             )
         );
         let other = connect_options(&target, "nqn.2026-01.test:other-owner", [3; 16]);
@@ -1219,26 +1411,26 @@ mod tests {
     fn queue_geometry_admission_requires_exact_readable_kernel_attributes() {
         let temp = tempdir::TempDir::new("controller-queues").unwrap();
         let path = temp.path();
-        std::fs::write(path.join("queue_count"), "2\n").unwrap();
-        std::fs::write(path.join("sqsize"), "31\n").unwrap();
+        std::fs::write(path.join("queue_count"), "5\n").unwrap();
+        std::fs::write(path.join("sqsize"), "127\n").unwrap();
         verify_queue_geometry(path, LiveQueueGeometry::default()).unwrap();
         for (geometry, count, size) in [
             (
                 LiveQueueGeometry {
-                    io_queues: 4,
-                    queue_size: 128,
+                    io_queues: 1,
+                    queue_size: 32,
                     poll_queues: 0,
                 },
-                "5",
-                "127",
+                "2",
+                "31",
             ),
             (
                 LiveQueueGeometry {
                     poll_queues: 1,
                     ..Default::default()
                 },
-                "3",
-                "31",
+                "6",
+                "127",
             ),
         ] {
             std::fs::write(path.join("queue_count"), count).unwrap();
@@ -1253,8 +1445,8 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
-        std::fs::write(path.join("queue_count"), "2\n").unwrap();
-        std::fs::write(path.join("sqsize"), "127\n").unwrap();
+        std::fs::write(path.join("queue_count"), "5\n").unwrap();
+        std::fs::write(path.join("sqsize"), "31\n").unwrap();
         assert_eq!(
             verify_queue_geometry(path, LiveQueueGeometry::default())
                 .unwrap_err()

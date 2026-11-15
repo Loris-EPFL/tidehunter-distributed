@@ -131,6 +131,9 @@ class CompactReadLifecycleTests(unittest.TestCase):
                   next(j for j in parallel if j.get('owner_trace'))]
         cases += [j for j in controller.cloud_campaign.make_focused_matrix('nvmeof_reads_geometry')
                   if 'coordinator_read_memory_allowance_bytes' in j]
+        fallback = {key: value for key, value in cases[0].items()
+                    if key not in ('live_io_queues', 'live_io_queue_size', 'live_poll_queues')}
+        cases.append(fallback)
         nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
         for job in cases:
             with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as tmp:
@@ -158,6 +161,13 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     out = Path(argv[-1])
                     out.mkdir()
                     live = prep['live_nvmeof']
+                    self.assertEqual(live['queue_geometry'], {
+                        'io_queues': job.get('live_io_queues', 4),
+                        'queue_size': job.get('live_io_queue_size', 128),
+                        'poll_queues': job.get('live_poll_queues', 0)})
+                    if 'live_io_queues' not in job:
+                        self.assertEqual(live['queue_geometry'],
+                                         {'io_queues': 4, 'queue_size': 128, 'poll_queues': 0})
                     client = {key: live[key] for key in ('max_inflight_requests', 'max_inflight_bytes',
                               'connect_timeout_ms', 'io_timeout_ms', 'write_mode', 'inline_reads',
                               'lease_ahead', 'polled_writes', 'leased_write_window')}

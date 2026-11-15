@@ -421,6 +421,10 @@ pub struct RemoteDatabaseConfig {
     pub scan_prefetch_pages: usize,
     #[serde(default = "default_read_lanes")]
     pub read_lanes: usize,
+    /// Pin live read workers to hardware-queue CPUs once a namespace is known.
+    /// Best effort: affinity failures are counted and do not fail reads.
+    #[serde(default)]
+    pub pin_read_lanes: bool,
     #[serde(default = "default_max_pending_reads")]
     pub max_pending_reads: usize,
     #[serde(default = "default_max_pending_read_bytes")]
@@ -537,6 +541,11 @@ impl RemoteDatabaseConfig {
         }
         if let Some(live) = &self.live_nvme {
             live.validate().map_err(LocalDbError::new)?;
+            if self.pin_read_lanes && self.read_lanes > live.queue_geometry.io_queues as usize {
+                return Err(LocalDbError::new(
+                    "pin_read_lanes requires read_lanes <= live I/O queues",
+                ));
+            }
             if !live.owner_identities.is_empty()
                 && (live.owner_identities.len() != self.storage.partitions.len()
                     || self
@@ -5627,8 +5636,13 @@ impl ClientWorker {
                     }
                     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if let Some((epoch, batches, members)) = deferred.take() {
-                        match client.submit_leased_group(epoch, batches, &write_timeline, partition)
-                        {
+                        match client.submit_leased_group(
+                            epoch,
+                            batches,
+                            &write_timeline,
+                            partition,
+                            queued.is_empty(),
+                        ) {
                             Ok(super::tcp::LeasedSubmit::Submitted(id)) => {
                                 leased_replies.push_back((id, members));
                                 if position.is_none() {
@@ -5762,6 +5776,7 @@ impl ClientWorker {
                                     merged,
                                     &write_timeline,
                                     partition,
+                                    queued.is_empty(),
                                 ) {
                                     Ok(super::tcp::LeasedSubmit::Submitted(id)) => {
                                         leased_replies.push_back((id, members));

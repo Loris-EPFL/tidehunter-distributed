@@ -54,7 +54,7 @@ def _row(case, export):
     mode = job.get('live_write_mode')
     live_ack = {
         ('leased', 'native'): 'leased extent: page-cache write',
-        ('leased', 'synchronous'): 'leased extent: FUA data sync; owner frontier root asynchronous',
+        ('leased', 'synchronous'): 'synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous',
         ('reserved', 'native'): 'reserved frame: owner validated page-cache write',
         ('reserved', 'synchronous'): 'reserved frame: owner WAL and frontier root synchronized',
     }.get((mode, tier))
@@ -94,8 +94,15 @@ def _row(case, export):
         if job['backend'] == 'tidehunter_nvme_rdma':
             if live.get('write_mode') != job.get('live_write_mode'):
                 reasons.append('executed live write mode differs or unavailable')
-            if live_ack is None or live.get('acknowledgement_contract') != live_ack:
+            observed_ack = live.get('acknowledgement_contract')
+            # Archived per-frame-FUA binaries used this narrower, truthful label.
+            archived_fua = (mode == 'leased' and tier == 'synchronous'
+                            and job.get('live_leased_sync', 'per_frame_fua') == 'per_frame_fua'
+                            and observed_ack == 'leased extent: FUA data sync; owner frontier root asynchronous')
+            if live_ack is None or (observed_ack != live_ack and not archived_fua):
                 reasons.append('executed acknowledgement contract differs or unavailable')
+            elif job['group'] != 'G17R':
+                row['acknowledgement_contract'] = observed_ack
             if job['group'] == 'G17R' and live.get('inline_reads') is not job.get('live_inline_reads'):
                 reasons.append('executed inline setting differs or unavailable')
         elif job['backend'] == 'tidehunter_verbs_native':

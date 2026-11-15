@@ -930,6 +930,7 @@ fn live_frame_can_fill_one_fragment() {
         host_id: [1; 16],
         owner_identities: Default::default(),
         leased_write_window: Some(4),
+        leased_sync: Default::default(),
         max_inflight_requests: 8,
         max_inflight_bytes: 64 * 1024,
         connect_timeout_ms: 1000,

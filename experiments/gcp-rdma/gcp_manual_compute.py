@@ -98,7 +98,7 @@ class Compute:
         self.config, self.state, self.state_path, self.execute = config, state, state_path, execute
         self._cleanup_until = None
         if (config.get('project_id') != PROJECT or config.get('service_account') != GUEST_SERVICE_ACCOUNT
-                or config.get('machine_type') != 'z4m-highmem-16' or config.get('max_distance') != 3):
+                or config.get('machine_type', 'z4m-highmem-16') not in {'z4m-highmem-16', 'z4m-highmem-32'} or config.get('max_distance') != 3):
             raise ValueError('unreviewed Compute configuration')
         if not re.fullmatch(r'bench-[0-9a-f]{16}', state.get('run_id', '')):
             raise ValueError('invalid run identity')
@@ -349,7 +349,7 @@ class Compute:
             raise ComputeError('instance identity or DELETE expiry mismatch')
         spec = rec.get('launch_spec', {})
         if (spec.get('deadline') != self.state['deadline'] or spec.get('policy') != self.state['policy']['name']
-                or spec.get('machine_type') != 'z4m-highmem-16'):
+                or spec.get('machine_type', 'z4m-highmem-16') != self.config.get('machine_type', 'z4m-highmem-16')):
             raise ComputeError('persisted launch specification mismatch')
         scheduling = vm.get('scheduling', {})
         if scheduling.get('onHostMaintenance') != 'TERMINATE' or scheduling.get('automaticRestart') is not False:

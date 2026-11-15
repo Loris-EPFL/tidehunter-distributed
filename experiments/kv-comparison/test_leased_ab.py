@@ -29,7 +29,7 @@ class LeasedAnalysisTests(unittest.TestCase):
         case = {'case_id': job['case_id'], 'job': job, 'status': 'completed', 'metrics': {'success_calls_per_second': 1, 'measurement_timeline': {'mean_observed_api_concurrency': 1}}}
         self.cases.append(case)
         result = self.export / 'cases' / job['case_id'] / 'result'; result.mkdir(parents=True)
-        ack = {('leased', 'synchronous'): 'leased extent: FUA data sync; owner frontier root asynchronous',
+        ack = {('leased', 'synchronous'): 'synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous',
                ('leased', 'native'): 'leased extent: page-cache write',
                ('reserved', 'synchronous'): 'reserved frame: owner WAL and frontier root synchronized',
                ('reserved', 'native'): 'reserved frame: owner validated page-cache write'}
@@ -51,6 +51,20 @@ class LeasedAnalysisTests(unittest.TestCase):
     def publish(self, selection='leased_ab_compact'):
         (self.export / 'matrix.json').write_text(json.dumps({'spec': {'selection': selection}, 'jobs': self.jobs}))
         (self.report / 'comparison.json').write_text(json.dumps({'cases': self.cases}))
+
+    def test_archived_fua_contract_replay_preserves_executed_label(self):
+        old = 'leased extent: FUA data sync; owner frontier root asynchronous'
+        for sync, label in (('per_frame_fua', old), ('group_flush', old),
+                            ('per_frame_fua', 'wrong contract')):
+            result = self.add(0, live_leased_sync=sync)
+            path = result / 'manifest.json'
+            data = json.loads(path.read_text())
+            data['backend_info']['configuration']['live_write']['acknowledgement_contract'] = label
+            path.write_text(json.dumps(data))
+        self.publish()
+        rows = leased_ab.generate(self.export, self.report, self.out)
+        self.assertEqual([row['status'] for row in rows], ['completed', 'failed', 'failed'])
+        self.assertEqual(rows[0]['acknowledgement_contract'], old)
 
     def test_repetitions_and_unavailable(self):
         self.add(0); self.add(1); self.publish()

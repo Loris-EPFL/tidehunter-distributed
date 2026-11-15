@@ -93,7 +93,7 @@ class RiskOrderTests(unittest.TestCase):
             risk_order.validate_order(jobs, order)
     def test_nvmeof_path_preserves_canaries_and_group_order(self):
         for selection in risk_order.cloud_campaign.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
             with self.subTest(selection=selection):
                 jobs = risk_order.cloud_campaign.make_focused_matrix(selection)
                 self.assertEqual(len(jobs), expected_count)
@@ -103,6 +103,8 @@ class RiskOrderTests(unittest.TestCase):
                     self.assertEqual(order['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 if selection == 'nvmeof_single_caller':
                     self.assertEqual(order['matrix_sha256'], risk_order.SINGLE_CALLER_MATRIX_SHA256)
+                if selection == 'nvmeof_f6':
+                    self.assertEqual(order['matrix_sha256'], risk_order.F6_MATRIX_SHA256)
                 self.assertEqual(order['case_ids'][:12], original[:12])
                 self.assertEqual(order['case_ids'], original)
                 for left, right in ((0, 1), (min(12, len(jobs)//2), min(13, len(jobs)//2+1)), (len(jobs) - 2, len(jobs) - 1)):
@@ -111,6 +113,12 @@ class RiskOrderTests(unittest.TestCase):
                         changed['case_ids'][right], changed['case_ids'][left])
                     with self.subTest(left=left, right=right), self.assertRaisesRegex(ValueError, 'reviewed matrix'):
                         risk_order.validate_order(jobs, changed)
+
+    def test_f6_rejects_self_consistent_but_unreviewed_content(self):
+        jobs = risk_order.cloud_campaign.make_focused_matrix('nvmeof_f6')
+        jobs[0]['live_polled_writes'] = True
+        with self.assertRaisesRegex(ValueError, 'F6 matrix differs'):
+            risk_order.validate_order(jobs, {})
 
 
     def test_fair_native_canary_cannot_move(self):

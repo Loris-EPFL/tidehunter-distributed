@@ -47,6 +47,61 @@ fn worker_with_failure_context(
 }
 
 #[test]
+fn leased_worker_group_flush_replies_and_checkpoint_cover_the_durable_prefix() {
+    let fixture = Fixture::new(DurabilityTier::Synchronous, 64 * 1024);
+    fixture
+        .node
+        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
+    let mut client = fixture.writer();
+    client.leased_test_group_flush();
+    client.leased_test_set_window(4);
+    client.leased_test_single_batch_groups();
+    client.leased_test_hold_completions(&[1, 2, 3, 4]);
+    let (worker, failure) = worker(&fixture, client);
+    let guard = worker.client.lock();
+    let replies: Vec<_> = (0..8)
+        .map(|sequence| worker.append(1, vec![fixture.batch(sequence)]).unwrap())
+        .collect();
+    drop(guard);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.metrics.snapshot().counts.max_leased_in_flight < 4 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    for reply in &replies {
+        assert!(matches!(reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+    worker.client.lock().leased_test_release_held();
+    for (sequence, reply) in replies.into_iter().enumerate() {
+        let receipt = reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()[0];
+        assert_eq!(
+            receipt.appended().version(),
+            fixture.batch(sequence as u64).version()
+        );
+    }
+    let counts = fixture.metrics.snapshot().counts;
+    assert_eq!(counts.leased_frames, 8);
+    assert!(counts.leased_flushes > 0);
+    assert_eq!(counts.leased_flushes, counts.leased_flush_samples);
+    assert_eq!(counts.fua_writes + counts.leased_flush_covered_frames, 8);
+    let (reply, checkpoint) = mpsc::sync_channel(1);
+    worker.send(Command::Checkpoint(1, 1, 8, reply)).unwrap();
+    assert_eq!(
+        checkpoint
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .prefix,
+        8
+    );
+    let written = worker.client.lock().leased_test_frontier().0;
+    assert!(fixture.node.log_for_test(1).synced_frontier() >= written);
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
 fn leased_worker_merges_ready_appends_and_splits_receipts_in_order() {
     let fixture = Fixture::new(DurabilityTier::Synchronous, 16384);
     let mut writer = fixture.writer();
@@ -669,6 +724,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             preparation_workers: 1,
             scan_prefetch_pages: 1,
             read_lanes: 1,
+            pin_read_lanes: false,
             max_pending_reads: 4,
             max_pending_read_bytes: 128 * 1024,
             write_profile_limit: 0,
@@ -679,6 +735,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 host_id: [1; 16],
                 owner_identities: Default::default(),
                 leased_write_window: Some(1),
+                leased_sync: Default::default(),
                 max_inflight_requests: 4,
                 max_inflight_bytes: 128 * 1024,
                 connect_timeout_ms: 1000,

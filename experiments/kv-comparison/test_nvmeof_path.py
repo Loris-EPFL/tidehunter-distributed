@@ -8,6 +8,22 @@ import nvmeof_path as analysis
 
 
 class NvmeofPathTests(unittest.TestCase):
+    def test_owner_cpu_summary_keeps_unavailable_distinct(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G29R', selection='nvmeof_f6', op='read')
+        path = directory.parent / 'owner-cpu.json'
+        for available in (True, False):
+            path.write_text(json.dumps({'available': available, 'summary': {
+                'max_busy_pct': 95, 'mean_busy_pct': 72.5, 'max_softirq_pct': 10, 'cpus_above_90_busy': 1}}))
+            row = analysis.result_row(self.cases[0], self.export)
+            self.assertEqual([row[column] for column in analysis.CPU_COLUMNS],
+                             [95, 72.5, 10, 1] if available else [None] * 4)
+        path.unlink()
+        self.assertTrue(all(analysis.result_row(self.cases[0], self.export)[column] is None
+                            for column in analysis.CPU_COLUMNS))
+        self.generate()
+        with (self.output / 'reads.csv').open() as stream:
+            self.assertEqual(next(csv.DictReader(stream))['group'], 'G29R')
+
     def test_crossing2_report_keeps_contracts_separate(self):
         for selection, tier in (('nvmeof_contracts_crossing', 'synchronous'),
                                 ('nvmeof_contracts_crossing2', 'native')):

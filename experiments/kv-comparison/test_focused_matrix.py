@@ -186,6 +186,47 @@ class FocusedMatrixTests(unittest.TestCase):
                          {(s, c, n, r) for s in (1024, 65536) for c in (False, True)
                           for n in (1, 16, 64) for r in (0, 1)})
 
+
+    def test_f6_exact_reviewed_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_f6")
+        self.assertEqual(Counter(j["group"] for j in jobs),
+                         {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4})
+        self.assertEqual(len({j["case_id"] for j in jobs}), 42)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                         "1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7")
+        self.assertEqual([j["case_id"] for j in jobs[:3]],
+                         ["G29W-r0-f144fdde700a84ff476f", "G29W-r0-144fada772a94de658da",
+                          "G29W-r0-ee6fb75b39a6e5b14665"])
+        self.assertEqual(campaign.NVMEOF_F6_WRITE_LANES, [])
+        for job in jobs:
+            campaign.validate_focused_job(job)
+            self.assertEqual(set(job["mix"]), set(campaign.MIX_FIELDS))
+            self.assertEqual(job["durability_tier"], "synchronous")
+            self.assertFalse(job["live_polled_writes"])
+            self.assertFalse("diagnostics" in job and job["diagnostics"] is None)
+            fields = {k: v for k, v in job.items() if k != "case_id"}
+            identity = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+            self.assertEqual(job["case_id"], f'{job["group"]}-r{job["repeat"]}-{identity}')
+            if job["group"] == "G29W":
+                self.assertEqual(bool(job.get("diagnostics")), job["value_size"] == 65536 and job["repeat"] == 0)
+                self.assertIn(job["repeat"], (0,) if job["concurrency"] == 1 else (0, 1))
+            if job["group"] == "G29R":
+                self.assertEqual((job["read_lanes"], job["live_io_queues"], job["live_io_queue_size"]), (4, 4, 128))
+                self.assertTrue(job["owner_trace"])
+                self.assertFalse(job["drop_os_caches"])
+            if job["group"] == "G24M":
+                self.assertEqual(job["mix"]["missing_read"], 0)
+                self.assertFalse(job["warmup_key_sweep"])
+        writes = [j for j in jobs if j["group"] == "G29W"]
+        self.assertEqual({(j["concurrency"], j["value_size"], j["live_leased_sync"], j["repeat"]) for j in writes},
+                         {(c, s, sync, r) for c in (1, 16, 64) for s in (1024, 65536)
+                          for sync in ("per_frame_fua", "group_flush") for r in ((0,) if c == 1 else (0, 1))})
+        self.assertEqual({(j["concurrency"], j["live_pin_read_lanes"], j["repeat"])
+                          for j in jobs if j["group"] == "G29R"},
+                         {(c, p, r) for c in (16, 64) for p in (False, True) for r in (0, 1)})
+        self.assertEqual({(j["value_size"], j["live_io_queues"], j["live_io_queue_size"])
+                          for j in jobs if j["group"] == "G29G"},
+                         {(s, q, d) for s in (1024, 65536) for q, d in ((1, 32), (4, 128))})
     def test_single_caller_exact_reviewed_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_single_caller")
         self.assertEqual(len(jobs), 20)
@@ -439,7 +480,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}

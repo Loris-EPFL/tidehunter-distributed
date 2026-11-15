@@ -51,7 +51,7 @@ class FocusedValkeyQualificationTests(unittest.TestCase):
         campaign = cloud_controller.cloud_campaign
         jobs = [job for job in campaign.make_focused_matrix('valkey_rdma_reads') if job['group'] == 'G25A']
         contracts = {
-            ('leased', 'synchronous'): 'leased extent: FUA data sync; owner frontier root asynchronous',
+            ('leased', 'synchronous'): 'synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous',
             ('leased', 'native'): 'leased extent: page-cache write',
             ('reserved', 'synchronous'): 'reserved frame: owner WAL and frontier root synchronized',
             ('reserved', 'native'): 'reserved frame: owner validated page-cache write',

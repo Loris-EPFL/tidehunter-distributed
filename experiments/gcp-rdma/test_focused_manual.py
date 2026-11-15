@@ -159,13 +159,18 @@ class FocusedAdmissionTest(unittest.TestCase):
 
     def test_nvmeof_path_exact_spec(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
             with self.subTest(selection=selection):
                 spec = copy.deepcopy(manual.REVIEWED_SPECS[selection])
                 if selection == 'nvmeof_parallel_writes':
                     self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 if selection == 'nvmeof_single_caller':
                     self.assertEqual(spec['matrix_sha256'], '294b50957b21d6acafadcf1b682c71d1b424524a144ecd6c2c18e2b1cc40fd4e')
+                if selection == 'nvmeof_f6':
+                    self.assertEqual(spec['matrix_sha256'], '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7')
+                    self.assertEqual(spec['machine_type'], 'z4m-highmem-16')
+                    with self.assertRaises(ValueError):
+                        manual._reviewed_jobs({**spec, 'machine_type': 'z4m-highmem-32'})
                 jobs = manual._reviewed_jobs(spec)
                 self.assertEqual(len(jobs), expected_count)
                 self.assertEqual(spec['max_cases'], expected_count)

@@ -9,6 +9,7 @@ import cloud_campaign
 
 PARALLEL_WRITES_MATRIX_SHA256 = '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4'
 SINGLE_CALLER_MATRIX_SHA256 = '294b50957b21d6acafadcf1b682c71d1b424524a144ecd6c2c18e2b1cc40fd4e'
+F6_MATRIX_SHA256 = '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7'
 READS_GEOMETRY_MATRIX_SHA256 = 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea'
 READS_REST_MATRIX_SHA256 = 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935'
 READS_REST2_MATRIX_SHA256 = 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4'
@@ -32,6 +33,9 @@ def validate_order(jobs, document):
     if (jobs and jobs[0].get('selection') == 'nvmeof_single_caller'
             and digest != SINGLE_CALLER_MATRIX_SHA256):
         raise ValueError('single-caller matrix differs from the reviewed digest')
+    if (jobs and jobs[0].get('selection') == 'nvmeof_f6'
+            and digest != F6_MATRIX_SHA256):
+        raise ValueError('F6 matrix differs from the reviewed digest')
     if (jobs and jobs[0].get('selection') == 'nvmeof_reads_geometry'
             and digest != READS_GEOMETRY_MATRIX_SHA256):
         raise ValueError('read geometry matrix differs from the reviewed digest')

@@ -1703,6 +1703,9 @@ def admit_prepared_live_client(live_client, prep, tier):
     for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
+    for key, default in (("leased_sync", "per_frame_fua"),):
+        if key in live_client or key in prep:
+            expected[key] = prep.get(key, default)
     if live_client != expected:
         raise SafetyError("prepared live client differs from admitted configuration")
     return host_nqn
@@ -2078,9 +2081,11 @@ def store_owner_ftrace(directory, traces):
             continue  # all_hosts starts with the coordinator.
         trace = dict(trace)
         text = trace.pop("trace", "")
+        cpu = trace.pop("cpu_samples", {"available": False, "reason": "owner CPU samples unavailable"})
         target = Path(directory) if index == 1 else Path(directory) / "owner-ftrace" / f"node-{index - 1}"
         target.mkdir(parents=True, exist_ok=True)
         (target / "owner-ftrace.txt").write_text(text)
+        dump(target / "owner-cpu.json", cpu)
         dump(target / "owner-ftrace.json", trace)
 
 
@@ -2669,7 +2674,9 @@ def guest_operation(config, request, clients, *, local_mode=None):
         state_path = capsule_root / "owner-ftrace-state.json"
         instance = Path("/sys/kernel/tracing/instances") / ("th-" + case)
         if action == "owner_ftrace_start":
-            instance = owner_ftrace.start(case)
+            duration = min(owner_ftrace.CPU_MAX_SAMPLES,
+                           (timestamp(config["deadline_utc"]) - utc()).total_seconds())
+            instance = owner_ftrace.start(case, cpu_directory=capsule_root, duration_seconds=duration)
             state = owner_ftrace.START_STATES.pop(str(instance))
             dump(state_path, state)
             return state
@@ -2677,6 +2684,10 @@ def guest_operation(config, request, clients, *, local_mode=None):
         result = owner_ftrace.stop(instance, capsule_root, state)
         result["trace"] = ((capsule_root / "owner-ftrace.txt").read_text(errors="replace")
                            if (capsule_root / "owner-ftrace.txt").exists() else "")
+        cpu_path = capsule_root / "owner-cpu.json"
+        result["cpu_samples"] = (json.loads(cpu_path.read_text())
+                                 if cpu_path.exists() and cpu_path.stat().st_size <= owner_ftrace.CPU_MAX_BYTES
+                                 else {"available": False, "reason": "owner CPU artifact unavailable or exceeds bound"})
         return result
     if action in ("cold_trace_start", "cold_trace_stop"):
         if index < 0:
@@ -3383,9 +3394,14 @@ class Controller:
                                        lease_ahead=job.get("live_lease_ahead", True),
                                        polled_writes=job.get("live_polled_writes", False),
                                        leased_write_window=job.get("live_leased_write_window"),
-                                       queue_geometry={"io_queues": job.get("live_io_queues", 1),
-                                                       "queue_size": job.get("live_io_queue_size", 32),
+                                       queue_geometry={"io_queues": job.get("live_io_queues", 4),
+                                                       "queue_size": job.get("live_io_queue_size", 128),
                                                        "poll_queues": job.get("live_poll_queues", 0)})
+            for key in ("leased_sync", "leased_write_lanes"):
+                if "live_" + key in job:
+                    prep["live_nvmeof"][key] = job["live_" + key]
+        if "live_pin_read_lanes" in job:
+            prep["pin_read_lanes"] = job["live_pin_read_lanes"]
         if "sealed_dataset" in job:
             # Preparation and each planned reader consume one retained epoch.
             source = job["sealed_dataset"]["source_id"]
@@ -3428,6 +3444,9 @@ class Controller:
             raise SafetyError("unexpected live client in non-live campaign case")
         if "read_lanes" in job:
             remote["read_lanes"] = job["read_lanes"]
+        if "live_pin_read_lanes" in job:
+            if remote.get("pin_read_lanes") != job["live_pin_read_lanes"]:
+                raise SafetyError("prepared coordinator read pinning differs from planned case")
         # The typed remote config references guest_root on the coordinator too.
         # Stage just its client identity there without rebasing engine serde.
         for field in ("ca", "cert", "key"):
@@ -3703,6 +3722,10 @@ class Controller:
         options = copy.deepcopy(self.shared_tide["options"])
         options["evidence"] = str(directory / "read-evidence")
         options["external_remote_config"]["read_lanes"] = job["read_lanes"]
+        if "live_pin_read_lanes" in job:
+            options["external_remote_config"]["pin_read_lanes"] = job["live_pin_read_lanes"]
+        else:
+            options["external_remote_config"].pop("pin_read_lanes", None)
         return options
 
     def connect_nvme(self, job, directory):

@@ -35,7 +35,7 @@ pub use super::nvmeof::{LiveExportMode, LiveQueueGeometry};
 pub(crate) use live_client::leased_tests;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) use live_client::{LeasedSubmit, LiveGroupBudget};
-pub use live_client::{LiveClientConfig, LiveInitiatorIdentity, LiveWriteMode};
+pub use live_client::{LeasedSync, LiveClientConfig, LiveInitiatorIdentity, LiveWriteMode};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_control;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

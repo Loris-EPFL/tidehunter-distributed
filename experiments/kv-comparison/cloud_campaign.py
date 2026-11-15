@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
 
 
 
@@ -723,6 +723,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35,
                   "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "nvmeof_single_caller": 20, "valkey_rdma_reads": 22,
                   "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20, "nvmeof_reads_geometry_rest2": 18}
+FOCUSED_COUNTS["nvmeof_f6"] = 42
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -730,7 +731,8 @@ NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route
                                 "live_io_queues", "live_io_queue_size", "live_poll_queues",
                                 "live_lease_ahead", "live_polled_writes")
 NVMEOF_PATH_OPTIONAL_LIVE_SETTING_KEYS = ("live_leased_write_window", "live_max_inflight_requests",
-                                        "coordinator_read_memory_allowance_bytes")
+                                        "coordinator_read_memory_allowance_bytes", "live_leased_sync",
+                                        "live_pin_read_lanes", "live_leased_write_lanes")
 NVMEOF_PATH_SETTING_KEYS = {
     "native": NVMEOF_PATH_NATIVE_SETTING_KEYS,
     "tidehunter_verbs_native": NVMEOF_PATH_REMOTE_SETTING_KEYS,
@@ -767,6 +769,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_contracts_crossing2": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 2},
     "nvmeof_parallel_writes": {"G23W": 32, "G23X": 6, "G23N": 6},
     "nvmeof_single_caller": {"G28W": 8, "G28C": 8, "G28N": 4},
+    "nvmeof_f6": {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -1795,6 +1798,58 @@ def _nvmeof_single_caller(path):
     return result
 
 
+# Kept separate until the write-lane experiment authorizes an arm.
+NVMEOF_F6_WRITE_LANES = []
+
+
+def _nvmeof_f6(path):
+    """Compare opt-in sync and CPU placement on the reviewed -16 fleet."""
+    sources = _nvmeof_contracts_crossing2(path)
+    result = []
+    selection = "nvmeof_f6"
+    for concurrency in (1, 16, 64):
+        for size in (1024, 65536):
+            source = _clone_source(sources, "G21W", "tidehunter_nvme_rdma", size, 16,
+                                   durability_tier="synchronous", diagnostics=None,
+                                   measurement_operations=4096)
+            for sync in ("per_frame_fua", "group_flush"):
+                for repeat in range(1 if concurrency == 1 else 2):
+                    _clone_job(result, selection, source, "G29W", concurrency=concurrency,
+                               read_lanes=1 if concurrency == 1 else 4, repeat=repeat,
+                               live_leased_sync=sync, live_polled_writes=False,
+                               **({"diagnostics": {"write_timeline_limit": 4096}}
+                                  if size == 65536 and repeat == 0 else {}))
+    for source in _nvmeof_parallel_writes(path):
+        if source["group"] == "G23X" and source["durability_tier"] == "synchronous":
+            for sync in ("per_frame_fua", "group_flush"):
+                _clone_job(result, selection, source, "G29X", live_leased_sync=sync,
+                           live_polled_writes=False)
+    reads = _nvmeof_contracts(path)
+    source = _clone_source(reads, "G21R", "tidehunter_nvme_rdma", 1024, 16,
+                           operation="read", drop_os_caches=False)
+    for concurrency in (16, 64):
+        for pinned in (False, True):
+            for repeat in (0, 1):
+                _clone_job(result, selection, source, "G29R", concurrency=concurrency,
+                           repeat=repeat, read_lanes=4, live_io_queues=4, live_io_queue_size=128,
+                           live_pin_read_lanes=pinned, live_max_inflight_requests=128,
+                           durability_tier="synchronous", live_polled_writes=False, owner_trace=True)
+    for size in (1024, 65536):
+        source = _clone_source(reads, "G21R", "tidehunter_nvme_rdma", size, 16,
+                               operation="read", drop_os_caches=False)
+        for queues, depth in ((1, 32), (4, 128)):
+            _clone_job(result, selection, source, "G29G", read_lanes=4,
+                       live_io_queues=queues, live_io_queue_size=depth,
+                       live_max_inflight_requests=128, durability_tier="synchronous",
+                       live_polled_writes=False)
+    for source in _nvmeof_reads_geometry(path):
+        if source["group"] == "G24M":
+            for repeat in (0, 1):
+                _clone_job(result, selection, source, "G24M", repeat=repeat,
+                           warmup_key_sweep=False, live_polled_writes=False)
+    return result
+
+
 def _nvmeof_first_put(sources):
     """Keep the reviewed first-put checks in their canary-first order."""
     result = []
@@ -2015,6 +2070,8 @@ def make_focused_matrix(selection):
             return _nvmeof_parallel_writes(path)
         if selection == "nvmeof_single_caller":
             return _nvmeof_single_caller(path)
+        if selection == "nvmeof_f6":
+            return _nvmeof_f6(path)
         if selection == "nvmeof_contracts_crossing2":
             return _nvmeof_contracts_crossing2(path)
         if selection == "nvmeof_contracts_crossing":
@@ -2456,6 +2513,10 @@ LIVE_NVME_COUNTERS = ("completed_read_ops", "completed_read_bytes", "completed_w
                       "frontier_namespace_ns", "frontier_namespace_samples",
                       "route_evidence_dropped", "fence_evidence_dropped")
 
+# Each exchange increments metadata_requests at the same submission site.
+WRITE_METADATA_EXCHANGES = ("adoption_async_exchanges", "adoption_sync_exchanges",
+                            "lease_exchanges", "reserve_exchanges", "complete_exchanges")
+
 
 def qualify_live_nvme_measurement(evidence, job):
     """Validate deltas against raw boundaries; a requested route alone is not proof."""
@@ -2492,23 +2553,38 @@ def qualify_live_nvme_measurement(evidence, job):
                 reasons.append(f"invalid live NVMe counter {name}")
     if job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         names = ("reserve_exchanges", "complete_exchanges", "leased_frames", "leased_skip_markers", "fua_writes")
+        if job.get("live_leased_sync") == "group_flush":
+            names += ("leased_flushes", "leased_flush_covered_frames")
+        if job.get("group") == "G29R" and job.get("live_pin_read_lanes"):
+            names += ("read_lane_pin_failures",)
         for name in names:
             a, b, value = start.get(name), end.get(name), counters.get(name)
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G24W", "G24M") and any(
+        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G29W", "G29X", "G24W", "G24M") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
             if job["live_write_mode"] == "leased":
                 if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
                     reasons.append("leased write exchanges or frame count differ")
-                expected_fua = (counters["leased_frames"] + counters["leased_skip_markers"]
-                                if job["durability_tier"] == "synchronous" else 0)
-                if counters["fua_writes"] != expected_fua:
-                    reasons.append("leased FUA count differs from frames and skip markers")
+                if job.get("live_leased_sync", "per_frame_fua") == "group_flush":
+                    if counters["fua_writes"] > counters["leased_frames"]:
+                        reasons.append("group flush FUA count exceeds frames")
+                    if job["concurrency"] in (16, 64) and (
+                            counters["leased_flushes"] <= 0
+                            or counters["leased_flush_covered_frames"] <= counters["leased_flushes"]):
+                        reasons.append("group flush did not cover shared frames")
+                else:
+                    expected_fua = (counters["leased_frames"] + counters["leased_skip_markers"]
+                                    if job["durability_tier"] == "synchronous" else 0)
+                    if counters["fua_writes"] != expected_fua:
+                        reasons.append("leased FUA count differs from frames and skip markers")
             elif counters["leased_frames"]:
                 reasons.append("reserved write observed leased frames")
-        if (job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R", "G24R", "G24Q", "G24L", "G24P", "G24S", "G24C", "G24M", "G25A")
+        if (job.get("group") == "G29R" and job.get("live_pin_read_lanes")
+                and counters.get("read_lane_pin_failures") != 0):
+            reasons.append("read lane pin failures observed")
+        if (job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R", "G24R", "G24Q", "G24L", "G24P", "G24S", "G24C", "G24M", "G25A", "G29R", "G29G")
                 and job["backend"] == "tidehunter_nvme_rdma" and job["mix"]["read"] > 0):
             coordinator = (data.get("deltas") or {}).get("coordinator") or {}
             value = (coordinator.get("counters") or {}).get("read_profile_live_inline")
@@ -2530,7 +2606,29 @@ def qualify_live_nvme_measurement(evidence, job):
         if counters["namespace_connects"] > 1:
             reasons.append("permanent export made more than one controller connect")
         if any(job.get("mix", {}).get(name, 0) for name in ("read", "get_many")):
-            if counters["metadata_requests"] > job["read_lanes"] + 1:
+            mixed_puts = any(job.get("mix", {}).get(name, 0) for name in ("put", "put_batch"))
+            metadata_bound = job["read_lanes"] + 1
+            read_metadata = counters["metadata_requests"]
+            if mixed_puts:
+                valid = True
+                for name in ("extents_leased", *WRITE_METADATA_EXCHANGES):
+                    a, b, value = start.get(name), end.get(name), counters.get(name)
+                    if (type(a) is not int or type(b) is not int or type(value) is not int
+                            or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
+                        reasons.append("invalid live NVMe counter " + name)
+                        valid = False
+                if valid:
+                    metadata_bound += job["read_lanes"] * counters["extents_leased"]
+                    read_metadata -= sum(counters[name] for name in WRITE_METADATA_EXCHANGES)
+                coordinator = (data.get("deltas") or {}).get("coordinator") or {}
+                a = ((data.get("start") or {}).get("coordinator") or {}).get("read_rpc_count")
+                b = ((data.get("end") or {}).get("coordinator") or {}).get("read_rpc_count")
+                value = (coordinator.get("counters") or {}).get("read_rpc_count")
+                if (coordinator.get("available") is not True or type(a) is not int
+                        or type(b) is not int or type(value) is not int
+                        or a < 0 or b < a or value != b - a or value != 0):
+                    reasons.append("mixed workload coordinator read RPC evidence differs")
+            if read_metadata < 0 or read_metadata > metadata_bound:
                 reasons.append("permanent export sent owner requests for reads")
     mix = job.get("mix", {})
     if any(mix.get(name, 0) for name in ("put", "put_batch", "delete")):
@@ -2558,6 +2656,18 @@ def qualify_live_nvme_measurement(evidence, job):
 
 
 def admit_live_write_contract(job, backend_info):
+    if "live_leased_sync" in job and job["live_leased_sync"] not in ("per_frame_fua", "group_flush"):
+        raise ValueError("invalid live_leased_sync")
+    if "live_pin_read_lanes" in job and type(job["live_pin_read_lanes"]) is not bool:
+        raise ValueError("invalid live_pin_read_lanes")
+    if "live_leased_write_lanes" in job and (
+            type(job["live_leased_write_lanes"]) is not int or not 1 <= job["live_leased_write_lanes"] <= 4):
+        raise ValueError("invalid live_leased_write_lanes")
+    configuration = backend_info.get("configuration", {})
+    for key, actual in (("live_leased_sync", configuration.get("live_leased_sync")),
+                        ("live_pin_read_lanes", configuration.get("client", {}).get("pin_read_lanes"))):
+        if key in job and actual != job[key]:
+            raise ValueError(key + " differs")
     if job.get("selection") not in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) or job.get("nvmeof_route") != "live":
         return
     if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
@@ -2569,7 +2679,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")
@@ -2589,7 +2699,7 @@ def admit_live_write_contract(job, backend_info):
     mode, tier = job["live_write_mode"], job["durability_tier"]
     expected = {
         ("leased", "native"): "leased extent: page-cache write",
-        ("leased", "synchronous"): "leased extent: FUA data sync; owner frontier root asynchronous",
+        ("leased", "synchronous"): "synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous",
         ("reserved", "native"): "reserved frame: owner validated page-cache write",
         ("reserved", "synchronous"): "reserved frame: owner WAL and frontier root synchronized",
     }[(mode, tier)]

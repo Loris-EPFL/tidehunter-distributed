@@ -53,6 +53,7 @@ pub enum LiveWriteSync {
 #[derive(Debug)]
 pub enum LiveIoResult {
     Written,
+    Flushed,
     /// Member slices of aligned I/O blocks, in request order. A block returns to
     /// the queue's pool only after every slice and clone of it dropped; long-term
     /// retention of a slice keeps its whole block (at least one device block)
@@ -66,7 +67,7 @@ pub struct LiveCompletion {
     pub result: Result<LiveIoResult, LiveIoError>,
 }
 
-/// Times are cumulative nanoseconds. A barrier is never issued by this queue.
+/// Times are cumulative nanoseconds. Namespace flushes use barrier counters.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct LiveIoStats {
     pub read_requests: u64,
@@ -289,6 +290,7 @@ struct Request {
     remaining: usize,
     records: Vec<Option<Bytes>>,
     write: bool,
+    flush: bool,
     deadline: Instant,
     cancelled_at: Option<Instant>,
     error: Option<LiveIoError>,
@@ -531,7 +533,11 @@ impl LiveIo {
         reads
             .iter()
             .try_fold(0usize, |total, read| {
-                total.checked_add(read.len.checked_add(slack)?)
+                total.checked_add(if read.len == 0 {
+                    0
+                } else {
+                    read.len.checked_add(slack)?
+                })
             })
             .ok_or(LiveIoError::Invalid("request charge overflow"))
     }
@@ -735,6 +741,34 @@ impl LiveIo {
             None,
         )
     }
+    /// Flush all writes completed before admission on this namespace. A flush
+    /// owns one slot and no DMA buffer until its terminal CQE; an uncertain
+    /// completion has the same unknown-outcome class as a data-sync write.
+    pub(crate) fn submit_flush(&mut self, id: u64, deadline: Instant) -> Result<u64, LiveIoError> {
+        if self.namespace.access != LiveNamespaceAccess::ReadWrite {
+            return Err(LiveIoError::Invalid("namespace is read only"));
+        }
+        // Only flush admission passes a zero-length operation to `submit`.
+        match self.submit(
+            self.namespace.file.as_raw_fd(),
+            id,
+            smallvec::smallvec![PlannedRead {
+                offset: 0,
+                len: 0,
+                members: SmallVec::new(),
+            }],
+            Some((WriteData::Borrowed(&[]), LiveWriteSync::None)),
+            deadline,
+            None,
+        )? {
+            LiveSubmitOutcome::Submitted => {
+                // Submit before the worker waits on its CQE eventfd.
+                let _ = self.flush_submissions();
+                Ok(id)
+            }
+            LiveSubmitOutcome::Full => Err(LiveIoError::Full),
+        }
+    }
     pub fn submit_reads(
         &mut self,
         id: u64,
@@ -807,6 +841,7 @@ impl LiveIo {
         let members: usize = ranges.iter().map(|read| read.members.len()).sum();
         let read_bytes: u64 = ranges.iter().map(|read| read.len as u64).sum();
         let operations = ranges.len();
+        let flush = data.is_some() && read_bytes == 0;
         // Scalar reads and writes keep all transient SQE metadata inline.
         let mut entries = SmallVec::<[io_uring::squeue::Entry; 1]>::with_capacity(ranges.len());
         let mut prepared = SmallVec::<[(u64, Operation); 1]>::with_capacity(ranges.len());
@@ -816,11 +851,19 @@ impl LiveIo {
                 len,
                 members,
             } = read;
-            let buffer = match data.as_mut() {
-                Some((WriteData::Owned(buffer), _)) => buffer
-                    .take()
-                    .ok_or(LiveIoError::Invalid("write buffer missing")),
-                _ => self.buffer(len),
+            let buffer = if flush {
+                Ok(Buffer {
+                    data: Vec::new(),
+                    start: 0,
+                    len: 0,
+                })
+            } else {
+                match data.as_mut() {
+                    Some((WriteData::Owned(buffer), _)) => buffer
+                        .take()
+                        .ok_or(LiveIoError::Invalid("write buffer missing")),
+                    _ => self.buffer(len),
+                }
             };
             let mut buffer = match buffer {
                 Ok(buffer) => buffer,
@@ -835,7 +878,11 @@ impl LiveIo {
                 buffer.slice_mut().copy_from_slice(data);
             }
             let token = self.next_token + index as u64;
-            let entry = if data.is_some() {
+            let entry = if flush {
+                opcode::Fsync::new(types::Fd(fd))
+                    .flags(types::FsyncFlags::DATASYNC)
+                    .build()
+            } else if data.is_some() {
                 opcode::Write::new(types::Fd(fd), buffer.ptr(), len as u32)
                     .offset(offset)
                     .rw_flags(if matches!(data, Some((_, LiveWriteSync::Data))) {
@@ -900,6 +947,7 @@ impl LiveIo {
                     (0..members).map(|_| None).collect()
                 },
                 write: data.is_some(),
+                flush,
                 deadline,
                 cancelled_at: None,
                 error: None,
@@ -910,7 +958,9 @@ impl LiveIo {
         self.used_bytes += charge;
         self.queued.extend(self.next_token..end);
         self.next_token = end;
-        if data.is_some() {
+        if flush {
+            self.stats.barrier_count += 1;
+        } else if data.is_some() {
             self.stats.write_requests += 1;
             self.stats.write_operations += operations as u64;
             self.stats.requested_write_bytes += read_bytes;
@@ -1138,11 +1188,14 @@ impl LiveIo {
             self.stats.completions += 1;
             if let Some(started) = submitted {
                 self.stats.submit_to_cq_ns += started.elapsed().as_nanos();
+                if req.flush {
+                    self.stats.barrier_ns += started.elapsed().as_nanos();
+                }
             }
             let complete = usize::try_from(result).is_ok_and(|n| n == buffer.len);
             if !complete {
                 self.stats.errors += 1;
-                if write {
+                if write && !req.flush {
                     if result < 0 {
                         eprintln!(
                             "live namespace write CQE failed: errno={}, error={}",
@@ -1167,6 +1220,8 @@ impl LiveIo {
                         ))
                     });
                 }
+            } else if req.flush {
+                // Fsync returns zero and transfers no bytes.
             } else if write {
                 self.stats.completed_write_bytes += buffer.len as u64;
                 self.stats.completed_write_ops += 1;
@@ -1186,7 +1241,7 @@ impl LiveIo {
                     req.records[member.index] =
                         Some(whole.slice(member.start..member.start + member.len));
                 }
-            } else {
+            } else if !req.flush {
                 self.pool.push(buffer);
             }
             req.remaining -= 1;
@@ -1210,6 +1265,8 @@ impl LiveIo {
                     Err(LiveIoError::Cancelled)
                 } else if timed_out {
                     Err(LiveIoError::Timeout)
+                } else if req.flush {
+                    Ok(LiveIoResult::Flushed)
                 } else if req.write {
                     Ok(LiveIoResult::Written)
                 } else {
@@ -1334,7 +1391,9 @@ mod tests {
                 assert_eq!(&records[0][..], &expected[20..84]);
             }
             Err(error) => unsupported(error),
-            Ok(LiveIoResult::Written) => panic!("polled read returned a write completion"),
+            Ok(LiveIoResult::Written | LiveIoResult::Flushed) => {
+                panic!("polled read returned a write completion")
+            }
         }
         assert_eq!(polled.outstanding(), 0);
         assert!(polled.shutdown().unwrap().is_empty());
@@ -2086,6 +2145,45 @@ mod tests {
         assert_eq!(io.pool.len(), 2);
         assert_eq!(io.allocated_bytes, 2 * 8191);
         assert_eq!(io.stats().copy_bytes_avoided, 0);
+    }
+
+    #[test]
+    fn namespace_flush_uses_one_slot_without_a_buffer_and_retires_unknown_outcomes() {
+        let (_dir, mut io) = fixture();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let before = io.credit();
+        let allocated = io.allocated_bytes;
+        let id = io.submit_flush(100, deadline).unwrap();
+        assert_eq!(id, 100);
+        assert_eq!(io.credit().0, before.0 - 1);
+        assert_eq!(io.credit().1, before.1);
+        assert_eq!(io.allocated_bytes, allocated);
+        assert!(matches!(
+            completion(&mut io).result,
+            Ok(LiveIoResult::Flushed)
+        ));
+        assert_eq!(io.credit(), before);
+        assert_eq!(io.stats().barrier_count, 1);
+        assert_eq!(io.stats().completed_write_ops, 0);
+        assert_eq!(io.stats().completed_read_ops, 0);
+        for (id, expire, cancel) in [(101, false, false), (102, true, false), (103, false, true)] {
+            if !expire && !cancel {
+                io.override_completion_result(id, -libc::EIO);
+            }
+            io.submit_flush(id, deadline).unwrap();
+            if expire {
+                io.requests.get_mut(&id).unwrap().deadline = Instant::now();
+            }
+            if cancel {
+                io.cancel(id);
+            }
+            assert!(matches!(
+                completion(&mut io).result,
+                Err(LiveIoError::UnknownWrite)
+            ));
+            assert_eq!(io.credit(), before);
+            assert_eq!(io.allocated_bytes, allocated);
+        }
     }
 
     #[test]

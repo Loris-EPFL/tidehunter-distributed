@@ -20,7 +20,7 @@ GUEST_PATH = '/opt/tidehunter-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbi
 
 # Google automatically attaches these NVMe Local SSDs for the machine type.
 # https://docs.cloud.google.com/compute/docs/disks/local-ssd#performance
-LOCAL_SSD_COUNTS = {'z4m-highmem-16': 1, 'h4d-highmem-192-lssd': 10}
+LOCAL_SSD_COUNTS = {'z4m-highmem-16': 1, 'z4m-highmem-32': 2, 'h4d-highmem-192-lssd': 10}
 
 
 class RuntimeSafetyError(RuntimeError):

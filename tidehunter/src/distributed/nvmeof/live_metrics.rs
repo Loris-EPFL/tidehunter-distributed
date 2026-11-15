@@ -117,6 +117,12 @@ counter_fields!(
     leased_worker_waits,
     /// Timed-out waits on the acknowledgement path: at least one leased frame in flight.
     leased_worker_wait_timeouts,
+    leased_flushes,
+    /// Flush submission to local CQE harvest; includes worker wake delay.
+    leased_flush_ns,
+    leased_flush_samples,
+    leased_flush_covered_frames,
+    read_lane_pin_failures,
     leased_bytes,
     leased_skip_markers,
     extents_leased,
@@ -326,6 +332,21 @@ impl LiveNvmeCounters {
             self.leased_worker_wait_timeouts
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+    pub(crate) fn record_leased_flush(&self, covered_frames: u64) {
+        // Relaxed: evidence counters publish no durability state.
+        self.leased_flushes.fetch_add(1, Ordering::Relaxed);
+        self.leased_flush_covered_frames
+            .fetch_add(covered_frames, Ordering::Relaxed);
+    }
+    pub(crate) fn record_leased_flush_completion(&self, ns: u64) {
+        // Relaxed: local observation times do not publish the durable prefix.
+        self.leased_flush_ns.fetch_add(ns, Ordering::Relaxed);
+        self.leased_flush_samples.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_read_lane_pin_failure(&self) {
+        // Relaxed: diagnostic evidence, not lane-state publication.
+        self.read_lane_pin_failures.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_leased_skip(&self) {
         // Relaxed: evidence only, not a stream ordering barrier.

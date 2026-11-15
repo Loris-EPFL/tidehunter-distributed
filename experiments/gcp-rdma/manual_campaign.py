@@ -46,6 +46,10 @@ EXPORT_RESERVE_SECONDS = 900
 CAMPAIGN_MARGIN_SECONDS = 120
 CEILING_CENTS = 14500
 # Rounded-up compute for six six-hour guests at $3.287109973 per host-hour.
+# Iowa on-demand: https://cloud.google.com/products/compute/pricing/storage-optimized
+Z4M_HIGHMEM_16_USD_PER_HOUR = 3.287109973
+Z4M_HIGHMEM_32_USD_PER_HOUR = 6.574219945
+MACHINE_RATE_NANODOLLARS = {'z4m-highmem-16': 3287109973, 'z4m-highmem-32': 6574219945}
 COMPUTE_CENTS = (3287109973 * 6 * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
 COMPACT_COMPUTE_CENTS = (3287109973 * 2 * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
 COMPACT_CEILING_CENTS = (COMPACT_COMPUTE_CENTS * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
@@ -105,6 +109,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
     'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
     'nvmeof_single_caller': '294b50957b21d6acafadcf1b682c71d1b424524a144ecd6c2c18e2b1cc40fd4e',
+    'nvmeof_f6': '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7',
     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
@@ -156,6 +161,7 @@ REVIEWED_SPECS = {
         ('nvmeof_contracts_crossing2', FOCUSED_MATRIX_SHA256['nvmeof_contracts_crossing2'], 36),
         ('nvmeof_parallel_writes', FOCUSED_MATRIX_SHA256['nvmeof_parallel_writes'], 44),
         ('nvmeof_single_caller', FOCUSED_MATRIX_SHA256['nvmeof_single_caller'], 20),
+        ('nvmeof_f6', FOCUSED_MATRIX_SHA256['nvmeof_f6'], 42),
         ('nvmeof_reads_geometry', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry'], 74),
         ('nvmeof_reads_geometry_rest', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest'], 20),
         ('nvmeof_reads_geometry_rest2', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest2'], 18),
@@ -167,6 +173,7 @@ REVIEWED_SPECS['valkey_rdma_reads'] = {
     'matrix_sha256': FOCUSED_MATRIX_SHA256['valkey_rdma_reads'],
     'backends': ['valkey_rdma', 'tidehunter_nvme_rdma'], 'owner_hosts': 1,
 }
+REVIEWED_SPECS['nvmeof_f6']['machine_type'] = 'z4m-highmem-16'
 
 
 def _utc(seconds):
@@ -260,6 +267,12 @@ def _record(path, state, phase):
 
 
 def _reviewed_jobs(spec):
+    if isinstance(spec, dict) and 'machine_type' in spec:
+        if spec['machine_type'] not in MACHINE_RATE_NANODOLLARS:
+            raise ValueError('unreviewed machine type')
+        # A shape pinned by the reviewed selection is part of its exact contract.
+        if 'machine_type' not in REVIEWED_SPECS.get(spec.get('selection'), {}):
+            spec = {key: value for key, value in spec.items() if key != 'machine_type'}
     if isinstance(spec, dict) and spec.get("suite") in ("sui", "both"):
         import manual_sui
         if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(spec)):
@@ -288,15 +301,19 @@ def _check_config(config, spec, surcharge_cents):
     if (config.get('project_id') != 'mysten-research'
             or config.get('bucket') != 'mysten-research-bench-artifacts'
             or config.get('service_account') != campaign.GUEST_SERVICE_ACCOUNT
-            or config.get('machine_type') != 'z4m-highmem-16'
+            or config.get('machine_type', 'z4m-highmem-16') not in MACHINE_RATE_NANODOLLARS
             or config.get('max_distance') != 3
             or len(config.get('candidates', [])) != 1
             or config['candidates'][0].get('zone') != 'us-central1-a'):
         raise ValueError('manual campaign requires the reviewed single zonal configuration')
     _reviewed_jobs(spec)
     owners = spec.get('owner_hosts', 5)
-    ceiling, compute = ((COMPACT_CEILING_CENTS, COMPACT_COMPUTE_CENTS)
-                        if owners == 1 else (CEILING_CENTS, COMPUTE_CENTS))
+    machine = config.get('machine_type', 'z4m-highmem-16')
+    if machine != spec.get('machine_type', 'z4m-highmem-16'):
+        raise ValueError('machine type differs from reviewed specification')
+    rate = MACHINE_RATE_NANODOLLARS[machine]
+    compute = (rate * (owners + 1) * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
+    ceiling = (compute * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
     if type(surcharge_cents) is not int or not 0 <= surcharge_cents <= ceiling - compute:
         raise ValueError('non-compute quote exceeds the selected fleet ceiling')
 
@@ -1273,8 +1290,10 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     _check_config(config, spec, surcharge_cents)
     spec = copy.deepcopy(spec)
     host_count = spec.get('owner_hosts', 5) + 1
-    ceiling, compute = ((COMPACT_CEILING_CENTS, COMPACT_COMPUTE_CENTS)
-                        if host_count == 2 else (CEILING_CENTS, COMPUTE_CENTS))
+    config = dict(config, machine_type=config.get('machine_type', 'z4m-highmem-16'))
+    rate = MACHINE_RATE_NANODOLLARS[config['machine_type']]
+    compute = (rate * host_count * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
+    ceiling = (compute * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
     weekly_limit = json.loads(Path(__file__).with_name('budget.json').read_text()).get('weekly_limit_cents')
     if type(weekly_limit) is not int or weekly_limit <= 0:
         raise ValueError('budget.json requires a positive integer weekly_limit_cents')

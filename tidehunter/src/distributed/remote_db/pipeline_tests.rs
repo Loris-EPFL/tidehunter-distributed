@@ -134,6 +134,7 @@ impl Fixture {
             preparation_workers: 2,
             scan_prefetch_pages: 2,
             read_lanes: 2,
+            pin_read_lanes: false,
             max_pending_reads: 256,
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,

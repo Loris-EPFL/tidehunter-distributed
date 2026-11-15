@@ -296,13 +296,19 @@ class CaseIdentityTests(unittest.TestCase):
         counters.update(lease_reserve_ns=60177392, lease_namespace_sync_ns=199, lease_publish_ns=2807,
                         lease_profile_samples=3, adopt_owner_ns=356584672, adopt_close_scan_ns=86328087,
                         adopt_close_scan_bytes=4096, adopt_profile_samples=93, extent_preleases=2,
-                        extent_switch_waits=0, leased_worker_waits=20, leased_worker_wait_timeouts=1)
+                        extent_switch_waits=0, leased_worker_waits=20, leased_worker_wait_timeouts=1,
+                        leased_flushes=3, leased_flush_ns=200, leased_flush_samples=3,
+                        leased_flush_covered_frames=12, read_lane_pin_failures=0)
         text = campaign.measurement_read_metrics(evidence, {})
         self.assertIn('counter="extent_preleases"} 2', text)
         self.assertIn('counter="lease_reserve_ns"} 60177392', text)
         self.assertIn('kv_live_nvmeof_bytes{scope="measurement_boundary",counter="adopt_close_scan_bytes"} 4096', text)
         self.assertIn('counter="leased_worker_waits"} 20', text)
         self.assertIn('counter="leased_worker_wait_timeouts"} 1', text)
+        for name, value in (('leased_flushes', 3), ('leased_flush_ns', 200),
+                            ('leased_flush_samples', 3), ('leased_flush_covered_frames', 12),
+                            ('read_lane_pin_failures', 0)):
+            self.assertIn(f'counter="{name}"}} {value}', text)
         counters["unknown_leased_counter"] = 0
         with self.assertRaises(ValueError):
             campaign.measurement_read_metrics(evidence, {})

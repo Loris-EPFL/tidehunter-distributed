@@ -46,6 +46,36 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
             "Timed-out waits on the acknowledgement path: at least one leased frame in flight",
         ),
         (
+            "leased_flushes_total",
+            c.leased_flushes,
+            false,
+            "Submitted namespace flushes",
+        ),
+        (
+            "leased_flush_seconds_total",
+            c.leased_flush_ns,
+            false,
+            "Flush submission to local CQE harvest, including worker wake delay",
+        ),
+        (
+            "leased_flush_samples_total",
+            c.leased_flush_samples,
+            false,
+            "Successful namespace flush observations",
+        ),
+        (
+            "leased_flush_covered_frames_total",
+            c.leased_flush_covered_frames,
+            false,
+            "Non-FUA frames captured by submitted namespace flushes",
+        ),
+        (
+            "read_lane_pin_failures_total",
+            c.read_lane_pin_failures,
+            false,
+            "Read lane affinity failures",
+        ),
+        (
             "leased_bytes_total",
             c.leased_bytes,
             false,
@@ -621,6 +651,9 @@ mod tests {
         producer.record_leased_frame(4096);
         producer.record_leased_worker_wait(false);
         producer.record_leased_worker_wait(true);
+        producer.record_leased_flush(3);
+        producer.record_leased_flush_completion(2_000_000_000);
+        producer.record_read_lane_pin_failure();
         producer.record_leased_skip();
         producer.record_extent_lease();
         producer.record_adoption(false);
@@ -677,6 +710,11 @@ mod tests {
         for (name, expected) in [
             ("leased_worker_waits_total", 2.0),
             ("leased_worker_wait_timeouts_total", 1.0),
+            ("leased_flushes_total", 1.0),
+            ("leased_flush_seconds_total", 2.0),
+            ("leased_flush_samples_total", 1.0),
+            ("leased_flush_covered_frames_total", 3.0),
+            ("read_lane_pin_failures_total", 1.0),
             ("adoption_async_seconds_total", 4.0),
             ("adoption_async_samples_total", 2.0),
             ("adoption_settle_seconds_total", 6.0),

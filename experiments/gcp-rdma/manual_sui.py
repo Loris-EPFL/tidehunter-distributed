@@ -37,6 +37,7 @@ def _specs():
                             ('sui_nvmeof_with_contracts_crossing', 'nvmeof_contracts_crossing'),
                             ('sui_nvmeof_with_contracts_crossing2', 'nvmeof_contracts_crossing2'),
                             ('sui_nvmeof_with_parallel_writes', 'nvmeof_parallel_writes'),
+                            ('sui_nvmeof_with_f6', 'nvmeof_f6'),
                             ('sui_nvmeof_with_reads_geometry', 'nvmeof_reads_geometry'),
                             ('sui_nvmeof_with_reads_rest', 'nvmeof_reads_geometry_rest'),
                             ('sui_nvmeof_with_reads_rest2', 'nvmeof_reads_geometry_rest2')):

@@ -144,6 +144,7 @@ pub(super) fn run(
     }
     drop(driver);
     let mut sleeping_cache = None;
+    let mut pin_pending = state.pin_read_lanes;
     let mut inbox = LaneInbox {
         state: &state,
         receiver,
@@ -239,6 +240,17 @@ pub(super) fn run(
         // Harvest CQEs, start parked members, and collect requests that failed
         // admission (they come back from poll with their error).
         let polled = cache.poll(&mut client, epoch, &mut inbox.done);
+        let pin_device = if pin_pending {
+            cache.namespace_device().map(|device| {
+                pin_pending = false;
+                ReadLanePlacement {
+                    device,
+                    counters: client.read_lane_pin_counters(),
+                }
+            })
+        } else {
+            None
+        };
         drop(client);
         if let Err(error) = polled {
             super::super::record_first_failure(
@@ -256,6 +268,7 @@ pub(super) fn run(
         if cache.in_flight() == 0 {
             driver.live_cache = Some(cache);
             drop(driver);
+            pin_live_read_lane(pin_device, lane.index);
             if !inbox.waiting.is_empty() {
                 inbox.wait_one(Duration::from_micros(100));
             }
@@ -264,6 +277,7 @@ pub(super) fn run(
         // Only active flights move the cache out of the driver. Their global
         // credits and lane outstanding count prevent inline admission.
         drop(driver);
+        pin_live_read_lane(pin_device, lane.index);
         if !delivered {
             // Sleeps until a CQE is ready, the actor wakes us, or a deadline.
             if let Err(error) = cache.wait(MAX_POLL_WAIT) {

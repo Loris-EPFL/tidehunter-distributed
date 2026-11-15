@@ -1136,6 +1136,8 @@ struct State {
     live_reads: bool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_inline_reads: bool,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pin_read_lanes: bool,
     /// Drain commands accepted by live workers and not yet completed.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_drains: AtomicUsize,
@@ -1907,6 +1909,49 @@ fn progress_read_lane(state: &Arc<State>, lane: &mut ReactorLane, epoch: u64) ->
     progressed
 }
 
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+struct ReadLanePlacement {
+    device: std::io::Result<PathBuf>,
+    counters: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeCounters>>,
+}
+
+/// Affinity is a best-effort placement hint, never part of read correctness.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn pin_live_read_lane(
+    placement: Option<ReadLanePlacement>,
+    lane: usize,
+) {
+    let Some(ReadLanePlacement { device, counters }) = placement else {
+        return;
+    };
+    let result = device
+        .and_then(|device| super::super::nvmeof::live_connect::queue_cpus(&device))
+        .and_then(|queues| {
+            super::super::nvmeof::live_connect::pin_current_thread(queues[lane % queues.len()][0])
+        });
+    if result.is_err()
+        && let Some(counters) = counters
+    {
+        counters.record_read_lane_pin_failure();
+    }
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn live_read_lane_pin_failure_is_counted_without_failing_the_read() {
+    let temp = tempdir::TempDir::new("read-lane-pin-failure").unwrap();
+    let metrics = super::super::nvmeof::live_metrics::LiveNvmeMetrics::new();
+    let counters = metrics.register().unwrap();
+    pin_live_read_lane(
+        Some(ReadLanePlacement {
+            device: Ok(temp.path().join("missing-device")),
+            counters: Some(counters),
+        }),
+        0,
+    );
+    assert_eq!(metrics.snapshot().counts.read_lane_pin_failures, 1);
+}
+
 // Live control and CQ waits must not occupy the shared multi-lane reactor.
 // Global flight credits bound all channel entries, including these lane queues.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -2573,6 +2618,8 @@ impl ReadService {
             first_failure,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_reads,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            pin_read_lanes: config.pin_read_lanes,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_inline_reads: config
                 .live_nvme

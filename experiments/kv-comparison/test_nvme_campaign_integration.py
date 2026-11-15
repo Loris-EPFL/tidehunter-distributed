@@ -16,6 +16,94 @@ HERE = Path(__file__).resolve().parent
 
 
 class CampaignModeTests(unittest.TestCase):
+    @staticmethod
+    def f6_evidence(**values):
+        names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'reserve_exchanges', 'complete_exchanges',
+                 'leased_frames', 'leased_skip_markers', 'fua_writes', 'grant_misses',
+                 'controller_connect_ns', 'controller_connect_samples', 'leased_flushes',
+                 'leased_flush_covered_frames', 'read_lane_pin_failures')
+        start = dict.fromkeys(names, 7)
+        counters = dict.fromkeys(names, 0)
+        counters.update(values)
+        end = {name: start[name] + value for name, value in counters.items()}
+        return {'measurement_attempted': True, 'measurement_drained': True,
+                'start': {'live_nvmeof': start, 'coordinator': {'read_profile_live_inline': 0}},
+                'end': {'live_nvmeof': end, 'coordinator': {'read_profile_live_inline': 0}},
+                'deltas': {'coordinator': {'available': True, 'counters': {'read_profile_live_inline': 0}}},
+                'live_nvmeof': {'available': True, 'counters': counters}}
+
+    def test_f6_sync_qualification_branches(self):
+        jobs = cloud_campaign.make_focused_matrix('nvmeof_f6')
+        for group in ('G29W', 'G29X'):
+            for concurrency in ((1, 16, 64) if group == 'G29W' else (16,)):
+                for sync in ('per_frame_fua', 'group_flush'):
+                    job = next(j for j in jobs if j['group'] == group and j['concurrency'] == concurrency
+                               and j['live_leased_sync'] == sync)
+                    evidence = self.f6_evidence(completed_write_ops=4, completed_write_bytes=4096,
+                        leased_frames=4, leased_skip_markers=1,
+                        fua_writes=5 if sync == 'per_frame_fua' else 1,
+                        leased_flushes=1, leased_flush_covered_frames=3)
+                    with self.subTest(group=group, concurrency=concurrency, sync=sync):
+                        self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'])
+                        changes = [('fua_writes', 4 if sync == 'per_frame_fua' else 5)]
+                        if sync == 'group_flush':
+                            for name in ('leased_flushes', 'leased_flush_covered_frames'):
+                                bad = copy.deepcopy(evidence)
+                                bad['live_nvmeof']['counters'][name] += 1
+                                self.assertIn('invalid live NVMe counter ' + name,
+                                              cloud_campaign.qualify_live_nvme_measurement(bad, job)['reasons'])
+                                del bad['live_nvmeof']['counters'][name]
+                                self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(bad, job)['qualified'])
+                            if concurrency in (16, 64):
+                                changes += [('leased_flushes', 0), ('leased_flush_covered_frames', 1)]
+                            else:
+                                lone = self.f6_evidence(completed_write_ops=1, completed_write_bytes=1024,
+                                                       leased_frames=1, fua_writes=1)
+                                self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(lone, job)['qualified'])
+                        for name, value in changes:
+                            bad = copy.deepcopy(evidence)
+                            bad['end']['live_nvmeof'][name] = bad['start']['live_nvmeof'][name] + value
+                            bad['live_nvmeof']['counters'][name] = value
+                            self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(bad, job)['qualified'])
+
+    def test_f6_read_pinning_and_inline_qualification(self):
+        jobs = cloud_campaign.make_focused_matrix('nvmeof_f6')
+        for group in ('G29R', 'G29G'):
+            job = next(j for j in jobs if j['group'] == group and
+                       (group == 'G29G' or j.get('live_pin_read_lanes')))
+            job = dict(job, live_inline_reads=False)
+            evidence = self.f6_evidence(completed_read_ops=4, completed_read_bytes=4096)
+            self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'])
+            bad = copy.deepcopy(evidence)
+            bad['end']['coordinator']['read_profile_live_inline'] = 1
+            bad['deltas']['coordinator']['counters']['read_profile_live_inline'] = 1
+            self.assertIn('live inline admission evidence differs',
+                          cloud_campaign.qualify_live_nvme_measurement(bad, job)['reasons'])
+            if group == 'G29R':
+                for value in (1, None):
+                    bad = copy.deepcopy(evidence)
+                    if value is None:
+                        del bad['live_nvmeof']['counters']['read_lane_pin_failures']
+                    else:
+                        bad['end']['live_nvmeof']['read_lane_pin_failures'] += value
+                        bad['live_nvmeof']['counters']['read_lane_pin_failures'] = value
+                    self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(bad, job)['qualified'])
+                bad = copy.deepcopy(evidence)
+                bad['live_nvmeof']['counters']['read_lane_pin_failures'] = 0
+                bad['end']['live_nvmeof']['read_lane_pin_failures'] += 1
+                self.assertIn('invalid live NVMe counter read_lane_pin_failures',
+                              cloud_campaign.qualify_live_nvme_measurement(bad, job)['reasons'])
+
+    def test_optional_effective_configuration_admission(self):
+        for key, configuration in (
+                ('live_leased_sync', {'live_leased_sync': 'group_flush'}),
+                ('live_pin_read_lanes', {'client': {'pin_read_lanes': True}})):
+            value = 'group_flush' if key == 'live_leased_sync' else True
+            with self.assertRaises(ValueError):
+                cloud_campaign.admit_live_write_contract({key: value}, {'configuration': {}})
+            cloud_campaign.admit_live_write_contract({key: value}, {'configuration': configuration})
+        cloud_campaign.admit_live_write_contract({}, {'configuration': {}})
+
     def test_owner_history_receipt_defaults_and_freshness(self):
         launch = {'ready_file': '/tmp/ready', 'launch_nonce': 'nonce', 'listen': '127.0.0.1:1',
                   'node': {'partition': {'partition': 0, 'inventory': {'database': [1] * 16}}}}
@@ -68,6 +156,34 @@ class CampaignModeTests(unittest.TestCase):
                                'counters': {'read_profile_live_inline': 0}}},
                     'live_nvmeof': {'available': True, 'counters': dict(end)}}
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'])
+        mixed = dict(job, mix={'read': 50, 'put': 50})
+        current = copy.deepcopy(evidence)
+        current['end']['live_nvmeof'].update(completed_write_ops=1, completed_write_bytes=1024)
+        current['live_nvmeof']['counters'].update(completed_write_ops=1, completed_write_bytes=1024)
+        # q3 rest attempt-1 G24M: metadata 15038 -> 15592, extents 2 -> 2.
+        current['start']['live_nvmeof'].update(metadata_requests=15038, extents_leased=2)
+        current['end']['live_nvmeof'].update(metadata_requests=15592, extents_leased=2)
+        current['live_nvmeof']['counters'].update(metadata_requests=554, extents_leased=0)
+        for name in cloud_campaign.WRITE_METADATA_EXCHANGES:
+            current['start']['live_nvmeof'][name] = 0
+            value = 554 if name == 'adoption_async_exchanges' else 0
+            current['end']['live_nvmeof'][name] = value
+            current['live_nvmeof']['counters'][name] = value
+        current['start']['coordinator']['read_rpc_count'] = 0
+        current['end']['coordinator']['read_rpc_count'] = 0
+        current['deltas']['coordinator']['counters']['read_rpc_count'] = 0
+        self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(current, mixed)['qualified'])
+        for name, value, reason in (
+                ('metadata_requests', 557, 'permanent export sent owner requests for reads'),
+                ('payload_rpc_requests', 1, 'payload RPC observed on live NVMe route')):
+            bad = copy.deepcopy(current)
+            bad['end']['live_nvmeof'][name] = bad['start']['live_nvmeof'][name] + value
+            bad['live_nvmeof']['counters'][name] = value
+            self.assertIn(reason, cloud_campaign.qualify_live_nvme_measurement(bad, mixed)['reasons'])
+        bad = copy.deepcopy(current)
+        del bad['live_nvmeof']['counters']['adoption_async_exchanges']
+        self.assertIn('invalid live NVMe counter adoption_async_exchanges',
+                      cloud_campaign.qualify_live_nvme_measurement(bad, mixed)['reasons'])
         for name in ('grant_misses', 'controller_connect_ns', 'controller_connect_samples'):
             bad = copy.deepcopy(evidence)
             del bad['live_nvmeof']['counters'][name]
@@ -96,7 +212,7 @@ class CampaignModeTests(unittest.TestCase):
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
                 'live_write': {'write_mode': 'leased',
                                'acknowledgement_contract': 'leased extent: page-cache write'}}}
-        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_single_caller', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2'):
+        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_single_caller', 'nvmeof_f6', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2'):
             window = job.get('live_leased_write_window')
             info['configuration'].update(live_leased_write_window=window,
                 live_leased_write_window_bound=31 if window is None else window)
@@ -168,6 +284,12 @@ class CampaignModeTests(unittest.TestCase):
                     client = {**prep, 'host_nqn': host_nqn, 'host_id': controller.live_host_identity(host_nqn),
                               'leased_durability': tier if mode == 'leased' else None}
                     self.assertEqual(controller.admit_prepared_live_client(client, prep, tier), host_nqn)
+                    for key, value in (('leased_sync', 'group_flush'),):
+                        requested = dict(prep, **{key: value})
+                        with self.assertRaises(controller.SafetyError):
+                            controller.admit_prepared_live_client(client, requested, tier)
+                        self.assertEqual(controller.admit_prepared_live_client(
+                            dict(client, **{key: value}), requested, tier), host_nqn)
                     for field in client:
                         changed = dict(client)
                         changed[field] = None
@@ -244,7 +366,7 @@ class CampaignModeTests(unittest.TestCase):
                        and j.get('live_inline_reads') is inline and j['concurrency'] == 1
                        and j['mix']['read'] == 100)
             info = {'configuration': {'live_write': {'write_mode': 'leased',
-                'acknowledgement_contract': 'leased extent: FUA data sync; owner frontier root asynchronous'}}}
+                'acknowledgement_contract': 'synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous'}}}
             cloud_campaign.admit_live_write_contract(job, info)
             for field in ('write_mode', 'acknowledgement_contract'):
                 bad = copy.deepcopy(info)

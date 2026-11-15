@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +10,74 @@ import owner_ftrace
 
 
 class OwnerFtraceTests(unittest.TestCase):
+    def test_cpu_stat_excludes_guest_and_rejects_counter_resets(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'stat'
+            path.write_text('cpu 1 2 3 4 5 6 7 8\ncpu0 10 2 3 4 5 6 7 8 9 10\nintr 9\n')
+            self.assertEqual(owner_ftrace.cpu_ticks(path), {'cpu0': [10, 2, 3, 4, 5, 6, 7, 8]})
+        with self.assertRaises(ValueError):
+            owner_ftrace.cpu_deltas({'cpu0': [1] * 8}, {'cpu0': [0] * 8})
+        with self.assertRaises(ValueError):
+            owner_ftrace.cpu_deltas({'cpu0': [0] * 8}, {'cpu1': [1] * 8})
+
+    def test_cpu_sampling_deltas_summary_and_bound(self):
+        before = {'cpu0': [0] * 8, 'cpu1': [0] * 8}
+        after = {'cpu0': [90, 0, 0, 5, 0, 0, 5, 0], 'cpu1': [40, 0, 0, 50, 0, 0, 10, 0]}
+        for bound in (owner_ftrace.CPU_MAX_BYTES, 4096):
+            with self.subTest(bound=bound), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                (root / 'owner-cpu.stop').touch()
+                with patch.object(owner_ftrace, 'cpu_ticks', side_effect=[before, after]), \
+                        patch.object(owner_ftrace.time, 'monotonic', side_effect=[0, 1]), \
+                        patch.object(owner_ftrace, 'CPU_MAX_BYTES', bound):
+                    owner_ftrace.sample_cpu(root)
+                data = json.loads((root / 'owner-cpu.json').read_text())
+                if bound == 4096:
+                    self.assertFalse(data['available'])
+                    self.assertTrue(data['truncated'])
+                    self.assertNotIn('summary', data)
+                else:
+                    self.assertTrue(data['available'])
+                    self.assertEqual(data['samples'][0]['elapsed_seconds'], 1)
+                    self.assertEqual(data['samples'][0]['cpus']['cpu0']['ticks'], after['cpu0'])
+                    self.assertEqual(data['summary'], {'max_busy_pct': 95, 'mean_busy_pct': 72.5,
+                                                       'max_softirq_pct': 10, 'cpus_above_90_busy': 1})
+
+    def test_cpu_sampling_unavailable_is_not_zero(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(owner_ftrace, 'cpu_ticks', side_effect=OSError('denied')):
+                owner_ftrace.sample_cpu(root)
+            data = json.loads((Path(root) / 'owner-cpu.json').read_text())
+            self.assertFalse(data['available'])
+            self.assertNotIn('summary', data)
+            self.assertIn('denied', data['reason'])
+        self.assertFalse(owner_ftrace.stop_cpu(None)['available'])
+
+    def test_cpu_sampler_process_stops_and_persists_bounded_artifact(self):
+        with tempfile.TemporaryDirectory() as root:
+            script = ('import json, owner_ftrace, sys; '
+                      'print(json.dumps(owner_ftrace.start_cpu(sys.argv[1], duration_seconds=5)))')
+            started = subprocess.run([sys.executable, '-B', '-c', script, root],
+                                     check=True, capture_output=True, text=True, timeout=5)
+            state = json.loads(started.stdout)
+            self.assertIn('directory', state)
+            data = owner_ftrace.stop_cpu(state)
+            self.assertIn('samples', data)
+            self.assertLess((Path(root) / 'owner-cpu.json').stat().st_size, owner_ftrace.CPU_MAX_BYTES)
+        self.assertFalse(owner_ftrace.start_cpu('/unused', duration_seconds=0)['available'])
+        self.assertFalse(owner_ftrace.start_cpu('/unused', duration_seconds=7201)['available'])
+
+    def test_cpu_sampler_deadline_marks_incomplete_window_unavailable(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(owner_ftrace, 'cpu_ticks', side_effect=[
+                    {'cpu0': [0] * 8}, {'cpu0': [1] * 8}]), \
+                    patch.object(owner_ftrace.time, 'monotonic', side_effect=[0, 1, 1]):
+                owner_ftrace.sample_cpu(root, duration_seconds=1)
+            data = json.loads((Path(root) / 'owner-cpu.json').read_text())
+            self.assertFalse(data['available'])
+            self.assertTrue(data['truncated'])
+            self.assertIn('deadline expired', data['reason'])
+
     def test_missing_events_and_failed_start_remove_instance(self):
         with tempfile.TemporaryDirectory() as root:
             tracefs = Path(root)

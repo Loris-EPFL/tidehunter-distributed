@@ -84,7 +84,7 @@ pub struct LiveSpdkConfig {
     pub executable: std::path::PathBuf,
 }
 
-/// Bounded live controller queues; defaults preserve the original connection.
+/// Bounded live controller queues; defaults use four 128-entry I/O queues.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveQueueGeometry {
@@ -96,8 +96,8 @@ pub struct LiveQueueGeometry {
 impl Default for LiveQueueGeometry {
     fn default() -> Self {
         Self {
-            io_queues: 1,
-            queue_size: 32,
+            io_queues: 4,
+            queue_size: 128,
             poll_queues: 0,
         }
     }

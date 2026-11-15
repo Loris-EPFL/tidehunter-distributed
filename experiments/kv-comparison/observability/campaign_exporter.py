@@ -524,7 +524,9 @@ def live_nvmeof_metrics(evidence, labels):
                     "lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns", "lease_profile_samples",
                     "adopt_owner_ns", "adopt_close_scan_ns", "adopt_close_scan_bytes", "adopt_profile_samples",
                     "extent_preleases", "extent_switch_waits", "leased_eventfd_unavailable",
-                    "leased_worker_waits", "leased_worker_wait_timeouts")
+                    "leased_worker_waits", "leased_worker_wait_timeouts",
+                    "leased_flushes", "leased_flush_ns", "leased_flush_samples", "leased_flush_covered_frames",
+                    "read_lane_pin_failures")
     extra_stages = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
                     "extent_switch", "adoption_async", "adoption_settle")
     expected = set(fields) | {stage + suffix for stage in stages for suffix in ("_ns", "_samples")}
@@ -865,6 +867,8 @@ LIVE_NVME_WRITE_COUNTERS = {
     "leased_full_writes", "failed_write_ops", "short_write_ops", "short_write_bytes",
     "adoption_history_full_settles", "leased_eventfd_unavailable",
     "leased_worker_waits", "leased_worker_wait_timeouts",
+    "leased_flushes", "leased_flush_ns", "leased_flush_samples", "leased_flush_covered_frames",
+    "read_lane_pin_failures",
     *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
                                    "allocation", "publication", "namespace_setup", "read_io",
                                    "owner_completion", "wal_persistence", "wal_namespace",

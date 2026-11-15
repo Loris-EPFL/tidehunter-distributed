@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import analyze
-from cloud_campaign import NVMEOF_PATH_SELECTIONS
+from cloud_campaign import NVMEOF_PATH_SELECTIONS, WRITE_METADATA_EXCHANGES
 import focused_analysis as focused
 import leased_ab
 
@@ -19,7 +19,7 @@ PAGE_CACHE = 'A put is acknowledged from the page cache of the owner. Its latenc
 DEVICE_WINDOW = 'Device counters cover the window between the two controller snapshots on the whole SSD. The window is longer than the measured calls and includes other writes (run 12, first launch: about 1 GiB in each 1 KiB put case on both routes; the data file system is made with default `mkfs.ext4`). `device_write_payload_ratio` is therefore an upper bound, not a write amplification.'
 SETTINGS = ('group', 'arm', 'backend', 'route', 'write mode', 'acknowledgement contract', 'target I/O', 'live export mode', 'inline reads', 'read lanes', 'I/O queues', 'queue size', 'poll queues', 'owner fragment bytes', 'owner WAL file bytes', 'mapped fragments', 'history persistence', 'coordinator cache bytes', 'cache procedure', 'keys', 'key distribution', 'value bytes', 'concurrency', 'repetitions', 'cases', 'differs from engine default')
 REMOTE_DEFAULTS = dict(owner_wal_geometry='native_default', history_persistence='wal_replay', coordinator_cache_bytes=8388608, read_lanes=2)
-LIVE_DEFAULTS = dict(live_export_mode='on_demand', live_write_mode='reserved', live_inline_reads=True, live_io_queues=1, live_io_queue_size=32, live_poll_queues=0, target_io='buffered', live_lease_ahead=True, live_polled_writes=False, live_leased_write_window=None)
+LIVE_DEFAULTS = dict(live_export_mode='on_demand', live_write_mode='reserved', live_inline_reads=True, live_io_queues=4, live_io_queue_size=128, live_poll_queues=0, target_io='buffered', live_lease_ahead=True, live_polled_writes=False, live_leased_write_window=None)
 GEOMETRY = {'native_default': (134217728, 10737418240, 16), 'research': (4194304, 1073741824, 3), 'sui_harness': (16777216, 268435456, 3)}
 # The arm columns identify a row without the settings table: several arms share operation, size and concurrency.
 ARM = ('route', 'tier', 'history_persistence', 'lease_ahead', 'polled_writes', 'media_expected', 'keys', 'read_lanes', 'io_queues', 'queue_size', 'poll_queues', 'inline_reads', 'diagnostic')
@@ -34,6 +34,11 @@ RESULTS += tuple(name + '_mean' for name in PROFILE_COUNTERS) + (
     'lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits',
     'leased_worker_waits', 'leased_worker_wait_timeouts', 'worker_timeouts_per_frame')
 RESULTS += ('first_call_us', 'contract_class')
+RESULTS += ('owner_metadata_per_read', 'read_side_metadata')
+CPU_COLUMNS = ('owner_cpu_max_busy_pct', 'owner_cpu_mean_busy_pct',
+               'owner_cpu_max_softirq_pct', 'owner_cpus_above_90_busy')
+RESULTS += (*CPU_COLUMNS, 'live_leased_sync', 'live_pin_read_lanes',
+            'leased_flushes', 'leased_flush_covered_frames')
 STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
 STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share', 'calls_with_pair', 'cond_mean_us', 'cond_p50_us', 'cond_p99_us')
 
@@ -144,6 +149,14 @@ def result_row(case, export):
                diagnostic='sustained' if j.get('measurement_operations') == 200000 else 'history diagnostics' if j.get('owner_history_diagnostics') else None)
     row['contract_class'] = contract_class(j)
     row['load_model'] = 'open_loop' if j.get('offered_ops_per_second') else 'closed_loop'
+    row.update(live_leased_sync=j.get('live_leased_sync', 'per_frame_fua') if live(j) else None,
+               live_pin_read_lanes=j.get('live_pin_read_lanes', False) if live(j) else None)
+    cpu = load(directory.parent / 'owner-cpu.json')
+    if cpu.get('available') is True:
+        summary = cpu.get('summary', {})
+        for column, key in zip(CPU_COLUMNS, ('max_busy_pct', 'mean_busy_pct', 'max_softirq_pct',
+                                            'cpus_above_90_busy')):
+            row[column] = nonnegative(summary.get(key))
     row.update(history_persistence=None if native else j.get('history_persistence', 'on_disk'),
                lease_ahead=j.get('live_lease_ahead', True) if live(j) else None,
                polled_writes=j.get('live_polled_writes', False) if live(j) else None)
@@ -170,11 +183,18 @@ def result_row(case, export):
         row['live_leased_write_window_bound'] = nonnegative(configuration.get('live_leased_write_window_bound'))
     for name in ('grant_misses', 'metadata_requests', 'namespace_connects'):
         row[name] = nonnegative(counters.get(name))
+    reads = nonnegative(counters.get('completed_read_ops'))
+    metadata = nonnegative(counters.get('metadata_requests'))
+    row['owner_metadata_per_read'] = metadata / reads if reads and metadata is not None else None
+    exchanges = [nonnegative(counters.get(name)) for name in WRITE_METADATA_EXCHANGES]
+    row['read_side_metadata'] = (metadata - sum(exchanges)
+                                 if metadata is not None and all(value is not None for value in exchanges) else None)
     for name, denominator in PROFILE_COUNTERS.items():
         value, count = nonnegative(counters.get(name)), nonnegative(counters.get(denominator))
         row[name + '_mean'] = value / count if value is not None and count else None
     for name in ('lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits',
-                 'leased_worker_waits', 'leased_worker_wait_timeouts'):
+                 'leased_worker_waits', 'leased_worker_wait_timeouts',
+                 'leased_flushes', 'leased_flush_covered_frames'):
         row[name] = nonnegative(counters.get(name))
     frames = nonnegative(counters.get('leased_frames'))
     timeouts = row['leased_worker_wait_timeouts']
@@ -373,7 +393,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G29R', 'G29G', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -411,9 +431,10 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         if len(refs) == 1 and refs[0]['p50_us'] > 0 and row['p50_us'] is not None:
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
+    lines.extend(['Owner CPU columns use time-weighted /proc/stat deltas per CPU across the owner trace window (one-second intervals plus the final partial interval). Max and mean busy are across CPUs; softirq is the maximum per-CPU percentage; the count uses per-CPU busy > 90%. Missing or truncated samples remain unavailable.', ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
-    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N') and r['operation'] in ('put', 'put_batch')]
-    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R') and r['operation'] in ('read', 'get_many')]
+    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X') and r['operation'] in ('put', 'put_batch')]
+    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R', 'G29R', 'G29G') and r['operation'] in ('read', 'get_many')]
     tables['puts'] += [r for r in rows if r['group'] in ('G24W', 'G24M') and r['operation'] == 'put']
     tables['reads'] += [r for r in rows if r['group'].startswith('G24') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']

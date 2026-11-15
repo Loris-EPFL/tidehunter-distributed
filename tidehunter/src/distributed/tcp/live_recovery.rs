@@ -266,7 +266,7 @@ impl Client {
                             }
                             break match completion.result.map_err(TcpError::component)? {
                                 LiveIoResult::Reads(records) => records,
-                                LiveIoResult::Written => {
+                                LiveIoResult::Written | LiveIoResult::Flushed => {
                                     return Err(TcpError::new("unexpected live recovery write"));
                                 }
                             };

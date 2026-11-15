@@ -80,8 +80,8 @@ def validate(config, budget, run_id, source, deadline):
             raise ValueError('config missing ' + key)
     if config['service_account'] != GUEST_SERVICE_ACCOUNT:
         raise ValueError('config service_account must be ' + GUEST_SERVICE_ACCOUNT)
-    if config.get('machine_type') != 'z4m-highmem-16':
-        raise ValueError('protected campaign requires z4m-highmem-16')
+    if config.get('machine_type', 'z4m-highmem-16') not in {'z4m-highmem-16', 'z4m-highmem-32'}:
+        raise ValueError('protected campaign requires a reviewed Z4M machine type')
     if type(config.get('max_distance')) is not int or config['max_distance'] not in (1, 2, 3):
         raise ValueError('max_distance must be 1, 2 or 3')
     if not config.get('candidates'):
@@ -107,8 +107,9 @@ def validate(config, budget, run_id, source, deadline):
             raise ValueError('budget missing positive integer ' + key)
     if budget['max_duration_seconds'] > MAX_DURATION_SECONDS:
         raise ValueError('quoted maximum duration exceeds 4-hour safety limit')
-    # Reviewed six-host US rate: $3.287109973 per host-hour, rounded up to cents.
-    numerator = 6 * budget['max_duration_seconds'] * 3287109973 * 100
+    # Iowa on-demand: https://cloud.google.com/products/compute/pricing/storage-optimized
+    rate = {'z4m-highmem-16': 3287109973, 'z4m-highmem-32': 6574219945}[config.get('machine_type', 'z4m-highmem-16')]
+    numerator = 6 * budget['max_duration_seconds'] * rate * 100
     denominator = 3600 * 1000000000
     base_cents = (numerator + denominator - 1) // denominator
     if budget['run_upper_bound_cents'] < base_cents:

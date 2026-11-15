@@ -556,6 +556,19 @@ impl Default for LiveReadCache {
 }
 
 impl LiveReadCache {
+    /// Resolve this grant's descriptor, not the controller pool's original
+    /// binding: a shared controller may now serve a different namespace.
+    /// Resolve while the caller exclusively owns the cache, before an inline
+    /// borrower can retire a grant and allow its descriptor number to be reused.
+    pub(crate) fn namespace_device(&self) -> Option<std::io::Result<std::path::PathBuf>> {
+        self.grants.first().map(|grant| {
+            let path = format!("/proc/self/fd/{}", grant.io.namespace().file.as_raw_fd());
+            std::fs::canonicalize(&path).map_err(|error| {
+                std::io::Error::new(error.kind(), format!("resolve namespace {path}: {error}"))
+            })
+        })
+    }
+
     pub(crate) fn with_max_requests(max_requests: usize) -> Self {
         Self {
             grants: Vec::with_capacity(LIVE_READ_CACHE_CAPACITY),
@@ -1702,7 +1715,7 @@ impl LiveReadCache {
                     cancel = true;
                 }
             }
-            Ok(LiveIoResult::Written) => {
+            Ok(LiveIoResult::Written | LiveIoResult::Flushed) => {
                 state.fail(TcpError::new("unexpected live write completion"));
                 cancel = true;
             }
@@ -1840,6 +1853,10 @@ impl LiveReadCache {
 }
 
 impl Client {
+    pub(crate) fn read_lane_pin_counters(&self) -> Option<Arc<LiveNvmeCounters>> {
+        self.live_counters.clone()
+    }
+
     /// Blocking read of `references` through `cache`. For callers that own a
     /// lane exclusively and keep one request at a time; lane workers use the
     /// multi-flight calls of [`LiveReadCache`] instead.
@@ -1902,6 +1919,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn namespace_device_is_owned_before_the_cached_grant_is_retired() {
+        let mut lane = lane(4);
+        let device = lane.cache.namespace_device().unwrap().unwrap();
+        lane.cache.grants.clear();
+        assert_eq!(
+            device,
+            std::fs::canonicalize(lane._dir.path().join("wal-0")).unwrap()
+        );
+        assert!(lane.cache.namespace_device().is_none());
+    }
+
+    #[test]
     fn failed_grant_drains_error_cqe_before_releasing_flights() {
         let mut lane = lane(4);
         let namespace = LiveNamespace::open_local_file(
@@ -1944,6 +1973,7 @@ pub(crate) mod tests {
             host_id: [1; 16],
             owner_identities: Default::default(),
             leased_write_window: Some(4),
+            leased_sync: Default::default(),
             max_inflight_requests: 4,
             max_inflight_bytes: 65536,
             connect_timeout_ms: 1000,
@@ -2339,6 +2369,7 @@ pub(crate) mod tests {
             host_id: [1; 16],
             owner_identities: Default::default(),
             leased_write_window: Some(4),
+            leased_sync: Default::default(),
             max_inflight_requests: slots,
             max_inflight_bytes: 16 * (4096 + 4095),
             connect_timeout_ms: 1000,
