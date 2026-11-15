@@ -1014,7 +1014,7 @@ def verify_package(config):
         raise SafetyError("sealed package differs from externally admitted runtime hashes")
     focused = config["spec"].get("mode") == "focused"
     if focused:
-        expected_profile = "focused_valkey" if config["spec"].get("selection") == "valkey_rdma_reads" else "focused"
+        expected_profile = "focused_valkey" if config["spec"].get("selection") in ("valkey_rdma_reads", "nvmeof_f7_highmem32") else "focused"
         if admission.get("build_profile") != expected_profile:
             raise SafetyError("focused campaign requires the focused package profile")
         fdb = None
@@ -1703,7 +1703,7 @@ def admit_prepared_live_client(live_client, prep, tier):
     for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
-    for key, default in (("leased_sync", "per_frame_fua"),):
+    for key, default in (("leased_sync", "per_frame_fua"), ("leased_flush_min_frame_bytes", 0)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
     if live_client != expected:
@@ -3397,7 +3397,7 @@ class Controller:
                                        queue_geometry={"io_queues": job.get("live_io_queues", 4),
                                                        "queue_size": job.get("live_io_queue_size", 128),
                                                        "poll_queues": job.get("live_poll_queues", 0)})
-            for key in ("leased_sync", "leased_write_lanes"):
+            for key in ("leased_sync", "leased_flush_min_frame_bytes", "leased_write_lanes"):
                 if "live_" + key in job:
                     prep["live_nvmeof"][key] = job["live_" + key]
         if "live_pin_read_lanes" in job:

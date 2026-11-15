@@ -60,6 +60,7 @@ class SelectedBackendRuntimeTests(unittest.TestCase):
     def test_focused_package_profile_is_selection_specific(self):
         for selection, expected, rejected in (
                 ('valkey_rdma_reads', 'focused_valkey', 'focused'),
+                ('nvmeof_f7_highmem32', 'focused_valkey', 'focused'),
                 ('nvmeof_reads_geometry', 'focused', 'focused_valkey'),
                 ('nvmeof_reads_geometry_rest', 'focused', 'focused_valkey'),
                 ('nvmeof_reads_geometry_rest2', 'focused', 'focused_valkey')):

@@ -38,14 +38,14 @@ class CampaignModeTests(unittest.TestCase):
             for concurrency in ((1, 16, 64) if group == 'G29W' else (16,)):
                 for sync in ('per_frame_fua', 'group_flush'):
                     job = next(j for j in jobs if j['group'] == group and j['concurrency'] == concurrency
-                               and j['live_leased_sync'] == sync)
+                               and j['live_leased_sync'] == sync and j.get('live_leased_write_window') != 1)
                     evidence = self.f6_evidence(completed_write_ops=4, completed_write_bytes=4096,
                         leased_frames=4, leased_skip_markers=1,
                         fua_writes=5 if sync == 'per_frame_fua' else 1,
                         leased_flushes=1, leased_flush_covered_frames=3)
                     with self.subTest(group=group, concurrency=concurrency, sync=sync):
                         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'])
-                        changes = [('fua_writes', 4 if sync == 'per_frame_fua' else 5)]
+                        changes = [('fua_writes', 4 if sync == 'per_frame_fua' else 6)]
                         if sync == 'group_flush':
                             for name in ('leased_flushes', 'leased_flush_covered_frames'):
                                 bad = copy.deepcopy(evidence)
@@ -54,17 +54,34 @@ class CampaignModeTests(unittest.TestCase):
                                               cloud_campaign.qualify_live_nvme_measurement(bad, job)['reasons'])
                                 del bad['live_nvmeof']['counters'][name]
                                 self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(bad, job)['qualified'])
-                            if concurrency in (16, 64):
+                            if job['value_size'] == 65536 and concurrency in (16, 64):
                                 changes += [('leased_flushes', 0), ('leased_flush_covered_frames', 1)]
                             else:
                                 lone = self.f6_evidence(completed_write_ops=1, completed_write_bytes=1024,
                                                        leased_frames=1, fua_writes=1)
                                 self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(lone, job)['qualified'])
+                                # A lone frame that crosses a fragment also writes a FUA skip marker.
+                                crossing = self.f6_evidence(completed_write_ops=1, completed_write_bytes=1024,
+                                                            leased_frames=1, leased_skip_markers=1, fua_writes=2)
+                                self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(crossing, job)['qualified'])
                         for name, value in changes:
                             bad = copy.deepcopy(evidence)
                             bad['end']['live_nvmeof'][name] = bad['start']['live_nvmeof'][name] + value
                             bad['live_nvmeof']['counters'][name] = value
                             self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(bad, job)['qualified'])
+
+    def test_f6_group_flush_window_of_one_needs_no_shared_coverage(self):
+        # F6 G29X-r0-c8b826d0881ac415257f counters: window 1 cannot share a flush.
+        job = next(j for j in cloud_campaign.make_focused_matrix('nvmeof_f6')
+                   if j['group'] == 'G29X' and j['live_leased_sync'] == 'group_flush'
+                   and j.get('live_leased_write_window') == 1)
+        evidence = self.f6_evidence(completed_write_ops=2070, completed_write_bytes=4096,
+                                    leased_frames=2070, leased_skip_markers=8, fua_writes=2063,
+                                    leased_flushes=15, leased_flush_covered_frames=15)
+        self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'])
+        unbounded = dict(job, live_leased_write_window=None)
+        self.assertIn('group flush did not cover shared frames',
+                      cloud_campaign.qualify_live_nvme_measurement(evidence, unbounded)['reasons'])
 
     def test_f6_read_pinning_and_inline_qualification(self):
         jobs = cloud_campaign.make_focused_matrix('nvmeof_f6')
@@ -93,6 +110,36 @@ class CampaignModeTests(unittest.TestCase):
                 bad['end']['live_nvmeof']['read_lane_pin_failures'] += 1
                 self.assertIn('invalid live NVMe counter read_lane_pin_failures',
                               cloud_campaign.qualify_live_nvme_measurement(bad, job)['reasons'])
+
+    def test_flush_minimum_validation_and_effective_binding(self):
+        key = 'live_leased_flush_min_frame_bytes'
+        for value in (-1, True, 1.5, None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                cloud_campaign.admit_live_write_contract(
+                    {'live_leased_sync': 'group_flush', key: value}, {})
+        with self.assertRaises(ValueError):
+            cloud_campaign.admit_live_write_contract({key: 0}, {})
+        for value in (0, 32768):
+            job = {'live_leased_sync': 'group_flush', key: value}
+            with self.assertRaises(ValueError):
+                cloud_campaign.admit_live_write_contract(
+                    job, {'configuration': {'live_leased_sync': 'group_flush'}})
+            cloud_campaign.admit_live_write_contract(
+                job, {'configuration': {'live_leased_sync': 'group_flush', key: value}})
+        for job in cloud_campaign.make_focused_matrix('nvmeof_f6b'):
+            if job['group'] not in ('G31W', 'G31H', 'G31S', 'G31X'):
+                continue
+            evidence = self.f6_evidence(completed_write_ops=4, completed_write_bytes=4096,
+                                        leased_frames=4, fua_writes=4)
+            requires_shared = (job['live_leased_sync'] == 'group_flush'
+                               and job['value_size'] == 65536 and job['concurrency'] in (16, 64)
+                               and job.get('live_leased_write_window') != 1)
+            self.assertEqual(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'],
+                             not requires_shared)
+            if requires_shared:
+                gated = dict(job, live_leased_flush_min_frame_bytes=
+                             job['value_size'] * job['concurrency'] + 1)
+                self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, gated)['qualified'])
 
     def test_optional_effective_configuration_admission(self):
         for key, configuration in (
@@ -212,7 +259,7 @@ class CampaignModeTests(unittest.TestCase):
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
                 'live_write': {'write_mode': 'leased',
                                'acknowledgement_contract': 'leased extent: page-cache write'}}}
-        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_single_caller', 'nvmeof_f6', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2'):
+        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_single_caller', 'nvmeof_f6', 'nvmeof_f6b', 'nvmeof_f7_highmem32', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2'):
             window = job.get('live_leased_write_window')
             info['configuration'].update(live_leased_write_window=window,
                 live_leased_write_window_bound=31 if window is None else window)

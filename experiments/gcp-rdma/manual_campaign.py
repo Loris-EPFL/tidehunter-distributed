@@ -110,6 +110,8 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
     'nvmeof_single_caller': '294b50957b21d6acafadcf1b682c71d1b424524a144ecd6c2c18e2b1cc40fd4e',
     'nvmeof_f6': '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7',
+    'nvmeof_f6b': 'f5e680e6959f3a74369bae97c21354b6dc2911f0b6e15f048c6e7172e4c823de',
+    'nvmeof_f7_highmem32': '3319cef697350c791476126a297d19f768ffb0690b6dd2fb4cef79978d9f6800',
     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
@@ -162,6 +164,8 @@ REVIEWED_SPECS = {
         ('nvmeof_parallel_writes', FOCUSED_MATRIX_SHA256['nvmeof_parallel_writes'], 44),
         ('nvmeof_single_caller', FOCUSED_MATRIX_SHA256['nvmeof_single_caller'], 20),
         ('nvmeof_f6', FOCUSED_MATRIX_SHA256['nvmeof_f6'], 42),
+        ('nvmeof_f6b', FOCUSED_MATRIX_SHA256['nvmeof_f6b'], 58),
+        ('nvmeof_f7_highmem32', FOCUSED_MATRIX_SHA256['nvmeof_f7_highmem32'], 10),
         ('nvmeof_reads_geometry', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry'], 74),
         ('nvmeof_reads_geometry_rest', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest'], 20),
         ('nvmeof_reads_geometry_rest2', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest2'], 18),
@@ -174,6 +178,9 @@ REVIEWED_SPECS['valkey_rdma_reads'] = {
     'backends': ['valkey_rdma', 'tidehunter_nvme_rdma'], 'owner_hosts': 1,
 }
 REVIEWED_SPECS['nvmeof_f6']['machine_type'] = 'z4m-highmem-16'
+REVIEWED_SPECS['nvmeof_f6b']['machine_type'] = 'z4m-highmem-16'
+REVIEWED_SPECS['nvmeof_f7_highmem32'].update(
+    machine_type='z4m-highmem-32', backends=['valkey_rdma', 'tidehunter_nvme_rdma'])
 
 
 def _utc(seconds):
@@ -348,7 +355,7 @@ def _admit_package(package_dir, revision, spec):
     verified = package.verify_directory(root)
     import manual_sui
     focused = manual_sui.focused_qualification(spec)
-    expected_profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
+    expected_profile = 'focused_valkey' if spec.get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32') else 'focused'
     if focused and verified.get('build_profile') != expected_profile:
         raise ValueError('focused campaign requires its exact package profile')
     if not focused and verified.get('build_profile') is not None:
@@ -379,7 +386,7 @@ def _admit_package(package_dir, revision, spec):
             or any(name.startswith('runtime/bin/valkey-') or name == 'runtime/valkey-rdma.json'
                    for name in manifest.get('files', {}))):
         raise ValueError('focused package must not contain Valkey binaries')
-    if expected_profile == 'focused_valkey' and spec.get('selection') == 'valkey_rdma_reads':
+    if expected_profile == 'focused_valkey':
         required = {'runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
                     'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json'}
         if (manifest.get('features') != package.FOCUSED_VALKEY_FEATURES

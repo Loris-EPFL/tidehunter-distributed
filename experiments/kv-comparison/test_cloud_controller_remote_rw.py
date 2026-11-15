@@ -134,6 +134,8 @@ class CompactReadLifecycleTests(unittest.TestCase):
         fallback = {key: value for key, value in cases[0].items()
                     if key not in ('live_io_queues', 'live_io_queue_size', 'live_poll_queues')}
         cases.append(fallback)
+        cases.append(next(j for j in controller.cloud_campaign.make_focused_matrix('nvmeof_f6b')
+                          if 'live_leased_flush_min_frame_bytes' in j))
         nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
         for job in cases:
             with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as tmp:
@@ -172,6 +174,10 @@ class CompactReadLifecycleTests(unittest.TestCase):
                               'connect_timeout_ms', 'io_timeout_ms', 'write_mode', 'inline_reads',
                               'lease_ahead', 'polled_writes', 'leased_write_window')}
                     client.update(queue_geometry=live['queue_geometry'], export_mode=live['export_mode'])
+                    for key in ('leased_sync', 'leased_flush_min_frame_bytes'):
+                        if 'live_' + key in job:
+                            self.assertEqual(live[key], job['live_' + key])
+                            client[key] = live[key]
                     client.update(host_nqn=nqn, host_id=controller.live_host_identity(nqn),
                                   leased_durability=prep['durability_tier'] if live['write_mode'] == 'leased' else None)
                     controller.dump(out / 'remote.json', {'tls': {}, 'live_nvme': client,

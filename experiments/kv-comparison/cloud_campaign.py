@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
 
 
 
@@ -724,6 +724,8 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "nvmeof_single_caller": 20, "valkey_rdma_reads": 22,
                   "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20, "nvmeof_reads_geometry_rest2": 18}
 FOCUSED_COUNTS["nvmeof_f6"] = 42
+FOCUSED_COUNTS["nvmeof_f6b"] = 58
+FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 10
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -732,7 +734,8 @@ NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route
                                 "live_lease_ahead", "live_polled_writes")
 NVMEOF_PATH_OPTIONAL_LIVE_SETTING_KEYS = ("live_leased_write_window", "live_max_inflight_requests",
                                         "coordinator_read_memory_allowance_bytes", "live_leased_sync",
-                                        "live_pin_read_lanes", "live_leased_write_lanes")
+                                        "live_pin_read_lanes", "live_leased_write_lanes",
+                                        "live_leased_flush_min_frame_bytes")
 NVMEOF_PATH_SETTING_KEYS = {
     "native": NVMEOF_PATH_NATIVE_SETTING_KEYS,
     "tidehunter_verbs_native": NVMEOF_PATH_REMOTE_SETTING_KEYS,
@@ -770,6 +773,8 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_parallel_writes": {"G23W": 32, "G23X": 6, "G23N": 6},
     "nvmeof_single_caller": {"G28W": 8, "G28C": 8, "G28N": 4},
     "nvmeof_f6": {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4},
+    "nvmeof_f6b": {"G31W": 24, "G31H": 8, "G31S": 2, "G31X": 6, "G31G": 18},
+    "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2, "G30V": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -1850,6 +1855,75 @@ def _nvmeof_f6(path):
     return result
 
 
+def _nvmeof_f6b(path):
+    """Measure size-gated group flush and matched explicit read geometries."""
+    sources = _nvmeof_f6(path)
+    result = []
+    selection = "nvmeof_f6b"
+    arms = (("per_frame_fua", None), ("group_flush", None), ("group_flush", 32768))
+    for group, concurrency, sizes, selected, repeats in (
+            ("G31W", 16, (1024, 4096, 16384, 65536), arms, 2),
+            ("G31H", 64, (1024, 65536), (arms[0], arms[2]), 2),
+            ("G31S", 1, (65536,), (arms[0], arms[2]), 1)):
+        for size in sizes:
+            for sync, minimum in selected:
+                source = _clone_source(sources, "G29W", "tidehunter_nvme_rdma",
+                                       65536 if size == 65536 else 1024, concurrency,
+                                       live_leased_sync=sync)
+                for repeat in range(repeats):
+                    item = {key: value for key, value in source.items() if key != "diagnostics"}
+                    _clone_job(result, selection, item, group, value_size=size, repeat=repeat,
+                               **({"live_leased_flush_min_frame_bytes": minimum}
+                                  if minimum is not None else {}),
+                               **({"diagnostics": {"write_timeline_limit": 4096}}
+                                  if size == 65536 and repeat == 0 else {}))
+    for window, selected, repeats in ((None, (arms[0], arms[2]), 2),
+                                      (1, arms[:2], 1)):
+        for sync, minimum in selected:
+            source = _clone_source(sources, "G29X", "tidehunter_nvme_rdma", 65536, 16,
+                                   live_leased_sync=sync, live_leased_write_window=window,
+                                   owner_wal_file_bytes=268435456)
+            for repeat in range(repeats):
+                _clone_job(result, selection, source, "G31X", repeat=repeat,
+                           **({"live_leased_flush_min_frame_bytes": minimum}
+                              if minimum is not None else {}))
+    for size in (1024, 65536):
+        source = _clone_source(sources, "G29G", "tidehunter_nvme_rdma", size, 16,
+                               operation="read", live_io_queues=1, live_io_queue_size=32)
+        for queues, depth in ((1, 32), (4, 32), (4, 128)):
+            for concurrency in (16, 64):
+                for repeat in range(2 if concurrency == 16 else 1):
+                    _clone_job(result, selection, source, "G31G", concurrency=concurrency,
+                               repeat=repeat, live_io_queues=queues, live_io_queue_size=depth)
+    return result
+
+
+def _nvmeof_f7_highmem32(path):
+    """Keep matched -16 controls while measuring the reviewed -32 shape."""
+    result = []
+    selection = "nvmeof_f7_highmem32"
+    reads = _nvmeof_reads_geometry(path)
+    for group, size, concurrencies in (("G30R", 65536, (16, 64)),
+                                       ("G30S", 1024, (64,))):
+        for concurrency in concurrencies:
+            source = _clone_source(reads, "G24Q", "tidehunter_nvme_rdma",
+                                   size, concurrency, operation="read", drop_os_caches=False,
+                                   live_io_queues=4, live_io_queue_size=128)
+            for repeat in (0, 1):
+                _clone_job(result, selection, source, group, repeat=repeat,
+                           owner_trace=True)
+    source = _clone_source(_nvmeof_parallel_writes(path), "G23W",
+                           "tidehunter_nvme_rdma", 65536, 64,
+                           durability_tier="native", live_leased_write_window=None)
+    for repeat in (0, 1):
+        _clone_job(result, selection, source, "G30W", repeat=repeat)
+    for concurrency in (16, 64):
+        source = _clone_source(_valkey_rdma_reads(), "G25R", "valkey_rdma",
+                               65536, concurrency, repeat=0, operation="read")
+        _clone_job(result, selection, source, "G30V")
+    return result
+
+
 def _nvmeof_first_put(sources):
     """Keep the reviewed first-put checks in their canary-first order."""
     result = []
@@ -2072,6 +2146,10 @@ def make_focused_matrix(selection):
             return _nvmeof_single_caller(path)
         if selection == "nvmeof_f6":
             return _nvmeof_f6(path)
+        if selection == "nvmeof_f6b":
+            return _nvmeof_f6b(path)
+        if selection == "nvmeof_f7_highmem32":
+            return _nvmeof_f7_highmem32(path)
         if selection == "nvmeof_contracts_crossing2":
             return _nvmeof_contracts_crossing2(path)
         if selection == "nvmeof_contracts_crossing":
@@ -2562,15 +2640,17 @@ def qualify_live_nvme_measurement(evidence, job):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G29W", "G29X", "G24W", "G24M") and any(
+        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G29W", "G29X", "G31W", "G31H", "G31S", "G31X", "G30W", "G24W", "G24M") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
             if job["live_write_mode"] == "leased":
                 if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
                     reasons.append("leased write exchanges or frame count differ")
                 if job.get("live_leased_sync", "per_frame_fua") == "group_flush":
-                    if counters["fua_writes"] > counters["leased_frames"]:
-                        reasons.append("group flush FUA count exceeds frames")
-                    if job["concurrency"] in (16, 64) and (
+                    if counters["fua_writes"] > counters["leased_frames"] + counters["leased_skip_markers"]:
+                        reasons.append("group flush FUA count exceeds frames and skip markers")
+                    if (job["value_size"] == 65536 and job["concurrency"] in (16, 64)
+                            and job.get("live_leased_flush_min_frame_bytes", 0) <= job["value_size"] * job["concurrency"]
+                            and job.get("live_leased_write_window") != 1) and (
                             counters["leased_flushes"] <= 0
                             or counters["leased_flush_covered_frames"] <= counters["leased_flushes"]):
                         reasons.append("group flush did not cover shared frames")
@@ -2584,7 +2664,7 @@ def qualify_live_nvme_measurement(evidence, job):
         if (job.get("group") == "G29R" and job.get("live_pin_read_lanes")
                 and counters.get("read_lane_pin_failures") != 0):
             reasons.append("read lane pin failures observed")
-        if (job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R", "G24R", "G24Q", "G24L", "G24P", "G24S", "G24C", "G24M", "G25A", "G29R", "G29G")
+        if (job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R", "G24R", "G24Q", "G24L", "G24P", "G24S", "G24C", "G24M", "G25A", "G29R", "G29G", "G31G", "G30R", "G30S")
                 and job["backend"] == "tidehunter_nvme_rdma" and job["mix"]["read"] > 0):
             coordinator = (data.get("deltas") or {}).get("coordinator") or {}
             value = (coordinator.get("counters") or {}).get("read_profile_live_inline")
@@ -2658,6 +2738,11 @@ def qualify_live_nvme_measurement(evidence, job):
 def admit_live_write_contract(job, backend_info):
     if "live_leased_sync" in job and job["live_leased_sync"] not in ("per_frame_fua", "group_flush"):
         raise ValueError("invalid live_leased_sync")
+    if "live_leased_flush_min_frame_bytes" in job and (
+            type(job["live_leased_flush_min_frame_bytes"]) is not int
+            or job["live_leased_flush_min_frame_bytes"] < 0
+            or job.get("live_leased_sync") != "group_flush"):
+        raise ValueError("invalid live_leased_flush_min_frame_bytes")
     if "live_pin_read_lanes" in job and type(job["live_pin_read_lanes"]) is not bool:
         raise ValueError("invalid live_pin_read_lanes")
     if "live_leased_write_lanes" in job and (
@@ -2665,6 +2750,7 @@ def admit_live_write_contract(job, backend_info):
         raise ValueError("invalid live_leased_write_lanes")
     configuration = backend_info.get("configuration", {})
     for key, actual in (("live_leased_sync", configuration.get("live_leased_sync")),
+                        ("live_leased_flush_min_frame_bytes", configuration.get("live_leased_flush_min_frame_bytes")),
                         ("live_pin_read_lanes", configuration.get("client", {}).get("pin_read_lanes"))):
         if key in job and actual != job[key]:
             raise ValueError(key + " differs")
@@ -2679,7 +2765,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")

@@ -33,6 +33,23 @@ def config_fixture():
             "replication_factor": 1}}
 
 
+class F7PackageTests(unittest.TestCase):
+    def test_f7_requires_focused_valkey_package(self):
+        config = config_fixture()
+        config["spec"] = {"mode": "focused", "selection": "nvmeof_f7_highmem32"}
+        admission = {key: config[key] for key in
+                     ("source_sha256", "binary_sha256", "binary_blake2b512")}
+        admission["build_profile"] = "focused_valkey"
+        with patch("cloud_package.verify_directory", return_value=admission), \
+                patch.object(controller, "platform_module", return_value=None), \
+                patch.object(Path, "read_text", return_value=json.dumps(
+                    {"revision": config["source_revision"]})):
+            self.assertIsNone(controller.verify_package(config)["fdb"])
+            admission["build_profile"] = "focused"
+            with self.assertRaisesRegex(controller.SafetyError, "package profile"):
+                controller.verify_package(config)
+
+
 def instance_response(config):
     tags = {**controller.TAGS, "RunId": config["prefix"], "ExpiresAt": config["deadline_utc"]}
     return {"Reservations": [{"OwnerId": config["account"], "Instances": [

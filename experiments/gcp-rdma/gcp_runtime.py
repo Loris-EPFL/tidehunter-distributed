@@ -144,7 +144,7 @@ def validate_runtime(config):
             if mode != 'focused' or config['spec'].get('suite') != 'kv':
                 raise RuntimeSafetyError('compact fleet requires a focused KV selection')
             forbidden = {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'garnet', 'kvrocks'}
-            if config['spec'].get('selection') != 'valkey_rdma_reads':
+            if config['spec'].get('selection') not in ('valkey_rdma_reads', 'nvmeof_f7_highmem32'):
                 forbidden.add('valkey_rdma')
             if set(backends) & forbidden:
                 raise RuntimeSafetyError('backend requires five owner hosts')
@@ -250,7 +250,7 @@ def live_mode(spec):
 def admit_package_profile(spec, package):
     expected = None
     if spec.get('mode') == 'focused':
-        expected = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
+        expected = 'focused_valkey' if spec.get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32') else 'focused'
     if package.get('build_profile') != expected:
         raise RuntimeSafetyError('package build profile differs from campaign')
 
@@ -773,7 +773,7 @@ def _controller_config(runtime):
     package = runtime['package']
     if manifest['source_sha256'] != runtime['source_sha256'] or manifest['revision'] != package['source_revision']:
         raise RuntimeSafetyError('runtime manifest source mismatch')
-    if runtime['spec'].get('mode') == 'focused' and runtime['spec'].get('selection') == 'valkey_rdma_reads':
+    if runtime['spec'].get('mode') == 'focused' and runtime['spec'].get('selection') in ('valkey_rdma_reads', 'nvmeof_f7_highmem32'):
         import prepare
         prepare.admit_selected_features(runtime['spec'], manifest)
     elif runtime['spec'].get('mode') == 'focused':

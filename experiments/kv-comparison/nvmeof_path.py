@@ -38,7 +38,7 @@ RESULTS += ('owner_metadata_per_read', 'read_side_metadata')
 CPU_COLUMNS = ('owner_cpu_max_busy_pct', 'owner_cpu_mean_busy_pct',
                'owner_cpu_max_softirq_pct', 'owner_cpus_above_90_busy')
 RESULTS += (*CPU_COLUMNS, 'live_leased_sync', 'live_pin_read_lanes',
-            'leased_flushes', 'leased_flush_covered_frames')
+            'live_leased_flush_min_frame_bytes', 'leased_flushes', 'leased_flush_covered_frames')
 STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
 STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share', 'calls_with_pair', 'cond_mean_us', 'cond_p50_us', 'cond_p99_us')
 
@@ -150,6 +150,7 @@ def result_row(case, export):
     row['contract_class'] = contract_class(j)
     row['load_model'] = 'open_loop' if j.get('offered_ops_per_second') else 'closed_loop'
     row.update(live_leased_sync=j.get('live_leased_sync', 'per_frame_fua') if live(j) else None,
+               live_leased_flush_min_frame_bytes=j.get('live_leased_flush_min_frame_bytes', 0) if live(j) else None,
                live_pin_read_lanes=j.get('live_pin_read_lanes', False) if live(j) else None)
     cpu = load(directory.parent / 'owner-cpu.json')
     if cpu.get('available') is True:
