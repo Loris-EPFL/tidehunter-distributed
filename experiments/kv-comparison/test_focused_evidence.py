@@ -60,6 +60,32 @@ class FocusedEvidenceTests(unittest.TestCase):
                 "successful_reads": count, "read_ops_per_success": delta / count,
                 "history_loads_before": None, "history_loads_after": None,
                 "history_prewarm_verified": None}
+    def test_rest2_groups_preserve_read_media_and_write_device_admission(self):
+        jobs = cloud_campaign.make_focused_matrix("nvmeof_reads_geometry_rest2")
+        for job in jobs:
+            with self.subTest(case=job["case_id"], group=job["group"]):
+                self.job = job
+                self.receipt = {"measurement_evidence": {
+                    "gate_released": True, "completion_gate_observed": True}}
+                self.bind("phase_timing", {"schema_version": 1, "case_id": job["case_id"], "spans": []})
+                if job["group"] == "G24C":
+                    with self.assertRaisesRegex(ValueError, "media_evidence"):
+                        self.admit()
+                    media = self.media(0, job["measurement_operations"])
+                    media.update(case_id=job["case_id"], expected="memory")
+                    self.bind("media_evidence", media)
+                    self.assertEqual(self.admit()["media_evidence"]["status"], "qualified")
+                elif job["group"] == "G24W":
+                    row = {"owner_index": 0, "major": 259, "minor": 3, "read_ops": 0,
+                           "read_sectors": 0, "write_ops": 1, "write_sectors": 8}
+                    self.bind("device_counters", {"before": [row], "after": [{**row, "write_sectors": 16}]})
+                    admitted = self.admit()
+                    self.assertIn("device_counters", admitted)
+                    self.assertNotIn("media_evidence", admitted)
+                else:
+                    self.assertEqual(job["group"], "G24N")
+                    self.assertNotIn("media_evidence", self.admit())
+
     def test_live_read_requires_and_admits_media_evidence(self):
         self.job.update(case_kind="live_read")
         with self.assertRaisesRegex(ValueError, "completed case lacks requested media_evidence"):

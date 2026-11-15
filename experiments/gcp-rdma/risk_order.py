@@ -10,6 +10,7 @@ import cloud_campaign
 PARALLEL_WRITES_MATRIX_SHA256 = '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4'
 READS_GEOMETRY_MATRIX_SHA256 = 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea'
 READS_REST_MATRIX_SHA256 = 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935'
+READS_REST2_MATRIX_SHA256 = 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4'
 VALKEY_READS_MATRIX_SHA256 = 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2'
 
 
@@ -33,6 +34,9 @@ def validate_order(jobs, document):
     if (jobs and jobs[0].get('selection') == 'nvmeof_reads_geometry_rest'
             and digest != READS_REST_MATRIX_SHA256):
         raise ValueError('remaining read matrix differs from the reviewed digest')
+    if (jobs and jobs[0].get('selection') == 'nvmeof_reads_geometry_rest2'
+            and digest != READS_REST2_MATRIX_SHA256):
+        raise ValueError('read rest2 matrix differs from the reviewed digest')
     if (jobs and jobs[0].get('selection') == 'valkey_rdma_reads'
             and digest != VALKEY_READS_MATRIX_SHA256):
         raise ValueError('Valkey read matrix differs from the reviewed digest')

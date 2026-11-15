@@ -134,7 +134,7 @@ class ManualCampaignTest(unittest.TestCase):
 
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
@@ -151,6 +151,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
                     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
                     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
+                    'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
                     'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
                     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
                 }[selection])
@@ -2344,6 +2345,18 @@ class ReadsRestSuiTests(CombinedSuiAdmissionTests):
         self.assertEqual(spec['matrix_sha256'],
                          'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935')
         self.assertEqual(len(manual._reviewed_jobs(spec)), 20)
+        self.assertEqual(len(spec['sui_cells']), 4)
+
+
+class ReadsRest2SuiTests(CombinedSuiAdmissionTests):
+    spec_name = 'sui_nvmeof_with_reads_rest2'
+
+    def test_reads_rest2_combined_count_and_digest(self):
+        spec = self.sui.REVIEWED_SUI_SPECS[self.spec_name]
+        self.assertEqual(spec['job_count'], 18)
+        self.assertEqual(spec['matrix_sha256'],
+                         'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4')
+        self.assertEqual(len(manual._reviewed_jobs(spec)), 18)
         self.assertEqual(len(spec['sui_cells']), 4)
 
 

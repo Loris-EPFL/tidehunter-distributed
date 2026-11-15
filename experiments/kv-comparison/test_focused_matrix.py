@@ -14,8 +14,25 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_reads_rest2_excludes_mixed_without_changing_original_matrices(self):
+        original = campaign.make_focused_matrix("nvmeof_reads_geometry_rest")
+        jobs = campaign.make_focused_matrix("nvmeof_reads_geometry_rest2")
+        sources = [j for j in original if j["group"] in ("G24C", "G24W", "G24N")]
+        self.assertEqual(len(jobs), 18)
+        self.assertEqual(Counter(j["group"] for j in jobs), {"G24C": 6, "G24W": 8, "G24N": 4})
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                         "c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4")
+        self.assertEqual([j["case_id"] for j in jobs[:3]],
+                         ["G24C-r0-96a4d5f39a2d0c9116a5", "G24C-r0-1ced882cfac5c1ff87ec",
+                          "G24C-r0-3f5a4655a3f093b70a38"])
+        for job, source in zip(jobs, sources):
+            self.assertEqual({k: v for k, v in job.items() if k not in ("case_id", "selection")},
+                             {k: v for k, v in source.items() if k not in ("case_id", "selection")})
+            self.assertFalse(job["mix"]["read"] and job["mix"]["put"])
+            self.assertEqual(job["selection"], "nvmeof_reads_geometry_rest2")
+
     def test_g24_cache_allowance_matches_dataset_cache_arms(self):
-        for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest"):
+        for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2"):
             jobs = campaign.make_focused_matrix(selection)
             self.assertEqual(sum("coordinator_read_memory_allowance_bytes" in j for j in jobs), 2)
             for job in jobs:
@@ -54,7 +71,7 @@ class FocusedMatrixTests(unittest.TestCase):
                             self.assertLessEqual(visited, job["keys"])
 
     def test_g24_generated_configs_match_runtime_bounds(self):
-        for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest"):
+        for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2"):
             for job in campaign.make_focused_matrix(selection):
                 with self.subTest(selection=selection, case=job["case_id"]):
                     config = campaign.make_run_config(job, "/tmp/g24/" + job["case_id"], {}, "a" * 40)
@@ -403,7 +420,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}

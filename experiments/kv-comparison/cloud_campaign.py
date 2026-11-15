@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
 
 
 
@@ -722,7 +722,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
                   "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35,
                   "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "valkey_rdma_reads": 22,
-                  "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20}
+                  "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20, "nvmeof_reads_geometry_rest2": 18}
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -769,6 +769,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
+    "nvmeof_reads_geometry_rest2": {"G24C": 6, "G24W": 8, "G24N": 4},
     "valkey_rdma_reads": {"G25R": 12, "G25M": 2, "G25A": 8},
 }
 
@@ -1713,6 +1714,15 @@ def _nvmeof_reads_geometry_rest(path):
     return result
 
 
+def _nvmeof_reads_geometry_rest2(path):
+    """Retain the unfinished read/cache and write controls without mixed reads."""
+    result = []
+    for source in _nvmeof_reads_geometry_rest(path):
+        if source["group"] in ("G24C", "G24W", "G24N"):
+            _clone_job(result, "nvmeof_reads_geometry_rest2", source, source["group"])
+    return result
+
+
 def _nvmeof_parallel_writes(path):
     """Clone reviewed contract cells for the bounded leased-write window sweep."""
     sources = _nvmeof_contracts_crossing2(path)
@@ -1963,6 +1973,8 @@ def make_focused_matrix(selection):
             return _nvmeof_path_fix(path, make_focused_matrix("fabric_ab_compact"))
         if selection == "nvmeof_first_put":
             return _nvmeof_first_put(make_focused_matrix("nvmeof_path_fix"))
+        if selection == "nvmeof_reads_geometry_rest2":
+            return _nvmeof_reads_geometry_rest2(path)
         if selection == "nvmeof_reads_geometry_rest":
             return _nvmeof_reads_geometry_rest(path)
         if selection == "nvmeof_reads_geometry":
@@ -2523,7 +2535,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")
