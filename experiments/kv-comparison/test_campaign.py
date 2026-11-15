@@ -73,6 +73,29 @@ class AdmissionTests(unittest.TestCase):
         base["phases"]["measurement_operations"] = 1_000_000
         with self.assertRaisesRegex(ValueError, "exceeds supported"):
             campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
+
+    def test_ci_rss_budget_covers_native_owner_wal_lookahead(self):
+        root = Path(__file__).resolve().parents[2]
+        spec = json.loads((Path(__file__).with_name("ci.json")).read_text())
+        base = json.loads((Path(__file__).parent / spec["base_config"]).read_text())
+        job = next(job for job in campaign.matrix(spec) if job["backend"] == "tidehunter_tcp")
+        config = campaign.build_config(base, job, None, Path("/tmp/unused"), spec["seed"], True)
+        owners = config["backend"]["options"]["owners"]
+        fragment_mib, initial_maps_buffer = 128, 2
+        # Keep this bound tied to the actual native geometry and mapper lookahead.
+        self.assertIn("pub const NATIVE_FRAGMENT_BYTES: u64 = 128 * 1024 * 1024;",
+                      (root / "tidehunter/src/distributed/storage.rs").read_text())
+        self.assertIn("pub(super) const INITIAL_MAPS_BUFFER: usize = 2;",
+                      (root / "tidehunter/src/wal/mapper.rs").read_text())
+        wal_mib = owners * (1 + initial_maps_buffer) * fragment_mib
+        # Measured RSS: about 428 MiB/owner (384 MiB WAL + 44 MiB runtime),
+        # plus 61 MiB coordinator. Reserve 64 MiB/owner and 128 MiB coordinator,
+        # then add 25% margin and round up to 256 MiB: 3072 MiB for five owners.
+        overhead_mib = owners * 64 + 128
+        with_margin_mib = ((wal_mib + overhead_mib) * 5 + 3) // 4
+        required_mib = (with_margin_mib + 255) // 256 * 256
+        self.assertEqual(spec["client_memory_mib"], required_mib)
+
     def test_native_local_geometry_and_acknowledgement_are_explicit(self):
         base = {"dataset": {}, "phases": {"preload": True, "warmup_operations": 10,
                 "aging_operations": 0, "measurement_operations": 100}, "execution": {}, "limits": {}}
