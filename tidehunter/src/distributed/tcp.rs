@@ -275,14 +275,24 @@ pub enum PollingPolicy {
     Busy,
 }
 
+/// Budget for the bounded initial-fence metadata chain: 11 synchronous fsyncs
+/// (Preparing manifest 2, epoch directory 1, WAL file/directory 2, registration 2,
+/// WAL root 2, Active manifest 2) at 3 s each, plus 1.5 s for the initial mmap.
+/// The 3 s allowance adds about 30% to the measured 2.308668 s contended fsync.
+/// This is not a completion bound for sealing arbitrarily many retained files
+/// or revoking many exports. Larger explicitly configured timeouts still apply.
+/// Data requests, including read/write grants and position proofs, do not use it.
+pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(34_500);
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TcpLimits {
     pub max_frame_bytes: usize,
     pub max_connections: usize,
     pub max_reads: usize,
     pub recovery_page_batches: usize,
-    /// Handshake, partial-frame, and accepted-request timeout; established
-    /// authenticated sessions may remain idle without expiring.
+    /// Handshake, partial-frame, and accepted-data-request timeout; lifecycle
+    /// requests use at least [`LIFECYCLE_TIMEOUT`]. Established authenticated
+    /// sessions may remain idle without expiring.
     pub io_timeout: Duration,
     #[serde(default)]
     pub polling: PollingPolicy,
@@ -704,6 +714,67 @@ enum Request {
     ReadRamProbe,
 }
 impl Request {
+    /// Startup/recovery negotiation and durable epoch/retirement maintenance
+    /// have a different contract from data-path control messages. In particular,
+    /// a grant, adoption or position proof must not extend its caller's data SLA.
+    fn timeout(&self, data_timeout: Duration) -> Duration {
+        let lifecycle = match self {
+            Self::Checkpoint { .. }
+            | Self::RetirementFiles { .. }
+            | Self::RetireFiles { .. }
+            | Self::Status { .. }
+            | Self::Fence { .. }
+            | Self::Recover { .. }
+            | Self::Seal { .. }
+            | Self::ReplayWal { .. }
+            | Self::RetireWalFiles { .. } => true,
+            Self::Append { .. }
+            | Self::Read { .. }
+            | Self::ReadProfiled { .. }
+            | Self::ReadIoStats
+            | Self::Stats
+            | Self::StatsDetailed
+            | Self::ConnectionProfile { .. }
+            | Self::OperationalReadIoStats
+            | Self::OwnerTimelineArm { .. }
+            | Self::OwnerTimelineFetch { .. }
+            | Self::CheckpointPosition { .. } => false,
+            #[cfg(feature = "experimental-nvmeof")]
+            Self::ValidateRecordReferences { .. } => false,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Self::RecoverLiveMetadata { .. }
+            | Self::ShutdownLiveTarget { .. }
+            | Self::OpenLiveExports { .. }
+            | Self::ReplayLiveWal { .. } => true,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Self::RegisterNvmeofExport { .. }
+            | Self::ReleaseNvmeofExport { .. }
+            | Self::RegisterNvmeofEpochPin { .. }
+            | Self::ReleaseNvmeofEpochPin { .. }
+            | Self::ReleaseLiveEpochPin { .. }
+            | Self::ReserveLiveGroup { .. }
+            | Self::CompleteLiveGroup { .. }
+            | Self::ResolveLiveRecords { .. }
+            | Self::LiveTargetStats
+            | Self::LeaseLiveExtent { .. }
+            | Self::AdoptLiveExtent { .. }
+            | Self::PreleaseLiveExtent { .. } => false,
+            #[cfg(all(target_os = "linux", feature = "test-utils"))]
+            Self::ReadEvidence { evict, .. } => *evict,
+            #[cfg(all(target_os = "linux", feature = "test-utils"))]
+            Self::ProcessResources { .. } => false,
+            #[cfg(feature = "test-utils")]
+            Self::PrepareRamProbe { .. } => true,
+            #[cfg(feature = "test-utils")]
+            Self::ReadRamProbe => false,
+        };
+        if lifecycle {
+            data_timeout.max(LIFECYCLE_TIMEOUT)
+        } else {
+            data_timeout
+        }
+    }
+
     fn is_measurement_control(&self) -> bool {
         match self {
             Self::Stats

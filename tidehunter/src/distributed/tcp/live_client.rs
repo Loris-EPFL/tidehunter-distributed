@@ -3243,6 +3243,13 @@ pub(crate) mod leased_tests {
             );
             eprintln!("local filesystem or kernel rejects polled writes: errno={errno:?}");
         };
+        let unsupported_write = |client: &mut Client, error: super::super::TcpError| {
+            assert_eq!(error.to_string(), "leased write failed");
+            let io = &mut client.live_writer.as_mut().unwrap().io;
+            unsupported(io.last_write_errno());
+            assert_eq!(io.outstanding(), 0);
+            assert!(io.shutdown().unwrap().is_empty());
+        };
         for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
             let fixture = Fixture::new(tier, 16384);
             let mut client = fixture.writer_without_ahead();
@@ -3286,15 +3293,14 @@ pub(crate) mod leased_tests {
                 &WriteTimeline::default(),
                 2,
             ) {
-                assert_eq!(error.to_string(), "leased write failed");
-                let io = &mut client.live_writer.as_mut().unwrap().io;
-                unsupported(io.last_write_errno());
-                assert_eq!(io.outstanding(), 0);
-                assert!(io.shutdown().unwrap().is_empty());
+                unsupported_write(&mut client, error);
                 return;
             }
             let cursor = client.live_leased.current.as_ref().unwrap().cursor;
-            client.write_leased_skip().unwrap();
+            if let Err(error) = client.write_leased_skip() {
+                unsupported_write(&mut client, error);
+                return;
+            }
             assert_eq!(client.live_writer.as_ref().unwrap().io.outstanding(), 0);
             assert_eq!(fixture.metrics.snapshot().counts.completed_write_ops, 2);
             let counts = fixture.metrics.snapshot().counts;
@@ -3311,7 +3317,13 @@ pub(crate) mod leased_tests {
             let mut marker = [0; 8];
             std::os::unix::fs::FileExt::read_exact_at(&file, &mut marker, cursor).unwrap();
             assert_eq!(&marker, crate::crc::CrcFrame::skip_marker().as_ref());
-            client.close_live_writer(&mut Vec::new(), None).unwrap();
+            // Local IOPOLL can reject an already-written block at close too,
+            // not just ring setup or the first write. Keep the documented
+            // unsupported outcome through the final closing skip as well.
+            if let Err(error) = client.close_live_writer(&mut Vec::new(), None) {
+                unsupported_write(&mut client, error);
+                return;
+            }
             let log = fixture.node.inventory.lock().active(1).unwrap();
             assert_eq!(log.receipt_count(), 1);
         }

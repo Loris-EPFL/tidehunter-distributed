@@ -73,6 +73,8 @@ pub struct WalIterator {
     wal: Arc<Wal>,
     maps: WalMaps,
     map: Map,
+    /// Bytes covered by EOF when the current map was made, before its extension.
+    map_existing_bytes: usize,
     position: u64,
     skip_crc: bool,
     /// When false, the iterator does not populate `maps` (each fragment
@@ -674,14 +676,14 @@ impl Wal {
         self.maps.load().get(id).cloned()
     }
 
-    /// Resize file to fit the specified map id
-    fn extend_to_map_id(layout: &WalLayout, file: &File, map_id: MapId) -> io::Result<()> {
+    /// Resize to fit the map, returning EOF before this extension.
+    fn extend_to_map_id(layout: &WalLayout, file: &File, map_id: MapId) -> io::Result<u64> {
         let end = Self::map_end_in_file(layout, map_id);
         let len = file.metadata()?.len();
         if len < end {
             file.set_len(end)?;
         }
-        Ok(())
+        Ok(len)
     }
 
     /// Whether `file` is long enough to hold all of fragment `map_id`.
@@ -945,7 +947,7 @@ impl WalIterator {
         let mut maps = WalMaps::default();
         let (map_id, _) = wal.layout.locate(position);
         let files = wal.files.load();
-        let map = Self::make_map(
+        let (map, map_existing_bytes) = Self::make_map(
             &wal.layout,
             map_id,
             &files,
@@ -960,6 +962,7 @@ impl WalIterator {
             wal,
             position,
             map,
+            map_existing_bytes,
             skip_crc: false,
             for_writer,
         })
@@ -991,7 +994,7 @@ impl WalIterator {
         let (map_id, offset) = self.wal.layout.locate(self.position);
         if self.map.id != map_id {
             let files = self.wal.files.load();
-            let Some(map) = Self::make_map(
+            let Some((map, map_existing_bytes)) = Self::make_map(
                 &self.wal.layout,
                 map_id,
                 &files,
@@ -1004,6 +1007,7 @@ impl WalIterator {
                 return Err(WalError::EndOfWal);
             };
             self.map = map;
+            self.map_existing_bytes = map_existing_bytes;
         }
         if self.skip_crc {
             Ok(CrcFrame::read_unchecked_from_bytes(
@@ -1030,7 +1034,7 @@ impl WalIterator {
         wal_mmap_bytes: MetricIntGauge,
         for_writer: bool,
         retained: bool,
-    ) -> Result<Option<Map>, WalError> {
+    ) -> Result<Option<(Map, usize)>, WalError> {
         // Check if the file still exists before trying to extend it.
         // GC may have removed the file asynchronously (via the mapper thread)
         // between iterator steps.
@@ -1039,19 +1043,23 @@ impl WalIterator {
         };
         if retained {
             return WalMaps::create_retained_map(file, layout, map_id, wal_mmap_bytes)
+                .map(|map| {
+                    map.map(|map| {
+                        let existing_bytes = map.data.len();
+                        (map, existing_bytes)
+                    })
+                })
                 .map_err(WalError::from);
         }
-        Wal::extend_to_map_id(layout, file, map_id)?;
-        if for_writer {
-            Ok(Some(maps.map(file, layout, map_id, wal_mmap_bytes).clone()))
+        let old_len = Wal::extend_to_map_id(layout, file, map_id)?;
+        let map = if for_writer {
+            maps.map(file, layout, map_id, wal_mmap_bytes).clone()
         } else {
-            Ok(Some(WalMaps::create_map(
-                file,
-                layout,
-                map_id,
-                wal_mmap_bytes,
-            )))
-        }
+            WalMaps::create_map(file, layout, map_id, wal_mmap_bytes)
+        };
+        let start = layout.offset_in_wal_file(layout.map_range(map_id).start);
+        let existing_bytes = old_len.saturating_sub(start).min(layout.frag_size) as usize;
+        Ok(Some((map, existing_bytes)))
     }
 
     /// Restores the read window over historical fragments before this
@@ -1192,20 +1200,24 @@ impl WalIterator {
     /// doesn't exist; the writer that takes over from this iterator
     /// will create the file lazily via the mapper thread when its first
     /// write lands there.
-    fn clear_fragment_from_position(&self, position: u64) {
+    fn clear_fragment_from_position(&self, position: u64) -> usize {
         let (map_id, offset) = self.wal.layout.locate(position);
         if map_id != self.map.id {
-            return;
+            return 0;
         }
 
-        let map_range = self.wal.layout.map_range(map_id);
-        let fragment_size = (map_range.end - map_range.start) as usize;
-        let bytes_to_zero = fragment_size - offset as usize;
+        // Only the suffix that existed at map time can contain stale frames.
+        // open_file may already have rounded EOF up; clearing those extra zero
+        // bytes is harmless. Never dirty the map's new sparse extension: after
+        // a crash before the first write, either the old length survives or the
+        // extension reads as zero, so replay still stops at the first zero header.
+        let bytes_to_zero = self.map_existing_bytes.saturating_sub(offset as usize);
 
         if bytes_to_zero > 0 {
             let buf = write_buf_at(&self.map.data, offset as usize, bytes_to_zero);
             buf.fill(0);
         }
+        bytes_to_zero
     }
 
     pub fn wal(&self) -> &Wal {
@@ -1321,6 +1333,151 @@ mod tests {
     use crate::wal::position::WalFileId;
     use bytes::{BufMut, BytesMut};
     use std::collections::HashSet;
+
+    #[test]
+    fn writer_initialization_clears_only_bytes_before_extension() {
+        for old_len in [0, 512, 2048] {
+            let dir = tempdir::TempDir::new("wal-zero-extension").unwrap();
+            let layout = index_layout(4, 16 * 4096);
+            let wal = Wal::open(dir.path(), layout, Metrics::new()).unwrap();
+            wal.files.load().current_file().set_len(old_len).unwrap();
+            let iterator = wal.wal_iterator_for_writer(0).unwrap();
+            assert_eq!(
+                iterator.clear_fragment_from_position(0),
+                usize::try_from(old_len.min(wal.layout.frag_size)).unwrap(),
+                "newly extended bytes must not receive zero-fill writes",
+            );
+            assert!(iterator.map.data.iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn writer_initialization_clears_stale_frames_after_recovered_position() {
+        let dir = tempdir::TempDir::new("wal-stale-tail").unwrap();
+        let layout = index_layout(4, 16 * 4096);
+        let first = {
+            let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+            let writer = wal.writer_after(None).unwrap();
+            let first = writer
+                .write(&PreparedWalWrite::new(&vec![1; 100]))
+                .unwrap()
+                .into_wal_position();
+            for value in [2, 3] {
+                writer
+                    .write(&PreparedWalWrite::new(&vec![value; 100]))
+                    .unwrap()
+                    .into_wal_position();
+            }
+            wal.fsync().unwrap();
+            first
+        };
+        {
+            let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+            let writer = wal.writer_after(Some(first)).unwrap();
+            writer
+                .write(&PreparedWalWrite::new(&vec![4; 8]))
+                .unwrap()
+                .into_wal_position();
+            wal.fsync().unwrap();
+        }
+        let wal = Wal::open(dir.path(), layout, Metrics::new()).unwrap();
+        let mut iterator = wal.wal_iterator_for_scan(0).unwrap();
+        assert_eq!(iterator.next().unwrap().1.as_ref(), &[1; 100]);
+        assert_eq!(iterator.next().unwrap().1.as_ref(), &[4; 8]);
+        assert!(iterator.next().is_err(), "stale frames must not replay");
+    }
+
+    #[test]
+    fn writer_initialization_clears_stale_next_fragment_after_iterator_advances() {
+        for advance_iterator in [false, true] {
+            let dir = tempdir::TempDir::new("wal-stale-next-fragment").unwrap();
+            let layout = index_layout(4, 16 * 4096);
+            let first = {
+                let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+                let writer = wal.writer_after(None).unwrap();
+                let first = writer
+                    .write(&PreparedWalWrite::new(&vec![1; 1016]))
+                    .unwrap()
+                    .into_wal_position();
+                writer
+                    .write(&PreparedWalWrite::new(&vec![2; 100]))
+                    .unwrap()
+                    .into_wal_position();
+                wal.fsync().unwrap();
+                first
+            };
+            let wal = Wal::open(dir.path(), layout, Metrics::new()).unwrap();
+            let position = wal.layout.next_after_wal_position(first);
+            let iterator = if advance_iterator {
+                let mut iterator = wal.wal_iterator_for_writer(0).unwrap();
+                iterator.next().unwrap();
+                assert_eq!(iterator.position, position);
+                // Map the next fragment without accepting its stale frame.
+                assert_eq!(iterator.read_one().unwrap().as_ref(), &[2; 100]);
+                iterator
+            } else {
+                wal.wal_iterator_for_writer(position).unwrap()
+            };
+            assert_eq!(iterator.map.id, MapId(1));
+            assert_eq!(iterator.clear_fragment_from_position(position), 1024);
+            let writer = iterator.into_writer(None);
+            writer
+                .write(&PreparedWalWrite::new(&vec![3; 8]))
+                .unwrap()
+                .into_wal_position();
+            wal.fsync().unwrap();
+            let mut scan = wal.wal_iterator_for_scan(0).unwrap();
+            assert_eq!(scan.next().unwrap().1.as_ref(), &[1; 1016]);
+            assert_eq!(scan.next().unwrap().1.as_ref(), &[3; 8]);
+            assert!(
+                scan.next().is_err(),
+                "stale next-fragment frames must not replay"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess entry point for writer_initialization_recovers_extension_before_first_write"]
+    fn writer_initialization_extension_crash_child() {
+        let path = std::env::var_os("TH_WAL_EXTENSION_CRASH_PATH").unwrap();
+        let path = Path::new(&path);
+        let wal = Wal::open(path, index_layout(4, 16 * 4096), Metrics::new()).unwrap();
+        let _iterator = wal.wal_iterator_for_writer(0).unwrap();
+        wal.fsync().unwrap();
+        File::open(path).unwrap().sync_all().unwrap();
+        // Exit without dropping the mapping, as after a process crash.
+        std::process::exit(47);
+    }
+
+    #[test]
+    fn writer_initialization_recovers_extension_before_first_write() {
+        let dir = tempdir::TempDir::new("wal-extension-crash").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wal::tests::writer_initialization_extension_crash_child",
+                "--ignored",
+            ])
+            .env("TH_WAL_EXTENSION_CRASH_PATH", dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(47), "{output:?}");
+        let wal = Wal::open(dir.path(), index_layout(4, 16 * 4096), Metrics::new()).unwrap();
+        let mut iterator = wal.wal_iterator_for_writer(0).unwrap();
+        assert!(
+            iterator.next().is_err(),
+            "the extended WAL contains no frame"
+        );
+        // These bytes existed before reopen; retain the old recovery clear.
+        assert_eq!(iterator.clear_fragment_from_position(0), 1024);
+        let writer = iterator.into_writer(None);
+        let position = writer
+            .write(&PreparedWalWrite::new(&vec![5; 100]))
+            .unwrap()
+            .into_wal_position();
+        wal.fsync().unwrap();
+        assert_eq!(wal.read(position).unwrap().1.unwrap().as_ref(), &[5; 100]);
+    }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]

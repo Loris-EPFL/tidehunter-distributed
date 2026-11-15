@@ -148,6 +148,110 @@ fn collect(
 }
 
 #[test]
+fn correlated_data_read_keeps_five_second_deadline_under_stall() {
+    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
+    let mut client = server.client();
+    client.timeout = Duration::from_secs(5);
+    let (_, references) = server.data(&mut client);
+    let (entered, entries) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let released = Mutex::new(released);
+    *server.node.read_hook.lock() = Some(Arc::new(move |_| {
+        entered.send(()).unwrap();
+        released
+            .lock()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+    }));
+    let deadline = Instant::now() + client.timeout;
+    client
+        .submit_read(1, vec![references[0]], deadline, false)
+        .unwrap()
+        .unwrap();
+    let admission_deadline = Instant::now() + Duration::from_secs(2);
+    while entries.try_recv().is_err() {
+        client.progress_reads().unwrap();
+        assert!(
+            Instant::now() < admission_deadline,
+            "read did not enter stall"
+        );
+        thread::yield_now();
+    }
+    // Advance only the deadline-check clock; no wall-clock sleep is needed.
+    client
+        .progress_correlated_at(deadline - Duration::from_nanos(1))
+        .unwrap();
+    let result = client.progress_correlated_at(deadline + Duration::from_nanos(1));
+    release.send(()).unwrap();
+    server.node.read_hook.lock().take();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("remote operation deadline expired")
+    );
+}
+
+#[test]
+fn correlated_lifecycle_control_expires_at_its_separate_deadline_under_stall() {
+    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
+    let mut client = server.client();
+    client.timeout = Duration::from_secs(5);
+    let request = Request::Fence { epoch: 1 };
+    assert_eq!(request.timeout(client.timeout), LIFECYCLE_TIMEOUT);
+    assert_eq!(
+        request.timeout(Duration::from_secs(60)),
+        Duration::from_secs(60),
+        "an explicitly larger lifecycle budget must not shrink",
+    );
+    let inventory = server.node.inventory.lock();
+    let started = Instant::now();
+    let deadline = started + request.timeout(client.timeout);
+    assert!(client.submit_control(&request, deadline).unwrap());
+    client
+        .progress_correlated_at(started + Duration::from_secs(5))
+        .unwrap();
+    client
+        .progress_correlated_at(deadline - Duration::from_nanos(1))
+        .unwrap();
+    let result = client.progress_correlated_at(deadline + Duration::from_nanos(1));
+    drop(inventory);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("remote operation deadline expired")
+    );
+}
+
+#[test]
+fn correlated_position_proof_keeps_data_deadline_under_stall() {
+    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
+    let mut client = server.client();
+    client.timeout = Duration::from_secs(5);
+    client.fence_to(1).unwrap();
+    let inventory = server.node.inventory.lock();
+    let deadline = client.position_deadline();
+    assert!(deadline <= Instant::now() + Duration::from_secs(5));
+    assert!(
+        client
+            .submit_checkpoint_position(1, 1, 0, deadline)
+            .unwrap()
+    );
+    client
+        .progress_correlated_at(deadline - Duration::from_nanos(1))
+        .unwrap();
+    let result = client.progress_correlated_at(deadline + Duration::from_nanos(1));
+    drop(inventory);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("remote operation deadline expired")
+    );
+}
+
+#[test]
 fn status_shape_mismatch_names_request_and_both_sha256_values() {
     let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
     let different = KeyShape::new_single(4, 1024, KeyType::uniform(1));

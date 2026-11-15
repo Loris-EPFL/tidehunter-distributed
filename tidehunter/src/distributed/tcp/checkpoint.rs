@@ -134,6 +134,10 @@ impl PrefixDigest {
 
 impl Client {
     pub(crate) fn checkpoint_deadline(&self) -> Instant {
+        Instant::now() + self.timeout.max(LIFECYCLE_TIMEOUT)
+    }
+
+    pub(crate) fn position_deadline(&self) -> Instant {
         Instant::now() + self.timeout
     }
 
