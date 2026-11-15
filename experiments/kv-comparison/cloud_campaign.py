@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry")
 
 
 
@@ -714,21 +714,22 @@ def make_read_tier_matrix(spec, backends, diagnostics):
 
 FOCUSED_SELECTIONS = ("recommended", "full", "device", "floors", "stages", "unified",
                       "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner",
-                      "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", *NVMEOF_PATH_SELECTIONS)
+                      "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS)
 FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "stages": 183, "ssd_write": 18, "unified": 270, "append_floors": 48,
                   "fair_native": 168, "parity": 216, "parity_compact": 177, "fair_five_owner": 39,
                   "remote_rw_compact": 342, "fabric_ab_compact": 80, "leased_ab_compact": 72,
                   "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
                   "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35,
-                  "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44}
+                  "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "valkey_rdma_reads": 22,
+                  "nvmeof_reads_geometry": 74}
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
                                 "target_io", "live_write_mode", "live_export_mode", "live_inline_reads",
                                 "live_io_queues", "live_io_queue_size", "live_poll_queues",
                                 "live_lease_ahead", "live_polled_writes")
-NVMEOF_PATH_OPTIONAL_LIVE_SETTING_KEYS = ("live_leased_write_window",)
+NVMEOF_PATH_OPTIONAL_LIVE_SETTING_KEYS = ("live_leased_write_window", "live_max_inflight_requests")
 NVMEOF_PATH_SETTING_KEYS = {
     "native": NVMEOF_PATH_NATIVE_SETTING_KEYS,
     "tidehunter_verbs_native": NVMEOF_PATH_REMOTE_SETTING_KEYS,
@@ -764,12 +765,15 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_contracts_crossing": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 1},
     "nvmeof_contracts_crossing2": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 2},
     "nvmeof_parallel_writes": {"G23W": 32, "G23X": 6, "G23N": 6},
+    "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
+                              "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
+    "valkey_rdma_reads": {"G25R": 12, "G25M": 2, "G25A": 8},
 }
 
 
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
-    return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", *NVMEOF_PATH_SELECTIONS) else 5
+    return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) else 5
 
 
 def job_owner_hosts(job):
@@ -788,7 +792,7 @@ def focused_group_counts(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
     groups = dict(_FOCUSED_GROUP_COUNTS[selection])
-    if selection in ("stages", "unified", "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", *NVMEOF_PATH_SELECTIONS):
+    if selection in ("stages", "unified", "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         jobs = make_focused_matrix(selection)
         for kind in {job["case_kind"] for job in jobs}:
             groups[kind] = sum(job["case_kind"] == kind for job in jobs)
@@ -1640,6 +1644,62 @@ def _nvmeof_contracts_crossing2(path):
     return result
 
 
+def _nvmeof_reads_geometry(path):
+    """Vary bounded read resources without changing dataset identities."""
+    sources = _nvmeof_contracts(path)
+    result = []
+    selection = "nvmeof_reads_geometry"
+    def read(group, size=1024, cold=False, concurrency=16, lanes=None, **extra):
+        source = _clone_source(sources, "G21R", "tidehunter_nvme_rdma", size,
+                               1 if concurrency == 1 else 16, operation="read",
+                               drop_os_caches=cold)
+        return _clone_job(result, selection, source, group, concurrency=concurrency,
+                          read_lanes=lanes if lanes is not None else (1 if concurrency == 1 else 4),
+                          live_max_inflight_requests=128, **extra)
+    for size in (1024, 65536):
+        for cold in (False, True):
+            for concurrency in (1, 16, 64):
+                for repeat in (0, 1):
+                    read("G24R", size, cold, concurrency, repeat=repeat)
+    for queues in (1, 4, 16):
+        for size in (1024, 65536):
+            for cold in (False, True):
+                for concurrency in (16, 64):
+                    read("G24Q", size, cold, concurrency,
+                         live_io_queues=queues, live_io_queue_size=128)
+    for lanes in (1, 8):
+        read("G24L", concurrency=64, lanes=lanes, live_io_queues=4, live_io_queue_size=128)
+    for concurrency in (16, 64):
+        read("G24P", concurrency=concurrency, live_io_queues=4,
+             live_io_queue_size=128, live_poll_queues=1)
+    for queues, depth in ((1, 32), (4, 128)):
+        read("G24S", live_io_queues=queues, live_io_queue_size=depth,
+             diagnostics={"read_profile_limit": 4096})
+    for size in (1024, 65536):
+        read("G24M", size, live_io_queues=4, live_io_queue_size=128,
+             mix={"read": 50, "put": 50, "delete": 0, "put_batch": 0, "get_many": 0},
+             durability_tier="synchronous", live_leased_write_window=1)
+        for cache, distribution in ((8 * 1024**2, "uniform"),
+                                    (8 * 1024**2, {"zipf": {"exponent": 0.99}}),
+                                    (128 * 1024**2 if size == 1024 else 6 * 1024**3, "uniform")):
+            read("G24C", size, coordinator_cache_bytes=cache, distribution=distribution)
+    for concurrency in (16, 64):
+        source = _clone_source(sources, "G21W", "tidehunter_nvme_rdma", 65536, 16,
+                               durability_tier="synchronous", diagnostics=None)
+        for queues, depth in ((1, 32), (4, 128)):
+            for window in (1, None):
+                _clone_job(result, selection, source, "G24W", concurrency=concurrency,
+                           read_lanes=4, live_io_queues=queues, live_io_queue_size=depth,
+                           live_max_inflight_requests=128,
+                           **({"live_leased_write_window": window} if window is not None else {}))
+        for size in (1024, 65536):
+            source = _clone_source(path, "G18N", "native", size, 16, operation="read",
+                                   drop_os_caches=False)
+            _clone_job(result, selection, source, "G24N", concurrency=concurrency,
+                       live_max_inflight_requests=128)
+    return result
+
+
 def _nvmeof_parallel_writes(path):
     """Clone reviewed contract cells for the bounded leased-write window sweep."""
     sources = _nvmeof_contracts_crossing2(path)
@@ -1721,9 +1781,51 @@ def _nvmeof_first_put(sources):
     return result
 
 
+VALKEY_ANCHOR_GEOMETRY = (4, 128)
+
+
+def _valkey_rdma_reads():
+    """One standalone RAM-read primary and matched live TideHunter anchors."""
+    result = []
+    sources = make_focused_matrix("nvmeof_contracts")
+    for size in (1024, 65536):
+        source = _clone_source(sources, "G21R", "tidehunter_nvme_rdma", size, 16,
+                               operation="read", drop_os_caches=False)
+        for concurrency in (1, 16, 64):
+            for repeat in (0, 1):
+                job = copy.deepcopy(source)
+                for key in tuple(job):
+                    if key.startswith("live_") or key.startswith("nvmeof_") or key in (
+                            "sealed_dataset", "history_persistence", "owner_polling",
+                            "owner_wal_geometry", "media", "durability_tier"):
+                        job.pop(key)
+                job.update(backend="valkey_rdma", owner_count=1, repeat=repeat,
+                           concurrency=concurrency, read_lanes=1, target_io="not_applicable",
+                           case_kind="standard", profile="read-concurrent",
+                           cohort="primary_rf1", warmup_operations=65536,
+                           warmup_key_sweep=True)
+                job = {key: value for key, value in job.items() if value is not None or key == "offered_ops_per_second"}
+                _clone_job(result, "valkey_rdma_reads", job, "G25R")
+        mixed = copy.deepcopy(result[-1])
+        mixed.update(concurrency=16, repeat=0, profile="point-mixed",
+                     mix=mix(read=50, put=50))
+        _clone_job(result, "valkey_rdma_reads", mixed, "G25M")
+        for concurrency in (16, 64):
+            for queues, depth in ((1, 32), VALKEY_ANCHOR_GEOMETRY):
+                clean = {key: value for key, value in source.items()
+                         if value is not None or key == "offered_ops_per_second"}
+                _clone_job(result, "valkey_rdma_reads", clean, "G25A",
+                           concurrency=concurrency, read_lanes=4,
+                           live_io_queues=queues, live_io_queue_size=depth,
+                           live_max_inflight_requests=128)
+    return result
+
+
 def make_focused_matrix(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
+    if selection == "valkey_rdma_reads":
+        return _valkey_rdma_reads()
     jobs = _focused_jobs()
     ids = [job["case_id"] for job in jobs]
     if len(ids) != len(set(ids)):
@@ -1848,6 +1950,8 @@ def make_focused_matrix(selection):
             return _nvmeof_path_fix(path, make_focused_matrix("fabric_ab_compact"))
         if selection == "nvmeof_first_put":
             return _nvmeof_first_put(make_focused_matrix("nvmeof_path_fix"))
+        if selection == "nvmeof_reads_geometry":
+            return _nvmeof_reads_geometry(path)
         if selection == "nvmeof_parallel_writes":
             return _nvmeof_parallel_writes(path)
         if selection == "nvmeof_contracts_crossing2":

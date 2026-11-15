@@ -32,7 +32,7 @@ class Plans(unittest.TestCase):
                     layout.validate_fleet(candidate)
         compact = copy.deepcopy(value)
         compact["nodes"] = compact["nodes"][:1]
-        for backend in layout.BACKENDS:
+        for backend in (name for name in layout.BACKENDS if name != "valkey_rdma"):
             with self.subTest(backend=backend):
                 with self.assertRaisesRegex(ValueError, "five owner hosts"):
                     layout.node_config(compact, backend, 0)
@@ -40,6 +40,8 @@ class Plans(unittest.TestCase):
                     layout.backend_options(compact, backend, "/tmp")
                 with self.assertRaisesRegex(ValueError, "five owner hosts"):
                     layout.build_plan(compact, backend)
+        with self.assertRaisesRegex(ValueError, "admitted matched package"):
+            layout.build_plan(compact, "valkey_rdma")
         compact["nodes"][0]["index"] = 1
         with self.assertRaises(ValueError):
             layout.validate_fleet(compact)
@@ -63,6 +65,39 @@ class Plans(unittest.TestCase):
             self.assertEqual(tcp_node["native_valkey"]["args"][0], rdma_node["native_valkey"]["args"][0])
         with self.assertRaises(ValueError):
             layout.backend_options(fleet(), "valkey_rdma", "/tmp")
+
+    def test_single_owner_rdma_is_standalone_with_tcp_control(self):
+        value = fleet()
+        value["nodes"] = value["nodes"][:1]
+        value["valkey_rdma_package"] = True
+        value["nodes"][0]["rdma_address"] = "10.2.0.1"
+        metadata = {"source_commit": "fe8d406c0b5a64ec897f6455e4de684629883764",
+                    "artifacts": {"src/valkey-server": {"sha256": "a" * 64}}}
+        with patch.object(layout.valkey_service, "identity", return_value=metadata):
+            plan = layout.build_plan(value, "valkey_rdma")
+            with self.assertRaisesRegex(ValueError, "node index"):
+                layout.node_config(value, "valkey_rdma", 1)
+        self.assertEqual(plan["physical_storage_hosts"], 1)
+        self.assertEqual(plan["backend_options"], {
+            "nodes": ["10.2.0.1:6380"], "cluster": False, "required_replication_factor": 1,
+            "required_primary_nodes": 1, "request_timeout_ms": 5000})
+        self.assertEqual(len(plan["nodes"]), 2)
+        coordinator, owner = plan["nodes"]
+        self.assertIsNone(coordinator["native_valkey"])
+        self.assertEqual(coordinator["containers"], [])
+        self.assertEqual(coordinator["client_budget"], {"cpus": 4, "memory_mib": 8192})
+        self.assertEqual(owner["containers"], [])
+        argv = owner["native_valkey"]["args"]
+        for key, expected in (("--bind", "10.1.0.21"), ("--port", "6379"),
+                              ("--rdma-bind", "10.2.0.1"), ("--rdma-port", "6380"),
+                              ("--appendonly", "yes"),
+                              ("--appendfsync", "always"), ("--no-appendfsync-on-rewrite", "no")):
+            self.assertEqual(argv[argv.index(key) + 1], expected)
+        self.assertNotIn("--cluster-port", argv)
+        self.assertNotIn("--cluster-enabled", argv)
+        for config in plan["nodes"]:
+            self.assertNotIn("--initialize", config["actions"]["probe"])
+            self.assertNotIn("--cluster", config["actions"]["probe"])
 
     def test_pinned_runnable_bind_mounts_and_equal_storage_caps(self):
         for backend in (name for name in layout.BACKENDS if name != "valkey_rdma"):

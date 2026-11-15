@@ -12,6 +12,69 @@ ci_prepare = prepare.ci_prepare
 
 
 class FocusedPackageTest(unittest.TestCase):
+    def test_focused_valkey_container_propagates_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(package, 'command', return_value='sha256:' + 'a' * 64), \
+                    patch.object(ci_prepare, 'bounded') as bounded, \
+                    patch.object(prepare, 'remove_build_container'):
+                prepare.container_build(root, root, 'builder', 3600, 100000, True,
+                                        focused_valkey=True)
+            self.assertEqual(bounded.call_args.args[0][-2:], ['1', '2'])
+
+    def test_focused_valkey_cli_propagates_profile(self):
+        argv = ['cloud_package.py', 'build', '--snapshot', 'snapshot', '--output', 'build',
+                '--fabric-prefix', 'fabric', '--valkey-source', 'valkey', '--focused-valkey']
+        with patch('sys.argv', argv), patch.object(package, 'build', return_value={}) as build, \
+                patch('builtins.print'):
+            package.main()
+        self.assertTrue(build.call_args.kwargs['focused_valkey'])
+        self.assertFalse(build.call_args.kwargs['focused'])
+        self.assertIsNone(build.call_args.args[2])
+
+    def test_focused_valkey_requires_exact_features_and_staged_artifacts(self):
+        spec = {'suite': 'kv', 'mode': 'focused', 'selection': 'valkey_rdma_reads',
+                'backends': ['valkey_rdma']}
+        files = dict.fromkeys(('runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
+                               'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json',
+                               'source/experiments/kv-comparison/nvme_campaign_owner.py'), {})
+        manifest = {'build_profile': 'focused_valkey',
+                    'features': package.FOCUSED_VALKEY_FEATURES, 'files': files}
+        prepare.admit_selected_features(spec, manifest)
+        for change in ({'build_profile': 'focused'}, {'features': package.FEATURES + ['valkey-rdma']},
+                       {'features': package.FOCUSED_FEATURES}, {'files': {}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                prepare.admit_selected_features(spec, {**manifest, **change})
+
+    def test_focused_valkey_build_receipt_binds_profile_and_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'kv-research').write_bytes(b'binary')
+            (root / 'build.log').write_bytes(b'build')
+            binary = {'identity': package.identity(root / 'kv-research'), 'needed': ['libfabric.so.1']}
+            source = {'snapshot_sha256': 'a' * 64, 'tree_sha256': 'b' * 64}
+            valkey = {'source_commit': package.VALKEY_COMMIT}
+            receipt = {'schema_version': 1, 'source_sha256': source['snapshot_sha256'],
+                       'source_tree_sha256': source['tree_sha256'],
+                       'features': package.FOCUSED_VALKEY_FEATURES, 'valkey_rdma': valkey,
+                       'target': package.TARGET, 'cpu': 'x86-64', 'runtime_efa': package.EFA,
+                       'binary': binary, 'fdb': None, 'build_log': package.identity(root / 'build.log'),
+                       'build_profile': 'focused_valkey',
+                       'build_command': ['cargo', '--no-default-features', '--features',
+                                         ','.join(package.FOCUSED_VALKEY_FEATURES)]}
+            with patch.object(package, 'admit_source', return_value=source), \
+                    patch.object(package, 'elf_identity', return_value=binary), \
+                    patch.object(package, 'valkey_source_identity', return_value=valkey):
+                (root / 'build.json').write_text(json.dumps(receipt))
+                package.admit_build(root, root, None, root, focused_valkey=True)
+                for change in ({'features': package.FEATURES + ['valkey-rdma']},
+                               {'build_profile': 'focused'}, {'fdb': {}}, {'valkey_rdma': None}):
+                    (root / 'build.json').write_text(json.dumps({**receipt, **change}))
+                    with self.subTest(change=change), self.assertRaises(ValueError):
+                        package.admit_build(root, root, None, root, focused_valkey=True)
+                with self.assertRaises(ValueError):
+                    package.admit_build(root, root, None, focused_valkey=True)
+
     def test_focused_build_receipt_rejects_other_features_or_fdb(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -35,6 +35,9 @@ SAMPLE_SECONDS = 2.0
 POLL_SECONDS = 0.1
 CLEANUP_RESERVE = 5.0
 KILL_RESERVE = 1.0
+# A storage node removes its live NVMe-oF target only on a stop-file exit;
+# SIGTERM ends it at once and leaves configfs objects for the next cell.
+STOP_GRACE_SECONDS = 30.0
 
 
 def bounded_text(path, limit):
@@ -478,8 +481,8 @@ class NodeOwner:
                 if exit_status(record['child']) is not None:
                     self.fail('namespace exited before requested shutdown')
         self.stopping = True
-        # Stop-file handling is advisory; TERM/KILL always target only our
-        # unreaped child-led groups, including descendants of an exited leader.
+        # Children get STOP_GRACE_SECONDS to exit on the stop file; TERM/KILL then
+        # target only our unreaped child-led groups, including descendants of an exited leader.
         for record in self.children:
             try:
                 path = Path(record['stop'])
@@ -489,6 +492,11 @@ class NodeOwner:
                 pass
             except OSError as error:
                 self.fail('namespace stop-file write failed: ' + type(error).__name__)
+        end = time.monotonic() + min(STOP_GRACE_SECONDS, max(0, self.remaining() - KILL_RESERVE - 3))
+        while time.monotonic() < end:
+            if all(exit_status(record['child']) is not None for record in self.children):
+                break
+            time.sleep(min(POLL_SECONDS, max(0, end - time.monotonic())))
         self.signal_groups(signal.SIGTERM)
         end = time.monotonic() + min(3, max(0, self.remaining() - KILL_RESERVE))
         while time.monotonic() < end:

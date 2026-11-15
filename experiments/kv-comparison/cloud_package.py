@@ -24,6 +24,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "garnet", "kvrocks", "fabric", "nvmeof", "test-utils"]
 FOCUSED_FEATURES = ["fabric", "nvmeof", "test-utils"]
+FOCUSED_VALKEY_FEATURES = FOCUSED_FEATURES + ["valkey-rdma"]
 FOCUSED_SOURCE_CLOSURE = frozenset({
     "experiments/gcp-rdma/gcp_image_qualify.py", "experiments/gcp-rdma/gcp_image.py",
     "experiments/gcp-rdma/gcp_image_receipt.py", "experiments/gcp-rdma/gcp_qualify_bootstrap.py",
@@ -452,13 +453,18 @@ def valkey_source_identity(source):
 
 
 def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_source=None, target_dir=None,
-          *, focused=False):
+          *, focused=False, focused_valkey=False):
     if platform.machine() != "x86_64" or version_tuple(command(["getconf", "GNU_LIBC_VERSION"]).split()[-1]) > MAX_GLIBC:
         raise ValueError("build host must be x86_64 and glibc<=2.39; use Dockerfile.cloud-build")
     if not 1 <= timeout <= 7200:
         raise ValueError("build timeout must be 1..7200 seconds")
-    if type(focused) is not bool or focused and (valkey_source is not None or fdb_prefix is not None):
-        raise ValueError("focused build forbids external-store runtimes")
+    if (type(focused) is not bool or type(focused_valkey) is not bool
+            or focused and focused_valkey
+            or focused and (valkey_source is not None or fdb_prefix is not None)
+            or focused_valkey and (valkey_source is None or fdb_prefix is not None)):
+        raise ValueError("focused profiles require exact external-store dependencies")
+    profile = "focused_valkey" if focused_valkey else "focused"
+    focused = focused or focused_valkey
     snapshot_dir, fabric_prefix = (p.resolve(strict=True) for p in (snapshot_dir, fabric_prefix))
     if not focused:
         fdb_prefix = fdb_prefix.resolve(strict=True)
@@ -473,7 +479,7 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_
         raise ValueError("Cargo cache must be an existing directory")
     fdb = None if focused else fdb_identity(fdb_prefix)
     valkey = valkey_source_identity(valkey_source) if valkey_source is not None else None
-    features = list(FOCUSED_FEATURES) if focused else FEATURES + (["valkey-rdma"] if valkey else [])
+    features = list(FOCUSED_VALKEY_FEATURES if focused_valkey else FOCUSED_FEATURES) if focused else FEATURES + (["valkey-rdma"] if valkey else [])
     environment = clean_environment()
     if focused:
         for key in ("FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH", "LIBRARY_PATH"):
@@ -538,18 +544,23 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_
                "builder_recipe_sha256": metadata["sha256"].get(
                    os.environ.get("CLOUD_PACKAGE_BUILDER_RECIPE", "experiments/kv-comparison/Dockerfile.cloud-build"))}
     if focused:
-        receipt["build_profile"] = "focused"
+        receipt["build_profile"] = profile
     dump(output / "build.json", receipt)
     return receipt
 
 
-def admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source=None, *, focused=False):
+def admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source=None, *, focused=False, focused_valkey=False):
     source = admit_source(snapshot_dir)
     receipt = json.loads((build_dir / "build.json").read_text())
-    if type(focused) is not bool or focused and (valkey_source is not None or fdb_prefix is not None):
-        raise ValueError("focused build forbids external-store runtimes")
+    if (type(focused) is not bool or type(focused_valkey) is not bool
+            or focused and focused_valkey
+            or focused and (valkey_source is not None or fdb_prefix is not None)
+            or focused_valkey and (valkey_source is None or fdb_prefix is not None)):
+        raise ValueError("focused profiles require exact external-store dependencies")
+    profile = "focused_valkey" if focused_valkey else "focused"
+    focused = focused or focused_valkey
     valkey = valkey_source_identity(valkey_source) if valkey_source is not None else None
-    features = list(FOCUSED_FEATURES) if focused else FEATURES + (["valkey-rdma"] if valkey else [])
+    features = list(FOCUSED_VALKEY_FEATURES if focused_valkey else FOCUSED_FEATURES) if focused else FEATURES + (["valkey-rdma"] if valkey else [])
     if (receipt.get("schema_version") != 1 or receipt.get("source_sha256") != source["snapshot_sha256"]
             or receipt.get("source_tree_sha256") != source["tree_sha256"] or receipt.get("features") != features
             or receipt.get("valkey_rdma") != valkey
@@ -560,9 +571,9 @@ def admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source=None, *, focu
         raise ValueError("source/build/native-client binding differs")
     if focused:
         argv = receipt.get("build_command", [])
-        if (receipt.get("build_profile") != "focused" or "libfdb_c.so" in receipt["binary"]["needed"]
+        if (receipt.get("build_profile") != profile or "libfdb_c.so" in receipt["binary"]["needed"]
                 or not isinstance(argv, list) or "--no-default-features" not in argv
-                or argv.count("--features") != 1 or argv[argv.index("--features") + 1:][:1] != [",".join(FOCUSED_FEATURES)]):
+                or argv.count("--features") != 1 or argv[argv.index("--features") + 1:][:1] != [",".join(features)]):
             raise ValueError("focused build command or binary profile mismatch")
     elif "build_profile" in receipt:
         raise ValueError("unexpected focused build profile")
@@ -631,8 +642,11 @@ def admit_nvmet_assets(directory, files, declared):
 
 
 def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None, spdk_prefix=None, nvmet_fix_prefix=None,
-          *, focused=False):
-    source, receipt = admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source, focused=focused)
+          *, focused=False, focused_valkey=False):
+    source, receipt = admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source,
+                                  focused=focused, focused_valkey=focused_valkey)
+    profile = "focused_valkey" if focused_valkey else "focused"
+    focused = focused or focused_valkey
     if inventory(repo.resolve(strict=True)) != source["sha256"]:
         raise ValueError("checkout changed after source freeze; snapshot and rebuild latest sources")
     output.mkdir(parents=True, exist_ok=False)
@@ -684,7 +698,7 @@ def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None,
                 "paths": {"repository_root": "source", "binary": "runtime/bin/kv-research", "fdb_library_dir": "runtime/lib"},
                 "runtime_efa": EFA, "files": {name: identity(path) for name, path in sorted(files.items())}}
     if focused:
-        manifest["build_profile"] = "focused"
+        manifest["build_profile"] = profile
     if nvmet_fix is not None:
         manifest["nvmet_fix"] = nvmet_fix
     dump(output / "manifest.json", manifest)
@@ -704,25 +718,26 @@ def verify_directory(directory, runtime=False, provider="aws"):
         raise ValueError("unknown runtime provider")
     manifest = json.loads((directory / "manifest.json").read_text())
     files = manifest["files"]
-    focused = manifest.get("build_profile") == "focused"
+    profile = manifest.get("build_profile")
+    focused = profile in {"focused", "focused_valkey"}
     if "build_profile" in manifest and not focused:
         raise ValueError("unknown runtime build profile")
     if focused and runtime and provider != "gcp":
         raise ValueError("focused runtime is only admitted for GCP")
     if (manifest.get("schema_version") != 1
-            or manifest.get("features") not in ((FOCUSED_FEATURES,) if focused else (FEATURES, FEATURES + ["valkey-rdma"]))
+            or manifest.get("features") not in ((FOCUSED_VALKEY_FEATURES if profile == "focused_valkey" else FOCUSED_FEATURES,) if focused else (FEATURES, FEATURES + ["valkey-rdma"]))
             or manifest.get("runtime_efa") != EFA or len(files) > MAX_FILES):
         raise ValueError("runtime manifest schema/features/provider mismatch")
     if manifest.get("paths") != {"repository_root": "source", "binary": "runtime/bin/kv-research", "fdb_library_dir": "runtime/lib"}:
         raise ValueError("runtime manifest paths differ from package interface")
     required_files = {"source.zip", "source.json", "build.json", "build.log", "runtime/bin/kv-research"}
     if focused:
-        forbidden = {"runtime/lib/libfdb_c.so", "runtime/fdb-client.json", "runtime/valkey-rdma.json"}
-        if any(name in forbidden or name.startswith("runtime/bin/valkey-") for name in files):
+        forbidden = {"runtime/lib/libfdb_c.so", "runtime/fdb-client.json"}
+        if any(name in forbidden or (profile == "focused" and (name == "runtime/valkey-rdma.json" or name.startswith("runtime/bin/valkey-"))) for name in files):
             raise ValueError("focused runtime contains external-store binaries")
     else:
         required_files |= {"runtime/lib/libfdb_c.so", "runtime/fdb-client.json"}
-    if manifest["features"] == FEATURES + ["valkey-rdma"]:
+    if "valkey-rdma" in manifest["features"]:
         required_files |= {"runtime/bin/valkey-server", "runtime/bin/valkey-cli",
                            "runtime/bin/valkey-benchmark", "runtime/valkey-rdma.json"}
     if required_files - files.keys():
@@ -761,10 +776,10 @@ def verify_directory(directory, runtime=False, provider="aws"):
     roots = [elf_identity(binary)]
     if focused:
         argv = build_receipt.get("build_command", [])
-        if (build_receipt.get("build_profile") != "focused" or build_receipt.get("fdb") is not None
+        if (build_receipt.get("build_profile") != profile or build_receipt.get("fdb") is not None
                 or "libfdb_c.so" in roots[0]["needed"] or not isinstance(argv, list)
                 or "--no-default-features" not in argv or argv.count("--features") != 1
-                or argv[argv.index("--features") + 1:][:1] != [",".join(FOCUSED_FEATURES)]):
+                or argv[argv.index("--features") + 1:][:1] != [",".join(manifest["features"])]):
             raise ValueError("focused runtime build profile or ELF dependencies differ")
     else:
         if "build_profile" in build_receipt:
@@ -793,7 +808,7 @@ def verify_directory(directory, runtime=False, provider="aws"):
               "binary_blake2b512": manifest["binary_blake2b512"], "runtime_checked": runtime,
               "abi": abi_requirements(roots)}
     if focused:
-        result["build_profile"] = "focused"
+        result["build_profile"] = profile
     if spdk is not None:
         result["spdk"] = spdk
     if nvmet_fix is not None:
@@ -872,6 +887,7 @@ def main():
     compile_parser.add_argument("--output", type=Path, required=True)
     compile_parser.add_argument("--fdb-prefix", type=Path)
     compile_parser.add_argument("--focused", action="store_true")
+    compile_parser.add_argument("--focused-valkey", action="store_true")
     compile_parser.add_argument("--fabric-prefix", type=Path, required=True)
     compile_parser.add_argument("--timeout", type=int, default=5400)
     compile_parser.add_argument("--valkey-source", type=Path)
@@ -882,6 +898,7 @@ def main():
     pack.add_argument("--build", type=Path, required=True)
     pack.add_argument("--fdb-prefix", type=Path)
     pack.add_argument("--focused", action="store_true")
+    pack.add_argument("--focused-valkey", action="store_true")
     pack.add_argument("--output", type=Path, required=True)
     pack.add_argument("--valkey-source", type=Path)
     pack.add_argument("--spdk-prefix", type=Path)
@@ -898,15 +915,16 @@ def main():
         result = snapshot(args.repo, args.output)
         result = {k: v for k, v in result.items() if k != "sha256"}
     elif args.action == "build":
-        if not args.focused and args.fdb_prefix is None:
+        if not (args.focused or args.focused_valkey) and args.fdb_prefix is None:
             parser.error("--fdb-prefix is required for a full build")
         result = build(args.snapshot, args.output, args.fdb_prefix, args.fabric_prefix, args.timeout,
-                       args.valkey_source, args.target_dir, focused=args.focused)
+                       args.valkey_source, args.target_dir, focused=args.focused, focused_valkey=args.focused_valkey)
     elif args.action == "stage":
-        if not args.focused and args.fdb_prefix is None:
+        if not (args.focused or args.focused_valkey) and args.fdb_prefix is None:
             parser.error("--fdb-prefix is required for a full package")
         result = stage(args.repo, args.snapshot, args.build, args.fdb_prefix, args.output,
-                       args.valkey_source, args.spdk_prefix, args.nvmet_fix_prefix, focused=args.focused)
+                       args.valkey_source, args.spdk_prefix, args.nvmet_fix_prefix,
+                       focused=args.focused, focused_valkey=args.focused_valkey)
         result = {k: v for k, v in result.items() if k != "files"}
     else:
         if args.archive:

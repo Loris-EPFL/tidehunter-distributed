@@ -11,6 +11,20 @@ import nvme_campaign_native
 
 
 class CompactReadLifecycleTests(unittest.TestCase):
+    def test_live_request_bound_preparation(self):
+        from test_cloud_controller import config_fixture
+        config = config_fixture()
+        config["spec"].update(mode="focused", selection="nvmeof_reads_geometry")
+        jobs = controller.cloud_campaign.make_focused_matrix("nvmeof_reads_geometry")
+        prep = controller.live_nvme_preparation(config, jobs[0]["case_id"], "rdma")
+        self.assertEqual(prep["max_inflight_requests"], 128)
+        self.assertEqual(prep["max_inflight_bytes"], 64 * 1024**2)
+        for value in (0, 1025, True, None):
+            with patch.object(controller.cloud_campaign, "make_focused_matrix",
+                              return_value=[dict(jobs[0], live_max_inflight_requests=value)]):
+                with self.assertRaises(controller.SafetyError):
+                    controller.live_nvme_preparation(config, jobs[0]["case_id"], "rdma")
+
     def test_nvmeof_path_reviewed_cases_pass_compact_admission(self):
         from test_cloud_controller import config_fixture, clients_fixture
         for selection in controller.cloud_campaign.NVMEOF_PATH_SELECTIONS:

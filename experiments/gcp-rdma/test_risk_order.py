@@ -11,6 +11,21 @@ import risk_order
 
 
 class RiskOrderTests(unittest.TestCase):
+    def test_reads_geometry_pins_and_order(self):
+        import manual_campaign
+        jobs = risk_order.cloud_campaign.make_focused_matrix("nvmeof_reads_geometry")
+        digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(digest, risk_order.READS_GEOMETRY_MATRIX_SHA256)
+        spec = manual_campaign.REVIEWED_SPECS["nvmeof_reads_geometry"]
+        self.assertEqual(spec["suite"], "kv")
+        self.assertEqual(spec["job_count"], 74)
+        self.assertEqual(spec["matrix_sha256"], digest)
+        document = {"matrix_sha256": digest, "planned_cases": 74,
+                    "case_ids": [j["case_id"] for j in jobs]}
+        self.assertTrue(risk_order.validate_order(jobs, document))
+        with self.assertRaises(ValueError):
+            risk_order.validate_order(jobs, {**document, "case_ids": document["case_ids"][::-1]})
+
     def setUp(self):
         self.jobs = [
             {'case_id': 'a', 'backend': 'tidehunter_tcp', 'sealed_dataset': {'source_id': 's'}},

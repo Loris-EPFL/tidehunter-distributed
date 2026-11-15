@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
 import cloud_campaign
 
 PARALLEL_WRITES_MATRIX_SHA256 = '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4'
+READS_GEOMETRY_MATRIX_SHA256 = '0e8129a38e338651ea3a3a4df2698a0bc550262457aaf8a2fa501ef35ded2fec'
+VALKEY_READS_MATRIX_SHA256 = '784c732c8f9c641d6e5e594a1bc271fcccd69fb90e534fbaa6dd995ef9f07cfc'
 
 
 def dataset_identity(job):
@@ -24,6 +26,12 @@ def validate_order(jobs, document):
     if (jobs and jobs[0].get('selection') == 'nvmeof_parallel_writes'
             and digest != PARALLEL_WRITES_MATRIX_SHA256):
         raise ValueError('parallel-write matrix differs from the reviewed digest')
+    if (jobs and jobs[0].get('selection') == 'nvmeof_reads_geometry'
+            and digest != READS_GEOMETRY_MATRIX_SHA256):
+        raise ValueError('read geometry matrix differs from the reviewed digest')
+    if (jobs and jobs[0].get('selection') == 'valkey_rdma_reads'
+            and digest != VALKEY_READS_MATRIX_SHA256):
+        raise ValueError('Valkey read matrix differs from the reviewed digest')
     if document.get('matrix_sha256') != digest or document.get('planned_cases') != len(jobs):
         raise ValueError('order does not bind the admitted matrix')
     original = [job['case_id'] for job in jobs]
@@ -34,6 +42,8 @@ def validate_order(jobs, document):
         raise ValueError('order must be an exact matrix permutation')
     if jobs and jobs[0].get('selection') == 'fair_native' and ordered[0] != original[0]:
         raise ValueError('fair native canary must run first')
+    if jobs and jobs[0].get('selection') == 'valkey_rdma_reads' and ordered != original:
+        raise ValueError('Valkey read order must match the reviewed matrix')
     # Membership includes contracts, crossing and parallel-window jobs: they retain one exact reviewed order.
     if jobs and all(job.get('selection') in ('fabric_ab_compact', 'leased_ab_compact', *cloud_campaign.NVMEOF_PATH_SELECTIONS) for job in jobs) and ordered != original:
         raise ValueError('reviewed A/B order must match the reviewed matrix')
@@ -60,6 +70,11 @@ def validate_order(jobs, document):
 
 def generate_order(jobs):
     """Prioritize live storage risks without splitting or reordering sealed sources."""
+    if jobs and jobs[0].get('selection') == 'valkey_rdma_reads':
+        document = {'matrix_sha256': VALKEY_READS_MATRIX_SHA256,
+                    'planned_cases': len(jobs), 'case_ids': [job['case_id'] for job in jobs]}
+        validate_order(jobs, document)
+        return document
     blocks, seen = [], {}
     for job in jobs:
         identity = dataset_identity(job)

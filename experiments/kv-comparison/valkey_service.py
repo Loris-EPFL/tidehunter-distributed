@@ -1,4 +1,4 @@
-"""Exact-owned systemd Valkey process for a packaged matched TCP/RDMA pair."""
+"""Exact-owned systemd Valkey process with TCP control and RDMA data listeners."""
 import hashlib
 import json
 import os

@@ -57,6 +57,21 @@ def deadline():
 
 
 class SelectedBackendRuntimeTests(unittest.TestCase):
+    def test_focused_package_profile_is_selection_specific(self):
+        for selection, expected, rejected in (
+                ('valkey_rdma_reads', 'focused_valkey', 'focused'),
+                ('nvmeof_reads_geometry', 'focused', 'focused_valkey')):
+            spec = {'mode': 'focused', 'selection': selection}
+            with self.subTest(selection=selection):
+                runtime.admit_package_profile(spec, {'build_profile': expected})
+                with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'package build profile'):
+                    runtime.admit_package_profile(spec, {'build_profile': rejected})
+                with self.assertRaises(runtime.RuntimeSafetyError):
+                    runtime.admit_package_profile(spec, {})
+        runtime.admit_package_profile({'mode': 'standard'}, {})
+        with self.assertRaises(runtime.RuntimeSafetyError):
+            runtime.admit_package_profile({'mode': 'standard'}, {'build_profile': 'focused_valkey'})
+
     def test_controller_rejects_each_missing_selected_store_feature(self):
         backends = ['tikv', 'cassandra', 'foundationdb', 'garnet', 'kvrocks']
         with tempfile.TemporaryDirectory() as directory:

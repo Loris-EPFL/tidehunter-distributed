@@ -486,6 +486,8 @@ class CloudNodeContract(unittest.TestCase):
         self.assertNotIn('io', final_process)
         self.assertEqual(final_process['unavailable']['process'], 'exited_and_reaped')
         self.assertLessEqual(len(result['samples']), cloud_node.MAX_SAMPLES)
+        # Storage nodes remove their live NVMe-oF targets only on a stop-file exit, not on SIGTERM.
+        self.assertEqual([record['exit_code'] for record in owner.children], [0] * len(owner.children))
 
     def test_final_receipt_failure_cannot_publish_complete_resources(self):
         owner = self.owner()

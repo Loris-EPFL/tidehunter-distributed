@@ -22,13 +22,19 @@ mkdir -p "$HOME"
 bash "$engine/.github/scripts/setup.sh" fabric
 args=()
 if [[ $with_valkey == 1 ]]; then
-    python3 "$engine/experiments/kv-comparison/prepare_valkey_rdma.py" --output "$output/valkey-source" --cq-diagnostics
+    if [[ $focused != 2 ]]; then
+        python3 "$engine/experiments/kv-comparison/prepare_valkey_rdma.py" --output "$output/valkey-source" --cq-diagnostics
+    fi
     args+=(--valkey-source "$output/valkey-source")
 fi
-if [[ $focused == 1 ]]; then
+if [[ $focused == 1 || $focused == 2 ]]; then
+    profile=--focused
+    if [[ $focused == 2 ]]; then
+        profile=--focused-valkey
+    fi
     exec python3 "$engine/experiments/kv-comparison/cloud_package.py" build \
         --snapshot "$output/snapshot" --output "$output/build" \
-        --fabric-prefix "$output/fabric" --focused \
+        --fabric-prefix "$output/fabric" "$profile" \
         --timeout "$build_timeout" "${args[@]}"
 fi
 exec python3 "$engine/experiments/kv-comparison/cloud_package.py" build \

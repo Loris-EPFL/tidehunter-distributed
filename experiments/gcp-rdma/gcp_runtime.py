@@ -143,7 +143,10 @@ def validate_runtime(config):
         else:
             if mode != 'focused' or config['spec'].get('suite') != 'kv':
                 raise RuntimeSafetyError('compact fleet requires a focused KV selection')
-            if set(backends) & {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
+            forbidden = {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'garnet', 'kvrocks'}
+            if config['spec'].get('selection') != 'valkey_rdma_reads':
+                forbidden.add('valkey_rdma')
+            if set(backends) & forbidden:
                 raise RuntimeSafetyError('backend requires five owner hosts')
             import workflow_input
             selection = config['spec'].get('selection')
@@ -242,6 +245,14 @@ def live_mode(spec):
     from workflow_input import cloud_campaign
     return (spec.get('mode') == 'standard-with-live-nvmeof'
             or (spec.get('mode') == 'focused' and spec.get('selection') in ('leased_ab_compact', *cloud_campaign.NVMEOF_PATH_SELECTIONS)))
+
+
+def admit_package_profile(spec, package):
+    expected = None
+    if spec.get('mode') == 'focused':
+        expected = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
+    if package.get('build_profile') != expected:
+        raise RuntimeSafetyError('package build profile differs from campaign')
 
 
 def admit_live_qualification(runtime):
@@ -734,9 +745,7 @@ def bootstrap_guest(config, index, clients):
     package = cloud_package.verify_directory(Path(config['platform']['runtime']['package_root']), runtime=True, provider='gcp')
     if package['source_sha256'] != config['source_sha256'] or package['binary_sha256'] != config['binary_sha256']:
         raise RuntimeSafetyError('package identity differs from controller')
-    focused = config['spec'].get('mode') == 'focused'
-    if (package.get('build_profile') == 'focused') is not focused:
-        raise RuntimeSafetyError('package build profile differs from campaign')
+    admit_package_profile(config['spec'], package)
     nvmet_fix = admit_nvmet_fix(config['platform']['runtime'],
                                 {'name': identity['name'], 'id': identity['instance_id']}, package)
     unit_admission = admit_guest_unit(config, index)

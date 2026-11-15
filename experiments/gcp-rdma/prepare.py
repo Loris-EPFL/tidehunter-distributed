@@ -32,14 +32,21 @@ def checkout(repo, revision, allow_dirty=False):
 def admit_selected_features(spec, manifest):
     if spec.get('suite') == 'sui':
         return
+    profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
     if spec.get('mode') == 'focused':
-        if (manifest.get('build_profile') != 'focused'
-                or manifest.get('features') != cloud_package.FOCUSED_FEATURES):
-            raise ValueError('focused package requires exact TideHunter build features')
+        features = (cloud_package.FOCUSED_VALKEY_FEATURES if profile == 'focused_valkey'
+                    else cloud_package.FOCUSED_FEATURES)
+        if manifest.get('build_profile') != profile or manifest.get('features') != features:
+            raise ValueError('focused package requires exact selected build features')
     required = set(spec['backends']) & {'tikv', 'cassandra', 'foundationdb', 'garnet', 'kvrocks'}
     if not required <= set(manifest.get('features', [])):
         raise ValueError('packaged binary lacks selected industry backend features')
     artifacts = set()
+    if 'valkey_rdma' in spec['backends']:
+        if 'valkey-rdma' not in manifest.get('features', []):
+            raise ValueError('packaged binary lacks selected Valkey RDMA feature')
+        artifacts |= {'runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
+                      'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json'}
     if gcp_runtime.live_mode(spec):
         artifacts.add('source/experiments/kv-comparison/nvme_campaign_owner.py')
     if spec.get('spdk_comparison'):
@@ -86,7 +93,7 @@ def remove_build_container(name, owner):
         raise RuntimeError(f'build container cleanup failed: {removed.stderr}')
 
 
-def container_build(engine, output, image_name, timeout, deadline, with_valkey, *, focused=False):
+def container_build(engine, output, image_name, timeout, deadline, with_valkey, *, focused=False, focused_valkey=False):
     image = cloud_package.command(['docker', 'image', 'inspect', '--format', '{{.Id}}', image_name])
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
         raise ValueError('Docker did not resolve the build image to an immutable image ID')
@@ -109,8 +116,8 @@ def container_build(engine, output, image_name, timeout, deadline, with_valkey, 
             '--env', 'TIDEHUNTER_GCP_BUILD_CHILD=0',
             image, 'bash', str(engine / 'experiments/gcp-rdma/build-container.sh'),
             str(engine), str(output), str(timeout), '1' if with_valkey else '0']
-    if focused:
-        argv.append('1')
+    if focused or focused_valkey:
+        argv.append('2' if focused_valkey else '1')
     try:
         ci_prepare.bounded(argv, deadline - 1200)
     finally:
@@ -138,6 +145,9 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     spec = json.loads(Path(spec_path).read_text()) if spec_path is not None else {}
     import manual_sui
     focused = manual_sui.focused_qualification(spec)
+    focused_valkey = spec.get('selection') == 'valkey_rdma_reads'
+    focused = focused or focused_valkey
+    profile_args = {'focused_valkey': True} if focused_valkey else ({'focused': True} if focused else {})
     if focused:
         import manual_campaign
         manual_campaign._reviewed_jobs(spec)
@@ -165,10 +175,17 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
         spec = json.loads(Path(spec_path).read_text())
         if spec.get('suite') != 'sui' and ('valkey_rdma' in spec['backends'] or
                 ('valkey_tcp' in spec['backends'] and spec.get('diagnostics', {}).get('valkey_profile_limit', 0))):
-            valkey_source = output / 'valkey-source'
-            if not build_container:
-                ci_prepare.bounded([sys.executable, engine / 'experiments/kv-comparison/prepare_valkey_rdma.py',
-                                    '--output', valkey_source, '--cq-diagnostics'], deadline)
+            if focused_valkey:
+                valkey_source = engine.parent / 'checkpoint-work/gcp-manual-qualified-b35a62e24b47faaf/valkey-source'
+                cloud_package.valkey_source_identity(valkey_source)
+                if build_container:
+                    shutil.copytree(valkey_source, output / 'valkey-source')
+                    valkey_source = output / 'valkey-source'
+            else:
+                valkey_source = output / 'valkey-source'
+                if not build_container:
+                    ci_prepare.bounded([sys.executable, engine / 'experiments/kv-comparison/prepare_valkey_rdma.py',
+                                        '--output', valkey_source, '--cq-diagnostics'], deadline)
     fdb = None if focused else output / 'fdb-client'
     if not focused:
         ci_prepare.bounded([sys.executable, engine / 'experiments/kv-comparison/local.py', 'prepare-fdb', '--prefix', fdb], deadline)
@@ -182,10 +199,10 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
         raise TimeoutError('no build and qualification reserve remains')
     if build_container:
         container_build(engine, output, build_container, remaining, deadline, valkey_source is not None,
-                        **({'focused': True} if focused else {}))
+                        **profile_args)
     else:
         cloud_package.build(snapshot, build, fdb, fabric, timeout=remaining, valkey_source=valkey_source,
-                            **({'focused': True} if focused else {}))
+                            **profile_args)
     if build_container:
         built = json.loads((build / 'build.json').read_text())
         admit_rocky9_abi(cloud_package.abi_requirements(
@@ -199,7 +216,7 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     package = output / 'package'
     cloud_package.stage(engine, snapshot, build, fdb, package,
                         valkey_source=valkey_source, spdk_prefix=spdk_prefix, nvmet_fix_prefix=nvmet_fix_prefix,
-                        **({'focused': True} if focused else {}))
+                        **profile_args)
     if (package / 'bundle.tar.gz').stat().st_size > 512 << 20:
         raise ValueError('compressed KV runtime exceeds guest download limit')
     env = cloud_package.clean_environment()

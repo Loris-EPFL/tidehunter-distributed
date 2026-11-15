@@ -12,6 +12,28 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_reads_geometry_reviewed_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_reads_geometry")
+        self.assertEqual(len(jobs), 74)
+        self.assertEqual(len({j["case_id"] for j in jobs}), 74)
+        self.assertEqual(Counter(j["group"] for j in jobs),
+                         campaign._FOCUSED_GROUP_COUNTS["nvmeof_reads_geometry"])
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                         "0e8129a38e338651ea3a3a4df2698a0bc550262457aaf8a2fa501ef35ded2fec")
+        for job in jobs:
+            self.assertEqual(job["live_max_inflight_requests"], 128)
+            if "live_leased_write_window" in job:
+                self.assertIn(job["group"], ("G24M", "G24W"))
+                self.assertEqual(job["live_leased_write_window"], 1)
+            self.assertFalse(any(v is None and k != "offered_ops_per_second" for k, v in job.items()))
+            if "diagnostics" in job:
+                self.assertEqual(job["group"], "G24S")
+                self.assertEqual(job["diagnostics"], {"read_profile_limit": 4096})
+        base = [j for j in jobs if j["group"] == "G24R"]
+        self.assertEqual({(j["value_size"], j["drop_os_caches"], j["concurrency"], j["repeat"]) for j in base},
+                         {(s, c, n, r) for s in (1024, 65536) for c in (False, True)
+                          for n in (1, 16, 64) for r in (0, 1)})
+
     def test_parallel_writes_exact_reviewed_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_parallel_writes")
         self.assertEqual(len(jobs), 44)

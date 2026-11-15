@@ -116,6 +116,88 @@ class ValkeyAdmission(unittest.TestCase):
 
 
 class Lifecycle(unittest.TestCase):
+    def test_reviewed_valkey_read_fleet_cases_pass_compact_controller_admission(self):
+        import cloud_controller
+        runtime = cloud_controller.Controller.__new__(cloud_controller.Controller)
+        runtime.config = {"fleet": {"nodes": [{}]},
+                          "spec": {"mode": "focused", "selection": "valkey_rdma_reads"}}
+        jobs = cloud_controller.cloud_campaign.make_focused_matrix("valkey_rdma_reads")
+        self.assertEqual(len(jobs), 22)
+        with tempfile.TemporaryDirectory() as directory:
+            runtime.root = Path(directory)
+            for job in jobs:
+                with self.subTest(case=job["case_id"]), patch.object(
+                        cloud_controller, "guarded", side_effect=RuntimeError("admitted")):
+                    with self.assertRaisesRegex(RuntimeError, "^admitted$"):
+                        runtime.run_case(job)
+            for field, changed in (("owner_count", 5), ("selection", "leased_ab_compact")):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    runtime.run_case(dict(jobs[0], **{field: changed}))
+
+    def test_standalone_server_arguments_disable_cluster(self):
+        args = local.valkey_server_args("127.0.0.21", 6379, 16379, False, 1024)
+        self.assertNotIn("--cluster-enabled", args)
+        self.assertEqual(args[args.index("--appendfsync") + 1], "always")
+        self.assertNotIn("--cluster-port", args)
+
+    def test_standalone_initialization_never_creates_cluster(self):
+        value = fleet(True)
+        value["nodes"] = value["nodes"][:1]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                cloud_layout, "require_state", return_value=Path(directory)), patch.object(
+                cloud_layout, "guarded", side_effect=Path), patch.object(
+                local, "initialize_valkey") as initialize:
+            result = cloud_layout.initialize(value, {"index": -1, "backend": "valkey_rdma"})
+        self.assertTrue(result["standalone"])
+        self.assertNotIn("cluster_create", result)
+        initialize.assert_not_called()
+
+    def test_standalone_rdma_probe_admits_and_qualifies_without_cluster_commands(self):
+        value = fleet(True)
+        value["nodes"] = value["nodes"][:1]
+        value["nodes"][0]["rdma_address"] = "127.0.1.21"
+        value["valkey_rdma_package"] = True
+        for index in (-1, 0):
+            for failed in (None, "PING", "SET", "GET", "DEL"):
+                with self.subTest(index=index, failed=failed):
+                    nodes, endpoints = evidence(False)
+                    nodes[0]["effective_config"]["dir"] = value["data_root"] + "/valkey_rdma/node-0/data"
+                    calls = []
+
+                    def run(config, endpoint, *args):
+                        calls.append(args)
+                        self.assertEqual(endpoint, endpoints[0])
+                        self.assertIn("--rdma", args)
+                        self.assertEqual(args[args.index("-h") + 1], "127.0.1.21")
+                        self.assertEqual(args[args.index("-p") + 1], "6380")
+                        command = args[args.index("-p") + 2:]
+                        self.assertNotIn("CLUSTER", command)
+                        if command[:2] == ("CONFIG", "GET"):
+                            return json.dumps(nodes[0]["effective_config"])
+                        if command[0] == "INFO":
+                            return "\n".join(k + ":" + v for k, v in nodes[0]["info_" + command[1]].items())
+                        if command[0] == failed:
+                            return "qualification-failed"
+                        return {"PING": "PONG", "SET": "OK", "GET": "rdma-qualified", "DEL": "1"}[command[0]]
+
+                    config = {"index": index, "backend": "valkey_rdma", "owner": "a" * 64,
+                              "qualification_only": True, "paired_valkey": True, "address": "127.0.0.21"}
+                    with tempfile.TemporaryDirectory() as directory, patch.object(
+                            cloud_layout, "require_state", return_value=Path(directory)), patch.object(
+                            cloud_layout, "nvme_evidence", return_value={}), patch.object(
+                            cloud_layout, "runtime_evidence", return_value=[]), patch.object(
+                            cloud_layout, "save"), patch.object(cloud_layout, "valkey_command", side_effect=run):
+                        if failed:
+                            with self.assertRaisesRegex(RuntimeError, "qualification failed"):
+                                cloud_layout.probe_once(value, config)
+                        else:
+                            proof = cloud_layout.probe_once(value, config)
+                            self.assertEqual(proof["coverage"]["required_primary_nodes"], 1)
+                            self.assertEqual(proof["coverage"]["replica_count"], 0)
+                            self.assertEqual(proof["rdma_qualification"]["endpoints"], ["127.0.1.21:6380"])
+                            self.assertEqual([args[args.index("-p") + 2] for args in calls[-4:]],
+                                             ["PING", "SET", "GET", "DEL"])
+
     def test_supported_cluster_create_is_not_replayed_on_partial_membership(self):
         _, endpoints = evidence()
         for pristine in (False, True):

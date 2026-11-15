@@ -1645,11 +1645,18 @@ def live_nvme_preparation(config, case, transport):
             or transport not in ("tcp", "rdma")
             or "tidehunter_nvme_" + transport not in config["spec"]["backends"]):
         raise SafetyError("live NVMe transport is not admitted by the campaign")
+    jobs = (cloud_campaign.make_focused_matrix(config["spec"]["selection"])
+            if config["spec"].get("mode") == "focused" else config.get("jobs", []))
+    job = next((job for job in jobs if job["case_id"] == case), {})
+    requests = job.get("live_max_inflight_requests", 32)
+    if type(requests) is not int or not 1 <= requests <= 1024:
+        raise SafetyError("live_max_inflight_requests must be an integer in 1..1024")
     field = "rdma_address" if platform_module(config) and transport == "rdma" else "address"
     return {"addresses": [host[field] for host in config["fleet"]["nodes"]],
             "transport": transport, "service": 4420, "port_id": 1000,
             "commissioning_service": 4421, "commissioning_port_id": 1001,
-            "max_inflight_requests": 32, "max_inflight_bytes": 16 * 1024**2,
+            "max_inflight_requests": requests,
+            "max_inflight_bytes": min(1024**3, requests * 512 * 1024),
             "leased_write_window": None, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}
 
 
@@ -3244,9 +3251,10 @@ class Controller:
             self.layout(backend, "start", index)
             if backend == "cassandra" and index >= 0:
                 self.layout(backend, "probe", index, timeout=180)
-        proofs.append(self.layout(backend, "probe", -1, timeout=180, initialize=True, cluster=True))
+        standalone = backend == "valkey_rdma" and len(self.config["fleet"]["nodes"]) == 1
+        proofs.append(self.layout(backend, "probe", -1, timeout=180, initialize=not standalone, cluster=not standalone))
         for index in range(len(self.config["fleet"]["nodes"])):
-            proofs.append(self.layout(backend, "probe", index, timeout=180, cluster=True))
+            proofs.append(self.layout(backend, "probe", index, timeout=180, cluster=not standalone))
         if self.local_mode is None:
             provider = "gcp" if platform_module(self.config) else "aws"
             hosts = [self.config["fleet"]["coordinator"], *self.config["fleet"]["nodes"]] if provider == "gcp" else []
@@ -4272,7 +4280,7 @@ class Controller:
                 (job.get("backend") in cloud_campaign.TRANSPORTS and job.get("case_kind") not in
                  ("ssd_write_floor", "ssd_floor", "net_floor"))) and not (read_case or fabric_read or (
                      host_count == 1 and (
-                         self.config["spec"].get("selection") == "leased_ab_compact"
+                         self.config["spec"].get("selection") in ("leased_ab_compact", "valkey_rdma_reads")
                          or self.config["spec"].get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)
                      and cloud_campaign._focused_exact(job, expected))) and (
                 job.get("case_kind") not in cloud_campaign.ONE_OWNER_CASE_KINDS

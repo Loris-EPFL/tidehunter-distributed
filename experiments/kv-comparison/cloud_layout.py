@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Node-local RF1 external stores. No AWS access or remote process orchestration."""
+"""Node-local RF1 stores, including one-owner standalone Valkey RDMA with TCP control."""
 import ack_contract as contracts
 import argparse
 import hashlib
@@ -89,7 +89,7 @@ def backend_options(fleet, backend, root, ack_contract="synced"):
     import ack_contract as contracts
     contracts.selected(backend, ack_contract)
     validate_fleet(fleet)
-    if len(fleet["nodes"]) != 5:
+    if len(fleet["nodes"]) != 5 and backend != "valkey_rdma":
         raise ValueError("external store backends require five owner hosts")
     pd = fleet["coordinator"]["address"]
     if backend == "tikv":
@@ -105,12 +105,12 @@ def backend_options(fleet, backend, root, ack_contract="synced"):
             raise ValueError("Valkey RDMA requires the admitted matched package")
         if paired:
             addresses = [str(ipaddress.IPv4Address(x["rdma_address"])) for x in fleet["nodes"]]
-            if len(set(addresses)) != 5:
-                raise ValueError("five distinct RDMA addresses required")
+            if len(set(addresses)) != len(fleet["nodes"]):
+                raise ValueError("distinct RDMA addresses required for every owner")
         nodes = ([x["rdma_address"] + ":6380" for x in fleet["nodes"]]
                  if backend == "valkey_rdma" else valkey_control_endpoints(fleet))
-        options = {"nodes": nodes, "cluster": True, "required_replication_factor": 1,
-                   "required_primary_nodes": 5, "request_timeout_ms": 5000}
+        options = {"nodes": nodes, "cluster": len(nodes) > 1, "required_replication_factor": 1,
+                   "required_primary_nodes": len(nodes), "request_timeout_ms": 5000}
         if paired and backend == "valkey_tcp":
             options["client"] = "libvalkey"
         if ack_contract != "synced":
@@ -133,9 +133,9 @@ def node_config(fleet, backend, index, ack_contract="synced"):
     import ack_contract as contracts
     contracts.selected(backend, ack_contract)
     validate_fleet(fleet)
-    if len(fleet["nodes"]) != 5:
+    if len(fleet["nodes"]) != 5 and backend != "valkey_rdma":
         raise ValueError("external store backends require five owner hosts")
-    if backend not in BACKENDS or type(index) is not int or index not in range(-1, 5):
+    if backend not in BACKENDS or type(index) is not int or index not in range(-1, len(fleet["nodes"])):
         raise ValueError("unsupported backend or node index")
     if backend == "valkey_rdma" and not paired_valkey(fleet, backend):
         raise ValueError("Valkey RDMA requires the admitted matched package")
@@ -263,7 +263,7 @@ def node_config(fleet, backend, index, ack_contract="synced"):
         metadata = valkey_service.identity(runtime)
         if not coordinator:
             data = str(directory / "data")
-            args = local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4, ack_contract)
+            args = local.valkey_server_args(address, 6379, 16379, len(fleet["nodes"]) > 1, memory * 3 // 4, ack_contract)
             args = [str(runtime / "bin/valkey-server") if x == "valkey-server" else
                     x.replace("/data", data) for x in args]
             args += ["--rdma-bind", str(ipaddress.IPv4Address(host["rdma_address"])), "--rdma-port", "6380"]
@@ -279,7 +279,9 @@ def node_config(fleet, backend, index, ack_contract="synced"):
     actions = {action: [*invocation, action, *arguments]
                for action in ("prepare", "start", "probe", "stop", "export", "reset-data")}
     actions["bootstrap-probe"] = [*actions["probe"], "--timeout", "300"]
-    actions["probe"] += ["--timeout", "300", "--initialize" if coordinator else "--cluster"]
+    actions["probe"] += ["--timeout", "300"]
+    if backend != "valkey_rdma" or len(fleet["nodes"]) > 1:
+        actions["probe"] += ["--initialize" if coordinator else "--cluster"]
     return {"schema_version": 1, "run_id": fleet["run_id"], "backend": backend, "index": index,
             "address": address, "instance_id": host["instance_id"], "directory": str(directory), "owner": owner,
             "labels": labels, "files": files, "containers": containers, "actions": actions,
@@ -294,12 +296,12 @@ def node_config(fleet, backend, index, ack_contract="synced"):
 
 
 def build_plan(fleet, backend, ack_contract="synced"):
-    nodes = [node_config(fleet, backend, i, ack_contract) for i in range(-1, 5)]
+    nodes = [node_config(fleet, backend, i, ack_contract) for i in range(-1, len(fleet["nodes"]))]
     return {"schema_version": 1, "backend": backend, "replication_factor": 1,
             "qualification_only": fleet.get("qualification_only", False),
-            "physical_storage_hosts": None if fleet.get("qualification_only") else 5,
+            "physical_storage_hosts": None if fleet.get("qualification_only") else len(fleet["nodes"]),
             "nodes": nodes, "backend_options": backend_options(fleet, backend, nodes[0]["directory"], ack_contract),
-            "lifecycle": {"order": "prepare all; start coordinator; start stores (Cassandra sequential with local probes); coordinator probe --initialize; probe all; export all; stop all; optional reset-data only after every host stopped",
+            "lifecycle": {"order": "prepare all; start coordinator; start stores (Cassandra sequential with local probes); coordinator probe (initialize clusters only); probe all; export all; stop all; optional reset-data only after every host stopped",
                           "timeout_seconds": 300, "cleanup": "exact label-checked containers only; reset-data is separate and retains configs/exports"},
             "ack_policy": (contracts.acknowledgement(backend, ack_contract) if ack_contract != "synced" else {"tikv": "RF1 raft-kv/Raft Engine, apply-unpersisted limit=0; v8.5.4 source synchronizes raft writes before persistence notification",
                            "cassandra": "commitlog_sync=batch, durable_writes=true, QUORUM at RF1",
@@ -713,6 +715,8 @@ def initialize(fleet, config):
     elif backend == "cassandra":
         evidence["create_keyspace"] = cql(fleet, config, "CREATE KEYSPACE IF NOT EXISTS kv_comparison WITH replication = "
             "{'class':'SimpleStrategy','replication_factor':1} AND durable_writes = true;")
+    elif backend == "valkey_rdma" and len(fleet["nodes"]) == 1:
+        evidence["standalone"] = True
     elif backend in ("valkey_tcp", "valkey_rdma"):
         evidence["cluster_create"] = local.initialize_valkey(
             lambda endpoint, *args: valkey_command(config, endpoint, *args),
@@ -797,7 +801,8 @@ def probe_once(fleet, config, cluster=False):
                 raise RuntimeError("Cassandra effective RF1/durable keyspace mismatch")
             proof.update({"peers": peers, "keyspace": rows[0], "storage_node_receipts_required": True})
     elif backend in ("valkey_tcp", "valkey_rdma"):
-        complete = config["index"] == -1 or cluster
+        clustered = len(fleet["nodes"]) > 1
+        complete = not clustered or config["index"] == -1 or cluster
         endpoints = valkey_control_endpoints(fleet) if complete else [config["address"] + ":6379"]
         if backend == "valkey_rdma":
             mapping = dict(zip(valkey_control_endpoints(fleet),
@@ -812,31 +817,33 @@ def probe_once(fleet, config, cluster=False):
             run = rdma_command
         else:
             run = lambda endpoint, *args: valkey_command(config, endpoint, *args)
-        observed = local.valkey_evidence(run, endpoints, True)
+        observed = local.valkey_evidence(run, endpoints, clustered)
         if config.get("paired_valkey"):
             observed["image"] = None
             observed["source_commit"] = "fe8d406c0b5a64ec897f6455e4de684629883764"
             observed["transport"] = "RDMA-CM RC" if backend == "valkey_rdma" else "TCP"
-            observed["cluster_bus"] = "TCP control network"
+            observed["cluster_bus"] = "TCP control network" if clustered else None
         proof.update(observed)
         save(directory / "probe-attempt.json", proof)
         data_dirs = ({x["address"] + ":6379": str(Path(fleet["data_root"]) / backend / f"node-{x['index']}" / "data")
                       for x in fleet["nodes"]} if config.get("paired_valkey") else "/data")
-        proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, True, complete=complete, data_dir=data_dirs, ack_contract=config.get("ack_contract", "synced"))
+        proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, clustered, complete=complete, data_dir=data_dirs, ack_contract=config.get("ack_contract", "synced"))
         if backend == "valkey_rdma" and complete:
             for node in observed["nodes"]:
                 endpoint = node["endpoint"]
                 if local.valkey_cli(run, endpoint, "PING").strip() != "PONG":
                     raise RuntimeError("RDMA PING qualification failed")
-                own = next(line.split() for line in node["cluster_nodes"].splitlines()
-                           if "myself" in line.split()[2].split(","))
-                ranges = [tuple(map(int, token.split("-"))) if "-" in token else (int(token), int(token))
-                          for token in own[8:] if not token.startswith("[")]
-                key = next((f"kv-rdma-qualify-{config['owner'][:12]}-{i}" for i in range(200000)
-                            if any(a <= binascii.crc_hqx(f"kv-rdma-qualify-{config['owner'][:12]}-{i}".encode(), 0) % 16384 <= b
-                                   for a, b in ranges)), None)
-                if key is None:
-                    raise RuntimeError("no owned qualification key")
+                key = f"kv-rdma-qualify-{config['owner'][:12]}"
+                if clustered:
+                    own = next(line.split() for line in node["cluster_nodes"].splitlines()
+                               if "myself" in line.split()[2].split(","))
+                    ranges = [tuple(map(int, token.split("-"))) if "-" in token else (int(token), int(token))
+                              for token in own[8:] if not token.startswith("[")]
+                    key = next((f"kv-rdma-qualify-{config['owner'][:12]}-{i}" for i in range(200000)
+                                if any(a <= binascii.crc_hqx(f"kv-rdma-qualify-{config['owner'][:12]}-{i}".encode(), 0) % 16384 <= b
+                                       for a, b in ranges)), None)
+                    if key is None:
+                        raise RuntimeError("no owned qualification key")
                 value = "rdma-qualified"
                 if (local.valkey_cli(run, endpoint, "SET", key, value).strip() != "OK" or
                         local.valkey_cli(run, endpoint, "GET", key).strip() != value or
@@ -904,6 +911,8 @@ def probe(fleet, config, timeout=120, initialize_cluster=False, cluster=False):
                     raise RuntimeError("Cassandra exact five-node UN ring not reached")
             proof["initialization"] = initialization
             proof["scope"] = "cluster" if cluster or config["index"] == -1 else "node"
+            if config["backend"] == "valkey_rdma" and len(fleet["nodes"]) == 1:
+                proof["scope"] = "standalone"
             if config["backend"] == "cassandra" and config["index"] == -1:
                 proof["scope"] = "cluster_metadata_requires_all_storage_cluster_receipts"
             save(Path(config["directory"]) / "deployment.json", proof)

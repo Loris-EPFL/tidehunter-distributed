@@ -104,7 +104,9 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
     'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
     'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
+    'nvmeof_reads_geometry': '0e8129a38e338651ea3a3a4df2698a0bc550262457aaf8a2fa501ef35ded2fec',
     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
+    'valkey_rdma_reads': '784c732c8f9c641d6e5e594a1bc271fcccd69fb90e534fbaa6dd995ef9f07cfc',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -150,7 +152,14 @@ REVIEWED_SPECS = {
         ('nvmeof_contracts_crossing', FOCUSED_MATRIX_SHA256['nvmeof_contracts_crossing'], 35),
         ('nvmeof_contracts_crossing2', FOCUSED_MATRIX_SHA256['nvmeof_contracts_crossing2'], 36),
         ('nvmeof_parallel_writes', FOCUSED_MATRIX_SHA256['nvmeof_parallel_writes'], 44),
+        ('nvmeof_reads_geometry', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry'], 74),
     )
+}
+REVIEWED_SPECS['valkey_rdma_reads'] = {
+    **copy.deepcopy(REVIEWED_SPECS['nvmeof_parallel_writes']),
+    'selection': 'valkey_rdma_reads', 'job_count': 22, 'max_cases': 22,
+    'matrix_sha256': FOCUSED_MATRIX_SHA256['valkey_rdma_reads'],
+    'backends': ['valkey_rdma', 'tidehunter_nvme_rdma'], 'owner_hosts': 1,
 }
 
 
@@ -316,8 +325,9 @@ def _admit_package(package_dir, revision, spec):
     verified = package.verify_directory(root)
     import manual_sui
     focused = manual_sui.focused_qualification(spec)
-    if focused and verified.get('build_profile') != 'focused':
-        raise ValueError('focused campaign requires the focused package profile')
+    expected_profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
+    if focused and verified.get('build_profile') != expected_profile:
+        raise ValueError('focused campaign requires its exact package profile')
     if not focused and verified.get('build_profile') is not None:
         raise ValueError('full campaign cannot use a focused package')
     gcp_image.admit_spdk_scope(spec, verified.get('spdk'))
@@ -341,11 +351,17 @@ def _admit_package(package_dir, revision, spec):
             or proof.get('binary_blake2b512') != verified['binary_blake2b512']):
         raise ValueError('qualification does not bind the sealed executable')
     manifest = json.loads((root / 'manifest.json').read_text())
-    if focused and (
+    if focused and expected_profile != 'focused_valkey' and (
             'valkey-rdma' in manifest.get('features', [])
             or any(name.startswith('runtime/bin/valkey-') or name == 'runtime/valkey-rdma.json'
                    for name in manifest.get('files', {}))):
         raise ValueError('focused package must not contain Valkey binaries')
+    if expected_profile == 'focused_valkey' and spec.get('selection') == 'valkey_rdma_reads':
+        required = {'runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
+                    'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json'}
+        if (manifest.get('features') != package.FOCUSED_VALKEY_FEATURES
+                or not required <= set(manifest.get('files', {}))):
+            raise ValueError('Valkey read package requires exact features and sealed runtime')
     prepare.admit_selected_features(spec, manifest)
     if 'valkey_rdma' in spec['backends'] and 'valkey-rdma' not in manifest.get('features', []):
         raise ValueError('the selected Valkey RDMA comparison requires its sealed runtime')
