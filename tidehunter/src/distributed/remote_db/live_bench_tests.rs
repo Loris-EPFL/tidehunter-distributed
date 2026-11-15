@@ -9,7 +9,7 @@ use crate::distributed::nvmeof::{
     live_target::LiveTargetManager,
 };
 use crate::distributed::tcp::{
-    LiveClientConfig, LiveWriteMode, NodeConfig, StorageNode, Transport,
+    LeasedSync, LiveClientConfig, LiveWriteMode, NodeConfig, StorageNode, Transport,
 };
 use crate::key_shape::KeyType;
 use serde_json::{Value, json};
@@ -34,7 +34,7 @@ fn live_config(mode: LiveWriteMode, tier: DurabilityTier) -> LiveClientConfig {
         host_id: [1; 16],
         owner_identities: Default::default(),
         leased_write_window: Some(4),
-        leased_sync: Default::default(),
+        leased_sync: LeasedSync::PerFrameFua,
         leased_flush_min_frame_bytes: 0,
         max_inflight_requests: 32,
         max_inflight_bytes: 4 * MIB,

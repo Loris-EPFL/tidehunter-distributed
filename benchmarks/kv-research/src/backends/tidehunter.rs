@@ -159,7 +159,9 @@ struct ExternalLiveNvmeof {
     leased_write_window: Option<usize>,
     #[serde(default)]
     leased_sync: tidehunter::distributed::tcp::LeasedSync,
-    #[serde(default)]
+    #[serde(
+        default = "tidehunter::distributed::tcp::LiveClientConfig::default_leased_flush_min_frame_bytes"
+    )]
     leased_flush_min_frame_bytes: usize,
     max_inflight_bytes: usize,
     connect_timeout_ms: u64,
@@ -583,11 +585,15 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
 }
 // Checkpoint phase sums are charged on completion, including work begun before
 // the measurement boundary. They are not per-request latency or network clocks.
-const COORDINATOR_INTERVAL_COUNTERS: [&str; 29] = [
+const COORDINATOR_INTERVAL_COUNTERS: [&str; 33] = [
     "write_storage_wait_ns",
     "write_publication_ns",
     "write_dispatch_ns",
     "write_preparation_admission_ns",
+    "write_authority_prepare_ns",
+    "write_authority_admit_ns",
+    "write_authority_windows",
+    "write_authority_batches",
     "write_checkpoint_ns",
     "write_checkpoint_count",
     "write_foreground_checkpoint_ns",
@@ -1549,6 +1555,10 @@ impl KvBackend for TidehunterBackend {
                 if matches!(
                     name,
                     "read_profile_live_inline"
+                        | "write_authority_prepare_ns"
+                        | "write_authority_admit_ns"
+                        | "write_authority_windows"
+                        | "write_authority_batches"
                         | "read_profile_live_inline_fallback_drain"
                         | "read_profile_live_inline_fallback_busy"
                         | "read_profile_live_inline_fallback_grant"
@@ -2399,6 +2409,11 @@ mod tests {
         let parsed: ExternalLiveNvmeof = serde_json::from_value(input.clone()).unwrap();
         assert!(parsed.inline_reads);
         assert_eq!(
+            parsed.leased_sync,
+            tidehunter::distributed::tcp::LeasedSync::GroupFlush
+        );
+        assert_eq!(parsed.leased_flush_min_frame_bytes, 65536);
+        assert_eq!(
             parsed.export_mode,
             tidehunter::distributed::tcp::LiveExportMode::OnDemand
         );
@@ -2409,6 +2424,13 @@ mod tests {
         assert_eq!(
             parsed.write_mode,
             tidehunter::distributed::tcp::LiveWriteMode::Reserved
+        );
+        input["leased_flush_min_frame_bytes"] = serde_json::json!(0);
+        assert_eq!(
+            serde_json::from_value::<ExternalLiveNvmeof>(input.clone())
+                .unwrap()
+                .leased_flush_min_frame_bytes,
+            0
         );
         input["inline_reads"] = serde_json::json!(false);
         assert!(
@@ -2622,7 +2644,7 @@ mod tests {
         value["live_nvmeof"]["lease_ahead"] = serde_json::json!(false);
         value["live_nvmeof"]["polled_writes"] = serde_json::json!(true);
         value["live_nvmeof"]["leased_write_window"] = serde_json::json!(8);
-        value["live_nvmeof"]["leased_sync"] = serde_json::json!("group_flush");
+        value["live_nvmeof"]["leased_sync"] = serde_json::json!("per_frame_fua");
         value["live_nvmeof"]["leased_flush_min_frame_bytes"] = serde_json::json!(8192);
         let input: ExternalPreparationInput = serde_json::from_value(value).unwrap();
         let live = input.live_nvmeof.unwrap();
@@ -2631,7 +2653,7 @@ mod tests {
         assert_eq!(live.leased_write_window, Some(8));
         assert_eq!(
             live.leased_sync,
-            tidehunter::distributed::tcp::LeasedSync::GroupFlush
+            tidehunter::distributed::tcp::LeasedSync::PerFrameFua
         );
         assert_eq!(live.leased_flush_min_frame_bytes, 8192);
         assert_eq!(input.history_persistence, HistoryPersistence::WalReplay);
@@ -2650,9 +2672,9 @@ mod tests {
         assert_eq!(live.leased_write_window, None);
         assert_eq!(
             live.leased_sync,
-            tidehunter::distributed::tcp::LeasedSync::PerFrameFua
+            tidehunter::distributed::tcp::LeasedSync::GroupFlush
         );
-        assert_eq!(live.leased_flush_min_frame_bytes, 0);
+        assert_eq!(live.leased_flush_min_frame_bytes, 65536);
     }
 
     #[cfg(all(feature = "fabric", feature = "nvmeof", target_os = "linux"))]
@@ -2816,6 +2838,8 @@ mod tests {
             assert_eq!(remote["live_nvme"]["export_mode"], "on_demand");
             assert_eq!(remote["live_nvme"]["lease_ahead"], true);
             assert_eq!(remote["live_nvme"]["polled_writes"], false);
+            assert_eq!(remote["live_nvme"]["leased_sync"], "group_flush");
+            assert_eq!(remote["live_nvme"]["leased_flush_min_frame_bytes"], 65536);
             assert_eq!(
                 remote["live_nvme"]["queue_geometry"],
                 serde_json::json!({"io_queues": 4, "queue_size": 128, "poll_queues": 0})
@@ -3087,6 +3111,14 @@ mod tests {
         let delta = coordinator_interval_delta(&baseline, &end).unwrap();
         assert_eq!(delta.len(), COORDINATOR_INTERVAL_COUNTERS.len());
         assert!(delta.values().all(|value| *value == 5));
+        for name in [
+            "write_authority_prepare_ns",
+            "write_authority_admit_ns",
+            "write_authority_windows",
+            "write_authority_batches",
+        ] {
+            assert_eq!(delta[name], 5);
+        }
 
         let mut missing = end.clone();
         missing.remove(COORDINATOR_INTERVAL_COUNTERS[0]);

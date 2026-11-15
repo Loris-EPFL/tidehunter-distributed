@@ -58,12 +58,13 @@ impl LiveWriteMode {
     }
 }
 
-/// Synchronous leased durability mechanism; group flush remains opt-in.
+/// Synchronous leased durability mechanism. F6b gained 34–40% throughput at
+/// 64 KiB c16 with shared flushes, but lost 6–17% at 1–16 KiB without a threshold.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeasedSync {
-    #[default]
     PerFrameFua,
+    #[default]
     GroupFlush,
 }
 
@@ -94,7 +95,9 @@ pub struct LiveClientConfig {
     #[serde(default)]
     pub leased_sync: LeasedSync,
     /// GroupFlush only: frames whose physical (padded) length is smaller than this use FUA.
-    #[serde(default)]
+    /// Defaults to 65536: F6b gained 34–40% throughput at 64 KiB c16, but lost
+    /// 6–17% at 1–16 KiB without a threshold.
+    #[serde(default = "LiveClientConfig::default_leased_flush_min_frame_bytes")]
     pub leased_flush_min_frame_bytes: usize,
     pub max_inflight_bytes: usize,
     pub connect_timeout_ms: u64,
@@ -107,6 +110,7 @@ pub struct LiveClientConfig {
     #[serde(default = "default_inline_reads")]
     pub lease_ahead: bool,
     /// Use IOPOLL for leased writes; requires a controller poll queue.
+    /// IOPOLL rings cannot submit Fsync, so polled writes keep per-frame FUA.
     #[serde(default)]
     pub polled_writes: bool,
     /// Disable caller-inline reads without changing lane-worker reads.
@@ -124,6 +128,11 @@ fn default_inline_reads() -> bool {
 }
 
 impl LiveClientConfig {
+    /// Physical frame threshold selected from the F6b large/small-frame crossover.
+    pub const fn default_leased_flush_min_frame_bytes() -> usize {
+        65536
+    }
+
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn for_owner(&self, partition: u32) -> Result<std::borrow::Cow<'_, Self>, &'static str> {
         if self.owner_identities.is_empty() {
@@ -181,9 +190,6 @@ impl LiveClientConfig {
         }
         if self.polled_writes && self.write_mode != LiveWriteMode::Leased {
             return Err("polled live writes require leased write mode");
-        }
-        if self.leased_sync == LeasedSync::GroupFlush && self.polled_writes {
-            return Err("group_flush requires polled_writes=false: IOPOLL rings reject Fsync");
         }
         if self.export_mode != LiveExportMode::OnDemand && self.write_mode != LiveWriteMode::Leased
         {
@@ -1259,8 +1265,8 @@ mod tests {
         assert_eq!(restored.queue_geometry, LiveQueueGeometry::default());
         assert_eq!(restored.export_mode, LiveExportMode::OnDemand);
         assert_eq!(restored.leased_write_window, None);
-        assert_eq!(restored.leased_sync, LeasedSync::PerFrameFua);
-        assert_eq!(restored.leased_flush_min_frame_bytes, 0);
+        assert_eq!(restored.leased_sync, LeasedSync::GroupFlush);
+        assert_eq!(restored.leased_flush_min_frame_bytes, 65536);
         config.leased_flush_min_frame_bytes = 8192;
         let restored: LiveClientConfig =
             serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
@@ -1310,10 +1316,7 @@ mod tests {
         polled.leased_durability =
             Some(crate::distributed::durability::DurabilityTier::Synchronous);
         polled.leased_sync = LeasedSync::GroupFlush;
-        assert_eq!(
-            polled.validate(),
-            Err("group_flush requires polled_writes=false: IOPOLL rings reject Fsync")
-        );
+        assert!(polled.validate().is_ok());
         config.inline_reads = false;
         assert_eq!(
             config.validate(),
@@ -2104,6 +2107,8 @@ impl super::Client {
         // A window of one frame cannot share a flush; FUA avoids a serial write then flush.
         let durable_at_completion = tier == crate::distributed::durability::DurabilityTier::Native
             || config.leased_sync == LeasedSync::PerFrameFua
+            // IOPOLL rings cannot submit Fsync, so polled writes keep per-frame FUA.
+            || config.polled_writes
             || self.leased_write_window() == 1
             || len < config.leased_flush_min_frame_bytes
             || (self.live_leased.flights.is_empty() && queue_empty);
@@ -3060,7 +3065,7 @@ pub(crate) mod leased_tests {
                         host_id: [1; 16],
                         owner_identities: Default::default(),
                         leased_write_window: Some(4),
-                        leased_sync: Default::default(),
+                        leased_sync: LeasedSync::PerFrameFua,
                         leased_flush_min_frame_bytes: 0,
                         max_inflight_requests: 4,
                         max_inflight_bytes: (self.config.partition.group_limits.max_encoded_bytes
@@ -3178,6 +3183,8 @@ pub(crate) mod leased_tests {
             let mut client = fixture.writer_without_ahead();
             let mut config = client.live_config.clone().unwrap();
             config.polled_writes = true;
+            config.leased_sync = LeasedSync::GroupFlush;
+            config.leased_flush_min_frame_bytes = 0;
             config.queue_geometry.poll_queues = 1;
             client
                 .configure_live_nvme(
@@ -3225,6 +3232,16 @@ pub(crate) mod leased_tests {
             client.write_leased_skip().unwrap();
             assert_eq!(client.live_writer.as_ref().unwrap().io.outstanding(), 0);
             assert_eq!(fixture.metrics.snapshot().counts.completed_write_ops, 2);
+            let counts = fixture.metrics.snapshot().counts;
+            assert_eq!(counts.leased_flushes, 0);
+            assert_eq!(
+                counts.fua_writes,
+                if tier == DurabilityTier::Synchronous {
+                    2
+                } else {
+                    0
+                }
+            );
             let file = std::fs::File::open(path).unwrap();
             let mut marker = [0; 8];
             std::os::unix::fs::FileExt::read_exact_at(&file, &mut marker, cursor).unwrap();
@@ -4958,6 +4975,97 @@ pub(crate) mod leased_tests {
         let mut client = fixture.writer_without_ahead();
         client.live_config.as_mut().unwrap().leased_sync = LeasedSync::GroupFlush;
         client
+    }
+
+    #[test]
+    fn group_flush_defaults_use_fua_for_small_frames_and_flush_large_frames() {
+        let timeline = WriteTimeline::default();
+        for value_bytes in [1024, 65536] {
+            let temp = tempdir::TempDir::new("leased-default-sync").unwrap();
+            let mut config = tcp::tests::config(&temp.path().join("node"));
+            config.partition.fragment_bytes = 256 * 1024;
+            config.partition.wal_file_bytes = 512 * 1024;
+            config.partition.batch_limits.max_encoded_bytes = 64 * 1024 + 1024;
+            config.partition.group_limits.max_encoded_bytes = 128 * 1024;
+            let fixture = Fixture::open(
+                DurabilityTier::Synchronous,
+                config,
+                temp,
+                Duration::from_secs(10),
+            );
+            let mut client = fixture.writer_without_ahead();
+            client.live_config.as_mut().unwrap().leased_sync = LeasedSync::default();
+            client
+                .live_config
+                .as_mut()
+                .unwrap()
+                .leased_flush_min_frame_bytes =
+                LiveClientConfig::default_leased_flush_min_frame_bytes();
+            let original = fixture.batch(0);
+            let batch = tcp::CompleteBatch::new(
+                &crate::key_shape::KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap(),
+                original.id(),
+                original.version(),
+                vec![crate::distributed::codec::Mutation::Put {
+                    keyspace: crate::key_shape::KeySpace(0),
+                    key: b"key1"[..].into(),
+                    value: vec![1; value_bytes].into(),
+                }],
+                fixture.config.partition.batch_limits,
+            )
+            .unwrap();
+            assert!(matches!(
+                client
+                    .submit_leased_group(1, vec![batch], &timeline, 2, false)
+                    .unwrap(),
+                LeasedSubmit::Submitted(_)
+            ));
+            assert_eq!(
+                client.live_leased.flights[0].durable_at_completion,
+                value_bytes < 65536
+            );
+            let mut released = Vec::new();
+            client.drain_leased_flights(&mut released, None).unwrap();
+            assert_eq!(released.len(), 1);
+            let counts = fixture.metrics.snapshot().counts;
+            assert_eq!(counts.fua_writes, u64::from(value_bytes < 65536));
+            assert_eq!(counts.leased_flushes, u64::from(value_bytes == 65536));
+            client.close_leased_extent(&mut Vec::new(), None).unwrap();
+        }
+    }
+
+    #[test]
+    fn group_flush_polled_writes_use_fua_with_queued_work() {
+        let fixture = Fixture::new(DurabilityTier::Synchronous, 32768);
+        let mut client = group_flush_writer(&fixture);
+        let config = client.live_config.as_mut().unwrap();
+        config.polled_writes = true;
+        config.queue_geometry.poll_queues = 1;
+        config.leased_flush_min_frame_bytes = 0;
+        config.validate().unwrap();
+        // The local fixture's interrupt ring makes policy coverage independent
+        // of IOPOLL kernel support; the real-polled test covers the kernel route.
+        client.leased_test_hold_completions(&[1, 2]);
+        let timeline = WriteTimeline::default();
+        for sequence in 0..2 {
+            client
+                .submit_leased_group(1, vec![fixture.batch(sequence)], &timeline, 2, false)
+                .unwrap();
+        }
+        assert!(
+            client
+                .live_leased
+                .flights
+                .iter()
+                .all(|flight| flight.durable_at_completion)
+        );
+        client.leased_test_release_held();
+        let mut released = Vec::new();
+        client.drain_leased_flights(&mut released, None).unwrap();
+        assert_eq!(released.len(), 2);
+        let counts = fixture.metrics.snapshot().counts;
+        assert_eq!(counts.fua_writes, 2);
+        assert_eq!(counts.leased_flushes, 0);
     }
 
     #[test]

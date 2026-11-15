@@ -10,6 +10,80 @@ use super::*;
 use parking_lot::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// One authority thread writes these counters. Relaxed atomics let metric
+/// visitors sample them without a new lock; they publish no write authority.
+#[derive(Default)]
+#[repr(align(64))]
+pub(super) struct AuthorityCounters {
+    prepare_ns: AtomicU64,
+    admit_ns: AtomicU64,
+    windows: AtomicU64,
+    batches: AtomicU64,
+}
+
+/// Exclusive wall time: nested preparation/admission spans subtract from their
+/// parent, so pool-join progress and stale re-preparation are counted only once.
+pub(super) struct AuthoritySpan<'a> {
+    counters: &'a AuthorityCounters,
+    target: &'a AtomicU64,
+    started: Instant,
+    prepare_before: u64,
+    admit_before: u64,
+}
+
+impl AuthorityCounters {
+    fn span<'a>(&'a self, target: &'a AtomicU64) -> AuthoritySpan<'a> {
+        AuthoritySpan {
+            counters: self,
+            target,
+            started: Instant::now(),
+            // Relaxed: this authority thread is the sole counter writer.
+            prepare_before: self.prepare_ns.load(Ordering::Relaxed),
+            admit_before: self.admit_ns.load(Ordering::Relaxed),
+        }
+    }
+    pub(super) fn preparing(&self) -> AuthoritySpan<'_> {
+        self.span(&self.prepare_ns)
+    }
+    pub(super) fn admitting(&self) -> AuthoritySpan<'_> {
+        self.span(&self.admit_ns)
+    }
+    fn record_window(&self, batches: usize) {
+        // Relaxed: independent workload counts, not admission publication.
+        self.windows.fetch_add(1, Ordering::Relaxed);
+        self.batches.fetch_add(batches as u64, Ordering::Relaxed);
+    }
+    fn snapshot(&self, mut stats: AuthorityWriteStats) -> AuthorityWriteStats {
+        // Relaxed: weakly consistent diagnostic sums; sample after quiescence.
+        stats.authority_prepare_ns = self.prepare_ns.load(Ordering::Relaxed);
+        stats.authority_admit_ns = self.admit_ns.load(Ordering::Relaxed);
+        stats.authority_windows = self.windows.load(Ordering::Relaxed);
+        stats.authority_batches = self.batches.load(Ordering::Relaxed);
+        stats
+    }
+}
+
+impl Drop for AuthoritySpan<'_> {
+    fn drop(&mut self) {
+        // Relaxed: only the authority thread records nested spans.
+        let nested = self
+            .counters
+            .prepare_ns
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.prepare_before)
+            .saturating_add(
+                self.counters
+                    .admit_ns
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.admit_before),
+            );
+        self.target.fetch_add(
+            elapsed(self.started).saturating_sub(nested),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 pub(super) struct FailureOnPanic(pub(super) Arc<AtomicBool>);
 impl Drop for FailureOnPanic {
     fn drop(&mut self) {
@@ -33,6 +107,7 @@ struct Admission {
     max_requests: usize,
     max_bytes: usize,
     first_failure: Arc<std::sync::OnceLock<String>>,
+    authority: AuthorityCounters,
 }
 struct WriteCredit {
     admission: Arc<Admission>,
@@ -109,7 +184,10 @@ type QueuedWrite = ([u8; 16], Vec<Mutation>, WriteReply);
 fn prepare_window(
     db: &mut RemoteDatabase,
     writes: &[QueuedWrite],
+    counters: &AuthorityCounters,
 ) -> Result<Vec<Result<PreparedAdmission, LocalDbError>>, LocalDbError> {
+    counters.record_window(writes.len());
+    let _admit = counters.admitting();
     let started = Instant::now();
     let before = db.authority_write_stats();
     let mut planned = HashMap::with_capacity(writes.len());
@@ -160,6 +238,7 @@ fn prepare_window(
     let prepared = db.encode_preparation_plans(
         &plans,
         encoded_bytes >= super::preparation::PARALLEL_PREPARATION_MIN_BYTES,
+        Some(counters),
     )?;
     for (index, result) in slots.into_iter().zip(prepared) {
         results[index] = Some(result.and_then(|(batch, _)| {
@@ -511,6 +590,7 @@ impl ConcurrentRemoteDatabase {
             max_requests: db.config.max_pending_batches,
             max_bytes: db.config.max_pending_bytes,
             first_failure: db.first_failure.clone(),
+            authority: AuthorityCounters::default(),
         });
         let snapshot = Arc::new(Mutex::new(Snapshot {
             stats: db.stats(),
@@ -948,7 +1028,7 @@ impl ConcurrentRemoteDatabase {
     pub fn visit_write_metrics(&self, visit: impl FnOnce(WriteMetricsSnapshot)) {
         let snapshot = *self.snapshot.lock();
         visit(WriteMetricsSnapshot {
-            authority: snapshot.authority,
+            authority: self.admission.authority.snapshot(snapshot.authority),
             pipeline: self.pipeline_stats(),
             read_cache: self.cache.stats(),
             write_profile: *self.write_profile.lock(),
@@ -966,7 +1046,7 @@ impl ConcurrentRemoteDatabase {
             pipeline.concurrent_queued_peak = budget.peak_requests;
             pipeline.concurrent_queue_bytes_peak = budget.peak_bytes;
             WriteMetricsSnapshot {
-                authority: stored.authority,
+                authority: self.admission.authority.snapshot(stored.authority),
                 pipeline,
                 read_cache: cache.stats(),
                 write_profile: *write_profile,
@@ -1244,42 +1324,45 @@ fn drive_owner(
         // Harvest completions first, without dispatching short tails. Drain only
         // commands already ready below, then send the resulting groups at once.
         // There is no timer or wait for a second request: singletons stay prompt.
-        db.progress_pipeline(false).inspect_err(|error| {
-            record_first_failure(
-                &db.first_failure,
-                None,
-                error.uncertain_version,
-                "progress_pipeline",
-                error,
-            );
-        })?;
-        for _ in 0..pending.len() {
-            let reply = pending.pop_front().unwrap();
-            let version = reply.version.unwrap();
-            if version.epoch < db.epoch || db.publication.is_published(version) {
-                db.ensure_healthy().inspect_err(|error| {
-                    record_first_failure(
-                        &db.first_failure,
-                        None,
-                        error.uncertain_version,
-                        "publication_health",
-                        error,
-                    );
-                })?;
-                db.pipeline_stats.concurrent_completed += 1;
-                if db.config.write_profile_limit != 0 {
-                    // Diagnostic snapshots must be visible before client completion.
-                    refresh_snapshot(db, snapshot);
-                }
-                db.write_timeline.batch_event(
-                    version,
-                    WriteTimelineStage::CallerReplyQueued,
+        {
+            let _admit = admission.authority.admitting();
+            db.progress_pipeline(false).inspect_err(|error| {
+                record_first_failure(
+                    &db.first_failure,
                     None,
-                    None,
+                    error.uncertain_version,
+                    "progress_pipeline",
+                    error,
                 );
-                reply.finish(Ok(version));
-            } else {
-                pending.push_back(reply);
+            })?;
+            for _ in 0..pending.len() {
+                let reply = pending.pop_front().unwrap();
+                let version = reply.version.unwrap();
+                if version.epoch < db.epoch || db.publication.is_published(version) {
+                    db.ensure_healthy().inspect_err(|error| {
+                        record_first_failure(
+                            &db.first_failure,
+                            None,
+                            error.uncertain_version,
+                            "publication_health",
+                            error,
+                        );
+                    })?;
+                    db.pipeline_stats.concurrent_completed += 1;
+                    if db.config.write_profile_limit != 0 {
+                        // Diagnostic snapshots must be visible before client completion.
+                        refresh_snapshot(db, snapshot);
+                    }
+                    db.write_timeline.batch_event(
+                        version,
+                        WriteTimelineStage::CallerReplyQueued,
+                        None,
+                        None,
+                    );
+                    reply.finish(Ok(version));
+                } else {
+                    pending.push_back(reply);
+                }
             }
         }
         if barrier.is_some() && db.submissions.is_empty() {
@@ -1334,6 +1417,7 @@ fn drive_owner(
                     if receive_budget == 0 {
                         break;
                     }
+                    let collect_span = admission.authority.admitting();
                     let mut writes = Vec::new();
                     let mut bytes = 0usize;
                     for _ in 0..window_bound
@@ -1365,8 +1449,10 @@ fn drive_owner(
                             }
                         }
                     }
+                    drop(collect_span);
                     if !writes.is_empty() {
-                        let prepared = prepare_window(db, &writes)?;
+                        let prepared = prepare_window(db, &writes, &admission.authority)?;
+                        let _admit = admission.authority.admitting();
                         for ((_, _, reply), result) in writes.into_iter().zip(prepared) {
                             match result {
                                 Ok(prepared) => prepared_writes.push_back(DeferredWrite {
@@ -1383,6 +1469,7 @@ fn drive_owner(
                     }
                 }
                 if let Some(mut write) = prepared_writes.pop_front() {
+                    let _admit = admission.authority.admitting();
                     let id = write.prepared.batch.id();
                     let version = write.prepared.batch.version();
                     let next = BatchVersion {
@@ -1406,6 +1493,7 @@ fn drive_owner(
                         let result = db.prepare_submit(
                             id.operation,
                             write.prepared.batch.mutations().to_vec(),
+                            Some(&admission.authority),
                         );
                         db.record_admission_span(started, before);
                         match result {
@@ -1588,15 +1676,18 @@ fn drive_owner(
                 }
             }
         }
-        db.progress_pipeline(true).inspect_err(|error| {
-            record_first_failure(
-                &db.first_failure,
-                None,
-                error.uncertain_version,
-                "progress_pipeline",
-                error,
-            );
-        })?;
+        {
+            let _admit = admission.authority.admitting();
+            db.progress_pipeline(true).inspect_err(|error| {
+                record_first_failure(
+                    &db.first_failure,
+                    None,
+                    error.uncertain_version,
+                    "progress_pipeline",
+                    error,
+                );
+            })?;
+        }
         if !admitted {
             // Notifications share the append completion channel, so either new
             // input or ANY node completion wakes the owner. The timeout covers

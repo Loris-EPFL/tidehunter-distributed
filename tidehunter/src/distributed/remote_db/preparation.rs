@@ -128,7 +128,7 @@ impl RemoteDatabase {
             .prepare_reserved_bytes_peak
             .max(reserved);
         let prepared = self
-            .encode_preparation_plans(&plans, true)?
+            .encode_preparation_plans(&plans, true, None)?
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
         let prepared = prepared
@@ -198,7 +198,9 @@ impl RemoteDatabase {
         &mut self,
         plans: &[PreparationPlan<'_>],
         parallel: bool,
+        authority: Option<&concurrent::AuthorityCounters>,
     ) -> Result<Vec<EncodedPreparation>, LocalDbError> {
+        let _prepare = authority.map(concurrent::AuthorityCounters::preparing);
         let prepare = |(id, version, validated): &PreparationPlan<'_>| {
             let began = Instant::now();
             let result = validated
@@ -246,7 +248,10 @@ impl RemoteDatabase {
                     });
                     loop {
                         self.pipeline_stats.prepare_progress_passes += 1;
-                        self.progress_pipeline(false)?;
+                        {
+                            let _admit = authority.map(concurrent::AuthorityCounters::admitting);
+                            self.progress_pipeline(false)?;
+                        }
                         match receiver.try_recv() {
                             Ok(result) => break result,
                             Err(mpsc::TryRecvError::Disconnected) => {

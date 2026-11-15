@@ -1565,6 +1565,108 @@ fn enqueue_window_write(
 }
 
 #[test]
+fn sui_timing_visitors_export_authority_split_counters() {
+    use crate::distributed::sui::Db;
+    let fixture = Fixture::new();
+    let db = Db::open_remote(
+        &fixture.temp.path().join("authority"),
+        fixture.shape.clone(),
+        fixture.config.clone(),
+    )
+    .unwrap();
+    for key in [1u32, 2] {
+        let mut batch = db.write_batch();
+        batch.write(db.ks("root"), key.to_be_bytes().to_vec(), vec![3u8; 32]);
+        batch.commit_traced(u64::from(key)).unwrap();
+    }
+    let mut counters = HashMap::new();
+    db.visit_timing_metrics(|name, value| {
+        counters.insert(name, value);
+    });
+    assert_eq!(counters["write_authority_windows"], 2);
+    assert_eq!(counters["write_authority_batches"], 2);
+    assert!(counters["write_authority_prepare_ns"] > 0);
+    assert!(counters["write_authority_admit_ns"] > 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        counters.clear();
+        if db
+            .try_visit_timing_metrics(|name, value| {
+                counters.insert(name, value);
+            })
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert_eq!(counters["write_authority_windows"], 2);
+    assert_eq!(counters["write_authority_batches"], 2);
+    assert!(counters["write_authority_prepare_ns"] > 0);
+    assert!(counters["write_authority_admit_ns"] > 0);
+    db.wait_for_background_threads_to_finish().unwrap();
+}
+
+#[test]
+fn authority_split_counters_cover_single_and_multiple_batch_windows() {
+    for workers in [1, 8] {
+        for batches in [1, 4] {
+            let fixture = scalar_window_fixture(workers);
+            let (db, resume) = paused_owner(fixture.open());
+            let replies: Vec<_> = (0..batches)
+                .map(|index| {
+                    enqueue_window_write(
+                        &db,
+                        fixture.operation(0, u64::from(index)),
+                        vec![large_put(index)],
+                    )
+                })
+                .collect();
+            resume.send(()).unwrap();
+            for reply in replies {
+                reply
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap()
+                    .unwrap();
+            }
+            db.flush_index().unwrap();
+            db.visit_write_metrics(|snapshot| {
+                assert_eq!(snapshot.authority.authority_windows, 1);
+                assert_eq!(snapshot.authority.authority_batches, u64::from(batches));
+                assert!(snapshot.authority.authority_prepare_ns > 0);
+                assert!(snapshot.authority.authority_admit_ns > 0);
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if db
+                    .try_visit_write_metrics(|snapshot| {
+                        assert_eq!(snapshot.authority.authority_windows, 1);
+                        assert_eq!(snapshot.authority.authority_batches, u64::from(batches));
+                        assert!(snapshot.authority.authority_prepare_ns > 0);
+                        assert!(snapshot.authority.authority_admit_ns > 0);
+                    })
+                    .is_some()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            assert_eq!(
+                db.pipeline_stats().parallel_prepared_batches,
+                if workers > 1 && batches > 1 {
+                    u64::from(batches)
+                } else {
+                    0
+                }
+            );
+            db.shutdown().unwrap();
+        }
+    }
+}
+
+#[test]
 fn concurrent_scalar_window_parallel_and_serial_keep_admission_order() {
     for workers in [1, 8] {
         let fixture = scalar_window_fixture(workers);

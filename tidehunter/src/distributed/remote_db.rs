@@ -1041,6 +1041,15 @@ pub struct AuthorityWriteStats {
     pub publication_ns: u64,
     pub dispatch_ns: u64,
     pub preparation_admission_ns: u64,
+    /// Exclusive concurrent-authority preparation wall time, including pool join
+    /// waits, but excluding nested admission/publication progress.
+    pub authority_prepare_ns: u64,
+    /// Concurrent-authority planning, admission and publication bookkeeping.
+    pub authority_admit_ns: u64,
+    /// Nonempty input windows, including windows with rejected members.
+    pub authority_windows: u64,
+    /// Input batches in those windows; stale re-preparation does not add a batch.
+    pub authority_batches: u64,
     /// Owner time freezing/adopting checkpoints and explicitly waiting for their
     /// completion. Background I/O overlaps are excluded.
     pub checkpoint_ns: u64,
@@ -2367,7 +2376,7 @@ impl RemoteDatabase {
         operation: [u8; 16],
         mutations: Vec<Mutation>,
     ) -> Result<BatchVersion, LocalDbError> {
-        let prepared = self.prepare_submit(operation, mutations)?;
+        let prepared = self.prepare_submit(operation, mutations, None)?;
         self.admit_prepared(prepared)
     }
 
@@ -2375,6 +2384,7 @@ impl RemoteDatabase {
         &mut self,
         operation: [u8; 16],
         mutations: Vec<Mutation>,
+        authority: Option<&concurrent::AuthorityCounters>,
     ) -> Result<PreparedAdmission, LocalDbError> {
         self.ensure_healthy()?;
         let started = Instant::now();
@@ -2389,6 +2399,7 @@ impl RemoteDatabase {
                 epoch: self.epoch,
                 sequence: self.submission_next(),
             });
+        let prepare_span = authority.map(concurrent::AuthorityCounters::preparing);
         let batch = CompleteBatch::new(
             &self.shape,
             id,
@@ -2396,7 +2407,9 @@ impl RemoteDatabase {
             mutations,
             self.config.storage.batch_limits,
         )
-        .map_err(LocalDbError::component)?;
+        .map_err(LocalDbError::component);
+        drop(prepare_span);
+        let batch = batch?;
         let prepared = self.prepare_admission(batch)?;
         self.write_timeline.batch(operation, version);
         self.stats.validation_ns += elapsed(started);

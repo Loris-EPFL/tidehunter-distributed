@@ -963,6 +963,10 @@ fn measurement_read_evidence(
         "admitted_bytes",
         "served_bytes",
         "read_profile_live_inline",
+        "write_authority_prepare_ns",
+        "write_authority_admit_ns",
+        "write_authority_windows",
+        "write_authority_batches",
         "read_profile_live_inline_fallback_drain",
         "read_profile_live_inline_fallback_busy",
         "read_profile_live_inline_fallback_grant",
@@ -3675,6 +3679,16 @@ mod tests {
         assert_eq!(evidence["deltas"]["coordinator"]["counters"]["hits"], 2);
         assert!(evidence["start"]["coordinator"]["hits"].as_u64().unwrap() >= 3);
         assert!(!output.join("read-diagnostics.json").exists());
+        for name in [
+            "write_authority_prepare_ns",
+            "write_authority_admit_ns",
+            "write_authority_windows",
+            "write_authority_batches",
+        ] {
+            assert_eq!(evidence["start"]["coordinator"][name], 0);
+            assert_eq!(evidence["end"]["coordinator"][name], 0);
+            assert_eq!(evidence["deltas"]["coordinator"]["counters"][name], 0);
+        }
         assert_eq!(evidence["deltas"]["owner_executor"]["available"], false);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -3983,6 +3997,10 @@ mod tests {
                 "bypass_disabled": 0, "bypass_admission": 0, "bypass_eviction_limit": 0,
                 "admitted_bytes": 0, "served_bytes": 0,
                 "read_profile_live_inline": 0,
+                "write_authority_prepare_ns": 0,
+                "write_authority_admit_ns": 0,
+                "write_authority_windows": 0,
+                "write_authority_batches": 0,
                 "read_profile_live_inline_fallback_drain": 0,
                 "read_profile_live_inline_fallback_busy": 0,
                 "read_profile_live_inline_fallback_grant": 0,
@@ -6385,6 +6403,10 @@ mod tests {
             "admitted_bytes",
             "served_bytes",
             "read_profile_live_inline",
+            "write_authority_prepare_ns",
+            "write_authority_admit_ns",
+            "write_authority_windows",
+            "write_authority_batches",
             "read_profile_live_inline_fallback_drain",
             "read_profile_live_inline_fallback_busy",
             "read_profile_live_inline_fallback_grant",
@@ -6419,6 +6441,41 @@ mod tests {
             .remove("read_profile_live_inline_fallback_grant");
         let missing = measurement_read_evidence(&start, &end, true, true);
         assert_eq!(missing["deltas"]["coordinator"]["available"], false);
+    }
+
+    #[test]
+    fn authority_split_read_boundaries_require_complete_monotone_counters() {
+        for name in [
+            "write_authority_prepare_ns",
+            "write_authority_admit_ns",
+            "write_authority_windows",
+            "write_authority_batches",
+        ] {
+            let mut start = read_boundary(&serde_json::Value::Null, &serde_json::Value::Null);
+            start["coordinator"][name] = serde_json::json!(10);
+            let mut end = start.clone();
+            end["coordinator"][name] = serde_json::json!(17);
+            let evidence = measurement_read_evidence(&start, &end, true, true);
+            assert_eq!(evidence["start"]["coordinator"][name], 10);
+            assert_eq!(evidence["end"]["coordinator"][name], 17);
+            assert_eq!(evidence["deltas"]["coordinator"]["counters"][name], 7);
+            assert_eq!(evidence["deltas"]["coordinator"]["available"], true);
+            let reset = measurement_read_evidence(&end, &start, true, true);
+            assert_eq!(reset["deltas"]["coordinator"]["available"], false);
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!("17"),
+                serde_json::json!(-1),
+            ] {
+                let mut invalid_end = end.clone();
+                invalid_end["coordinator"][name] = invalid;
+                let evidence = measurement_read_evidence(&start, &invalid_end, true, true);
+                assert_eq!(evidence["deltas"]["coordinator"]["available"], false);
+            }
+            end["coordinator"].as_object_mut().unwrap().remove(name);
+            let missing = measurement_read_evidence(&start, &end, true, true);
+            assert_eq!(missing["deltas"]["coordinator"]["available"], false);
+        }
     }
 
     #[test]

@@ -1917,10 +1917,7 @@ struct ReadLanePlacement {
 
 /// Affinity is a best-effort placement hint, never part of read correctness.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-fn pin_live_read_lane(
-    placement: Option<ReadLanePlacement>,
-    lane: usize,
-) {
+fn pin_live_read_lane(placement: Option<ReadLanePlacement>, lane: usize) {
     let Some(ReadLanePlacement { device, counters }) = placement else {
         return;
     };

@@ -1046,6 +1046,10 @@ impl Db {
                     progress_error_count,
                 );
                 let authority = snapshot.authority;
+                set("write_authority_prepare_ns", authority.authority_prepare_ns);
+                set("write_authority_admit_ns", authority.authority_admit_ns);
+                set("write_authority_windows", authority.authority_windows);
+                set("write_authority_batches", authority.authority_batches);
                 set("write_storage_wait_ns", authority.storage_wait_ns);
                 set("write_publication_ns", authority.publication_ns);
                 set("write_dispatch_ns", authority.dispatch_ns);
@@ -1345,6 +1349,10 @@ impl Db {
                     progress_error_count,
                 );
                 let authority = snapshot.authority;
+                set("write_authority_prepare_ns", authority.authority_prepare_ns);
+                set("write_authority_admit_ns", authority.authority_admit_ns);
+                set("write_authority_windows", authority.authority_windows);
+                set("write_authority_batches", authority.authority_batches);
                 set("write_storage_wait_ns", authority.storage_wait_ns);
                 set("write_publication_ns", authority.publication_ns);
                 set("write_dispatch_ns", authority.dispatch_ns);
