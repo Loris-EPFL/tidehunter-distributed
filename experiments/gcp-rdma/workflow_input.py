@@ -32,7 +32,7 @@ def specification(suite, backends, mode, fixture=None, sui_transports='tcp', sel
             raise ValueError('focused mode requires the exact reviewed selection and backends')
         spec = copy.deepcopy(manual_campaign.REVIEWED_SPECS[selection])
         manual_campaign._reviewed_jobs(spec)
-        if selection in cloud_campaign.M3_SELECTIONS:
+        if selection in (*cloud_campaign.M3_SELECTIONS, *cloud_campaign.TOOL_SELECTIONS):
             spec["reservation_hours"] = 2
         return spec
     if selection is not None:

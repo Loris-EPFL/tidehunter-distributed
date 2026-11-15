@@ -2298,6 +2298,12 @@ def guest_operation(config, request, clients, *, local_mode=None):
     if action in ("valkey_native_start", "valkey_native_snapshot", "valkey_native_stop"):
         import valkey_cloud
         return valkey_cloud.guest(config, request)
+    if action in ("fleet_tools_target_setup", "fleet_tools_target_cleanup",
+                  "fleet_tools_cpu_start", "fleet_tools_cpu_stop"):
+        if local_mode is not None:
+            raise SafetyError("F9 tools require fleet hardware")
+        import fleet_tools
+        return fleet_tools.guest(config, request, sys.modules[__name__])
     if action == "bootstrap" and platform_module(config):
         return platform_module(config).bootstrap_guest(config, index, clients)
     if action == "bootstrap":
@@ -4597,6 +4603,11 @@ class Controller:
 
 
     def run_case(self, job):
+        if job.get("selection") in cloud_campaign.TOOL_SELECTIONS:
+            import fleet_tools
+            if self.config["spec"].get("selection") != job["selection"]:
+                raise SafetyError("F9 tool selection differs from admitted fleet")
+            return fleet_tools.run_case(self, job, sys.modules[__name__])
         host_count = len(self.config["fleet"]["nodes"])
         owner_count = job.get("owner_count", host_count)
         if host_count == 1:
