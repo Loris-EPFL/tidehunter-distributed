@@ -8,6 +8,6 @@
   "rates": [100],
   "base_config": "../../benchmarks/kv-research/example.json",
   "client_cpus": 2,
-  "client_memory_mib": 2048,
+  "client_memory_mib": 3072,
   "max_runs": 8
 }
