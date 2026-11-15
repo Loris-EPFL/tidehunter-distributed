@@ -447,11 +447,15 @@ fn write_child(directory: &Path, case: &Case) {
         serde_json::to_vec(&restart).unwrap(),
     )
     .unwrap();
-    let mut original = fixture.open();
+    let original = fixture.open();
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    if case.leased.is_some() {
-        leased::prepare_database(&mut original);
-    }
+    let original = {
+        let mut original = original;
+        if case.leased.is_some() {
+            leased::prepare_database(&mut original);
+        }
+        original
+    };
     let readers = Readers::new(&fixture.config, &fixture.shape, original.epoch);
     let clients: Vec<_> = original
         .clients
@@ -589,7 +593,7 @@ fn recover_child(directory: &Path) {
         }));
         nodes.push(node);
     }
-    let mut db = RemoteDatabase::open(
+    let db = RemoteDatabase::open(
         &restart.root.join("authority"),
         &restart.shape,
         restart.config.clone(),
@@ -597,9 +601,13 @@ fn recover_child(directory: &Path) {
     )
     .unwrap();
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    if case.leased.is_some() {
-        leased::prepare_database(&mut db);
-    }
+    let db = {
+        let mut db = db;
+        if case.leased.is_some() {
+            leased::prepare_database(&mut db);
+        }
+        db
+    };
     let readers = Readers::new(&restart.config, &restart.shape, db.epoch);
     let db = ConcurrentRemoteDatabase::new(db).unwrap();
     let values = snapshot(&db, &readers);
@@ -978,7 +986,7 @@ fn write_model_crash_soak() {
             let boundaries = leased::boundaries(&case);
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
             let boundaries = BOUNDARIES;
-            for boundary in boundaries {
+            for boundary in boundaries.iter().copied() {
                 run_case(&Case {
                     boundary: boundary.into(),
                     ..case.clone()
