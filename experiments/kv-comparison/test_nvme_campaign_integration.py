@@ -50,7 +50,7 @@ class CampaignModeTests(unittest.TestCase):
                 self._permanent_export_measurement_and_configuration(selection)
 
     def _permanent_export_measurement_and_configuration(self, selection):
-        job = {'selection': selection, 'group': 'G18R',
+        job = {'selection': selection, 'group': 'G18R', 'backend': 'tidehunter_nvme_rdma',
                'nvmeof_route': 'live', 'mix': {'read': 100}, 'concurrency': 1,
                'read_lanes': 1, 'live_inline_reads': False, 'live_write_mode': 'leased',
                'durability_tier': 'native', 'live_export_mode': 'per_owner',
@@ -96,7 +96,7 @@ class CampaignModeTests(unittest.TestCase):
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
                 'live_write': {'write_mode': 'leased',
                                'acknowledgement_contract': 'leased extent: page-cache write'}}}
-        if job['selection'] == 'nvmeof_parallel_writes':
+        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_reads_geometry'):
             window = job.get('live_leased_write_window')
             info['configuration'].update(live_leased_write_window=window,
                 live_leased_write_window_bound=31 if window is None else window)

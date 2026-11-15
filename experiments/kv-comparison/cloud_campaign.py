@@ -2436,7 +2436,7 @@ def qualify_live_nvme_measurement(evidence, job):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W") and any(
+        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G24W", "G24M") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
             if job["live_write_mode"] == "leased":
                 if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
@@ -2447,7 +2447,8 @@ def qualify_live_nvme_measurement(evidence, job):
                     reasons.append("leased FUA count differs from frames and skip markers")
             elif counters["leased_frames"]:
                 reasons.append("reserved write observed leased frames")
-        if job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R") and job["mix"]["read"] == 100:
+        if (job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R", "G24R", "G24Q", "G24L", "G24P", "G24S", "G24C", "G24M")
+                and job["backend"] == "tidehunter_nvme_rdma" and job["mix"]["read"] > 0):
             coordinator = (data.get("deltas") or {}).get("coordinator") or {}
             value = (coordinator.get("counters") or {}).get("read_profile_live_inline")
             first = (data.get("start") or {}).get("coordinator") or {}
@@ -2507,7 +2508,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") == "nvmeof_parallel_writes" and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")
@@ -2515,7 +2516,8 @@ def admit_live_write_contract(job, backend_info):
         if ("live_leased_write_window" not in configuration
                 or (window is not None and type(window) is not int)
                 or window != expected_window
-                or type(bound) is not int or bound <= 0):
+                or type(bound) is not int or bound <= 0
+                or bound > job.get("live_max_inflight_requests", 32)):
             raise ValueError("leased write window or resource bound differs")
     elif "live_leased_write_window" in job:
         configuration = backend_info.get("configuration", {})

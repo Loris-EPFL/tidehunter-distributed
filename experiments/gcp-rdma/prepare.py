@@ -45,8 +45,9 @@ def admit_selected_features(spec, manifest):
     if 'valkey_rdma' in spec['backends']:
         if 'valkey-rdma' not in manifest.get('features', []):
             raise ValueError('packaged binary lacks selected Valkey RDMA feature')
-        artifacts |= {'runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
-                      'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json'}
+        if profile == 'focused_valkey':
+            artifacts |= {'runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
+                          'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json'}
     if gcp_runtime.live_mode(spec):
         artifacts.add('source/experiments/kv-comparison/nvme_campaign_owner.py')
     if spec.get('spdk_comparison'):

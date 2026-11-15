@@ -1,4 +1,5 @@
 import copy
+import ast
 import hashlib
 import json
 import tempfile
@@ -12,6 +13,20 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_reads_geometry_controller_mapping_defaults(self):
+        tree = ast.parse(Path(campaign.__file__).with_name("cloud_controller.py").read_text())
+        fields = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get" and len(node.args) > 1
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[1], (ast.Dict, ast.List))):
+                fields[node.args[0].value] = dict if isinstance(node.args[1], ast.Dict) else list
+        for job in campaign.make_focused_matrix("nvmeof_reads_geometry"):
+            for key, kind in fields.items():
+                if key in job:
+                    self.assertIsInstance(job[key], kind, (job["case_id"], key))
+
     def test_reads_geometry_reviewed_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_reads_geometry")
         self.assertEqual(len(jobs), 74)
@@ -268,7 +283,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}

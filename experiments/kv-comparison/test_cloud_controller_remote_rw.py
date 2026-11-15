@@ -15,6 +15,7 @@ class CompactReadLifecycleTests(unittest.TestCase):
         from test_cloud_controller import config_fixture
         config = config_fixture()
         config["spec"].update(mode="focused", selection="nvmeof_reads_geometry")
+        config["spec"]["backends"] = ["native", "tidehunter_nvme_rdma"]
         jobs = controller.cloud_campaign.make_focused_matrix("nvmeof_reads_geometry")
         prep = controller.live_nvme_preparation(config, jobs[0]["case_id"], "rdma")
         self.assertEqual(prep["max_inflight_requests"], 128)
