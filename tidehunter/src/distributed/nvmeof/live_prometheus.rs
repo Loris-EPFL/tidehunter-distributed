@@ -263,6 +263,12 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
         };
     }
     stage!(
+        "frame_fill_pool",
+        frame_fill_pool_ns,
+        frame_fill_pool_count,
+        "Parallel frame fill seconds including shared preparation pool queue and join"
+    );
+    stage!(
         "leased_write",
         leased_write_ns,
         leased_write_samples,
@@ -661,6 +667,7 @@ mod tests {
         producer.record_fua_write();
         producer.record_terminal_write_outcomes(1, 2, 2048);
         producer.record_timing(LiveTimingStage::LeasedWrite, 1_000_000_000, 1);
+        producer.record_frame_fill_pool(7_000_000_000);
         producer.record_timing(LiveTimingStage::ExtentSwitch, 3_000_000_000, 1);
         producer.record_timing(LiveTimingStage::AdoptionAsync, 4_000_000_000, 2);
         producer.record_timing(LiveTimingStage::AdoptionSettle, 6_000_000_000, 3);
@@ -708,6 +715,8 @@ mod tests {
         };
         assert_eq!(counter("tidehunter_nvmeof_live_cq_seconds_total"), 2.0);
         for (name, expected) in [
+            ("frame_fill_pool_seconds_total", 7.0),
+            ("frame_fill_pool_samples_total", 1.0),
             ("leased_worker_waits_total", 2.0),
             ("leased_worker_wait_timeouts_total", 1.0),
             ("leased_flushes_total", 1.0),

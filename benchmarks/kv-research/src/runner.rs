@@ -1006,6 +1006,8 @@ const LIVE_NVME_COUNTERS: &[&str] = &[
     "complete_exchanges",
     "lease_exchanges",
     "leased_frames",
+    "frame_fill_pool_ns",
+    "frame_fill_pool_count",
     "leased_eventfd_unavailable",
     "leased_worker_waits",
     "leased_worker_wait_timeouts",
@@ -6563,5 +6565,35 @@ mod tests {
         }
         assert_eq!(row["stages"]["lock_wait"]["lifetime_max_ns_at_end"], 300);
         assert_eq!(row["available"], true);
+    }
+}
+
+#[cfg(test)]
+mod frame_fill_counter_tests {
+    use super::*;
+
+    #[test]
+    fn frame_fill_boundaries_require_complete_monotone_counters() {
+        let counters: serde_json::Map<String, serde_json::Value> = LIVE_NVME_COUNTERS
+            .iter()
+            .map(|name| ((*name).to_owned(), serde_json::json!(0)))
+            .collect();
+        let start = serde_json::json!({"available": true, "live_nvmeof": counters});
+        for name in ["frame_fill_pool_ns", "frame_fill_pool_count"] {
+            let mut end = start.clone();
+            end["live_nvmeof"][name] = serde_json::json!(7);
+            let result = measurement_read_evidence(&start, &end, true, true);
+            assert_eq!(result["live_nvmeof"]["available"], true);
+            assert_eq!(result["live_nvmeof"]["counters"][name], 7);
+            assert_eq!(
+                measurement_read_evidence(&end, &start, true, true)["live_nvmeof"]["available"],
+                false,
+            );
+            end["live_nvmeof"].as_object_mut().unwrap().remove(name);
+            assert_eq!(
+                measurement_read_evidence(&start, &end, true, true)["live_nvmeof"]["available"],
+                false,
+            );
+        }
     }
 }

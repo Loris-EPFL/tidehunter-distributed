@@ -112,6 +112,9 @@ counter_fields!(
     complete_exchanges,
     lease_exchanges,
     leased_frames,
+    /// Parallel frame fill and scoped join, including shared-pool queue delay.
+    frame_fill_pool_ns,
+    frame_fill_pool_count,
     leased_eventfd_unavailable,
     /// Waits on the acknowledgement path: at least one leased frame in flight.
     leased_worker_waits,
@@ -266,6 +269,12 @@ pub(crate) enum LiveWriteFailure {
 }
 
 impl LiveNvmeCounters {
+    pub(crate) fn record_frame_fill_pool(&self, ns: u64) {
+        // Relaxed: timing evidence does not publish DMA or authority state.
+        self.frame_fill_pool_ns.fetch_add(ns, Ordering::Relaxed);
+        self.frame_fill_pool_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_lease_profile(&self, profile: super::super::tcp::LeaseProfile) {
         // Relaxed: owner-local timing evidence publishes no stream state.
         self.lease_reserve_ns
