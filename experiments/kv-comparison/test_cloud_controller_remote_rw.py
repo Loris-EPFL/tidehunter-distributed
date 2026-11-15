@@ -178,6 +178,8 @@ class CompactReadLifecycleTests(unittest.TestCase):
                         if 'live_' + key in job:
                             self.assertEqual(live[key], job['live_' + key])
                             client[key] = live[key]
+                    client.setdefault('leased_sync', controller.cloud_campaign.requested_leased_sync(job))
+                    client.setdefault('leased_flush_min_frame_bytes', 65536)
                     client.update(host_nqn=nqn, host_id=controller.live_host_identity(nqn),
                                   leased_durability=prep['durability_tier'] if live['write_mode'] == 'leased' else None)
                     controller.dump(out / 'remote.json', {'tls': {}, 'live_nvme': client,

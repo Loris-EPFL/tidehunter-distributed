@@ -97,7 +97,7 @@ def _row(case, export):
             observed_ack = live.get('acknowledgement_contract')
             # Archived per-frame-FUA binaries used this narrower, truthful label.
             archived_fua = (mode == 'leased' and tier == 'synchronous'
-                            and job.get('live_leased_sync', 'per_frame_fua') == 'per_frame_fua'
+                            and ('live_leased_sync' not in job or job['live_leased_sync'] == 'per_frame_fua')
                             and observed_ack == 'leased extent: FUA data sync; owner frontier root asynchronous')
             if live_ack is None or (observed_ack != live_ack and not archived_fua):
                 reasons.append('executed acknowledgement contract differs or unavailable')

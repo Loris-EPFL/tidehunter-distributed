@@ -10,10 +10,14 @@ from unittest import mock
 import gcp_bootstrap
 import gcp_worker as worker
 import gcp_runtime
+
 import workflow_input
+FORMATTED_STORAGE = {'device': '/dev/nvme7n1', 'mkfs_duration_seconds': 2.5,
+                     'lazy_initialization_disabled': True, 'inode_ratio_bytes': 4194304, 'inode_count': 1024}
 
 
 class FakePath:
+    files = {}
     links = {'/dev/disk/by-id/google-local-nvme-ssd-4': '/dev/nvme7n1',
              '/dev/disk/by-id/google-boot': '/dev/nvme0n1'}
 
@@ -45,11 +49,21 @@ class FakePath:
 
     def mkdir(self, **kwargs):
         pass
+    def exists(self):
+        return self.value in self.files
+
+    def read_text(self):
+        return self.files[self.value]
+
+    def write_text(self, text):
+        self.files[self.value] = text
+
 
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self.host = {'id': '42', 'name': 'vm', 'zone': 'zone'}
+        FakePath.files = {}
         self.config = {'run_id': 'run', 'deadline_utc': '2030-01-01T00:00:00Z',
                        'machine_type': 'z4m-highmem-16'}
         self.instance = {'id': '42', 'name': 'vm', 'disks': [
@@ -64,16 +78,23 @@ class StorageTests(unittest.TestCase):
                      'serial': 'serial', 'size': 4096, 'mountpoints': [None]}
         self.commands = []
 
-    def run_storage(self, *, signatures=None, probe_code=2, mounted_code=1, mounted_source=''):
+    def run_storage(self, *, signatures=None, probe_code=2, mounted_code=1, mounted_source='',
+                    inode_output='Inode count: 1024\n'):
         def check_output(argv, **kwargs):
             if argv[0] == 'lsblk':
                 return json.dumps({'blockdevices': [self.disk]})
             if argv[0] == 'wipefs':
                 return json.dumps({'signatures': signatures or []})
+            if argv[0] == 'tune2fs':
+                self.assertEqual(argv, ['tune2fs', '-l', '/dev/nvme7n1'])
+                self.assertEqual(kwargs['env']['LC_ALL'], 'C')
+                return inode_output
             raise AssertionError(argv)
 
         def run(argv, **kwargs):
             self.commands.append(argv)
+            if argv[0] == 'mkfs.ext4':
+                self.mkfs_timeout = kwargs['timeout']
             if argv[0] == 'findmnt':
                 return mock.Mock(returncode=mounted_code, stdout=mounted_source)
             if argv[0] == 'blkid':
@@ -84,13 +105,32 @@ class StorageTests(unittest.TestCase):
              mock.patch.object(worker, 'metadata', side_effect=self.meta.__getitem__), \
              mock.patch.object(worker.subprocess, 'check_output', side_effect=check_output), \
              mock.patch.object(worker.subprocess, 'run', side_effect=run), \
-             mock.patch.object(worker.time, 'time', return_value=1):
-            worker.prepare_storage(self.config, self.host, self.api)
+             mock.patch.object(worker.time, 'time', return_value=1), \
+             mock.patch.object(worker.time, 'monotonic', side_effect=[10, 12.5]):
+            self.storage = worker.prepare_storage(self.config, self.host, self.api)
 
     def test_exact_api_and_metadata_disk_is_formatted_only_after_signature_probes(self):
         self.run_storage()
         self.assertEqual([c[0] for c in self.commands], ['findmnt', 'blkid', 'mkfs.ext4', 'mount'])
         self.assertEqual(self.commands[2][-1], '/dev/nvme7n1')
+        self.assertEqual(self.commands[2], ['mkfs.ext4', '-F', '-T', 'largefile4', '-E',
+                                          'lazy_itable_init=0,lazy_journal_init=0', '/dev/nvme7n1'])
+        self.assertEqual(self.storage['mkfs_duration_seconds'], 2.5)
+        self.assertTrue(self.storage['lazy_initialization_disabled'])
+        self.assertEqual(self.storage['inode_count'], 1024)
+        self.assertEqual(self.storage['inode_ratio_bytes'], 4194304)
+        self.assertEqual(self.storage['mkfs_profile'], 'largefile4')
+        self.assertEqual(self.mkfs_timeout, 600)
+        saved = self.storage
+        self.run_storage(mounted_code=0, mounted_source='/dev/nvme7n1')
+        self.assertEqual(self.storage, saved)
+
+    def test_invalid_formatted_inode_count_prevents_mount(self):
+        for text in ('', 'Inode count: 0\n', 'Inode count: 1\nInode count: 2\n'):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    gcp_runtime.RuntimeSafetyError, 'inode count'):
+                self.run_storage(inode_output=text)
+        self.assertNotIn('mount', [command[0] for command in self.commands])
 
     def test_metadata_mismatch_rejected(self):
         self.meta['instance/disks/1/type'] = 'PERSISTENT'
@@ -126,6 +166,26 @@ class StorageTests(unittest.TestCase):
             FakePath.links['/dev/disk/by-id/google-local-nvme-ssd-10'] = '/dev/nvme20n1'
             with self.assertRaisesRegex(gcp_runtime.RuntimeSafetyError, 'zero identity'):
                 worker.admit_scratch(self.config, self.host, self.api)
+
+    def test_z4m_32_admits_both_local_ssd_cards_and_selects_the_first(self):
+        # F7 failure: z4m-highmem-32 reports its second local SSD as nvme_card1.
+        self.config['machine_type'] = 'z4m-highmem-32'
+        self.instance['disks'] = [self.instance['disks'][0]] + [
+            {'type': 'SCRATCH', 'interface': 'NVME'} for _ in range(2)]
+        self.meta = {'instance/disks/': '0/\n1/\n2/', 'instance/disks/0/type': 'PERSISTENT',
+                     'instance/disks/1/type': 'LOCAL-SSD', 'instance/disks/2/type': 'LOCAL-SSD'}
+        links = {'/dev/disk/by-id/google-boot': '/dev/nvme2n1',
+                 '/dev/disk/by-id/google-local-nvme-ssd-0': '/dev/nvme0n1',
+                 '/dev/disk/by-id/google-local-nvme-ssd-1': '/dev/nvme1n1'}
+        def inspect(argv, **kwargs):
+            card = 'nvme_card' + argv[-1][len('/dev/nvme')]
+            return json.dumps({'blockdevices': [{**self.disk, 'path': argv[-1], 'model': card, 'serial': card}]})
+        with mock.patch.dict(FakePath.links, links, clear=True), \
+             mock.patch.object(worker, 'Path', FakePath), \
+             mock.patch.object(worker, 'metadata', side_effect=self.meta.__getitem__), \
+             mock.patch.object(worker.subprocess, 'check_output', side_effect=inspect):
+            self.assertEqual(worker.admit_scratch(self.config, self.host, self.api)['device'], '/dev/nvme0n1')
+        self.assertFalse(worker.physical_storage.admitted_model('gcp', 'nvme_card-pd'))
 
     def test_boot_alias_rejected(self):
         with mock.patch.dict(FakePath.links, {'/dev/disk/by-id/google-boot': '/dev/nvme7n1'}):
@@ -186,7 +246,7 @@ class WorkerQueueTests(unittest.TestCase):
         with mock.patch.object(worker, 'Path', FakePath), \
              mock.patch.object(worker, 'WorkerState', MemoryState), \
              mock.patch.object(worker, 'identify', return_value=host), \
-             mock.patch.object(worker, 'prepare_storage'), \
+             mock.patch.object(worker, 'prepare_storage', return_value=FORMATTED_STORAGE), \
              mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
              mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
              mock.patch.object(worker.gcp_runtime, '_deadline', return_value=3), \
@@ -242,7 +302,7 @@ class WorkerQueueTests(unittest.TestCase):
                 with mock.patch.object(worker, 'Path', FakePath), \
                      mock.patch.object(worker, 'WorkerState', MemoryState), \
                      mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
-                     mock.patch.object(worker, 'prepare_storage'), \
+                     mock.patch.object(worker, 'prepare_storage', return_value=FORMATTED_STORAGE), \
                      mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
                      mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
                      mock.patch.object(worker.gcp_runtime, '_deadline', return_value=8), \
@@ -305,7 +365,7 @@ class WorkerQueueTests(unittest.TestCase):
              mock.patch.object(worker, 'Path', FakePath), \
              mock.patch.object(worker, 'WorkerState', side_effect=lambda ignored, prefix: original_state(root, prefix)), \
              mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
-             mock.patch.object(worker, 'prepare_storage'), \
+             mock.patch.object(worker, 'prepare_storage', return_value=FORMATTED_STORAGE), \
              mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
              mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
              mock.patch.object(worker.gcp_runtime, '_deadline', side_effect=lambda value: end[0]), \
@@ -375,7 +435,7 @@ class WorkerQueueTests(unittest.TestCase):
         with mock.patch.object(worker, 'Path', FakePath), \
              mock.patch.object(worker, 'WorkerState', return_value=state), \
              mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
-             mock.patch.object(worker, 'prepare_storage'), \
+             mock.patch.object(worker, 'prepare_storage', return_value=FORMATTED_STORAGE), \
              mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
              mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
              mock.patch.object(worker.gcp_runtime, '_deadline', return_value=3), \
@@ -407,7 +467,7 @@ class WorkerQueueTests(unittest.TestCase):
             with mock.patch.object(worker, 'Path', FakePath), \
                  mock.patch.object(worker, 'WorkerState', MemoryState), \
                  mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
-                 mock.patch.object(worker, 'prepare_storage'), \
+                 mock.patch.object(worker, 'prepare_storage', return_value=FORMATTED_STORAGE), \
                  mock.patch.object(worker, 'run_request', side_effect=blocked), \
                  mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
                  mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \

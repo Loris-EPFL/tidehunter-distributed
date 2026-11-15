@@ -1703,7 +1703,8 @@ def admit_prepared_live_client(live_client, prep, tier):
     for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
-    for key, default in (("leased_sync", "per_frame_fua"), ("leased_flush_min_frame_bytes", 0)):
+    for key, default in (("leased_sync", "group_flush"),
+                         ("leased_flush_min_frame_bytes", 65536)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
     if live_client != expected:
@@ -2072,6 +2073,61 @@ def floor_client_attempts(argv, deadline, *, perftest):
             raise DeadlineError("network floor client deadline exceeded")
         time.sleep(min(0.1, remaining - 1))
     raise AssertionError("bounded floor attempts exhausted")
+
+
+def native_wal_snapshot(directory, label):
+    """Capture the paused client's cumulative logical-WAL counter at a gate."""
+    from decimal import Decimal
+    source = Path(directory) / "result/live.prom"
+    try:
+        with source.open("rb") as stream:
+            data = stream.read(16 * 1024**2 + 1)
+        if len(data) > 16 * 1024**2:
+            raise ValueError("native metrics snapshot exceeds bound")
+        series = {}
+        for line in data.decode().splitlines():
+            if not line.startswith("wal_written_bytes_type"):
+                continue
+            match = re.fullmatch(r'(wal_written_bytes_type(?:_total)?(?:\{.*\})?)\s+([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\s*', line)
+            if match is None:
+                raise ValueError("invalid native logical-WAL counter")
+            key, number = match.groups()
+            value = Decimal(number)
+            if value < 0 or value > 2**53 or value != value.to_integral_value() or key in series:
+                raise ValueError("native logical-WAL counter is not a unique nonnegative integer")
+            series[key] = int(value)
+            if len(series) > 4096:
+                raise ValueError("native logical-WAL metric population exceeds bound")
+        if not series:
+            raise ValueError("native logical-WAL counter unavailable")
+        target = Path(directory) / ("native-wal-" + label + ".prom")
+        target.write_bytes(data)
+        return {"available": True, "series": series, "path": target.name,
+                "sha256": hashlib.sha256(data).hexdigest()}
+    except (OSError, UnicodeError, ValueError, ArithmeticError) as exc:
+        return {"available": False, "reason": str(exc)}
+
+
+def native_wal_interval(start, end):
+    evidence = {"available": False, "start": start, "end": end,
+                "counter": "wal_written_bytes_type",
+                "scope": "post-warmup pre-release to completion-observed; includes background logical WAL records, excludes preload/warmup; not physical device bytes"}
+    if not start or not end or not start.get("available") or not end.get("available"):
+        evidence["reason"] = "native WAL boundary unavailable"
+        return evidence
+    before, after = start["series"], end["series"]
+    if before.keys() != after.keys() or any(after[key] < value for key, value in before.items()):
+        evidence["reason"] = "native WAL counter population changed or reset"
+        return evidence
+    evidence.update(available=True, logical_wal_bytes=sum(after[key] - value for key, value in before.items()))
+    return evidence
+
+
+def store_thread_cpu(directory, traces):
+    artifact = {"coordinator": traces[0] if traces and not traces[0].get("inactive") else {"available": False},
+                "owners": [trace for trace in traces[1:] if not trace.get("inactive")]}
+    dump(Path(directory) / "thread-cpu.json", artifact)
+    return artifact
 
 
 def store_owner_ftrace(directory, traces):
@@ -2590,6 +2646,24 @@ def guest_operation(config, request, clients, *, local_mode=None):
             raise SafetyError("NVMe trace requires an admitted NVMe fleet owner")
         import nvme_campaign_trace
         return nvme_campaign_trace.execute(config, request, clients, command=command)
+    if action in ("thread_cpu_start", "thread_cpu_stop"):
+        import owner_ftrace
+        case = request["case_id"]
+        state_root = guarded(root / "cells" / case /
+                             ("coordinator-cpu" if index < 0 else "node-" + str(index)) / "thread-cpu", root)
+        state_root.mkdir(parents=True, exist_ok=True)
+        state_path = state_root / "state.json"
+        if action == "thread_cpu_start":
+            role = "client" if index < 0 else "storage-" + str(index)
+            status = unit_status(unit_name(config, case, role))
+            pid = int(status.get("MainPID", "0"))
+            duration = min(owner_ftrace.CPU_MAX_SAMPLES,
+                           (timestamp(config["deadline_utc"]) - utc()).total_seconds())
+            state = owner_ftrace.start_threads(state_root, pid, duration)
+            dump(state_path, state)
+            return state
+        state = json.loads(state_path.read_text()) if state_path.exists() else None
+        return owner_ftrace.stop_threads(state)
     case = request["case_id"]
     guest_root = guarded(root / "cells" / case, root)
     capsule_root = guarded(guest_root / ("node-" + str(index)), root)
@@ -4350,6 +4424,8 @@ class Controller:
         tracer_stopped = False
         tracer_clean = True
         owner_ftrace_active = False
+        thread_cpu_active = False
+        native_wal_start = None
         nvme_trace_attempted = False
         nvme_trace_stopped = False
         live_observation_attempted = False
@@ -4394,6 +4470,14 @@ class Controller:
                 case=job["case_id"], owner_count=owner_count, timeout=60, export=True)
             store_owner_ftrace(directory, traces)
             owner_ftrace_active = False
+        def collect_thread_cpu():
+            nonlocal thread_cpu_active
+            traces = self.all_hosts({"action": "thread_cpu_stop", "case_id": job["case_id"]},
+                case=job["case_id"], owner_count=0 if job["backend"] == "native" else owner_count, timeout=60, export=True)
+            store_thread_cpu(directory, traces)
+            receipt["thread_cpu_evidence"] = {"path": "thread-cpu.json",
+                                              "sha256": digest(directory / "thread-cpu.json")}
+            thread_cpu_active = False
         self.select_monitoring(job, directory)
         try:
             require_supported_nvme_route(job)
@@ -4625,12 +4709,26 @@ class Controller:
                     receipt["owner_ftrace_start"] = self.all_hosts(
                         {"action": "owner_ftrace_start", "case_id": job["case_id"]},
                         case=job["case_id"], owner_count=owner_count, timeout=60)
+                if job.get("native_wal_sampling"):
+                    native_wal_start = native_wal_snapshot(directory, "start")
+                if job.get("thread_cpu_sampling") and self.local_mode is None:
+                    thread_cpu_active = True
+                    receipt["thread_cpu_start"] = self.all_hosts(
+                        {"action": "thread_cpu_start", "case_id": job["case_id"]},
+                        case=job["case_id"], owner_count=0 if job["backend"] == "native" else owner_count, timeout=60)
                 (directory / "measurement.release").touch(exist_ok=False)
                 gate_released = True
                 while True:
                     self.remaining()
                     completed = directory / "measurement.complete"
                     if completed.exists() and not completion_observed:
+                        if job.get("native_wal_sampling"):
+                            native_wal = native_wal_interval(native_wal_start, native_wal_snapshot(directory, "end"))
+                            dump(directory / "native-wal-evidence.json", native_wal)
+                            receipt["native_wal_evidence"] = {"path": "native-wal-evidence.json",
+                                "sha256": digest(directory / "native-wal-evidence.json")}
+                        if thread_cpu_active:
+                            collect_thread_cpu()
                         if owner_ftrace_active:
                             collect_owner_ftrace()
                         ended = self.all_hosts({"action": "snapshot", "drop": False,
@@ -4813,7 +4911,7 @@ class Controller:
                 receipt["hybrid_put_qualification"] = qualification
             elif backend in cloud_campaign.NVME_BACKENDS and job.get("nvmeof_route") == "live":
                 qualification = cloud_campaign.qualify_live_nvme_route(
-                    read_interval["observed"] if read_interval is not None else None, job, live_expected)
+                    read_interval["observed"] if read_interval is not None else None, job, live_expected, summary["backend"])
                 cloud_campaign.admit_live_write_contract(job, summary["backend"])
                 receipt["live_nvme_measurement_qualification"] = qualification
                 if not qualification["qualified"]:
@@ -4917,6 +5015,11 @@ class Controller:
                     failure.__cause__ = error
                 else:
                     failure = error
+            if thread_cpu_active:
+                try:
+                    collect_thread_cpu()
+                except Exception as exc:
+                    record_cleanup_error("thread_cpu_stop", exc)
             if owner_ftrace_active:
                 try:
                     collect_owner_ftrace()

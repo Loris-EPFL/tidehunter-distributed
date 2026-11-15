@@ -1001,6 +1001,38 @@ class CaseIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported"):
             campaign.write_diagnostic_metrics(value, {})
 
+    def test_authority_write_intervals_are_allowlisted_with_independent_scopes(self):
+        value = write_diagnostics()
+        counters = dict(zip(sorted(campaign.AUTHORITY_INTERVAL_COUNTERS), (64000, 4, 32000, 2)))
+        value["pre_completion_gate"] = {
+            "available": True, "scope": "coordinator_arm_through_pre_completion_gate",
+            "clock_scope": "exclusive wall elapsed", "stages": counters}
+        value["profile"]["coordinator_interval"] = {
+            "scope": "measurement_boundary_cumulative_delta",
+            "clock_scope": "exclusive wall elapsed", "stages": counters}
+        text = campaign.write_diagnostic_metrics(value, {})
+        for name in campaign.AUTHORITY_INTERVAL_COUNTERS:
+            label = 'stage' if name.endswith('_ns') else 'counter'
+            self.assertEqual(sum(f'{label}="{name}"' in line for line in text.splitlines()), 2)
+        self.assertIn('scope="coordinator_arm_through_pre_completion_gate"', text)
+        self.assertIn('scope="measurement_boundary_cumulative_delta"', text)
+
+    def test_authority_read_observation_uses_write_stage_seconds_not_read_call_units(self):
+        counters = {"write_authority_prepare_ns": 32000, "write_authority_admit_ns": 64000,
+                    "write_authority_windows": 2, "write_authority_batches": 4}
+        evidence = {"scope": "measurement_boundary", "deltas": {
+            "coordinator": {"available": True, "counters": counters},
+            "owner_executor": {"available": False}}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        for name, value in counters.items():
+            metric = "kv_case_write_diagnostic_stage_seconds" if name.endswith("_ns") else "kv_case_write_diagnostic_stage_count"
+            lines = [line for line in text.splitlines() if f'="{name}"' in line]
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith(metric + "{"))
+            self.assertEqual(float(lines[0].rsplit(" ", 1)[1]), value / 1e9 if name.endswith("_ns") else value)
+            self.assertIn('scope="measurement_boundary"', lines[0])
+        self.assertNotIn('path="write_authority_', text)
+
     def test_full_remote_profile_and_coordinator_window_fit_without_clipping(self):
         value = write_diagnostics()
         value["backend"] = "tidehunter_tcp"

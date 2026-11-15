@@ -182,7 +182,9 @@ def admit_scratch(config, host, api):
                 not physical_storage.admitted_model('gcp', disk.get('model')) or
                 not isinstance(disk.get('serial'), str) or not disk['serial'].strip() or
                 type(disk.get('size')) is not int or disk['size'] <= 0):
-            raise gcp_runtime.RuntimeSafetyError('local SSD model or serial not admitted')
+            raise gcp_runtime.RuntimeSafetyError(
+                'local SSD model or serial not admitted: ' + json.dumps(
+                    {key: disk.get(key) for key in ('path', 'type', 'model', 'serial', 'size')}, sort_keys=True))
         inventory.append(disk)
     if len({disk['serial'].strip() for disk in inventory}) != expected:
         raise gcp_runtime.RuntimeSafetyError('local SSD physical serials are not unique')
@@ -196,11 +198,14 @@ def prepare_storage(config, host, api):
     device, disk = admitted['device'], admitted['block_device']
     target = Path('/mnt/tidehunter-kv-comparison') / config['run_id']
     target.mkdir(parents=True, mode=0o700, exist_ok=True)
+    evidence_path = target / 'storage-evidence.json'
     mounted = subprocess.run(['findmnt', '-rn', '-M', str(target), '-o', 'SOURCE'], capture_output=True, text=True, timeout=10)
     if mounted.returncode == 0:
         if Path(mounted.stdout.strip()).resolve() != Path(device):
             raise gcp_runtime.RuntimeSafetyError('run data mount belongs to another device')
-        return
+        return (json.loads(evidence_path.read_text()) if evidence_path.exists() else
+                {'device': device, 'mkfs_duration_seconds': None,
+                 'lazy_initialization_disabled': None, 'reason': 'existing mount has no formatting evidence'})
     if mounted.returncode != 1:
         raise gcp_runtime.RuntimeSafetyError('could not inspect run data mount')
     if disk.get('children') or any(disk.get('mountpoints') or []):
@@ -216,12 +221,32 @@ def prepare_storage(config, host, api):
     remaining = gcp_runtime._deadline(config['deadline_utc']) - time.time()
     if remaining <= 0:
         raise gcp_runtime.RuntimeSafetyError('storage admission expired')
-    subprocess.run(['mkfs.ext4', '-F', device], check=True, timeout=min(120, remaining))
+    mkfs_args = ['mkfs.ext4', '-F', '-T', 'largefile4', '-E', 'lazy_itable_init=0,lazy_journal_init=0', device]
+    mkfs_started = time.monotonic()
+    # largefile4 uses one inode per 4 MiB (~0.9 GiB of inode tables on 14,000 GiB).
+    # Bound eager inode/journal initialization to ten minutes and the fleet expiry.
+    subprocess.run(mkfs_args, check=True, timeout=min(600, remaining))
+    evidence = {'run_id': config['run_id'], 'device': device, 'mkfs_arguments': mkfs_args,
+                'mkfs_duration_seconds': time.monotonic() - mkfs_started,
+                'lazy_initialization_disabled': True, 'inode_ratio_bytes': 4 * 1024**2,
+                'mkfs_profile': 'largefile4'}
+    remaining = gcp_runtime._deadline(config['deadline_utc']) - time.time()
+    if remaining <= 0:
+        raise gcp_runtime.RuntimeSafetyError('storage admission expired')
+    filesystem = subprocess.check_output(
+        ['tune2fs', '-l', device], text=True, timeout=min(30, remaining),
+        env={**os.environ, 'LC_ALL': 'C'})
+    inode_counts = re.findall(r'^Inode count:[ \t]*([0-9]+)[ \t]*$', filesystem, flags=re.MULTILINE)
+    if len(inode_counts) != 1 or int(inode_counts[0]) <= 0:
+        raise gcp_runtime.RuntimeSafetyError('formatted scratch inode count unavailable or invalid')
+    evidence['inode_count'] = int(inode_counts[0])
     remaining = gcp_runtime._deadline(config['deadline_utc']) - time.time()
     if remaining <= 0:
         raise gcp_runtime.RuntimeSafetyError('storage admission expired')
     subprocess.run(['mount', device, str(target)], check=True, timeout=min(30, remaining))
 
+    evidence_path.write_text(json.dumps(evidence) + '\n')
+    return evidence
 
 def _inside(path, root):
     try:
@@ -335,7 +360,7 @@ def serve(config, *, api=None, poll_seconds=1):
                 config['fleet'].index(host) - 1, {}, None)
         if 'tidehunter_nvme_rdma' in transports:
             gcp_runtime.admit_live_qualification(config)
-    prepare_storage(config, host, api)
+    storage_evidence = prepare_storage(config, host, api)
     store = api.objects(config['bucket'])
     gate_root = Path('/var/lib/tidehunter-gcp-control') / config['run_id']
     gate_root.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -349,6 +374,7 @@ def serve(config, *, api=None, poll_seconds=1):
         ready = {'run_id': config['run_id'], 'source_sha256': config['source_sha256'],
                  'manifest_sha256': admission['manifest_sha256'], 'deadline_utc': config['deadline_utc'],
                  'instance_name': host['name'], 'instance_id': str(host['id']), 'complete': True}
+        ready['storage'] = storage_evidence
         if nvmet_fix is not None:
             ready['nvmet_fix'] = nvmet_fix
         gcp_runtime._put_once(

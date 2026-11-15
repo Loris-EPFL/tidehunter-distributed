@@ -1,3 +1,4 @@
+import copy
 import csv
 import json
 from pathlib import Path
@@ -5,9 +6,190 @@ import tempfile
 import unittest
 
 import nvmeof_path as analysis
+import cloud_campaign
+
+
+def authority_evidence():
+    first = dict.fromkeys(analysis.AUTHORITY_COUNTERS, 10000)
+    counters = dict(zip(analysis.AUTHORITY_COUNTERS, (32000, 64000, 2, 4)))
+    return {'scope': 'measurement_boundary', 'measurement_attempted': True, 'measurement_drained': True,
+            'start': {'coordinator': first},
+            'end': {'coordinator': {name: first[name] + value for name, value in counters.items()}},
+            'deltas': {'coordinator': {'available': True, 'counters': counters}}}
+
+
+def authority_diagnostics():
+    return {'phase_attempted': True, 'measurement_drained': True, 'pre_completion_gate': {
+        'available': True, 'scope': 'coordinator_arm_through_pre_completion_gate',
+        'clock_scope': 'exclusive local wall elapsed time, not CPU',
+        'stages': authority_evidence()['deltas']['coordinator']['counters']}}
 
 
 class NvmeofPathTests(unittest.TestCase):
+    def test_authority_columns_prefer_validated_read_boundaries_and_reach_csv(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G32W')
+        evidence, diagnostics = authority_evidence(), authority_diagnostics()
+        diagnostics['pre_completion_gate']['stages']['write_authority_prepare_ns'] = 128000
+        (directory / 'measurement-read-evidence.json').write_text(json.dumps(evidence))
+        (directory / 'write-diagnostics.json').write_text(json.dumps(diagnostics))
+        row = analysis.result_row(self.cases[0], self.export)
+        self.assertEqual(row['authority_prepare_us_per_put'], 8)
+        self.assertEqual(row['authority_admit_us_per_put'], 16)
+        self.assertEqual(row['batches_per_window'], 2)
+        self.assertEqual(row['authority_interval_source'], 'measurement-read-evidence.json')
+        self.generate()
+        with (self.output / 'puts.csv').open() as stream:
+            exported = next(csv.DictReader(stream))
+        self.assertEqual(float(exported['authority_prepare_us_per_put']), 8)
+        self.assertEqual(exported['authority_interval_scope'], 'measurement_start_to_drained_end_counter_delta')
+
+    def test_authority_boundaries_reject_missing_reset_mismatched_and_saturated_counters(self):
+        for path, value in (
+                (('start', 'coordinator', 'write_authority_prepare_ns'), None),
+                (('end', 'coordinator', 'write_authority_prepare_ns'), 9999),
+                (('end', 'coordinator', 'write_authority_prepare_ns'), 2**64 - 1),
+                (('deltas', 'coordinator', 'counters', 'write_authority_prepare_ns'), 32001),
+                (('deltas', 'coordinator', 'counters', 'write_authority_batches'), True),
+                (('deltas', 'coordinator', 'counters', 'write_authority_batches'), 4.0),
+                (('deltas', 'coordinator', 'counters', 'write_authority_windows'), -1),
+                (('deltas', 'coordinator', 'available'), False),
+                (('measurement_attempted',), False), (('measurement_drained',), False),
+                (('start',), 17), (('end', 'coordinator'), ['wrong']),
+                (('deltas', 'coordinator', 'counters'), 'write_authority_batches'),
+                (('scope',), 'lifetime')):
+            with self.subTest(path=path, value=value):
+                evidence = authority_evidence()
+                target = evidence
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                self.assertTrue(all(value is None for value in analysis.authority_columns(
+                    evidence, authority_diagnostics()).values()))
+        evidence = authority_evidence()
+        del evidence['deltas']['coordinator']['counters']['write_authority_prepare_ns']
+        self.assertTrue(all(value is None for value in analysis.authority_columns(
+            evidence, authority_diagnostics()).values()))
+
+    def test_authority_profile_fallback_preserves_the_selected_interval_scope(self):
+        diagnostics = authority_diagnostics()
+        interval = copy.deepcopy(diagnostics['pre_completion_gate'])
+        interval.pop('available')
+        interval.update(scope='measurement_boundary_cumulative_delta')
+        interval['stages']['write_authority_prepare_ns'] = 128000
+        diagnostics['profile'] = {'coordinator_interval': interval}
+        columns = analysis.authority_columns({}, diagnostics)
+        self.assertEqual(columns['authority_prepare_us_per_put'], 8)
+        self.assertEqual(columns['authority_interval_scope'], 'coordinator_arm_through_pre_completion_gate')
+        diagnostics['pre_completion_gate'] = {'available': False, 'reason': 'unavailable'}
+        columns = analysis.authority_columns({}, diagnostics)
+        self.assertEqual(columns['authority_prepare_us_per_put'], 32)
+        self.assertEqual(columns['authority_interval_source'], 'write-diagnostics.json:coordinator_interval')
+        self.assertEqual(columns['authority_interval_scope'], 'measurement_boundary_cumulative_delta')
+        for key in ('measurement_drained', 'phase_attempted'):
+            broken = copy.deepcopy(diagnostics)
+            broken[key] = False
+            self.assertTrue(all(value is None for value in analysis.authority_columns({}, broken).values()))
+        interval['clock_scope'] = ''
+        self.assertTrue(all(value is None for value in analysis.authority_columns({}, diagnostics).values()))
+
+    def test_authority_missing_or_zero_denominators_are_not_fabricated_ratios(self):
+        self.assertTrue(all(value is None for value in analysis.authority_columns({}, {}).values()))
+        evidence = authority_evidence()
+        evidence['end']['coordinator'] = evidence['start']['coordinator'].copy()
+        evidence['deltas']['coordinator']['counters'] = dict.fromkeys(analysis.AUTHORITY_COUNTERS, 0)
+        columns = analysis.authority_columns(evidence, {})
+        for name in analysis.AUTHORITY_COLUMNS[:3]:
+            self.assertIsNone(columns[name])
+        self.assertEqual(columns['authority_interval_source'], 'measurement-read-evidence.json')
+        for name in analysis.AUTHORITY_COUNTERS[:2]:
+            evidence['end']['coordinator'][name] = 42000 if name.endswith('prepare_ns') else 74000
+        evidence['end']['coordinator']['write_authority_batches'] += 4
+        evidence['deltas']['coordinator']['counters'].update(
+            write_authority_prepare_ns=32000, write_authority_admit_ns=64000, write_authority_batches=4)
+        columns = analysis.authority_columns(evidence, {})
+        self.assertEqual(columns['authority_prepare_us_per_put'], 8)
+        self.assertIsNone(columns['batches_per_window'])
+
+    def test_thread_cpu_columns_keep_role_and_missing_class_semantics(self):
+        first = {'available': True, 'summary': {
+            'wal_write_owner': {'available': True, 'thread_count': 2, 'max_busy_pct': 90, 'mean_busy_pct': 70},
+            'other': {'available': True, 'thread_count': 1, 'max_busy_pct': 99, 'mean_busy_pct': 99,
+                      'busiest_name': 'driver'}}}
+        second = {'available': True, 'summary': {
+            'wal_write_owner': {'available': True, 'thread_count': 1, 'max_busy_pct': 40, 'mean_busy_pct': 30}}}
+        columns = analysis.thread_cpu_columns({'coordinator': first, 'owners': [first, second]})
+        self.assertEqual(columns['coordinator_wal_write_owner_max_busy_pct'], 90)
+        self.assertAlmostEqual(columns['owner_wal_write_owner_mean_busy_pct'], 170 / 3)
+        self.assertEqual(columns['coordinator_other_busiest_thread'], 'driver')
+        self.assertIsNone(columns['owner_other_max_busy_pct'])
+        self.assertIsNone(columns['coordinator_wal_live_read_mean_busy_pct'])
+        first['available'] = False
+        self.assertTrue(all(value is None for value in analysis.thread_cpu_columns(
+            {'coordinator': first, 'owners': [first, second]}).values()))
+
+    def test_wal_payload_metrics_use_measured_successful_puts(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G32W', measurement_operations=1000)
+        row = analysis.result_row(self.cases[0], self.export)
+        self.assertIsNone(row['wal_bytes_per_payload'])
+        self.assertIsNone(row['puts_per_frame'])
+        (directory / 'measurement-read-evidence.json').write_text(json.dumps({
+            'live_nvmeof': {'counters': {'completed_write_bytes': 8192, 'leased_frames': 1}}}))
+        row = analysis.result_row(self.cases[0], self.export)
+        self.assertEqual(row['wal_bytes_per_payload'], 4)
+        self.assertEqual(row['puts_per_frame'], 2)
+        native = self.add('native', group='G32N', measurement_operations=1000)
+        (native.parent / 'native-wal-evidence.json').write_text(json.dumps({
+            'available': True, 'logical_wal_bytes': 4096}))
+        row = analysis.result_row(self.cases[1], self.export)
+        self.assertEqual(row['native_logical_wal_bytes_per_payload'], 2)
+        self.assertIsNone(row['wal_bytes_per_payload'])
+        (native.parent / 'native-wal-evidence.json').write_text(json.dumps({'available': False}))
+        self.assertIsNone(analysis.result_row(self.cases[1], self.export)['native_logical_wal_bytes_per_payload'])
+
+    def test_every_reviewed_selection_group_is_accepted(self):
+        for selection in cloud_campaign.NVMEOF_PATH_SELECTIONS:
+            with self.subTest(selection=selection):
+                jobs = cloud_campaign.make_focused_matrix(selection)
+                matrix = self.export / 'all-groups.json'
+                matrix.write_text(json.dumps(jobs))
+                rows = analysis.generate(matrix=matrix, output=self.output, settings_only=True)
+                self.assertEqual({r['group'] for r in rows}, {j['group'] for j in jobs})
+
+    def test_new_groups_reach_operation_tables(self):
+        reads = ('G30R', 'G30S', 'G30V', 'G31G')
+        puts = ('G30W', 'G31W', 'G31H', 'G31S', 'G31X', 'G32W', 'G32H', 'G32S', 'G32N')
+        for group in reads + puts:
+            self.add('tidehunter_nvme_rdma', group=group, op='read' if group in reads else 'put')
+        self.generate()
+        for name, groups in (('reads', reads), ('puts', puts)):
+            with (self.output / (name + '.csv')).open() as stream:
+                self.assertEqual({row['group'] for row in csv.DictReader(stream)}, set(groups))
+
+    def test_live_executed_columns_and_legacy_export(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G32W')
+        missing = analysis.result_row(self.cases[0], self.export)
+        self.assertIsNone(missing['live_leased_sync'])
+        self.assertIsNone(missing['live_leased_flush_min_frame_bytes'])
+        path = directory / 'manifest.json'
+        manifest = {'backend_info': {'configuration': {}}}
+        path.write_text(json.dumps(manifest))
+        job = self.cases[0]['job']
+        job.update(live_leased_sync='group_flush', live_leased_flush_min_frame_bytes=32768)
+        row = analysis.result_row(self.cases[0], self.export)
+        self.assertEqual((row['live_leased_sync'], row['live_leased_flush_min_frame_bytes']),
+                         ('per_frame_fua', 0))
+        for mode in ('group_flush', 'per_frame_fua'):
+            manifest['backend_info']['configuration'].update(
+                live_leased_sync=mode, live_leased_flush_min_frame_bytes=65536,
+                live_polled_writes=mode == 'group_flush')
+            path.write_text(json.dumps(manifest))
+            row = analysis.result_row(self.cases[0], self.export)
+            self.assertEqual((row['live_leased_sync'], row['live_leased_flush_min_frame_bytes']),
+                             (mode, 65536))
+            self.assertEqual(row['polled_writes'], mode == 'group_flush')
+        self.cases[0]['status'] = 'not_run'
+        self.assertIsNone(analysis.result_row(self.cases[0], self.export)['live_leased_sync'])
+
     def test_owner_cpu_summary_keeps_unavailable_distinct(self):
         directory = self.add('tidehunter_nvme_rdma', group='G29R', selection='nvmeof_f6', op='read')
         path = directory.parent / 'owner-cpu.json'

@@ -211,10 +211,37 @@ class FocusedMatrixTests(unittest.TestCase):
     def test_new_fleet_value_sizes_match_binary_validator(self):
         # Matches benchmarks/kv-research/src/config.rs, the dataset.value_size check.
         allowed = {64, 256, 1024, 4096, 8192, 16384, 65536}
-        for selection in ("nvmeof_f6b", "nvmeof_f7_highmem32"):
+        for selection in ("nvmeof_f6b", "nvmeof_f7_highmem32", "nvmeof_f8"):
             for job in campaign.make_focused_matrix(selection):
                 with self.subTest(selection=selection, case=job["case_id"]):
                     self.assertIn(job["value_size"], allowed)
+
+    def test_f8_exact_reviewed_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_f8")
+        self.assertEqual(Counter(j["group"] for j in jobs), {"G32W": 16, "G32H": 8, "G32S": 4, "G32N": 8})
+        self.assertEqual(len({j["case_id"] for j in jobs}), 36)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                         "30e7121a926003ebe18e691425db063c4093a942efdf5528913003720b9d5e1a")
+        self.assertEqual([j["case_id"] for j in jobs[:3]],
+                         ["G32W-r0-e95f3c61d30b1f960942", "G32W-r1-a40e4628708c8e71922a",
+                          "G32W-r0-cc329f4b5dc477d314f6"])
+        for job in jobs:
+            campaign.validate_focused_job(job)
+            if job["backend"] == "native":
+                self.assertTrue(job["native_wal_sampling"])
+                self.assertTrue(job["thread_cpu_sampling"])
+                continue
+            self.assertNotIn("live_leased_flush_min_frame_bytes", job)
+            self.assertEqual(job.get("live_leased_sync"), "per_frame_fua" if "live_leased_sync" in job else None)
+            self.assertEqual("diagnostics" in job, job["value_size"] == 65536 and job["repeat"] == 0)
+            self.assertFalse(job["live_polled_writes"])
+            self.assertEqual(job["durability_tier"], "synchronous")
+            self.assertTrue(job["thread_cpu_sampling"])
+        self.assertEqual(sum("live_leased_sync" not in j for j in jobs if j["backend"] != "native"), 14)
+        self.assertEqual({(j["native_durability"], j["value_size"], j["concurrency"])
+                          for j in jobs if j["group"] == "G32N"},
+                         {(tier, size, c) for tier in ("page_cache", "value_wal_barrier")
+                          for size in (1024, 65536) for c in (1, 16)})
 
     def test_f6b_exact_reviewed_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_f6b")
@@ -538,7 +565,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}

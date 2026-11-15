@@ -1,5 +1,6 @@
 """Bounded owner tracing. Only the owned tracefs instance is changed."""
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -98,22 +99,22 @@ def sample_cpu(directory, stat_path=Path('/proc/stat'), duration_seconds=CPU_MAX
     temporary.replace(output)
 
 
-def start_cpu(directory, duration_seconds=CPU_MAX_SAMPLES):
+def _start_sampler(directory, kind, duration_seconds, args=()):
     directory = Path(directory)
     if not 0 < duration_seconds <= CPU_MAX_SAMPLES:
-        return {'available': False, 'reason': 'owner CPU sampling deadline unavailable or expired'}
+        return {'available': False, 'reason': 'CPU sampling deadline unavailable or expired'}
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        for name in ('owner-cpu.json', 'owner-cpu.ready', 'owner-cpu.stop'):
+        for name in (kind + '.json', kind + '.ready', kind + '.stop'):
             (directory / name).unlink(missing_ok=True)
-        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--sample-cpu',
-                                    str(directory), str(duration_seconds)],
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--sample-' + kind,
+                                    str(directory), str(duration_seconds), *map(str, args)],
                                    start_new_session=True, close_fds=True,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         return {'available': False, 'reason': str(error)}
     for attempt in range(100):
-        if (directory / 'owner-cpu.ready').exists():
+        if (directory / (kind + '.ready')).exists():
             return {'directory': str(directory)}
         if process.poll() is not None:
             return {'available': False, 'reason': 'owner CPU sampler failed to start'}
@@ -123,14 +124,14 @@ def start_cpu(directory, duration_seconds=CPU_MAX_SAMPLES):
     return {'available': False, 'reason': 'owner CPU sampler startup timed out'}
 
 
-def stop_cpu(state):
+def _stop_sampler(state, kind):
     if not state or 'directory' not in state:
         return state or {'available': False, 'reason': 'owner CPU sampling was not started'}
     directory = Path(state['directory'])
     try:
-        (directory / 'owner-cpu.stop').touch()
+        (directory / (kind + '.stop')).touch()
         for attempt in range(500):
-            path = directory / 'owner-cpu.json'
+            path = directory / (kind + '.json')
             if path.exists():
                 if path.stat().st_size > CPU_MAX_BYTES:
                     return {'available': False, 'reason': 'owner CPU artifact exceeds bound'}
@@ -140,6 +141,152 @@ def stop_cpu(state):
         return {'available': False, 'reason': str(error)}
     return {'available': False, 'reason': 'owner CPU sampler stop timed out'}
 
+
+def start_cpu(directory, duration_seconds=CPU_MAX_SAMPLES):
+    return _start_sampler(directory, 'owner-cpu', duration_seconds)
+
+
+def stop_cpu(state):
+    return _stop_sampler(state, 'owner-cpu')
+
+
+THREAD_CLASSES = ('wal_write_owner', 'value_wal_tcp', 'value_wal_prepare', 'wal_live_read', 'other')
+THREAD_MAX_THREADS = 4096
+
+
+def thread_class(name):
+    if name == 'wal-write-owner':
+        return 'wal_write_owner'
+    if name == 'value-wal-tcp':
+        return 'value_wal_tcp'
+    # Linux comm is truncated to 15 bytes, including value-wal-prepare-*.
+    if name.startswith('value-wal-prepa'):
+        return 'value_wal_prepare'
+    if name.startswith('wal-live-read-'):
+        return 'wal_live_read'
+    return 'other'
+
+
+def parse_thread_stat(text):
+    opening, closing = text.find('('), text.rfind(')')
+    fields = text[closing + 1:].split()
+    if opening < 0 or closing <= opening or len(fields) < 20:
+        raise ValueError('invalid task stat fields')
+    ticks, started = int(fields[11]) + int(fields[12]), int(fields[19])
+    if ticks < 0 or started < 0:
+        raise ValueError('invalid task stat counters')
+    return {'name': text[opening + 1:closing], 'cpu_ticks': ticks, 'start_ticks': started}
+
+
+def thread_snapshot(pid, proc=Path('/proc')):
+    root = Path(proc) / str(pid)
+    process = parse_thread_stat((root / 'stat').read_text())
+    threads = {}
+    for index, task in enumerate((root / 'task').iterdir()):
+        if not task.name.isdigit():
+            continue
+        if index >= THREAD_MAX_THREADS:
+            raise ValueError('task population exceeds bound')
+        try:
+            threads[task.name] = parse_thread_stat((task / 'stat').read_text())
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # A task can exit between readdir and stat; the process identity is checked separately.
+    if not threads:
+        raise ValueError('task population unavailable')
+    return {'process_start_ticks': process['start_ticks'], 'threads': threads}
+
+
+def thread_summary(totals, incomplete, elapsed, ticks_per_second):
+    summary = {}
+    for group in THREAD_CLASSES:
+        members = [row for row in totals.values() if thread_class(row['name']) == group]
+        available = bool(members) and group not in incomplete and elapsed > 0
+        values = [100 * row['cpu_ticks'] / ticks_per_second / elapsed for row in members] if available else []
+        summary[group] = {'available': available, 'thread_count': len(members),
+                          'max_busy_pct': max(values) if values else None,
+                          'mean_busy_pct': sum(values) / len(values) if values else None}
+        if group == 'other' and values:
+            summary[group]['busiest_name'] = members[values.index(max(values))]['name']
+        if not available:
+            summary[group]['reason'] = 'thread population changed' if group in incomplete else 'no observed threads'
+    return summary
+
+
+def sample_threads(directory, pid, duration_seconds=CPU_MAX_SAMPLES, proc=Path('/proc')):
+    """One logical CPU is 100%; missing/churning classes remain unavailable."""
+    directory = Path(directory)
+    artifact = {'available': False, 'source': '/proc/PID/task/*/stat', 'pid': pid,
+                'interval_seconds': 1, 'samples': [], 'truncated': False,
+                'scope': 'sampler-ready before measurement release to completion-observed stop; includes boundary RPC overlap and final partial interval'}
+    try:
+        hz = os.sysconf('SC_CLK_TCK')
+        before = thread_snapshot(pid, proc)
+        previous = started = time.monotonic()
+        expires = started + duration_seconds
+        totals = {(tid, row['start_ticks']): dict(row, cpu_ticks=0)
+                  for tid, row in before['threads'].items()}
+        incomplete = set()
+        size = 0
+        (directory / 'thread-cpu.ready').touch()
+        for index in range(CPU_MAX_SAMPLES):
+            deadline = min(previous + 1, expires)
+            while not (directory / 'thread-cpu.stop').exists() and time.monotonic() < deadline:
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            after = thread_snapshot(pid, proc)
+            now = time.monotonic()
+            elapsed = now - previous
+            if after['process_start_ticks'] != before['process_start_ticks'] or elapsed <= 0:
+                raise ValueError('sampled process identity or clock changed')
+            rows = []
+            for tid in before['threads'].keys() | after['threads'].keys():
+                first, last = before['threads'].get(tid), after['threads'].get(tid)
+                if first is None or last is None or first['start_ticks'] != last['start_ticks'] or first['name'] != last['name']:
+                    incomplete.update(thread_class(row['name']) for row in (first, last) if row is not None)
+                    if last is not None:
+                        totals.setdefault((tid, last['start_ticks']), dict(last, cpu_ticks=0))
+                        if len(totals) > THREAD_MAX_THREADS:
+                            raise ValueError('observed task identities exceed bound')
+                    continue
+                delta = last['cpu_ticks'] - first['cpu_ticks']
+                if delta < 0:
+                    raise ValueError('task CPU counter decreased')
+                totals[(tid, last['start_ticks'])]['cpu_ticks'] += delta
+                rows.append({'tid': tid, 'name': last['name'], 'start_ticks': last['start_ticks'],
+                             'cpu_ticks': delta, 'busy_pct': 100 * delta / hz / elapsed})
+            sample = {'elapsed_seconds': elapsed, 'threads': rows}
+            size += len(json.dumps(sample)) + 2
+            if size > CPU_MAX_BYTES - 65536:
+                artifact['truncated'] = True
+                break
+            artifact['samples'].append(sample)
+            before, previous = after, now
+            if (directory / 'thread-cpu.stop').exists():
+                break
+            if now >= expires:
+                artifact.update(truncated=True, reason='thread CPU sampling deadline expired')
+                break
+        else:
+            artifact['truncated'] = True
+        artifact.update(available=not artifact['truncated'], elapsed_seconds=previous - started,
+                        ticks_per_second=hz)
+        if artifact['available']:
+            artifact['summary'] = thread_summary(totals, incomplete, previous - started, hz)
+    except (OSError, ValueError) as error:
+        artifact['reason'] = str(error)
+    output = directory / 'thread-cpu.json'
+    temporary = output.with_suffix('.tmp')
+    temporary.write_text(json.dumps(artifact) + '\n')
+    temporary.replace(output)
+
+
+def start_threads(directory, pid, duration_seconds=CPU_MAX_SAMPLES):
+    if type(pid) is not int or pid <= 0:
+        return {'available': False, 'reason': 'workload PID unavailable'}
+    return _start_sampler(directory, 'thread-cpu', duration_seconds, (pid,))
+
+
+def stop_threads(state):
+    return _stop_sampler(state, 'thread-cpu')
 
 def probe(tracefs=Path('/sys/kernel/tracing')):
     tracefs = Path(tracefs)
@@ -232,6 +379,9 @@ def stop(instance, output_dir, state=None):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4 or sys.argv[1] != '--sample-cpu':
-        raise SystemExit('usage: owner_ftrace.py --sample-cpu DIRECTORY DURATION_SECONDS')
-    sample_cpu(sys.argv[2], duration_seconds=float(sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[1] == '--sample-owner-cpu':
+        sample_cpu(sys.argv[2], duration_seconds=float(sys.argv[3]))
+    elif len(sys.argv) == 5 and sys.argv[1] == '--sample-thread-cpu':
+        sample_threads(sys.argv[2], int(sys.argv[4]), duration_seconds=float(sys.argv[3]))
+    else:
+        raise SystemExit('usage: owner_ftrace.py --sample-owner-cpu DIRECTORY DURATION_SECONDS | --sample-thread-cpu DIRECTORY DURATION_SECONDS PID')

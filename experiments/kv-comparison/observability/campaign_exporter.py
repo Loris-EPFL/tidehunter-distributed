@@ -21,6 +21,9 @@ TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 METRIC = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
 LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")')
 QUANTILES = {"p50": "0.5", "p95": "0.95", "p99": "0.99", "p999": "0.999", "max": "1"}
+AUTHORITY_INTERVAL_COUNTERS = {
+    "write_authority_prepare_ns", "write_authority_admit_ns",
+    "write_authority_windows", "write_authority_batches"}
 COORDINATOR_INTERVAL_COUNTERS = {
     "write_storage_wait_ns", "write_publication_ns", "write_dispatch_ns", "write_preparation_admission_ns",
     "write_checkpoint_ns", "write_checkpoint_count", "write_foreground_checkpoint_ns",
@@ -33,7 +36,7 @@ COORDINATOR_INTERVAL_COUNTERS = {
     "write_checkpoint_diagnostic_root_adoption_ns", "write_checkpoint_diagnostic_root_adoption_count",
     "write_checkpoint_diagnostic_owner_adoption_ns", "write_checkpoint_diagnostic_owner_adoption_count",
     "write_checkpoint_diagnostic_obsolete_cleanup_ns", "write_checkpoint_diagnostic_obsolete_cleanup_count",
-    "write_checkpoint_diagnostic_index_prepare_ns", "write_checkpoint_diagnostic_index_prepare_count"}
+    "write_checkpoint_diagnostic_index_prepare_ns", "write_checkpoint_diagnostic_index_prepare_count"} | AUTHORITY_INTERVAL_COUNTERS
 
 
 def absolute(value):
@@ -241,7 +244,16 @@ def measurement_read_metrics(evidence, labels):
             if not isinstance(counters, dict):
                 raise ValueError("measurement read counters missing")
             for name, value in counters.items():
-                text += sample("kv_case_read_path_calls", count(value), local | {"path": token(name)})
+                if name in AUTHORITY_INTERVAL_COUNTERS:
+                    dimensions = local | {"component": "coordinator_interval", "phase": "measurement"}
+                    if name.endswith("_ns"):
+                        text += sample("kv_case_write_diagnostic_stage_seconds", count(value) / 1e9,
+                                       dimensions | {"stage": name})
+                    else:
+                        text += sample("kv_case_write_diagnostic_stage_count", count(value),
+                                       dimensions | {"counter": name})
+                else:
+                    text += sample("kv_case_read_path_calls", count(value), local | {"path": token(name)})
         return text
     result += emit(deltas.get("coordinator"), labels | {"component": "coordinator"})
     components = ("owner_executor",)

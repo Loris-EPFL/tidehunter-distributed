@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 
 import analyze
-from cloud_campaign import NVMEOF_PATH_SELECTIONS, WRITE_METADATA_EXCHANGES
+from cloud_campaign import (NVMEOF_PATH_SELECTIONS, WRITE_METADATA_EXCHANGES,
+                            executed_leased_settings)
 import focused_analysis as focused
 import leased_ab
+from owner_ftrace import THREAD_CLASSES
 
 NA = 'not available'
 MISSING = 'missing'
@@ -39,6 +41,17 @@ CPU_COLUMNS = ('owner_cpu_max_busy_pct', 'owner_cpu_mean_busy_pct',
                'owner_cpu_max_softirq_pct', 'owner_cpus_above_90_busy')
 RESULTS += (*CPU_COLUMNS, 'live_leased_sync', 'live_pin_read_lanes',
             'live_leased_flush_min_frame_bytes', 'leased_flushes', 'leased_flush_covered_frames')
+THREAD_CPU_COLUMNS = tuple(
+    f'{role}_{group}_{metric}_busy_pct' for role in ('coordinator', 'owner')
+    for group in THREAD_CLASSES for metric in ('max', 'mean')) + (
+    'coordinator_other_busiest_thread', 'owner_other_busiest_thread')
+RESULTS += (*THREAD_CPU_COLUMNS, 'wal_bytes_per_payload', 'puts_per_frame',
+            'native_logical_wal_bytes_per_payload')
+AUTHORITY_COUNTERS = ('write_authority_prepare_ns', 'write_authority_admit_ns',
+                      'write_authority_windows', 'write_authority_batches')
+AUTHORITY_COLUMNS = ('authority_prepare_us_per_put', 'authority_admit_us_per_put',
+                     'batches_per_window', 'authority_interval_source', 'authority_interval_scope')
+RESULTS += AUTHORITY_COLUMNS
 STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
 STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share', 'calls_with_pair', 'cond_mean_us', 'cond_p50_us', 'cond_p99_us')
 
@@ -48,6 +61,8 @@ def load(path):
 
 
 def contract(job):
+    if job.get('backend') == 'valkey_rdma':
+        return 'not applicable'
     tier = job.get('native_durability' if job.get('backend') == 'native' else 'durability_tier', MISSING)
     return 'page_cache' if tier in ('native', 'page_cache') else 'durable' if tier in ('synchronous', 'value_wal_barrier') else tier
 
@@ -78,14 +93,21 @@ def settings(jobs):
     for members in arms.values():
         j = members[0]
         native = j.get('backend') == 'native'
+        valkey = j.get('backend') == 'valkey_rdma'
         floor = j.get('group') == 'G18F'
-        defaults = dict(native_wal_geometry='native_default', native_shards=1) if native else REMOTE_DEFAULTS | (LIVE_DEFAULTS if live(j) else {})
-        required = (set(defaults) - {'live_lease_ahead', 'live_polled_writes', 'live_leased_write_window'}) | {'backend', 'keys', 'distribution', 'value_size', 'concurrency', 'repeat', 'native_durability' if native else 'durability_tier'}
+        defaults = (dict(coordinator_cache_bytes=0, read_lanes=1) if valkey else
+                    dict(native_wal_geometry='native_default', native_shards=1) if native else
+                    REMOTE_DEFAULTS | (LIVE_DEFAULTS if live(j) else {}))
+        required = (set(defaults) - {'live_lease_ahead', 'live_polled_writes', 'live_leased_write_window'}) | {'backend', 'keys', 'distribution', 'value_size', 'concurrency', 'repeat'}
+        if not valkey:
+            required.add('native_durability' if native else 'durability_tier')
         if not floor:
             for member in members:
                 errors.extend(member.get('case_id', '?') + ': ' + k for k in sorted(required - member.keys()))
         get = lambda k: j.get(k, LIVE_DEFAULTS[k] if k in ('live_lease_ahead', 'live_polled_writes', 'live_leased_write_window') else MISSING)
         geometry = GEOMETRY.get(get('native_wal_geometry' if native else 'owner_wal_geometry'), (MISSING,) * 3)
+        if valkey:
+            geometry = ('not applicable',) * 3
         if not native and 'owner_wal_file_bytes' in j:
             geometry = (geometry[0], j['owner_wal_file_bytes'], geometry[2])
         differences = '; '.join(k + '=' + (str(get(k)).lower() if isinstance(get(k), bool) else str(get(k))) for k, default in defaults.items() if get(k) != default)
@@ -97,7 +119,7 @@ def settings(jobs):
         required = sorted(str(m.get('repeat', MISSING)) for m in members if m.get('require_media_qualified'))
         if required:
             cache += '; require_media_qualified on repetition ' + ', '.join(required)
-        values = (get('group'), j.get('case_id', str(len(rows))), get('backend'), 'native' if native else 'live NVMe-oF' if live(j) else 'owner RPC', get('live_write_mode') if live(j) else 'not applicable', contract(j), get('target_io') if live(j) else 'not applicable', get('live_export_mode') if live(j) else 'not applicable', get('live_inline_reads') if live(j) else 'not applicable', get('read_lanes') if not native else 'not applicable', get('live_io_queues') if live(j) else 'not applicable', get('live_io_queue_size') if live(j) else 'not applicable', get('live_poll_queues') if live(j) else 'not applicable', *geometry, get('history_persistence') if not native else 'not applicable', get('coordinator_cache_bytes') if not native else 'not applicable', cache, get('keys'), get('distribution'), get('value_size'), get('concurrency'), ', '.join(str(x) for x in sorted({m.get('repeat', MISSING) for m in members}, key=str)), len(members), differences)
+        values = (get('group'), j.get('case_id', str(len(rows))), get('backend'), 'native' if native else 'Valkey RDMA' if valkey else 'live NVMe-oF' if live(j) else 'owner RPC', get('live_write_mode') if live(j) else 'not applicable', contract(j), get('target_io') if live(j) else 'not applicable', get('live_export_mode') if live(j) else 'not applicable', get('live_inline_reads') if live(j) else 'not applicable', get('read_lanes') if not native else 'not applicable', get('live_io_queues') if live(j) else 'not applicable', get('live_io_queue_size') if live(j) else 'not applicable', get('live_poll_queues') if live(j) else 'not applicable', *geometry, get('history_persistence') if not native and not valkey else 'not applicable', get('coordinator_cache_bytes') if not native else 'not applicable', cache, get('keys'), get('distribution'), get('value_size'), get('concurrency'), ', '.join(str(x) for x in sorted({m.get('repeat', MISSING) for m in members}, key=str)), len(members), differences)
         rows.append(dict(zip(SETTINGS, values)))
         rows[-1]['arm'] = str(j.get('group', 'unknown')) + '-arm-' + str(len(rows))
         if floor:
@@ -137,9 +159,90 @@ def first_measured_sample(samples):
                key=lambda sample: sample['dispatched_ns'], default=None)
 
 
+def thread_cpu_columns(artifact):
+    columns = dict.fromkeys(THREAD_CPU_COLUMNS)
+    for role, records in (('coordinator', [artifact.get('coordinator', {})]),
+                          ('owner', artifact.get('owners', []))):
+        if not records or any(record.get('available') is not True for record in records):
+            continue
+        for group in THREAD_CLASSES:
+            summaries = [record.get('summary', {}).get(group, {}) for record in records]
+            if any(row.get('available') is not True or type(row.get('thread_count')) is not int
+                   or row['thread_count'] <= 0 for row in summaries):
+                continue
+            maximum = [nonnegative(row.get('max_busy_pct')) for row in summaries]
+            means = [nonnegative(row.get('mean_busy_pct')) for row in summaries]
+            if any(value is None for value in (*maximum, *means)):
+                continue
+            count = sum(row['thread_count'] for row in summaries)
+            columns[f'{role}_{group}_max_busy_pct'] = max(maximum)
+            columns[f'{role}_{group}_mean_busy_pct'] = sum(
+                value * row['thread_count'] for value, row in zip(means, summaries)) / count
+            if group == 'other':
+                columns[role + '_other_busiest_thread'] = summaries[maximum.index(max(maximum))].get('busiest_name')
+    return columns
+
+
+def authority_columns(boundary, diagnostics):
+    columns = dict.fromkeys(AUTHORITY_COLUMNS)
+    if not isinstance(boundary, dict):
+        return columns
+    snapshots = [boundary.get(name) or {} for name in ('start', 'end', 'deltas')]
+    if any(not isinstance(snapshot, dict) for snapshot in snapshots):
+        return columns
+    first, last, coordinator = [snapshot.get('coordinator') or {} for snapshot in snapshots]
+    if any(not isinstance(snapshot, dict) for snapshot in (first, last, coordinator)):
+        return columns
+    counters = coordinator.get('counters') or {}
+    if not isinstance(counters, dict):
+        return columns
+    if any(name in values for values in (first, last, counters) for name in AUTHORITY_COUNTERS):
+        if (boundary.get('scope') != 'measurement_boundary' or boundary.get('measurement_attempted') is not True
+                or boundary.get('measurement_drained') is not True or coordinator.get('available') is not True):
+            return columns
+        for name in AUTHORITY_COUNTERS:
+            a, b, value = first.get(name), last.get(name), counters.get(name)
+            if (type(a) is not int or type(b) is not int or type(value) is not int
+                    or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
+                return columns
+        source, scope = 'measurement-read-evidence.json', 'measurement_start_to_drained_end_counter_delta'
+    else:
+        if (not isinstance(diagnostics, dict) or diagnostics.get('phase_attempted') is not True
+                or diagnostics.get('measurement_drained') is not True):
+            return columns
+        pre, profile = diagnostics.get('pre_completion_gate') or {}, diagnostics.get('profile') or {}
+        if not isinstance(pre, dict) or not isinstance(profile, dict):
+            return columns
+        final = profile.get('coordinator_interval') or {}
+        if not isinstance(final, dict):
+            return columns
+        if pre.get('available') is True and pre.get('scope') == 'coordinator_arm_through_pre_completion_gate':
+            interval, source = pre, 'write-diagnostics.json:pre_completion_gate'
+        elif final.get('scope') == 'measurement_boundary_cumulative_delta':
+            interval, source = final, 'write-diagnostics.json:coordinator_interval'
+        else:
+            return columns
+        counters, scope = interval.get('stages', {}), interval['scope']
+        if (not isinstance(counters, dict) or not isinstance(interval.get('clock_scope'), str) or not interval['clock_scope']
+                or any(type(counters.get(name)) is not int or not 0 <= counters[name] < 2**64 - 1
+                       for name in AUTHORITY_COUNTERS)):
+            return columns
+    columns.update(authority_interval_source=source, authority_interval_scope=scope)
+    batches, windows = counters['write_authority_batches'], counters['write_authority_windows']
+    if batches:
+        columns['authority_prepare_us_per_put'] = counters['write_authority_prepare_ns'] / batches / 1000
+        columns['authority_admit_us_per_put'] = counters['write_authority_admit_ns'] / batches / 1000
+    if windows:
+        columns['batches_per_window'] = batches / windows
+    return columns
+
+
 def result_row(case, export):
     j = case['job']; op = operation(j)
     directory = export / 'cases' / case['case_id'] / 'result'
+    configuration = load(directory / 'manifest.json').get('backend_info', {}).get('configuration', {})
+    has_execution = case.get('status') not in (None, 'not_run') and (directory / 'manifest.json').is_file()
+    executed_sync, executed_minimum = executed_leased_settings({'configuration': configuration}) if live(j) and has_execution else (None, None)
     row = dict.fromkeys(RESULTS)
     native = j['backend'] == 'native'
     row.update(case_id=case['case_id'], group=j['group'], backend=j['backend'], operation=op, value_size=j.get('value_size'), concurrency=j.get('concurrency'), repetition=j.get('repeat'), contract=contract(j), status=case.get('status', 'not_run'),
@@ -149,9 +252,10 @@ def result_row(case, export):
                diagnostic='sustained' if j.get('measurement_operations') == 200000 else 'history diagnostics' if j.get('owner_history_diagnostics') else None)
     row['contract_class'] = contract_class(j)
     row['load_model'] = 'open_loop' if j.get('offered_ops_per_second') else 'closed_loop'
-    row.update(live_leased_sync=j.get('live_leased_sync', 'per_frame_fua') if live(j) else None,
-               live_leased_flush_min_frame_bytes=j.get('live_leased_flush_min_frame_bytes', 0) if live(j) else None,
+    row.update(live_leased_sync=executed_sync,
+               live_leased_flush_min_frame_bytes=executed_minimum,
                live_pin_read_lanes=j.get('live_pin_read_lanes', False) if live(j) else None)
+    row.update(thread_cpu_columns(load(directory.parent / 'thread-cpu.json')))
     cpu = load(directory.parent / 'owner-cpu.json')
     if cpu.get('available') is True:
         summary = cpu.get('summary', {})
@@ -160,7 +264,8 @@ def result_row(case, export):
             row[column] = nonnegative(summary.get(key))
     row.update(history_persistence=None if native else j.get('history_persistence', 'on_disk'),
                lease_ahead=j.get('live_lease_ahead', True) if live(j) else None,
-               polled_writes=j.get('live_polled_writes', False) if live(j) else None)
+               polled_writes=(configuration.get('live_polled_writes')
+                              if live(j) and has_execution and type(configuration.get('live_polled_writes')) is bool else None))
     samples = list(analyze.read_samples(directory / 'samples.csv')) if (directory / 'samples.csv').is_file() and case.get('status') == 'completed' else []
     first_call = first_measured_sample(samples)
     row['first_call_us'] = first_call['api_ns'] / 1000 if first_call is not None else None
@@ -173,13 +278,22 @@ def result_row(case, export):
         slow = [x for x in good if x >= 5000000]
         row.update(calls_ge_5ms=len(slow), time_ge_5ms_share=sum(slow) / sum(good) if sum(good) else None)
     boundary = load(directory / 'measurement-read-evidence.json')
+    row.update(authority_columns(boundary, load(directory / 'write-diagnostics.json')))
     counters = (boundary.get('live_nvmeof') or {}).get('counters') or {}
+    puts = sum(sample['operation'] == 'put' and sample['outcome'] in ('ok', 'success') for sample in samples)
+    written, frames = nonnegative(counters.get('completed_write_bytes')), nonnegative(counters.get('leased_frames'))
+    if live(j) and puts and j.get('value_size') and written is not None:
+        row['wal_bytes_per_payload'] = written / (puts * j['value_size'])
+    if live(j) and puts and frames:
+        row['puts_per_frame'] = puts / frames
+    native_wal = load(directory.parent / 'native-wal-evidence.json') if native else {}
+    native_bytes = nonnegative(native_wal.get('logical_wal_bytes'))
+    if native and puts and j.get('value_size') and native_wal.get('available') is True and native_bytes is not None:
+        row['native_logical_wal_bytes_per_payload'] = native_bytes / (puts * j['value_size'])
     if live(j) and j.get('live_write_mode') == 'leased':
         peak = boundary.get('live_nvmeof_peaks', {}).get('max_leased_in_flight', {})
         row['max_leased_in_flight'] = nonnegative(peak.get('at_end'))
         row['max_leased_in_flight_scope'] = peak.get('scope')
-        manifest = load(directory / 'manifest.json')
-        configuration = manifest.get('backend_info', {}).get('configuration', {})
         row['live_leased_write_window'] = configuration.get('live_leased_write_window')
         row['live_leased_write_window_bound'] = nonnegative(configuration.get('live_leased_write_window_bound'))
     for name in ('grant_misses', 'metadata_requests', 'namespace_connects'):
@@ -394,7 +508,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G29R', 'G29G', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G29R', 'G29G', 'G30R', 'G30S', 'G30W', 'G30V', 'G31W', 'G31H', 'G31S', 'G31X', 'G31G', 'G32W', 'G32H', 'G32S', 'G32N', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -433,9 +547,12 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
     lines.extend(['Owner CPU columns use time-weighted /proc/stat deltas per CPU across the owner trace window (one-second intervals plus the final partial interval). Max and mean busy are across CPUs; softirq is the maximum per-CPU percentage; the count uses per-CPU busy > 90%. Missing or truncated samples remain unavailable.', ''])
+    lines.extend(['Thread CPU columns use /proc/PID/task/*/stat at one-second intervals around the measurement gate. One logical CPU is 100%; max and mean are across per-thread window-average utilization in each class, not across machines or sampling peaks. Coordinator and owner columns are separate; owner means are weighted by thread count. The other-thread name identifies its busiest thread. Linux comm truncation is accounted for; missing, churning or incomplete classes remain unavailable. Start/stop includes boundary RPC overlap and the final partial interval.', '',
+                  'wal_bytes_per_payload uses live completed_write_bytes (aligned NVMe-oF frames) divided by measured successful scalar puts times value_size; puts_per_frame uses that put count divided by leased_frames. Native logical_wal_bytes_per_payload uses the gate-boundary delta of native wal_written_bytes_type counters, including background WAL records but excluding preload/warmup. Neither is physical SSD write amplification. Device/payload ratios still cover the whole device observation window; F8 disables ext4 lazy initialization, but the remaining background-write scope must still be checked.', ''])
+    lines.extend(['Authority preparation/admission columns are exclusive coordinator wall elapsed time per attempted input batch (called per put for scalar F8), not CPU time, device time or latency quantiles. They divide the nanosecond counter deltas by write_authority_batches and 1000; batches_per_window divides batches by write_authority_windows. Missing counters, invalid/reset/saturated boundaries and zero denominators remain unavailable. The validated measurement-read-evidence.json start/end/deltas.coordinator counters take precedence; write-profile intervals are a fallback only when read observations contain no authority counters. authority_interval_source and authority_interval_scope identify the selected population/window; no intervals are added together.', ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
-    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X') and r['operation'] in ('put', 'put_batch')]
-    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R', 'G29R', 'G29G') and r['operation'] in ('read', 'get_many')]
+    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G30W', 'G31W', 'G31H', 'G31S', 'G31X', 'G32W', 'G32H', 'G32S', 'G32N') and r['operation'] in ('put', 'put_batch')]
+    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R', 'G29R', 'G29G', 'G30R', 'G30S', 'G30V', 'G31G') and r['operation'] in ('read', 'get_many')]
     tables['puts'] += [r for r in rows if r['group'] in ('G24W', 'G24M') and r['operation'] == 'put']
     tables['reads'] += [r for r in rows if r['group'].startswith('G24') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']

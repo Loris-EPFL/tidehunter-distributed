@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
 
 
 
@@ -725,6 +725,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20, "nvmeof_reads_geometry_rest2": 18}
 FOCUSED_COUNTS["nvmeof_f6"] = 42
 FOCUSED_COUNTS["nvmeof_f6b"] = 58
+FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 10
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
@@ -774,6 +775,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_single_caller": {"G28W": 8, "G28C": 8, "G28N": 4},
     "nvmeof_f6": {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4},
     "nvmeof_f6b": {"G31W": 24, "G31H": 8, "G31S": 2, "G31X": 6, "G31G": 18},
+    "nvmeof_f8": {"G32W": 16, "G32H": 8, "G32S": 4, "G32N": 8},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2, "G30V": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -1898,6 +1900,37 @@ def _nvmeof_f6b(path):
     return result
 
 
+def _nvmeof_f8(path):
+    """Compare engine-default size-gated flush against explicit per-frame FUA."""
+    sources = _nvmeof_f6b(path)
+    result = []
+    for group, source_group, concurrency, sizes, repeats in (
+            ("G32W", "G31W", 16, (1024, 4096, 16384, 65536), 2),
+            ("G32H", "G31H", 64, (1024, 65536), 2),
+            ("G32S", "G31S", 1, (1024, 65536), 1)):
+        for size in sizes:
+            source = _clone_source(sources, source_group, "tidehunter_nvme_rdma",
+                                   65536 if source_group == "G31S" else size, concurrency,
+                                   live_leased_sync="per_frame_fua")
+            item = {key: value for key, value in source.items()
+                    if key not in ("live_leased_sync", "live_leased_flush_min_frame_bytes", "diagnostics")}
+            for explicit_fua in (False, True):
+                for repeat in range(repeats):
+                    _clone_job(result, "nvmeof_f8", item, group, value_size=size, repeat=repeat,
+                               thread_cpu_sampling=True,
+                               **({"live_leased_sync": "per_frame_fua"} if explicit_fua else {}),
+                               **({"diagnostics": {"write_timeline_limit": 4096}}
+                                  if size == 65536 and repeat == 0 else {}))
+    native = _nvmeof_single_caller(path)
+    for tier in ("page_cache", "value_wal_barrier"):
+        for size in (1024, 65536):
+            source = _clone_source(native, "G28N", "native", size, 1, native_durability=tier)
+            for concurrency in (1, 16):
+                _clone_job(result, "nvmeof_f8", source, "G32N", concurrency=concurrency,
+                           thread_cpu_sampling=True, native_wal_sampling=True)
+    return result
+
+
 def _nvmeof_f7_highmem32(path):
     """Keep matched -16 controls while measuring the reviewed -32 shape."""
     result = []
@@ -2148,6 +2181,8 @@ def make_focused_matrix(selection):
             return _nvmeof_f6(path)
         if selection == "nvmeof_f6b":
             return _nvmeof_f6b(path)
+        if selection == "nvmeof_f8":
+            return _nvmeof_f8(path)
         if selection == "nvmeof_f7_highmem32":
             return _nvmeof_f7_highmem32(path)
         if selection == "nvmeof_contracts_crossing2":
@@ -2591,15 +2626,50 @@ LIVE_NVME_COUNTERS = ("completed_read_ops", "completed_read_bytes", "completed_w
                       "frontier_namespace_ns", "frontier_namespace_samples",
                       "route_evidence_dropped", "fence_evidence_dropped")
 
+def requested_leased_sync(job):
+    return job.get("live_leased_sync", "group_flush")
+
+
+def requested_leased_flush_min_frame_bytes(job):
+    return job.get("live_leased_flush_min_frame_bytes", 65536)
+
+
+def executed_leased_settings(backend_info):
+    """Resolve execution from the binary export, not from requested job keys."""
+    if backend_info is not None and not isinstance(backend_info, dict):
+        raise ValueError("invalid executed backend information")
+    configuration = (backend_info or {}).get("configuration", {})
+    if not isinstance(configuration, dict):
+        raise ValueError("invalid executed leased sync configuration")
+    if "live_leased_sync" not in configuration:
+        return "per_frame_fua", 0
+    mode = configuration["live_leased_sync"]
+    minimum = configuration.get("live_leased_flush_min_frame_bytes", 0)
+    if mode not in ("per_frame_fua", "group_flush") or type(minimum) is not int or minimum < 0:
+        raise ValueError("invalid executed leased sync configuration")
+    return mode, minimum
+
+
 # Each exchange increments metadata_requests at the same submission site.
 WRITE_METADATA_EXCHANGES = ("adoption_async_exchanges", "adoption_sync_exchanges",
                             "lease_exchanges", "reserve_exchanges", "complete_exchanges")
 
 
-def qualify_live_nvme_measurement(evidence, job):
+def qualify_live_nvme_measurement(evidence, job, backend_info=None):
     """Validate deltas against raw boundaries; a requested route alone is not proof."""
     reasons = []
     data = evidence if isinstance(evidence, dict) else {}
+    f8_default = (job.get("selection") == "nvmeof_f8" and job.get("backend") in NVME_BACKENDS
+                  and "live_leased_sync" not in job and "live_leased_flush_min_frame_bytes" not in job)
+    try:
+        executed_sync, executed_minimum = executed_leased_settings(backend_info)
+        executed_configuration = (backend_info or {}).get("configuration", {})
+        executed_polled = executed_configuration.get("live_polled_writes", False)
+        if type(executed_polled) is not bool:
+            raise ValueError("invalid executed leased polled configuration")
+    except ValueError as exc:
+        return {"qualified": False, "reasons": [str(exc)] + (
+            ["F8 default arm did not run the engine default"] if f8_default else [])}
     start = data.get("start") or {}
     end = data.get("end") or {}
     start = start.get("live_nvmeof") if isinstance(start, dict) else None
@@ -2631,7 +2701,9 @@ def qualify_live_nvme_measurement(evidence, job):
                 reasons.append(f"invalid live NVMe counter {name}")
     if job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         names = ("reserve_exchanges", "complete_exchanges", "leased_frames", "leased_skip_markers", "fua_writes")
-        if job.get("live_leased_sync") == "group_flush":
+        if (executed_sync == "group_flush"
+                and job.get("durability_tier") == "synchronous"
+                and any(job["mix"].get(name, 0) for name in ("put", "put_batch"))):
             names += ("leased_flushes", "leased_flush_covered_frames")
         if job.get("group") == "G29R" and job.get("live_pin_read_lanes"):
             names += ("read_lane_pin_failures",)
@@ -2640,16 +2712,20 @@ def qualify_live_nvme_measurement(evidence, job):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G29W", "G29X", "G31W", "G31H", "G31S", "G31X", "G30W", "G24W", "G24M") and any(
+        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G29W", "G29X", "G31W", "G31H", "G31S", "G31X", "G32W", "G32H", "G32S", "G30W", "G24W", "G24M") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
             if job["live_write_mode"] == "leased":
                 if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
                     reasons.append("leased write exchanges or frame count differ")
-                if job.get("live_leased_sync", "per_frame_fua") == "group_flush":
+                if executed_polled and any(
+                        counters.get(name, 0) != 0 for name in ("leased_flushes", "leased_flush_covered_frames")):
+                    reasons.append("polled leased writes observed shared flushes")
+                if (executed_sync == "group_flush" and not executed_polled
+                        and job["durability_tier"] == "synchronous"):
                     if counters["fua_writes"] > counters["leased_frames"] + counters["leased_skip_markers"]:
                         reasons.append("group flush FUA count exceeds frames and skip markers")
                     if (job["value_size"] == 65536 and job["concurrency"] in (16, 64)
-                            and job.get("live_leased_flush_min_frame_bytes", 0) <= job["value_size"] * job["concurrency"]
+                            and executed_minimum <= job["value_size"] * job["concurrency"]
                             and job.get("live_leased_write_window") != 1) and (
                             counters["leased_flushes"] <= 0
                             or counters["leased_flush_covered_frames"] <= counters["leased_flushes"]):
@@ -2732,6 +2808,13 @@ def qualify_live_nvme_measurement(evidence, job):
                         or a < 0 or b < a or count != b - a
                         or count < job.get("measurement_operations", 0)):
                     reasons.append("cache hits do not account for the measured read calls")
+    if f8_default and (executed_sync != "group_flush" or executed_minimum != 65536
+                       or executed_configuration.get("live_polled_writes") is not False):
+        reasons.append("F8 default arm did not run the engine default")
+    if (job.get("selection") == "nvmeof_f8" and job.get("backend") in NVME_BACKENDS
+            and job.get("live_leased_sync") == "per_frame_fua"
+            and executed_configuration.get("live_leased_sync") != "per_frame_fua"):
+        reasons.append("F8 explicit FUA arm did not export per_frame_fua")
     return {"qualified": not reasons, "reasons": reasons}
 
 
@@ -2741,7 +2824,7 @@ def admit_live_write_contract(job, backend_info):
     if "live_leased_flush_min_frame_bytes" in job and (
             type(job["live_leased_flush_min_frame_bytes"]) is not int
             or job["live_leased_flush_min_frame_bytes"] < 0
-            or job.get("live_leased_sync") != "group_flush"):
+            or requested_leased_sync(job) != "group_flush"):
         raise ValueError("invalid live_leased_flush_min_frame_bytes")
     if "live_pin_read_lanes" in job and type(job["live_pin_read_lanes"]) is not bool:
         raise ValueError("invalid live_pin_read_lanes")
@@ -2749,11 +2832,12 @@ def admit_live_write_contract(job, backend_info):
             type(job["live_leased_write_lanes"]) is not int or not 1 <= job["live_leased_write_lanes"] <= 4):
         raise ValueError("invalid live_leased_write_lanes")
     configuration = backend_info.get("configuration", {})
-    for key, actual in (("live_leased_sync", configuration.get("live_leased_sync")),
-                        ("live_leased_flush_min_frame_bytes", configuration.get("live_leased_flush_min_frame_bytes")),
-                        ("live_pin_read_lanes", configuration.get("client", {}).get("pin_read_lanes"))):
-        if key in job and actual != job[key]:
+    for key in ("live_leased_sync", "live_leased_flush_min_frame_bytes"):
+        if key in job and configuration.get(key) != job[key]:
             raise ValueError(key + " differs")
+    if ("live_pin_read_lanes" in job
+            and configuration.get("client", {}).get("pin_read_lanes") != job["live_pin_read_lanes"]):
+        raise ValueError("live_pin_read_lanes differs")
     if job.get("selection") not in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) or job.get("nvmeof_route") != "live":
         return
     if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
@@ -2765,7 +2849,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")
@@ -2793,9 +2877,9 @@ def admit_live_write_contract(job, backend_info):
         raise ValueError("live write mode or acknowledgement contract differs")
 
 
-def qualify_live_nvme_route(evidence, job, expected):
+def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
     """Bind verified initiator namespaces and target implementations to the fleet."""
-    result = qualify_live_nvme_measurement(evidence, job)
+    result = qualify_live_nvme_measurement(evidence, job, backend_info)
     reasons = result["reasons"]
     transport = "rdma" if job["backend"] == "tidehunter_nvme_rdma" else "tcp"
     if not isinstance(expected, dict) or expected.get("transport") != transport:
@@ -3701,8 +3785,9 @@ def summarize_case(directory, *, local_mode=False):
                 raise ValueError(f"native {option} differs from the planned case")
     admit_durability_tier(job, normalized["backend"]["options"], result / "manifest.json")
     if job["backend"] in NVME_BACKENDS and job.get("nvmeof_route") == "live":
+        manifest_path = result / "manifest.json"
+        backend_info = json.loads(manifest_path.read_text()).get("backend_info", {}) if manifest_path.is_file() else {}
         if receipt.get("status") == "completed":
-            backend_info = json.loads((result / "manifest.json").read_text())["backend_info"]
             admit_live_write_contract(job, backend_info)
         binding = receipt.get("live_nvme_expected")
         admitted = receipt.get("live_nvme_measurement_qualification")
@@ -3717,7 +3802,7 @@ def summarize_case(directory, *, local_mode=False):
             live = config["backend"]["options"].get("external_remote_config", {}).get("live_nvme")
             if not isinstance(live, dict) or any(expected.get(k) != live.get(k) for k in ("host_id", "host_nqn")):
                 raise ValueError("live NVMe identity differs from executed configuration")
-        qualification = qualify_live_nvme_route(read_interval["observed"] if read_interval else None, job, expected)
+        qualification = qualify_live_nvme_route(read_interval["observed"] if read_interval else None, job, expected, backend_info)
         value["live_nvme_measurement_qualification"] = qualification
         if admitted is not None and qualification != admitted:
             raise ValueError("live NVMe qualification differs from measurement evidence")
