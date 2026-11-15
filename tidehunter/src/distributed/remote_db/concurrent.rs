@@ -21,8 +21,8 @@ pub(super) struct AuthorityCounters {
     batches: AtomicU64,
 }
 
-/// Exclusive wall time: nested preparation/admission spans subtract from their
-/// parent, so pool-join progress and stale re-preparation are counted only once.
+/// Exclusive authority wall time. Pool work and pool waits never enter these
+/// spans on the concurrent path; canonical J2 time is prepare_task_ns instead.
 pub(super) struct AuthoritySpan<'a> {
     counters: &'a AuthorityCounters,
     target: &'a AtomicU64,
@@ -173,6 +173,7 @@ enum OwnerCommand {
 
 struct DeferredWrite {
     prepared: PreparedAdmission,
+    fresh_slot: bool,
     reply: WriteReply,
     since: Option<Instant>,
     drained_generation: Option<u64>,
@@ -180,32 +181,200 @@ struct DeferredWrite {
 }
 
 type QueuedWrite = ([u8; 16], Vec<Mutation>, WriteReply);
+type EncodedPreparation = Result<(CompleteBatch, u64), LocalDbError>;
+
+struct PreparingWrite {
+    id: BatchId,
+    fresh_slot: bool,
+    result: Result<mpsc::Receiver<EncodedPreparation>, LocalDbError>,
+    reply: WriteReply,
+    window_started: Option<Instant>,
+}
+
+/// A stale suffix retains the same credits and one input backing per request.
+/// No new plan or replacement job is issued until every old job is harvested.
+#[derive(Default)]
+struct ReplanSuffix {
+    writes: Vec<QueuedWrite>,
+}
+
+impl ReplanSuffix {
+    fn retain(&mut self, db: &mut RemoteDatabase, batch: CompleteBatch, reply: WriteReply) {
+        let id = batch.id();
+        db.write_timeline
+            .forget_version(id.operation, batch.version());
+        self.writes
+            .push((id.operation, batch.into_mutations(), reply));
+        db.pipeline_stats.prepare_suffix_harvested_batches += 1;
+    }
+}
+
+fn rejection_invalidates_suffix(
+    db: &RemoteDatabase,
+    fresh_slot: bool,
+    before: BatchVersion,
+    reply: &WriteReply,
+    preparing: &VecDeque<PreparingWrite>,
+    prepared: &VecDeque<DeferredWrite>,
+) -> bool {
+    if !fresh_slot {
+        // Only a fresh-slot plan advances the speculative cursor. Unadmitted
+        // requests own independent canonical inputs and credits: they reserve no
+        // WAL offset, frame membership or predecessor links until admission.
+        // Rejecting a shared-slot retry therefore cannot invalidate the suffix.
+        debug_assert_eq!(
+            before,
+            BatchVersion {
+                epoch: db.epoch,
+                sequence: db.submission_next()
+            },
+        );
+        debug_assert!(reply.version.is_none());
+        debug_assert!(preparing.iter().all(|write| write.reply.version.is_none()));
+        debug_assert!(prepared.iter().all(|write| write.reply.version.is_none()));
+    }
+    fresh_slot
+}
+
+/// Try a FIFO harvest without blocking publication or waiting on the authority.
+/// A second rejection/epoch change during harvest is coalesced: re-planning uses
+/// the latest authority state only after all old jobs have relinquished inputs.
+fn harvest_suffix(
+    db: &mut RemoteDatabase,
+    suffix: &mut ReplanSuffix,
+    preparing: &mut VecDeque<PreparingWrite>,
+    prepared: &mut VecDeque<DeferredWrite>,
+) -> Result<bool, LocalDbError> {
+    for write in prepared.drain(..) {
+        suffix.retain(db, write.prepared.batch, write.reply);
+    }
+    for _ in 0..preparing.len() {
+        let write = preparing.pop_front().unwrap();
+        let result = match write.result {
+            Ok(receiver) => match receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => {
+                    preparing.push_front(PreparingWrite {
+                        result: Ok(receiver),
+                        ..write
+                    });
+                    return Ok(false);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(LocalDbError::new("batch preparation lost result"))
+                }
+            },
+            Err(error) => Err(error),
+        };
+        if let Some(started) = write.window_started {
+            db.pipeline_stats.prepare_wall_ns += elapsed(started);
+        }
+        match result {
+            Ok((batch, ns)) => {
+                db.pipeline_stats.prepare_task_ns += ns;
+                suffix.retain(db, batch, write.reply);
+            }
+            Err(error) => {
+                db.pipeline_stats.prepare_suffix_harvest_failures += 1;
+                reject_preparation(db, write.reply, error)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Each task and its one-slot reply channel are covered by the write's request
+/// and byte credits. Workers never wait for the authority: one result fits even
+/// during shutdown. The pool is joined when the database drops.
+fn spawn_preparation(
+    db: &mut RemoteDatabase,
+    id: BatchId,
+    version: BatchVersion,
+    mutations: Vec<Mutation>,
+    encoded_len: usize,
+) -> Result<mpsc::Receiver<EncodedPreparation>, LocalDbError> {
+    let pool = db
+        .preparation_pool
+        .as_ref()
+        .and_then(|owner| owner.pool.as_ref())
+        .ok_or_else(|| LocalDbError::new("preparation pool missing"))?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let wake = db.preparation_wake.clone();
+    #[cfg(test)]
+    let gate = db.before_preparation.take();
+    #[cfg(test)]
+    let finished = db.preparation_finished.clone();
+    #[cfg(test)]
+    let step = db
+        .preparation_steps
+        .get_mut(&id.operation)
+        .and_then(VecDeque::pop_front);
+    pool.spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
+            #[cfg(test)]
+            if let Some(PreparationTestStep::Pause {
+                entered,
+                resume,
+                fail,
+            }) = step
+            {
+                let _ = entered.send(version);
+                let _ = resume.recv();
+                if fail {
+                    return Err(LocalDbError::new("injected pool preparation failure"));
+                }
+            }
+            let started = Instant::now();
+            CompleteBatch::encode_validated(id, version, mutations, encoded_len)
+                .map(CompleteBatch::into_canonical_owned)
+                .map(|batch| (batch, elapsed(started)))
+                .map_err(LocalDbError::component)
+        }))
+        .unwrap_or_else(|_| Err(LocalDbError::new("batch preparation panicked")));
+        #[cfg(test)]
+        if let Some(finished) = finished {
+            let _ = finished.try_send((id, version));
+        }
+        let _ = sender.send(result);
+        // Publish the result before the coalescing wake hint.
+        let _ = wake.try_send(());
+    });
+    db.pipeline_stats.parallel_prepared_batches += 1;
+    Ok(receiver)
+}
 
 fn prepare_window(
     db: &mut RemoteDatabase,
-    writes: &[QueuedWrite],
+    writes: Vec<QueuedWrite>,
     counters: &AuthorityCounters,
-) -> Result<Vec<Result<PreparedAdmission, LocalDbError>>, LocalDbError> {
-    counters.record_window(writes.len());
+    planned: &mut HashMap<BatchId, BatchVersion>,
+    next: &mut u64,
+    record_window: bool,
+) -> VecDeque<PreparingWrite> {
+    if record_window {
+        counters.record_window(writes.len());
+    }
     let _admit = counters.admitting();
     let started = Instant::now();
     let before = db.authority_write_stats();
-    let mut planned = HashMap::with_capacity(writes.len());
-    let mut next = db.submission_next();
-    let mut encoded_bytes = 0usize;
-    let mut plans = Vec::with_capacity(writes.len());
-    let mut slots = Vec::with_capacity(writes.len());
-    let mut results: Vec<_> = (0..writes.len()).map(|_| None).collect();
-    for (index, (operation, mutations, _)) in writes.iter().enumerate() {
-        let plan = (|| {
-            let id = BatchId {
-                database: db.config.storage.database,
-                operation: *operation,
-            };
+    let mut results = VecDeque::with_capacity(writes.len());
+    for (operation, mutations, reply) in writes {
+        let id = BatchId {
+            database: db.config.storage.database,
+            operation,
+        };
+        let next_before = *next;
+        let mut fresh_slot = false;
+        let result = (|| {
             let existing = db.existing_identity(id)?;
-            let validated = CompleteBatch::validated_mutations(
+            let encoded_len = CompleteBatch::encoded_len_for_mutations(
                 &db.shape,
-                mutations,
+                &mutations,
                 db.config.storage.batch_limits,
             )
             .map_err(LocalDbError::component)?;
@@ -216,54 +385,51 @@ fn prepare_window(
             } else {
                 let version = BatchVersion {
                     epoch: db.epoch,
-                    sequence: next,
+                    sequence: *next,
                 };
-                next = next
+                *next = next
                     .checked_add(1)
                     .ok_or_else(|| LocalDbError::new("version overflow"))?;
                 planned.insert(id, version);
+                fresh_slot = true;
                 version
             };
-            encoded_bytes = encoded_bytes.saturating_add(validated.encoded_len());
-            Ok((id, version, validated))
+            spawn_preparation(db, id, version, mutations, encoded_len)
         })();
-        match plan {
-            Ok(plan) => {
-                slots.push(index);
-                plans.push(plan);
-            }
-            Err(error) => results[index] = Some(Err(error)),
-        }
+        debug_assert_eq!(*next, next_before + u64::from(fresh_slot));
+        results.push_back(PreparingWrite {
+            id,
+            fresh_slot,
+            result,
+            reply,
+            window_started: None,
+        });
     }
-    let prepared = db.encode_preparation_plans(
-        &plans,
-        encoded_bytes >= super::preparation::PARALLEL_PREPARATION_MIN_BYTES,
-        Some(counters),
-    )?;
-    for (index, result) in slots.into_iter().zip(prepared) {
-        results[index] = Some(result.and_then(|(batch, _)| {
-            let prepared = db.prepare_admission(batch)?;
-            let batch = &prepared.batch;
-            db.write_timeline
-                .batch(batch.id().operation, batch.version());
-            // The timeline has no timestamp insertion API. Prepared is recorded
-            // on the owner after join; prepare_task_ns sums per-put encode spans.
-            db.write_timeline.batch_event(
-                batch.version(),
-                WriteTimelineStage::Prepared,
-                None,
-                None,
-            );
-            Ok(prepared)
-        }));
+    if let Some(last) = results.back_mut() {
+        last.window_started = Some(started);
     }
-    let after = db.authority_write_stats();
-    let nested = (after.storage_wait_ns - before.storage_wait_ns)
-        .saturating_add(after.publication_ns - before.publication_ns)
-        .saturating_add(after.dispatch_ns - before.dispatch_ns);
-    db.stats.validation_ns += elapsed(started).saturating_sub(nested);
+    if record_window {
+        db.pipeline_stats.prepare_calls += 1;
+    }
+    db.stats.validation_ns += elapsed(started);
     db.record_admission_span(started, before);
-    Ok(results.into_iter().map(Option::unwrap).collect())
+    results
+}
+
+fn finish_preparation(
+    db: &mut RemoteDatabase,
+    result: EncodedPreparation,
+) -> Result<PreparedAdmission, LocalDbError> {
+    result.and_then(|(batch, ns)| {
+        db.pipeline_stats.prepare_task_ns += ns;
+        let prepared = db.prepare_admission(batch)?;
+        let batch = &prepared.batch;
+        db.write_timeline
+            .batch(batch.id().operation, batch.version());
+        db.write_timeline
+            .batch_event(batch.version(), WriteTimelineStage::Prepared, None, None);
+        Ok(prepared)
+    })
 }
 
 fn reject_preparation(
@@ -1296,10 +1462,15 @@ fn drive_owner(
         let _ = resume.recv();
     }
     let mut pending: VecDeque<WriteReply> = VecDeque::new();
-    // At most one ready-input window is retained. Reply credits cover its
-    // detached inputs and encodings; a deferred front blocks all later writes.
+    // Preparing and deferred writes retain request/byte credits. Only the FIFO
+    // head may enter admission, irrespective of pool completion order.
     let window_bound = admission.max_requests.min(db.config.max_pending_batches);
     let mut prepared_writes = VecDeque::with_capacity(window_bound);
+    let mut preparing_writes: VecDeque<PreparingWrite> = VecDeque::with_capacity(window_bound);
+    let mut planned = HashMap::with_capacity(window_bound);
+    let mut planning_next = db.submission_next();
+    let mut planning_epoch = db.epoch;
+    let mut replan: Option<ReplanSuffix> = None;
     let mut held_command = None;
     let mut barrier: Option<Reply<()>> = None;
     let mut disconnected = false;
@@ -1326,6 +1497,7 @@ fn drive_owner(
         // There is no timer or wait for a second request: singletons stay prompt.
         {
             let _admit = admission.authority.admitting();
+            let completions_before = db.pipeline_stats.completions_before_drain;
             db.progress_pipeline(false).inspect_err(|error| {
                 record_first_failure(
                     &db.first_failure,
@@ -1335,6 +1507,11 @@ fn drive_owner(
                     error,
                 );
             })?;
+            if !preparing_writes.is_empty() {
+                db.pipeline_stats.prepare_progress_passes += 1;
+                db.pipeline_stats.prepare_progress_completions +=
+                    db.pipeline_stats.completions_before_drain - completions_before;
+            }
             for _ in 0..pending.len() {
                 let reply = pending.pop_front().unwrap();
                 let version = reply.version.unwrap();
@@ -1405,17 +1582,62 @@ fn drive_owner(
         if let Some(events) = db.concurrent_progress.lock().as_ref() {
             let _ = events.try_send(db.pipeline_stats());
         }
-        if disconnected && prepared_writes.is_empty() && db.submissions.is_empty() {
+        if planning_epoch != db.epoch {
+            replan.get_or_insert_with(ReplanSuffix::default);
+        }
+        if let Some(suffix) = &mut replan {
+            let retained_bytes: usize = suffix
+                .writes
+                .iter()
+                .map(|(_, _, reply)| reply._credit.bytes)
+                .chain(
+                    preparing_writes
+                        .iter()
+                        .map(|write| write.reply._credit.bytes),
+                )
+                .chain(
+                    prepared_writes
+                        .iter()
+                        .map(|write: &DeferredWrite| write.reply._credit.bytes),
+                )
+                .sum();
+            db.pipeline_stats.prepare_suffix_retained_bytes_peak = db
+                .pipeline_stats
+                .prepare_suffix_retained_bytes_peak
+                .max(retained_bytes);
+            let _admit = admission.authority.admitting();
+            if harvest_suffix(db, suffix, &mut preparing_writes, &mut prepared_writes)? {
+                let suffix = replan.take().unwrap();
+                planned.clear();
+                planning_next = db.submission_next();
+                planning_epoch = db.epoch;
+                db.pipeline_stats.prepare_suffix_replans += 1;
+                db.pipeline_stats.prepare_suffix_replanned_batches += suffix.writes.len() as u64;
+                preparing_writes.extend(prepare_window(
+                    db,
+                    suffix.writes,
+                    &admission.authority,
+                    &mut planned,
+                    &mut planning_next,
+                    false,
+                ));
+            }
+        }
+        if disconnected
+            && preparing_writes.is_empty()
+            && prepared_writes.is_empty()
+            && db.submissions.is_empty()
+        {
             return Ok(());
         }
         let mut admitted = false;
-        // Retained prepared writes consume this pass's budget too.
-        let mut receive_budget = admission.max_requests - prepared_writes.len();
-        if barrier.is_none() && !disconnected {
+        let mut receive_budget = window_bound - prepared_writes.len() - preparing_writes.len();
+        if barrier.is_none() && !disconnected && replan.is_none() {
             for pass in 0..admission.max_requests {
-                if prepared_writes.is_empty() && held_command.is_none() {
-                    if receive_budget == 0 {
-                        break;
+                if held_command.is_none() && receive_budget != 0 {
+                    if prepared_writes.is_empty() && preparing_writes.is_empty() {
+                        planned.clear();
+                        planning_next = db.submission_next();
                     }
                     let collect_span = admission.authority.admitting();
                     let mut writes = Vec::new();
@@ -1443,6 +1665,7 @@ fn drive_owner(
                                     break;
                                 }
                             }
+                            Err(mpsc::TryRecvError::Empty) => break,
                             other => {
                                 held_command = Some(other);
                                 break;
@@ -1451,21 +1674,73 @@ fn drive_owner(
                     }
                     drop(collect_span);
                     if !writes.is_empty() {
-                        let prepared = prepare_window(db, &writes, &admission.authority)?;
-                        let _admit = admission.authority.admitting();
-                        for ((_, _, reply), result) in writes.into_iter().zip(prepared) {
-                            match result {
-                                Ok(prepared) => prepared_writes.push_back(DeferredWrite {
-                                    prepared,
-                                    reply,
-                                    since: None,
-                                    drained_generation: None,
-                                    fresh_generation: None,
-                                }),
-                                Err(error) => reject_preparation(db, reply, error)?,
-                            }
-                        }
+                        preparing_writes.extend(prepare_window(
+                            db,
+                            writes,
+                            &admission.authority,
+                            &mut planned,
+                            &mut planning_next,
+                            true,
+                        ));
                         admitted = true;
+                    }
+                }
+                if prepared_writes.is_empty()
+                    && let Some(write) = preparing_writes.pop_front()
+                {
+                    let result = match write.result {
+                        Ok(receiver) => match receiver.try_recv() {
+                            Ok(result) => result,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                preparing_writes.push_front(PreparingWrite {
+                                    result: Ok(receiver),
+                                    ..write
+                                });
+                                break;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                Err(LocalDbError::new("batch preparation lost result"))
+                            }
+                        },
+                        Err(error) => Err(error),
+                    };
+                    if write.fresh_slot {
+                        planned.remove(&write.id);
+                    }
+                    let _admit = admission.authority.admitting();
+                    if let Some(started) = write.window_started {
+                        db.pipeline_stats.prepare_wall_ns += elapsed(started);
+                    }
+                    let before = BatchVersion {
+                        epoch: db.epoch,
+                        sequence: db.submission_next(),
+                    };
+                    match finish_preparation(db, result) {
+                        Ok(prepared) => prepared_writes.push_back(DeferredWrite {
+                            prepared,
+                            fresh_slot: write.fresh_slot,
+                            reply: write.reply,
+                            since: None,
+                            drained_generation: None,
+                            fresh_generation: None,
+                        }),
+                        Err(error) => {
+                            let invalidates = rejection_invalidates_suffix(
+                                db,
+                                write.fresh_slot,
+                                before,
+                                &write.reply,
+                                &preparing_writes,
+                                &prepared_writes,
+                            );
+                            reject_preparation(db, write.reply, error)?;
+                            admitted = true;
+                            if invalidates {
+                                replan = Some(ReplanSuffix::default());
+                                break;
+                            }
+                            continue;
+                        }
                     }
                 }
                 if let Some(mut write) = prepared_writes.pop_front() {
@@ -1484,26 +1759,12 @@ fn drive_owner(
                             .unwrap_or(next)
                     };
                     if version != expected {
-                        // An earlier prepare/admission failed, or a checkpoint
-                        // changed the epoch. No slot was allocated for this
-                        // batch: re-encode with the next reachable version.
-                        db.write_timeline.forget_version(id.operation, version);
-                        let started = Instant::now();
-                        let before = db.authority_write_stats();
-                        let result = db.prepare_submit(
-                            id.operation,
-                            write.prepared.batch.mutations().to_vec(),
-                            Some(&admission.authority),
-                        );
-                        db.record_admission_span(started, before);
-                        match result {
-                            Ok(prepared) => write.prepared = prepared,
-                            Err(error) => {
-                                reject_preparation(db, write.reply, error)?;
-                                admitted = true;
-                                continue;
-                            }
-                        }
+                        // No slot was allocated. Harvest the complete old suffix
+                        // before re-planning, rather than serially chasing holes.
+                        prepared_writes.push_front(write);
+                        replan = Some(ReplanSuffix::default());
+                        admitted = true;
+                        break;
                     }
                     let trace_identity = db.write_timeline.enabled().then(|| {
                         (
@@ -1628,9 +1889,23 @@ fn drive_owner(
                                 db.concurrent_failure.store(true, Ordering::Release);
                                 db.reads.poison();
                             }
-                            write.reply.finish(Err(error));
                             if poisoned {
+                                write.reply.finish(Err(error));
                                 return Err(LocalDbError::new("write failed; recovery required"));
+                            }
+                            let invalidates = rejection_invalidates_suffix(
+                                db,
+                                write.fresh_slot,
+                                next,
+                                &write.reply,
+                                &preparing_writes,
+                                &prepared_writes,
+                            );
+                            write.reply.finish(Err(error));
+                            if invalidates {
+                                replan = Some(ReplanSuffix::default());
+                                admitted = true;
+                                break;
                             }
                         }
                     }

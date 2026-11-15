@@ -413,7 +413,7 @@ pub struct RemoteDatabaseConfig {
     /// Explicit host slice for cache ownership and bounded pending read buffers.
     #[serde(default = "default_read_memory_allowance_bytes")]
     pub read_memory_allowance_bytes: usize,
-    /// CPU workers for the bounded borrowed-window submit_many API.
+    /// Fixed CPU pool shared by canonical preparation and parallel live frame fill.
     #[serde(default = "default_preparation_workers")]
     pub preparation_workers: usize,
     /// Bounded scan-page lookahead; one is the serial control.
@@ -1016,6 +1016,13 @@ pub struct PipelineStats {
     pub prepare_wall_ns: u64,
     /// Sum of worker elapsed durations: overlaps; not process CPU time.
     pub prepare_task_ns: u64,
+    /// Completed whole-suffix re-plan passes, coalescing failures during harvest.
+    pub prepare_suffix_replans: u64,
+    pub prepare_suffix_replanned_batches: u64,
+    pub prepare_suffix_harvested_batches: u64,
+    pub prepare_suffix_harvest_failures: u64,
+    /// Reserved input/result credit of the retained suffix, not process RSS.
+    pub prepare_suffix_retained_bytes_peak: usize,
     pub prepare_reserved_bytes_peak: usize,
     /// Completion replies consumed while the next preparation is running.
     pub prepare_progress_completions: u64,
@@ -1041,8 +1048,8 @@ pub struct AuthorityWriteStats {
     pub publication_ns: u64,
     pub dispatch_ns: u64,
     pub preparation_admission_ns: u64,
-    /// Exclusive concurrent-authority preparation wall time, including pool join
-    /// waits, but excluding nested admission/publication progress.
+    /// Exclusive concurrent-authority encoding time. The concurrent path moves
+    /// this work to the preparation pool, so this counter remains zero.
     pub authority_prepare_ns: u64,
     /// Concurrent-authority planning, admission and publication bookkeeping.
     pub authority_admit_ns: u64,
@@ -1390,6 +1397,16 @@ struct WorkerReadProfile {
     tcp: super::tcp::TcpReadProfile,
 }
 
+#[cfg(test)]
+enum PreparationTestStep {
+    Pass,
+    Pause {
+        entered: mpsc::SyncSender<BatchVersion>,
+        resume: mpsc::Receiver<()>,
+        fail: bool,
+    },
+}
+
 pub struct RemoteDatabase {
     clients: Vec<ClientWorker>,
     reads: Arc<ReadService>,
@@ -1473,6 +1490,10 @@ pub struct RemoteDatabase {
     stats: LocalDbStats,
     #[cfg(test)]
     before_preparation: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+    #[cfg(test)]
+    preparation_finished: Option<mpsc::SyncSender<(BatchId, BatchVersion)>>,
+    #[cfg(test)]
+    preparation_steps: HashMap<[u8; 16], VecDeque<PreparationTestStep>>,
     #[cfg(test)]
     owner_start_pause: Option<mpsc::Receiver<()>>,
     #[cfg(test)]
@@ -2023,11 +2044,7 @@ impl RemoteDatabase {
         // Current checkpoint/proofs and the complete tail have now validated.
         // Resolve only durably named cleanup intents before allowing more work.
         cleanup_checkpoint_artifacts(&path, &mut manifest, false)?;
-        let preparation_pool = if config.preparation_workers > 1 {
-            Some(PreparationPool::build(config.preparation_workers)?)
-        } else {
-            None
-        };
+        let preparation_pool = Some(PreparationPool::build(config.preparation_workers)?);
         let mut workers = Vec::new();
         let write_profile = Arc::new(Mutex::new(WriteProfileSnapshot {
             limit_per_connection: config.write_profile_limit,
@@ -2039,6 +2056,16 @@ impl RemoteDatabase {
         let first_failure = Arc::new(std::sync::OnceLock::new());
         let (wake_sender, completion_wake) = mpsc::sync_channel(clients.len());
         for client in clients {
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let client = {
+                let mut client = client;
+                client.set_preparation_pool(
+                    preparation_pool
+                        .as_ref()
+                        .and_then(|owner| owner.pool.clone()),
+                );
+                client
+            };
             workers.push(
                 ClientWorker::start(
                     client,
@@ -2187,6 +2214,10 @@ impl RemoteDatabase {
             stats: LocalDbStats::default(),
             #[cfg(test)]
             before_preparation: None,
+            #[cfg(test)]
+            preparation_finished: None,
+            #[cfg(test)]
+            preparation_steps: HashMap::new(),
             #[cfg(test)]
             owner_start_pause: None,
             #[cfg(test)]
@@ -6559,7 +6590,13 @@ impl Drop for ClientWorker {
             let _ = thread.join();
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        self.client.lock().clear_worker_wake();
+        {
+            let mut client = self.client.lock();
+            client.clear_worker_wake();
+            // Monitors and the transport cache may retain the client. Release
+            // its pool reference before PreparationPool joins the CPU workers.
+            client.set_preparation_pool(None);
+        }
     }
 }
 fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {

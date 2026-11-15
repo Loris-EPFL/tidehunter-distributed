@@ -2057,6 +2057,10 @@ impl super::Client {
         Ok(released.remove(0).1)
     }
 
+    pub(crate) fn set_preparation_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
+        self.preparation_pool = pool;
+    }
+
     pub(crate) fn set_worker_wake(&mut self, fd: std::os::fd::RawFd) {
         self.live_leased.worker_wake = Some(fd);
         self.register_leased_worker_wake();
