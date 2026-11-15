@@ -536,6 +536,37 @@ fn leased_worker_failed_merged_frame_marks_every_command_unknown() {
 }
 
 #[test]
+fn leased_worker_completes_flight_while_adoption_pending_without_timer_wait() {
+    use crate::distributed::storage::LivePausePoint;
+    let fixture = Fixture::new(DurabilityTier::Synchronous, 64 * 1024);
+    let mut client = fixture.writer();
+    client.leased_test_set_window(1);
+    let (entered, release) = fixture
+        .node
+        .log_for_test(1)
+        .pause_live(LivePausePoint::FrameProbe);
+    let (worker, failure) = worker(&fixture, client);
+    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let before = worker.client.lock().leased_test_flight_adoption_waits();
+    for sequence in 1..=20 {
+        let batch = fixture.batch(sequence);
+        let version = batch.version();
+        let replies = receive(worker.append(1, vec![batch]).unwrap()).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].appended().version(), version);
+    }
+    let waits = worker.client.lock().leased_test_flight_adoption_waits() - before;
+    // CQE waits may time out on slow local storage. Only the adoption timer
+    // wait with a frame in flight identifies the acknowledgement-path bug.
+    release.send(()).unwrap();
+    drop(worker);
+    assert_eq!(waits, 0, "adoption timer blocked an in-flight frame");
+    // Acquire observes the worker's fatal-outcome publication, if any.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
 fn leased_worker_checkpoint_waits_for_adoption_without_holding_client_lock() {
     use crate::distributed::storage::LivePausePoint;
     let fixture = Fixture::new(DurabilityTier::Native, 16384);

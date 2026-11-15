@@ -34,6 +34,18 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
             "Completed leased frames",
         ),
         (
+            "leased_worker_waits_total",
+            c.leased_worker_waits,
+            false,
+            "Waits on the acknowledgement path: at least one leased frame in flight",
+        ),
+        (
+            "leased_worker_wait_timeouts_total",
+            c.leased_worker_wait_timeouts,
+            false,
+            "Timed-out waits on the acknowledgement path: at least one leased frame in flight",
+        ),
+        (
             "leased_bytes_total",
             c.leased_bytes,
             false,
@@ -224,7 +236,7 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
         "leased_write",
         leased_write_ns,
         leased_write_samples,
-        "Successful leased block writes including skips: admission to terminal CQE seconds; excludes failed writes and drain",
+        "Successful leased block writes including skips: submission return to local CQE harvest; includes worker wake delay; not device time; excludes failed writes and drain",
     );
     stage!(
         "extent_switch",
@@ -268,7 +280,7 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
         "adoption_async",
         adoption_async_ns,
         adoption_async_samples,
-        "Successful asynchronous adoption submission to validated reply seconds"
+        "Successful asynchronous adoption post-submit to validated reply harvest seconds; includes harvest delay"
     );
     stage!(
         "adoption_settle",
@@ -607,6 +619,8 @@ mod tests {
         let producer = metrics.register().unwrap();
         producer.record_timing(LiveTimingStage::Completion, 2_000_000_000, 2);
         producer.record_leased_frame(4096);
+        producer.record_leased_worker_wait(false);
+        producer.record_leased_worker_wait(true);
         producer.record_leased_skip();
         producer.record_extent_lease();
         producer.record_adoption(false);
@@ -661,6 +675,8 @@ mod tests {
         };
         assert_eq!(counter("tidehunter_nvmeof_live_cq_seconds_total"), 2.0);
         for (name, expected) in [
+            ("leased_worker_waits_total", 2.0),
+            ("leased_worker_wait_timeouts_total", 1.0),
             ("adoption_async_seconds_total", 4.0),
             ("adoption_async_samples_total", 2.0),
             ("adoption_settle_seconds_total", 6.0),

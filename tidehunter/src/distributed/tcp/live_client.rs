@@ -406,6 +406,8 @@ pub(super) struct LeasedWriter {
     #[cfg(test)]
     command_adoption_waits: u64,
     #[cfg(test)]
+    flight_adoption_waits: u64,
+    #[cfg(test)]
     largest_close_profile: super::live_control::AdoptProfile,
 }
 
@@ -2348,6 +2350,9 @@ impl super::Client {
                     return Err(super::TcpError::component(error));
                 }
             }
+            if let Some(counters) = &self.live_counters {
+                counters.record_leased_worker_wait(result == 0);
+            }
             let mut value = 0u64;
             // SAFETY: value is writable for eight bytes and fd stays owned by the worker.
             let result = unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
@@ -2367,12 +2372,16 @@ impl super::Client {
             .as_mut()
             .ok_or_else(|| super::TcpError::new("live queue missing"))?
             .io;
-        io.wait(if polled {
-            std::time::Duration::ZERO
-        } else {
-            remaining
-        })
-        .map_err(super::TcpError::component)?;
+        let completed = io
+            .wait(if polled {
+                std::time::Duration::ZERO
+            } else {
+                remaining
+            })
+            .map_err(super::TcpError::component)?;
+        if let Some(counters) = &self.live_counters {
+            counters.record_leased_worker_wait(!polled && !completed);
+        }
         Ok(())
     }
 
@@ -5033,6 +5042,12 @@ impl super::Client {
     }
     pub(crate) fn leased_test_command_adoption_waits(&self) -> u64 {
         self.live_leased.command_adoption_waits
+    }
+    pub(crate) fn leased_test_note_flight_adoption_wait(&mut self) {
+        self.live_leased.flight_adoption_waits += 1;
+    }
+    pub(crate) fn leased_test_flight_adoption_waits(&self) -> u64 {
+        self.live_leased.flight_adoption_waits
     }
     pub(crate) fn leased_test_corrupt_adoption(&mut self, bad_token: bool) {
         if bad_token {

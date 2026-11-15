@@ -5562,6 +5562,7 @@ impl ClientWorker {
                         if checkpoint.is_none()
                             && position.is_none()
                             && client.leased_adoption_pending()
+                            && client.leased_flights_in_flight() == 0
                             && !matches!(
                                 queued.front(),
                                 Some(Command::Append(..) | Command::CheckpointPosition(..))
@@ -5573,6 +5574,11 @@ impl ClientWorker {
                             #[cfg(test)]
                             if !queued.is_empty() {
                                 client.leased_test_note_command_adoption_wait();
+                            }
+                            // A guard regression would wait here with a frame in flight.
+                            #[cfg(test)]
+                            if client.leased_flights_in_flight() != 0 {
+                                client.leased_test_note_flight_adoption_wait();
                             }
                             drop(client);
                             if disconnected || queued.len() == queue_capacity {

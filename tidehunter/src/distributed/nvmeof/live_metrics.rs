@@ -72,14 +72,14 @@ pub struct LiveFenceEvidence {
 // `sum` fields add across producers; `max` fields keep the largest value (a
 // gauge peak, not an additive count).
 macro_rules! counter_fields {
-    (sum: $($name:ident),+ $(,)?; max: $($peak:ident),+ $(,)?) => {
+    (sum: $($(#[$attr:meta])* $name:ident),+ $(,)?; max: $($peak:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
         #[serde(default)]
-        pub struct LiveNvmeCounts { $(pub $name: u64,)+ $(pub $peak: u64,)+ }
+        pub struct LiveNvmeCounts { $($(#[$attr])* pub $name: u64,)+ $(pub $peak: u64,)+ }
 
         #[repr(align(64))]
         #[derive(Default)]
-        pub struct LiveNvmeCounters { $($name: AtomicU64,)+ $($peak: AtomicU64,)+ }
+        pub struct LiveNvmeCounters { $($(#[$attr])* $name: AtomicU64,)+ $($peak: AtomicU64,)+ }
 
         impl LiveNvmeCounters {
             fn snapshot(&self) -> LiveNvmeCounts {
@@ -113,18 +113,25 @@ counter_fields!(
     lease_exchanges,
     leased_frames,
     leased_eventfd_unavailable,
+    /// Waits on the acknowledgement path: at least one leased frame in flight.
+    leased_worker_waits,
+    /// Timed-out waits on the acknowledgement path: at least one leased frame in flight.
+    leased_worker_wait_timeouts,
     leased_bytes,
     leased_skip_markers,
     extents_leased,
     adoption_async_exchanges,
     adoption_sync_exchanges,
     adoption_history_full_settles,
+    /// Post-submit to validated reply harvest; includes harvest delay.
     adoption_async_ns,
     adoption_async_samples,
     adoption_settle_ns,
     adoption_settle_samples,
     fua_writes,
+    /// Submission return to local CQE harvest; includes worker wake delay; not device time.
     leased_write_ns,
+    /// Samples of submission return to local CQE harvest; includes worker wake delay; not device time.
     leased_write_samples,
     extent_switch_ns,
     extent_switch_samples,
@@ -311,6 +318,14 @@ impl LiveNvmeCounters {
         // Relaxed: this count does not publish queue ownership.
         self.leased_eventfd_unavailable
             .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_leased_worker_wait(&self, timed_out: bool) {
+        // Relaxed: independent wait evidence, not queue-state publication.
+        self.leased_worker_waits.fetch_add(1, Ordering::Relaxed);
+        if timed_out {
+            self.leased_worker_wait_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub fn record_leased_skip(&self) {
         // Relaxed: evidence only, not a stream ordering barrier.
@@ -529,5 +544,23 @@ impl LiveNvmeMetrics {
             route_evidence_dropped: registry.route_evidence_dropped,
             fence_evidence_dropped: registry.fence_evidence_dropped,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leased_worker_waits_sum_across_producers() {
+        let metrics = LiveNvmeMetrics::new();
+        let first = metrics.register().unwrap();
+        let second = metrics.register().unwrap();
+        first.record_leased_worker_wait(false);
+        first.record_leased_worker_wait(true);
+        second.record_leased_worker_wait(true);
+        let counts = metrics.snapshot().counts;
+        assert_eq!(counts.leased_worker_waits, 3);
+        assert_eq!(counts.leased_worker_wait_timeouts, 2);
     }
 }
