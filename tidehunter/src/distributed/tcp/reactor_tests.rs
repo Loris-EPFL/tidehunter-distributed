@@ -252,6 +252,108 @@ fn correlated_position_proof_keeps_data_deadline_under_stall() {
 }
 
 #[test]
+fn owner_session_deadlines_extend_fence_but_not_reads() {
+    let io_timeout = Duration::from_millis(300);
+    let server = Running::with_limits(
+        Transport::TcpTrusted,
+        WalMemberReadPolicy::Positional,
+        default_read_bytes(),
+        default_device_reads(),
+        TcpLimits {
+            io_timeout,
+            ..TcpLimits::default()
+        },
+    );
+    let mut client = server.client();
+    client.timeout = Duration::from_secs(5);
+    let admission_deadline = Instant::now() + Duration::from_secs(2);
+    while server.node.control.pending_requests_for_test() != 0 {
+        assert!(Instant::now() < admission_deadline);
+        thread::yield_now();
+    }
+
+    let inventory = server.node.inventory.lock();
+    let request = Request::Fence { epoch: 1 };
+    assert!(
+        client
+            .submit_control(&request, Instant::now() + request.timeout(client.timeout))
+            .unwrap()
+    );
+    // Start the hold only after this Fence has entered the owner's queue.
+    while server.node.control.pending_requests_for_test() == 0 {
+        client.progress_reads().unwrap();
+        assert!(
+            Instant::now() < admission_deadline,
+            "Fence was not admitted"
+        );
+        thread::yield_now();
+    }
+    thread::sleep(io_timeout + Duration::from_millis(100));
+    drop(inventory);
+    let completion_deadline = Instant::now() + Duration::from_secs(2);
+    let response = loop {
+        client.progress_reads().unwrap();
+        if let Some(response) = client.take_control() {
+            break response.unwrap();
+        }
+        assert!(Instant::now() < completion_deadline, "Fence did not finish");
+        thread::yield_now();
+    };
+    assert!(matches!(response, Response::Status(status) if status.active_epoch == Some(1)));
+
+    let (_, references) = server.data(&mut client);
+    let (entered, entries) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let released = Mutex::new(released);
+    *server.node.read_hook.lock() = Some(Arc::new(move |_| {
+        entered.send(()).unwrap();
+        released
+            .lock()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+    }));
+    client
+        .submit_read(
+            1,
+            vec![references[0]],
+            Instant::now() + client.timeout,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    let admission_deadline = Instant::now() + Duration::from_secs(2);
+    while entries.try_recv().is_err() {
+        client.progress_reads().unwrap();
+        assert!(
+            Instant::now() < admission_deadline,
+            "read did not enter stall"
+        );
+        thread::yield_now();
+    }
+    thread::sleep(io_timeout + Duration::from_millis(100));
+    release.send(()).unwrap();
+    server.node.read_hook.lock().take();
+    let completion_deadline = Instant::now() + Duration::from_secs(2);
+    let error = loop {
+        match client.progress_reads() {
+            Err(error) => break error,
+            Ok(completed) => assert!(completed.is_empty(), "owner extended a data deadline"),
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "owner did not expire the stalled read"
+        );
+        thread::yield_now();
+    };
+    assert!(
+        !error
+            .to_string()
+            .contains("remote operation deadline expired"),
+        "the owner's short deadline, not the five-second client deadline, must expire"
+    );
+}
+
+#[test]
 fn status_shape_mismatch_names_request_and_both_sha256_values() {
     let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
     let different = KeyShape::new_single(4, 1024, KeyType::uniform(1));

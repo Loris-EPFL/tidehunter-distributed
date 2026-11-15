@@ -518,6 +518,11 @@ impl ControlOwner {
         self.shared.session_barrier_waits.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(super) fn pending_requests_for_test(&self) -> usize {
+        self.shared.queue.lock().requests
+    }
+
     #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn exclusive_waits_for_stream(&self) -> bool {
         let queue = self.shared.queue.lock();
