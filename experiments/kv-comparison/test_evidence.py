@@ -66,6 +66,19 @@ class LiveTimelineAdmission(unittest.TestCase):
             retry = copy.deepcopy(data)
             retry["timeline"]["live_groups"].append(copy.deepcopy(group))
             self.assertEqual(admit(retry)["coverage"]["live_groups"], 2)
+            # Leased groups carry frame coordinates (schema 2 exports); bad values are rejected.
+            located = copy.deepcopy(data)
+            located["schema_version"] = 2
+            located["timeline"]["origin_monotonic_ns"] = 7
+            located["timeline"]["live_groups"][0].update(
+                wal_position=8192, file_offset=8192, frame_len=4096, wal_file=0, namespace_block_size=4096)
+            self.assertEqual(admit(located)["coverage"]["live_groups"], 1)
+            for field, value in (("frame_len", 0), ("namespace_block_size", 3000),
+                                 ("file_offset", -1), ("wal_file", True), ("extra", 1)):
+                bad = copy.deepcopy(located)
+                bad["timeline"]["live_groups"][0][field] = value
+                with self.assertRaisesRegex(ValueError, "invalid live group"):
+                    admit(bad)
             for mutate in ("legacy", "duplicate", "unknown", "owner", "token", "storage", "counter"):
                 broken = copy.deepcopy(data)
                 g = broken["timeline"]["live_groups"][0]

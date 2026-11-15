@@ -1444,12 +1444,22 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
     batch_records = {(record["batch"]["epoch"], record["batch"]["sequence"]): record
                      for record in records if record.get("batch") is not None}
     group_memberships = 0
+    group_required = {"owner", "batches", "reservation_token", "owner_validation_ns", "owner_persistence"}
+    # Leased groups add their frame coordinates; other routes omit them.
+    group_geometry = {"wal_position": 2**64, "file_offset": 2**64, "frame_len": 2**32,
+                      "wal_file": 2**64, "namespace_block_size": 2**32}
     for group in groups or []:
         if (not isinstance(group, dict)
-                or set(group) != {"owner", "batches", "reservation_token", "owner_validation_ns", "owner_persistence"}
+                or not group_required <= set(group) <= group_required | set(group_geometry)
                 or type(group["owner"]) is not int or not 0 <= group["owner"] < 2**32
                 or not isinstance(group["batches"], list) or not group["batches"]):
             raise ValueError("invalid live group timeline")
+        for field, bound in group_geometry.items():
+            if field in group and (type(group[field]) is not int or not 0 <= group[field] < bound):
+                raise ValueError("invalid live group frame coordinate")
+        block = group.get("namespace_block_size")
+        if (block is not None and (block == 0 or block & (block - 1))) or group.get("frame_len") == 0:
+            raise ValueError("invalid live group frame coordinate")
         token = group["reservation_token"]
         if token is not None and (not isinstance(token, list) or len(token) != 16
                                   or any(type(byte) is not int or not 0 <= byte <= 255 for byte in token)):
