@@ -211,6 +211,63 @@ class ImageAdmissionTests(unittest.TestCase):
                 'version_requirements': {'GLIBC': ['2.34'], 'GLIBCXX': [], 'CXXABI': [], 'OPENSSL': []}})
             with self.assertRaisesRegex(ValueError, 'focused proof'):
                 gcp_image.validate_pair(focused, identity, runtime, self.config['service_account'])
+            focused_valkey = copy.deepcopy(focused)
+            for item, original in zip(focused_valkey, records):
+                item['outputs']['package']['build_profile'] = 'focused_valkey'
+                item['outputs']['package']['valkey_runtime_linkage'] = copy.deepcopy(
+                    original['outputs']['package']['valkey_runtime_linkage'])
+                for linkage in item['outputs']['package']['valkey_runtime_linkage'].values():
+                    linkage['resolved'].pop('/lib/libfdb_c.so', None)
+                item['outputs']['valkey'] = copy.deepcopy(original['outputs']['valkey'])
+            gcp_image.validate_pair(focused_valkey, identity, runtime, self.config['service_account'],
+                                    qualification_profile='focused')
+            for index in range(2):
+                mixed = copy.deepcopy(focused_valkey)
+                mixed[index] = copy.deepcopy(focused[index])
+                with self.subTest(plain_focused_guest=index):
+                    with self.assertRaisesRegex(ValueError, 'focused build profile'):
+                        gcp_image.validate_pair(mixed, identity, runtime, self.config['service_account'],
+                                                qualification_profile='focused')
+            for index in range(2):
+                for binary in ('valkey-server', 'valkey-cli', 'valkey-benchmark'):
+                    for malformed in (False, True):
+                        with self.subTest(guest=index, binary=binary, malformed=malformed):
+                            wrong = copy.deepcopy(focused_valkey)
+                            linkage = wrong[index]['outputs']['package']['valkey_runtime_linkage']
+                            if malformed:
+                                linkage[binary] = {}
+                            else:
+                                del linkage[binary]
+                            with self.assertRaisesRegex(ValueError, 'linkage'):
+                                gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                                        qualification_profile='focused')
+                wrong = copy.deepcopy(focused_valkey)
+                del wrong[index]['outputs']['package']['valkey_runtime_linkage']
+                with self.assertRaisesRegex(ValueError, 'Valkey linkage'):
+                    gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                            qualification_profile='focused')
+                for field in (None, 'endpoint', 'set', 'get', 'del', 'value'):
+                    for malformed in (False, True):
+                        with self.subTest(guest=index, field=field, malformed=malformed):
+                            wrong = copy.deepcopy(focused_valkey)
+                            if field is None:
+                                if malformed:
+                                    wrong[index]['outputs']['valkey'] = []
+                                else:
+                                    del wrong[index]['outputs']['valkey']
+                            elif malformed:
+                                wrong[index]['outputs']['valkey'][field] = 'invalid'
+                            else:
+                                del wrong[index]['outputs']['valkey'][field]
+                            with self.assertRaisesRegex(ValueError, 'Valkey RDMA'):
+                                gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                                        qualification_profile='focused')
+            wrong = copy.deepcopy(focused)
+            wrong[0]['outputs']['package']['valkey_runtime_linkage'] = copy.deepcopy(
+                focused_valkey[0]['outputs']['package']['valkey_runtime_linkage'])
+            with self.assertRaisesRegex(ValueError, 'Valkey proof'):
+                gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                        qualification_profile='focused')
             wrong = copy.deepcopy(focused)
             wrong[0]['qualification_proofs'].append('valkey')
             with self.assertRaisesRegex(ValueError, 'proof list'):

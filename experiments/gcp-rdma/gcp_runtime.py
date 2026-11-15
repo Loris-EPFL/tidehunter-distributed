@@ -244,7 +244,7 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
 def live_mode(spec):
     from workflow_input import cloud_campaign
     return (spec.get('mode') == 'standard-with-live-nvmeof'
-            or (spec.get('mode') == 'focused' and spec.get('selection') in ('leased_ab_compact', *cloud_campaign.NVMEOF_PATH_SELECTIONS)))
+            or (spec.get('mode') == 'focused' and spec.get('selection') in ('leased_ab_compact', 'valkey_rdma_reads', *cloud_campaign.NVMEOF_PATH_SELECTIONS)))
 
 
 def admit_package_profile(spec, package):
@@ -773,7 +773,10 @@ def _controller_config(runtime):
     package = runtime['package']
     if manifest['source_sha256'] != runtime['source_sha256'] or manifest['revision'] != package['source_revision']:
         raise RuntimeSafetyError('runtime manifest source mismatch')
-    if runtime['spec'].get('mode') == 'focused':
+    if runtime['spec'].get('mode') == 'focused' and runtime['spec'].get('selection') == 'valkey_rdma_reads':
+        import prepare
+        prepare.admit_selected_features(runtime['spec'], manifest)
+    elif runtime['spec'].get('mode') == 'focused':
         import cloud_package
         if manifest.get('build_profile') != 'focused' or manifest.get('features') != cloud_package.FOCUSED_FEATURES:
             raise RuntimeSafetyError('focused campaign requires exact TideHunter build features')

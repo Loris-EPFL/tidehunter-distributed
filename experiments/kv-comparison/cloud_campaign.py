@@ -73,7 +73,7 @@ def active_owner_count(job):
                      and ((job.get("nvmeof_target") == "kernel" and job.get("target_io") == "direct")
                           or (job.get("backend") == "tidehunter_nvme_rdma"
                               and job.get("nvmeof_target") == "spdk" and job.get("target_io") == "spdk_direct")))))))
-    if count == 1 and job.get("selection") in ("leased_ab_compact", *NVMEOF_PATH_SELECTIONS):
+    if count == 1 and job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         expected = next((item for item in make_focused_matrix(job["selection"])
                          if item["case_id"] == job.get("case_id")), None)
         if expected is None or not _focused_exact(job, expected):
@@ -2240,7 +2240,7 @@ def validate_focused_job(job):
     if not isinstance(case_id, str):
         raise ValueError("focused case_id is required")
     candidates = (make_focused_matrix(job["selection"])
-                  if job.get("selection") in NVMEOF_PATH_SELECTIONS else _focused_jobs())
+                  if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) else _focused_jobs())
     expected = next((item for item in candidates if item["case_id"] == case_id), None)
     if expected is None or not _focused_exact(job, expected):
         raise ValueError("focused job differs from the exact reviewed case")
@@ -2432,7 +2432,7 @@ def qualify_live_nvme_measurement(evidence, job):
             reasons.append(f"invalid live NVMe counter {name}")
     if reasons:
         return {"qualified": False, "reasons": reasons}
-    if job.get("selection") in NVMEOF_PATH_SELECTIONS:
+    if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         profile_names = ("lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns",
                          "lease_profile_samples", "adopt_owner_ns", "adopt_close_scan_ns",
                          "adopt_close_scan_bytes", "adopt_profile_samples",
@@ -2444,7 +2444,7 @@ def qualify_live_nvme_measurement(evidence, job):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-    if job.get("selection") in ("leased_ab_compact", *NVMEOF_PATH_SELECTIONS):
+    if job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         names = ("reserve_exchanges", "complete_exchanges", "leased_frames", "leased_skip_markers", "fua_writes")
         for name in names:
             a, b, value = start.get(name), end.get(name), counters.get(name)
@@ -2462,7 +2462,7 @@ def qualify_live_nvme_measurement(evidence, job):
                     reasons.append("leased FUA count differs from frames and skip markers")
             elif counters["leased_frames"]:
                 reasons.append("reserved write observed leased frames")
-        if (job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R", "G24R", "G24Q", "G24L", "G24P", "G24S", "G24C", "G24M")
+        if (job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R", "G21R", "G24R", "G24Q", "G24L", "G24P", "G24S", "G24C", "G24M", "G25A")
                 and job["backend"] == "tidehunter_nvme_rdma" and job["mix"]["read"] > 0):
             coordinator = (data.get("deltas") or {}).get("coordinator") or {}
             value = (coordinator.get("counters") or {}).get("read_profile_live_inline")
@@ -2512,9 +2512,9 @@ def qualify_live_nvme_measurement(evidence, job):
 
 
 def admit_live_write_contract(job, backend_info):
-    if job.get("selection") not in ("leased_ab_compact", *NVMEOF_PATH_SELECTIONS) or job.get("nvmeof_route") != "live":
+    if job.get("selection") not in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) or job.get("nvmeof_route") != "live":
         return
-    if job.get("selection") in NVMEOF_PATH_SELECTIONS:
+    if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         configuration = backend_info.get("configuration", {})
         geometry = {"io_queues": job["live_io_queues"], "queue_size": job["live_io_queue_size"],
                     "poll_queues": job["live_poll_queues"]}
@@ -2523,7 +2523,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest") and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")
@@ -3284,13 +3284,14 @@ def summarize_case(directory, *, local_mode=False):
             directory, job, receipt, completed=receipt.get("status") == "completed")
         value["focused_evidence"] = focused
     standalone = job.get("case_kind") in ("fio_floor", "block_trace", "net_floor", "ssd_floor", "ssd_write_floor")
+    owner_layout = job["backend"] in TRANSPORTS and "owner_count" in job
     owner_bindings = receipt.get("owner_durability_receipts")
-    if ("owner_count" in job and not standalone and receipt.get("status") == "completed"
+    if (owner_layout and not standalone and receipt.get("status") == "completed"
             and owner_bindings is None):
         raise ValueError("completed case lacks owner durability receipts")
     if owner_bindings is not None:
         if (not isinstance(owner_bindings, list) or len(owner_bindings) > active_owner_count(job)
-                or ("owner_count" in job and receipt.get("status") == "completed"
+                or (owner_layout and receipt.get("status") == "completed"
                     and len(owner_bindings) != active_owner_count(job))):
             raise ValueError("invalid owner durability receipt bindings")
         owners = []
@@ -3303,7 +3304,7 @@ def summarize_case(directory, *, local_mode=False):
             if hashlib.sha256(data).hexdigest() != binding.get("sha256"):
                 raise ValueError("owner durability receipt differs from its integrity binding")
             owner = json.loads(data)
-            if "owner_count" in job and (type(owner.get("partition")) is not int
+            if owner_layout and (type(owner.get("partition")) is not int
                                            or owner["partition"] != index):
                 raise ValueError("owner durability receipt partition differs from its binding")
             owners.append(owner)

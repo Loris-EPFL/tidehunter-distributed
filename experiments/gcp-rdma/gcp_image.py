@@ -228,12 +228,13 @@ def validate_pair(records, image, runtime_sha, service_account, *, qualification
         elif 'sui_library_linkage' in package:
             _linkage(package['sui_library_linkage'])
         valkey_linkage = package.get('valkey_runtime_linkage')
+        needs_valkey = qualification_profile == 'full' or package.get('build_profile') == 'focused_valkey'
         if qualification_profile == 'focused':
-            if package.get('build_profile') != 'focused':
+            if package.get('build_profile') not in ('focused', 'focused_valkey'):
                 raise ValueError('focused qualification requires the focused package')
-            if valkey_linkage is not None or 'valkey' in outputs:
+            if not needs_valkey and (valkey_linkage is not None or 'valkey' in outputs):
                 raise ValueError('focused qualification must not contain Valkey proof')
-        else:
+        if needs_valkey:
             if not isinstance(valkey_linkage, dict) or set(valkey_linkage) != {'valkey-server', 'valkey-cli', 'valkey-benchmark'}:
                 raise ValueError('server, CLI and native benchmark Valkey linkage records required')
             for linkage in valkey_linkage.values():
@@ -300,7 +301,7 @@ def validate_pair(records, image, runtime_sha, service_account, *, qualification
                 raise ValueError('perftest latency result invalid') from exc
             if not all(math.isfinite(value) for value in values) or any(value <= 0 for index, value in enumerate(values) if index != 4) or values[4] < 0:
                 raise ValueError('perftest latency values must be finite and positive')
-        if qualification_profile == 'full':
+        if needs_valkey:
             valkey = outputs.get('valkey', {})
             if not isinstance(valkey, dict) or valkey.get('endpoint') != str(record.get('peer')) + ':6380' or valkey.get('set') != 'OK' or valkey.get('del') != '1' or not re.fullmatch(r'[0-9a-f]{32}', str(valkey.get('value', ''))) or valkey.get('get') != valkey['value']:
                 raise ValueError('Valkey RDMA SET/GET/DEL evidence invalid')
@@ -312,6 +313,8 @@ def validate_pair(records, image, runtime_sha, service_account, *, qualification
         if records[0]['outputs'][field] != records[1]['outputs'][field]:
             raise ValueError(f'qualification guests differ in {field}')
     packages = [record['outputs']['package'] for record in records]
+    if qualification_profile == 'focused' and packages[0]['build_profile'] != packages[1]['build_profile']:
+        raise ValueError('qualification guests differ in focused build profile')
     if any('sui_library_linkage' in package for package in packages):
         if (_envelope(records[0], sui=True) != _envelope(records[1], sui=True)
                 or packages[0]['sui_library_linkage'].get('ld_library_path') != packages[1]['sui_library_linkage'].get('ld_library_path')):

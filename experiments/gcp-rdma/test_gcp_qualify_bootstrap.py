@@ -393,10 +393,14 @@ class QualificationBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             def open_log(name, mode):
                 return (Path(directory) / Path(name).name).open(mode)
-            for profile in ('focused', 'full'):
-                with self.subTest(profile=profile), \
+            for profile, build_profile, selection in (
+                    ('focused', 'focused', 'tcp_reads'),
+                    ('full', None, None),
+                    ('focused', 'focused_valkey', 'valkey_rdma_reads')):
+                with self.subTest(profile=profile, build_profile=build_profile), \
                         mock.patch.object(cloud_package, 'verify_directory',
-                                          return_value={'manifest_sha256': cfg['manifest_sha256']}), \
+                                          return_value={'manifest_sha256': cfg['manifest_sha256'],
+                                                        'build_profile': build_profile}), \
                         mock.patch.object(gcp_api, 'GoogleApi', return_value=api), \
                         mock.patch.object(gcp_image_qualify, 'metadata',
                                           side_effect=['mysten-research', 'zones/us-central1-a']), \
@@ -407,17 +411,38 @@ class QualificationBootstrapTests(unittest.TestCase):
                         mock.patch.object(bootstrap, '_stop_processes'), \
                         mock.patch.object(bootstrap, '_put'), mock.patch.object(bootstrap, '_wait'), \
                         mock.patch.object(sys, 'path', list(sys.path)):
-                    bootstrap._pair(Path(directory), {**cfg, 'qualification_profile': profile},
+                    bootstrap._pair(Path(directory), {**cfg, 'qualification_profile': profile,
+                                                      'selection': selection},
                                     time.time() + 1000, mock.Mock(), 'own', {})
                 commands = [call.args[0][0] for call in spawn.call_args_list]
                 self.assertEqual(commands[:2], ['ib_read_lat', 'ib_send_lat'])
-                self.assertEqual(len(commands), 2 if profile == 'focused' else 3)
-                self.assertEqual(ready.call_args.args[1] is None, profile == 'focused')
+                valkey = profile == 'full' or build_profile == 'focused_valkey'
+                self.assertEqual(len(commands), 3 if valkey else 2)
+                self.assertEqual(ready.call_args.args[1],
+                                 Path(directory) / 'runtime/bin/valkey-cli' if valkey else None)
+                if valkey:
+                    self.assertEqual(commands[2], str(Path(directory) / 'runtime/bin/valkey-server'))
                 self.assertEqual(guest.call_args.kwargs, {'qualification_profile': 'focused'} if profile == 'focused' else {})
             with self.assertRaisesRegex(ValueError, 'forbids'):
                 bootstrap._pair(Path(directory), {**cfg, 'qualification_profile': 'focused',
                                                  'valkey_qualification': True},
                                 time.time() + 1000, mock.Mock(), 'own', {})
+            for build_profile, selection in (
+                    ('focused_valkey', 'tcp_reads'),
+                    ('focused_valkey', None),
+                    ('focused', 'valkey_rdma_reads')):
+                with self.subTest(build_profile=build_profile, selection=selection), \
+                        mock.patch.object(cloud_package, 'verify_directory',
+                                          return_value={'manifest_sha256': cfg['manifest_sha256'],
+                                                        'build_profile': build_profile}), \
+                        mock.patch.object(bootstrap.subprocess, 'Popen') as spawn, \
+                        mock.patch.object(sys, 'path', list(sys.path)):
+                    with self.assertRaisesRegex(ValueError, 'selection/package profile mismatch'):
+                        bootstrap._pair(Path(directory),
+                                        {**cfg, 'qualification_profile': 'focused',
+                                         'selection': selection},
+                                        time.time() + 1000, mock.Mock(), 'own', {})
+                    spawn.assert_not_called()
 
 
     def test_shared_bootstrap_fetches_and_extracts_admitted_archive(self):

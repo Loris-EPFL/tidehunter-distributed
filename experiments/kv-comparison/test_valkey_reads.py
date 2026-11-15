@@ -1,5 +1,7 @@
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 import unittest
 import cloud_campaign as campaign
 
@@ -32,3 +34,53 @@ class ValkeyReadsTests(unittest.TestCase):
             elif job['group'] == 'G25M':
                 self.assertEqual(job['mix'], campaign.mix(read=50, put=50))
                 self.assertEqual(job['concurrency'], 16)
+
+
+class ValkeyOwnerReceiptTests(unittest.TestCase):
+    def write_case(self, root, job):
+        root = Path(root)
+        result = root / 'result'
+        result.mkdir()
+        config = campaign.make_run_config(job, root, {}, 'a' * 40)
+        binary = 'b' * 128
+        backend = {'name': job['backend'], 'configuration': {'ack_contract': 'synced'}}
+        for name in ('config.json', 'normalized-config.json'):
+            (root / name).write_text(json.dumps(config))
+        (result / 'manifest.json').write_text(json.dumps({
+            'status': 'completed', 'backend_info': backend,
+            'run': {'config': config, 'binary': {'blake2b512': binary}}}))
+        (result / 'summary.json').write_text(json.dumps({'status': 'completed', 'backend': backend}))
+        (result / 'metrics.prom').write_text('')
+        rows = ['phase,operation,outcome,scheduled_ns,dispatched_ns,dispatch_observed,completed_ns,api_ns,response_ns,scheduling_ns,logical_keys,bytes,error_kind']
+        for index, operation in enumerate(key for key in ('read', 'put') if job['mix'][key]):
+            start = 1000 * (index + 1)
+            rows.append(f'measurement,{operation},ok,{start},{start + 10},true,{start + 110},100,110,10,1,{job["value_size"]},')
+        (result / 'samples.csv').write_text('\n'.join(rows) + '\n')
+        timing = root / 'phase_timing.json'
+        timing.write_text(json.dumps({'schema_version': 1, 'case_id': job['case_id'], 'spans': []}))
+        receipt = {'job': job, 'status': 'completed', 'binary_blake2b512': binary,
+                   'phase_timing': {'path': timing.name, 'sha256': hashlib.sha256(timing.read_bytes()).hexdigest()},
+                   'artifacts_sha256': {name: hashlib.sha256((result / name).read_bytes()).hexdigest()
+                       for name in ('manifest.json', 'summary.json', 'samples.csv', 'metrics.prom')}}
+        (root / 'receipt.json').write_text(json.dumps(receipt))
+
+    def test_completed_valkey_primary_needs_no_tidehunter_owner_receipt(self):
+        jobs = campaign.make_focused_matrix('valkey_rdma_reads')
+        selected = [next(job for job in jobs if job['group'] == 'G25R')]
+        selected += [job for job in jobs if job['group'] == 'G25M']
+        for job in selected:
+            with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as root:
+                self.write_case(root, job)
+                summary = campaign.summarize_case(root)
+                self.assertEqual(summary['status'], 'completed')
+                self.assertNotIn('owner_durability_receipts', summary)
+                self.assertEqual({row['operation'] for row in summary['metrics']['populations']},
+                                 {key for key in ('read', 'put') if job['mix'][key]})
+
+    def test_completed_tidehunter_owner_still_requires_receipt(self):
+        job = next(job for job in campaign.make_focused_matrix('fair_native')
+                   if job.get('owner_count') == 1)
+        with tempfile.TemporaryDirectory() as root:
+            self.write_case(root, job)
+            with self.assertRaisesRegex(ValueError, 'lacks owner durability receipts'):
+                campaign.summarize_case(root)

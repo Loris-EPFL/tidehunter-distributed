@@ -1014,7 +1014,8 @@ def verify_package(config):
         raise SafetyError("sealed package differs from externally admitted runtime hashes")
     focused = config["spec"].get("mode") == "focused"
     if focused:
-        if admission.get("build_profile") != "focused":
+        expected_profile = "focused_valkey" if config["spec"].get("selection") == "valkey_rdma_reads" else "focused"
+        if admission.get("build_profile") != expected_profile:
             raise SafetyError("focused campaign requires the focused package profile")
         fdb = None
     else:
@@ -1633,7 +1634,7 @@ def admitted_live_campaign(config, case):
     if spec.get("mode") == "standard-with-live-nvmeof":
         return True
     if (spec.get("mode") != "focused"
-            or not (spec.get("selection") == "leased_ab_compact"
+            or not (spec.get("selection") in ("leased_ab_compact", "valkey_rdma_reads")
                     or spec.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)):
         return False
     return any(job["case_id"] == case and job.get("nvmeof_route") == "live"

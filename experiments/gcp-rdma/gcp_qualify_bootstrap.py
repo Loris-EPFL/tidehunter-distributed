@@ -382,6 +382,10 @@ def _pair(package, cfg, deadline, store, own, identity):
     proof = cloud_package.verify_directory(package, runtime=True, provider='gcp')
     if proof['manifest_sha256'] != cfg['manifest_sha256']:
         raise ValueError('sealed manifest mismatch')
+    focused_valkey = proof.get('build_profile') == 'focused_valkey'
+    if profile == 'focused' and (
+            focused_valkey != (cfg.get('selection') == 'valkey_rdma_reads')):
+        raise ValueError('focused Valkey selection/package profile mismatch')
     api = gcp_api.GoogleApi(gcp_image_qualify.metadata('project/project-id'), token_provider=gcp_api.metadata_token)
     zone = gcp_image_qualify.metadata('instance/zone').rsplit('/', 1)[-1]
     info = api.request('GET', f'zones/{zone}/instances/{own}')
@@ -398,7 +402,7 @@ def _pair(package, cfg, deadline, store, own, identity):
             logs.append(log)
             processes.append(subprocess.Popen(['ib_' + op + '_lat', '-R', '-d', cfg['rdma_device'], '-p', port, '-s', '1024', '-n', '1000'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True))
         cli = None
-        if profile == 'full':
+        if profile == 'full' or focused_valkey:
             log = open('/tmp/tidehunter-qualify-valkey.log', 'w+')
             logs.append(log)
             processes.append(subprocess.Popen([str(package / 'runtime/bin/valkey-server'), '--bind', '127.0.0.1', '--port', '16380', '--protected-mode', 'no', '--rdma-bind', address, '--rdma-port', '6380', '--save', '', '--appendonly', 'no'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True))

@@ -112,6 +112,25 @@ def sui_library_linkage(package, needed):
     return proof
 
 
+def admit_package(manifest, proof, qualification_profile):
+    """Bind the qualification scope to the exact sealed package variant."""
+    import cloud_package
+    features = manifest['features']
+    if qualification_profile == 'focused' and manifest.get('build_profile') == 'focused_valkey':
+        linkage = proof.get('valkey_runtime_linkage')
+        if (features != cloud_package.FOCUSED_VALKEY_FEATURES
+                or proof.get('build_profile') != 'focused_valkey'
+                or not isinstance(linkage, dict)
+                or set(linkage) != {'valkey-server', 'valkey-cli', 'valkey-benchmark'}):
+            raise ValueError('focused Valkey qualification requires the exact RDMA runtime')
+    elif qualification_profile == 'focused':
+        if (manifest.get('build_profile') != 'focused' or features != cloud_package.FOCUSED_FEATURES
+                or proof.get('build_profile') != 'focused' or 'valkey_runtime_linkage' in proof):
+            raise ValueError('focused qualification requires the TideHunter-only runtime')
+    elif 'valkey-rdma' not in features:
+        raise ValueError('sealed runtime lacks Valkey RDMA')
+
+
 def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, qualification_profile='full', sui_needed_libraries=()):
     if qualification_profile not in ('full', 'focused'):
         raise ValueError('unknown qualification profile')
@@ -220,13 +239,7 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, q
     if proof['manifest_sha256'] != expected_manifest_sha:
         raise ValueError('runtime manifest hash mismatch')
     manifest = json.loads((package / 'manifest.json').read_text())
-    features = manifest['features']
-    if qualification_profile == 'focused':
-        if (manifest.get('build_profile') != 'focused' or features != cloud_package.FOCUSED_FEATURES
-                or proof.get('build_profile') != 'focused' or 'valkey_runtime_linkage' in proof):
-            raise ValueError('focused qualification requires the TideHunter-only runtime')
-    elif 'valkey-rdma' not in features:
-        raise ValueError('sealed runtime lacks Valkey RDMA')
+    admit_package(manifest, proof, qualification_profile)
     if sui_needed_libraries:
         proof['sui_library_linkage'] = sui_library_linkage(package, sui_needed_libraries)
         proof['sui_needed_libraries'] = list(sui_needed_libraries)
@@ -252,7 +265,7 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, q
         argv = ['ib_' + op + '_lat', '-R', '-d', rdma_device, '-p', port, '-s', '1024', '-n', '1000', peer]
         outputs['rdma_' + op] = command(argv, timeout=60)
         outputs['rdma_commands'][op] = argv
-    if qualification_profile == 'full':
+    if qualification_profile == 'full' or proof.get('build_profile') == 'focused_valkey':
         cli = package / 'runtime/bin/valkey-cli'
         key = 'tidehunter-qualification-' + uuid.uuid4().hex
         value = uuid.uuid4().hex
