@@ -739,7 +739,7 @@ FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS.update(nvmeof_m3_t1=11, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=11)
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
-FOCUSED_COUNTS["nvmeof_f9_tools"] = 38
+FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -798,7 +798,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "nvmeof_reads_geometry_rest2": {"G24C": 6, "G24W": 8, "G24N": 4},
     "valkey_rdma_reads": {"G25R": 12, "G25M": 2, "G25A": 8},
-    "nvmeof_f9_tools": {"G33F": 8, "G33A": 30},
+    "nvmeof_f9_tools": {"G33F": 8, "G33A": 26},
 }
 
 

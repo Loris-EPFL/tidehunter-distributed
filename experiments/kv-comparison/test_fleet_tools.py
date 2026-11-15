@@ -58,12 +58,12 @@ class FleetToolsTests(unittest.TestCase):
 
     def test_fixed_grid_digest_and_exact_admission(self):
         jobs = fleet_tools.make_jobs()
-        self.assertEqual(len(jobs), 38)
+        self.assertEqual(len(jobs), 34)
         self.assertEqual(len({j['case_id'] for j in jobs}), len(jobs))
         self.assertEqual(cloud_campaign.make_focused_matrix(fleet_tools.SELECTION), jobs)
         self.assertEqual(cloud_campaign.selection_owner_hosts(fleet_tools.SELECTION), 1)
         self.assertEqual(cloud_campaign.focused_group_counts(fleet_tools.SELECTION), {
-            'G33F': 8, 'G33A': 30, 'nvmeof_write_ceiling': 8, 'admission_options': 30})
+            'G33F': 8, 'G33A': 26, 'nvmeof_write_ceiling': 8, 'admission_options': 26})
         for job in jobs:
             cloud_campaign.validate_focused_job(job)
             self.assertEqual(cloud_campaign.job_owner_hosts(job), 1)
@@ -71,15 +71,15 @@ class FleetToolsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cloud_campaign.validate_focused_job(bad)
         digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        self.assertEqual(digest, '2bfaafed8b3e7830a4a8b4b634a6762607d66499327284afe030920855665b5f')
+        self.assertEqual(digest, '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d')
 
     def test_measurement_budget_and_internal_followup_builder(self):
         rows = self.jobs('admission_options')
         windows = sum(len(j['admission']['options']) * j['admission']['repeats'] *
                       sum(1 if j['admission']['owners'] == 1 or b == 1 else 3
                           for b in j['admission']['batches']) for j in rows)
-        self.assertEqual(windows, 800)
-        self.assertLess(windows * 1.2, 1200)
+        self.assertEqual(windows, 640)
+        self.assertEqual(windows * 1.2 + 240, fleet_tools.TOOL_BUDGET_SECONDS['admission_options'])
         self.assertEqual({tuple(j['admission']['batches']) for j in rows if j['concurrency'] in (1, 4)}, {(2, 22)})
         followup = fleet_tools._measurement_jobs(repetitions=3,
             cell_filter=lambda c, o, d, b: c == 16 and o == 4 and d == 'uniform' and b == 22,

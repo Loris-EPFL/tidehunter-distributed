@@ -18,7 +18,7 @@ class FleetToolsRegistryTests(unittest.TestCase):
     def test_exact_registered_spec_and_digest(self):
         spec = manual_campaign.REVIEWED_SPECS['nvmeof_f9_tools']
         jobs = manual_campaign._reviewed_jobs(spec)
-        self.assertEqual(len(jobs), 38)
+        self.assertEqual(len(jobs), 34)
         self.assertEqual(spec['owner_hosts'], 1)
         self.assertEqual(spec['machine_type'], 'z4m-highmem-16')
         self.assertEqual(spec['repeats'], 1)
@@ -39,7 +39,7 @@ class FleetToolsRegistryTests(unittest.TestCase):
                  + manual_campaign.PAIR_CLEANUP_SECONDS + manual_campaign.WORKER_READY_SECONDS
                  + sum(fleet_tools.TOOL_BUDGET_SECONDS.values())
                  + manual_campaign.EXPORT_RESERVE_SECONDS + manual_campaign.CAMPAIGN_MARGIN_SECONDS)
-        self.assertEqual(worst, 5700)
+        self.assertEqual(worst, 6108)
         self.assertLessEqual(worst, 0.85 * manual_campaign.reservation_seconds(spec))
 
     def test_workflow_observer_and_reviewed_order(self):
@@ -50,7 +50,7 @@ class FleetToolsRegistryTests(unittest.TestCase):
                          manual_campaign.REVIEWED_SPECS['nvmeof_f9_tools'])
         jobs = cloud_campaign.make_focused_matrix(spec['selection'])
         proof = qualify_observer_matrix.qualify_jobs(jobs)
-        self.assertEqual(proof['planned_cases'], 38)
+        self.assertEqual(proof['planned_cases'], 34)
         self.assertEqual(proof['matrix_sha256'], spec['matrix_sha256'])
         order = risk_order.generate_order(jobs)
         self.assertEqual(order['case_ids'], [j['case_id'] for j in jobs])

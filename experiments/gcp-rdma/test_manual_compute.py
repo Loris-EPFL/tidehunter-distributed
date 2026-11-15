@@ -615,6 +615,51 @@ class ManualComputeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.compute._cleanup_until = None
 
+    async def test_delete_uses_longer_timeout_without_absence_retries(self):
+        await self.make_vm()
+        self.compute._save_delete_intent(self.state['instances'][0], 'delete_requested')
+        captured = []
+        async def elapsed_command(awaitable, timeout):
+            captured.append(timeout)
+            # Model a 60-second delete without sleeping in the test.
+            if len(captured) == 1:
+                self.assertGreater(timeout, 60)
+            return await awaitable
+        before = len(self.api.calls)
+        with mock.patch('gcp_manual_compute.asyncio.wait_for', side_effect=elapsed_command):
+            await self.compute._delete('instance', self.state['instances'][0]['name'])
+        self.assertEqual(captured, [300, 30])
+        self.assertEqual([argv[2] for argv in self.api.calls[before:]], ['delete', 'list'])
+        self.assertNotIn('delete_reply_errors', self.state)
+
+    async def test_delete_timeout_keeps_absence_verification(self):
+        await self.make_vm()
+        self.compute._save_delete_intent(self.state['instances'][0], 'delete_requested')
+        name = self.state['instances'][0]['name']
+        original = self.api.__call__
+        async def delayed_delete(argv):
+            result = await original(argv)
+            if argv[:3] == ['compute', 'instances', 'delete']:
+                await asyncio.Event().wait()
+            return result
+        self.compute.execute = delayed_delete
+        with mock.patch('gcp_manual_compute.DELETE_CALL_SECONDS', 0.001):
+            await self.compute._delete('instance', name)
+        self.assertIn('timed out', self.state['delete_reply_errors']['instance:' + name])
+        self.assertEqual(self.api.calls[-1][:3], ['compute', 'instances', 'list'])
+
+    async def test_non_delete_call_keeps_thirty_second_bound(self):
+        captured = []
+        async def timed_out(awaitable, timeout):
+            captured.append(timeout)
+            awaitable.close()
+            raise TimeoutError()
+        with mock.patch('gcp_manual_compute.asyncio.wait_for', side_effect=timed_out):
+            with self.assertRaisesRegex(ComputeError, 'timed out'):
+                await self.compute._call(['compute', 'instances', 'describe', 'missing'])
+        self.assertEqual(captured, [30])
+
+
     async def test_unknown_policy_is_not_assumed_absent(self):
         self.api.lost = self.api.suppress = 'policy'
         with self.assertRaises(ComputeError):
