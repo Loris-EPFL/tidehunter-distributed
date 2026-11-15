@@ -1226,7 +1226,10 @@ mod live_fencing {
             assert!(!inventory.live_pins.contains_key(&token));
             inventory.reap_idle_live_segments(1).unwrap();
             let target = inventory.live_target.as_ref().unwrap();
-            assert_eq!(target.binding_for_file(&file).as_ref(), Some(&leased.binding));
+            assert_eq!(
+                target.binding_for_file(&file).as_ref(),
+                Some(&leased.binding)
+            );
             assert_eq!(
                 target.stats().unwrap().owned_namespace_count,
                 if prepared { 2 } else { 1 }
