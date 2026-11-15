@@ -59,7 +59,8 @@ class OwnerFtraceTests(unittest.TestCase):
             script = ('import json, owner_ftrace, sys; '
                       'print(json.dumps(owner_ftrace.start_cpu(sys.argv[1], duration_seconds=5)))')
             started = subprocess.run([sys.executable, '-B', '-c', script, root],
-                                     check=True, capture_output=True, text=True, timeout=5)
+                                     check=True, capture_output=True, text=True, timeout=5,
+                                     cwd=Path(__file__).resolve().parent)
             state = json.loads(started.stdout)
             self.assertIn('directory', state)
             data = owner_ftrace.stop_cpu(state)

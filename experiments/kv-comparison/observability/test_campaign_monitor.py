@@ -53,15 +53,15 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         spec['hosts'][0]['address'] = '8.8.8.8'
         with self.assertRaises(ValueError):
             monitor.validate_spec(spec)
-    def test_compact_cloud_fleet_requires_exact_two_hosts(self):
+    def test_cloud_fleet_requires_admitted_owner_host_count(self):
         spec = copy.deepcopy(self.spec)
         spec['allow_loopback_hosts'] = False
         spec['state_dir'] = '/var/lib/tidehunter-observation/' + spec['run_id']
         hosts = [{'index': i, 'role': 'coordinator' if i == -1 else f'storage-{i}',
                   'address': f'10.7.0.{i + 3}'} for i in range(-1, 5)]
-        for count in (2, 6):
+        for count in (2, 3, 5, 6):
             self.assertEqual(monitor.validate_spec(spec | {'hosts': hosts[:count]})['hosts'], hosts[:count])
-        for count in (0, 1, 3, 4, 5):
+        for count in (0, 1, 4):
             with self.subTest(count=count), self.assertRaises(ValueError):
                 monitor.validate_spec(spec | {'hosts': hosts[:count]})
         bad = copy.deepcopy(hosts[:2])
@@ -160,7 +160,7 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         state, _, _ = self.initialize_selection()
         monitor.select_host(self.spec, -1, self.job, [])
         self.assertEqual(monitor.load_json(state / 'host--1/selection.json')['processes'], [])
-        for cgroup in ('/', '/proc', '/system.slice/../proc', '/system.slice', '/user.slice/a'):
+        for cgroup in ('/', '/proc', '/system.slice/../proc', '/system.slice', '/user.slice/a', '/kvowners.slice/x'):
             with self.subTest(cgroup=cgroup), self.assertRaises(ValueError):
                 monitor.select_host(self.spec, -1, self.job, [{'role': 'worker', 'cgroup': cgroup}])
         process = {'role': 'worker', 'cgroup': '/system.slice/exact-owned.service'}
@@ -168,6 +168,14 @@ class CampaignMonitorBoundaries(unittest.TestCase):
             monitor.select_host(self.spec, -1, self.job, [process, process])
         answer = monitor.select_host(self.spec, -1, self.job, [process])
         self.assertTrue(answer['complete'])
+        owners = [{'role': f'storage-{i}', 'cgroup':
+                   '/kvowners' + 'a' * 24 + f'.slice/kvcloud-case-storage-{i}.service'}
+                  for i in range(16)]
+        self.assertTrue(monitor.select_host(self.spec, -1, self.job, owners)['complete'])
+        import campaign_exporter
+        selected = {'job': self.job, 'processes': owners}
+        self.assertLess(len(json.dumps(selected).encode()), campaign_exporter.MAX_SELECTION)
+        self.assertEqual(monitor.load_json(state / 'host--1/selection.json'), selected)
 
     def test_industry_info_targets_require_selected_owned_node_role(self):
         self.spec['hosts'] = [{'index': index, 'role': 'coordinator' if index == -1 else f'storage-{index}',

@@ -316,8 +316,11 @@ class LocalMode:
         if job["backend"] == self.layout_backend:
             config = dict(self.config, fleet=self.layout_fleet)
             evidence = self.cloud.owned_monitor_processes(config, index, job, owner_case)
-            if evidence["missing"]:
-                raise RuntimeError("local deployment process identity unavailable: " + repr(evidence["missing"]))
+            # Client lifecycle belongs to self.units above, not the external layout.
+            missing = [item for item in evidence["missing"]
+                       if not (index == -1 and item["role"] == "client")]
+            if missing:
+                raise RuntimeError("local deployment process identity unavailable: " + repr(missing))
             processes.extend(p for p in evidence["processes"]
                              if not (index == -1 and p["role"] == "client"))
         return processes

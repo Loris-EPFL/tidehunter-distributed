@@ -150,12 +150,14 @@ def validate_runtime(config):
                 raise RuntimeSafetyError('backend requires five owner hosts')
             import workflow_input
             selection = config['spec'].get('selection')
-            if (config['spec'].get('owner_hosts', 5) != 1
-                    or workflow_input.cloud_campaign.selection_owner_hosts(selection) != 1):
+            owners = config['spec'].get('owner_hosts', 5)
+            if owners != 1 or (selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5')
+                    and workflow_input.cloud_campaign.selection_owner_hosts(selection) != 1):
                 raise RuntimeSafetyError('selection does not admit a compact fleet')
-            jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
+            import manual_campaign
+            jobs = manual_campaign._reviewed_jobs(config['spec'])
             if any(workflow_input.cloud_campaign.job_owner_hosts(job) > 1 for job in jobs):
-                raise RuntimeSafetyError('selection contains a five-owner job')
+                raise RuntimeSafetyError('selection contains a multi-host owner job')
     if mode == 'focused':
         import manual_campaign
         manual_campaign._reviewed_jobs(config['spec'])
@@ -165,7 +167,8 @@ def validate_runtime(config):
         raise RuntimeSafetyError('NVMe backends require an NVMe-oF mode')
     if live_mode(config['spec']) and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
         live = config.get('live_qualification')
-        if not isinstance(live, dict) or set(live) != {'image', 'image_qualification', 'pair_hosts', 'rdma_device', 'service_account'}:
+        expected_fields = {'image', 'image_qualification', 'pair_hosts', 'rdma_device', 'service_account'}
+        if not isinstance(live, dict) or set(live) != expected_fields:
             raise RuntimeSafetyError('generation-pinned live pair qualification is required')
         reference = live['image_qualification']
         if (not isinstance(reference, dict) or set(reference) != {'bucket', 'object', 'generation', 'sha256'}
@@ -244,7 +247,7 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
 def live_mode(spec):
     from workflow_input import cloud_campaign
     return (spec.get('mode') == 'standard-with-live-nvmeof'
-            or (spec.get('mode') == 'focused' and spec.get('selection') in ('leased_ab_compact', 'valkey_rdma_reads', *cloud_campaign.NVMEOF_PATH_SELECTIONS)))
+            or (spec.get('mode') == 'focused' and spec.get('selection') in ('leased_ab_compact', 'valkey_rdma_reads', *cloud_campaign.NVMEOF_PATH_SELECTIONS, *cloud_campaign.TOOL_SELECTIONS)))
 
 
 def admit_package_profile(spec, package):
@@ -590,7 +593,11 @@ def prepare_transport(config, preparation):
         fleet = config['fleet']
         transport['fabric']['source_address'] = fleet['coordinator']['rdma_address']
         result['owner_transports'] = []
-        for host in fleet['nodes'][:len(result.get('addresses', fleet['nodes']))]:
+        selected_hosts = fleet['nodes']
+        if 'addresses' in result:
+            hosts = {host['address']: host for host in fleet['nodes']}
+            selected_hosts = [hosts[endpoint.rsplit(':', 1)[0]] for endpoint in result['addresses']]
+        for host in selected_hosts:
             owner = copy.deepcopy(transport)
             owner['fabric']['source_address'] = host['rdma_address']
             result['owner_transports'].append(owner)

@@ -22,7 +22,8 @@ import physical_storage
 import binascii
 
 BACKENDS = ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks")
-OWNER_HOST_COUNTS = (1, 5)
+OWNER_HOST_COUNTS = (1, 2, 4, 5)
+LOGICAL_OWNER_COUNTS = (*OWNER_HOST_COUNTS, 16)
 RUN_LABEL = "io.tidehunter.kv-comparison.run"
 NODE_LABEL = "io.tidehunter.kv-comparison.node"
 BACKEND_LABEL = "io.tidehunter.kv-comparison.backend"

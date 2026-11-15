@@ -63,11 +63,11 @@ class QualificationBootstrapTests(unittest.TestCase):
         members = [{'name': f'run-1-{i}', 'id': str(i + 1), 'rdma_ip': f'10.0.0.{i + 1}'}
                    for i in range(6)]
         args = ('test-bucket', 'run-1', 'a' * 64, '2030-01-01T00:00:00Z', 'b' * 64, 'c' * 64)
-        for count in (2, 6):
+        for count in (2, 3, 5, 6):
             self.assertIn('TIDEHUNTER_BOOTSTRAP', bootstrap.fleet_startup_script(
                 *args, members=members[:count], rdma_device='irdma0', machine_type='z4m-highmem-16',
                 qualification_profile='focused'))
-        for count in (1, 3, 4, 5):
+        for count in (1, 4):
             with self.assertRaises(ValueError):
                 bootstrap.fleet_startup_script(*args, members=members[:count],
                     rdma_device='irdma0', machine_type='z4m-highmem-16')
@@ -515,6 +515,25 @@ class FleetBootstrapTests(unittest.TestCase):
                     'live_transports': ['rdma'], 'live_spdk': True}
         self.identity = {key: self.cfg[key] for key in
                          ('run_id', 'source_sha256', 'manifest_sha256', 'deadline_utc')}
+
+    def test_pair_budget_matches_measured_m3_envelope(self):
+        for selection, seconds in (('nvmeof_m3_t1', 480), ('nvmeof_m3_t2_2', 480),
+                                   ('nvmeof_m3_t2_5', 480), ('nvmeof_f8', 1200), (None, 1200)):
+            with self.subTest(selection=selection), \
+                 mock.patch.object(bootstrap.time, 'time', return_value=1000), \
+                 mock.patch.object(bootstrap, '_call') as call:
+                bootstrap._fleet_pair(Path('/package'), dict(self.cfg, selection=selection), 5000)
+                argv, deadline, maximum = call.call_args.args
+                self.assertEqual((deadline, maximum), (5000, seconds + 30))
+                child = json.loads(argv[argv.index('--guest') + 1])
+                self.assertEqual(child['phase_deadline'], 1000 + seconds)
+
+    def test_pair_budget_cannot_extend_fleet_deadline(self):
+        with mock.patch.object(bootstrap.time, 'time', return_value=1000), \
+             mock.patch.object(bootstrap, '_call') as call:
+            bootstrap._fleet_pair(Path('/package'), dict(self.cfg, selection='nvmeof_m3_t1'), 1100)
+        child = json.loads(call.call_args.args[0][3])
+        self.assertEqual(child['phase_deadline'], 1070)
 
     def test_six_receipts_only_two_pairs_and_cleanup_precedes_status(self):
         pair_calls = []

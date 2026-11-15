@@ -113,7 +113,8 @@ class ThreadCpuTests(unittest.TestCase):
             script = ('import json,sys,owner_ftrace; '
                       'print(json.dumps(owner_ftrace.start_threads(sys.argv[1], int(sys.argv[2]), 5)))')
             result = subprocess.run([sys.executable, '-B', '-c', script, tmp, str(os.getpid())],
-                                    capture_output=True, text=True, timeout=10, check=True)
+                                    capture_output=True, text=True, timeout=10, check=True,
+                                    cwd=Path(__file__).resolve().parent)
             state = json.loads(result.stdout)
             self.assertEqual(state['directory'], tmp)
             artifact = sampler.stop_threads(state)

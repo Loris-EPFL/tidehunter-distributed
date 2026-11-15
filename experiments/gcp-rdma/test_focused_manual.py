@@ -159,7 +159,7 @@ class FocusedAdmissionTest(unittest.TestCase):
 
     def test_nvmeof_path_exact_spec(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_f6b': 58, 'nvmeof_f8': 36, 'nvmeof_f7_highmem32': 8, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
+            expected_count = workflow_input.cloud_campaign.FOCUSED_COUNTS[selection]
             with self.subTest(selection=selection):
                 spec = copy.deepcopy(manual.REVIEWED_SPECS[selection])
                 if selection == 'nvmeof_parallel_writes':
@@ -178,14 +178,15 @@ class FocusedAdmissionTest(unittest.TestCase):
                 jobs = manual._reviewed_jobs(spec)
                 self.assertEqual(len(jobs), expected_count)
                 self.assertEqual(spec['max_cases'], expected_count)
-                self.assertEqual(spec['owner_hosts'], 1)
+                self.assertEqual(spec['owner_hosts'], workflow_input.cloud_campaign.selection_owner_hosts(selection))
                 self.assertFalse(spec['spdk_comparison'])
-                self.assertEqual(spec['backends'], ['tidehunter_nvme_rdma'] if selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
+                self.assertEqual(spec['backends'], ['tidehunter_nvme_rdma'] if selection.startswith('nvmeof_m3_') or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
                 self.assertEqual(workflow_input.specification(
-                    'kv', ','.join(spec['backends']), 'focused', selection=selection), spec)
+                    'kv', ','.join(spec['backends']), 'focused', selection=selection),
+                    dict(spec, reservation_hours=2) if selection.startswith("nvmeof_m3_") else spec)
                 self.assertTrue(gcp_runtime.live_mode(spec))
                 for mutation in ({'job_count': expected_count - 1}, {'matrix_sha256': '0' * 64},
-                                 {'owner_hosts': 5}, {'spdk_comparison': True},
+                                 {'owner_hosts': 6 if selection.startswith('nvmeof_m3_') else 5}, {'spdk_comparison': True},
                                  {'backends': ['tidehunter_verbs_native', 'tidehunter_nvme_rdma']}):
                     with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                         manual._reviewed_jobs({**spec, **mutation})
@@ -230,9 +231,9 @@ class FocusedAdmissionTest(unittest.TestCase):
         hosts = [{'index': i, 'role': 'coordinator' if i == 0 else 'owner', 'name': f'run-{i}',
                   'id': str(100 + i), 'zone': 'us-central1-a', 'internal_ip': f'10.0.0.{i+1}',
                   'rdma_ip': f'10.1.0.{i+1}'} for i in range(6)]
-        for count in (2, 6):
+        for count in (2, 3, 5, 6):
             self.assertEqual(gcp_runtime._fleet(hosts[:count]), hosts[:count])
-        for count in (0, 1, 3, 4, 5):
+        for count in (0, 1, 4):
             with self.assertRaises(gcp_runtime.RuntimeSafetyError):
                 gcp_runtime._fleet(hosts[:count])
         config = {'project_id': 'project', 'project_number': '123', 'bucket': 'bucket',

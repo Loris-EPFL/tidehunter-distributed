@@ -72,16 +72,18 @@ class ObserverMatrixQualification(unittest.TestCase):
 
     def test_nvmeof_path_observer_qualifies_exact_matrix(self):
         for selection in qualification.cloud_campaign.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_first_put': 12, 'nvmeof_path_fix': 37, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_f6b': 58, 'nvmeof_f8': 36, 'nvmeof_f7_highmem32': 8, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
+            expected_count = qualification.cloud_campaign.FOCUSED_COUNTS[selection]
             with self.subTest(selection=selection):
                 import manual_campaign
                 spec = manual_campaign.REVIEWED_SPECS[selection]
                 if selection == 'nvmeof_parallel_writes':
                     self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 jobs = qualification.cloud_campaign.make_focused_matrix(selection)
+                if selection.startswith('nvmeof_m3_'):
+                    jobs = [job for job in jobs if qualification.cloud_campaign.job_owner_hosts(job) == spec['owner_hosts']]
                 self.assertEqual(len(jobs), expected_count)
                 self.assertEqual({job['backend'] for job in jobs},
-                                 {'tidehunter_nvme_rdma'} if selection in ('nvmeof_f6', 'nvmeof_f6b', 'nvmeof_f7_highmem32') else
+                                 {'tidehunter_nvme_rdma'} if selection in ('nvmeof_f6', 'nvmeof_f6b', 'nvmeof_f7_highmem32', *qualification.cloud_campaign.M3_SELECTIONS) else
                                  {'native', 'tidehunter_nvme_rdma'} if selection in ('nvmeof_first_put', 'nvmeof_parallel_writes', 'nvmeof_single_caller', 'nvmeof_f8', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2') else
                                  {'native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'})
                 receipt = qualification.qualify_jobs(jobs)

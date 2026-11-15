@@ -22,6 +22,12 @@ import traceback
 import gcp_bootstrap
 import gcp_runtime
 
+# Retained whole-bootstrap maximum: 133.906s (focused qualification).
+# Double it, add 180s for log export/status, then round up to one minute.
+M3_PAIR_SECONDS = 480
+# The child alarm must fire before its parent subprocess timeout.
+PAIR_EXIT_SECONDS = 30
+
 
 def _script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256, mode, **fields):
     gcp_runtime._sha(manifest_sha256)
@@ -162,7 +168,8 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
     if qualification_profile == 'focused' and (live_transports or live_spdk):
         if (not (gcp_runtime.live_mode({'mode': 'focused', 'selection': selection})
                  or (suite_spec is not None and manual_sui.focused_qualification(suite_spec)))
-                or list(live_transports) != ['rdma'] or live_spdk or len(members) != 2):
+                or list(live_transports) != ['rdma'] or live_spdk
+                or (len(members) != 2 and selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'))):
             raise ValueError('focused qualification forbids unreviewed live and Valkey probes')
     normalized = []
     for member in members:
@@ -505,11 +512,12 @@ def _fleet_cleanup(run_id):
 
 
 def _fleet_pair(package, cfg, deadline):
+    seconds = M3_PAIR_SECONDS if cfg.get("selection") in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5') else 1200
     pair_cfg = {**cfg, 'mode': 'fleet-pair',
-                'phase_deadline': min(deadline, time.time() + 1200)}
+                'phase_deadline': min(deadline - PAIR_EXIT_SECONDS, time.time() + seconds)}
     module = package / 'source/experiments/gcp-rdma/gcp_qualify_bootstrap.py'
     _call([gcp_runtime.GUEST_PYTHON, module, '--guest', json.dumps(pair_cfg, sort_keys=True),
-           '--package', package], deadline, 1215)
+           '--package', package], deadline, seconds + PAIR_EXIT_SECONDS)
 
 
 def _fleet_nvmet_fix(package, cfg, own, own_id, metadata):
@@ -570,9 +578,9 @@ def _fleet_guest(cfg, package, deadline, store, own, identity, metadata):
         proof['nvmet_fix'] = nvmet_fix
     _put(store, prefix + 'preparation.json', {**host_identity, 'complete': True, 'proof': proof})
     if index < 2:
-        peer = cfg['members'][1 - index]
-        pair_cfg = {**cfg, 'peer_instance': peer['name'], 'peer_instance_id': peer['id'],
-                    'peer_ip': peer['rdma_ip'], 'own_instance': own, 'own_instance_id': own_id}
+        peer = cfg["members"][1 - index]
+        pair_cfg = {**cfg, "peer_instance": peer["name"], "peer_instance_id": peer["id"],
+                    "peer_ip": peer["rdma_ip"], "own_instance": own, "own_instance_id": own_id}
         _fleet_pair(package, pair_cfg, deadline)
     _fleet_cleanup(cfg['run_id'])
     _put(store, prefix + 'status.json', {**host_identity, 'complete': True,

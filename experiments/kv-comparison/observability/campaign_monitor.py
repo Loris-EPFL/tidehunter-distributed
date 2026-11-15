@@ -754,8 +754,9 @@ def select_host(spec, index, job, processes):
     host = host_for(spec, index)
     if job is not None:
         validate_job(job)
-    if not isinstance(processes, list) or len(processes) > 8:
-        raise ValueError('at most eight explicit cgroups allowed')
+    import campaign_exporter
+    if not isinstance(processes, list) or len(processes) > campaign_exporter.MAX_SELECTED_PROCESSES:
+        raise ValueError('explicit cgroups exceed admitted host population')
     seen = set()
     for process in processes:
         if set(process) != {'role', 'cgroup'} or not TOKEN.fullmatch(process['role']):
@@ -763,8 +764,10 @@ def select_host(spec, index, job, processes):
         path = PurePosixPath(process['cgroup'])
         if '..' in path.parts or not path.is_absolute() or str(path) != process['cgroup']:
             raise ValueError('cgroup must be a canonical absolute cgroupv2 path')
-        if not (str(path).startswith('/system.slice/') or re.fullmatch(r'/docker/system.slice/docker-[a-f0-9]{12,64}\.scope', str(path))):
-            raise ValueError('cgroup must be an explicitly admitted system.slice unit')
+        if not (str(path).startswith('/system.slice/')
+                or re.fullmatch(r'/docker/system.slice/docker-[a-f0-9]{12,64}\.scope', str(path))
+                or campaign_exporter.OWNER_SLICE_CGROUP.fullmatch(str(path))):
+            raise ValueError('cgroup must be an explicitly admitted service or container unit')
         if process['role'] in seen:
             raise ValueError('duplicate process role')
         seen.add(process['role'])

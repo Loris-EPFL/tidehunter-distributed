@@ -25,7 +25,7 @@ class Plans(unittest.TestCase):
             candidate = copy.deepcopy(value)
             candidate["nodes"] = [{"index": i, "instance_id": f"i-storage-{i}",
                                    "address": f"10.1.0.{i + 21}"} for i in range(count)]
-            if count in (1, 5):
+            if count in (1, 2, 4, 5):
                 self.assertEqual(layout.validate_fleet(candidate), candidate)
             else:
                 with self.subTest(count=count), self.assertRaises(ValueError):

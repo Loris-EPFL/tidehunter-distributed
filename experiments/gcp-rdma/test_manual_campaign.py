@@ -144,12 +144,12 @@ class ManualCampaignTest(unittest.TestCase):
 
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12, 'nvmeof_contracts': 34, 'nvmeof_contracts_crossing': 35, 'nvmeof_contracts_crossing2': 36, 'nvmeof_parallel_writes': 44, 'nvmeof_single_caller': 20, 'nvmeof_f6': 42, 'nvmeof_f6b': 58, 'nvmeof_f8': 36, 'nvmeof_f7_highmem32': 8, 'nvmeof_reads_geometry': 74, 'nvmeof_reads_geometry_rest': 20, 'nvmeof_reads_geometry_rest2': 18}[selection]
+            expected_count = manual.workflow_input.cloud_campaign.FOCUSED_COUNTS[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
                 self.assertEqual(spec['backends'],
-                                 ['tidehunter_nvme_rdma'] if selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
+                                 ['tidehunter_nvme_rdma'] if selection.startswith('nvmeof_m3_') or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
                 self.assertFalse(spec['spdk_comparison'])
                 self.assertEqual(spec['matrix_sha256'], manual.FOCUSED_MATRIX_SHA256[selection])
                 self.assertEqual(spec['matrix_sha256'], {
@@ -163,6 +163,9 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_f6': '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7',
                     'nvmeof_f6b': 'f5e680e6959f3a74369bae97c21354b6dc2911f0b6e15f048c6e7172e4c823de',
                     'nvmeof_f8': '30e7121a926003ebe18e691425db063c4093a942efdf5528913003720b9d5e1a',
+                    'nvmeof_m3_t1': 'a0315c29b6e6a00a5df6fe41a7fb31418823d1d176e383f1c67569c7c301966a',
+                    'nvmeof_m3_t2_2': 'f36366496e564b8fe303ef1dba03d2797c8a700f91cca2054ac11ee94eed42b6',
+                    'nvmeof_m3_t2_5': '6a1c63730a74ab97b232b1b947f6b9149098f76f63336cfad6447b95019d7402',
                     'nvmeof_f7_highmem32': '25ef27bc334edc0d07a84061427893063e162f16f8f1a986ea99d758ca2c05dd',
                     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
                     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
@@ -263,6 +266,8 @@ class ManualCampaignTest(unittest.TestCase):
         self.assertEqual((manual.PREPARATION_SECONDS, manual.PAIR_SECONDS,
                           manual.WORKER_READY_SECONDS, manual.EXPORT_RESERVE_SECONDS),
                          (900, 1200, 180, 900))
+        self.assertEqual(manual.PAIR_CLEANUP_SECONDS, 300)
+        self.assertEqual(manual.qualify.M3_PAIR_SECONDS + manual.PAIR_CLEANUP_SECONDS, 780)
         with self.assertRaisesRegex(ValueError, 'specification'):
             manual._check_config(CONFIG, dict(spec, hard_deadline_seconds=21601), 0)
 

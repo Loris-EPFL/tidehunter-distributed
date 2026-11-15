@@ -54,6 +54,8 @@ def main():
     jobs = (cloud_campaign.make_focused_matrix(spec['selection'])
             if spec.get('mode') == 'focused'
             else cloud_campaign.make_matrix({key: value for key, value in spec.items() if key not in ('suite', 'reservation_hours')}))
+    if spec.get('selection') in cloud_campaign.M3_SELECTIONS:
+        jobs = [job for job in jobs if cloud_campaign.job_owner_hosts(job) == spec['owner_hosts']]
     print(json.dumps(qualify_jobs(jobs), sort_keys=True))
 
 

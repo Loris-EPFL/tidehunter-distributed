@@ -98,6 +98,8 @@ class CompactReadLifecycleTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as tmp:
                     runtime.root = Path(tmp)
                     for job in jobs:
+                        if selection.startswith('nvmeof_m3_'):
+                            config['fleet']['nodes'] = config_fixture()['fleet']['nodes'][:controller.cloud_campaign.job_owner_hosts(job)]
                         with self.subTest(case=job['case_id']):
                             if job['case_kind'] in ('net_floor', 'ssd_floor', 'ssd_write_floor'):
                                 self.assertEqual(runtime.run_case(job), 'floor')
@@ -108,6 +110,8 @@ class CompactReadLifecycleTests(unittest.TestCase):
                                     with self.assertRaisesRegex(RuntimeError, 'admitted'):
                                         runtime.run_case(job)
                     remote = next(j for j in jobs if j.get('nvmeof_route') == 'live')
+                    if selection.startswith('nvmeof_m3_'):
+                        config['fleet']['nodes'] = config['fleet']['nodes'][:1]
                     for mutated in (dict(remote, selection='leased_ab_compact'),
                                     dict(remote, owner_count=5), dict(remote, history_persistence='unexpected')):
                         with self.subTest(mutated=mutated), self.assertRaises(ValueError):

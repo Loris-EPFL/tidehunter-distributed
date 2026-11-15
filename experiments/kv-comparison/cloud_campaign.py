@@ -3,9 +3,11 @@
 import argparse
 import csv
 import copy
+import functools
 import hashlib
 import ipaddress
 import json
+import math
 from pathlib import Path
 import random
 import statistics
@@ -15,7 +17,7 @@ import sys
 
 import ack_contract
 import analyze
-from cloud_layout import OWNER_HOST_COUNTS
+from cloud_layout import OWNER_HOST_COUNTS, LOGICAL_OWNER_COUNTS
 import local
 import resource_accounting
 
@@ -42,6 +44,11 @@ DURABILITY_TIERS = ("native", "synchronous")
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
+M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5")
+M3_OWNER_ADMISSION_TIMEOUT_SECONDS = 95
+M3_OWNER_ADMISSION_MARGIN_SECONDS = 5
+NVMEOF_PATH_SELECTIONS += M3_SELECTIONS
+TOOL_SELECTIONS = ("nvmeof_f9_tools",)
 
 
 
@@ -56,8 +63,12 @@ def durability_tier(job):
 
 def active_owner_count(job):
     count = job.get("owner_count", 5)
-    if type(count) is not int or count not in OWNER_HOST_COUNTS:
-        raise ValueError("owner_count must be 1 or 5")
+    if type(count) is not int or count not in LOGICAL_OWNER_COUNTS:
+        raise ValueError("unsupported logical owner_count")
+    if count not in (1, 5):
+        expected = _m3_cases().get(job.get("case_id"))
+        if expected is None or not _focused_exact(job, expected):
+            raise ValueError("multiple owners require an exact reviewed M3 case")
     one_owner_read = (job.get("selection") == "remote_rw_compact"
                       and ((job.get("group") == "G15C" and job.get("case_kind") == "media_read")
                            or (job.get("group") == "G15M" and job.get("case_kind") == "sealed_knee")))
@@ -726,6 +737,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
 FOCUSED_COUNTS["nvmeof_f6"] = 42
 FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
+FOCUSED_COUNTS.update(nvmeof_m3_t1=11, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=11)
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
@@ -776,6 +788,9 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_f6": {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4},
     "nvmeof_f6b": {"G31W": 24, "G31H": 8, "G31S": 2, "G31X": 6, "G31G": 18},
     "nvmeof_f8": {"G32W": 16, "G32H": 8, "G32S": 4, "G32N": 8},
+    "nvmeof_m3_t1": {"G33W": 6, "G33R": 3, "G33M": 2},
+    "nvmeof_m3_t2_2": {"G33W": 4, "G33R": 2, "G33M": 2},
+    "nvmeof_m3_t2_5": {"G33W": 5, "G33R": 4, "G33M": 2},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -787,6 +802,8 @@ _FOCUSED_GROUP_COUNTS = {
 
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
+    if selection in M3_SELECTIONS:
+        return dict(zip(M3_SELECTIONS, (1, 2, 5)))[selection]
     return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) else 5
 
 
@@ -797,9 +814,11 @@ def job_owner_hosts(job):
             or job.get("group") in ("G11N", "G11S", "G15F")):
         return 1
     count = job.get("owner_count", 5)
-    if type(count) is not int or count not in OWNER_HOST_COUNTS:
-        raise ValueError("owner_count must be 1 or 5")
-    return count
+    if type(count) is not int or count not in LOGICAL_OWNER_COUNTS:
+        raise ValueError("unsupported logical owner_count")
+    if count not in (1, 5):
+        active_owner_count(job)
+    return 1 if job.get("owner_topology") == "colocated" else count
 
 
 def focused_group_counts(selection):
@@ -1931,6 +1950,128 @@ def _nvmeof_f8(path):
     return result
 
 
+def _m3_measurement_sizing(operation, size, concurrency, seconds=None):
+    """Fleet-derived planning rates, not local timings or per-owner rate claims."""
+    f8 = "checkpoint-work/f8-launch-20261116-w1/analysis/report-root/cases/"
+    f6b = "checkpoint-work/f6b-launch-20261116-u1/analysis/output/reads.csv"
+    f6 = "checkpoint-work/f6-launch-20261116-t1/analysis/output/puts.csv"
+    rates = {
+        ("put", 1024, 16): (90951.43976950737, f8 + "G32W-r0-e95f3c61d30b1f960942/result/samples.csv"),
+        ("put", 65536, 16): (15439.243305798911, f8 + "G32W-r0-94d8b7c7e811cd073f2b/result/samples.csv"),
+        ("put", 1024, 64): (115911.11213740741, f8 + "G32H-r0-29b51040abe86d6ee183/result/samples.csv"),
+        ("put", 65536, 64): (24685.549283755958, f8 + "G32H-r0-5634232bed98479251ca/result/samples.csv"),
+        ("read", 1024, 16): (154781.55299106718, f6b + "#G31G-r0-1bb643d98361da2db85d,G31G-r1-d13a0678775d5f4a5d34"),
+        ("read", 1024, 64): (143199.73694040513, f6b + "#G31G-r0-fd453fff2f8f5f113640"),
+        ("read", 65536, 16): (57103.35257522893, f6b + "#G31G-r0-9dac8d64ae325deb8058,G31G-r1-9bdaec256dee12413f1c"),
+        ("read", 65536, 64): (57109.86719146396, f6b + "#G31G-r0-c88eddbe2ccac9b7d26d"),
+        # Total calls/s: measured put rate plus matching get population, not puts/s.
+        ("mixed", 1024, 16): (83273.91080464034, f6 + "#G24M-r0-d8908dad8a786dd6667f,G24M-r1-88593fb23cd2a92f2380"),
+    }
+    source_concurrency = 16 if operation == "mixed" or concurrency == 16 else 64
+    rate, source = rates[operation, size, source_concurrency]
+    seconds = (5 if rate >= 90000 else 10) if seconds is None else seconds
+    measurement = min(2_000_000, max(4096, int(-(-rate * seconds // 1))))
+    warmup = max(4096, int(-(-rate * 2 // 1)))
+    if operation != "read" and 4096 + measurement + warmup > 1_000_000:
+        seconds = 5
+        measurement = min(2_000_000, max(4096, int(-(-rate * seconds // 1))))
+    # F8 median case-start overhead is rounded to 28s; include preload and
+    # actual rounded warmup/window operation counts at the planning rate.
+    expected_case_seconds = (4096 + warmup + measurement) / rate + 28
+    return {"source": source, "source_concurrency": source_concurrency,
+            "rate_calls_per_second": rate, "measurement_seconds": seconds, "warmup_seconds": 2,
+            "rate_scope": ("c64 planning upper bound; c256 unmeasured" if concurrency == 256
+                           and source_concurrency == 64 else "closest measured same-operation cell"),
+            "measurement_operations": measurement, "warmup_operations": warmup,
+            "expected_case_seconds": expected_case_seconds,
+            "case_deadline_seconds": max(180, math.ceil(6 * expected_case_seconds)),
+            "expected_archive_bytes": (4096 + measurement + warmup) * 256 + 8 * 1024**2,
+            "archive_model": "256 bytes per sample row (F8 observed max180) plus8MiB non-sample allowance"}
+
+
+@functools.cache
+def _m3_source():
+    return next(job for job in make_focused_matrix("nvmeof_f8")
+                if job["backend"] == "tidehunter_nvme_rdma"
+                and job["value_size"] == 1024 and job["concurrency"] == 64
+                and "live_leased_sync" not in job and job["repeat"] == 0)
+
+
+@functools.cache
+def _m3_cases():
+    return {job["case_id"]: job for job in _nvmeof_m3_owners()}
+
+
+def _nvmeof_m3_owners():
+    """One bounded selection per fleet; repeat only the historical c16 cells."""
+    source, result = _m3_source(), []
+    for selection, topology, counts in (
+            ("nvmeof_m3_t1", "colocated", (4, 16)),
+            ("nvmeof_m3_t2_2", "separate", (2,)),
+            ("nvmeof_m3_t2_5", "separate", (5,))):
+        for owners in counts:
+            for concurrency in ((16, 64, 256) if owners == 5 else (64, 256)):
+                read_sizes = (1024, 65536) if concurrency == 16 else (1024,)
+                for operation, sizes in (("put", (1024, 65536)), ("read", read_sizes), ("mixed", (1024,))):
+                    for size in sizes:
+                        for repeat in range(2 if concurrency == 16 and operation != "mixed" else 1):
+                            group = {"put": "G33W", "read": "G33R", "mixed": "G33M"}[operation]
+                            item = {key: value for key, value in source.items()
+                                    if key not in ("diagnostics", "sealed_dataset")}
+                            _clone_job(result, selection, item, group,
+                                       owner_count=owners, owner_topology=topology,
+                                       repeat=repeat, concurrency=concurrency, value_size=size,
+                                       durability_tier="synchronous" if concurrency == 16 else item["durability_tier"],
+                                       profile=f"{group}-{operation}-c{concurrency}-{topology}-o{owners}",
+                                       case_kind="live_read" if operation == "read" else "remote_put",
+                                       mix=mix(read=100) if operation == "read" else
+                                           mix(read=50, put=50) if operation == "mixed" else mix(put=100),
+                                       measurement_operations=200000, warmup_operations=4096,
+                                       warmup_key_sweep=operation == "read", thread_cpu_sampling=True,
+                                       execution={"queue_capacity": max(128, concurrency)})
+    planned = []
+    for selection in M3_SELECTIONS:
+        jobs = [job for job in result if job["selection"] == selection]
+        shapes = {job["case_id"]: ("mixed" if job["mix"]["read"] == 50 else
+                                  "read" if job["mix"]["read"] else "put") for job in jobs}
+        sizing = {job["case_id"]: _m3_measurement_sizing(shapes[job["case_id"]], job["value_size"],
+                                                       job["concurrency"]) for job in jobs}
+        for _ in range(len(jobs) + 1):
+            if sum(item["expected_archive_bytes"] for item in sizing.values()) <= 3_000_000_000:
+                break
+            candidates = [item["rate_calls_per_second"] for item in sizing.values()
+                          if item["measurement_seconds"] == 10]
+            if not candidates:
+                raise ValueError("M3 sample archive exceeds3GB at five-second windows")
+            rate = max(candidates)
+            for job in jobs:
+                old = sizing[job["case_id"]]
+                if old["measurement_seconds"] == 10 and old["rate_calls_per_second"] == rate:
+                    sizing[job["case_id"]] = _m3_measurement_sizing(
+                        shapes[job["case_id"]], job["value_size"], job["concurrency"], 5)
+        else:
+            raise ValueError("M3 archive sizing did not converge within the case bound")
+        for job in jobs:
+            item = sizing[job["case_id"]]
+            _clone_job(planned, selection, job, job["group"], measurement_sizing=item,
+                       measurement_operations=item["measurement_operations"],
+                       warmup_operations=item["warmup_operations"])
+    # Remove redundant c256 cells/repetitions to fit admission and clients
+    # inside two hours, retaining every topology, operation and value size.
+    def retained(job):
+        operation = "mixed" if job["mix"]["read"] == 50 else "read" if job["mix"]["read"] else "put"
+        if job["selection"] == "nvmeof_m3_t1" and job["concurrency"] == 256:
+            return (operation == "put" and job["value_size"] == 1024
+                    or operation == "read" and job["owner_count"] == 16)
+        if job["selection"] == "nvmeof_m3_t2_5":
+            if job["concurrency"] == 256:
+                return operation == "put" and job["value_size"] == 1024
+            if job["concurrency"] == 16 and job["repeat"] == 1:
+                return operation != "put" and job["value_size"] != 65536
+        return True
+    return [job for job in planned if retained(job)]
+
+
 def _nvmeof_f7_highmem32(path):
     """Keep -16 workload controls with roughly ten-second measurement windows."""
     result = []
@@ -2039,6 +2180,8 @@ def _valkey_rdma_reads():
 def make_focused_matrix(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
+    if selection in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+        return copy.deepcopy([job for job in _m3_cases().values() if job["selection"] == selection])
     if selection == "valkey_rdma_reads":
         return _valkey_rdma_reads()
     jobs = _focused_jobs()
@@ -2670,6 +2813,19 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
             ["F8 default arm did not run the engine default"] if f8_default else [])}
     start = data.get("start") or {}
     end = data.get("end") or {}
+    if job.get("selection") in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+        partitions = {str(i) for i in range(active_owner_count(job))}
+        for boundary in (data.get("start"), data.get("end"), data.get("deltas")):
+            owner = (boundary or {}).get("owner_executor") or {}
+            rows = owner.get("partitions") or {}
+            if owner.get("available") is not True or set(rows) != partitions:
+                reasons.append("per-owner measurement counter population unavailable")
+                break
+        delta_owners = ((data.get("deltas") or {}).get("owner_executor") or {}).get("partitions") or {}
+        if any(row.get("available") is not True or not isinstance(row.get("counters"), dict)
+               or any(type(value) is not int or value < 0 for value in row["counters"].values())
+               for row in delta_owners.values()):
+            reasons.append("per-owner measurement counters reset or unavailable")
     start = start.get("live_nvmeof") if isinstance(start, dict) else None
     end = end.get("live_nvmeof") if isinstance(end, dict) else None
     delta = data.get("live_nvmeof")
@@ -2757,7 +2913,7 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
     if counters["route_evidence_dropped"] or counters["fence_evidence_dropped"]:
         reasons.append("live NVMe route or fence evidence was dropped")
     if job.get("live_export_mode") in ("per_owner", "per_file"):
-        if counters["namespace_connects"] > 1:
+        if counters["namespace_connects"] > job.get("owner_count", 1):
             reasons.append("permanent export made more than one controller connect")
         if any(job.get("mix", {}).get(name, 0) for name in ("read", "get_many")):
             mixed_puts = any(job.get("mix", {}).get(name, 0) for name in ("put", "put_batch"))
@@ -2887,9 +3043,25 @@ def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
     host_id = expected.get("host_id")
     host_nqn = expected.get("host_nqn")
     service = expected.get("service")
+    owners = expected.get("owners")
+    if owners is not None:
+        if (not isinstance(owners, dict)
+                or set(owners) != {str(i) for i in range(active_owner_count(job))}):
+            return {"qualified": False, "reasons": reasons + ["incomplete live owner identities"]}
+        for index, owner in owners.items():
+            try:
+                owner_uuid = uuid.UUID(bytes=bytes(owner["host_id"]))
+                if (owner["host_nqn"] != "nqn.2014-08.org.nvmexpress:uuid:" + str(owner_uuid)
+                        or owner["address"] != addresses[int(index)]
+                        or owner["service"] != service + 2 * int(index)):
+                    raise ValueError("owner identity mismatch")
+            except (ValueError, KeyError, TypeError, IndexError):
+                return {"qualified": False, "reasons": reasons + ["invalid live owner identity"]}
+        if len({owner["host_nqn"] for owner in owners.values()}) != len(owners):
+            return {"qualified": False, "reasons": reasons + ["duplicate live owner identity"]}
     try:
         if (not isinstance(addresses, list) or not addresses
-                or len(set(addresses)) != len(addresses)
+                or (owners is None and len(set(addresses)) != len(addresses))
                 or any(ipaddress.ip_address(address).is_loopback for address in addresses)
                 or type(service) is not int or not 1 <= service <= 65535
                 or not isinstance(host_id, list) or len(host_id) != 16
@@ -2909,6 +3081,11 @@ def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
         reasons.append("no verified kernel live NVMe namespace route")
     else:
         for route in routes:
+            if owners is not None and isinstance(route, dict):
+                admitted = next((owner for owner in owners.values()
+                                 if owner["host_nqn"] == route.get("host_nqn")), {})
+                addresses = [admitted.get("address")]
+                service, host_nqn, host_id = (admitted.get(key) for key in ("service", "host_nqn", "host_id"))
             ns = route.get("namespace_identity") if isinstance(route, dict) else None
             if (not isinstance(route, dict) or route.get("transport") != transport
                     or route.get("address") not in addresses or route.get("service") != service
@@ -2951,6 +3128,10 @@ def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
                             or file.get("block_size") != ns["block_size"])):
                     reasons.append("live SPDK route lacks a valid authenticated owner binding")
                     break
+        if owners is not None:
+            observed = {route.get("host_nqn") for route in routes if isinstance(route, dict)}
+            if observed != {owner["host_nqn"] for owner in owners.values()}:
+                reasons.append("verified namespace route missing for an owner")
     return {"qualified": not reasons, "reasons": reasons}
 
 

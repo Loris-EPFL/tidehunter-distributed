@@ -562,7 +562,7 @@ class MailboxTests(unittest.TestCase):
     def test_verbs_binds_each_host_without_mutating_case_defaults(self):
         transport = {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'}
         config = {'fleet': {'coordinator': {'rdma_address': '10.1.0.1'},
-                            'nodes': [{'rdma_address': f'10.1.0.{i+2}'} for i in range(5)]}}
+                            'nodes': [{'address': f'10.0.0.{i+2}', 'rdma_address': f'10.1.0.{i+2}'} for i in range(5)]}}
         prepared = runtime.prepare_transport(config, {'transport': transport})
         self.assertEqual(prepared['transport']['fabric']['source_address'], '10.1.0.1')
         self.assertEqual([value['fabric']['source_address'] for value in prepared['owner_transports']],
@@ -570,6 +570,10 @@ class MailboxTests(unittest.TestCase):
         single = runtime.prepare_transport(config, {'transport': transport, 'addresses': ['10.0.0.2:9400']})
         self.assertEqual([value['fabric']['source_address'] for value in single['owner_transports']],
                          ['10.1.0.2'])
+        colocated = runtime.prepare_transport(config, {'transport': transport,
+            'addresses': ['10.0.0.2:' + str(9400 + i) for i in range(16)]})
+        self.assertEqual(len(colocated['owner_transports']), 16)
+        self.assertEqual({owner['fabric']['source_address'] for owner in colocated['owner_transports']}, {'10.1.0.2'})
         self.assertEqual(transport, {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'})
         self.assertEqual(runtime.prepare_transport(config, {'transport': {'kind': 'tcp'}}),
                          {'transport': {'kind': 'tcp'}})

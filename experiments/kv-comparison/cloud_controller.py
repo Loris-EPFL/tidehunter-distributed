@@ -115,9 +115,42 @@ def admitted_host_count(count):
     return count - 1 in cloud_layout.OWNER_HOST_COUNTS
 
 
+def logical_owner_hosts(config, job):
+    """Map logical WAL owners to physical fleet nodes without sharing state."""
+    count = job.get("owner_count", len(config["fleet"]["nodes"]))
+    hosts = config["fleet"]["nodes"]
+    if job.get("owner_topology") == "colocated":
+        return [hosts[0]] * count
+    if count > len(hosts):
+        raise SafetyError("logical owners exceed separate owner hosts")
+    return hosts[:count]
+
+
+def case_owner_job(config, case):
+    if config.get("spec", {}).get("selection") in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+        job = cloud_campaign._m3_cases().get(case, {})
+        if job and cloud_campaign.job_owner_hosts(job) == len(config["fleet"]["nodes"]):
+            return job
+        return {}
+    return {}
+
+
+def owner_process_budget(config, job, index):
+    shares = sum(owner_host_index(config, job, owner) == owner_host_index(config, job, index)
+                 for owner in range(job["owner_count"])) if job.get("owner_topology") else 1
+    return config["fleet"]["server_cpus"], config["fleet"]["server_memory_mib"] // shares
+
+
+def owner_host_index(config, job, index):
+    return logical_owner_hosts(config, job)[index]["index"]
+
+
 def controller_matrix(spec):
     if spec.get("mode") == "focused":
-        return cloud_campaign.make_focused_matrix(spec["selection"])
+        jobs = cloud_campaign.make_focused_matrix(spec["selection"])
+        if spec["selection"] in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5') and "owner_hosts" in spec:
+            jobs = [job for job in jobs if cloud_campaign.job_owner_hosts(job) == spec["owner_hosts"]]
+        return jobs
     return cloud_campaign.make_matrix(spec)
 
 
@@ -619,7 +652,7 @@ def store_measurement_device_evidence(directory, receipt, job, media, before, af
         receipt["media_evidence"] = {"path": path.name, "sha256": digest(path)}
     if job.get("device_counters"):
         native = job.get("backend") == "native"
-        count = 1 if native else owner_count
+        count = 1 if native else min(owner_count, cloud_campaign.job_owner_hosts(job))
         start = 0 if native else 1
         try:
             counters = {
@@ -1282,17 +1315,67 @@ def verify_instances(config, response, *, terminating=False, starting=False, now
 
 
 def unit_name(config, case, role):
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", case) or not re.fullmatch(r"(?:client|storage-[0-4])", role):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", case) or not re.fullmatch(r"(?:client|storage-(?:[0-9]|1[0-5]))", role):
         raise SafetyError("unsafe exact-owned unit name")
     return f"kvcloud-{config['prefix']}-{hashlib.sha256(case.encode()).hexdigest()[:16]}-{role}"
+
+
+def owner_slice_limits(config, case):
+    name = "kvowners" + hashlib.sha256((config["prefix"] + ":" + case).encode()).hexdigest()[:24] + ".slice"
+    text = ("[Slice]\nCPUAccounting=yes\nMemoryAccounting=yes\n"
+            f"CPUQuota={config['fleet']['server_cpus'] * 100}%\n"
+            f"MemoryMax={config['fleet']['server_memory_mib']}M\nMemorySwapMax=0\n")
+    return name, text
+
+
+def configure_owner_slice(config, case):
+    import fcntl
+    name, text = owner_slice_limits(config, case)
+    directory = Path("/run/systemd/system") / (name + ".d")
+    with (Path("/run/lock") / (name + ".lock")).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        limits, ready = directory / "limits.conf", directory / "ready"
+        if limits.exists() and limits.read_text() != text:
+            raise SafetyError("owner slice limits differ from exact admitted VM budget")
+        if not ready.exists():
+            publish_synced(limits, text.encode())
+            command(["systemctl", "daemon-reload"], timeout=20)
+            publish_synced(ready, b"ready\n")
+    return name
+
+
+def cleanup_owner_slice(config, case, physical_index):
+    job = case_owner_job(config, case)
+    for owner in range(job["owner_count"]):
+        if owner_host_index(config, job, owner) != physical_index:
+            continue
+        status = unit_status(unit_name(config, case, "storage-" + str(owner)))
+        if status.get("LoadState") != "not-found" and (
+                status.get("ActiveState") not in ("inactive", "failed") or status.get("MainPID") != "0"):
+            raise SafetyError("owner slice cleanup requires every co-located process stopped")
+    name, _ = owner_slice_limits(config, case)
+    if unit_status(name).get("LoadState") != "not-found":
+        command(["systemctl", "stop", name], timeout=30)
+    directory = Path("/run/systemd/system") / (name + ".d")
+    for leaf in ("limits.conf", "ready"):
+        (directory / leaf).unlink(missing_ok=True)
+    if directory.exists():
+        directory.rmdir()
+    command(["systemctl", "daemon-reload"], timeout=20)
+    (Path("/run/lock") / (name + ".lock")).unlink(missing_ok=True)
+    return {"owner_slice": name, "removed": True}
 
 
 def systemd_argv(config, case, role, cpus, memory, seconds, executable, setenv=None):
     if seconds < 1 or cpus <= 0 or memory <= 0:
         raise DeadlineError("no admitted runtime/budget remains")
     env = environment(config)
+    shared = role.startswith("storage-") and case_owner_job(config, case).get("owner_topology") == "colocated"
+    cpu = (["--property=Slice=" + owner_slice_limits(config, case)[0]] if shared else
+           ["--property=CPUQuota=" + str(cpus * 100) + "%"])
     return ["systemd-run", "--unit=" + unit_name(config, case, role), "--service-type=exec",
-            "--property=CPUQuota=" + str(cpus * 100) + "%", "--property=MemoryMax=" + str(int(memory)) + "M",
+            *cpu, "--property=MemoryMax=" + str(int(memory)) + "M",
             "--property=MemorySwapMax=0", "--property=LimitMEMLOCK=infinity", "--property=LimitNOFILE=524288",
             "--property=RuntimeMaxSec=" + str(int(seconds)), "--property=TimeoutStopSec=25",
             "--property=KillMode=control-group", "--property=RemainAfterExit=yes",
@@ -1408,11 +1491,30 @@ def docker_monitor_identity(item, proc_root=Path("/proc")):
 def owned_monitor_processes(config, index, job, owner_case=None):
     """Observe known deployment PIDs only; never scan /proc for candidates."""
     processes, missing, identities = [], [], []
-    role = "client" if index == -1 else "storage-" + str(index)
-    if index == -1 or (job["backend"] in cloud_campaign.TRANSPORTS
-                       and index < job.get("owner_count", len(config["fleet"]["nodes"]))):
+    if job.get("owner_topology") and index >= 0:
+        roles = ["storage-" + str(owner) for owner in range(job["owner_count"])
+                 if owner_host_index(config, job, owner) == index]
+    else:
+        roles = ["client" if index == -1 else "storage-" + str(index)] if (
+            index == -1 or (job["backend"] in cloud_campaign.TRANSPORTS
+                           and index < job.get("owner_count", len(config["fleet"]["nodes"])))) else []
+    for role in roles:
         name = unit_name(config, owner_case if index >= 0 and owner_case is not None else job["case_id"], role) + ".service"
-        processes.append({"role": role, "cgroup": "/system.slice/" + name})
+        try:
+            status = unit_status(name)
+        except (InfrastructureError, OSError, subprocess.SubprocessError) as exc:
+            missing.append({"role": role, "reason": type(exc).__name__ + ": " + str(exc)})
+            continue
+        cgroup = status.get("ControlGroup", "")
+        allowed = {"/system.slice/" + name}
+        if role.startswith("storage-") and job.get("owner_topology") == "colocated":
+            slice_case = owner_case if owner_case is not None else job["case_id"]
+            allowed.add("/" + owner_slice_limits(config, slice_case)[0] + "/" + name)
+        if cgroup not in allowed:
+            missing.append({"role": role, "reason": "owned service has no admitted observed ControlGroup"})
+            continue
+        processes.append({"role": role, "cgroup": cgroup})
+        identities.append({"role": role, "unit": name, "cgroup": cgroup})
     if job["backend"] in cloud_layout.BACKENDS:
         contract = contracts.selected(job["backend"], job.get("ack_contract", "synced"))
         kwargs = {"ack_contract": contract} if contract != "synced" else {}
@@ -1677,7 +1779,7 @@ def live_nvme_preparation(config, case, transport):
     if type(requests) is not int or not 1 <= requests <= 1024:
         raise SafetyError("live_max_inflight_requests must be an integer in 1..1024")
     field = "rdma_address" if platform_module(config) and transport == "rdma" else "address"
-    return {"addresses": [host[field] for host in config["fleet"]["nodes"]],
+    return {"addresses": [host[field] for host in logical_owner_hosts(config, job)],
             "transport": transport, "service": 4420, "port_id": 1000,
             "commissioning_service": 4421, "commissioning_port_id": 1001,
             "max_inflight_requests": requests,
@@ -1705,6 +1807,18 @@ def admit_prepared_live_client(live_client, prep, tier):
     host_id = live_host_identity(host_nqn)
     expected = {key: prep[key] for key in
                 ("max_inflight_requests", "max_inflight_bytes", "connect_timeout_ms", "io_timeout_ms")}
+    identities = live_client.get("owner_identities", {})
+    if identities:
+        if set(identities) != {str(i) for i in range(len(prep["addresses"]))}:
+            raise SafetyError("live owner identity map is incomplete")
+        nqns = [identity.get("host_nqn") for identity in identities.values()]
+        if len(set(nqns)) != len(nqns):
+            raise SafetyError("live owner initiator identities are not unique")
+        for identity in identities.values():
+            if identity != {"host_nqn": identity.get("host_nqn"),
+                            "host_id": live_host_identity(identity.get("host_nqn"))}:
+                raise SafetyError("live owner UUID differs from its NQN")
+        expected["owner_identities"] = identities
     expected.update(host_nqn=host_nqn, host_id=host_id, write_mode=prep["write_mode"],
                     leased_durability=tier if prep["write_mode"] == "leased" else None,
                     inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"],
@@ -1724,13 +1838,14 @@ def admit_prepared_live_client(live_client, prep, tier):
 def live_target_for_owner(config, case, index, transport, host_nqn, target="kernel", export_mode="on_demand"):
     prep = live_nvme_preparation(config, case, transport)
     live_host_identity(host_nqn)
-    result = {"address": prep["addresses"][index], "service": prep["service"],
+    offset = 2 * index
+    result = {"address": prep["addresses"][index], "service": prep["service"] + offset,
             "transport": transport, "host_nqn": host_nqn,
-            "port_id": prep["port_id"],
+            "port_id": prep["port_id"] + offset,
             "state_dir": str(Path(config["fleet"]["data_root"]) / "cells" / case
                              / f"node-{index}" / "live-nvmeof"),
-            "commissioning_port_id": prep["commissioning_port_id"],
-            "commissioning_service": prep["commissioning_service"], "export_mode": export_mode}
+            "commissioning_port_id": prep["commissioning_port_id"] + offset,
+            "commissioning_service": prep["commissioning_service"] + offset, "export_mode": export_mode}
     if target == "spdk":
         if transport != "rdma" or config["spec"].get("spdk_comparison") is not True:
             raise SafetyError("live SPDK requires explicitly admitted RDMA comparison")
@@ -1766,7 +1881,9 @@ def validate_launch(config, launch, case, index, polling=None):
         actual_target = {key: value for key, value in live_target.items() if key != "spdk" or value is not None}
         if actual_target != expected_target:
             raise SafetyError("live target differs from exact owner campaign configuration")
-    if launch.get("listen") != config["fleet"]["nodes"][index]["address"] + ":9400":
+    host = logical_owner_hosts(config, case_owner_job(config, case))[index]
+    port = 9400 + index if case_owner_job(config, case).get("owner_topology") else 9400
+    if launch.get("listen") != host["address"] + ":" + str(port):
         raise SafetyError("typed listener differs from exact storage endpoint")
     tls = launch.get("tls", {})
     try:
@@ -1957,11 +2074,14 @@ def live_case_observation(config, case, index, launch, boundary, expected):
                 if not all(value.get("available") for value in attrs.values()):
                     continue
                 address = dict(part.split("=", 1) for part in attrs["address"]["value"].split(",") if "=" in part)
+                candidates = expected.get("owners", {}).values() or [
+                    {"host_nqn": expected["host_nqn"], "address": address, "service": expected["service"]}
+                    for address in expected["addresses"]]
                 if (attrs["subsysnqn"]["value"].startswith("nqn.2026-01.local.tidehunter:live-")
-                        and attrs["hostnqn"]["value"] == expected["host_nqn"]
                         and attrs["transport"]["value"] == expected["transport"]
-                        and address.get("traddr") in expected["addresses"]
-                        and address.get("trsvcid") == str(expected["service"])):
+                        and any(attrs["hostnqn"]["value"] == owner["host_nqn"]
+                                and address.get("traddr") == owner["address"]
+                                and address.get("trsvcid") == str(owner["service"]) for owner in candidates)):
                     controllers.append(entry.name)
             controllers.sort()
         except OSError as exc:
@@ -2155,11 +2275,18 @@ def store_owner_ftrace(directory, traces):
 
 
 def guest_operation(config, request, clients, *, local_mode=None):
-    index = request["index"]
-    if type(index) is not int or index not in range(-1, len(config["fleet"]["nodes"])):
+    index = request.get("owner_index", request["index"])
+    physical_index = request["index"]
+    if type(physical_index) is not int or physical_index not in range(-1, len(config["fleet"]["nodes"])):
         raise SafetyError("exact guest index required")
-    identity = (verify_local_identity(config, index) if local_mode is None
-                else local_mode.identity(index))
+    if "owner_index" in request:
+        job = case_owner_job(config, request.get("case_id"))
+        if (type(index) is not int or index < 0
+                or index >= job.get("owner_count", 0)
+                or owner_host_index(config, job, index) != physical_index):
+            raise SafetyError("logical owner does not belong to the addressed host")
+    identity = (verify_local_identity(config, physical_index) if local_mode is None
+                else local_mode.identity(physical_index))
     root = guarded(config["fleet"]["data_root"], Path("/mnt/tidehunter-kv-comparison"), must_exist=True)
     action = request["action"]
     if local_mode is not None and action in ("cold_trace_probe", "cold_trace_start", "cold_trace_stop",
@@ -2669,11 +2796,26 @@ def guest_operation(config, request, clients, *, local_mode=None):
             duration = min(owner_ftrace.CPU_MAX_SAMPLES,
                            (timestamp(config["deadline_utc"]) - utc()).total_seconds())
             state = owner_ftrace.start_threads(state_root, pid, duration)
+            job = case_owner_job(config, case)
+            if job.get("owner_topology"):
+                state["owner_index"] = index
+                state["physical_host_index"] = physical_index
+                first = index < 0 or all(owner_host_index(config, job, other) != physical_index
+                                         for other in range(index))
+                if first:
+                    state["host_cpu_sampler"] = owner_ftrace.start_cpu(state_root, duration)
             dump(state_path, state)
             return state
         state = json.loads(state_path.read_text()) if state_path.exists() else None
-        return owner_ftrace.stop_threads(state)
+        result = owner_ftrace.stop_threads(state)
+        if isinstance(state, dict) and "owner_index" in state:
+            result.update(owner_index=state["owner_index"], physical_host_index=state["physical_host_index"])
+            if "host_cpu_sampler" in state:
+                result["host_cpu"] = owner_ftrace.stop_cpu(state["host_cpu_sampler"])
+        return result
     case = request["case_id"]
+    if action == "tide_slice_cleanup":
+        return cleanup_owner_slice(config, case, physical_index)
     guest_root = guarded(root / "cells" / case, root)
     capsule_root = guarded(guest_root / ("node-" + str(index)), root)
     if action == "live_spdk_snapshot":
@@ -2721,7 +2863,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
             if index >= 0 and launch["node"].get("live_target") is None:
                 raise SafetyError("live boundary requires exact live owner")
             expected = request.get("expected")
-            if not isinstance(expected, dict) or set(expected) != {"host_nqn", "transport"}:
+            if not isinstance(expected, dict) or set(expected) not in ({"host_nqn", "transport"}, {"host_nqn", "transport", "owners"}):
                 raise SafetyError("exact live initiator identity and transport required")
             live_host_identity(expected["host_nqn"])
             if expected["transport"] not in ("tcp", "rdma"):
@@ -2824,8 +2966,11 @@ def guest_operation(config, request, clients, *, local_mode=None):
                 "--executable", live_spdk["executable"], "--deadline-epoch", str(deadline_epoch)],
                 timeout=45))
         seconds = min(request["timeout"], int((timestamp(config["deadline_utc"]) - utc()).total_seconds()))
-        command(systemd_argv(config, case, "storage-" + str(index), config["fleet"]["server_cpus"],
-                             config["fleet"]["server_memory_mib"], seconds,
+        cpus, memory = owner_process_budget(config, case_owner_job(config, case), index)
+        shared_slice = (configure_owner_slice(config, case)
+                        if case_owner_job(config, case).get("owner_topology") == "colocated" else None)
+        command(systemd_argv(config, case, "storage-" + str(index), cpus,
+                             memory, seconds,
                              [config["binary"], "--experimental-storage-node", capsule_root / "launch.yaml"],
                              setenv={**({"TIDEHUNTER_HISTORY_DIAGNOSTICS": "1"} if request.get("owner_history_diagnostics") else {}),
                                      **({"TIDEHUNTER_OWNER_EVENTS": "1"} if request.get("owner_trace") else {})}), timeout=20)
@@ -2841,6 +2986,9 @@ def guest_operation(config, request, clients, *, local_mode=None):
                     raise SafetyError("storage readiness endpoint differs from typed launch")
                 result = {"ready": address, "launch_sha256": digest(capsule_root / "launch.yaml"), "unit": status}
                 result["durability_receipt"] = owner_durability_receipt(launch)
+                if shared_slice is not None:
+                    result["owner_slice"] = {"name": shared_slice, "limits": owner_slice_limits(config, case)[1],
+                                             "observed": unit_status(shared_slice)}
                 if daemon is not None:
                     result["live_spdk_daemon"] = daemon
                 if launch["node"].get("live_target") is not None:
@@ -2968,6 +3116,14 @@ class Controller:
         if available < 1:
             raise DeadlineError("insufficient whole-second control-operation budget")
         timeout = max(1, min(int(timeout), int(available)))
+        logical_index = index
+        action = request.get("action", "")
+        job = case_owner_job(self.config, request.get("case_id", case))
+        owner_action = (action.startswith("tide_") or action.startswith("live_")
+                        or action.startswith("nvme_owner_") or action.startswith("thread_cpu_"))
+        if index >= 0 and job.get("owner_topology") and owner_action:
+            index = owner_host_index(self.config, job, logical_index)
+            request = {**request, "owner_index": logical_index}
         request = {**request, "index": index}
         if self.local_mode is not None:
             return self.local_mode.request(index, request, case=case, timeout=timeout, export=export)
@@ -3129,6 +3285,10 @@ class Controller:
         pool = ThreadPoolExecutor(max_workers=6)
         host_count = len(self.config["fleet"]["nodes"])
         active_count = host_count if owner_count is None else owner_count
+        job = case_owner_job(self.config, request.get("case_id", case))
+        if job.get("owner_topology") and request.get("action") in (
+                "snapshot", "owner_ftrace_start", "owner_ftrace_stop", "cold_trace_start", "cold_trace_stop"):
+            active_count = min(active_count, cloud_campaign.job_owner_hosts(job))
         indices = range(-1, active_count)
         futures = [pool.submit(capture, index) for index in indices]
         try:
@@ -3447,16 +3607,21 @@ class Controller:
                 and (job.get("nvmeof_route") != "live"
                      or job.get("live_export_mode", "on_demand") not in ("per_owner", "per_file"))):
             raise SafetyError("memory-only history admits reads only with permanent live export")
+        owner_memory = (owner_process_budget(self.config, job, 0)[1] if job.get("owner_topology")
+                        else self.config["fleet"]["server_memory_mib"])
         allowance = job.get("owner_read_memory_allowance_bytes",
-            min(512 * 1024**2, int(self.config["fleet"]["server_memory_mib"] * 1024**2 // 4)))
+            min(512 * 1024**2, int(owner_memory * 1024**2 // 4)))
+        if allowance + 64 * 1024**2 > owner_memory * 1024**2:
+            raise SafetyError("owner read allowance exceeds its co-located process share")
         owner_count = job.get("owner_count", len(self.config["fleet"]["nodes"]))
         polling = job.get("owner_polling", "adaptive")
         if polling not in ("adaptive", "busy"):
             raise ValueError("owner_polling must be adaptive or busy")
         storage_batches = (planned_write_batches_per_partition(job)
-                           if job.get("selection") == "nvmeof_f7_highmem32"
+                           if job.get("selection") in ("nvmeof_f7_highmem32", *cloud_campaign.M3_SELECTIONS)
                            else job["keys"] + job["warmup_operations"] + job["measurement_operations"])
-        prep = {"guest_root": guest_root, "addresses": [h["address"] + ":9400" for h in self.config["fleet"]["nodes"][:owner_count]],
+        owner_hosts = logical_owner_hosts(self.config, job)
+        prep = {"guest_root": guest_root, "addresses": [h["address"] + ":" + str(9400 + (i if job.get("owner_topology") else 0)) for i, h in enumerate(owner_hosts)],
                 "transport": owner_control_settings(job)["owner_transport"],
                 "max_batches_per_partition": max(16384, storage_batches),
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
@@ -3526,6 +3691,7 @@ class Controller:
             raise SafetyError("prepared coordinator WAL geometry differs from the planned case")
         if job.get("nvmeof_route") == "live":
             host_nqn = admit_prepared_live_client(remote.get("live_nvme"), prep["live_nvmeof"], tier)
+            owner_identities = remote["live_nvme"].get("owner_identities", {})
         elif remote.get("live_nvme") is not None:
             raise SafetyError("unexpected live client in non-live campaign case")
         if "read_lanes" in job:
@@ -3549,7 +3715,8 @@ class Controller:
             launch = yaml.safe_load(launch_path.read_text())
             if job.get("nvmeof_route") == "live" and job.get("nvmeof_target") == "spdk":
                 validate_launch(self.config, launch, case, index, polling)
-                expected = live_target_for_owner(self.config, case, index, live_transport, host_nqn, "spdk", job.get("live_export_mode", "on_demand"))
+                nqn = owner_identities.get(str(index), {}).get("host_nqn", host_nqn)
+                expected = live_target_for_owner(self.config, case, index, live_transport, nqn, "spdk", job.get("live_export_mode", "on_demand"))
                 launch["node"]["live_target"]["spdk"] = expected["spdk"]
                 launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
             validate_launch(self.config, launch, case, index, polling)
@@ -3557,7 +3724,8 @@ class Controller:
                 selected = launch.get("node", {}).get("live_target") or {}
                 selected = {key: value for key, value in selected.items() if key != "spdk" or value is not None}
                 if selected != live_target_for_owner(
-                        self.config, case, index, live_transport, host_nqn, job.get("nvmeof_target", "kernel"),
+                        self.config, case, index, live_transport,
+                        owner_identities.get(str(index), {}).get("host_nqn", host_nqn), job.get("nvmeof_target", "kernel"),
                         job.get("live_export_mode", "on_demand")):
                     raise SafetyError("prepared live target is missing or differs from selected transport")
             elif launch.get("node", {}).get("live_target") is not None:
@@ -3586,7 +3754,8 @@ class Controller:
                 self.active_tide[2].append(index)
             service_seconds = (int(self.remaining()) if "sealed_dataset" in job else
                 min(int(self.remaining()), max(self.config["spec"]["case_deadline_seconds"],
-                    600 if job["keys"] > 65536 else 0) + 300))
+                    600 if job["keys"] > 65536 else 0) + 300
+                    + (90 * owner_count if job.get("owner_topology") == "colocated" else 0)))
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
                 "sha256": digest(archive), "files": list(files), "timeout": service_seconds,
                 "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
@@ -3602,7 +3771,7 @@ class Controller:
             path = (directory / "owner-durability" / f"node-{index}.durability.json").absolute()
             publish_synced(path, (json.dumps(receipts[index], sort_keys=True) + "\n").encode())
             receipt_paths.append(str(path))
-        return {"path": str(directory / "database"), "evidence": str(directory / "read-evidence"), "owners": owner_count,
+        options = {"path": str(directory / "database"), "evidence": str(directory / "read-evidence"), "owners": owner_count,
                 "key_count": max(1048576, job["keys"]), "max_batches_per_partition": prep["max_batches_per_partition"],
                 "coordinator_read_cache_bytes": job["coordinator_cache_bytes"],
                 "owner_read_resident_first": prep["owner_read_resident_first"],
@@ -3610,6 +3779,58 @@ class Controller:
                 "durability_tier": tier,
                 "external_owner_durability_receipts": receipt_paths,
                 "external_owner_read_config": json.loads((prepared / "external_owner_read_config.json").read_text())}
+        if job.get("selection", "").startswith("nvmeof_m3_"):
+            self.admit_logical_owners(job, directory, options)
+        return options
+
+    def admit_logical_owners(self, job, directory, options):
+        """One preload put and verified cache-disabled read per exact live owner."""
+        def admit(index):
+            cell = directory / "owner-admission" / f"node-{index}"
+            cell.mkdir(parents=True, exist_ok=False)
+            selected = copy.deepcopy(options)
+            selected.update(path=str(cell / "database"), evidence=str(cell / "read-evidence"), owners=1,
+                            external_owner_durability_receipts=[options["external_owner_durability_receipts"][index]],
+                            external_owner_read_config=[options["external_owner_read_config"][index]])
+            remote = selected["external_remote_config"]
+            remote["storage"]["partitions"] = [index]
+            remote["endpoints"] = [endpoint for endpoint in remote["endpoints"] if endpoint["partition"] == index]
+            identity = remote["live_nvme"]["owner_identities"][str(index)]
+            remote["live_nvme"].update(identity, owner_identities={str(index): identity})
+            remote["read_cache_bytes"] = 0
+            selected["coordinator_read_cache_bytes"] = 0
+            config = cloud_campaign.make_run_config(job, cell, selected, self.config["source_revision"],
+                                                    cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS)
+            config.update(namespace=f"owner-admission-{index}", qualification_only=False)
+            config["dataset"].update(keys=1, value_size=1024)
+            config["workload"].update(mix=cloud_campaign.mix(read=100))
+            config["execution"].update(concurrency=1, queue_capacity=1)
+            config["phases"].update(warmup_operations=0, measurement_operations=1)
+            for key in ("measurement_gate", "measurement_completion_gate", "warmup_key_sweep", "diagnostics"):
+                config.pop(key, None)
+            dump(cell / "config.json", config)
+            command([self.config["binary"], "--config", cell / "config.json", "--output", cell / "result"],
+                    timeout=min(cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, self.remaining()), env=environment(self.config))
+            summary = json.loads((cell / "result/summary.json").read_text())
+            evidence = json.loads((cell / "result/measurement-read-evidence.json").read_text())
+            live = (evidence.get("end") or {}).get("live_nvmeof") or {}
+            with (cell / "result/samples.csv").open() as stream:
+                samples = list(csv.DictReader(stream))
+            if (summary.get("status") != "completed" or len(samples) != 1
+                    or samples[0].get("operation") != "read" or samples[0].get("outcome") not in ("ok", "success")
+                    or live.get("completed_read_ops", 0) < 1 or live.get("completed_write_ops", 0) < 1
+                    or live.get("errors") != 0 or live.get("payload_rpc_requests") != 0
+                    or not live.get("routes")
+                    or any(route.get("host_nqn") != identity["host_nqn"] for route in live["routes"])):
+                raise SafetyError(f"logical owner {index} write/read admission failed")
+            return {"owner_index": index, "host_index": owner_host_index(self.config, job, index),
+                    "host_nqn": identity["host_nqn"], "endpoint": remote["endpoints"][0],
+                    "config": str((cell / "config.json").relative_to(directory)),
+                    "summary_sha256": digest(cell / "result/summary.json")}
+        with ThreadPoolExecutor(max_workers=job["owner_count"]) as pool:
+            proofs = list(pool.map(admit, range(job["owner_count"])))
+        dump(directory / "owner-admission.json", {"owners": proofs,
+             "scope": "per-slot connect, preload write and verified cache-disabled read; crash qualification is per physical VM"})
 
     def stop_tide(self):
         if self.active_nvme is not None:
@@ -3648,6 +3869,10 @@ class Controller:
         if errors:
             self.tide_cleanup_forbidden = True
             raise InfrastructureError("Tidehunter exact unit cleanup incomplete: " + "; ".join(errors))
+        if job.get("owner_topology") == "colocated":
+            cleaned = self.request(0, {"action": "tide_slice_cleanup", "case_id": job["case_id"]},
+                case=job["case_id"], timeout=self.cleanup_timeout(deadline), export=True)
+            dump(directory / "server-proofs" / "slice-stop.json", cleaned)
         if self.shared_tide is not None:
             database = guarded(directory / "database", self.root)
             if database.exists():
@@ -4079,7 +4304,8 @@ class Controller:
             return {"index": index, "path": str(path.relative_to(directory)), "sha256": digest(path),
                     "available": frame.get("available", True)}
         with ThreadPoolExecutor(max_workers=6) as pool:
-            return list(pool.map(capture, range(-1, len(self.config["fleet"]["nodes"]))))
+            count = self.active_tide[0].get("owner_count", len(self.config["fleet"]["nodes"])) if self.active_tide else len(self.config["fleet"]["nodes"])
+            return list(pool.map(capture, range(-1, count)))
 
     def live_boundary_deltas(self, directory):
         script = Path(self.config["repository_root"]) / "experiments/nvmeof/collect.py"
@@ -4087,7 +4313,8 @@ class Controller:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         results = []
-        for index in range(-1, len(self.config["fleet"]["nodes"])):
+        count = self.active_tide[0].get("owner_count", len(self.config["fleet"]["nodes"])) if self.active_tide else len(self.config["fleet"]["nodes"])
+        for index in range(-1, count):
             try:
                 base = directory / "live-observation"
                 first = json.loads((base / f"begin-{index}.json").read_text())
@@ -4375,15 +4602,18 @@ class Controller:
         if host_count == 1:
             selection = self.config["spec"].get("selection")
             if (self.config["spec"].get("mode") != "focused"
-                    or cloud_campaign.selection_owner_hosts(selection) != 1):
+                    or (cloud_campaign.selection_owner_hosts(selection) != 1
+                        and selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'))):
                 raise ValueError("compact fleet requires a compact focused selection")
             expected = next((candidate for candidate in cloud_campaign.make_focused_matrix(selection)
                              if candidate["case_id"] == job.get("case_id")), None)
             if (expected is None or not cloud_campaign._focused_exact(job, expected)
                     or cloud_campaign.job_owner_hosts(job) > host_count):
                 raise ValueError("case is not in the reviewed compact selection")
-        if type(owner_count) is not int or owner_count not in cloud_layout.OWNER_HOST_COUNTS:
-            raise ValueError("owner_count must be 1 or 5")
+        if type(owner_count) is not int or owner_count not in cloud_layout.LOGICAL_OWNER_COUNTS:
+            raise ValueError("unsupported logical owner_count")
+        if owner_count not in (1, 5):
+            cloud_campaign.active_owner_count(job)
         read_case = (host_count == 1 and self.config["spec"].get("selection") == "remote_rw_compact"
                      and job.get("case_kind") in ("media_read", "sealed_knee")
                      and job.get("backend") in ("tidehunter_tcp", "tidehunter_verbs_native")
@@ -4554,6 +4784,10 @@ class Controller:
                     live_expected = {"addresses": prep["addresses"], "transport": transport,
                                      "service": prep["service"], "host_nqn": identity["host_nqn"],
                                      "host_id": identity["host_id"]}
+                    live_expected["owners"] = {
+                        str(index): {"address": address, "service": prep["service"] + 2 * index,
+                                     **identity["owner_identities"][str(index)]}
+                        for index, address in enumerate(prep["addresses"])}
                     dump(directory / "live-nvme-expected.json", live_expected)
                     receipt["live_nvme_expected"] = {"path": "live-nvme-expected.json",
                                                      "sha256": digest(directory / "live-nvme-expected.json")}
@@ -4569,7 +4803,10 @@ class Controller:
                 receipt["owner_durability_receipts"] = bindings
             if contract != "synced":
                 options = dict(options, ack_contract=contract)
-            seconds = min(self.config["spec"]["case_deadline_seconds"], int(self.remaining()))
+            client_deadline = (job["measurement_sizing"]["case_deadline_seconds"]
+                               if job.get("selection") in cloud_campaign.M3_SELECTIONS
+                               else self.config["spec"]["case_deadline_seconds"])
+            seconds = min(client_deadline, int(self.remaining()))
             config = cloud_campaign.make_run_config(job, directory, options, self.config["source_revision"], seconds)
             if job.get("case_kind") != "hybrid_put":
                 # Write controls use a separate namespace and run after every sealed read.
@@ -4641,7 +4878,8 @@ class Controller:
             if live_case:
                 live_observation_attempted = True
                 try:
-                    expected_route = {"host_nqn": live_expected["host_nqn"], "transport": live_expected["transport"]}
+                    expected_route = {"host_nqn": live_expected["host_nqn"], "transport": live_expected["transport"],
+                                      "owners": live_expected["owners"]}
                     receipt["live_observation_begin"] = self.live_boundaries(job["case_id"], "begin", directory, expected_route)
                 except Exception as exc:
                     receipt["live_observation_begin"] = {"available": False, "reason": repr(exc)}

@@ -296,6 +296,14 @@ class CampaignModeTests(unittest.TestCase):
                     'deltas': {'coordinator': {'available': True,
                                'counters': {'read_profile_live_inline': 0}}},
                     'live_nvmeof': {'available': True, 'counters': dict(end)}}
+        if selection.startswith('nvmeof_m3_'):
+            for boundary in ('start', 'end', 'deltas'):
+                evidence[boundary]['owner_executor'] = {'available': True, 'partitions': {
+                    str(i): {'available': True, 'counters': {}} for i in range(5)}}
+            incomplete = copy.deepcopy(evidence)
+            incomplete['deltas']['owner_executor']['partitions'].pop('4')
+            self.assertIn('per-owner measurement counter population unavailable',
+                cloud_campaign.qualify_live_nvme_measurement(incomplete, job, self.exported(job))['reasons'])
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job, self.exported(job))['qualified'])
         mixed = dict(job, mix={'read': 50, 'put': 50})
         current = copy.deepcopy(evidence)

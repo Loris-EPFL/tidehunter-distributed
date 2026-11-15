@@ -38,6 +38,9 @@ from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, Delegate
 
 PREPARATION_SECONDS = 900
 PAIR_SECONDS = 1200
+# The pair child has its own bound. Leave a separate five minutes inside the
+# controller wait for child exit, guest cleanup, status polling and evidence.
+PAIR_CLEANUP_SECONDS = 300
 WORKER_READY_SECONDS = 180
 FLEET_SECONDS = 21600
 EXPORT_RESERVE_SECONDS = 900
@@ -185,6 +188,29 @@ REVIEWED_SPECS['nvmeof_f8']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f7_highmem32'].update(
     machine_type='z4m-highmem-32', backends=['tidehunter_nvme_rdma'])
 
+# One immutable matrix and one fleet size per M3 selection.
+M3_MATRIX_BINDINGS = {
+    1: ("nvmeof_m3_t1", 11, "a0315c29b6e6a00a5df6fe41a7fb31418823d1d176e383f1c67569c7c301966a"),
+    2: ("nvmeof_m3_t2_2", 8, "f36366496e564b8fe303ef1dba03d2797c8a700f91cca2054ac11ee94eed42b6"),
+    5: ("nvmeof_m3_t2_5", 11, "6a1c63730a74ab97b232b1b947f6b9149098f76f63336cfad6447b95019d7402"),
+}
+for owners, (selection, count, digest) in M3_MATRIX_BINDINGS.items():
+    REVIEWED_SPECS[selection] = {
+        **copy.deepcopy(REVIEWED_SPECS["nvmeof_f8"]),
+        "selection": selection, "owner_hosts": owners, "job_count": count, "max_cases": count,
+        "matrix_sha256": digest, "backends": ["tidehunter_nvme_rdma"],
+        "case_deadline_seconds": max(job["measurement_sizing"]["case_deadline_seconds"]
+                                     for job in workflow_input.cloud_campaign.make_focused_matrix(selection)),
+    }
+    FOCUSED_MATRIX_SHA256[selection] = digest
+
+
+def m3_spec(owner_hosts):
+    if type(owner_hosts) is not int or owner_hosts not in M3_MATRIX_BINDINGS:
+        raise ValueError("M3 requires one, two or five owner VMs")
+    selection = M3_MATRIX_BINDINGS[owner_hosts][0]
+    return copy.deepcopy(REVIEWED_SPECS[selection])
+
 
 def _utc(seconds):
     return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).isoformat(timespec='seconds')
@@ -321,17 +347,20 @@ def _reviewed_jobs(spec):
     if isinstance(spec, dict) and any(_json(spec) == _json(reviewed)
                                      for reviewed in (REVIEWED_SPEC, REVIEWED_CONTRACT_SPEC)):
         return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
-    if (not isinstance(spec, dict) or type(spec.get('selection')) is not str
-            or spec['selection'] not in REVIEWED_SPECS
-            or _json(spec) != _json(REVIEWED_SPECS[spec['selection']])):
+    reviewed = REVIEWED_SPECS.get(spec.get('selection')) if isinstance(spec, dict) else None
+    if isinstance(spec, dict) and spec.get('selection') in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+        reviewed = m3_spec(spec.get('owner_hosts'))
+    if reviewed is None or _json(spec) != _json(reviewed):
         raise ValueError('an exact reviewed focused specification is required')
     jobs = workflow_input.cloud_campaign.make_focused_matrix(spec['selection'])
-    if (workflow_input.cloud_campaign.FOCUSED_COUNTS.get(spec['selection']) != spec['job_count']
-            or len(jobs) != spec['job_count'] or _digest(_json(jobs)) != spec['matrix_sha256']):
+    if spec['selection'] in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+        jobs = [job for job in jobs if workflow_input.cloud_campaign.job_owner_hosts(job) == spec['owner_hosts']]
+    if (len(jobs) != spec['job_count'] or _digest(_json(jobs)) != spec['matrix_sha256']):
         raise ValueError('focused matrix differs from the reviewed specification')
     owners = spec.get('owner_hosts', 5)
     if (type(owners) is not int or owners not in gcp_runtime.owner_host_counts()
-            or workflow_input.cloud_campaign.selection_owner_hosts(spec['selection']) != owners
+            or (spec['selection'] not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5')
+                and workflow_input.cloud_campaign.selection_owner_hosts(spec['selection']) != owners)
             or any(workflow_input.cloud_campaign.job_owner_hosts(job) > owners for job in jobs)):
         raise ValueError('focused selection and reviewed owner layout disagree')
     return jobs
@@ -447,6 +476,8 @@ def _qualify_observer(package_dir, spec):
     jobs = (workflow_input.cloud_campaign.make_focused_matrix(spec['selection'])
             if spec.get('mode') == 'focused'
             else workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k not in ('suite', 'reservation_hours')}))
+    if spec.get('selection') in workflow_input.cloud_campaign.M3_SELECTIONS:
+        jobs = [job for job in jobs if workflow_input.cloud_campaign.job_owner_hosts(job) == spec['owner_hosts']]
     digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     if proof.get('planned_cases') != len(jobs) or proof.get('matrix_sha256') != digest:
         raise ValueError('frozen observer qualified a different generated matrix')
@@ -605,6 +636,7 @@ def _evidence(store, bucket, state, name, output):
     meta = store.head(key)
     data = store.get(key, generation=meta['generation'], max_bytes=16 * 1024 * 1024)
     path = Path(output) / (name + '-diagnostic.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return {'file': str(path), 'reference': {'bucket': bucket, 'object': key,
             'generation': str(meta['generation']), 'sha256': _digest(data)}}
@@ -1443,7 +1475,9 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         fleet_state['preparation_evidence'] = [dict(bucket=config['bucket'], **item['_reference']) for item in prepared]
         await _blocking(campaign.save, fleet_path, fleet_state)
         await _blocking(_record, path, parent, 'pair')
-        async with asyncio.timeout(PAIR_SECONDS):
+        pair_seconds = qualify.M3_PAIR_SECONDS if spec.get("selection") in workflow_input.cloud_campaign.M3_SELECTIONS else PAIR_SECONDS
+        async with asyncio.timeout(min(pair_seconds + PAIR_CLEANUP_SECONDS,
+                campaign.parse_time(fleet_state['deadline']).timestamp() - time.time() - EXPORT_RESERVE_SECONDS)):
             statuses = await _joined_waiters(
                 _wait_status(store, fleet_state, host['name'], receipt['manifest_sha256'], host=host)
                 for host in fleet)

@@ -1246,9 +1246,18 @@ class ExplicitCgroupTests(unittest.TestCase):
         self.assertNotIn('cpu_seconds_total', text)
 
     def test_path_cannot_escape_the_selected_cgroup_mount(self):
-        for path in ('/system.slice/../other', '/../../etc', '/unrelated', '/system.slice//x'):
+        for path in ('/system.slice/../other', '/../../etc', '/unrelated', '/system.slice//x',
+                     '/kvowners.slice/x', '/user.slice/a'):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 campaign.cgroup_directory(self.root, path)
+
+    def test_exact_multi_owner_slice_is_readable(self):
+        group = self.root / ('kvowners' + 'a' * 24 + '.slice') / 'kvcloud-case-storage-15.service'
+        group.mkdir(parents=True)
+        (group / 'cpu.stat').write_text('usage_usec 2500000\n')
+        process = {'role': 'storage-15', 'cgroup': '/' + str(group.relative_to(self.root))}
+        text = campaign.process_payload(self.root, process, {})
+        self.assertIn('cpu_seconds_total{process_role="storage-15"} 2.5', text)
 
     def test_malformed_kernel_counter_is_unavailable_not_clamped(self):
         (self.group / 'cpu.stat').write_text('usage_usec -1\n')
@@ -1465,6 +1474,13 @@ class SealedSpdkExporterTests(unittest.TestCase):
         with patch.object(sys, "path", [str(Path(__file__).resolve().parent.parent), *sys.path]):
             import cloud_layout
             self.assertEqual(campaign.SEALED_OWNER_COUNTS, cloud_layout.OWNER_HOST_COUNTS)
+            self.assertEqual(campaign.MAX_SELECTED_PROCESSES, max(cloud_layout.LOGICAL_OWNER_COUNTS))
+            import cloud_controller
+            name, _ = cloud_controller.owner_slice_limits(
+                {'prefix': 'bench-' + '0' * 16,
+                 'fleet': {'server_cpus': 8, 'server_memory_mib': 16384}}, 'case')
+            self.assertIsNotNone(campaign.OWNER_SLICE_CGROUP.fullmatch(
+                '/' + name + '/kvcloud-case-storage-15.service'))
 
     def evidence(self, count=1):
         # Run 10 compact SPDK canary, trimmed to exporter fields.
@@ -1474,8 +1490,8 @@ class SealedSpdkExporterTests(unittest.TestCase):
                 "mean_read_completion_us": 75.01668017578125,
                 "owners": [row | {"index": i} for i in range(count)]}
 
-    def test_compact_and_five_owner_samples(self):
-        for count in (1, 5):
+    def test_all_admitted_owner_samples(self):
+        for count in (1, 2, 4, 5):
             with self.subTest(count=count):
                 text = campaign.spdk_target_metrics(self.evidence(count), {})
                 self.assertIn('target_owner="all"} 2048', text)
@@ -1484,11 +1500,11 @@ class SealedSpdkExporterTests(unittest.TestCase):
                 self.assertNotIn(f'target_owner="{count}"', text)
 
     def test_rejects_bad_owner_counts_and_indices(self):
-        for count in (0, 2, 3, 4, 6):
+        for count in (0, 3, 6, 16):
             with self.subTest(count=count), self.assertRaises(ValueError):
                 campaign.spdk_target_metrics(self.evidence(count), {})
         for indices in ([0, 1, 2, 3, 3], [0, 1, 2, 3, 5], [1],
-                        [True], ["0"], [None], [0, 1, 2, 3], [0, 1, 2, 3, 4, 5]):
+                        [True], ["0"], [None], [0, 2], [0, 1, 2, 3, 4, 5]):
             value = self.evidence(len(indices))
             for row, index in zip(value["owners"], indices):
                 row["index"] = index

@@ -285,7 +285,8 @@ class OwnerCountTests(unittest.TestCase):
     def test_inactive_hosts_have_no_owner_cgroup(self):
         config = config_fixture()
         job = {"backend": "tidehunter_tcp", "case_id": "case", "owner_count": 1}
-        self.assertEqual(len(controller.owned_monitor_processes(config, 0, job)["processes"]), 1)
+        with patch.object(controller, "unit_status", side_effect=lambda name: {"ControlGroup": "/system.slice/" + name}):
+            self.assertEqual(len(controller.owned_monitor_processes(config, 0, job)["processes"]), 1)
         for index in range(1, 5):
             self.assertEqual(controller.owned_monitor_processes(config, index, job)["processes"], [])
 
@@ -693,7 +694,8 @@ class ConfigTests(unittest.TestCase):
         config = config_fixture()
         job = next(job for job in controller.cloud_campaign.make_matrix(config["spec"])
                    if job["backend"] == "valkey_tcp")
-        coordinator = controller.owned_monitor_processes(config, -1, job)
+        with patch.object(controller, "unit_status", side_effect=lambda name: {"ControlGroup": "/system.slice/" + name}):
+            coordinator = controller.owned_monitor_processes(config, -1, job)
         self.assertEqual([item["role"] for item in coordinator["processes"]], ["client"])
         options = controller.cloud_layout.backend_options(config["fleet"], "valkey_tcp", "/tmp/client")
         self.assertEqual(options["nodes"], [f"10.0.0.{i+2}:6379" for i in range(5)])
@@ -1392,9 +1394,13 @@ class CommandSafetyTests(unittest.TestCase):
         else:
             runtime.all_hosts = Mock(return_value=[{"resource_accounting": {}} for _ in range(6)])
         runtime.observe_resource_interval = Mock(return_value={})
+        identities = [controller.uuid.uuid4() for _ in range(5)]
         runtime.prepare_tide = Mock(return_value={"external_remote_config": {"live_nvme": {
             "host_nqn": "nqn.2014-08.org.nvmexpress:uuid:12345678-1234-4234-8234-123456789abc",
-            "host_id": list(controller.uuid.UUID("12345678-1234-4234-8234-123456789abc").bytes)}}})
+            "host_id": list(controller.uuid.UUID("12345678-1234-4234-8234-123456789abc").bytes),
+            "owner_identities": {str(i): {"host_id": list(identity.bytes),
+                "host_nqn": "nqn.2014-08.org.nvmexpress:uuid:" + str(identity)}
+                for i, identity in enumerate(identities)}}}})
         runtime.stop_tide = Mock(side_effect=lambda: (_ for _ in ()).throw(
             controller.InfrastructureError("client quiescence unconfirmed; shared owner data retained"))
             if runtime.tide_cleanup_forbidden else None)
@@ -1447,7 +1453,7 @@ class CommandSafetyTests(unittest.TestCase):
                     return stack.enter_context(patch.object(obj, name, **kwargs))
                 mock(controller, "platform_module", return_value=Mock())
                 mock(controller, "live_nvme_preparation", return_value={
-                    "addresses": ["10.0.0.2"], "service": 4420})
+                    "addresses": ["10.0.0." + str(i + 2) for i in range(5)], "service": 4420})
                 mock(controller.cloud_campaign, "make_run_config", return_value=run_config)
                 mock(controller.campaign, "admit_config", return_value=admitted)
                 mock(controller.analyze, "verify_normalization")

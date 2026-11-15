@@ -321,7 +321,7 @@ impl Drop for ExternalPreparationStaging {
 pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<()> {
     let input: ExternalPreparationInput = serde_json::from_slice(&fs::read(input)?)?;
     if !input.guest_root.is_absolute()
-        || !matches!(input.addresses.len(), 1 | 2 | 5)
+        || !matches!(input.addresses.len(), 1 | 2 | 4 | 5 | 16)
         || input.max_batches_per_partition == 0
         || input.max_batches_per_partition > 1_000_000
         || !(1..=1024).contains(&input.max_epochs)
@@ -339,7 +339,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             && input.owner_wal_member_read
                 != tidehunter::distributed::storage::WalMemberReadPolicy::Async)
     {
-        return Err("external case requires one, two or five nodes, absolute guest_root, supported positive limits, and budgets including the 64MiB in-flight allowance".into());
+        return Err("external case requires one, two, four, five or sixteen owners, absolute guest_root, supported positive limits, and budgets including the 64MiB in-flight allowance".into());
     }
     if input.owner_wal_file_bytes.is_some_and(|bytes| {
         bytes < 2 * input.owner_wal_geometry.fragment_bytes()
@@ -365,14 +365,15 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
                 .addresses
                 .iter()
                 .any(|ip| ip.is_unspecified() || ip.is_multicast())
-            || live.addresses.iter().collect::<HashSet<_>>().len() != live.addresses.len()
             || !matches!(live.transport.as_str(), "tcp" | "rdma")
             || live.service == 0
             || live.port_id == 0
             || live.commissioning_service == 0
             || live.commissioning_port_id == 0
-            || live.service == live.commissioning_service
-            || live.port_id == live.commissioning_port_id
+            || live.commissioning_service.checked_add(2 * (input.addresses.len() as u16 - 1)).is_none()
+            || live.commissioning_service != live.service.checked_add(1).unwrap_or(0)
+            || live.commissioning_port_id.checked_add(2 * (input.addresses.len() as u16 - 1)).is_none()
+            || live.commissioning_port_id != live.port_id.checked_add(1).unwrap_or(0)
             || live.max_inflight_requests == 0
             || live.max_inflight_bytes == 0
             || live.connect_timeout_ms == 0
@@ -457,7 +458,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         DurabilityConfig::with_tier(input.durability_tier),
     )
     .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let live_identity = input.live_nvmeof.as_ref().map(|_| {
+    let live_identities: Vec<_> = (0..if input.live_nvmeof.is_some() { input.addresses.len() } else { 0 }).map(|_| {
         let mut id: [u8; 16] = rand::random();
         id[6] = (id[6] & 0x0f) | 0x40;
         id[8] = (id[8] & 0x3f) | 0x80;
@@ -467,7 +468,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15]
         );
         (id, nqn)
-    });
+    }).collect();
 
     let remote_path = prepared.join("remote.yaml");
     let mut remote: tidehunter::distributed::remote_db::RemoteDatabaseConfig =
@@ -478,14 +479,19 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     remote.read_cache_bytes = input.coordinator_cache_bytes;
     remote.read_memory_allowance_bytes = input.coordinator_read_memory_allowance_bytes;
     #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    if let (Some(live), Some((host_id, host_nqn))) = (&input.live_nvmeof, &live_identity) {
+    if let Some(live) = &input.live_nvmeof {
+        let (host_id, host_nqn) = &live_identities[0];
         remote.live_nvme = Some(tidehunter::distributed::tcp::LiveClientConfig {
             lease_ahead: live.lease_ahead,
             polled_writes: live.polled_writes,
             export_mode: live.export_mode,
             host_nqn: host_nqn.clone(),
             host_id: *host_id,
-            owner_identities: Default::default(),
+            owner_identities: live_identities.iter().enumerate().map(|(partition, (id, nqn))| {
+                (partition as u32, tidehunter::distributed::tcp::LiveInitiatorIdentity {
+                    host_id: *id, host_nqn: nqn.clone(),
+                })
+            }).collect(),
             max_inflight_requests: live.max_inflight_requests,
             leased_write_window: live.leased_write_window,
             leased_sync: live.leased_sync,
@@ -525,16 +531,18 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         let mut launch: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&launch_path)?)?;
         launch["history_persistence"] = serde_yaml::to_value(input.history_persistence)?;
         fs::write(&launch_path, serde_yaml::to_string(&launch)?)?;
-        if let (Some(live), Some((_, host_nqn))) = (&input.live_nvmeof, &live_identity) {
+        if let Some(live) = &input.live_nvmeof {
+            let (_, host_nqn) = &live_identities[partition as usize];
+            let port_offset = 2 * partition as u16;
             let config = serde_json::json!({
                 "address": live.addresses[partition as usize].to_string(),
-                "service": live.service,
+                "service": live.service + port_offset,
                 "transport": live.transport,
                 "host_nqn": host_nqn,
-                "port_id": live.port_id,
+                "port_id": live.port_id + port_offset,
                 "state_dir": input.guest_root.join(format!("node-{partition}")).join("live-nvmeof"),
-                "commissioning_port_id": live.commissioning_port_id,
-                "commissioning_service": live.commissioning_service,
+                "commissioning_port_id": live.commissioning_port_id + port_offset,
+                "commissioning_service": live.commissioning_service + port_offset,
                 "export_mode": live.export_mode
             });
             launch["node"]["live_target"] = serde_yaml::to_value(config)?;
@@ -726,8 +734,8 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
     {
         return Err(format!("{name} path and evidence path must not be empty").into());
     }
-    if !matches!(options.owners, 1 | 2 | 5) {
-        return Err(format!("{name} owners must be one of 1, 2, or 5").into());
+    if !matches!(options.owners, 1 | 2 | 4 | 5 | 16) {
+        return Err(format!("{name} owners must be one of 1, 2, 4, 5, or 16").into());
     }
     if options.key_count == 0 || options.max_batches_per_partition == 0 {
         return Err("key_count and max_batches_per_partition must be positive".into());
@@ -2861,8 +2869,9 @@ mod tests {
                     format!("10.1.0.{}", partition + 1)
                 );
                 assert_eq!(target["transport"].as_str().unwrap(), "rdma");
-                assert_eq!(target["host_nqn"].as_str(), Some(host_nqn));
-                assert_eq!(target["commissioning_service"].as_u64(), Some(4421));
+                let owner_identity = &remote["live_nvme"]["owner_identities"][partition.to_string()];
+                assert_eq!(target["host_nqn"].as_str(), owner_identity["host_nqn"].as_str());
+                assert_eq!(target["commissioning_service"].as_u64(), Some(4421 + 2 * partition));
             }
             config["live_nvmeof"]["export_mode"] = serde_json::json!("per_owner");
             config["live_nvmeof"]["write_mode"] = serde_json::json!("leased");
@@ -2882,6 +2891,33 @@ mod tests {
                     Some("per_owner")
                 );
             }
+            for count in [1, 2, 4, 16] {
+                config["addresses"] = serde_json::json!((0..count)
+                    .map(|owner| format!("10.1.0.1:{}", 9400 + owner)).collect::<Vec<_>>());
+                config["live_nvmeof"]["addresses"] = serde_json::json!(vec!["10.1.0.1"; count]);
+                write_input(&config);
+                let colocated = root.join(format!("colocated-{count}"));
+                prepare_external_case_file(&input, &colocated).unwrap();
+                let remote: serde_json::Value = serde_json::from_slice(
+                    &fs::read(colocated.join("remote.json")).unwrap()).unwrap();
+                let identities = remote["live_nvme"]["owner_identities"].as_object().unwrap();
+                assert_eq!(identities.len(), count);
+                let mut nqns = HashSet::new();
+                for owner in 0..count {
+                    let launch: serde_yaml::Value = serde_yaml::from_slice(
+                        &fs::read(colocated.join(format!("node-{owner}/launch.yaml"))).unwrap()).unwrap();
+                    let target = &launch["node"]["live_target"];
+                    assert!(nqns.insert(target["host_nqn"].as_str().unwrap().to_owned()));
+                    assert_eq!(target["service"].as_u64(), Some(4420 + 2 * owner as u64));
+                    assert_eq!(target["port_id"].as_u64(), Some(4420 + 2 * owner as u64));
+                    assert_eq!(target["state_dir"].as_str().unwrap(),
+                               root.join(format!("guest/node-{owner}/live-nvmeof")).to_str().unwrap());
+                }
+            }
+            config["addresses"] = serde_json::json!((1..=5)
+                .map(|owner| format!("10.1.0.{owner}:9400")).collect::<Vec<_>>());
+            config["live_nvmeof"]["addresses"] = serde_json::json!(
+                ["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"]);
             config["live_nvmeof"]["export_mode"] = serde_json::json!("on_demand");
             config["live_nvmeof"]["queue_geometry"] =
                 serde_json::json!({"io_queues": 2, "queue_size": 32, "poll_queues": 0});
@@ -2923,7 +2959,7 @@ mod tests {
                     );
                 }
             }
-            config["live_nvmeof"]["addresses"][1] = serde_json::json!("10.1.0.1");
+            config["addresses"][1] = config["addresses"][0].clone();
             write_input(&config);
             let invalid = root.join("live-duplicate");
             assert!(prepare_external_case_file(&input, &invalid).is_err());

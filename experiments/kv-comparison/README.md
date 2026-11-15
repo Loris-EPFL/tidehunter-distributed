@@ -20,6 +20,21 @@ Linux Docker Engine with Compose v2 is required; host networking and distinct
 loopback addresses are deliberate. Docker Desktop is not supported by this layout.
 The local helpers require no credential, OIDC role, cloud account, subscription or paid workflow.
 
+The Tidehunter-only M3 selections are `nvmeof_m3_t1` (4 or 16 logical owners
+on one owner VM), `nvmeof_m3_t2_2` (two owner VMs), and `nvmeof_m3_t2_5`
+(five owner VMs). Each uses one coordinator. Co-located owners share one flat,
+case-specific hashed systemd slice with a host-wide CPU and memory cap; process
+monitoring reads each service's actual `ControlGroup`. Cleanup stops all owners
+before removing only that slice's configuration. Read-memory allowances are
+read-path limits, not budgets for the retained coordinator index and history.
+Selections contain11/8/11 cases. Each case starts a fresh owner set and admits
+all its owners concurrently (at most16 processes), with95s per owner plus5s
+planning margin for the set. Client deadlines are six times preload, warmup,
+window and28s fleet-derived overhead, rounded up with a180s floor. The reviewed
+two-hour budget test includes admission, qualification cleanup, preparation and
+export. Redundant c256 cells and three T2-5 repeated c16 cells were removed;
+every topology, operation and value size remains represented.
+
 `nvmeof_contracts_crossing` keeps the 34 reviewed `nvmeof_contracts` jobs and
 appends one instrumented synchronous leased-write case (`G22W`). It uses
 128 MiB fragments, 256 MiB owner WAL files and 16,384 measured 64 KiB puts.

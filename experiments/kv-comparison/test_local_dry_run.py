@@ -9,6 +9,22 @@ import cloud_controller
 
 
 class OperationScalingTests(unittest.TestCase):
+    def test_layout_inventory_does_not_own_local_client_lifecycle(self):
+        mode = object.__new__(local_dry_run.LocalMode)
+        mode.cloud = cloud_controller
+        mode.config = {}
+        mode.layout_fleet = {}
+        mode.layout_backend = "tikv"
+        mode.units = set()
+        mode.valkey = None
+        job = {"backend": "tikv", "case_id": "case"}
+        evidence = {"processes": [], "missing": [{"role": "client", "reason": "not started"}]}
+        with mock.patch.object(cloud_controller, "unit_name", return_value="client"), mock.patch.object(
+                cloud_controller, "owned_monitor_processes", return_value=evidence):
+            self.assertEqual(mode.owned_processes(-1, job), [])
+            evidence["missing"].append({"role": "tikv", "reason": "identity unavailable"})
+            with self.assertRaises(RuntimeError):
+                mode.owned_processes(-1, job)
     def test_runtime_environment_applies_peer_limit_to_subprocesses(self):
         import os
         with mock.patch.dict(os.environ, {"FI_UNIVERSE_SIZE": "1024"}):

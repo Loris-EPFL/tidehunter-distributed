@@ -13,10 +13,14 @@ import time
 
 import exporter
 
+# Match the maximum admitted co-located logical-owner population (pinned in tests).
+MAX_SELECTED_PROCESSES = 16
+OWNER_SLICE_CGROUP = re.compile(r"/kvowners[0-9a-f]{24}\.slice/kvcloud-[A-Za-z0-9_-]+\.service")
+
 MAX_SELECTION = 1024 * 1024
 MAX_CGROUP_FILE = 256 * 1024
-# Match the compact and five-owner fleet layouts.
-SEALED_OWNER_COUNTS = (1, 5)
+# Match the admitted physical owner fleet layouts (pinned in tests).
+SEALED_OWNER_COUNTS = (1, 2, 4, 5)
 TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 METRIC = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
 LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")')
@@ -1940,7 +1944,7 @@ def cgroup_directory(root, relative):
     parts = relative[1:].split("/")
     if not parts or any(not part or part in (".", "..") or not re.fullmatch(r"[A-Za-z0-9_.:@-]+", part) for part in parts):
         raise ValueError("invalid cgroup components")
-    if parts[0] not in ("system.slice", "docker"):
+    if parts[0] not in ("system.slice", "docker") and not OWNER_SLICE_CGROUP.fullmatch(relative):
         raise ValueError("only explicitly owned service/container cgroups are supported")
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -2167,8 +2171,8 @@ def host_payload(config, selection):
         raise ValueError("unexpected host selection fields")
     labels = context(config["run_id"], selection["job"])
     processes = selection["processes"]
-    if not isinstance(processes, list) or len(processes) > 8:
-        raise ValueError("at most eight explicitly selected cgroups")
+    if not isinstance(processes, list) or len(processes) > MAX_SELECTED_PROCESSES:
+        raise ValueError("explicitly selected cgroups exceed admitted host population")
     roles = [process.get("role") for process in processes if isinstance(process, dict)]
     if len(roles) != len(processes) or len(roles) != len(set(roles)):
         raise ValueError("duplicate/invalid process roles")
