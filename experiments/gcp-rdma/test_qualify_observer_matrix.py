@@ -38,7 +38,7 @@ class ObserverMatrixQualification(unittest.TestCase):
             with self.subTest(selection=selection):
                 spec = manual_campaign.REVIEWED_SPECS[selection]
                 if selection == 'nvmeof_parallel_writes':
-                    self.assertEqual(spec['matrix_sha256'], 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
+                    self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 jobs = qualification.cloud_campaign.make_focused_matrix(selection)
                 direct = [job for job in jobs if job.get('target_io') == 'direct']
                 if selection not in ('stages', 'unified'):
@@ -77,7 +77,7 @@ class ObserverMatrixQualification(unittest.TestCase):
                 import manual_campaign
                 spec = manual_campaign.REVIEWED_SPECS[selection]
                 if selection == 'nvmeof_parallel_writes':
-                    self.assertEqual(spec['matrix_sha256'], 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
+                    self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 jobs = qualification.cloud_campaign.make_focused_matrix(selection)
                 self.assertEqual(len(jobs), expected_count)
                 self.assertEqual({job['backend'] for job in jobs},

@@ -163,7 +163,7 @@ class FocusedAdmissionTest(unittest.TestCase):
             with self.subTest(selection=selection):
                 spec = copy.deepcopy(manual.REVIEWED_SPECS[selection])
                 if selection == 'nvmeof_parallel_writes':
-                    self.assertEqual(spec['matrix_sha256'], 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
+                    self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 jobs = manual._reviewed_jobs(spec)
                 self.assertEqual(len(jobs), expected_count)
                 self.assertEqual(spec['max_cases'], expected_count)

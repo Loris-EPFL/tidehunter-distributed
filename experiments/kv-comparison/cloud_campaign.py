@@ -1654,8 +1654,8 @@ def _nvmeof_parallel_writes(path):
                 for repeat in (0, 1):
                     _clone_job(result, selection, source, "G23W", repeat=repeat,
                                **({"live_leased_write_window": window} if window is not None else {}),
-                               diagnostics={"write_timeline_limit": 4096}
-                               if size == 65536 and repeat == 0 else None)
+                               **({"diagnostics": {"write_timeline_limit": 4096}}
+                                  if size == 65536 and repeat == 0 else {}))
         for concurrency in (1, 64):
             source = _clone_source(sources, "G21W", "tidehunter_nvme_rdma", 65536, 1,
                                    durability_tier=tier, diagnostics=None)

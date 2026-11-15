@@ -85,7 +85,7 @@ class RiskOrderTests(unittest.TestCase):
                 original = [job['case_id'] for job in jobs]
                 order = risk_order.generate_order(jobs)
                 if selection == 'nvmeof_parallel_writes':
-                    self.assertEqual(order['matrix_sha256'], 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
+                    self.assertEqual(order['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 self.assertEqual(order['case_ids'][:12], original[:12])
                 self.assertEqual(order['case_ids'], original)
                 for left, right in ((0, 1), (min(12, len(jobs)//2), min(13, len(jobs)//2+1)), (len(jobs) - 2, len(jobs) - 1)):

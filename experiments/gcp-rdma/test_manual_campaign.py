@@ -148,7 +148,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
                     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
                     'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
-                    'nvmeof_parallel_writes': 'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70',
+                    'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
                     'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
                     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
                 }[selection])
@@ -2313,7 +2313,7 @@ class ParallelWritesSuiTests(CombinedSuiAdmissionTests):
         spec = self.sui.REVIEWED_SUI_SPECS[self.spec_name]
         self.assertEqual(spec['job_count'], 44)
         self.assertEqual(spec['matrix_sha256'],
-                         'e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70')
+                         '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
         jobs = manual._reviewed_jobs(spec)
         self.assertEqual(len(jobs), 44)
         self.assertEqual({group: sum(job['group'] == group for job in jobs)

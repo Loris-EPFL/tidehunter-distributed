@@ -17,9 +17,11 @@ class FocusedMatrixTests(unittest.TestCase):
         self.assertEqual(len(jobs), 44)
         self.assertEqual(Counter(j["group"] for j in jobs), {"G23W": 32, "G23X": 6, "G23N": 6})
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                         "e97badf8a942f01eb3ba51068f084599cd7c945b9ff88e9d26a7794672956c70")
+                         "64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4")
         writes = [j for j in jobs if j["group"] == "G23W"]
         self.assertEqual(sum(bool(j.get("diagnostics")) for j in writes), 6)
+        # The controller reads `diagnostics` as a mapping; an explicit null stopped fleet F1.
+        self.assertFalse(any("diagnostics" in j and not isinstance(j["diagnostics"], dict) for j in jobs))
         expected_writes = {
             (tier, size, 16, window, repeat)
             for tier in ("synchronous", "native") for size in (65536, 1024)
