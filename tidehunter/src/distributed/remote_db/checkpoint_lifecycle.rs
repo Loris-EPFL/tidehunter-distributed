@@ -432,7 +432,11 @@ impl RemoteDatabase {
                             None,
                             Some(generation),
                         );
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_staging_before");
                         persist_manifest(&path, &staging_manifest)?;
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_staging_after");
                         let staging_manifest_ns = phase_started.map(elapsed);
                         timeline.checkpoint_generation(
                             "staging_manifest_end",
@@ -726,9 +730,13 @@ impl RemoteDatabase {
                             None,
                             Some(generation),
                         );
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_image_before");
                         let persisted = prepared
                             .persist(&path.join(commit.index_name()))
                             .map_err(LocalDbError::component)?;
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_image_after");
                         let index_persist_ns = phase_started.map(elapsed);
                         timeline.checkpoint_generation(
                             "index_persist_end",
@@ -801,8 +809,12 @@ impl RemoteDatabase {
                             None,
                             Some(generation),
                         );
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_metadata_before");
                         install_metadata(&path, &commit.metadata_name(), &encoded)
                             .map_err(LocalDbError::component)?;
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_metadata_after");
                         let metadata_install_ns = phase_started.map(elapsed);
                         timeline.checkpoint_generation(
                             "metadata_install_end",
@@ -844,7 +856,11 @@ impl RemoteDatabase {
                             None,
                             Some(generation),
                         );
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_root_before");
                         persist_manifest(&path, &staging_manifest)?;
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_root_after");
                         let root_adoption_ns = phase_started.map(elapsed);
                         timeline.checkpoint_generation(
                             "root_persist_end",
@@ -1039,6 +1055,8 @@ impl RemoteDatabase {
                                 None,
                                 Some(completed.commit.generation),
                             );
+                            #[cfg(test)]
+                            crate::failpoints::write_model::boundary("checkpoint_install_before");
                             self.index.writer().begin_install_image(persisted);
                         }
                         loop {
@@ -1057,6 +1075,8 @@ impl RemoteDatabase {
                                 return Ok(());
                             }
                         }
+                        #[cfg(test)]
+                        crate::failpoints::write_model::boundary("checkpoint_install_after");
                         let mut diagnostic = CheckpointDiagnostic {
                             epoch: completed.commit.epoch,
                             generation: Some(completed.commit.generation),

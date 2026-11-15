@@ -73,29 +73,35 @@ impl Fixture {
         group_max_batches: u32,
         configure: impl FnOnce(&mut RemoteDatabaseConfig),
     ) -> Self {
-        Self::new_with_tier(
-            crate::distributed::durability::DurabilityTier::Native,
+        Self::new_with_root(
+            tempdir::TempDir::new("remote-pipeline-mtls").unwrap(),
+            5,
             max_batches,
             shape,
             group_max_batches,
             configure,
+            |config| StorageNode::open(config, metrics()).unwrap(),
         )
     }
 
-    fn new_with_tier(
-        tier: crate::distributed::durability::DurabilityTier,
+    pub(super) fn new_with_root(
+        temp: tempdir::TempDir,
+        owner_count: usize,
         max_batches: usize,
         shape: KeyShape,
         group_max_batches: u32,
         configure: impl FnOnce(&mut RemoteDatabaseConfig),
+        open_node: impl Fn(NodeConfig) -> Arc<StorageNode>,
     ) -> Self {
-        let temp = tempdir::TempDir::new("remote-pipeline-mtls").unwrap();
-        let certs = tls_material::TestCertificates::generate(&temp.path().join("tls"), 5).unwrap();
+        assert!((1..=16).contains(&owner_count));
+        let tier = crate::distributed::durability::DurabilityTier::Native;
+        let certs = tls_material::TestCertificates::generate(&temp.path().join("tls"), owner_count)
+            .unwrap();
         let mut config = RemoteDatabaseConfig {
             history_persistence: HistoryPersistence::default(),
             storage: LocalInventoryConfig {
                 database: [71; 16],
-                partitions: vec![0, 1, 2, 3, 4],
+                partitions: (0..owner_count as u32).collect(),
                 batch_limits: BatchLimits {
                     max_operations: 4,
                     max_encoded_bytes: 2048,
@@ -160,7 +166,7 @@ impl Fixture {
                 read_max_device_reads: 128,
                 live_target: None,
             };
-            let node = StorageNode::open(node_config.clone(), metrics()).unwrap();
+            let node = open_node(node_config.clone());
             node.set_history_persistence(config.history_persistence)
                 .unwrap();
             node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(

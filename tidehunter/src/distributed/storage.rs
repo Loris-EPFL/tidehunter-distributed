@@ -3725,6 +3725,8 @@ impl PartitionLog {
             // The held state lock keeps this provisional poison private on success.
             state.poison = Some(WriterPoison::Fatal);
             timing.stage(Some(WriteStage::AppendWal));
+            #[cfg(test)]
+            crate::failpoints::write_model::boundary("append_before");
             let guard = match state
                 .writer
                 .as_ref()
@@ -3740,6 +3742,8 @@ impl PartitionLog {
             let position = *guard.wal_position();
             let group_end = position.offset() + position.frame_len() as u64;
             drop(guard); // Native storage copy only, never native index publication.
+            #[cfg(test)]
+            crate::failpoints::write_model::boundary("append_after");
             timing.stage(Some(WriteStage::AppendPublication));
             let mut receipts = Vec::with_capacity(group.batches().len());
             let mut group_metadata = Vec::with_capacity(group.batches().len());
@@ -3982,7 +3986,11 @@ impl PartitionLog {
                 "injected namespace persistence failure after file sync",
             ));
         }
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("namespace_sync_before");
         self.wal.persist_namespace()?;
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("namespace_sync_after");
         timing.record(|profile| {
             profile.namespace_persist_successes =
                 profile.namespace_persist_successes.saturating_add(1);
@@ -4113,7 +4121,11 @@ impl PartitionLog {
                 let offset = file_id
                     .checked_mul(self.config().wal_file_bytes)
                     .ok_or_else(|| io::Error::other("WAL file offset overflow"))?;
+                #[cfg(test)]
+                crate::failpoints::write_model::boundary("file_sync_before");
                 self.wal.persist_frame_file(WalPosition::new(offset, 1))?;
+                #[cfg(test)]
+                crate::failpoints::write_model::boundary("file_sync_after");
                 timing.record(|profile| {
                     profile.file_persist_successes =
                         profile.file_persist_successes.saturating_add(1);

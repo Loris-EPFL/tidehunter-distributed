@@ -1079,6 +1079,13 @@ impl LiveIo {
             };
             self.stats.queue_ns += started.duration_since(op.queued).as_nanos();
             op.submitted = Some(started);
+            #[cfg(test)]
+            crate::failpoints::write_model::submitted(
+                op.write,
+                self.requests
+                    .get(&op.request)
+                    .is_some_and(|request| request.flush),
+            );
             if let (Some(trace), Some(queue)) = (
                 self.requests
                     .get(&op.request)

@@ -45,6 +45,44 @@ struct LiveTargetMarker {
     identity: super::super::nvmeof::live_target::LiveTargetIdentity,
 }
 
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+std::thread_local! {
+    static LIVE_FIXTURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Select only configfs emulation; `open` still commissions and validates the
+/// normal durable marker while holding the node lock, before recovering WALs.
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+pub(super) fn with_live_target_fixture<R>(configfs: PathBuf, open: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LIVE_FIXTURE.with(|fixture| fixture.borrow_mut().take());
+        }
+    }
+    LIVE_FIXTURE.with(|fixture| assert!(fixture.borrow_mut().replace(configfs).is_none()));
+    let _reset = Reset;
+    open()
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+fn open_live_target_fixture(
+    config: super::super::nvmeof::LiveTargetConfig,
+    expected: Option<super::super::nvmeof::live_target::LiveTargetIdentity>,
+) -> io::Result<super::super::nvmeof::live_target::LiveTargetManager> {
+    use super::super::nvmeof::live_target::LiveTargetManager;
+    if let Some(configfs) = LIVE_FIXTURE.with(|fixture| fixture.borrow().clone()) {
+        return match expected {
+            Some(identity) => LiveTargetManager::open_existing_fixture(config, configfs, identity),
+            None => LiveTargetManager::open_fixture(config, configfs),
+        };
+    }
+    match expected {
+        Some(identity) => LiveTargetManager::open_existing(config, identity),
+        None => LiveTargetManager::open(config),
+    }
+}
+
 pub struct NodeInventory {
     pub(super) config: NodeConfig,
     pub(super) shape: KeyShape,
@@ -363,6 +401,7 @@ impl NodeInventory {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live_target = {
             let marker = config.root.join(LIVE_TARGET_CONFIG);
+            #[cfg(not(test))]
             use super::super::nvmeof::live_target::LiveTargetManager;
             match fs::symlink_metadata(&marker) {
                 Ok(metadata) if metadata.file_type().is_file() => {
@@ -373,10 +412,13 @@ impl NodeInventory {
                             "live target configuration required and must match persisted configuration",
                         ));
                     }
-                    Some(
-                        LiveTargetManager::open_existing(saved.config, saved.identity)
-                            .map_err(TcpError::component)?,
-                    )
+                    #[cfg(test)]
+                    let manager = open_live_target_fixture(saved.config, Some(saved.identity))
+                        .map_err(TcpError::component)?;
+                    #[cfg(not(test))]
+                    let manager = LiveTargetManager::open_existing(saved.config, saved.identity)
+                        .map_err(TcpError::component)?;
+                    Some(manager)
                 }
                 Ok(_) => {
                     return Err(TcpError::new(
@@ -395,6 +437,10 @@ impl NodeInventory {
                         }
                     }
                     if let Some(target_config) = config.live_target.clone() {
+                        #[cfg(test)]
+                        let manager = open_live_target_fixture(target_config.clone(), None)
+                            .map_err(TcpError::component)?;
+                        #[cfg(not(test))]
                         let manager = LiveTargetManager::open(target_config.clone())
                             .map_err(TcpError::component)?;
                         let saved = LiveTargetMarker {

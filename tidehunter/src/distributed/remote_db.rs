@@ -3523,10 +3523,14 @@ impl RemoteDatabase {
                         }
                     }
                 }
+                #[cfg(test)]
+                crate::failpoints::write_model::boundary("publication_before");
                 routing
                     .publish_authenticated(batch, durable, index)
                     .map_err(LocalDbError::component)?;
                 index.promote_committed().map_err(LocalDbError::component)?;
+                #[cfg(test)]
+                crate::failpoints::write_model::boundary("publication_after");
                 *live_latest = Some(live_latest.map_or(entry.last_mutation, |previous| {
                     previous.max(entry.last_mutation)
                 }));
@@ -6583,5 +6587,7 @@ mod pipeline_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod model_check_tests;
 #[cfg(test)]
 mod wal_replay_tests;

@@ -270,6 +270,15 @@ impl LiveTargetManager {
         Self::open_inner(config, configfs, true, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_existing_fixture(
+        config: LiveTargetConfig,
+        configfs: PathBuf,
+        expected: LiveTargetIdentity,
+    ) -> io::Result<Self> {
+        Self::open_inner(config, configfs, true, Some(expected))
+    }
+
     pub fn open(config: LiveTargetConfig) -> io::Result<Self> {
         if config.spdk.is_none() {
             check_configfs()?;

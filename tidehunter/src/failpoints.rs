@@ -56,3 +56,106 @@ impl FailPoint {
         (self.fp)()
     }
 }
+
+/// Process-crash cuts for the distributed model checker. The arm step excludes
+/// initialization and recovery. Nothing in this module exists in production.
+#[cfg(all(test, feature = "experimental-distributed"))]
+pub(crate) mod write_model {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    pub(crate) const CRASH_EXIT: i32 = 86;
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    #[cfg(feature = "experimental-nvmeof")]
+    static FLUSH_SUBMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    struct State {
+        trace: File,
+        target: String,
+        acknowledged: usize,
+        after_acks: usize,
+        enabled: bool,
+    }
+
+    pub(crate) fn arm(trace: &std::path::Path, target: String, after_acks: usize) {
+        assert!(after_acks >= 7);
+        assert!(
+            STATE
+                .set(Mutex::new(State {
+                    trace: OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(trace)
+                        .unwrap(),
+                    target,
+                    acknowledged: 1,
+                    after_acks,
+                    enabled: false,
+                }))
+                .is_ok()
+        );
+    }
+
+    pub(crate) fn acknowledged() {
+        if let Some(state) = STATE.get() {
+            state.lock().unwrap().acknowledged += 1;
+        }
+    }
+
+    /// Enable only at a quiescent, seed-selected acknowledged prefix. Physical
+    /// grouping and background sync counts cannot move or remove this gate.
+    pub(crate) fn open_gate() {
+        let mut state = STATE.get().unwrap().lock().unwrap();
+        assert_eq!(state.acknowledged, state.after_acks);
+        let acknowledged = state.acknowledged;
+        writeln!(state.trace, "gate_after_acks={acknowledged}").unwrap();
+        state.enabled = true;
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn submitted(write: bool, flush: bool) {
+        if flush {
+            // Relaxed: this is an independent test observation, not a hand-off.
+            FLUSH_SUBMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if write {
+            boundary(if flush {
+                "flush_submitted_to_kernel"
+            } else {
+                "write_submitted_to_kernel"
+            });
+        }
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn flush_submissions() -> u64 {
+        // Relaxed: callers observe this after draining their own I/O.
+        FLUSH_SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn adoption(actual: bool, submitted: bool) {
+        if actual {
+            boundary(if submitted {
+                "leased_adoption_submitted"
+            } else {
+                "leased_adoption_completed"
+            });
+        }
+    }
+
+    pub(crate) fn boundary(name: &'static str) {
+        let Some(state) = STATE.get() else { return };
+        let mut state = state.lock().unwrap();
+        if !state.enabled {
+            return;
+        }
+        writeln!(state.trace, "{name}").unwrap();
+        if name == state.target {
+            // A whole-process exit kills owner, syncer, checkpoint and caller
+            // threads together, without destructors or a shutdown checkpoint.
+            std::process::exit(CRASH_EXIT);
+        }
+    }
+}

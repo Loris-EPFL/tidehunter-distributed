@@ -704,6 +704,10 @@ impl super::Client {
                 self.drain_live_writer(&mut Vec::new(), None)?;
             }
             self.live_config = Some(selected.into_owned());
+            #[cfg(test)]
+            {
+                self.live_write_local_fixture |= std::env::var_os("TH_MODEL_CHILD_ROOT").is_some();
+            }
         }
         Ok(())
     }
@@ -1614,6 +1618,11 @@ impl super::Client {
             self.live_write_failed = true;
         }
         if result.is_ok() {
+            #[cfg(test)]
+            crate::failpoints::write_model::adoption(
+                pending.target != PendingTarget::Prelease,
+                false,
+            );
             if pending.target != PendingTarget::Prelease
                 && let (Some(started), Some(counters)) = (started, &self.live_counters)
             {
@@ -1676,6 +1685,8 @@ impl super::Client {
         };
         match result {
             Ok(true) => {
+                #[cfg(test)]
+                crate::failpoints::write_model::adoption(target != PendingTarget::Prelease, true);
                 self.live_leased.pending_started = Some(Instant::now());
                 self.live_leased.pending = Some(PendingAdoption {
                     through,
@@ -1760,6 +1771,8 @@ impl super::Client {
         }
         let reply = self.adopt_live_extent(epoch, token, pending.through, close, lease_next)?;
         self.check_leased_adoption(pending, &reply)?;
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("leased_adoption_completed");
         if let Some(current) = self.live_leased.current.as_mut() {
             current.declared_through = current.written_end;
         }
@@ -2304,6 +2317,8 @@ impl super::Client {
                 }
                 self.live_leased.flushed_through_seq = covers_seq;
                 self.live_leased.flush_in_flight = None;
+                #[cfg(test)]
+                crate::failpoints::write_model::boundary("leased_flush_completed");
                 continue;
             }
             let Some(flight) = self
@@ -2347,6 +2362,8 @@ impl super::Client {
                 );
             }
             flight.completed = true;
+            #[cfg(test)]
+            crate::failpoints::write_model::boundary("leased_frame_completed");
         }
         if self
             .live_leased
@@ -2456,6 +2473,8 @@ impl super::Client {
                     timeline.live_group_event(flight.sample, Stage::LiveReceiptsValidated);
                 }
                 released.push((flight.id, flight.receipts));
+                #[cfg(test)]
+                crate::failpoints::write_model::boundary("leased_receipt_released");
             }
         }
         if self.live_leased.flights.is_empty() {
@@ -2765,6 +2784,8 @@ impl super::Client {
                 );
             }
             timeline.live_group_event(sample, Stage::LiveExtentSwitchCompleted);
+            #[cfg(test)]
+            crate::failpoints::write_model::boundary("leased_extent_switched");
         }
         let current = self
             .live_leased
@@ -5555,6 +5576,10 @@ impl super::Client {
     pub(crate) fn leased_test_single_batch_groups(&mut self) {
         self.expected.group_limits.max_batches = 1;
     }
+    pub(crate) fn leased_test_hold_next_completion(&mut self) {
+        let id = self.live_leased.next_flight_id.checked_add(1).unwrap();
+        self.leased_test_hold_completions(&[id]);
+    }
     pub(crate) fn leased_test_hold_completions(&mut self, ids: &[u64]) {
         if self.live_leased.current.is_none() {
             let leased = self.lease_live_extent(1).unwrap();
@@ -5612,6 +5637,20 @@ impl super::Client {
 
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 impl super::StorageNode {
+    pub(crate) fn bench_open_live_fixture(
+        config: super::NodeConfig,
+        metrics: std::sync::Arc<crate::metrics::Metrics>,
+        configfs: std::path::PathBuf,
+    ) -> Result<std::sync::Arc<Self>, super::TcpError> {
+        let mut node =
+            super::inventory::with_live_target_fixture(configfs, || Self::open(config, metrics))?;
+        // Match the existing local-file fixture: allow owner RPC oracle reads,
+        // but keep the commissioned target/marker and the real leased writer.
+        std::sync::Arc::get_mut(&mut node)
+            .unwrap()
+            .live_nvme_selected = false;
+        Ok(node)
+    }
     pub(crate) fn bench_install_live_target(
         &self,
         target: crate::distributed::nvmeof::live_target::LiveTargetManager,
