@@ -133,7 +133,7 @@ impl LiveClientConfig {
         65536
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(any(test, all(feature = "experimental-nvmeof", target_os = "linux")))]
     fn for_owner(&self, partition: u32) -> Result<std::borrow::Cow<'_, Self>, &'static str> {
         if self.owner_identities.is_empty() {
             return Ok(std::borrow::Cow::Borrowed(self));

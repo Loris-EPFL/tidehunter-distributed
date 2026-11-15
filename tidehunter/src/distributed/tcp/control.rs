@@ -513,12 +513,12 @@ impl ControlOwner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn session_barrier_waits(&self) -> u64 {
         self.shared.session_barrier_waits.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn exclusive_waits_for_stream(&self) -> bool {
         let queue = self.shared.queue.lock();
         queue.active_appends != 0

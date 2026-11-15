@@ -1,16 +1,10 @@
 name: Local KV adapter qualification
 
 on:
+  push:
+    branches: [feat/two-vm-remote-read-write, p8-ci]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'benchmarks/kv-research/**'
-      - 'experiments/kv-comparison/**'
-      - '.github/workflows/kv-comparison.yaml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'tidehunter/**'
-      - 'tidehunter-fabric/**'
   workflow_dispatch:
     inputs:
       backends:
@@ -29,6 +23,7 @@ env:
   CARGO_BUILD_JOBS: '2'
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
+  RUST_TEST_THREADS: '1'
 
 jobs:
   qualification:
