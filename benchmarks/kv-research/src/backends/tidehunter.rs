@@ -159,6 +159,8 @@ struct ExternalLiveNvmeof {
     leased_write_window: Option<usize>,
     #[serde(default)]
     leased_sync: tidehunter::distributed::tcp::LeasedSync,
+    #[serde(default)]
+    leased_flush_min_frame_bytes: usize,
     max_inflight_bytes: usize,
     connect_timeout_ms: u64,
     io_timeout_ms: u64,
@@ -485,6 +487,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             max_inflight_requests: live.max_inflight_requests,
             leased_write_window: live.leased_write_window,
             leased_sync: live.leased_sync,
+            leased_flush_min_frame_bytes: live.leased_flush_min_frame_bytes,
             max_inflight_bytes: live.max_inflight_bytes,
             connect_timeout_ms: live.connect_timeout_ms,
             io_timeout_ms: live.io_timeout_ms,
@@ -1187,6 +1190,12 @@ async fn open_for(
             .live_nvme
             .as_ref()
             .map(|live| live.leased_sync)
+    );
+    effective_configuration["live_leased_flush_min_frame_bytes"] = serde_json::json!(
+        remote_config
+            .live_nvme
+            .as_ref()
+            .map(|live| live.leased_flush_min_frame_bytes)
     );
     effective_configuration["live_leased_write_window_bound"] =
         serde_json::json!(remote_config.live_nvme.as_ref().map(|live| {
@@ -2614,6 +2623,7 @@ mod tests {
         value["live_nvmeof"]["polled_writes"] = serde_json::json!(true);
         value["live_nvmeof"]["leased_write_window"] = serde_json::json!(8);
         value["live_nvmeof"]["leased_sync"] = serde_json::json!("group_flush");
+        value["live_nvmeof"]["leased_flush_min_frame_bytes"] = serde_json::json!(8192);
         let input: ExternalPreparationInput = serde_json::from_value(value).unwrap();
         let live = input.live_nvmeof.unwrap();
         assert!(!live.lease_ahead);
@@ -2623,6 +2633,7 @@ mod tests {
             live.leased_sync,
             tidehunter::distributed::tcp::LeasedSync::GroupFlush
         );
+        assert_eq!(live.leased_flush_min_frame_bytes, 8192);
         assert_eq!(input.history_persistence, HistoryPersistence::WalReplay);
     }
 
@@ -2641,6 +2652,7 @@ mod tests {
             live.leased_sync,
             tidehunter::distributed::tcp::LeasedSync::PerFrameFua
         );
+        assert_eq!(live.leased_flush_min_frame_bytes, 0);
     }
 
     #[cfg(all(feature = "fabric", feature = "nvmeof", target_os = "linux"))]
@@ -2663,6 +2675,7 @@ mod tests {
             value["live_nvmeof"]["export_mode"] = serde_json::json!(export);
             value["live_nvmeof"]["lease_ahead"] = serde_json::json!(ahead);
             value["live_nvmeof"]["polled_writes"] = serde_json::json!(polled);
+            value["live_nvmeof"]["leased_flush_min_frame_bytes"] = serde_json::json!(8192);
             value["live_nvmeof"]["queue_geometry"]["poll_queues"] =
                 serde_json::json!(u8::from(polled));
             fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -2675,6 +2688,7 @@ mod tests {
             assert_eq!(remote["live_nvme"]["polled_writes"], polled);
             assert_eq!(remote["live_nvme"]["write_mode"], mode);
             assert_eq!(remote["live_nvme"]["export_mode"], export);
+            assert_eq!(remote["live_nvme"]["leased_flush_min_frame_bytes"], 8192);
             assert_eq!(
                 remote["live_nvme"]["queue_geometry"],
                 value["live_nvmeof"]["queue_geometry"]

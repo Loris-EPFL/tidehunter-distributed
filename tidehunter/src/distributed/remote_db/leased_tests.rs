@@ -363,15 +363,21 @@ fn leased_measurement_gate_observations_keep_warm_extent() {
             drop(worker);
             assert!(!failure.load(Ordering::Acquire));
             if mode == HistoryPersistence::WalReplay {
-                // The worker is gone. Recover a copy of its quiescent WAL
-                // and root, with no live owner state or receipt cache.
+                // The worker is gone, but the owner may still publish its
+                // frontier root asynchronously. Copy the WAL and root like a
+                // crash snapshot: a temporary root renamed away during the
+                // copy did not exist at that point of the snapshot.
                 let recovered_root = tempdir::TempDir::new("leased-gate-recovery").unwrap();
                 let stream = fixture.config.root.join("epoch_0000000000000001");
                 for entry in std::fs::read_dir(stream).unwrap() {
                     let entry = entry.unwrap();
                     assert!(entry.file_type().unwrap().is_file());
-                    std::fs::copy(entry.path(), recovered_root.path().join(entry.file_name()))
-                        .unwrap();
+                    match std::fs::copy(entry.path(), recovered_root.path().join(entry.file_name()))
+                    {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => panic!("crash snapshot copy failed: {error}"),
+                    }
                 }
                 let recovered = crate::distributed::storage::PartitionLog::recover_live_sealed(
                     recovered_root.path(),
@@ -736,6 +742,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 owner_identities: Default::default(),
                 leased_write_window: Some(1),
                 leased_sync: Default::default(),
+                leased_flush_min_frame_bytes: 0,
                 max_inflight_requests: 4,
                 max_inflight_bytes: 128 * 1024,
                 connect_timeout_ms: 1000,

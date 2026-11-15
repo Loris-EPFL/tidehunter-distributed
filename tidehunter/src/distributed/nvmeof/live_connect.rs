@@ -50,11 +50,13 @@ fn queue_cpus_at(block_root: &Path, namespace_device: &Path) -> io::Result<Vec<V
                 }
             }
             path = first
-                .ok_or_else(|| with_context(
-                    "read namespace paths",
-                    &multipath,
-                    invalid("no namespace paths"),
-                ))?
+                .ok_or_else(|| {
+                    with_context(
+                        "read namespace paths",
+                        &multipath,
+                        invalid("no namespace paths"),
+                    )
+                })?
                 .join("mq");
             std::fs::read_dir(&path)
                 .map_err(|error| with_context("read hardware queues", &path, error))?
@@ -69,7 +71,11 @@ fn queue_cpus_at(block_root: &Path, namespace_device: &Path) -> io::Result<Vec<V
             .to_str()
             .and_then(|name| name.parse::<usize>().ok())
             .ok_or_else(|| {
-                with_context("hardware queue index", &entry.path(), invalid("invalid index"))
+                with_context(
+                    "hardware queue index",
+                    &entry.path(),
+                    invalid("invalid index"),
+                )
             })?;
         let cpu_path = entry.path().join("cpu_list");
         let list = std::fs::read_to_string(&cpu_path)

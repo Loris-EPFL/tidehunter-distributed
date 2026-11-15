@@ -35,6 +35,7 @@ fn live_config(mode: LiveWriteMode, tier: DurabilityTier) -> LiveClientConfig {
         owner_identities: Default::default(),
         leased_write_window: Some(4),
         leased_sync: Default::default(),
+        leased_flush_min_frame_bytes: 0,
         max_inflight_requests: 32,
         max_inflight_bytes: 4 * MIB,
         connect_timeout_ms: 10000,
@@ -322,16 +323,32 @@ fn pin_read_lanes_defaults_off_and_validates_queue_count() {
     serialized.as_object_mut().unwrap().remove("pin_read_lanes");
     let legacy: RemoteDatabaseConfig = serde_json::from_value(serialized).unwrap();
     assert!(!legacy.pin_read_lanes);
-    fixture.config.live_nvme = Some(live_config(LiveWriteMode::Reserved, DurabilityTier::Synchronous));
+    fixture.config.live_nvme = Some(live_config(
+        LiveWriteMode::Reserved,
+        DurabilityTier::Synchronous,
+    ));
     fixture.config.pin_read_lanes = true;
     fixture.config.read_lanes = 4;
     fixture.config.validate().unwrap();
     fixture.config.read_lanes = 5;
-    assert!(fixture.config.validate().unwrap_err().to_string().contains("pin_read_lanes"));
+    assert!(
+        fixture
+            .config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("pin_read_lanes")
+    );
     fixture.config.pin_read_lanes = false;
     fixture.config.validate().unwrap();
     fixture.config.pin_read_lanes = true;
-    fixture.config.live_nvme.as_mut().unwrap().queue_geometry.io_queues = 1;
+    fixture
+        .config
+        .live_nvme
+        .as_mut()
+        .unwrap()
+        .queue_geometry
+        .io_queues = 1;
     fixture.config.read_lanes = 1;
     fixture.config.validate().unwrap();
     fixture.config.read_lanes = 2;

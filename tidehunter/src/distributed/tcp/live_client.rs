@@ -93,6 +93,9 @@ pub struct LiveClientConfig {
     pub leased_write_window: Option<usize>,
     #[serde(default)]
     pub leased_sync: LeasedSync,
+    /// GroupFlush only: frames whose physical (padded) length is smaller than this use FUA.
+    #[serde(default)]
+    pub leased_flush_min_frame_bytes: usize,
     pub max_inflight_bytes: usize,
     pub connect_timeout_ms: u64,
     pub io_timeout_ms: u64,
@@ -138,6 +141,7 @@ impl LiveClientConfig {
             max_inflight_requests: self.max_inflight_requests,
             leased_write_window: self.leased_write_window,
             leased_sync: self.leased_sync,
+            leased_flush_min_frame_bytes: self.leased_flush_min_frame_bytes,
             max_inflight_bytes: self.max_inflight_bytes,
             connect_timeout_ms: self.connect_timeout_ms,
             io_timeout_ms: self.io_timeout_ms,
@@ -1230,6 +1234,7 @@ mod tests {
             owner_identities: Default::default(),
             leased_write_window: Some(4),
             leased_sync: Default::default(),
+            leased_flush_min_frame_bytes: 0,
             max_inflight_requests: 32,
             max_inflight_bytes: 4096,
             connect_timeout_ms: 1000,
@@ -1246,12 +1251,24 @@ mod tests {
         old.as_object_mut().unwrap().remove("export_mode");
         old.as_object_mut().unwrap().remove("leased_write_window");
         old.as_object_mut().unwrap().remove("leased_sync");
+        old.as_object_mut()
+            .unwrap()
+            .remove("leased_flush_min_frame_bytes");
         assert!(!old.as_object().unwrap().contains_key("owner_identities"));
         let restored: LiveClientConfig = serde_json::from_value(old).unwrap();
         assert_eq!(restored.queue_geometry, LiveQueueGeometry::default());
         assert_eq!(restored.export_mode, LiveExportMode::OnDemand);
         assert_eq!(restored.leased_write_window, None);
         assert_eq!(restored.leased_sync, LeasedSync::PerFrameFua);
+        assert_eq!(restored.leased_flush_min_frame_bytes, 0);
+        config.leased_flush_min_frame_bytes = 8192;
+        let restored: LiveClientConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(restored.leased_flush_min_frame_bytes, 8192);
+        assert_eq!(
+            config.for_owner(1).unwrap().leased_flush_min_frame_bytes,
+            8192
+        );
         for (mode, name) in [
             (LeasedSync::PerFrameFua, "per_frame_fua"),
             (LeasedSync::GroupFlush, "group_flush"),
@@ -1290,7 +1307,8 @@ mod tests {
         let mut polled = config.clone();
         polled.polled_writes = true;
         polled.write_mode = LiveWriteMode::Leased;
-        polled.leased_durability = Some(crate::distributed::durability::DurabilityTier::Synchronous);
+        polled.leased_durability =
+            Some(crate::distributed::durability::DurabilityTier::Synchronous);
         polled.leased_sync = LeasedSync::GroupFlush;
         assert_eq!(
             polled.validate(),
@@ -2083,8 +2101,11 @@ impl super::Client {
             .ok_or_else(|| super::TcpError::new("leased extent missing"))?
             .lease
             .tier;
+        // A window of one frame cannot share a flush; FUA avoids a serial write then flush.
         let durable_at_completion = tier == crate::distributed::durability::DurabilityTier::Native
             || config.leased_sync == LeasedSync::PerFrameFua
+            || self.leased_write_window() == 1
+            || len < config.leased_flush_min_frame_bytes
             || (self.live_leased.flights.is_empty() && queue_empty);
         let sync = if tier == crate::distributed::durability::DurabilityTier::Synchronous
             && durable_at_completion
@@ -3040,6 +3061,7 @@ pub(crate) mod leased_tests {
                         owner_identities: Default::default(),
                         leased_write_window: Some(4),
                         leased_sync: Default::default(),
+                        leased_flush_min_frame_bytes: 0,
                         max_inflight_requests: 4,
                         max_inflight_bytes: (self.config.partition.group_limits.max_encoded_bytes
                             + 4096)
@@ -4950,6 +4972,97 @@ pub(crate) mod leased_tests {
         assert_eq!(counts.fua_writes, 1);
         assert_eq!(counts.leased_flushes, 0);
         assert_eq!(counts.leased_frames, 1);
+    }
+
+    #[test]
+    fn group_flush_window_of_one_uses_fua_with_queued_work() {
+        let fixture = Fixture::new(DurabilityTier::Synchronous, 32768);
+        let mut client = group_flush_writer(&fixture);
+        client.live_config.as_mut().unwrap().leased_write_window = Some(1);
+        let timeline = WriteTimeline::default();
+        assert!(matches!(
+            client
+                .submit_leased_group(1, vec![fixture.batch(0)], &timeline, 2, false)
+                .unwrap(),
+            LeasedSubmit::Submitted(1)
+        ));
+        let mut released = Vec::new();
+        client
+            .drain_leased_flights(&mut released, Some(&timeline))
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        let counts = fixture.metrics.snapshot().counts;
+        assert_eq!(counts.fua_writes, 1);
+        assert_eq!(counts.leased_flushes, 0);
+    }
+
+    #[test]
+    fn group_flush_threshold_selects_fua_or_covering_flush_with_queued_work() {
+        for (threshold, big, fua) in [
+            (4097, false, true),
+            (4096, false, false),
+            (4095, false, false),
+            (0, false, false),
+            (8193, true, true),
+            (8192, true, false),
+        ] {
+            let fixture = Fixture::new(DurabilityTier::Synchronous, 32768);
+            let mut client = group_flush_writer(&fixture);
+            client
+                .live_config
+                .as_mut()
+                .unwrap()
+                .leased_flush_min_frame_bytes = threshold;
+            let timeline = WriteTimeline::default();
+            client.leased_test_hold_completions(&[1, 2, 3]);
+            for sequence in 0..2 {
+                let batch = if big {
+                    fixture.big_batch(sequence)
+                } else {
+                    fixture.batch(sequence)
+                };
+                assert!(matches!(
+                    client.submit_leased_group(1, vec![batch], &timeline, 2, false).unwrap(),
+                    LeasedSubmit::Submitted(id) if id == sequence + 1
+                ));
+            }
+            assert_eq!(client.live_leased.flights.len(), 2);
+            for flight in &client.live_leased.flights {
+                assert_eq!(flight.frame_len, if big { 8192 } else { 4096 });
+                assert_eq!(flight.durable_at_completion, fua);
+            }
+            let mut released = Vec::new();
+            progress_until(&mut client, &mut released, &timeline, |client| {
+                client.live_writer.as_ref().unwrap().io.outstanding() == 0
+            });
+            client
+                .live_writer
+                .as_mut()
+                .unwrap()
+                .io
+                .hold_completions(&[3]);
+            progress_until(&mut client, &mut released, &timeline, |client| {
+                client
+                    .live_leased
+                    .flights
+                    .iter()
+                    .all(|flight| flight.completed)
+            });
+            if fua {
+                assert_eq!(released.len(), 2);
+                assert!(client.live_leased.flush_in_flight.is_none());
+            } else {
+                assert!(released.is_empty());
+                assert_eq!(client.live_leased.flush_in_flight.unwrap().1, 2);
+            }
+            client.leased_test_release_held();
+            client.drain_leased_flights(&mut released, None).unwrap();
+            assert_eq!(released.len(), 2);
+            let counts = fixture.metrics.snapshot().counts;
+            assert_eq!(counts.fua_writes, if fua { 2 } else { 0 });
+            assert_eq!(counts.leased_flushes, if fua { 0 } else { 1 });
+            assert_eq!(counts.leased_flush_covered_frames, if fua { 0 } else { 2 });
+        }
     }
 
     #[test]
