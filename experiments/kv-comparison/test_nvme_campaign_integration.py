@@ -96,7 +96,7 @@ class CampaignModeTests(unittest.TestCase):
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
                 'live_write': {'write_mode': 'leased',
                                'acknowledgement_contract': 'leased extent: page-cache write'}}}
-        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_reads_geometry'):
+        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest'):
             window = job.get('live_leased_write_window')
             info['configuration'].update(live_leased_write_window=window,
                 live_leased_write_window_bound=31 if window is None else window)

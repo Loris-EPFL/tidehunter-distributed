@@ -60,7 +60,8 @@ class SelectedBackendRuntimeTests(unittest.TestCase):
     def test_focused_package_profile_is_selection_specific(self):
         for selection, expected, rejected in (
                 ('valkey_rdma_reads', 'focused_valkey', 'focused'),
-                ('nvmeof_reads_geometry', 'focused', 'focused_valkey')):
+                ('nvmeof_reads_geometry', 'focused', 'focused_valkey'),
+                ('nvmeof_reads_geometry_rest', 'focused', 'focused_valkey')):
             spec = {'mode': 'focused', 'selection': selection}
             with self.subTest(selection=selection):
                 runtime.admit_package_profile(spec, {'build_profile': expected})

@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest")
 
 
 
@@ -722,7 +722,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
                   "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35,
                   "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "valkey_rdma_reads": 22,
-                  "nvmeof_reads_geometry": 74}
+                  "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20}
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -767,6 +767,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_parallel_writes": {"G23W": 32, "G23X": 6, "G23N": 6},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
+    "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "valkey_rdma_reads": {"G25R": 12, "G25M": 2, "G25A": 8},
 }
 
@@ -1677,7 +1678,7 @@ def _nvmeof_reads_geometry(path):
              diagnostics={"read_profile_limit": 4096})
     for size in (1024, 65536):
         read("G24M", size, live_io_queues=4, live_io_queue_size=128,
-             mix={"read": 50, "put": 50, "delete": 0, "put_batch": 0, "get_many": 0},
+             mix={"read": 50, "put": 50, "delete": 0, "missing_read": 0, "put_batch": 0, "get_many": 0},
              durability_tier="synchronous", live_leased_write_window=1)
         for cache, distribution in ((8 * 1024**2, "uniform"),
                                     (8 * 1024**2, {"zipf": {"exponent": 0.99}}),
@@ -1697,6 +1698,15 @@ def _nvmeof_reads_geometry(path):
                                    drop_os_caches=False)
             _clone_job(result, selection, source, "G24N", concurrency=concurrency,
                        live_max_inflight_requests=128)
+    return result
+
+
+def _nvmeof_reads_geometry_rest(path):
+    """Rerun only the cells that did not complete in the original read fleet."""
+    result = []
+    for source in _nvmeof_reads_geometry(path):
+        if source["group"] in ("G24C", "G24M", "G24W", "G24N"):
+            _clone_job(result, "nvmeof_reads_geometry_rest", source, source["group"])
     return result
 
 
@@ -1950,6 +1960,8 @@ def make_focused_matrix(selection):
             return _nvmeof_path_fix(path, make_focused_matrix("fabric_ab_compact"))
         if selection == "nvmeof_first_put":
             return _nvmeof_first_put(make_focused_matrix("nvmeof_path_fix"))
+        if selection == "nvmeof_reads_geometry_rest":
+            return _nvmeof_reads_geometry_rest(path)
         if selection == "nvmeof_reads_geometry":
             return _nvmeof_reads_geometry(path)
         if selection == "nvmeof_parallel_writes":
@@ -2508,7 +2520,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry") and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")

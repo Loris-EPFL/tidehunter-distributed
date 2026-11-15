@@ -13,6 +13,30 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_every_focused_mix_has_exact_runtime_fields(self):
+        for selection in campaign.FOCUSED_COUNTS:
+            # ssd_write is an internal component of unified, not a selectable matrix.
+            jobs = ([j for j in campaign.make_focused_matrix("unified") if j["group"] == "G11W"]
+                    if selection == "ssd_write" else campaign.make_focused_matrix(selection))
+            for job in jobs:
+                self.assertEqual(set(job["mix"]), set(campaign.MIX_FIELDS),
+                                 (selection, job["case_id"]))
+
+    def test_reads_rest_exact_subset_and_pin(self):
+        jobs = campaign.make_focused_matrix("nvmeof_reads_geometry_rest")
+        parent = [j for j in campaign.make_focused_matrix("nvmeof_reads_geometry")
+                  if j["group"] in ("G24C", "G24M", "G24W", "G24N")]
+        self.assertEqual(len(jobs), 20)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                         "6a9095d64c0f01894939b9e9d68431f723327fefb2288c0763770ec7ec7d6c59")
+        for actual, source in zip(jobs, parent):
+            self.assertEqual({k: v for k, v in actual.items() if k not in ("selection", "case_id")},
+                             {k: v for k, v in source.items() if k not in ("selection", "case_id")})
+            self.assertEqual(actual["selection"], "nvmeof_reads_geometry_rest")
+            campaign.active_owner_count(actual)
+            config = campaign.make_run_config(actual, "/tmp/read-rest/" + actual["case_id"], {}, "a" * 40)
+            self.assertEqual(set(config["workload"]["mix"]), set(campaign.MIX_FIELDS))
+
     def test_reads_geometry_controller_mapping_defaults(self):
         tree = ast.parse(Path(campaign.__file__).with_name("cloud_controller.py").read_text())
         fields = {}
@@ -34,7 +58,7 @@ class FocusedMatrixTests(unittest.TestCase):
         self.assertEqual(Counter(j["group"] for j in jobs),
                          campaign._FOCUSED_GROUP_COUNTS["nvmeof_reads_geometry"])
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                         "0e8129a38e338651ea3a3a4df2698a0bc550262457aaf8a2fa501ef35ded2fec")
+                         "02cfbeb029a74f2ff7acdac3292e66d3caa40c4d94a40b4093ce9eb0046f7188")
         for job in jobs:
             self.assertEqual(job["live_max_inflight_requests"], 128)
             if "live_leased_write_window" in job:
@@ -283,7 +307,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}
