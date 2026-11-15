@@ -10,7 +10,7 @@ class ValkeyReadsTests(unittest.TestCase):
         self.assertEqual(len(jobs), 22)
         self.assertEqual(len({job['case_id'] for job in jobs}), 22)
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
-                         '784c732c8f9c641d6e5e594a1bc271fcccd69fb90e534fbaa6dd995ef9f07cfc')
+                         'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2')
         self.assertEqual(campaign.selection_owner_hosts('valkey_rdma_reads'), 1)
         self.assertEqual(sum(job['backend'] == 'valkey_rdma' for job in jobs), 14)
         reads = [job for job in jobs if job['group'] == 'G25R']
@@ -21,7 +21,7 @@ class ValkeyReadsTests(unittest.TestCase):
             self.assertEqual(job['keys'], 65536)
             self.assertEqual(job['owner_count'], 1)
             self.assertFalse(job['drop_os_caches'])
-            self.assertTrue(job['warmup_key_sweep'])
+            self.assertEqual(job['warmup_key_sweep'], job['group'] != 'G25M')
             self.assertFalse([key for key, value in job.items()
                               if value is None and key != 'offered_ops_per_second'])
         for job in jobs:

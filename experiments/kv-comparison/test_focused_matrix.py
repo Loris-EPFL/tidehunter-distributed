@@ -2,6 +2,7 @@ import copy
 import ast
 import hashlib
 import json
+import math
 import tempfile
 from unittest import mock
 import unittest
@@ -13,6 +14,101 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_g24_cache_allowance_matches_dataset_cache_arms(self):
+        for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest"):
+            jobs = campaign.make_focused_matrix(selection)
+            self.assertEqual(sum("coordinator_read_memory_allowance_bytes" in j for j in jobs), 2)
+            for job in jobs:
+                if "coordinator_read_memory_allowance_bytes" in job:
+                    self.assertEqual(job["group"], "G24C")
+                    self.assertGreaterEqual(job["coordinator_cache_bytes"], job["keys"] * job["value_size"])
+                    self.assertEqual(job["coordinator_read_memory_allowance_bytes"],
+                                     512 * 1024**2 + job["coordinator_cache_bytes"])
+
+    def test_every_focused_key_sweep_matches_runtime_rule(self):
+        for selection in campaign.FOCUSED_COUNTS:
+            jobs = ([j for j in campaign.make_focused_matrix("unified") if j["group"] == "G11W"]
+                    if selection == "ssd_write" else campaign.make_focused_matrix(selection))
+            for job in jobs:
+                for name, operations in (("warmup_key_sweep", "warmup_operations"),
+                                         ("measurement_key_sweep", "measurement_operations")):
+                    if not job.get(name):
+                        continue
+                    with self.subTest(selection=selection, case=job["case_id"], sweep=name):
+                        mix = job["mix"]
+                        self.assertTrue(all(mix[k] == 0 for k in ("put", "delete", "missing_read", "put_batch")))
+                        # Mirror make_run_config's phases/mode without backend admission.
+                        self.assertFalse(job.get("qualification_only", False))
+                        preload = job.get("case_kind") == "hybrid_put" or "sealed_dataset" not in job
+                        self.assertTrue(preload or "sealed_dataset" in job)
+                        self.assertNotEqual(job.get("case_kind"), "interference")
+                        self.assertIsNone(job["offered_ops_per_second"])
+                        batch = 32  # make_run_config's workload.batch_size
+                        keys_per_op = ((1 if mix["read"] > 0 else batch) if name == "warmup_key_sweep"
+                                       else (batch if mix["get_many"] > 0 else 1))
+                        visited = job[operations] * keys_per_op
+                        self.assertLessEqual(visited, 2**64 - 1)
+                        if name == "warmup_key_sweep":
+                            self.assertGreaterEqual(visited, job["keys"])
+                        else:
+                            self.assertLessEqual(visited, job["keys"])
+
+    def test_g24_generated_configs_match_runtime_bounds(self):
+        for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest"):
+            for job in campaign.make_focused_matrix(selection):
+                with self.subTest(selection=selection, case=job["case_id"]):
+                    config = campaign.make_run_config(job, "/tmp/g24/" + job["case_id"], {}, "a" * 40)
+                    data, work, execution, phases, limits = (config[k] for k in
+                        ("dataset", "workload", "execution", "phases", "limits"))
+                    self.assertEqual(config["schema_version"], 1)
+                    self.assertRegex(config["case_id"], r"^[A-Za-z0-9_-]{1,160}$")
+                    self.assertRegex(config["namespace"], r"^[A-Za-z0-9_-]{1,64}$")
+                    self.assertTrue(config["backend"]["kind"].strip())
+                    self.assertTrue(0 < data["keys"] <= limits["max_keys"])
+                    self.assertIn(data["value_size"], (64, 256, 1024, 8192, 65536))
+                    self.assertTrue(math.isfinite(data["entropy"]) and 0 <= data["entropy"] <= 1)
+                    self.assertLessEqual(data["keys"] * data["value_size"], limits["max_bytes"])
+                    self.assertEqual(set(work["mix"]), set(campaign.MIX_FIELDS))
+                    self.assertTrue(all(type(v) is int and 0 <= v <= 2**32 - 1 for v in work["mix"].values()))
+                    self.assertGreater(sum(work["mix"].values()), 0)
+                    self.assertTrue(2 <= work["batch_size"] <= 1024)
+                    if isinstance(work["distribution"], dict):
+                        exponent = work["distribution"]["zipf"]["exponent"]
+                        self.assertTrue(math.isfinite(exponent) and 0 < exponent <= 2)
+                    self.assertTrue(1 <= execution["request_timeout_ms"] <= 300000)
+                    self.assertTrue(1 <= execution["concurrency"] <= 4096)
+                    self.assertTrue(execution["concurrency"] <= execution["queue_capacity"] <= 65536)
+                    self.assertEqual(execution["mode"], "closed_loop")
+                    self.assertIsNone(execution["offered_ops_per_second"])
+                    self.assertGreater(phases["measurement_operations"], 0)
+                    total = phases["warmup_operations"] + phases["aging_operations"] + phases["measurement_operations"]
+                    total += data["keys"] if phases["preload"] or phases.get("verify_existing_dataset") else 0
+                    self.assertLessEqual(total, min(limits["max_operations"], 2**64 - 1))
+                    for key in ("max_keys", "max_bytes", "max_operations"):
+                        self.assertGreater(limits[key], 0)
+                    self.assertTrue(1 <= limits["deadline_seconds"] <= 86400)
+                    self.assertTrue(1 <= limits["shutdown_grace_seconds"] <= 600)
+                    diagnostics = config.get("diagnostics", {})
+                    self.assertTrue(all(type(v) is int and 0 <= v <= 65536 for v in diagnostics.values()))
+                    if diagnostics.get("read_profile_limit") or diagnostics.get("write_timeline_limit"):
+                        self.assertEqual(config["backend"]["kind"], "tidehunter")
+                    self.assertFalse(diagnostics.get("write_timeline_limit") and diagnostics.get("write_profile_limit"))
+                    if config["backend"]["kind"] == "tidehunter":
+                        count = max(work["batch_size"], 2) if work["mix"]["put_batch"] else 2
+                        self.assertLessEqual(count, 32)
+                        self.assertLessEqual((data["value_size"] + 32 + 32) * count + 96, 320 * 1024)
+                    markers = []
+                    for key in ("measurement_gate", "measurement_completion_gate"):
+                        gate = config[key]
+                        self.assertTrue(1 <= gate["timeout_seconds"] <= 300)
+                        markers.extend((gate["ready_file"], gate["release_file"]))
+                    self.assertTrue(all(Path(p).is_absolute() for p in markers))
+                    self.assertEqual(len(set(markers)), 4)
+                    if job["group"] == "G24M":
+                        self.assertFalse(job["warmup_key_sweep"])
+                        self.assertTrue(phases["preload"])
+                        self.assertEqual(phases["warmup_operations"], 65536)
+
     def test_every_focused_mix_has_exact_runtime_fields(self):
         for selection in campaign.FOCUSED_COUNTS:
             # ssd_write is an internal component of unified, not a selectable matrix.
@@ -28,7 +124,7 @@ class FocusedMatrixTests(unittest.TestCase):
                   if j["group"] in ("G24C", "G24M", "G24W", "G24N")]
         self.assertEqual(len(jobs), 20)
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                         "6a9095d64c0f01894939b9e9d68431f723327fefb2288c0763770ec7ec7d6c59")
+                         "b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935")
         for actual, source in zip(jobs, parent):
             self.assertEqual({k: v for k, v in actual.items() if k not in ("selection", "case_id")},
                              {k: v for k, v in source.items() if k not in ("selection", "case_id")})
@@ -58,7 +154,7 @@ class FocusedMatrixTests(unittest.TestCase):
         self.assertEqual(Counter(j["group"] for j in jobs),
                          campaign._FOCUSED_GROUP_COUNTS["nvmeof_reads_geometry"])
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                         "02cfbeb029a74f2ff7acdac3292e66d3caa40c4d94a40b4093ce9eb0046f7188")
+                         "c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea")
         for job in jobs:
             self.assertEqual(job["live_max_inflight_requests"], 128)
             if "live_leased_write_window" in job:

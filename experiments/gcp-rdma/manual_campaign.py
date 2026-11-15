@@ -104,10 +104,10 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
     'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
     'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
-    'nvmeof_reads_geometry': '02cfbeb029a74f2ff7acdac3292e66d3caa40c4d94a40b4093ce9eb0046f7188',
-    'nvmeof_reads_geometry_rest': '6a9095d64c0f01894939b9e9d68431f723327fefb2288c0763770ec7ec7d6c59',
+    'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
+    'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
-    'valkey_rdma_reads': '784c732c8f9c641d6e5e594a1bc271fcccd69fb90e534fbaa6dd995ef9f07cfc',
+    'valkey_rdma_reads': 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2',
 }
 REVIEWED_SPECS = {
     selection: {

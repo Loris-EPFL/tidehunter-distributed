@@ -11,6 +11,34 @@ import nvme_campaign_native
 
 
 class CompactReadLifecycleTests(unittest.TestCase):
+    def test_cache_coordinator_allowance_is_independent_of_owner_allowance(self):
+        jobs = [j for j in controller.cloud_campaign.make_focused_matrix("nvmeof_reads_geometry")
+                if "coordinator_read_memory_allowance_bytes" in j]
+        self.assertEqual(len(jobs), 2)
+        for job in jobs:
+            self.assertNotIn("owner_read_memory_allowance_bytes", job)
+            evidence = {"schema_version": 1, "backend": "tidehunter_live_nvmeof",
+                        "coordinator": {"read_rpc_count": 0, "cache": {"budget_bytes": job["coordinator_cache_bytes"]}},
+                        "owner_read_configuration": [{"partition": 0, "read_memory_allowance_bytes": 512 * 1024**2}],
+                        "effective_configuration": {"coordinator": {
+                            "read_memory_allowance_bytes": job["coordinator_read_memory_allowance_bytes"]}}}
+            self.assertEqual(controller.verify_counter_evidence(job, evidence), evidence)
+            evidence["effective_configuration"]["coordinator"]["read_memory_allowance_bytes"] -= 1
+            with self.assertRaisesRegex(controller.SafetyError, "coordinator read allowance"):
+                controller.verify_counter_evidence(job, evidence)
+    def test_cache_coordinator_allowance_bounds(self):
+        from test_cloud_controller import config_fixture
+        runtime = controller.Controller.__new__(controller.Controller)
+        runtime.config = config_fixture()
+        runtime.config["spec"].update(mode="focused", selection="nvmeof_reads_geometry",
+                                      backends=["native", "tidehunter_nvme_rdma"])
+        job = next(j for j in controller.cloud_campaign.make_focused_matrix("nvmeof_reads_geometry")
+                   if "coordinator_read_memory_allowance_bytes" in j)
+        for value in (True, 512 * 1024**2 - 1, 16 * 1024**3 + 1):
+            with self.subTest(value=value), self.assertRaisesRegex(controller.SafetyError, "512 MiB"):
+                runtime.prepare_tide(dict(job, coordinator_read_memory_allowance_bytes=value), Path("/tmp"))
+
+
     def test_live_request_bound_preparation(self):
         from test_cloud_controller import config_fixture
         config = config_fixture()
@@ -71,6 +99,8 @@ class CompactReadLifecycleTests(unittest.TestCase):
         parallel = controller.cloud_campaign.make_focused_matrix('nvmeof_parallel_writes')
         cases += [next(j for j in parallel if j.get('live_leased_write_window') == 4),
                   next(j for j in parallel if j.get('owner_trace'))]
+        cases += [j for j in controller.cloud_campaign.make_focused_matrix('nvmeof_reads_geometry')
+                  if 'coordinator_read_memory_allowance_bytes' in j]
         nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
         for job in cases:
             with self.subTest(case=job['case_id']), tempfile.TemporaryDirectory() as tmp:
@@ -137,6 +167,11 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     self.assertEqual(prep['live_nvmeof']['export_mode'], job.get('live_export_mode', 'on_demand'))
                     self.assertEqual(prep['durability_tier'], job['durability_tier'])
                     self.assertEqual(prep['history_persistence'], job.get('history_persistence', 'on_disk'))
+                    if 'coordinator_read_memory_allowance_bytes' in job:
+                        self.assertEqual(prep['coordinator_read_memory_allowance_bytes'],
+                                         job['coordinator_read_memory_allowance_bytes'])
+                    else:
+                        self.assertNotIn('coordinator_read_memory_allowance_bytes', prep)
                     self.assertTrue(prep['live_nvmeof']['lease_ahead'])
                     self.assertFalse(prep['live_nvmeof']['polled_writes'])
                     self.assertEqual(prep['live_nvmeof']['leased_write_window'], job.get('live_leased_write_window'))

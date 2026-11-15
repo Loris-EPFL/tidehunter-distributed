@@ -3382,7 +3382,11 @@ class Controller:
                 candidate.get("sealed_dataset", {}).get("source_id") == source
                 for candidate in controller_matrix(self.config["spec"]))
         if "coordinator_read_memory_allowance_bytes" in job:
-            prep["coordinator_read_memory_allowance_bytes"] = job["coordinator_read_memory_allowance_bytes"]
+            memory = job["coordinator_read_memory_allowance_bytes"]
+            if (job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS
+                    and (type(memory) is not int or not 512 * 1024**2 <= memory <= 16 * 1024**3)):
+                raise SafetyError("coordinator_read_memory_allowance_bytes must be an integer in 512 MiB..16 GiB")
+            prep["coordinator_read_memory_allowance_bytes"] = memory
         if platform_module(self.config):
             prep = platform_module(self.config).prepare_transport(self.config, prep)
         dump(directory / "prepare-input.json", prep)
@@ -5337,6 +5341,7 @@ def verify_counter_evidence(job, evidence, owner_count=None):
         actual = evidence.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes")
         if actual != job["coordinator_read_memory_allowance_bytes"]:
             raise SafetyError("actual coordinator read allowance differs from declared cohort")
+    if "owner_read_memory_allowance_bytes" in job:
         if any(owner.get("read_memory_allowance_bytes") != job["owner_read_memory_allowance_bytes"] for owner in owners):
             raise SafetyError("actual owner read allowance differs from declared cohort")
     if "owner_read_resident_first" in job and any(

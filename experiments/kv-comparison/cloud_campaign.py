@@ -729,7 +729,8 @@ NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route
                                 "target_io", "live_write_mode", "live_export_mode", "live_inline_reads",
                                 "live_io_queues", "live_io_queue_size", "live_poll_queues",
                                 "live_lease_ahead", "live_polled_writes")
-NVMEOF_PATH_OPTIONAL_LIVE_SETTING_KEYS = ("live_leased_write_window", "live_max_inflight_requests")
+NVMEOF_PATH_OPTIONAL_LIVE_SETTING_KEYS = ("live_leased_write_window", "live_max_inflight_requests",
+                                        "coordinator_read_memory_allowance_bytes")
 NVMEOF_PATH_SETTING_KEYS = {
     "native": NVMEOF_PATH_NATIVE_SETTING_KEYS,
     "tidehunter_verbs_native": NVMEOF_PATH_REMOTE_SETTING_KEYS,
@@ -1679,11 +1680,13 @@ def _nvmeof_reads_geometry(path):
     for size in (1024, 65536):
         read("G24M", size, live_io_queues=4, live_io_queue_size=128,
              mix={"read": 50, "put": 50, "delete": 0, "missing_read": 0, "put_batch": 0, "get_many": 0},
-             durability_tier="synchronous", live_leased_write_window=1)
+             durability_tier="synchronous", live_leased_write_window=1, warmup_key_sweep=False)
         for cache, distribution in ((8 * 1024**2, "uniform"),
                                     (8 * 1024**2, {"zipf": {"exponent": 0.99}}),
                                     (128 * 1024**2 if size == 1024 else 6 * 1024**3, "uniform")):
-            read("G24C", size, coordinator_cache_bytes=cache, distribution=distribution)
+            read("G24C", size, coordinator_cache_bytes=cache, distribution=distribution,
+                 **({"coordinator_read_memory_allowance_bytes": 512 * 1024**2 + cache}
+                    if cache >= size * 65536 else {}))
     for concurrency in (16, 64):
         source = _clone_source(sources, "G21W", "tidehunter_nvme_rdma", 65536, 16,
                                durability_tier="synchronous", diagnostics=None)
@@ -1818,7 +1821,7 @@ def _valkey_rdma_reads():
                 _clone_job(result, "valkey_rdma_reads", job, "G25R")
         mixed = copy.deepcopy(result[-1])
         mixed.update(concurrency=16, repeat=0, profile="point-mixed",
-                     mix=mix(read=50, put=50))
+                     mix=mix(read=50, put=50), warmup_key_sweep=False)
         _clone_job(result, "valkey_rdma_reads", mixed, "G25M")
         for concurrency in (16, 64):
             for queues, depth in ((1, 32), VALKEY_ANCHOR_GEOMETRY):
