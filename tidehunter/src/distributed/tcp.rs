@@ -1517,6 +1517,8 @@ pub struct Client {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_writer: Option<live_client::LiveWriteQueue>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    preparation_pool: Option<Arc<rayon::ThreadPool>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_writer_closing: bool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_leased: live_client::LeasedWriter,
@@ -1780,6 +1782,8 @@ impl Client {
             live_pool: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_writer: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            preparation_pool: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_writer_closing: false,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

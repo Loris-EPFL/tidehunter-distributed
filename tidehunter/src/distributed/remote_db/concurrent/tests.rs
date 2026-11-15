@@ -1585,7 +1585,10 @@ fn sui_timing_visitors_export_authority_split_counters() {
     });
     assert_eq!(counters["write_authority_windows"], 2);
     assert_eq!(counters["write_authority_batches"], 2);
-    assert!(counters["write_authority_prepare_ns"] > 0);
+    assert_eq!(counters["write_authority_prepare_ns"], 0);
+    assert!(counters["write_pool_prepare_ns"] > 0);
+    assert_eq!(counters["write_pool_suffix_replans"], 0);
+    assert_eq!(counters["write_pool_suffix_replanned_batches"], 0);
     assert!(counters["write_authority_admit_ns"] > 0);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1603,7 +1606,10 @@ fn sui_timing_visitors_export_authority_split_counters() {
     }
     assert_eq!(counters["write_authority_windows"], 2);
     assert_eq!(counters["write_authority_batches"], 2);
-    assert!(counters["write_authority_prepare_ns"] > 0);
+    assert_eq!(counters["write_authority_prepare_ns"], 0);
+    assert!(counters["write_pool_prepare_ns"] > 0);
+    assert_eq!(counters["write_pool_suffix_replans"], 0);
+    assert_eq!(counters["write_pool_suffix_replanned_batches"], 0);
     assert!(counters["write_authority_admit_ns"] > 0);
     db.wait_for_background_threads_to_finish().unwrap();
 }
@@ -1634,7 +1640,7 @@ fn authority_split_counters_cover_single_and_multiple_batch_windows() {
             db.visit_write_metrics(|snapshot| {
                 assert_eq!(snapshot.authority.authority_windows, 1);
                 assert_eq!(snapshot.authority.authority_batches, u64::from(batches));
-                assert!(snapshot.authority.authority_prepare_ns > 0);
+                assert_eq!(snapshot.authority.authority_prepare_ns, 0);
                 assert!(snapshot.authority.authority_admit_ns > 0);
             });
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -1643,7 +1649,7 @@ fn authority_split_counters_cover_single_and_multiple_batch_windows() {
                     .try_visit_write_metrics(|snapshot| {
                         assert_eq!(snapshot.authority.authority_windows, 1);
                         assert_eq!(snapshot.authority.authority_batches, u64::from(batches));
-                        assert!(snapshot.authority.authority_prepare_ns > 0);
+                        assert_eq!(snapshot.authority.authority_prepare_ns, 0);
                         assert!(snapshot.authority.authority_admit_ns > 0);
                     })
                     .is_some()
@@ -1655,11 +1661,7 @@ fn authority_split_counters_cover_single_and_multiple_batch_windows() {
             }
             assert_eq!(
                 db.pipeline_stats().parallel_prepared_batches,
-                if workers > 1 && batches > 1 {
-                    u64::from(batches)
-                } else {
-                    0
-                }
+                u64::from(batches)
             );
             db.shutdown().unwrap();
         }
@@ -1699,10 +1701,7 @@ fn concurrent_scalar_window_parallel_and_serial_keep_admission_order() {
         let stats = db.pipeline_stats();
         assert_eq!(stats.concurrent_admitted, 16);
         assert_eq!(stats.prepare_calls, 1);
-        assert_eq!(
-            stats.parallel_prepared_batches,
-            if workers == 1 { 0 } else { 16 }
-        );
+        assert_eq!(stats.parallel_prepared_batches, 16);
         assert!(stats.prepare_task_ns > 0);
         db.shutdown().unwrap();
     }
@@ -1794,9 +1793,12 @@ fn concurrent_scalar_window_duplicate_identity_admits_once() {
     assert_eq!(last.sequence, version.sequence + 1);
     assert_eq!(get(&db, 2), Some(vec![2; 64 * 1024]));
     db.flush_index().unwrap();
-    // Retry acknowledgements are counted, but the next version proves only
-    // one logical slot was allocated to the duplicate identity.
-    assert_eq!(db.pipeline_stats().parallel_prepared_batches, 5);
+    // The conflict shares a version and frees no speculative slot, so the
+    // already-correct suffix must not be harvested or encoded again.
+    let stats = db.pipeline_stats();
+    assert_eq!(stats.parallel_prepared_batches, 5);
+    assert_eq!(stats.prepare_suffix_replans, 0);
+    assert_eq!(stats.prepare_suffix_replanned_batches, 0);
     db.shutdown().unwrap();
 }
 
@@ -1885,4 +1887,430 @@ fn concurrent_scalar_window_all_invalid_releases_budget_and_keeps_owner_healthy(
     assert_eq!(get(&db, 5), Some(vec![5; 64 * 1024]));
     db.ensure_healthy().unwrap();
     db.shutdown().unwrap();
+}
+
+#[test]
+fn pipelined_pool_admits_reordered_singleton_windows_in_fifo_order() {
+    let fixture = scalar_window_fixture(2);
+    let mut original = fixture.open();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    original.before_preparation = Some((entered, gate));
+    let (finished, completions) = mpsc::sync_channel(4);
+    original.preparation_finished = Some(finished);
+    let (progress, events) = mpsc::sync_channel(64);
+    *original.concurrent_progress.lock() = Some(progress);
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    let first_operation = fixture.operation(0, 1);
+    let second_operation = fixture.operation(0, 2);
+    let first = enqueue_window_write(&db, first_operation, vec![put(1, 1)]);
+    let entered = waiting.recv_timeout(Duration::from_secs(5));
+    let second = enqueue_window_write(&db, second_operation, vec![put(1, 2)]);
+    let completion = completions.recv_timeout(Duration::from_secs(5));
+    let progress = wait_event(&events, |stats| stats.prepare_calls == 2);
+    let first_pending = first.try_recv();
+    let second_pending = second.try_recv();
+    // Release the pool before assertions or database shutdown on failure.
+    resume.send(()).unwrap();
+    assert!(entered.is_ok());
+    assert_eq!(completion.unwrap().0.operation, second_operation);
+    assert_eq!(progress.unwrap().concurrent_admitted, 0);
+    assert!(matches!(first_pending, Err(mpsc::TryRecvError::Empty)));
+    assert!(matches!(second_pending, Err(mpsc::TryRecvError::Empty)));
+    let first = first
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    let second = second
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.sequence, first.sequence + 1);
+    assert_eq!(get(&db, 1), Some(vec![2; 32]));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn pipelined_pool_reprepares_stale_suffix_after_middle_admission_failure() {
+    let fixture = scalar_window_fixture(3);
+    let mut original = fixture.open();
+    let failed_operation = fixture.operation(0, 2);
+    let suffix_operation = fixture.operation(0, 3);
+    original.fail_prepared_operation = Some(failed_operation);
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    original.before_preparation = Some((entered, gate));
+    let (finished, completions) = mpsc::sync_channel(8);
+    original.preparation_finished = Some(finished);
+    let (db, start) = paused_owner(original);
+    let first = enqueue_window_write(&db, fixture.operation(0, 1), vec![put(1, 1)]);
+    let middle = enqueue_window_write(&db, failed_operation, vec![put(2, 2)]);
+    let suffix = enqueue_window_write(&db, suffix_operation, vec![put(3, 3)]);
+    start.send(()).unwrap();
+    let entered = waiting.recv_timeout(Duration::from_secs(5));
+    let early: Vec<_> = (0..2)
+        .map(|_| completions.recv_timeout(Duration::from_secs(5)))
+        .collect();
+    resume.send(()).unwrap();
+    assert!(entered.is_ok());
+    let initial_suffix = early
+        .into_iter()
+        .map(Result::unwrap)
+        .find(|(id, _)| id.operation == suffix_operation)
+        .unwrap()
+        .1;
+    let first = first
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(
+        middle
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err()
+    );
+    let suffix = suffix
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial_suffix.sequence, first.sequence + 2);
+    assert_eq!(suffix.sequence, first.sequence + 1);
+    let late: Vec<_> = completions.try_iter().collect();
+    assert!(
+        late.iter()
+            .any(|(id, version)| { id.operation == suffix_operation && *version == suffix })
+    );
+    assert_eq!(get(&db, 3), Some(vec![3; 32]));
+    db.shutdown().unwrap();
+    let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
+    assert_eq!(get(&reopened, 1), Some(vec![1; 32]));
+    assert_eq!(get(&reopened, 3), Some(vec![3; 32]));
+    reopened.shutdown().unwrap();
+}
+
+struct ReleasePreparation(mpsc::SyncSender<()>);
+
+impl Drop for ReleasePreparation {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
+}
+
+fn preparation_step(
+    fail: bool,
+) -> (
+    PreparationTestStep,
+    mpsc::Receiver<BatchVersion>,
+    mpsc::SyncSender<()>,
+) {
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    (
+        PreparationTestStep::Pause {
+            entered,
+            resume: gate,
+            fail,
+        },
+        waiting,
+        resume,
+    )
+}
+
+#[test]
+fn stale_suffix_replan_recovers_overlap_and_coalesces_failure_during_harvest() {
+    for second_failure in [false, true] {
+        let fixture = scalar_window_fixture(4);
+        let mut original = fixture.open();
+        let first_operation = fixture.operation(0, 0);
+        original.fail_prepared_operation = Some(first_operation);
+        let first_sequence = original.submission_next();
+        let epoch = original.epoch;
+        let (head_entered, head_waiting) = mpsc::sync_channel(1);
+        let (head_resume, head_gate) = mpsc::sync_channel(1);
+        original.before_preparation = Some((head_entered, head_gate));
+        let (old_step, old_waiting, old_resume) = preparation_step(second_failure);
+        original
+            .preparation_steps
+            .insert(fixture.operation(0, 4), VecDeque::from([old_step]));
+        let mut replanned_waiting = Vec::new();
+        let mut replanned_resumes = Vec::new();
+        for key in [1, 2] {
+            let (step, waiting, resume) = preparation_step(false);
+            original.preparation_steps.insert(
+                fixture.operation(0, key),
+                VecDeque::from([PreparationTestStep::Pass, step]),
+            );
+            replanned_waiting.push(waiting);
+            replanned_resumes.push(resume);
+        }
+        let (finished, completions) = mpsc::sync_channel(64);
+        original.preparation_finished = Some(finished);
+        let (progress, events) = mpsc::sync_channel(256);
+        *original.concurrent_progress.lock() = Some(progress);
+        let (db, start) = paused_owner(original);
+        // These guards must drop before the database on every failure path.
+        let release_head = ReleasePreparation(head_resume);
+        let release_old = ReleasePreparation(old_resume);
+        let release_replanned: Vec<_> = replanned_resumes
+            .into_iter()
+            .map(ReleasePreparation)
+            .collect();
+        let initial = 8u32;
+        let total = 14u32;
+        let mut replies: Vec<_> = (0..initial)
+            .map(|key| {
+                enqueue_window_write(
+                    &db,
+                    fixture.operation(0, u64::from(key)),
+                    vec![large_put(key)],
+                )
+            })
+            .collect();
+        start.send(()).unwrap();
+        head_waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        old_waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(release_head);
+        let harvesting = wait_event(&events, |stats| {
+            stats.prepare_suffix_harvested_batches >= 3 && stats.prepare_suffix_replans == 0
+        })
+        .unwrap();
+        assert_eq!(harvesting.concurrent_admitted, 0);
+        // Keep ready input queued while the suffix is harvested. It cannot be
+        // speculatively planned with the old cursor, even during a second failure.
+        replies.extend((initial..total).map(|key| {
+            enqueue_window_write(
+                &db,
+                fixture.operation(0, u64::from(key)),
+                vec![large_put(key)],
+            )
+        }));
+        assert_eq!(
+            db.admission.authority.batches.load(Ordering::Relaxed),
+            u64::from(initial),
+        );
+        drop(release_old);
+        let replanned_versions: Vec<_> = replanned_waiting
+            .iter()
+            .map(|waiting| waiting.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        // Neither re-preparation can finish before both have started: this
+        // proves parallel overlap, not merely multiple outstanding receivers.
+        assert_eq!(
+            replanned_versions[0],
+            BatchVersion {
+                epoch,
+                sequence: first_sequence
+            }
+        );
+        assert_eq!(
+            replanned_versions[1],
+            BatchVersion {
+                epoch,
+                sequence: first_sequence + 1
+            }
+        );
+        let stats = wait_event(&events, |stats| {
+            stats.prepare_suffix_replans == 1 && stats.prepare_calls >= 2
+        })
+        .unwrap();
+        assert_eq!(stats.concurrent_admitted, 0);
+        assert_eq!(
+            stats.prepare_suffix_replanned_batches,
+            u64::from(initial - 1 - u32::from(second_failure)),
+        );
+        assert_eq!(
+            stats.prepare_suffix_harvest_failures,
+            u64::from(second_failure)
+        );
+        assert!(stats.prepare_suffix_retained_bytes_peak > 0);
+        assert!(stats.prepare_suffix_retained_bytes_peak <= db.admission.max_bytes);
+        assert!(db.admission.budget.lock().peak_bytes <= db.admission.max_bytes);
+        drop(release_replanned);
+        let mut accepted = Vec::new();
+        for (key, reply) in (0..total).zip(replies) {
+            let result = reply.recv_timeout(Duration::from_secs(30)).unwrap();
+            if key == 0 || (second_failure && key == 4) {
+                assert!(result.is_err());
+                assert_eq!(get(&db, key), None);
+            } else {
+                let version = result.unwrap();
+                assert_eq!(version.epoch, epoch);
+                assert_eq!(version.sequence, first_sequence + accepted.len() as u64);
+                assert_eq!(get(&db, key), Some(vec![key as u8; 64 * 1024]));
+                accepted.push((key, version));
+            }
+        }
+        db.flush_index().unwrap();
+        assert_eq!(db.pipeline_stats().prepare_suffix_replans, 1);
+        let completions: Vec<_> = completions.try_iter().collect();
+        for key in initial..total {
+            assert_eq!(
+                completions
+                    .iter()
+                    .filter(|(id, _)| { id.operation == fixture.operation(0, u64::from(key)) })
+                    .count(),
+                1,
+                "new window was re-prepared for key {key}",
+            );
+        }
+        db.shutdown().unwrap();
+        let mut reopened = fixture.open();
+        for (key, version) in accepted {
+            let id = BatchId {
+                database: fixture.config.storage.database,
+                operation: fixture.operation(0, u64::from(key)),
+            };
+            let expected = CompleteBatch::new(
+                &fixture.shape,
+                id,
+                version,
+                vec![large_put(key)],
+                fixture.config.storage.batch_limits,
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.existing_identity(id).unwrap(),
+                Some((version, expected.digest()))
+            );
+            assert_eq!(
+                reopened
+                    .get(KeySpace(0), &key.to_be_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                vec![key as u8; 64 * 1024],
+            );
+        }
+        reopened.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn rejected_shared_version_retry_keeps_sustained_suffix_plans_and_receipts_exact() {
+    let fixture = scalar_window_fixture(4);
+    let mut original = fixture.open();
+    let operation = fixture.operation(0, 0);
+    let original_version = original.write_batch(operation, vec![large_put(0)]).unwrap();
+    let (step, waiting, resume) = preparation_step(false);
+    original
+        .preparation_steps
+        .insert(fixture.operation(0, 1), VecDeque::from([step]));
+    let (finished, completions) = mpsc::sync_channel(32);
+    original.preparation_finished = Some(finished);
+    let (progress, events) = mpsc::sync_channel(128);
+    *original.concurrent_progress.lock() = Some(progress);
+    let (db, start) = paused_owner(original);
+    let release = ReleasePreparation(resume);
+    let first_conflict = enqueue_window_write(&db, operation, vec![large_put(99)]);
+    let mut replies: Vec<_> = (1..=6u32)
+        .map(|key| {
+            enqueue_window_write(
+                &db,
+                fixture.operation(0, u64::from(key)),
+                vec![large_put(key)],
+            )
+        })
+        .collect();
+    start.send(()).unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        first_conflict
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
+    let first = wait_event(&events, |stats| stats.prepare_calls == 1).unwrap();
+    assert_eq!(first.prepare_suffix_harvested_batches, 0);
+    assert_eq!(first.prepare_suffix_replans, 0);
+    assert_eq!(first.concurrent_admitted, 0);
+    let second_conflict = enqueue_window_write(&db, operation, vec![large_put(98)]);
+    replies.extend((7..=12u32).map(|key| {
+        enqueue_window_write(
+            &db,
+            fixture.operation(0, u64::from(key)),
+            vec![large_put(key)],
+        )
+    }));
+    let sustained = wait_event(&events, |stats| {
+        stats.prepare_calls >= 2 && stats.parallel_prepared_batches == 14
+    })
+    .unwrap();
+    assert_eq!(sustained.prepare_suffix_replans, 0);
+    assert_eq!(sustained.prepare_suffix_harvested_batches, 0);
+    assert_eq!(sustained.concurrent_admitted, 0);
+    assert!(db.admission.budget.lock().peak_bytes <= db.admission.max_bytes);
+    drop(release);
+    let mut accepted = vec![(0u32, original_version)];
+    for (key, reply) in (1..=12u32).zip(replies) {
+        let version = reply
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(version.epoch, original_version.epoch);
+        assert_eq!(version.sequence, original_version.sequence + u64::from(key));
+        assert_eq!(get(&db, key), Some(vec![key as u8; 64 * 1024]));
+        accepted.push((key, version));
+    }
+    assert!(
+        second_conflict
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(get(&db, 0), Some(vec![0; 64 * 1024]));
+    assert_eq!(get(&db, 98), None);
+    assert_eq!(get(&db, 99), None);
+    db.flush_index().unwrap();
+    let stats = db.pipeline_stats();
+    assert_eq!(stats.parallel_prepared_batches, 14);
+    assert_eq!(stats.prepare_suffix_replans, 0);
+    assert_eq!(stats.prepare_suffix_replanned_batches, 0);
+    assert_eq!(stats.prepare_suffix_harvested_batches, 0);
+    let completions: Vec<_> = completions.try_iter().collect();
+    for key in 1..=12 {
+        assert_eq!(
+            completions
+                .iter()
+                .filter(|(id, _)| { id.operation == fixture.operation(0, key) })
+                .count(),
+            1,
+            "unchanged suffix key {key} was encoded twice"
+        );
+    }
+    assert_eq!(
+        completions
+            .iter()
+            .filter(|(id, _)| id.operation == operation)
+            .count(),
+        2
+    );
+    db.shutdown().unwrap();
+    let mut reopened = fixture.open();
+    for (key, version) in accepted {
+        let id = BatchId {
+            database: fixture.config.storage.database,
+            operation: fixture.operation(0, u64::from(key)),
+        };
+        let expected = CompleteBatch::new(
+            &fixture.shape,
+            id,
+            version,
+            vec![large_put(key)],
+            fixture.config.storage.batch_limits,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.existing_identity(id).unwrap(),
+            Some((version, expected.digest()))
+        );
+        assert_eq!(
+            reopened
+                .get(KeySpace(0), &key.to_be_bytes())
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            vec![key as u8; 64 * 1024],
+        );
+    }
+    reopened.shutdown().unwrap();
 }

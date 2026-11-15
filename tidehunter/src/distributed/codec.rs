@@ -221,7 +221,7 @@ impl CompleteBatch {
         Self::encode_validated(id, version, mutations, size)
     }
 
-    fn encode_validated(
+    pub(super) fn encode_validated(
         id: BatchId,
         version: BatchVersion,
         mutations: Vec<Mutation>,
@@ -366,6 +366,12 @@ impl CompleteBatch {
             encoded,
             canonical_owned: true,
         })
+    }
+
+    /// Reuse canonical member slices as bounded inputs for a new version.
+    /// Their backing stays alive until the replacement encoder releases them.
+    pub(super) fn into_mutations(self) -> Vec<Mutation> {
+        self.mutations
     }
 
     /// Keep only a bounded canonical payload plus exact-length metadata vectors.
