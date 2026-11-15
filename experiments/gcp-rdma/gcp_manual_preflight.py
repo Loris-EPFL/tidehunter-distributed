@@ -26,6 +26,7 @@ USER_PROJECT_PERMISSIONS = (
     'compute.resourcePolicies.create', 'compute.resourcePolicies.get',
     'compute.resourcePolicies.list', 'compute.resourcePolicies.use',
     'compute.resourcePolicies.delete', 'compute.zoneOperations.get',
+    'compute.regions.get',
     'compute.regionOperations.get', 'compute.globalOperations.get',
 )
 SERVICE_ACCOUNT_PERMISSIONS = ('iam.serviceAccounts.actAs', 'iam.serviceAccounts.getAccessToken')
@@ -127,3 +128,19 @@ async def infrastructure_preflight(config, base_image, execute):
             or 'IRDMA' not in profile.get('features', {}).get('interfaceTypes', [])):
         raise ValueError('zonal Falcon IRDMA profile mismatch')
     return image
+
+
+async def quota_preflight(config, execute):
+    """Read regional quota; admission sums reservations under its GCS CAS."""
+    response = await asyncio.wait_for(execute([
+        'compute', 'regions', 'describe', 'us-central1',
+        '--project=' + config['project_id'], '--quiet', '--format=json']), timeout=30)
+    region = _json(response)
+    if not isinstance(region, dict) or region.get('name') != 'us-central1':
+        raise ValueError('regional quota identity mismatch')
+    if region.get('quotaStatusWarning'):
+        raise ValueError('regional quota fetch returned a warning')
+    quotas = region.get('quotas')
+    if not isinstance(quotas, list):
+        raise ValueError('regional quota response missing quotas')
+    return quotas

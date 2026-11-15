@@ -31,10 +31,10 @@ class LeaseTests(unittest.TestCase):
 
     def test_contention_never_steals_expired_lease(self):
         self.state['deadline'] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
-        lease = gcp_lease.acquire(self.store, self.state)
+        lease = gcp_lease.acquire(self.store, self.state, max_runs=1)
         other = {**self.state, 'run_id': 'bench-fedcba9876543210'}
         with self.assertRaisesRegex(RuntimeError, 'another campaign'):
-            gcp_lease.acquire(self.store, other)
+            gcp_lease.acquire(self.store, other, max_runs=1)
         with self.assertRaisesRegex(RuntimeError, 'identity mismatch'):
             gcp_lease.owned(self.store, other)
         self.assertEqual(gcp_lease.read(self.store), lease)

@@ -53,7 +53,7 @@ def main():
     spec = json.load(sys.stdin)
     jobs = (cloud_campaign.make_focused_matrix(spec['selection'])
             if spec.get('mode') == 'focused'
-            else cloud_campaign.make_matrix({key: value for key, value in spec.items() if key != 'suite'}))
+            else cloud_campaign.make_matrix({key: value for key, value in spec.items() if key not in ('suite', 'reservation_hours')}))
     print(json.dumps(qualify_jobs(jobs), sort_keys=True))
 
 

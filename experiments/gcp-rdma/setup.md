@@ -94,9 +94,13 @@ requires the exact guest account. Our maximum absolute DELETE lifetime is
 four hours for GitHub or six hours for the reviewed manual fleet. The
 administrator's independent six-hour `bench-*` reaper remains a backstop;
 it can race the manual deadline rather than leaving additional slack.
-Workflow concurrency prevents overlapping runs from this workflow/ref. A second
-generation-CAS lease at `lifecycle/active-run.json` serializes campaigns sharing
-the artifact bucket, including other runners. Neither is a project-wide limit.
+Workflow concurrency still limits that workflow/ref. Bucket admission uses
+`lifecycle/active-runs.json`, a generation-CAS registry of per-run leases keyed
+by `run_id`. `config.max_concurrent_runs` defaults to 3. Every lease reserves
+its whole fleet before uploads or allocation; expired leases are never stolen.
+The legacy `lifecycle/active-run.json` counts as one active run and is not
+rewritten or deleted when another run starts. Only its own verified cleanup
+can release it. These controls are not project-wide billing limits.
 
 Local `loris.tran@epfl.ch` cannot list objects directly, but MCP object listing
 with short-lived guest-account impersonation succeeded. This establishes the
@@ -369,9 +373,47 @@ preparation wheels, the pinned base image path and numeric ID, a candidate RDMA
 device, an output directory, and an explicit non-compute cost quote. Recovery
 uses `await manual_campaign.recover_cleanup(config, run_id=..., state_path=...,
 execute=...)` with the persisted parent identity. It does not require a GitHub
-terminal workflow. An exclusive GCS lease covers one admitted fleet throughout
-preparation, physical qualification and benchmarking; failure does not start a
-replacement campaign.
+terminal workflow. Each run keeps its own lease throughout preparation,
+physical qualification and benchmarking; failure does not start a replacement.
+The CAS admission sums all active reservations (including the legacy run)
+against `config.active_run_limit_cents` (default 14500 cents). The existing
+weekly ledger is a separate guard; cleaning a run releases active exposure,
+not its weekly reservation.
+
+The reviewed spec can set `reservation_hours` to an integer from 2 to 6
+(default 6). It scales the conservative compute quote and per-run ceiling,
+the workload hard deadline, parent and child expiry, and VM DELETE/self-stop
+deadline together. The sealed spec and GO must bind this window. A shorter
+window also reduces the permitted non-compute surcharge; quote it again.
+Existing six-hour specs and their rounding are unchanged.
+
+Sealing from a separate worktree is supported. Set every copied seal stage's
+`REPO` (and make-go's `repo`) to that worktree, and `BASE` to a fresh attempt
+directory. The GO's `repo` must select that same worktree for launch/recovery
+imports. `prepare.ROOT` is derived from the imported module's `__file__`; the
+source gate compares that checkout's HEAD, branch, dirty state and inventory
+with `snapshot/source.json`. It does not require the main checkout or branch.
+Seal only after committing the intended source; do not reuse an old snapshot.
+After sealing, freeze that checkout until its fleet's cleanup is verified.
+Do not edit, switch branches, merge, or leave untracked test/build artifacts
+there while source gates can still run. Use another worktree for further work.
+The controller spec omits launch-only `reservation_hours` but retains the
+effective `hard_deadline_seconds`.
+
+Admission queries regional quotas through `gcloud compute regions describe`
+and CAS-checks all active plus new vCPU and local-SSD reservations. It adds
+observed usage conservatively, because uploaded-but-unallocated fleets cannot
+be assumed to appear in usage yet. This may refuse capacity that is already
+counted twice; it never assumes an overlap. Missing/ambiguous quota metrics
+fail closed. Z4M local SSDs are 14000 GiB each; the quota is
+`LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY`, not the deprecated aggregate SSD metric.
+
+Package, wheel, fixture and verification uploads share the machine-local
+`/tmp/tidehunter-package-upload.lock` flock across processes and worktrees.
+The lock wait is bounded to one hour; it is released on transfer failure or
+process exit. Never delete that inode while uploads can run. An already-running
+old launcher does not take this lock: wait for its upload to finish before
+starting the first new-code upload.
 
 Read-only Compute descriptions and lists retry actual callback timeouts at most
 three times with identical arguments and the original phase/cleanup deadline.
@@ -660,7 +702,12 @@ exceed the local deadline.
 They are not a substitute for each VM's verified platform DELETE expiry and
 boot-disk autoDelete. Resource deletion is name-based; even after checking
 the exact numeric ID and owner nonce there is a residual describe/delete race.
-The ownership model assumes a single lease holder and no malicious replacement.
+The ownership model assumes one owner per run and no malicious replacement.
+VMs, boot disks and compact policies use unique run names; manual guests also
+bind an owner nonce and numeric VM/disk IDs. Artifacts share the reviewed bucket
+but use distinct run prefixes. The subnet, base image and service account are
+shared read-only infrastructure, not resources that fleet cleanup deletes.
+No fleet-specific firewall rules or network tags are created by this launcher.
 
 The reviewed manual reservation is an estimate, not a project-wide billing
 cap. Allocation requires current user authorization, local validation and a

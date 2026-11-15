@@ -28,6 +28,9 @@ CONFIG = {'project_id': 'mysten-research', 'project_number': '514867804006',
           'ordinary_subnet': 'projects/mysten-research/regions/us-central1/subnetworks/default',
           'rdma_subnet': 'projects/mysten-research/regions/us-central1/subnetworks/rdma'}]}
 
+QUOTAS = [{'metric': metric, 'limit': 10**9, 'usage': 0}
+          for metric in ('Z4M_CPUS', 'LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY')]
+
 SPDK_IDENTITY = {
     'target_scope': 'file_aio_direct_live_and_sealed',
     'source_patch_sha256': 'ba21692d7ac70190a505a7b94dc749c8f544d6eef8632a38980f4acf5e987373',
@@ -912,7 +915,10 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
             state['lease_token'] = lease['token']
             gcp_campaign.save(path, state)
             lease['token'] = 'foreign'
-            store.put(gcp_lease.KEY, json.dumps(lease).encode(), if_generation_match=generation)
+            registry = json.loads(store.get(gcp_lease.REGISTRY_KEY))
+            registry['runs'][state['run_id']] = lease
+            store.put(gcp_lease.REGISTRY_KEY, json.dumps(registry).encode(),
+                      if_generation_match=store.head(gcp_lease.REGISTRY_KEY)['generation'])
             async def execute(_):
                 self.fail('foreign lease must prevent Compute calls')
             with self.assertRaisesRegex(RuntimeError, 'token changed'):
@@ -1326,6 +1332,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(manual, '_qualify_observer', return_value={}), \
                  patch.object(manual, '_check_snapshot'), \
                  patch.object(manual.gcp_manual_preflight, 'permission_preflight'), \
+                 patch.object(manual.gcp_manual_preflight, 'quota_preflight', new_callable=AsyncMock, return_value=QUOTAS), \
                  patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
                               return_value={'id': '42', 'status': 'READY', 'selfLink': 'https://www.googleapis.com/compute/v1/' + image}), \
                  patch.object(manual.gcp_budget, 'reserve', return_value={}), \
@@ -1391,6 +1398,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(manual, '_qualify_observer', return_value={}), \
                  patch.object(manual, '_check_snapshot'), \
                  patch.object(manual.gcp_manual_preflight, 'permission_preflight'), \
+                 patch.object(manual.gcp_manual_preflight, 'quota_preflight', new_callable=AsyncMock, return_value=QUOTAS), \
                  patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
                               return_value={'id': '42', 'status': 'READY', 'selfLink': 'https://example/' + image}), \
                  patch.object(manual.gcp_budget, 'reserve', return_value={}), \
@@ -1469,6 +1477,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                      patch.object(manual, '_qualify_observer', return_value={}), \
                      patch.object(manual, '_check_snapshot'), \
                      patch.object(manual.gcp_manual_preflight, 'permission_preflight'), \
+                     patch.object(manual.gcp_manual_preflight, 'quota_preflight', new_callable=AsyncMock, return_value=QUOTAS), \
                      patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
                                   return_value={'id': '42', 'status': 'READY', 'selfLink': 'https://example/' + image}), \
                      patch.object(manual.gcp_budget, 'reserve', return_value={}), \
@@ -1598,6 +1607,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                      patch.object(manual, '_qualify_observer', return_value={}), \
                      patch.object(manual, '_check_snapshot'), \
                      patch.object(manual.gcp_manual_preflight, 'permission_preflight'), \
+                     patch.object(manual.gcp_manual_preflight, 'quota_preflight', new_callable=AsyncMock, return_value=QUOTAS), \
                      patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
                                   return_value={'id': '42', 'status': 'READY', 'selfLink': 'https://example/' + image}), \
                      patch.object(manual.gcp_budget, 'reserve', return_value={}), \
@@ -1863,6 +1873,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(manual, '_qualify_observer', return_value={}), \
                  patch.object(manual, '_check_snapshot'), \
                  patch.object(manual.gcp_manual_preflight, 'permission_preflight'), \
+                 patch.object(manual.gcp_manual_preflight, 'quota_preflight', new_callable=AsyncMock, return_value=QUOTAS), \
                  patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
                               return_value={'id': '42', 'status': 'READY',
                                   'selfLink': 'https://www.googleapis.com/compute/v1/' + base_image}), \
@@ -2169,6 +2180,7 @@ class SuiRunGateTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(manual, '_admit_boot_images', new_callable=AsyncMock),
                     patch.object(manual, '_finish_campaign', side_effect=finish),
                     patch.object(manual.gcp_manual_preflight, 'permission_preflight'),
+                    patch.object(manual.gcp_manual_preflight, 'quota_preflight', new_callable=AsyncMock, return_value=QUOTAS),
                     patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
                                  return_value=dict(id='42',status='READY',selfLink='https://example/'+image)),
                     patch.object(manual.gcp_budget, 'reserve', return_value={}),

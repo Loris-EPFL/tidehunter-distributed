@@ -276,7 +276,37 @@ def _record(path, state, phase):
     campaign.save(path, state)
 
 
+def reservation_seconds(spec):
+    hours = spec.get('reservation_hours', 6)
+    if type(hours) is not int or not 2 <= hours <= 6:
+        raise ValueError('reservation_hours must be an integer from 2 to 6')
+    return hours * 3600
+
+
+def reservation_quote(spec, machine):
+    duration = reservation_seconds(spec)
+    hosts = spec.get('owner_hosts', 5) + 1
+    rate = MACHINE_RATE_NANODOLLARS[machine]
+    compute = (rate * hosts * duration * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
+    ceiling = (compute * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
+    return duration, compute, ceiling
+
+
+def reviewed_window_spec(spec):
+    """Normalize only the reviewed reservation window, not the workload."""
+    if not isinstance(spec, dict):
+        return spec
+    seconds = reservation_seconds(spec)
+    if 'reservation_hours' not in spec:
+        return spec
+    if spec.get('hard_deadline_seconds') not in (FLEET_SECONDS, seconds):
+        raise ValueError('hard deadline differs from reservation window')
+    return {**{key: value for key, value in spec.items() if key != 'reservation_hours'},
+            'hard_deadline_seconds': FLEET_SECONDS}
+
+
 def _reviewed_jobs(spec):
+    spec = reviewed_window_spec(spec)
     if isinstance(spec, dict) and 'machine_type' in spec:
         if spec['machine_type'] not in MACHINE_RATE_NANODOLLARS:
             raise ValueError('unreviewed machine type')
@@ -317,13 +347,10 @@ def _check_config(config, spec, surcharge_cents):
             or config['candidates'][0].get('zone') != 'us-central1-a'):
         raise ValueError('manual campaign requires the reviewed single zonal configuration')
     _reviewed_jobs(spec)
-    owners = spec.get('owner_hosts', 5)
     machine = config.get('machine_type', 'z4m-highmem-16')
     if machine != spec.get('machine_type', 'z4m-highmem-16'):
         raise ValueError('machine type differs from reviewed specification')
-    rate = MACHINE_RATE_NANODOLLARS[machine]
-    compute = (rate * (owners + 1) * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
-    ceiling = (compute * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
+    _, compute, ceiling = reservation_quote(spec, machine)
     if type(surcharge_cents) is not int or not 0 <= surcharge_cents <= ceiling - compute:
         raise ValueError('non-compute quote exceeds the selected fleet ceiling')
 
@@ -419,7 +446,7 @@ def _qualify_observer(package_dir, spec):
     proof = json.loads(result.stdout)
     jobs = (workflow_input.cloud_campaign.make_focused_matrix(spec['selection'])
             if spec.get('mode') == 'focused'
-            else workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'}))
+            else workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k not in ('suite', 'reservation_hours')}))
     digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     if proof.get('planned_cases') != len(jobs) or proof.get('matrix_sha256') != digest:
         raise ValueError('frozen observer qualified a different generated matrix')
@@ -943,6 +970,8 @@ async def recover_cleanup(config, *, run_id, state_path, execute, artifacts=None
     path, parent = await _blocking(campaign.StateFile.recover, state_path, artifacts, run_id)
     if parent.get('run_id') != run_id or parent.get('project_id') != config.get('project_id'):
         raise ValueError('recovered parent identity mismatch')
+    if parent.get('cleanup_verified') is True and await _blocking(gcp_lease.read, artifacts, run_id) is None:
+        return parent
     await _cleanup_joined(config, parent, path, artifacts, execute)
     return parent
 
@@ -1226,8 +1255,9 @@ def _lease_owned(store, parent):
     return lease, generation
 
 
-def _start_lease(store, parent, path):
-    lease, generation = gcp_lease.acquire(store, parent)
+def _start_lease(store, parent, path, *, max_runs=3, ceiling_cents=CEILING_CENTS, quotas=None):
+    lease, generation = gcp_lease.acquire(
+        store, parent, max_runs=max_runs, ceiling_cents=ceiling_cents, quotas=quotas)
     parent['lease_token'] = lease['token']
     try:
         campaign.save(path, parent)
@@ -1301,9 +1331,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     spec = copy.deepcopy(spec)
     host_count = spec.get('owner_hosts', 5) + 1
     config = dict(config, machine_type=config.get('machine_type', 'z4m-highmem-16'))
-    rate = MACHINE_RATE_NANODOLLARS[config['machine_type']]
-    compute = (rate * host_count * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
-    ceiling = (compute * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
+    duration, compute, ceiling = reservation_quote(spec, config['machine_type'])
     weekly_limit = json.loads(Path(__file__).with_name('budget.json').read_text()).get('weekly_limit_cents')
     if type(weekly_limit) is not int or weekly_limit <= 0:
         raise ValueError('budget.json requires a positive integer weekly_limit_cents')
@@ -1317,6 +1345,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     receipt, frozen_source = await _blocking(_admit_package, package_dir, revision, spec)
     if receipt.get('source_revision') != revision or not re.fullmatch(r'[0-9a-f]{64}', receipt.get('manifest_sha256', '')):
         raise ValueError('package source or sealed manifest mismatch')
+    spec['hard_deadline_seconds'] = duration
     observer_qualification = await _blocking(_qualify_observer, package_dir, spec)
     source = receipt['source_sha256']
     gcp_runtime._sha(source)
@@ -1332,30 +1361,38 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     await _blocking(_check_snapshot, frozen_source, revision)
     start = time.time()
     parent = {'run_id': _run_id(), 'project_id': config['project_id'], 'source_sha256': source,
-              'deadline': _utc(start + FLEET_SECONDS),
+              'deadline': _utc(start + duration),
               'children': {}, 'phase': 'initial', 'cleanup_verified': False,
               'budget': {'ceiling_cents': ceiling, 'compute_cents': compute,
-                         'non_compute_quote_cents': surcharge_cents, 'weekly_limit_cents': weekly_limit},
+                         'non_compute_quote_cents': surcharge_cents, 'weekly_limit_cents': weekly_limit,
+                         'reservation_hours': duration // 3600},
+              'reservation': {'cents': ceiling, 'region': 'us-central1',
+                              'vcpus': int(config['machine_type'].rsplit('-', 1)[-1]) * host_count,
+                              'local_ssds': gcp_runtime.LOCAL_SSD_COUNTS[config['machine_type']] * host_count,
+                              'local_ssd_gib': gcp_runtime.LOCAL_SSD_COUNTS[config['machine_type']] * host_count * 14000},
               'base_image': {'path': base_image, 'id': str(base_image_id)},
               'package': {'sha256': receipt['sha256'], 'manifest_sha256': receipt['manifest_sha256'],
                           'source_revision': revision, 'source_tree_sha256': frozen_source['tree_sha256'],
                           'source_dirty': frozen_source['dirty']}, 'spec_sha256': _digest(_json(spec)),
               'observer_qualification': observer_qualification,
               'artifact_transport': 'injected' if artifacts is not None else TRANSPORT}
-    store = artifacts or DelegatedArtifacts(config['bucket'], deadline=start + FLEET_SECONDS + 1800)
+    store = artifacts or DelegatedArtifacts(config['bucket'], deadline=start + duration + 1800)
     path = campaign.StateFile(out / 'state.json', store, parent['run_id'])
     await _blocking(campaign.save, path, parent)
     error = None
     result = None
     try:
-        await _blocking(_start_lease, store, parent, path)
+        quotas = await gcp_manual_preflight.quota_preflight(config, execute)
+        await _blocking(_start_lease, store, parent, path,
+                        max_runs=config.get('max_concurrent_runs', 3),
+                        ceiling_cents=config.get('active_run_limit_cents', CEILING_CENTS), quotas=quotas)
         await _blocking(_lease_owned, store, parent)
         await _blocking(_record, path, parent, 'budget')
         report = await _blocking(gcp_budget.reserve, store, parent['run_id'], ceiling, weekly_limit)
         (out / 'budget-report.json').write_bytes(_json(report))
 
         await _blocking(_record, path, parent, 'fleet')
-        fleet_state, fleet_path = await _blocking(_new_child, parent, path, 'fleet', FLEET_SECONDS)
+        fleet_state, fleet_path = await _blocking(_new_child, parent, path, 'fleet', duration)
         fleet_state['host_count'] = host_count
         package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels,
                                                 **({"spec": spec, "fixture": fixture} if spec.get("suite") in ("sui", "both") else {}))

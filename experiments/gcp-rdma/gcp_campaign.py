@@ -2,6 +2,7 @@
 """GCP benchmark lifecycle. No cloud mutation occurs without explicit activation."""
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -249,6 +250,7 @@ def admit_permissions(api, config):
     project = ('compute.instances.create', 'compute.instances.get', 'compute.instances.delete',
                'compute.instances.setMetadata', 'compute.instances.setLabels', 'compute.instances.setServiceAccount',
                'compute.disks.create', 'compute.disks.get', 'compute.disks.delete', 'compute.machineTypes.get', 'compute.networks.get',
+               'compute.regions.get',
                'compute.subnetworks.get', 'compute.subnetworks.use',
                'compute.resourcePolicies.create', 'compute.resourcePolicies.get',
                'compute.resourcePolicies.use', 'compute.resourcePolicies.delete',
@@ -520,12 +522,28 @@ def file_sha256(path):
 
 
 def upload_file(store, path, digest, key):
-    if file_sha256(path) != digest:
-        raise ValueError('package SHA256 mismatch: ' + str(path))
-    meta = store.upload(key, path, if_generation_match=0)
-    if meta.get('metadata', {}).get('sha256') != digest:
-        raise ValueError('package changed during upload')
-    return str(meta['generation'])
+    # A fixed machine-local inode serializes uploads across processes/worktrees.
+    # Never unlink it: waiters must keep locking the same inode after release.
+    lock_path = Path('/tmp/tidehunter-package-upload.lock')
+    with lock_path.open('a') as lock:
+        deadline = time.monotonic() + 3600
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('local package upload lock timed out')
+                time.sleep(0.1)
+        try:
+            if file_sha256(path) != digest:
+                raise ValueError('package SHA256 mismatch: ' + str(path))
+            meta = store.upload(key, path, if_generation_match=0)
+            if meta.get('metadata', {}).get('sha256') != digest:
+                raise ValueError('package changed during upload')
+            return str(meta['generation'])
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def launch(api, config, budget, state, state_path, receipt, spec, output):
@@ -731,7 +749,7 @@ def main(argv=None):
         if args.command == 'cleanup' and (state['source_sha256'], state['deadline']) != (args.source_sha, args.deadline):
             raise ValueError('cleanup arguments do not match persisted identity')
         store = api.objects(config['bucket'])
-        current = gcp_lease.read(store)
+        current = gcp_lease.read(store, args.run_id)
         if state.get('cleanup_verified') is True and (current is None or current[0].get('run_id') != args.run_id):
             Path(output, 'cleanup-receipt.json').write_bytes(json_bytes({'run_id': args.run_id, 'result': 'owned resources absent'}))
             return
@@ -783,9 +801,19 @@ def main(argv=None):
     if Path(args.state).exists():
         raise ValueError('refusing to overwrite existing run state')
     state_path = StateFile(args.state, api.objects(config['bucket']), args.run_id)
-    state = {'version': 1, 'project_id': config['project_id'], 'run_id': args.run_id, 'source_sha256': args.source_sha, 'deadline': args.deadline, 'instances': []}
+    cpus = int(config['machine_type'].rsplit('-', 1)[-1])
+    state = {'version': 1, 'project_id': config['project_id'], 'run_id': args.run_id, 'source_sha256': args.source_sha, 'deadline': args.deadline, 'instances': [],
+             'reservation': {'cents': budget['run_upper_bound_cents'], 'region': 'us-central1',
+                             'vcpus': cpus * 6, 'local_ssds': LOCAL_SSD_COUNTS[config['machine_type']] * 6,
+                             'local_ssd_gib': LOCAL_SSD_COUNTS[config['machine_type']] * 6 * 14000}}
     save(state_path, state)
-    lease = gcp_lease.acquire(api.objects(config['bucket']), state)
+    region = api.request('GET', 'regions/us-central1')
+    if region.get('quotaStatusWarning'):
+        raise ValueError('regional quota fetch returned a warning')
+    quotas = region['quotas']
+    lease = gcp_lease.acquire(api.objects(config['bucket']), state,
+                              max_runs=config.get('max_concurrent_runs', 3),
+                              ceiling_cents=config.get('active_run_limit_cents', 14500), quotas=quotas)
     run_campaign(api, config, budget, state, state_path, receipt, spec, output, lease)
 
 

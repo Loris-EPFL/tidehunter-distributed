@@ -75,6 +75,33 @@ class SelectedBackendRuntimeTests(unittest.TestCase):
         with self.assertRaises(runtime.RuntimeSafetyError):
             runtime.admit_package_profile({'mode': 'standard'}, {'build_profile': 'focused_valkey'})
 
+    def test_three_hour_f7_controller_omits_launch_only_reservation(self):
+        import cloud_campaign
+        import cloud_package
+        import manual_campaign
+        spec = dict(manual_campaign.REVIEWED_SPECS['nvmeof_f7_highmem32'],
+                    reservation_hours=3, hard_deadline_seconds=10800)
+        manifest = dict(revision='b'*40, source_sha256='a'*64,
+                        binary_sha256='c'*64, binary_blake2b512='d'*128,
+                        build_profile='focused_valkey', features=cloud_package.FOCUSED_VALKEY_FEATURES,
+                        files={name: {} for name in (
+                            'runtime/bin/valkey-server', 'runtime/bin/valkey-cli',
+                            'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json',
+                            'source/experiments/kv-comparison/nvme_campaign_owner.py')})
+        expiry = deadline()
+        config = dict(package_root='/package', package={'source_revision': 'b'*40},
+                      source_sha256='a'*64, spec=spec, fleet=fleet()[:2],
+                      run_id='bench-'+'1'*16, machine_type='z4m-highmem-32',
+                      bucket='bucket', project_number='1', deadline_utc=expiry)
+        with patch.object(Path, 'read_text', return_value=json.dumps(manifest)):
+            controller = runtime._controller_config(config)
+        self.assertNotIn('reservation_hours', controller['spec'])
+        self.assertNotIn('suite', controller['spec'])
+        self.assertEqual(controller['spec']['hard_deadline_seconds'], 10800)
+        self.assertEqual(controller['deadline_utc'], expiry)
+        self.assertEqual(len(cloud_campaign.make_matrix(controller['spec'])), 10)
+        self.assertEqual(config['spec']['reservation_hours'], 3)
+
     def test_controller_rejects_each_missing_selected_store_feature(self):
         backends = ['tikv', 'cassandra', 'foundationdb', 'garnet', 'kvrocks']
         with tempfile.TemporaryDirectory() as directory:

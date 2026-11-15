@@ -813,7 +813,7 @@ def _controller_config(runtime):
              'server_cpus': 8, 'client_cpus': 8, 'server_memory_mib': 16384, 'client_memory_mib': 16384}
     if 'valkey_rdma' in runtime['spec']['backends']:
         fleet['valkey_rdma_package'] = True
-    spec = {k: v for k, v in runtime['spec'].items() if k != 'suite' and not k.startswith('sui_')}
+    spec = {k: v for k, v in runtime['spec'].items() if k not in ('suite', 'reservation_hours') and not k.startswith('sui_')}
     return {'fleet': fleet, 'bucket': runtime['bucket'], 'bucket_region': region, 'prefix': runtime['run_id'],
             'account': runtime['project_number'], 'source_revision': manifest['revision'],
             'source_sha256': runtime['source_sha256'], 'binary_sha256': manifest['binary_sha256'],

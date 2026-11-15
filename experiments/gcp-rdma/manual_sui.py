@@ -62,6 +62,8 @@ def reviewed_part(spec):
 
 
 def reviewed_sui_spec(spec):
+    from manual_campaign import reviewed_window_spec
+    spec = reviewed_window_spec(spec)
     return any(json.dumps(spec, sort_keys=True) == json.dumps(value, sort_keys=True)
                for value in REVIEWED_SUI_SPECS.values())
 
