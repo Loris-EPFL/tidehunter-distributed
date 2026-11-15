@@ -102,6 +102,10 @@ class SelectedBackendRuntimeTests(unittest.TestCase):
         self.assertEqual(controller['deadline_utc'], expiry)
         self.assertEqual(len(cloud_campaign.make_matrix(controller['spec'])), 8)
         self.assertEqual(config['spec']['reservation_hours'], 3)
+        # The guest must accept the launcher's projection (F7 attempt 4 failed here).
+        with patch.object(runtime, 'validate_runtime'), patch('cloud_layout.validate_fleet'), \
+                patch('cloud_controller.validate_read_tier_memory'):
+            self.assertIs(runtime.validate_controller_config(controller), controller)
 
     def test_f7_preparation_requires_only_tidehunter_features(self):
         import cloud_package
