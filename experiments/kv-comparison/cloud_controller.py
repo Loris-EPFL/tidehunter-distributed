@@ -1629,6 +1629,21 @@ def require_zero_owner_history_waits(directory, owner_count):
             raise RuntimeError("memory-only owner waited for history")
 
 
+def owner_control_settings(job):
+    """Keep owner preparation and its receipt on the same control transport."""
+    backend = job["backend"]
+    if (job.get("case_kind") is not None and backend in cloud_campaign.NVME_BACKENDS
+            and (job.get("nvmeof_route") == "sealed_read"
+                 or job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads",
+                                              *cloud_campaign.NVMEOF_PATH_SELECTIONS))):
+        backend = "tidehunter_verbs_native"
+    transport = cloud_campaign.TRANSPORTS[backend]
+    return {"owner_polling": job.get("owner_polling", "adaptive"),
+            "owner_control_backend": backend, "owner_transport": copy.deepcopy(transport),
+            "owner_transport_security_label":
+                "trusted_network_no_tls" if is_trusted(transport) else "mutual_tls"}
+
+
 def admitted_live_campaign(config, case):
     spec = config["spec"]
     if spec.get("mode") == "standard-with-live-nvmeof":
@@ -3345,12 +3360,7 @@ class Controller:
         if polling not in ("adaptive", "busy"):
             raise ValueError("owner_polling must be adaptive or busy")
         prep = {"guest_root": guest_root, "addresses": [h["address"] + ":9400" for h in self.config["fleet"]["nodes"][:owner_count]],
-                "transport": cloud_campaign.TRANSPORTS[
-                    "tidehunter_verbs_native" if job.get("case_kind") and
-                    job["backend"] in cloud_campaign.NVME_BACKENDS and
-                    (job.get("nvmeof_route") == "sealed_read" or
-                     job.get("selection") == "leased_ab_compact" or
-                     job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS) else job["backend"]],
+                "transport": owner_control_settings(job)["owner_transport"],
                 "max_batches_per_partition": max(16384, job["keys"] + job["warmup_operations"] + job["measurement_operations"]),
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"], "owner_read_workers": 4,
@@ -4304,17 +4314,7 @@ class Controller:
                    "artifacts_sha256": {}, "measurement_evidence": {}, "counter_evidence": {},
                    "raw_artifacts_validated": False}
         if job.get("backend") in cloud_campaign.TRANSPORTS:
-            control_backend = ("tidehunter_verbs_native" if job.get("case_kind") is not None
-                               and job.get("backend") in cloud_campaign.NVME_BACKENDS
-                               and (job.get("nvmeof_route") == "sealed_read" or
-                                    job.get("selection") == "leased_ab_compact" or
-                                    job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS) else job["backend"])
-            transport = cloud_campaign.TRANSPORTS[control_backend]
-            receipt["owner_polling"] = job.get("owner_polling", "adaptive")
-            receipt["owner_control_backend"] = control_backend
-            receipt["owner_transport"] = copy.deepcopy(transport)
-            receipt["owner_transport_security_label"] = (
-                "trusted_network_no_tls" if is_trusted(transport) else "mutual_tls")
+            receipt.update(owner_control_settings(job))
         client = unit_name(self.config, job["case_id"], "client")
         started = False
         client_quiesced = False

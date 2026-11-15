@@ -11,6 +11,36 @@ import nvme_campaign_native
 
 
 class CompactReadLifecycleTests(unittest.TestCase):
+    def test_live_anchor_preparation_receipt_and_emitted_transport_match(self):
+        from test_cloud_controller import config_fixture
+        for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "valkey_rdma_reads"):
+            jobs = [job for job in controller.cloud_campaign.make_focused_matrix(selection)
+                    if job.get("nvmeof_route") == "live"]
+            for job in jobs:
+                with self.subTest(selection=selection, case=job["case_id"]), tempfile.TemporaryDirectory() as tmp:
+                    config = config_fixture()
+                    config["spec"].update(mode="focused", selection=selection,
+                                          backends=["native", "tidehunter_nvme_rdma"])
+                    runtime = controller.Controller.__new__(controller.Controller)
+                    runtime.config = config
+                    runtime.remaining = lambda: 600
+                    with patch.object(controller, "command", side_effect=RuntimeError("preparation captured")), \
+                         patch.object(controller, "environment", return_value={}):
+                        with self.assertRaisesRegex(RuntimeError, "preparation captured"):
+                            runtime.prepare_tide(job, Path(tmp))
+                    prep = json.loads((Path(tmp) / "prepare-input.json").read_text())
+                    emitted = controller.cloud_campaign.make_run_config(job, tmp, {}, "a" * 40)
+                    transport = emitted["backend"]["options"]["transport"]
+                    # run_case adds this exact record to the case receipt.
+                    receipt = controller.owner_control_settings(job)
+                    self.assertEqual(prep["transport"], transport)
+                    self.assertEqual(receipt["owner_transport"], transport)
+                    self.assertEqual(receipt["owner_control_backend"], "tidehunter_verbs_native")
+                    self.assertEqual(receipt["owner_transport_security_label"], "trusted_network_no_tls")
+                    # The external preparer maps verbs+trusted to ofi-verbs-trusted TLS.
+                    self.assertEqual(transport["fabric"]["backend"], "verbs")
+                    self.assertEqual(transport["security"], "trusted")
+
     def test_cache_coordinator_allowance_is_independent_of_owner_allowance(self):
         jobs = [j for j in controller.cloud_campaign.make_focused_matrix("nvmeof_reads_geometry")
                 if "coordinator_read_memory_allowance_bytes" in j]
