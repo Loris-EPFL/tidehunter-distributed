@@ -737,7 +737,7 @@ fn native_ack_paused_before_hand_off_fails_after_a_concurrent_persistence_failur
 mod live_fencing {
     use super::*;
     use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
-    use crate::distributed::nvmeof::live_target::LiveTargetManager;
+    use crate::distributed::nvmeof::live_target::{LiveFileIdentity, LiveTargetManager};
     use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
     use std::os::unix::fs::FileExt;
 
@@ -1165,11 +1165,15 @@ mod live_fencing {
         )
         .unwrap();
         let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let log = node.inventory.lock().active(1).unwrap();
+        let (preparing, resume) =
+            log.pause_live(crate::distributed::storage::LivePausePoint::PrepareBeforePublish);
         let Response::LiveLeased(leased) =
             extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
         else {
             panic!("expected lease")
         };
+        preparing.recv_timeout(Duration::from_secs(5)).unwrap();
         fs::OpenOptions::new()
             .write(true)
             .open(&leased.extent.segment.path)
@@ -1197,29 +1201,37 @@ mod live_fencing {
                 lease_next: false,
             },
         );
-        let log = node.inventory.lock().active(1).unwrap();
         let receipt = log.receipt_page(0, 1).unwrap()[0];
         let reference = batch.record_reference(receipt.address(), 0).unwrap();
-        let lease = log.resolve_live_record(&reference).unwrap();
-        let token = [7; 16];
-        node.inventory
-            .lock()
-            .live_pins
-            .insert(token, (1, vec![lease]));
-        node.inventory.lock().release_live_pin(1, token).unwrap();
-        assert!(!node.inventory.lock().live_pins.contains_key(&token));
-        node.inventory.lock().reap_idle_live_segments(1).unwrap();
-        assert_eq!(
-            node.inventory
-                .lock()
-                .live_target
-                .as_ref()
-                .unwrap()
-                .stats()
-                .unwrap()
-                .owned_namespace_count,
-            1
-        );
+        let segment = &leased.extent.segment;
+        let file = LiveFileIdentity {
+            path: segment.path.clone(),
+            device: segment.device,
+            inode: segment.inode,
+            bytes: segment.bytes,
+            block_size: segment.block_size,
+        };
+        // Pin release and idle reaping must retain this exact permanent export
+        // both before and after the preparer publishes the next WAL file.
+        for prepared in [false, true] {
+            if prepared {
+                resume.send(()).unwrap();
+                wait_prepared(&log, 1);
+            }
+            let lease = log.resolve_live_record(&reference).unwrap();
+            let token = [7; 16];
+            let mut inventory = node.inventory.lock();
+            inventory.live_pins.insert(token, (1, vec![lease]));
+            inventory.release_live_pin(1, token).unwrap();
+            assert!(!inventory.live_pins.contains_key(&token));
+            inventory.reap_idle_live_segments(1).unwrap();
+            let target = inventory.live_target.as_ref().unwrap();
+            assert_eq!(target.binding_for_file(&file).as_ref(), Some(&leased.binding));
+            assert_eq!(
+                target.stats().unwrap().owned_namespace_count,
+                if prepared { 2 } else { 1 }
+            );
+        }
         shutdown(&node, 1);
     }
 
