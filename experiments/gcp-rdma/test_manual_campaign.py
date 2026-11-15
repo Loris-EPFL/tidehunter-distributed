@@ -2365,6 +2365,7 @@ class F6bSuiTests(CombinedSuiAdmissionTests):
         self.assertEqual(spec['sui_cells'],
                          self.sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_f6']['sui_cells'])
         self.assertEqual(len(spec['sui_cells']), 4)
+        self.assertEqual(spec['job_count'] + len(spec['sui_cells']), 62)
         with self.assertRaises(ValueError):
             manual._reviewed_jobs({**spec, 'machine_type': 'z4m-highmem-32'})
 

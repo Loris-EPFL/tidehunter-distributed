@@ -2658,75 +2658,51 @@
         "pass_check": true
       },
       {
-        "key": "W:p16v|.0f",
-        "source_value": 60.89112020946351,
-        "pdf_value": "61",
+        "key": "J:pagecache64",
+        "source_value": 181.715,
+        "pdf_value": "181.7",
         "pass_check": true
       },
       {
-        "key": "p50:cassandra:primary_rf1:write-concurrent:put:256|.0f",
-        "source_value": 164.0745,
-        "pdf_value": "164",
+        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:256|.1f",
+        "source_value": 69.579177,
+        "pdf_value": "69.6",
         "pass_check": true
       },
       {
-        "key": "B:per-node-64k:native:puts_s_node|,.0f",
-        "source_value": 6102.1850333507355,
-        "pdf_value": "6,102",
+        "key": "p50:native:primary_rf1:point-mixed:put:65536|.1f",
+        "source_value": 154.121,
+        "pdf_value": "154.1",
         "pass_check": true
       },
       {
-        "key": "J:native_mean_ratio",
-        "source_value": 16.212045382833818,
-        "pdf_value": "16.2",
+        "key": "J:native_reciprocal|,.0f",
+        "source_value": 6396.033972330279,
+        "pdf_value": "6,396",
         "pass_check": true
       },
       {
-        "key": "C:p16v:queue",
-        "source_value": 70.04173022460938,
-        "pdf_value": "70.0",
+        "key": "B:device-write-spread:th_verbs:minimum|,.0f",
+        "source_value": 1553.0,
+        "pdf_value": "1,553",
         "pass_check": true
       },
       {
-        "key": "mean:native:primary_rf1:point-mixed:put:65536|.1f",
-        "source_value": 156.34688688741724,
-        "pdf_value": "156.3",
+        "key": "C:p64v:coordinator",
+        "source_value": 91.88503857421875,
+        "pdf_value": "91.9",
         "pass_check": true
       },
       {
-        "key": "B:paper-context:uniform_get_ops_s:value|,.0f",
-        "source_value": 392000.0,
-        "pdf_value": "392,000",
+        "key": "p50:native:primary_rf1:write-concurrent:put:1024|.1f",
+        "source_value": 63.798,
+        "pdf_value": "63.8",
         "pass_check": true
       },
       {
-        "key": "B:device-write-spread:valkey_rdma:ratio|.2f",
-        "source_value": 1.3584190579317812,
-        "pdf_value": "1.36",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache8",
-        "source_value": 3.797,
-        "pdf_value": "3.8",
-        "pass_check": true
-      },
-      {
-        "key": "C:p64v:owner",
-        "source_value": 127.53080810546876,
-        "pdf_value": "127.5",
-        "pass_check": true
-      },
-      {
-        "key": "p50:valkey_rdma:primary_rf1:read-concurrent:read:1024|.1f",
-        "source_value": 43.051,
-        "pdf_value": "43.1",
-        "pass_check": true
-      },
-      {
-        "key": "D:uput1v:p50_us",
-        "source_value": 121.4785,
-        "pdf_value": "121.5",
+        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:64|.0f",
+        "source_value": 989.9014999999999,
+        "pdf_value": "990",
         "pass_check": true
       },
       {
@@ -2736,21 +2712,27 @@
         "pass_check": true
       },
       {
-        "key": "B:device-write-spread:valkey_rdma:maximum|,.0f",
-        "source_value": 2509.0,
-        "pdf_value": "2,509",
+        "key": "B:chart-anomalies:garnet:stall_min_ms|.0f",
+        "source_value": 60.028398,
+        "pdf_value": "60",
         "pass_check": true
       },
       {
-        "key": "B:per-node-64k:th_verbs:puts_s_node|,.0f",
-        "source_value": 1987.322772934948,
-        "pdf_value": "1,987",
+        "key": "p50:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
+        "source_value": 108.837,
+        "pdf_value": "108.8",
         "pass_check": true
       },
       {
-        "key": "J:native_reciprocal|,.0f",
-        "source_value": 6396.033972330279,
-        "pdf_value": "6,396",
+        "key": "D:p16v:mean_us",
+        "source_value": 420.8671442871094,
+        "pdf_value": "420.9",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:p50_us",
+        "source_value": 2713.716,
+        "pdf_value": "2713.7",
         "pass_check": true
       },
       {
@@ -2766,153 +2748,15 @@
         "pass_check": true
       },
       {
-        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:64|.0f",
-        "source_value": 989.9014999999999,
-        "pdf_value": "990",
+        "key": "D:uput1v:p50_us",
+        "source_value": 121.4785,
+        "pdf_value": "121.5",
         "pass_check": true
       },
       {
-        "key": "J:pagecache1_cps|,.0f",
-        "source_value": 268809.05382494413,
-        "pdf_value": "268,809",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache64",
-        "source_value": 181.715,
-        "pdf_value": "181.7",
-        "pass_check": true
-      },
-      {
-        "key": "p50:th_verbs:primary_rf1:read-concurrent:read:1024|.1f",
-        "source_value": 45.025,
-        "pdf_value": "45.0",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:th_verbs:ratio|.2f",
-        "source_value": 1.0688989053444946,
-        "pdf_value": "1.07",
-        "pass_check": true
-      },
-      {
-        "key": "J:owner64_software_pct|.0f",
-        "source_value": 47.442630000843344,
-        "pdf_value": "47",
-        "pass_check": true
-      },
-      {
-        "key": "B:chart-anomalies:garnet:stall_min_ms|.0f",
-        "source_value": 60.028398,
-        "pdf_value": "60",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:point-mixed:put:65536|.1f",
-        "source_value": 154.121,
-        "pdf_value": "154.1",
-        "pass_check": true
-      },
-      {
-        "key": "D:p16v:mean_us",
-        "source_value": 420.8671442871094,
-        "pdf_value": "420.9",
-        "pass_check": true
-      },
-      {
-        "key": "J:native_reciprocal_pct|.0f",
-        "source_value": 95.40576331753779,
-        "pdf_value": "95",
-        "pass_check": true
-      },
-      {
-        "key": "p50:cassandra:primary_rf1:write-concurrent:put:1024|.0f",
-        "source_value": 263.3355,
-        "pdf_value": "263",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:write-concurrent:put:256|.1f",
-        "source_value": 72.334,
-        "pdf_value": "72.3",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:valkey_rdma:puts_s_node|,.0f",
-        "source_value": 6380.479918638912,
-        "pdf_value": "6,380",
-        "pass_check": true
-      },
-      {
-        "key": "C:p16v:durable",
-        "source_value": 105.24902905273437,
-        "pdf_value": "105.2",
-        "pass_check": true
-      },
-      {
-        "key": "B:paper-context:write_ops_s:value|,.0f",
-        "source_value": 830000.0,
-        "pdf_value": "830,000",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:read-concurrent:read:1024|.2f",
-        "source_value": 1.368,
-        "pdf_value": "1.37",
-        "pass_check": true
-      },
-      {
-        "key": "C:p64v:coordinator",
-        "source_value": 91.88503857421875,
-        "pdf_value": "91.9",
-        "pass_check": true
-      },
-      {
-        "key": "p50:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
-        "source_value": 108.837,
-        "pdf_value": "108.8",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:write-concurrent:put:1024|.1f",
-        "source_value": 63.798,
-        "pdf_value": "63.8",
-        "pass_check": true
-      },
-      {
-        "key": "D:uput1v:mean_us",
-        "source_value": 126.59611486816405,
-        "pdf_value": "126.6",
-        "pass_check": true
-      },
-      {
-        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:256|.1f",
-        "source_value": 69.579177,
-        "pdf_value": "69.6",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:th_verbs:maximum|,.0f",
-        "source_value": 1660.0,
-        "pdf_value": "1,660",
-        "pass_check": true
-      },
-      {
-        "key": "D:p64v:mean_us",
-        "source_value": 462.4866848144531,
-        "pdf_value": "462.5",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:puts_s|,.0f",
-        "source_value": 6102.1850333507355,
-        "pdf_value": "6,102",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache_c1_64",
-        "source_value": 37.896,
-        "pdf_value": "37.9",
+        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:8192|.0f",
+        "source_value": 631.9214999999999,
+        "pdf_value": "632",
         "pass_check": true
       },
       {
@@ -2922,45 +2766,15 @@
         "pass_check": true
       },
       {
-        "key": "J:pagecache_jump",
-        "source_value": 47.8575190940216,
-        "pdf_value": "47.9",
-        "pass_check": true
-      },
-      {
-        "key": "C:p16v:coalescing",
-        "source_value": 80.97995947265625,
-        "pdf_value": "81.0",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:p50_us",
-        "source_value": 2713.716,
-        "pdf_value": "2713.7",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:mean_inflight_calls",
-        "source_value": 15.467225646878244,
-        "pdf_value": "15.5",
-        "pass_check": true
-      },
-      {
         "key": "B:paper-context:skew_get_ops_s:value|,.0f",
         "source_value": 3980000.0,
         "pdf_value": "3,980,000",
         "pass_check": true
       },
       {
-        "key": "cps:native:primary_rf1:read-concurrent:read:1024|,.0f",
-        "source_value": 277534.0489930938,
-        "pdf_value": "277,534",
-        "pass_check": true
-      },
-      {
-        "key": "B:chart-anomalies:garnet:stall_max_ms|.0f",
-        "source_value": 90.487694,
-        "pdf_value": "90",
+        "key": "C:p64v:owner",
+        "source_value": 127.53080810546876,
+        "pdf_value": "127.5",
         "pass_check": true
       },
       {
@@ -2970,15 +2784,201 @@
         "pass_check": true
       },
       {
-        "key": "B:device-write-spread:th_verbs:minimum|,.0f",
-        "source_value": 1553.0,
-        "pdf_value": "1,553",
+        "key": "C:p16v:queue",
+        "source_value": 70.04173022460938,
+        "pdf_value": "70.0",
         "pass_check": true
       },
       {
-        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:8192|.0f",
-        "source_value": 631.9214999999999,
-        "pdf_value": "632",
+        "key": "B:device-write-spread:th_verbs:maximum|,.0f",
+        "source_value": 1660.0,
+        "pdf_value": "1,660",
+        "pass_check": true
+      },
+      {
+        "key": "p50:th_verbs:primary_rf1:read-concurrent:read:1024|.1f",
+        "source_value": 45.025,
+        "pdf_value": "45.0",
+        "pass_check": true
+      },
+      {
+        "key": "B:paper-context:write_ops_s:value|,.0f",
+        "source_value": 830000.0,
+        "pdf_value": "830,000",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:mean_inflight_calls",
+        "source_value": 15.467225646878244,
+        "pdf_value": "15.5",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:valkey_rdma:ratio|.2f",
+        "source_value": 1.3584190579317812,
+        "pdf_value": "1.36",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache8",
+        "source_value": 3.797,
+        "pdf_value": "3.8",
+        "pass_check": true
+      },
+      {
+        "key": "B:paper-context:uniform_get_ops_s:value|,.0f",
+        "source_value": 392000.0,
+        "pdf_value": "392,000",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:th_verbs:puts_s_node|,.0f",
+        "source_value": 1987.322772934948,
+        "pdf_value": "1,987",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache_jump",
+        "source_value": 47.8575190940216,
+        "pdf_value": "47.9",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache1_cps|,.0f",
+        "source_value": 268809.05382494413,
+        "pdf_value": "268,809",
+        "pass_check": true
+      },
+      {
+        "key": "J:native_reciprocal_pct|.0f",
+        "source_value": 95.40576331753779,
+        "pdf_value": "95",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:th_verbs:ratio|.2f",
+        "source_value": 1.0688989053444946,
+        "pdf_value": "1.07",
+        "pass_check": true
+      },
+      {
+        "key": "mean:native:primary_rf1:point-mixed:put:65536|.1f",
+        "source_value": 156.34688688741724,
+        "pdf_value": "156.3",
+        "pass_check": true
+      },
+      {
+        "key": "B:chart-anomalies:garnet:stall_max_ms|.0f",
+        "source_value": 90.487694,
+        "pdf_value": "90",
+        "pass_check": true
+      },
+      {
+        "key": "D:uput1v:mean_us",
+        "source_value": 126.59611486816405,
+        "pdf_value": "126.6",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:valkey_rdma:puts_s_node|,.0f",
+        "source_value": 6380.479918638912,
+        "pdf_value": "6,380",
+        "pass_check": true
+      },
+      {
+        "key": "p50:cassandra:primary_rf1:write-concurrent:put:1024|.0f",
+        "source_value": 263.3355,
+        "pdf_value": "263",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:puts_s_node|,.0f",
+        "source_value": 6102.1850333507355,
+        "pdf_value": "6,102",
+        "pass_check": true
+      },
+      {
+        "key": "J:owner64_software_pct|.0f",
+        "source_value": 47.442630000843344,
+        "pdf_value": "47",
+        "pass_check": true
+      },
+      {
+        "key": "C:p16v:coalescing",
+        "source_value": 80.97995947265625,
+        "pdf_value": "81.0",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:read-concurrent:read:1024|.2f",
+        "source_value": 1.368,
+        "pdf_value": "1.37",
+        "pass_check": true
+      },
+      {
+        "key": "W:p16v|.0f",
+        "source_value": 60.89112020946351,
+        "pdf_value": "61",
+        "pass_check": true
+      },
+      {
+        "key": "p50:valkey_rdma:primary_rf1:read-concurrent:read:1024|.1f",
+        "source_value": 43.051,
+        "pdf_value": "43.1",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache_c1_64",
+        "source_value": 37.896,
+        "pdf_value": "37.9",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:puts_s|,.0f",
+        "source_value": 6102.1850333507355,
+        "pdf_value": "6,102",
+        "pass_check": true
+      },
+      {
+        "key": "D:p64v:mean_us",
+        "source_value": 462.4866848144531,
+        "pdf_value": "462.5",
+        "pass_check": true
+      },
+      {
+        "key": "p50:cassandra:primary_rf1:write-concurrent:put:256|.0f",
+        "source_value": 164.0745,
+        "pdf_value": "164",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:write-concurrent:put:256|.1f",
+        "source_value": 72.334,
+        "pdf_value": "72.3",
+        "pass_check": true
+      },
+      {
+        "key": "J:native_mean_ratio",
+        "source_value": 16.212045382833818,
+        "pdf_value": "16.2",
+        "pass_check": true
+      },
+      {
+        "key": "C:p16v:durable",
+        "source_value": 105.24902905273437,
+        "pdf_value": "105.2",
+        "pass_check": true
+      },
+      {
+        "key": "cps:native:primary_rf1:read-concurrent:read:1024|,.0f",
+        "source_value": 277534.0489930938,
+        "pdf_value": "277,534",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:valkey_rdma:maximum|,.0f",
+        "source_value": 2509.0,
+        "pdf_value": "2,509",
         "pass_check": true
       }
     ],

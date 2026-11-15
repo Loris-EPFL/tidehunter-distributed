@@ -208,6 +208,14 @@ class FocusedMatrixTests(unittest.TestCase):
                 self.assertNotIn("live_leased_write_window", job)
                 self.assertEqual(job["durability_tier"], "native")
 
+    def test_new_fleet_value_sizes_match_binary_validator(self):
+        # Matches benchmarks/kv-research/src/config.rs, the dataset.value_size check.
+        allowed = {64, 256, 1024, 4096, 8192, 16384, 65536}
+        for selection in ("nvmeof_f6b", "nvmeof_f7_highmem32"):
+            for job in campaign.make_focused_matrix(selection):
+                with self.subTest(selection=selection, case=job["case_id"]):
+                    self.assertIn(job["value_size"], allowed)
+
     def test_f6b_exact_reviewed_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_f6b")
         self.assertEqual(Counter(j["group"] for j in jobs),

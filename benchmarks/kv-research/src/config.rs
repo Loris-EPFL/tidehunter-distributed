@@ -404,8 +404,13 @@ impl RunConfig {
         if self.dataset.keys == 0 || self.dataset.keys > self.limits.max_keys {
             return invalid("dataset.keys must be positive and within limits.max_keys");
         }
-        if !matches!(self.dataset.value_size, 64 | 256 | 1024 | 8192 | 65_536) {
-            return invalid("dataset.value_size must be 64, 256, 1024, 8192, or 65536 bytes");
+        if !matches!(
+            self.dataset.value_size,
+            64 | 256 | 1024 | 4096 | 8192 | 16_384 | 65_536
+        ) {
+            return invalid(
+                "dataset.value_size must be 64, 256, 1024, 4096, 8192, 16384, or 65536 bytes",
+            );
         }
         if self.backend.kind == "tidehunter" {
             // Qualification always checks a two-entry batch; workload batches
@@ -1052,11 +1057,14 @@ mod tests {
     #[test]
     fn admits_only_value_sizes_and_tidehunter_batch_limits_that_fit() {
         let mut config = config();
-        for size in [64, 65_536] {
+        for size in [64, 4096, 16_384, 65_536] {
             config.dataset.value_size = size;
             config.limits.max_bytes = config.dataset.keys * size as u64;
             assert!(config.validate().is_ok(), "value size {size}");
         }
+        config.dataset.value_size = 2048;
+        config.limits.max_bytes = config.dataset.keys * 2048;
+        assert!(config.validate().is_err());
 
         config.backend.kind = "tidehunter".to_owned();
         config.backend.options = serde_json::json!({});
