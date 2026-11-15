@@ -523,7 +523,8 @@ def live_nvmeof_metrics(evidence, labels):
                     # the existing events family (the counter label names the unit); no new metric family.
                     "lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns", "lease_profile_samples",
                     "adopt_owner_ns", "adopt_close_scan_ns", "adopt_close_scan_bytes", "adopt_profile_samples",
-                    "extent_preleases", "extent_switch_waits", "leased_eventfd_unavailable")
+                    "extent_preleases", "extent_switch_waits", "leased_eventfd_unavailable",
+                    "leased_worker_waits", "leased_worker_wait_timeouts")
     extra_stages = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
                     "extent_switch", "adoption_async", "adoption_settle")
     expected = set(fields) | {stage + suffix for stage in stages for suffix in ("_ns", "_samples")}
@@ -863,6 +864,7 @@ LIVE_NVME_WRITE_COUNTERS = {
     "fua_writes", "leased_failed_writes", "leased_short_writes", "leased_timed_out_writes",
     "leased_full_writes", "failed_write_ops", "short_write_ops", "short_write_bytes",
     "adoption_history_full_settles", "leased_eventfd_unavailable",
+    "leased_worker_waits", "leased_worker_wait_timeouts",
     *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
                                    "allocation", "publication", "namespace_setup", "read_io",
                                    "owner_completion", "wal_persistence", "wal_namespace",

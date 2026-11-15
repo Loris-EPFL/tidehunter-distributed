@@ -38,7 +38,8 @@ class StageControllerTests(unittest.TestCase):
             root = Path(tmp)
             for expected, calls, delta, status in [('cold', 2048, 1900, 'qualified'),
                                                     ('cold', 2048, 1700, 'unqualified'),
-                                                    ('memory', 8192, 10, 'qualified')]:
+                                                    ('memory', 8192, 0, 'qualified'),
+                                                    ('memory', 8192, 10, 'unqualified')]:
                 job = {'case_id': 'case', 'case_kind': 'live_read', 'media': {'expected': expected}}
                 first, last = frame(counter), frame({**counter, 'read_ops': counter['read_ops'] + delta})
                 samples = [{'operation': 'read', 'outcome': 'success'}] * calls

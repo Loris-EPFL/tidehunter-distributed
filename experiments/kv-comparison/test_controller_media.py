@@ -31,11 +31,12 @@ class MediaEvidenceTests(unittest.TestCase):
             "case", {"expected": expected, "history": history}, [self.row], after, reads, drained)
 
     def test_inclusive_thresholds(self):
-        for expected, count in (("cold", 190), ("memory", 106)):
+        for expected, count in (("cold", 190), ("memory", 100)):
             result = self.evidence(expected, [self.row | {"read_ops": count}])
             self.assertEqual(result["status"], "qualified")
         self.assertEqual(self.evidence("cold", [self.row | {"read_ops": 189}])["status"], "unqualified")
-        self.assertEqual(self.evidence("memory", [self.row | {"read_ops": 107}])["status"], "unqualified")
+        for count in (101, 106, 107):
+            self.assertEqual(self.evidence("memory", [self.row | {"read_ops": count}])["status"], "unqualified")
     def test_device_owner_cold_qualification_is_not_a_case_failure(self):
         job = next(job for job in controller.cloud_campaign.make_focused_matrix("device")
                    if job["case_kind"] == "media_read" and job["backend"] == "tidehunter_tcp")

@@ -96,7 +96,7 @@ class CampaignModeTests(unittest.TestCase):
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
                 'live_write': {'write_mode': 'leased',
                                'acknowledgement_contract': 'leased extent: page-cache write'}}}
-        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2'):
+        if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_single_caller', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2'):
             window = job.get('live_leased_write_window')
             info['configuration'].update(live_leased_write_window=window,
                 live_leased_write_window_bound=31 if window is None else window)
@@ -204,6 +204,14 @@ class CampaignModeTests(unittest.TestCase):
                     'start': {'live_nvmeof': start}, 'end': {'live_nvmeof': end},
                     'live_nvmeof': {'available': True, 'counters': dict(end)}}
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'])
+        for group in ('G23W', 'G23X', 'G28W', 'G28C'):
+            current = dict(job, group=group)
+            self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, current)['qualified'])
+            bad = copy.deepcopy(evidence)
+            bad['end']['live_nvmeof']['fua_writes'] = 1
+            bad['live_nvmeof']['counters']['fua_writes'] = 1
+            self.assertIn('leased FUA count differs from frames and skip markers',
+                          cloud_campaign.qualify_live_nvme_measurement(bad, current)['reasons'])
         skipped = copy.deepcopy(evidence)
         skipped['end']['live_nvmeof'].update(leased_skip_markers=1, fua_writes=3)
         skipped['live_nvmeof']['counters'].update(leased_skip_markers=1, fua_writes=3)

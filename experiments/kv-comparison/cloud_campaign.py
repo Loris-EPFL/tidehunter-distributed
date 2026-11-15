@@ -41,7 +41,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
 
 
 
@@ -721,7 +721,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "remote_rw_compact": 342, "fabric_ab_compact": 80, "leased_ab_compact": 72,
                   "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
                   "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35,
-                  "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "valkey_rdma_reads": 22,
+                  "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "nvmeof_single_caller": 20, "valkey_rdma_reads": 22,
                   "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20, "nvmeof_reads_geometry_rest2": 18}
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
@@ -766,6 +766,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_contracts_crossing": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 1},
     "nvmeof_contracts_crossing2": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 2},
     "nvmeof_parallel_writes": {"G23W": 32, "G23X": 6, "G23N": 6},
+    "nvmeof_single_caller": {"G28W": 8, "G28C": 8, "G28N": 4},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -1763,6 +1764,37 @@ def _nvmeof_parallel_writes(path):
     return result
 
 
+def _nvmeof_single_caller(path):
+    """Measure single-caller completion wakeups with matched c16 controls."""
+    sources = _nvmeof_contracts_crossing2(path)
+    result = []
+    selection = "nvmeof_single_caller"
+    for tier in ("synchronous", "native"):
+        for size in (65536, 1024):
+            source = _clone_source(sources, "G21W", "tidehunter_nvme_rdma", size, 16,
+                                   durability_tier=tier, diagnostics=None,
+                                   measurement_operations=4096)
+            for repeat in (0, 1):
+                _clone_job(result, selection, source, "G28W", repeat=repeat,
+                           concurrency=1, read_lanes=1,
+                           diagnostics={"write_timeline_limit": 4096})
+    for tier in ("synchronous", "native"):
+        for size in (65536, 1024):
+            source = _clone_source(sources, "G21W", "tidehunter_nvme_rdma", size, 16,
+                                   durability_tier=tier, diagnostics=None,
+                                   measurement_operations=4096)
+            for window in (1, None):
+                _clone_job(result, selection, source, "G28C",
+                           **({"live_leased_write_window": window} if window is not None else {}),
+                           **({"diagnostics": {"write_timeline_limit": 4096}} if size == 65536 else {}))
+    for tier in ("value_wal_barrier", "page_cache"):
+        for size in (65536, 1024):
+            source = _clone_source(sources, "G21N", "native", size, 16,
+                                   native_durability=tier)
+            _clone_job(result, selection, source, "G28N", concurrency=1)
+    return result
+
+
 def _nvmeof_first_put(sources):
     """Keep the reviewed first-put checks in their canary-first order."""
     result = []
@@ -1981,6 +2013,8 @@ def make_focused_matrix(selection):
             return _nvmeof_reads_geometry(path)
         if selection == "nvmeof_parallel_writes":
             return _nvmeof_parallel_writes(path)
+        if selection == "nvmeof_single_caller":
+            return _nvmeof_single_caller(path)
         if selection == "nvmeof_contracts_crossing2":
             return _nvmeof_contracts_crossing2(path)
         if selection == "nvmeof_contracts_crossing":
@@ -2463,7 +2497,7 @@ def qualify_live_nvme_measurement(evidence, job):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G24W", "G24M") and any(
+        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G24W", "G24M") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
             if job["live_write_mode"] == "leased":
                 if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
@@ -2535,7 +2569,7 @@ def admit_live_write_contract(job, backend_info):
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
             raise ValueError("live export mode or queue geometry differs")
-    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
+    if job.get("selection") in ("nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2", "valkey_rdma_reads") and job["live_write_mode"] == "leased":
         configuration = backend_info.get("configuration", {})
         window = configuration.get("live_leased_write_window")
         expected_window = job.get("live_leased_write_window")

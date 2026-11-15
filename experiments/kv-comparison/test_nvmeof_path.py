@@ -55,6 +55,37 @@ class NvmeofPathTests(unittest.TestCase):
         self.assertIn('## Settings — S — synced', text)
         self.assertIn('## Settings — P — page cache', text)
 
+    def test_conditional_stages_exclude_calls_without_pair(self):
+        directory = self.add('tidehunter_nvme_rdma')
+        records = [
+            dict(events=[dict(stage='caller_start', elapsed_ns=0),
+                         dict(stage='caller_finished', elapsed_ns=1000000)]),
+            dict(events=[dict(stage='caller_start', elapsed_ns=0),
+                         dict(stage='live_extent_switch_started', elapsed_ns=0),
+                         dict(stage='live_extent_switch_completed', elapsed_ns=1000000),
+                         dict(stage='caller_finished', elapsed_ns=1000000)])]
+        (directory / 'write-timeline.json').write_text(json.dumps(dict(timeline=dict(records=records))))
+        row = next(row for row in analysis.stage_rows(directory.parent)
+                   if row['stage_pair'] == 'live_extent_switch_started -> live_extent_switch_completed')
+        self.assertEqual(row['calls_with_pair'], 1)
+        self.assertEqual(row['cond_p50_us'], 1000)
+        self.assertEqual(row['cond_mean_us'], 1000)
+        self.assertEqual(row['cond_p99_us'], 1000)
+        self.assertEqual(row['mean_us'], 500)
+
+    def test_load_model_cold_label_and_worker_counters(self):
+        directory = self.add('tidehunter_nvme_rdma', media={'expected': 'cold'})
+        (directory / 'measurement-read-evidence.json').write_text(json.dumps(
+            {'live_nvmeof': {'counters': {'leased_frames': 20, 'leased_worker_waits': 22,
+                                        'leased_worker_wait_timeouts': 1}}}))
+        row = analysis.result_row(self.cases[0], self.export)
+        self.assertEqual(row['cache_label'], 'cold unqualified')
+        self.assertEqual(row['load_model'], 'closed_loop')
+        self.assertEqual(row['leased_worker_waits'], 22)
+        self.assertEqual(row['worker_timeouts_per_frame'], .05)
+        self.jobs[0]['offered_ops_per_second'] = 100
+        self.assertEqual(analysis.result_row(self.cases[0], self.export)['load_model'], 'open_loop')
+
     def test_stages_csv_uses_three_complete_captured_calls(self):
         directory = self.add('tidehunter_nvme_rdma', group='G21W', selection='nvmeof_contracts')
         records = [dict(caller_sample_id=index, events=[
@@ -286,7 +317,7 @@ class NvmeofPathTests(unittest.TestCase):
         self.assertEqual(rows[0]['media_status'], 'qualified')
         self.assertEqual(rows[0]['read_ops_per_success'], .93)
         self.assertEqual(rows[0]['device_bytes_per_read'], 4096)
-        self.assertEqual(rows[1]['cache_label'], 'partly cached')
+        self.assertEqual(rows[1]['cache_label'], 'cold unqualified')
         with (self.output / 'reads.csv').open() as stream:
             self.assertEqual(next(csv.DictReader(stream))['namespace_connects'], 'not available')
 

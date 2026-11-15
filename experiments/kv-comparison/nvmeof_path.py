@@ -23,7 +23,7 @@ LIVE_DEFAULTS = dict(live_export_mode='on_demand', live_write_mode='reserved', l
 GEOMETRY = {'native_default': (134217728, 10737418240, 16), 'research': (4194304, 1073741824, 3), 'sui_harness': (16777216, 268435456, 3)}
 # The arm columns identify a row without the settings table: several arms share operation, size and concurrency.
 ARM = ('route', 'tier', 'history_persistence', 'lease_ahead', 'polled_writes', 'media_expected', 'keys', 'read_lanes', 'io_queues', 'queue_size', 'poll_queues', 'inline_reads', 'diagnostic')
-RESULTS = ('case_id', 'group', 'backend', 'operation', 'value_size', 'concurrency', 'repetition', 'contract', *ARM, 'status', 'p50_us', 'p99_us', 'p999_us', 'mean_us', 'calls_per_second', 'mean_inflight_calls', 'max_leased_in_flight', 'max_leased_in_flight_scope', 'live_leased_write_window', 'live_leased_write_window_bound', 'native_p50_ratio', 'calls_ge_5ms', 'time_ge_5ms_share', 'device_write_payload_ratio', 'history_waits', 'read_ops_per_success', 'device_bytes_per_read', 'media_status', 'reason_codes', 'cache_label', 'grant_misses', 'metadata_requests', 'namespace_connects', 'Control_mean_us', 'NamespaceSetup_mean_us', 'ControllerConnect_mean_us', 'coordinator_hits', 'coordinator_misses', 'owner_wal_file_count')
+RESULTS = ('case_id', 'group', 'backend', 'operation', 'value_size', 'concurrency', 'repetition', 'contract', 'load_model', *ARM, 'status', 'p50_us', 'p99_us', 'p999_us', 'mean_us', 'calls_per_second', 'mean_inflight_calls', 'max_leased_in_flight', 'max_leased_in_flight_scope', 'live_leased_write_window', 'live_leased_write_window_bound', 'native_p50_ratio', 'calls_ge_5ms', 'time_ge_5ms_share', 'device_write_payload_ratio', 'history_waits', 'read_ops_per_success', 'device_bytes_per_read', 'media_status', 'reason_codes', 'cache_label', 'grant_misses', 'metadata_requests', 'namespace_connects', 'Control_mean_us', 'NamespaceSetup_mean_us', 'ControllerConnect_mean_us', 'coordinator_hits', 'coordinator_misses', 'owner_wal_file_count')
 PROFILE_COUNTERS = {'lease_reserve_ns': 'lease_profile_samples',
                     'lease_namespace_sync_ns': 'lease_profile_samples',
                     'lease_publish_ns': 'lease_profile_samples',
@@ -31,10 +31,11 @@ PROFILE_COUNTERS = {'lease_reserve_ns': 'lease_profile_samples',
                     'adopt_close_scan_ns': 'adopt_profile_samples',
                     'adopt_close_scan_bytes': 'adopt_profile_samples'}
 RESULTS += tuple(name + '_mean' for name in PROFILE_COUNTERS) + (
-    'lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits')
+    'lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits',
+    'leased_worker_waits', 'leased_worker_wait_timeouts', 'worker_timeouts_per_frame')
 RESULTS += ('first_call_us', 'contract_class')
 STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
-STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share')
+STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share', 'calls_with_pair', 'cond_mean_us', 'cond_p50_us', 'cond_p99_us')
 
 
 def load(path):
@@ -142,6 +143,7 @@ def result_row(case, export):
                io_queues=j.get('live_io_queues'), queue_size=j.get('live_io_queue_size'), poll_queues=j.get('live_poll_queues'), inline_reads=j.get('live_inline_reads'),
                diagnostic='sustained' if j.get('measurement_operations') == 200000 else 'history diagnostics' if j.get('owner_history_diagnostics') else None)
     row['contract_class'] = contract_class(j)
+    row['load_model'] = 'open_loop' if j.get('offered_ops_per_second') else 'closed_loop'
     row.update(history_persistence=None if native else j.get('history_persistence', 'on_disk'),
                lease_ahead=j.get('live_lease_ahead', True) if live(j) else None,
                polled_writes=j.get('live_polled_writes', False) if live(j) else None)
@@ -171,8 +173,12 @@ def result_row(case, export):
     for name, denominator in PROFILE_COUNTERS.items():
         value, count = nonnegative(counters.get(name)), nonnegative(counters.get(denominator))
         row[name + '_mean'] = value / count if value is not None and count else None
-    for name in ('lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits'):
+    for name in ('lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits',
+                 'leased_worker_waits', 'leased_worker_wait_timeouts'):
         row[name] = nonnegative(counters.get(name))
+    frames = nonnegative(counters.get('leased_frames'))
+    timeouts = row['leased_worker_wait_timeouts']
+    row['worker_timeouts_per_frame'] = timeouts / frames if frames and timeouts is not None else None
     for title, stage in (('Control', 'control'), ('NamespaceSetup', 'namespace_setup'), ('ControllerConnect', 'controller_connect')):
         row[title + '_mean_us'] = leased_ab._mean_stage(counters, stage) if nonnegative(counters.get(stage + '_ns')) is not None and (nonnegative(counters.get(stage + '_samples')) or 0) > 0 else None
     coordinator = ((boundary.get('deltas') or {}).get('coordinator') or {}).get('counters') or {}
@@ -184,7 +190,7 @@ def result_row(case, export):
     qualification = media.get('qualification') or media
     row.update(media_status=qualification.get('status'), reason_codes=qualification.get('reason_codes', qualification.get('reasons')))
     if j.get('media', {}).get('expected') == 'cold' and row['media_status'] != 'qualified':
-        row['cache_label'] = 'partly cached'
+        row['cache_label'] = 'cold unqualified'
     elif j['group'] == 'G18M':
         row['cache_label'] = 'cache case'
     devices = load(directory / 'device_counters.json') or load(directory.parent / 'device_counters.json')
@@ -341,11 +347,16 @@ def stage_rows(case):
     rows = []
     for pair in pairs:
         values = [call.get(pair, 0) for call in calls]
+        conditional = [call[pair] for call in calls if pair in call]
         total = sum(values)
         rows.append(dict(case_id=case.name, stage_pair=pair,
                          mean_us=total / len(calls) / 1000,
                          p50_us=analyze.quantile(values, .5) / 1000,
-                         share=total / total_ns if total_ns else None))
+                         share=total / total_ns if total_ns else None,
+                         calls_with_pair=len(conditional),
+                         cond_mean_us=sum(conditional) / len(conditional) / 1000,
+                         cond_p50_us=analyze.quantile(conditional, .5) / 1000,
+                         cond_p99_us=analyze.quantile(conditional, .99) / 1000))
     return rows
 
 
@@ -362,7 +373,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -401,7 +412,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
-    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N') and r['operation'] in ('put', 'put_batch')]
+    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N') and r['operation'] in ('put', 'put_batch')]
     tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R') and r['operation'] in ('read', 'get_many')]
     tables['puts'] += [r for r in rows if r['group'] in ('G24W', 'G24M') and r['operation'] == 'put']
     tables['reads'] += [r for r in rows if r['group'].startswith('G24') and r['operation'] in ('read', 'get_many')]
@@ -411,6 +422,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
     write_csv(output / 'stages.csv', STAGE_FIELDS,
               [row for case in cases for row in stage_rows(export / 'cases' / case['case_id'])])
     lines.append('Stages use complete captured coordinator calls. Missing adjacent pairs contribute zero per call; their shares use the mean captured call duration.')
+    lines.append('`p50_us` counts a missing pair as zero; `cond_*` columns use only calls that contain the pair.')
     for name, entries in tables.items():
         fields = tuple(dict.fromkeys(k for r in entries for k in r)) if name == 'floors' and entries else RESULTS
         write_csv(output / (name + '.csv'), fields, entries)

@@ -592,7 +592,7 @@ def qualify_media_evidence(case_id, media, before, after, successful_reads, drai
     if ratio is not None:
         if media["expected"] == "cold" and ratio < 0.9:
             reasons.append("cold_read_ratio_below_threshold")
-        if media["expected"] == "memory" and ratio > 0.06:
+        if media["expected"] == "memory" and ratio > 0:
             reasons.append("memory_read_ratio_above_threshold")
     if media.get("history") == "prewarm":
         reasons.append("history_baseline_compared_in_report")
