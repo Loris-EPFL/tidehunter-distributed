@@ -19,18 +19,18 @@ SELECTION = "nvmeof_p9_write_engine"
 class WriteEngineTests(unittest.TestCase):
     def test_exact_arms_and_cells(self):
         jobs = campaign.make_focused_matrix(SELECTION)
-        self.assertEqual(len(jobs), 32)
-        self.assertEqual(len({job["case_id"] for job in jobs}), 32)
+        self.assertEqual(len(jobs), 18)
+        self.assertEqual(len({job["case_id"] for job in jobs}), 18)
         for arm, prewrite in (("file", False), ("prewritten", True)):
             cells = [job for job in jobs if job["arm"] == arm]
-            self.assertEqual(len(cells), 16)
+            self.assertEqual(len(cells), 9)
             puts = [job for job in cells if job["case_kind"] == "remote_put"]
             self.assertEqual({(j["value_size"], j["concurrency"], j["durability_tier"]) for j in puts},
-                             {(size, concurrency, tier) for size in (512, 1024)
+                             {(size, concurrency, tier) for size in (512,)
                               for concurrency in (16, 64, 256) for tier in ("native", "synchronous")})
             reads = [job for job in cells if job["case_kind"] == "live_read"]
             self.assertEqual([(j["value_size"], j["concurrency"], j["coordinator_cache_bytes"]) for j in reads],
-                             [(1024, 16, 0), (1024, 64, 0)])
+                             [(1024, 16, 0)])
             replays = [job for job in cells if job["case_kind"] == "mainnet_replay"]
             self.assertEqual({j["durability_tier"] for j in replays}, {"native", "synchronous"})
             for job in cells:
@@ -41,12 +41,33 @@ class WriteEngineTests(unittest.TestCase):
                 self.assertNotIn("diagnostics", job)
                 self.assertEqual((job["owner_count"], job["owner_topology"]), (5, "separate"))
         self.assertEqual(campaign.selection_owner_hosts(SELECTION), 5)
-        for arms in (["file"], ["prewritten"], ["file", "prewritten"]):
+        for arms in (["file"], ["prewritten"]):
             selected = controller.controller_matrix({"mode": "focused", "selection": SELECTION, "arms": arms})
-            self.assertEqual(len(selected), 16 * len(arms))
+            self.assertEqual(len(selected), 9)
             self.assertEqual({job["arm"] for job in selected}, set(arms))
         with self.assertRaises(controller.SafetyError):
             controller.controller_matrix({"mode": "focused", "selection": SELECTION, "arms": ["raw"]})
+        with self.assertRaises(controller.SafetyError):
+            controller.controller_matrix({"mode": "focused", "selection": SELECTION, "arms": ["file", "prewritten"]})
+
+    def test_c256_only_reduction_and_archive_guard(self):
+        sources = campaign._nvmeof_p9_small_put()
+        jobs = campaign.make_focused_matrix(SELECTION)
+        for job in jobs:
+            if job["case_kind"] != "remote_put":
+                continue
+            source = next(s for s in sources if s["repeat"] == 0 and s["value_size"] == 512
+                          and s["concurrency"] == job["concurrency"])
+            divisor = 2 if job["concurrency"] == 256 else 1
+            self.assertEqual(job["measurement_operations"], source["measurement_operations"] // divisor)
+            self.assertEqual(job["warmup_operations"], source["warmup_operations"])
+        oversized = copy.deepcopy(sources)
+        for job in oversized:
+            if job["value_size"] == 512 and job["concurrency"] == 16:
+                job["measurement_sizing"]["expected_archive_bytes"] = 3_000_000_001
+        with patch.object(campaign, "_nvmeof_p9_small_put", return_value=oversized):
+            with self.assertRaisesRegex(ValueError, "archive exceeds3GB"):
+                campaign._nvmeof_p9_write_engine()
 
     def test_replay_config_and_result_counts(self):
         for job in campaign.make_focused_matrix(SELECTION):
@@ -115,6 +136,10 @@ class WriteEngineTests(unittest.TestCase):
             launch["node"].update(root=str(node / "storage"), wal_prewrite=not job["owner_wal_prewrite"])
             with self.assertRaisesRegex(controller.SafetyError, "wal_prewrite differs"):
                 controller.validate_launch(config, launch, job["case_id"], 0)
+            if not job["owner_wal_prewrite"]:
+                launch["node"]["wal_prewrite"] = False
+                with self.assertRaisesRegex(controller.SafetyError, "wal_prewrite differs"):
+                    controller.validate_launch(config, launch, job["case_id"], 0)
 
 
 if __name__ == "__main__":

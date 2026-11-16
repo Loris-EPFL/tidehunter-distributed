@@ -20,8 +20,8 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 63)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 63)
+        self.assertEqual(len(self.jobs), 49)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 49)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
                          {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:
@@ -163,14 +163,16 @@ class MultiOwnerTests(unittest.TestCase):
             if job["mix"]["put"]:
                 self.assertLessEqual(4096 + job["warmup_operations"] + job["measurement_operations"], 1_000_000)
         for selection in campaign.M3_SELECTIONS:
-            ceiling = 9_000_000_000 if selection == "nvmeof_p9_write_engine" else 3_000_000_000
-            self.assertLessEqual(sum(job["measurement_sizing"]["expected_archive_bytes"]
-                                     for job in self.jobs if job["selection"] == selection), ceiling)
+            arms = ("file", "prewritten") if selection == "nvmeof_p9_write_engine" else (None,)
+            for arm in arms:
+                self.assertLessEqual(sum(job["measurement_sizing"]["expected_archive_bytes"]
+                                         for job in self.jobs if job["selection"] == selection
+                                         and (arm is None or job["arm"] == arm)), 3_000_000_000)
 
     def test_cache_pair_has_explicit_hit_window_and_remote_deadline_rates(self):
         pairs = [job for job in self.jobs
                  if job["measurement_sizing"].get("minimum_phase_seconds")]
-        self.assertEqual(len(pairs), 8)
+        self.assertEqual(len(pairs), 6)
         for job in pairs:
             sizing = job["measurement_sizing"]
             self.assertEqual((job["measurement_operations"], job["warmup_operations"]),

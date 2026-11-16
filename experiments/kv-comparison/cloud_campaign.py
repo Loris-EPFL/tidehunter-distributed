@@ -777,7 +777,7 @@ FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
 FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
-FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 32
+FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 18
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -833,7 +833,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_m3_t2_2": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_m3_t2_5": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_p9_small_put": {"G34W": 7},
-    "nvmeof_p9_write_engine": {"G35W": 24, "G35R": 4, "G35S": 4},
+    "nvmeof_p9_write_engine": {"G35W": 12, "G35R": 2, "G35S": 4},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -2109,12 +2109,12 @@ def _nvmeof_p9_small_put():
 
 
 def _nvmeof_p9_write_engine():
-    """Matched file/prewritten arms: twelve puts, two reads and two perpetual replays."""
+    """One nine-case fleet per backing arm, within the two-hour/export envelope."""
     result = []
-    puts = [job for job in _nvmeof_p9_small_put() if job["repeat"] == 0]
+    puts = [job for job in _nvmeof_p9_small_put() if job["repeat"] == 0 and job["value_size"] == 512]
     reads = [job for job in _nvmeof_m3_owners()
              if job["selection"] == "nvmeof_m3_t2_5" and job["case_kind"] == "live_read"
-             and job["value_size"] == 1024 and job["concurrency"] in (16, 64)]
+             and job["value_size"] == 1024 and job["concurrency"] == 16]
     for arm, prewrite in (("file", False), ("prewritten", True)):
         common = dict(arm=arm, owner_wal_prewrite=prewrite,
                       owner_count=5, owner_topology="separate", coordinator_cache_bytes=0,
@@ -2122,6 +2122,17 @@ def _nvmeof_p9_write_engine():
         for source in puts:
             for tier in ("synchronous", "native"):
                 clean = {key: value for key, value in source.items() if key != "diagnostics"}
+                if clean["concurrency"] == 256:
+                    # Owner-approved reduction: only c256 puts halve their measured calls.
+                    measurement = clean["measurement_operations"] // 2
+                    sizing = dict(clean["measurement_sizing"])
+                    rate = sizing["rate_calls_per_second"]
+                    expected = (4096 + clean["warmup_operations"] + measurement) / rate + 28
+                    sizing.update(measurement_operations=measurement, measurement_seconds=measurement / rate,
+                                  expected_case_seconds=expected,
+                                  case_deadline_seconds=max(180, math.ceil(6 * expected)),
+                                  expected_archive_bytes=(4096 + clean["warmup_operations"] + measurement) * 256 + 8 * 1024**2)
+                    clean.update(measurement_operations=measurement, measurement_sizing=sizing)
                 _clone_job(result, "nvmeof_p9_write_engine", clean, "G35W",
                            durability_tier=tier, **common)
         for source in reads:
@@ -2138,6 +2149,9 @@ def _nvmeof_p9_write_engine():
                                            "expected_case_seconds": 120,
                                            "expected_archive_bytes": 600 * 1024**2},
                        **common)
+        if sum(job["measurement_sizing"]["expected_archive_bytes"]
+               for job in result if job["arm"] == arm) > 3_000_000_000:
+            raise ValueError("M3 sample archive exceeds3GB; drop cells, not measurement seconds")
     return result
 
 

@@ -151,9 +151,9 @@ def controller_matrix(spec):
         if spec["selection"] in cloud_campaign.M3_SELECTIONS and "owner_hosts" in spec:
             jobs = [job for job in jobs if cloud_campaign.job_owner_hosts(job) == spec["owner_hosts"]]
         if spec["selection"] == "nvmeof_p9_write_engine":
-            arms = spec.get("arms", ["file", "prewritten"])
-            if arms not in (["file"], ["prewritten"], ["file", "prewritten"]):
-                raise SafetyError("write-engine arms must be file and/or prewritten in reviewed order")
+            arms = spec.get("arms", ["file"])
+            if arms not in (["file"], ["prewritten"]):
+                raise SafetyError("write-engine fleets require exactly one file or prewritten arm")
             jobs = [job for job in jobs if job["arm"] in arms]
         return jobs
     return cloud_campaign.make_matrix(spec)
@@ -1892,7 +1892,9 @@ def validate_launch(config, launch, case, index, polling=None):
     if "owner_wal_prewrite" in job:
         expected_prewrite = job["owner_wal_prewrite"]
         actual_prewrite = launch.get("node", {}).get("wal_prewrite", False)
-        if type(expected_prewrite) is not bool or type(actual_prewrite) is not bool or actual_prewrite != expected_prewrite:
+        if (type(expected_prewrite) is not bool or type(actual_prewrite) is not bool
+                or actual_prewrite != expected_prewrite
+                or not expected_prewrite and "wal_prewrite" in launch.get("node", {})):
             raise SafetyError("owner wal_prewrite differs from the exact reviewed case")
     live_target = launch.get("node", {}).get("live_target")
     if live_target is not None:

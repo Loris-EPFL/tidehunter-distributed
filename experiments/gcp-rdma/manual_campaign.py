@@ -123,7 +123,7 @@ FOCUSED_MATRIX_SHA256 = {
     'valkey_rdma_reads': 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2',
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
-    'nvmeof_p9_write_engine': 'b6eeea3618832c10917952aa150f6ab2036b172b91e9526582b489fc5c1727bc',
+    'nvmeof_p9_write_engine': 'f64324a08713b8167fd6216948be8c7b5d44b48643d28537294dc6280cdcf3fa',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -222,9 +222,9 @@ REVIEWED_SPECS["nvmeof_p9_small_put"] = {
 }
 REVIEWED_SPECS["nvmeof_p9_write_engine"] = {
     **copy.deepcopy(REVIEWED_SPECS["nvmeof_m3_t2_5"]),
-    "selection": "nvmeof_p9_write_engine", "job_count": 32, "max_cases": 32, "repeats": 1,
+    "selection": "nvmeof_p9_write_engine", "job_count": 18, "max_cases": 18, "repeats": 1,
     "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p9_write_engine"],
-    "case_deadline_seconds": 600, "arms": ["file", "prewritten"],
+    "case_deadline_seconds": 600, "arms": ["file"],
 }
 
 
@@ -371,8 +371,8 @@ def _reviewed_jobs(spec):
     selected_arms = None
     if reviewed is not None and spec.get("selection") == "nvmeof_p9_write_engine":
         selected_arms = spec.get("arms")
-        if selected_arms not in (["file"], ["prewritten"], ["file", "prewritten"]):
-            raise ValueError("unreviewed write-engine arms")
+        if selected_arms not in (["file"], ["prewritten"]):
+            raise ValueError("write-engine fleets require exactly one file or prewritten arm")
         spec = {**spec, "arms": reviewed["arms"]}
     if reviewed is None or _json(spec) != _json(reviewed):
         raise ValueError('an exact reviewed focused specification is required')
