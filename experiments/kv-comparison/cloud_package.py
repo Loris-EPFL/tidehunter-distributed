@@ -19,11 +19,17 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "garnet", "kvrocks", "fabric", "nvmeof", "test-utils"]
 FOCUSED_FEATURES = ["fabric", "nvmeof", "test-utils"]
+ADMISSION_OPTIONS_SOURCES = frozenset({
+    "tidehunter/examples/admission_options.rs",
+    "tidehunter/benches/admission_options/core.rs",
+    "tidehunter/benches/admission_options/cli.rs",
+})
 FOCUSED_VALKEY_FEATURES = FOCUSED_FEATURES + ["valkey-rdma"]
 FOCUSED_SOURCE_CLOSURE = frozenset({
     "experiments/gcp-rdma/gcp_image_qualify.py", "experiments/gcp-rdma/gcp_image.py",
@@ -452,12 +458,34 @@ def valkey_source_identity(source):
             "benchmark_elf": elf_identity(source / "src/valkey-benchmark"), **diagnostic}
 
 
+def admission_options_command(build_command):
+    """Keep the sealed generic target/CPU flags; exclude engine/fabric features."""
+    return build_command[:build_command.index("-p")] + [
+        "-p", "tidehunter", "--example", "admission_options", "--no-default-features"]
+
+
+def admit_admission_options(receipt, build_command, binary):
+    if receipt is None:
+        if binary.exists():
+            raise ValueError("unbound admission-options executable")
+        return None
+    expected = elf_identity(binary)
+    if (not isinstance(receipt, dict) or set(receipt) != {"build_command", "binary"}
+            or receipt["build_command"] != admission_options_command(build_command)
+            or receipt["binary"] != expected or not binary.stat().st_mode & 0o111
+            or any(name.startswith(("libfabric", "libfdb")) for name in expected["needed"])):
+        raise ValueError("admission-options build command, ELF or dependency binding differs")
+    return expected
+
+
 def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_source=None, target_dir=None,
-          *, focused=False, focused_valkey=False):
+          *, focused=False, focused_valkey=False, admission_options=False):
     if platform.machine() != "x86_64" or version_tuple(command(["getconf", "GNU_LIBC_VERSION"]).split()[-1]) > MAX_GLIBC:
         raise ValueError("build host must be x86_64 and glibc<=2.39; use Dockerfile.cloud-build")
     if not 1 <= timeout <= 7200:
         raise ValueError("build timeout must be 1..7200 seconds")
+    if type(admission_options) is not bool:
+        raise ValueError("admission_options must be a boolean")
     if (type(focused) is not bool or type(focused_valkey) is not bool
             or focused and focused_valkey
             or focused and (valkey_source is not None or fdb_prefix is not None)
@@ -472,6 +500,8 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_
     output.mkdir(parents=True, exist_ok=False)
     source = output / "source"
     metadata = extract_source(snapshot_dir, source)
+    if admission_options and not ADMISSION_OPTIONS_SOURCES <= metadata["sha256"].keys():
+        raise ValueError("frozen source snapshot lacks admission-options example/core/CLI")
     # Reuse only Cargo outputs. Sources are freshly extracted and hash-checked,
     # and Cargo still runs with the frozen lockfile and complete build flags.
     target = output / "target" if target_dir is None else Path(target_dir).resolve(strict=True)
@@ -513,9 +543,20 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_
         raise ValueError("the source-pinned Rust1.90.0 toolchain is required")
     if identity(Path(__file__).resolve())["sha256"] != metadata["sha256"]["experiments/kv-comparison/cloud_package.py"]:
         raise ValueError("executing packager differs from frozen source")
+    admission = None
+    deadline = time.monotonic() + timeout
     with (output / "build.log").open("xb") as log:
         subprocess.run(argv, cwd=source, env=environment, stdout=log, stderr=subprocess.STDOUT,
                        timeout=timeout, check=True)
+        if admission_options:
+            admission_argv = admission_options_command(argv)
+            subprocess.run(admission_argv, cwd=source, env=environment,
+                           stdout=log, stderr=subprocess.STDOUT,
+                           timeout=max(1, deadline - time.monotonic()), check=True)
+            shutil.copyfile(target / TARGET / "release/examples/admission_options", output / "admission-options")
+            (output / "admission-options").chmod(0o755)
+            admission = {"build_command": admission_argv, "binary": elf_identity(output / "admission-options")}
+            admit_admission_options(admission, argv, output / "admission-options")
     admit_source(snapshot_dir, source)
     if ((not focused and fdb_identity(fdb_prefix) != fdb)
             or elf_identity(fabric_library) != {k: v for k, v in fabric.items() if k not in {"version", "path"}}):
@@ -545,6 +586,8 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_
                    os.environ.get("CLOUD_PACKAGE_BUILDER_RECIPE", "experiments/kv-comparison/Dockerfile.cloud-build"))}
     if focused:
         receipt["build_profile"] = profile
+    if admission is not None:
+        receipt["admission_options"] = admission
     dump(output / "build.json", receipt)
     return receipt
 
@@ -577,6 +620,7 @@ def admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source=None, *, focu
             raise ValueError("focused build command or binary profile mismatch")
     elif "build_profile" in receipt:
         raise ValueError("unexpected focused build profile")
+    admit_admission_options(receipt.get("admission_options"), receipt.get("build_command", []), build_dir / "admission-options")
     admit_source(snapshot_dir, build_dir / "source")
     return source, receipt
 
@@ -659,6 +703,9 @@ def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None,
     (output / "runtime/lib").mkdir()
     shutil.copyfile(build_dir / "kv-research", output / "runtime/bin/kv-research")
     (output / "runtime/bin/kv-research").chmod(0o755)
+    if receipt.get("admission_options") is not None:
+        shutil.copyfile(build_dir / "admission-options", output / "runtime/bin/admission-options")
+        (output / "runtime/bin/admission-options").chmod(0o755)
     if not focused:
         shutil.copyfile(fdb_prefix / "lib/libfdb_c.so", output / "runtime/lib/libfdb_c.so")
         dump(output / "runtime/fdb-client.json", receipt["fdb"])
@@ -774,6 +821,10 @@ def verify_directory(directory, runtime=False, provider="aws"):
                                  or native["sha256"] != FDB_SHA256 or native["blake2b512"] != FDB_BLAKE2B))):
         raise ValueError("manifest source/binary/native-client binding mismatch")
     roots = [elf_identity(binary)]
+    admission = admit_admission_options(build_receipt.get("admission_options"),
+                                        build_receipt.get("build_command", []), directory / "runtime/bin/admission-options")
+    if admission is not None:
+        roots.append(admission)
     if focused:
         argv = build_receipt.get("build_command", [])
         if (build_receipt.get("build_profile") != profile or build_receipt.get("fdb") is not None
@@ -888,6 +939,8 @@ def main():
     compile_parser.add_argument("--fdb-prefix", type=Path)
     compile_parser.add_argument("--focused", action="store_true")
     compile_parser.add_argument("--focused-valkey", action="store_true")
+    compile_parser.add_argument("--admission-options", action="store_true",
+                                help="seal the standalone pinned admission-model example")
     compile_parser.add_argument("--fabric-prefix", type=Path, required=True)
     compile_parser.add_argument("--timeout", type=int, default=5400)
     compile_parser.add_argument("--valkey-source", type=Path)
@@ -918,7 +971,8 @@ def main():
         if not (args.focused or args.focused_valkey) and args.fdb_prefix is None:
             parser.error("--fdb-prefix is required for a full build")
         result = build(args.snapshot, args.output, args.fdb_prefix, args.fabric_prefix, args.timeout,
-                       args.valkey_source, args.target_dir, focused=args.focused, focused_valkey=args.focused_valkey)
+                       args.valkey_source, args.target_dir, focused=args.focused, focused_valkey=args.focused_valkey,
+                       admission_options=args.admission_options)
     elif args.action == "stage":
         if not (args.focused or args.focused_valkey) and args.fdb_prefix is None:
             parser.error("--fdb-prefix is required for a full package")

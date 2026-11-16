@@ -409,6 +409,13 @@ class ManualCampaignTest(unittest.TestCase):
                 (root / 'manifest.json').write_text(json.dumps({'build_profile': 'focused',
                     'features': package.FOCUSED_FEATURES, 'files': focused_files}))
                 manual._admit_package(tmp, revision, focused_spec)
+                tools_spec = manual.REVIEWED_SPECS['nvmeof_f9_tools']
+                with self.assertRaisesRegex(ValueError, 'require sealed runtime/bin/admission-options'):
+                    manual._admit_package(tmp, revision, tools_spec)
+                focused_files['runtime/bin/admission-options'] = {}
+                (root / 'manifest.json').write_text(json.dumps({'build_profile': 'focused',
+                    'features': package.FOCUSED_FEATURES, 'files': focused_files}))
+                manual._admit_package(tmp, revision, tools_spec)
             for identity in (None, {**SPDK_IDENTITY, 'source_patch_sha256': '0' * 64},
                              {**SPDK_IDENTITY, 'target_scope': 'sealed_read_only_file_aio_direct'}):
                 with patch.object(package, 'verify_directory', return_value={**verified, 'spdk': identity}), \

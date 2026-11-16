@@ -22,6 +22,7 @@ _FOCUSED_ARTIFACTS = {
     "write_wait_diagnostic": "write_wait_metrics",
     "net_floor": "net_floor_result", "ssd_floor": "ssd_floor_result",
     "ssd_write_floor": "ssd_write_floor_result",
+    "nvmeof_write_ceiling": "fleet_tools_result", "admission_options": "fleet_tools_result",
 }
 
 _FIO_FIELDS = "schema_version case_id location device_identity namespace_uuid block_bytes requested_depth effective_depth actual_direct read_only elapsed_seconds read_ios read_bytes errors latency_ns fio_sha256 raw_fio_path region_bytes write_ios opened_read_only quiescent target_buffered_io"
@@ -67,6 +68,11 @@ def successful_read_keys(samples, batch_size):
 
 
 def _validate_focused_artifact(name, data, job, receipt):
+    if name == "fleet_tools_result":
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or data.get("case_id") != job.get("case_id")):
+            raise ValueError("invalid F9 tool result identity")
+        return
     if name == "device_counters":
         _focused_object(data, "before after")
         rows = []
@@ -331,7 +337,7 @@ def _validate_focused_artifact(name, data, job, receipt):
             raise ValueError("invalid phase spans")
         for span in data["spans"]:
             _focused_object(span, "operation host_index monotonic_start_ns monotonic_end_ns status")
-            if span["operation"] not in ("dataset_preload", "export_copy", "target_setup", "backend_deploy", "target_teardown"):
+            if span["operation"] not in ("dataset_preload", "export_copy", "target_setup", "backend_deploy", "target_teardown", "standalone_case"):
                 raise ValueError("invalid phase operation")
             _focused_uint(span["host_index"])
             _focused_uint(span["monotonic_start_ns"])
@@ -759,6 +765,9 @@ def admit_focused_artifacts(directory, job, receipt, *, completed):
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("unreadable focused artifact") from exc
         _validate_focused_artifact(name, data, job, receipt)
+        if name == "fleet_tools_result":
+            import fleet_tools
+            fleet_tools.validate_result(data, job, root)
         if name == "ssd_floor_result":
             _verify_ssd_floor(root, data, receipt)
         if name == "ssd_write_floor_result":

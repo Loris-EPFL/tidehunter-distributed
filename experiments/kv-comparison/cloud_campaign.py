@@ -84,7 +84,7 @@ def active_owner_count(job):
                      and ((job.get("nvmeof_target") == "kernel" and job.get("target_io") == "direct")
                           or (job.get("backend") == "tidehunter_nvme_rdma"
                               and job.get("nvmeof_target") == "spdk" and job.get("target_io") == "spdk_direct")))))))
-    if count == 1 and job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
+    if count == 1 and job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS):
         expected = next((item for item in make_focused_matrix(job["selection"])
                          if item["case_id"] == job.get("case_id")), None)
         if expected is None or not _focused_exact(job, expected):
@@ -725,7 +725,7 @@ def make_read_tier_matrix(spec, backends, diagnostics):
 
 FOCUSED_SELECTIONS = ("recommended", "full", "device", "floors", "stages", "unified",
                       "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner",
-                      "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS)
+                      "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS)
 FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "stages": 183, "ssd_write": 18, "unified": 270, "append_floors": 48,
                   "fair_native": 168, "parity": 216, "parity_compact": 177, "fair_five_owner": 39,
@@ -739,6 +739,7 @@ FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS.update(nvmeof_m3_t1=11, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=11)
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
+FOCUSED_COUNTS["nvmeof_f9_tools"] = 38
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -797,6 +798,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_reads_geometry_rest": {"G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
     "nvmeof_reads_geometry_rest2": {"G24C": 6, "G24W": 8, "G24N": 4},
     "valkey_rdma_reads": {"G25R": 12, "G25M": 2, "G25A": 8},
+    "nvmeof_f9_tools": {"G33F": 8, "G33A": 30},
 }
 
 
@@ -804,7 +806,7 @@ def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
         return dict(zip(M3_SELECTIONS, (1, 2, 5)))[selection]
-    return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) else 5
+    return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
 
 
 def job_owner_hosts(job):
@@ -825,7 +827,7 @@ def focused_group_counts(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
     groups = dict(_FOCUSED_GROUP_COUNTS[selection])
-    if selection in ("stages", "unified", "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
+    if selection in ("stages", "unified", "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS):
         jobs = make_focused_matrix(selection)
         for kind in {job["case_kind"] for job in jobs}:
             groups[kind] = sum(job["case_kind"] == kind for job in jobs)
@@ -2184,6 +2186,9 @@ def make_focused_matrix(selection):
         return copy.deepcopy([job for job in _m3_cases().values() if job["selection"] == selection])
     if selection == "valkey_rdma_reads":
         return _valkey_rdma_reads()
+    if selection in TOOL_SELECTIONS:
+        import fleet_tools
+        return fleet_tools.make_jobs()
     jobs = _focused_jobs()
     ids = [job["case_id"] for job in jobs]
     if len(ids) != len(set(ids)):
@@ -2597,7 +2602,7 @@ def validate_focused_job(job):
     if not isinstance(case_id, str):
         raise ValueError("focused case_id is required")
     candidates = (make_focused_matrix(job["selection"])
-                  if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) else _focused_jobs())
+                  if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else _focused_jobs())
     expected = next((item for item in candidates if item["case_id"] == case_id), None)
     if expected is None or not _focused_exact(job, expected):
         raise ValueError("focused job differs from the exact reviewed case")
@@ -3788,7 +3793,7 @@ def summarize_case(directory, *, local_mode=False):
         focused = analyze.admit_focused_artifacts(
             directory, job, receipt, completed=receipt.get("status") == "completed")
         value["focused_evidence"] = focused
-    standalone = job.get("case_kind") in ("fio_floor", "block_trace", "net_floor", "ssd_floor", "ssd_write_floor")
+    standalone = job.get("case_kind") in ("fio_floor", "block_trace", "net_floor", "ssd_floor", "ssd_write_floor", "nvmeof_write_ceiling", "admission_options")
     owner_layout = job["backend"] in TRANSPORTS and "owner_count" in job
     owner_bindings = receipt.get("owner_durability_receipts")
     if (owner_layout and not standalone and receipt.get("status") == "completed"
