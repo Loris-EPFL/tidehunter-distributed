@@ -84,7 +84,7 @@ def verify_run_identity(result_dir, receipt, normalized_config, fdb_identity=Non
         receipt["loaded_native_library"] = loaded
 
 
-def verify_timing_result(result_dir, config, *, allow_partial=False):
+def verify_timing_result(result_dir, config, *, allow_partial=False, phase_windows=None):
     counts = dict.fromkeys(("preload", "warmup", "aging", "measurement"), 0)
     if config["phases"].get("verify_existing_dataset", False):
         counts["verify_existing_dataset"] = 0
@@ -92,6 +92,17 @@ def verify_timing_result(result_dir, config, *, allow_partial=False):
         if row["phase"] not in counts:
             raise ValueError("unrecognized raw timing phase")
         counts[row["phase"]] += 1
+        if phase_windows is not None:
+            window = phase_windows.get(row["phase"])
+            if window is None:
+                window = {"start_ns": row["scheduled_ns"], "end_ns": row["completed_ns"],
+                          "rows": 0, "unsuccessful_rows": 0}
+                phase_windows[row["phase"]] = window
+            window["start_ns"] = min(window["start_ns"], row["scheduled_ns"])
+            window["end_ns"] = max(window["end_ns"], row["completed_ns"])
+            window["elapsed_ns"] = window["end_ns"] - window["start_ns"]
+            window["rows"] += 1
+            window["unsuccessful_rows"] += row["outcome"] != "success"
     expected = {
         "preload": config["dataset"]["keys"] if config["phases"]["preload"] else 0,
         "warmup": config["phases"]["warmup_operations"],

@@ -3790,53 +3790,83 @@ class Controller:
         return options
 
     def admit_logical_owners(self, job, directory, options):
-        """One preload put and verified cache-disabled read per exact live owner."""
-        def admit(index):
-            cell = directory / "owner-admission" / f"node-{index}"
-            cell.mkdir(parents=True, exist_ok=False)
-            selected = copy.deepcopy(options)
-            selected.update(path=str(cell / "database"), evidence=str(cell / "read-evidence"), owners=1,
-                            external_owner_durability_receipts=[options["external_owner_durability_receipts"][index]],
-                            external_owner_read_config=[options["external_owner_read_config"][index]])
-            remote = selected["external_remote_config"]
-            remote["storage"]["partitions"] = [index]
-            remote["endpoints"] = [endpoint for endpoint in remote["endpoints"] if endpoint["partition"] == index]
-            identity = remote["live_nvme"]["owner_identities"][str(index)]
-            remote["live_nvme"].update(identity, owner_identities={str(index): identity})
-            remote["read_cache_bytes"] = 0
-            selected["coordinator_read_cache_bytes"] = 0
-            config = cloud_campaign.make_run_config(job, cell, selected, self.config["source_revision"],
-                                                    cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS)
-            config.update(namespace=f"owner-admission-{index}", qualification_only=False)
-            config["dataset"].update(keys=1, value_size=1024)
-            config["workload"].update(mix=cloud_campaign.mix(read=100))
-            config["execution"].update(concurrency=1, queue_capacity=1)
-            config["phases"].update(warmup_operations=0, measurement_operations=1)
-            for key in ("measurement_gate", "measurement_completion_gate", "warmup_key_sweep", "diagnostics"):
-                config.pop(key, None)
-            dump(cell / "config.json", config)
-            command([self.config["binary"], "--config", cell / "config.json", "--output", cell / "result"],
-                    timeout=min(cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, self.remaining()), env=environment(self.config))
-            summary = json.loads((cell / "result/summary.json").read_text())
-            evidence = json.loads((cell / "result/measurement-read-evidence.json").read_text())
-            live = (evidence.get("end") or {}).get("live_nvmeof") or {}
-            with (cell / "result/samples.csv").open() as stream:
-                samples = list(csv.DictReader(stream))
-            if (summary.get("status") != "completed" or len(samples) != 1
-                    or samples[0].get("operation") != "read" or samples[0].get("outcome") not in ("ok", "success")
-                    or live.get("completed_read_ops", 0) < 1 or live.get("completed_write_ops", 0) < 1
-                    or live.get("errors") != 0 or live.get("payload_rpc_requests") != 0
-                    or not live.get("routes")
-                    or any(route.get("host_nqn") != identity["host_nqn"] for route in live["routes"])):
-                raise SafetyError(f"logical owner {index} write/read admission failed")
-            return {"owner_index": index, "host_index": owner_host_index(self.config, job, index),
-                    "host_nqn": identity["host_nqn"], "endpoint": remote["endpoints"][0],
-                    "config": str((cell / "config.json").relative_to(directory)),
-                    "summary_sha256": digest(cell / "result/summary.json")}
-        with ThreadPoolExecutor(max_workers=job["owner_count"]) as pool:
-            proofs = list(pool.map(admit, range(job["owner_count"])))
-        dump(directory / "owner-admission.json", {"owners": proofs,
-             "scope": "per-slot connect, preload write and verified cache-disabled read; crash qualification is per physical VM"})
+        """Admit all owners concurrently through one full-inventory authority."""
+        cell = directory / "owner-admission"
+        cell.mkdir(parents=True, exist_ok=False)
+        selected = copy.deepcopy(options)
+        selected.update(path=str(cell / "database"), evidence=str(cell / "read-evidence"),
+                        coordinator_read_cache_bytes=0)
+        config = cloud_campaign.make_run_config(job, cell, selected, self.config["source_revision"],
+                                                cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS)
+        return self.run_logical_owner_admission(job, directory, config)
+
+    def run_logical_owner_admission(self, job, directory, config):
+        """Run a typed full-topology admission, shared with local TCP checks."""
+        import importlib.util
+        cell = directory / "owner-admission"
+        remote = config["backend"]["options"]["external_remote_config"]
+        remote["read_cache_bytes"] = 0
+        identities = remote["live_nvme"]["owner_identities"]
+        expected_nqns = {identities[str(index)]["host_nqn"] for index in range(job["owner_count"])}
+        keys = 16 * job["owner_count"]
+        config.update(namespace="owner-admission", qualification_only=False)
+        config["dataset"].update(keys=keys, value_size=1024)
+        config["workload"].update(mix=cloud_campaign.mix(read=100))
+        config["execution"].update(concurrency=job["owner_count"], queue_capacity=job["owner_count"])
+        config["phases"].update(warmup_operations=0, measurement_operations=keys,
+                                measurement_key_sweep=True)
+        for key in ("measurement_gate", "measurement_completion_gate", "warmup_key_sweep", "diagnostics"):
+            config.pop(key, None)
+        dump(cell / "config.json", config)
+        began = self.clock()
+        command([self.config["binary"], "--config", cell / "config.json", "--output", cell / "result"],
+                timeout=min(cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, self.remaining()), env=environment(self.config))
+        elapsed = self.clock() - began
+        summary = json.loads((cell / "result/summary.json").read_text())
+        evidence = json.loads((cell / "result/measurement-read-evidence.json").read_text())
+        live = (evidence.get("end") or {}).get("live_nvmeof") or {}
+        routes = live.get("routes", [])
+        read_nqns = {route.get("host_nqn") for route in routes if route.get("writer") is None}
+        write_nqns = {route.get("host_nqn") for route in routes if route.get("writer") is not None}
+        with (cell / "result/samples.csv").open() as stream:
+            samples = list(csv.DictReader(stream))
+        preloads = [sample for sample in samples if sample.get("phase") == "preload"]
+        reads = [sample for sample in samples if sample.get("phase") == "measurement"]
+        if (summary.get("status") != "completed" or len(samples) != 2 * keys
+                or len(preloads) != keys or len(reads) != keys
+                or any(sample.get("operation") != "put" for sample in preloads)
+                or any(sample.get("operation") != "read" for sample in reads)
+                or any(sample.get("outcome") not in ("ok", "success") for sample in samples)
+                or live.get("completed_read_ops", 0) < keys or live.get("completed_write_ops", 0) <= 0
+                or live.get("errors") != 0 or live.get("payload_rpc_requests") != 0
+                or live.get("route_evidence_dropped", 0) != 0
+                or read_nqns != expected_nqns or write_nqns != expected_nqns):
+            raise SafetyError("full-inventory logical owner write/read admission failed")
+        # The blocking command has reaped the only admission coordinator. Its
+        # complete verified route inventory must also be drained before another
+        # coordinator can open the same owner authority.
+        script = Path(self.config["repository_root"]) / "experiments/nvmeof/manage.py"
+        spec = importlib.util.spec_from_file_location("nvmeof_admission_manage", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        controllers = module.controller_snapshot()
+        remaining = [name for name, identity in controllers.items() if any(
+            module.controller_matches(identity, route["namespace_identity"]["nqn"],
+                                      route["transport"], route["address"], route["service"])
+            for route in routes)]
+        if remaining:
+            raise SafetyError("admission coordinator left live controllers: " + ", ".join(remaining))
+        shutil.rmtree(guarded(cell / "database", cell, must_exist=True))
+        proofs = [{"owner_index": index, "host_index": owner_host_index(self.config, job, index),
+                   "host_nqn": identities[str(index)]["host_nqn"], "endpoint": remote["endpoints"][index],
+                   "config": str((cell / "config.json").relative_to(directory)),
+                   "summary_sha256": digest(cell / "result/summary.json")}
+                  for index in range(job["owner_count"])]
+        dump(directory / "owner-admission.json", {"owners": proofs, "elapsed_seconds": elapsed,
+             "preload_puts": keys, "verified_reads": keys, "concurrency": job["owner_count"],
+             "coordinator_exited": True, "coordinator_database_removed": not (cell / "database").exists(),
+             "remaining_controllers": remaining,
+             "scope": "one full-inventory authority; parallel verified cache-disabled reads of every preloaded key; every owner has read and write routes; crash qualification is per physical VM"})
 
     def stop_tide(self):
         if self.active_nvme is not None:
@@ -5106,7 +5136,11 @@ class Controller:
                         or manifest.get("raw_samples_complete") is not True):
                     raise ValueError("terminal manifest/summary schema, backend, status or raw writer completeness differs")
                 analyze.admit_ack_contract(backend, summary["backend"], job.get("ack_contract", "synced"))
-                observed_counts = campaign.verify_timing_result(directory / "result", admitted, allow_partial=True)
+                phase_windows = ({} if job.get("measurement_sizing", {}).get("minimum_phase_seconds") else None)
+                observed_counts = campaign.verify_timing_result(
+                    directory / "result", admitted, allow_partial=True, phase_windows=phase_windows)
+                if phase_windows is not None:
+                    receipt["timing_windows_by_phase"] = phase_windows
                 receipt["validated_timing_rows_by_phase"] = observed_counts
                 receipt["planned_timing_rows_by_phase"] = {
                     "preload": admitted["dataset"]["keys"] if admitted["phases"]["preload"] else 0,
@@ -5187,6 +5221,14 @@ class Controller:
                 receipt["nvmeof_measurement_qualification"] = qualification
                 if not qualification["qualified"]:
                     qualification_error = "NVMe measurement path was not qualified: " + "; ".join(qualification["reasons"])
+            window_qualification = cloud_campaign.qualify_m3_phase_windows(
+                job, receipt.get("timing_windows_by_phase", {}))
+            if window_qualification is not None:
+                receipt["measurement_window_qualification"] = window_qualification
+                if not window_qualification["qualified"]:
+                    qualification_error = "; ".join(filter(None, [
+                        qualification_error, "read phase windows were not qualified: "
+                        + "; ".join(window_qualification["reasons"])]))
             core_error = core_workload_failure(directory / "result", manifest, status, gate_released, completion_observed)
             if core_error is not None:
                 raise RuntimeError(core_error)

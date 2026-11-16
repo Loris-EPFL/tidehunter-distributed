@@ -737,7 +737,7 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
 FOCUSED_COUNTS["nvmeof_f6"] = 42
 FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
-FOCUSED_COUNTS.update(nvmeof_m3_t1=11, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=11)
+FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -789,9 +789,9 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_f6": {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4},
     "nvmeof_f6b": {"G31W": 24, "G31H": 8, "G31S": 2, "G31X": 6, "G31G": 18},
     "nvmeof_f8": {"G32W": 16, "G32H": 8, "G32S": 4, "G32N": 8},
-    "nvmeof_m3_t1": {"G33W": 6, "G33R": 3, "G33M": 2},
-    "nvmeof_m3_t2_2": {"G33W": 4, "G33R": 2, "G33M": 2},
-    "nvmeof_m3_t2_5": {"G33W": 5, "G33R": 4, "G33M": 2},
+    "nvmeof_m3_t1": {"G33W": 3, "G33R": 4, "G33M": 1},
+    "nvmeof_m3_t2_2": {"G33W": 3, "G33R": 4, "G33M": 1},
+    "nvmeof_m3_t2_5": {"G33W": 4, "G33R": 3, "G33M": 1},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -1952,8 +1952,8 @@ def _nvmeof_f8(path):
     return result
 
 
-def _m3_measurement_sizing(operation, size, concurrency, seconds=None):
-    """Fleet-derived planning rates, not local timings or per-owner rate claims."""
+def _m3_measurement_sizing(operation, size, concurrency, seconds=None, *, read_window_rate=None):
+    """Separate read-window sizing assumptions from slower-path deadline rates."""
     f8 = "checkpoint-work/f8-launch-20261116-w1/analysis/report-root/cases/"
     f6b = "checkpoint-work/f6b-launch-20261116-u1/analysis/output/reads.csv"
     f6 = "checkpoint-work/f6-launch-20261116-t1/analysis/output/puts.csv"
@@ -1972,15 +1972,20 @@ def _m3_measurement_sizing(operation, size, concurrency, seconds=None):
     source_concurrency = 16 if operation == "mixed" or concurrency == 16 else 64
     rate, source = rates[operation, size, source_concurrency]
     seconds = (5 if rate >= 90000 else 10) if seconds is None else seconds
-    measurement = min(2_000_000, max(4096, int(-(-rate * seconds // 1))))
-    warmup = max(4096, int(-(-rate * 2 // 1)))
+    window_rate = rate if read_window_rate is None else read_window_rate
+    if read_window_rate is not None and operation != "read":
+        raise ValueError("read-window sizing requires a pure read workload")
+    measurement = max(4096, math.ceil(window_rate * seconds))
+    if read_window_rate is None:
+        measurement = min(2_000_000, measurement)
+    warmup = max(4096, math.ceil(window_rate * 2))
     if operation != "read" and 4096 + measurement + warmup > 1_000_000:
         seconds = 5
         measurement = min(2_000_000, max(4096, int(-(-rate * seconds // 1))))
     # F8 median case-start overhead is rounded to 28s; include preload and
     # actual rounded warmup/window operation counts at the planning rate.
     expected_case_seconds = (4096 + warmup + measurement) / rate + 28
-    return {"source": source, "source_concurrency": source_concurrency,
+    sizing = {"source": source, "source_concurrency": source_concurrency,
             "rate_calls_per_second": rate, "measurement_seconds": seconds, "warmup_seconds": 2,
             "rate_scope": ("c64 planning upper bound; c256 unmeasured" if concurrency == 256
                            and source_concurrency == 64 else "closest measured same-operation cell"),
@@ -1989,6 +1994,30 @@ def _m3_measurement_sizing(operation, size, concurrency, seconds=None):
             "case_deadline_seconds": max(180, math.ceil(6 * expected_case_seconds)),
             "expected_archive_bytes": (4096 + measurement + warmup) * 256 + 8 * 1024**2,
             "archive_model": "256 bytes per sample row (F8 observed max180) plus8MiB non-sample allowance"}
+    if read_window_rate is not None:
+        sizing.update(window_planning_rate_calls_per_second=read_window_rate,
+                      window_planning_assumption="500k/s, over twice F2-rest2 cache239.1k/s and native c64 224k/s; not a hardware bound",
+                      window_planning_source="checkpoint-work/research/OVERNIGHT-ANALYSIS-2026-11-15.md#remaining-f2-groups",
+                      minimum_phase_seconds={"warmup": 2, "measurement": 5})
+    return sizing
+
+
+def qualify_m3_phase_windows(job, windows):
+    minimums = job.get("measurement_sizing", {}).get("minimum_phase_seconds")
+    if minimums is None:
+        return None
+    reasons = []
+    for phase, seconds in minimums.items():
+        window = windows.get(phase, {})
+        if window.get("rows") != job[phase + "_operations"]:
+            reasons.append(phase + " timing population incomplete")
+        if window.get("unsuccessful_rows") != 0:
+            reasons.append(phase + " unsuccessful or unavailable timing rows")
+        if window.get("elapsed_ns", 0) < seconds * 1_000_000_000:
+            reasons.append(f"{phase} window shorter than {seconds}s")
+    return {"qualified": not reasons, "reasons": reasons, "minimum_phase_seconds": minimums,
+            "observed": windows,
+            "scope": "max completed_ns minus min scheduled_ns per complete phase; includes API queueing; no row exclusion"}
 
 
 @functools.cache
@@ -2017,6 +2046,8 @@ def _nvmeof_m3_owners():
                 for operation, sizes in (("put", (1024, 65536)), ("read", read_sizes), ("mixed", (1024,))):
                     for size in sizes:
                         for repeat in range(2 if concurrency == 16 and operation != "mixed" else 1):
+                            # F7's owner_trace samples owners only. Keep the separate
+                            # all-host thread sampler enabled for reads as well as puts.
                             group = {"put": "G33W", "read": "G33R", "mixed": "G33M"}[operation]
                             item = {key: value for key, value in source.items()
                                     if key not in ("diagnostics", "sealed_dataset")}
@@ -2031,35 +2062,8 @@ def _nvmeof_m3_owners():
                                        measurement_operations=200000, warmup_operations=4096,
                                        warmup_key_sweep=operation == "read", thread_cpu_sampling=True,
                                        execution={"queue_capacity": max(128, concurrency)})
-    planned = []
-    for selection in M3_SELECTIONS:
-        jobs = [job for job in result if job["selection"] == selection]
-        shapes = {job["case_id"]: ("mixed" if job["mix"]["read"] == 50 else
-                                  "read" if job["mix"]["read"] else "put") for job in jobs}
-        sizing = {job["case_id"]: _m3_measurement_sizing(shapes[job["case_id"]], job["value_size"],
-                                                       job["concurrency"]) for job in jobs}
-        for _ in range(len(jobs) + 1):
-            if sum(item["expected_archive_bytes"] for item in sizing.values()) <= 3_000_000_000:
-                break
-            candidates = [item["rate_calls_per_second"] for item in sizing.values()
-                          if item["measurement_seconds"] == 10]
-            if not candidates:
-                raise ValueError("M3 sample archive exceeds3GB at five-second windows")
-            rate = max(candidates)
-            for job in jobs:
-                old = sizing[job["case_id"]]
-                if old["measurement_seconds"] == 10 and old["rate_calls_per_second"] == rate:
-                    sizing[job["case_id"]] = _m3_measurement_sizing(
-                        shapes[job["case_id"]], job["value_size"], job["concurrency"], 5)
-        else:
-            raise ValueError("M3 archive sizing did not converge within the case bound")
-        for job in jobs:
-            item = sizing[job["case_id"]]
-            _clone_job(planned, selection, job, job["group"], measurement_sizing=item,
-                       measurement_operations=item["measurement_operations"],
-                       warmup_operations=item["warmup_operations"])
     # Remove redundant c256 cells/repetitions to fit admission and clients
-    # inside two hours, retaining every topology, operation and value size.
+    # inside two hours, retaining the protected o16 and historical c16 cells.
     def retained(job):
         operation = "mixed" if job["mix"]["read"] == 50 else "read" if job["mix"]["read"] else "put"
         if job["selection"] == "nvmeof_m3_t1" and job["concurrency"] == 256:
@@ -2071,7 +2075,67 @@ def _nvmeof_m3_owners():
             if job["concurrency"] == 16 and job["repeat"] == 1:
                 return operation != "put" and job["value_size"] != 65536
         return True
-    return [job for job in planned if retained(job)]
+    retained_jobs = [job for job in result if retained(job)]
+    # Include the 720s campaign/cleanup margin. Keep all o16 cells, the write
+    # ceiling probes and diagnostic/cache pairs; drop redundant read controls.
+    result = []
+    for job in retained_jobs:
+        selection = job["selection"]
+        if selection == "nvmeof_m3_t1" and job["owner_count"] == 4:
+            continue
+        if (selection == "nvmeof_m3_t2_2" and job["concurrency"] == 256
+                and (job["value_size"] == 65536 or job["mix"]["read"] == 50)):
+            continue
+        if selection == "nvmeof_m3_t2_5":
+            if job["concurrency"] == 64 and (job["mix"]["read"] == 50
+                    or job["mix"]["put"] == 100 and job["value_size"] == 1024):
+                continue
+            if (job["concurrency"] == 16 and job["mix"]["read"] == 100
+                    and job["value_size"] == 1024):
+                continue
+        # Size only retained cells; the superseded full grid must not shorten
+        # the surviving low-rate reads to five-second windows.
+        operation = "mixed" if job["mix"]["read"] == 50 else "read" if job["mix"]["read"] else "put"
+        sizing = _m3_measurement_sizing(operation, job["value_size"], job["concurrency"])
+        job = _clone_job([], selection, job, job["group"], measurement_sizing=sizing,
+                         measurement_operations=sizing["measurement_operations"],
+                         warmup_operations=sizing["warmup_operations"])
+        diagnostics = {}
+        if (job["mix"]["read"] == 100 and job["repeat"] == 0
+                and job["concurrency"] in (16, 64)):
+            diagnostics = {"read_profile_limit": 1024}
+        if (job["mix"]["put"] == 100 and job["value_size"] == 1024
+                and job["concurrency"] == (16 if selection == "nvmeof_m3_t2_5" else 64)
+                and job["owner_count"] in (2, 5, 16)):
+            diagnostics = {"write_timeline_limit": 1024}
+        if diagnostics:
+            job = _clone_job([], selection, job, job["group"], diagnostics=diagnostics)
+        result.append(job)
+    for selection, owners in (("nvmeof_m3_t1", 16), ("nvmeof_m3_t2_2", 2), ("nvmeof_m3_t2_5", 5)):
+        source = next(job for job in result if job["selection"] == selection
+                      and job["owner_count"] == owners and job["concurrency"] == 64
+                      and job["mix"]["read"] == 100 and job["value_size"] == 1024)
+        # Identical counts cover a conservative cache-hit planning rate; retain
+        # the slower remote rate for both deadlines and qualify actual windows.
+        index = result.index(source)
+        sizing = _m3_measurement_sizing("read", 1024, 64, read_window_rate=500_000)
+        source = _clone_job([], selection, source, "G33R", measurement_sizing=sizing,
+                            measurement_operations=sizing["measurement_operations"],
+                            warmup_operations=sizing["warmup_operations"])
+        result[index] = source
+        # 4096 keys * 1KiB = 4MiB; 8MiB also covers cache entry overhead.
+        _clone_job(result, selection, source, "G33R", coordinator_cache_bytes=8 * 1024**2)
+        if selection != "nvmeof_m3_t2_5":
+            sizing = _m3_measurement_sizing("read", 65536, 64)
+            _clone_job(result, selection, source, "G33R", value_size=65536,
+                       diagnostics={"read_profile_limit": 1024}, measurement_sizing=sizing,
+                       measurement_operations=sizing["measurement_operations"],
+                       warmup_operations=sizing["warmup_operations"])
+    for selection in M3_SELECTIONS:
+        if sum(job["measurement_sizing"]["expected_archive_bytes"]
+               for job in result if job["selection"] == selection) > 3_000_000_000:
+            raise ValueError("M3 sample archive exceeds3GB; drop cells, not measurement seconds")
+    return result
 
 
 def _nvmeof_f7_highmem32(path):
