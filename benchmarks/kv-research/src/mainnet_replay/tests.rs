@@ -58,6 +58,32 @@ fn config(root: &Path) -> ReplayConfig {
         diagnostics: DiagnosticsConfig::default(),
     }
 }
+#[test]
+fn native_disk_reservation_covers_measured_growth_without_whole_wal_preallocation() {
+    let t = trace();
+    let payload_per_repeat = t
+        .preload
+        .iter()
+        .chain(t.batches.iter().flat_map(|batch| &batch.entries))
+        .map(|row| (row.key.len() + row.value.len()) as u64)
+        .sum::<u64>();
+    assert_eq!(payload_per_repeat, 876_225);
+    let fragment_size = 128 * 1024 * 1024;
+    let (reserve, fragments) =
+        native_disk_reservation(payload_per_repeat * 5456, fragment_size).unwrap();
+    assert_eq!(fragments, 805_306_368);
+    assert_eq!(reserve, 10_366_673_568);
+    // Real R=5456 physical usage; the 2x payload budget alone exceeds it.
+    assert!(reserve - fragments > 4_876_845_056);
+    assert_eq!(
+        native_disk_reservation(payload_per_repeat * 512, fragment_size).unwrap(),
+        (1_702_560_768, fragments)
+    );
+    assert!(native_disk_reservation(u64::MAX, fragment_size).is_err());
+    assert!(native_disk_reservation(0, u64::MAX).is_err());
+    assert!(native_disk_reservation((u64::MAX - fragments) / 2 + 1, fragment_size).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_native_two_repeats_same_final_contents_for_one_and_four_callers() {
     let trace = trace();

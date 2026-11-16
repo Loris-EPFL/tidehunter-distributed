@@ -949,13 +949,31 @@ fn now_unix() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+/// Native WALs grow by fragment (`wal/mod.rs::extend_to_map_id`), not by
+/// preallocating whole 10 GiB files. The R=5456 native_default evidence used
+/// 4,876,845,056 physical bytes for 4,780,683,600 key/value payload bytes:
+/// 1.0201146x. Reserve 2x payload (96.1% above that observed amplification)
+/// for framing/index growth, plus one whole fragment per open value/index WAL
+/// in each of the three node domains. This is a conservative empirical model,
+/// not a measured physical-I/O count or a universal engine amplification bound.
+fn native_disk_reservation(payload: u64, fragment_size: u64) -> BackendResult<(u64, u64)> {
+    let fragments = fragment_size
+        .checked_mul(6)
+        .ok_or("replay fragment reservation overflow")?;
+    let reserve = payload
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(fragments))
+        .ok_or("replay disk reservation overflow")?;
+    Ok((reserve, fragments))
+}
+
 fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<serde_json::Value> {
     let geometry = NativeReplayBackend::geometry(&config.backend.options)?;
     let payload = trace
         .preload
         .iter()
         .chain(trace.batches.iter().flat_map(|b| &b.entries))
-        .map(|r| (r.key.len() + r.value.len() + 32) as u64)
+        .map(|r| (r.key.len() + r.value.len()) as u64)
         .sum::<u64>()
         .checked_mul(config.workload.repetitions)
         .ok_or("replay disk bound overflow")?;
@@ -965,16 +983,10 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         .checked_mul(config.workload.repetitions)
         .and_then(|n| n.checked_mul(128))
         .ok_or("replay index bound overflow")?;
-    let wal = geometry["wal_file_size"]
+    let fragment_size = geometry["fragment_size"]
         .as_u64()
-        .ok_or("missing native WAL geometry")?
-        .checked_mul(6)
-        .ok_or("replay WAL reservation overflow")?;
-    let reserve = payload
-        .checked_mul(2)
-        .and_then(|n| n.checked_add(index))
-        .and_then(|n| n.checked_add(wal))
-        .ok_or("replay disk reservation overflow")?;
+        .ok_or("missing native fragment geometry")?;
+    let (reserve, wal) = native_disk_reservation(payload, fragment_size)?;
     let mut path = PathBuf::from(
         config.backend.options["path"]
             .as_str()
@@ -999,7 +1011,7 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         .parse::<u64>()?;
     ensure(
         reserve <= available,
-        "insufficient native replay disk space, including WAL preallocation and index reservation",
+        "insufficient native replay disk space, including payload amplification and open WAL fragments",
     )?;
     // Include immutable row views, retained raw samples, key-map nodes and key owners
     // at peak expansion. Values stay shared with the two input buffers.
@@ -1044,8 +1056,9 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
     Ok(
         serde_json::json!({"estimated_disk_reservation_bytes":reserve,"available_bytes":available,
         "estimated_memory_reservation_bytes":memory,"memory_available_bytes":memory_available,
-        "payload_and_record_framing_bytes":payload,"index_reservation_bytes":index,"wal_preallocation_reservation_bytes":wal,
-        "reservation_model":"2x payload/framing + 128 bytes per row + two WAL files per node DB; conservative reservation, not physical I/O measurement"}),
+        "payload_key_value_bytes":payload,"index_reservation_bytes":index,"wal_fragment_reservation_bytes":wal,
+        "disk_payload_amplification_factor":2,
+        "reservation_model":"2x key/value payload for framing/index amplification + six open WAL fragments; empirical conservative native estimate, not physical I/O measurement; memory additionally reserves 128 bytes per row for indexes"}),
     )
 }
 
