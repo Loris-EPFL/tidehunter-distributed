@@ -1,0 +1,901 @@
+//! Option-D scenarios driven through the real caller, owner-worker and
+//! publication paths of a five-owner mTLS fixture. Ordering comes from
+//! one-shot test hooks and condition predicates, never from elapsed time; the
+//! only deadline-driven case is the caller timeout, whose resolution is held
+//! by a hook until the caller has returned.
+
+use super::core::WriteCore;
+use super::sequencer::Resolution;
+use crate::distributed::codec::Mutation;
+use crate::distributed::local_db::LocalDbError;
+use crate::distributed::remote_db::concurrent::AdmissionCharges;
+use crate::distributed::remote_db::pipeline_tests::Fixture;
+use crate::distributed::remote_db::{IndexReadCut, RemoteDatabase};
+use crate::distributed::tcp::StorageNode;
+use crate::distributed::types::BatchVersion;
+use crate::key_shape::{KeyShape, KeySpace, KeyType};
+use crate::metrics::Metrics;
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Barrier, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Liveness guard for hook handshakes and results; never a latency bound.
+const WAIT: Duration = Duration::from_secs(30);
+
+type Hook = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
+
+/// A one-shot pause: install `hook`, receive on `entered`, send on `resume`.
+/// Dropping `resume` (for example on a failed assertion) unblocks the hook.
+fn gate() -> (Hook, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    let (entered, entering) = mpsc::sync_channel(1);
+    let (resume, resumed) = mpsc::sync_channel(1);
+    ((entered, resumed), entering, resume)
+}
+
+fn spawn<T: Send + 'static>(
+    core: &Arc<WriteCore>,
+    run: impl FnOnce(&Arc<WriteCore>) -> T + Send + 'static,
+) -> mpsc::Receiver<T> {
+    let core = Arc::clone(core);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(run(&core));
+    });
+    receiver
+}
+
+fn spawn_write(
+    core: &Arc<WriteCore>,
+    operation: [u8; 16],
+    mutations: Vec<Mutation>,
+) -> mpsc::Receiver<Result<BatchVersion, LocalDbError>> {
+    spawn(core, move |core| core.write(operation, mutations, None))
+}
+
+/// Bounded wait for a state another thread reaches without a hook.
+fn wait_for(what: &str, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "{what}");
+        thread::yield_now();
+    }
+}
+
+fn put(key: u32, value: u8) -> Mutation {
+    Mutation::Put {
+        keyspace: KeySpace(0),
+        key: key.to_be_bytes().to_vec().into(),
+        value: vec![value; 32].into(),
+    }
+}
+
+fn value(db: &mut RemoteDatabase, key: u32) -> Option<Vec<u8>> {
+    db.get(KeySpace(0), &key.to_be_bytes())
+        .unwrap()
+        .map(|value| value.to_vec())
+}
+
+fn version(core: &WriteCore, sequence: u64) -> BatchVersion {
+    BatchVersion {
+        epoch: core.epoch,
+        sequence,
+    }
+}
+
+fn shape() -> KeyShape {
+    KeyShape::new_single(4, 1, KeyType::uniform(1))
+}
+
+/// A rejected non-blocking submit must leave every dimension unchanged.
+/// Publication returns index/partition charges after waking its caller, so
+/// first wait until only unpublished generations still hold a partition batch.
+fn assert_capacity_rejected(core: &Arc<WriteCore>, operation: [u8; 16], key: u32) {
+    wait_for("publication releases settled", || {
+        core.admission.charges().partition_batches == core.unresolved_slots()
+    });
+    let next = core.next_sequence();
+    let charges = core.admission.charges();
+    let error = core.submit(operation, vec![put(key, 0)]).unwrap_err();
+    assert!(
+        error.message().contains("admission capacity reached"),
+        "{error}"
+    );
+    assert_eq!(core.next_sequence(), next);
+    assert_eq!(core.admission.charges(), charges);
+    core.ensure_healthy().unwrap();
+}
+
+#[test]
+fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let aborted = fixture.operation(0, 1);
+    let (hook, encoding, resume) = gate();
+    {
+        let mut hooks = core.test_hooks.lock();
+        hooks.fail_prepared_operation = Some(aborted);
+        hooks.before_preparation = Some(hook);
+    }
+    // Sequence 0 is allocated (identity Active, keys 1 and 2 registered),
+    // then held before encoding; its injected encoding failure aborts it.
+    let first = spawn_write(&core, aborted, vec![put(1, 1), put(2, 1)]);
+    encoding.recv_timeout(WAIT).unwrap();
+    assert_eq!(core.sequencer.resolution(0), Some(Resolution::Allocated));
+    assert_eq!(core.active_identities(), 1);
+    assert_eq!(core.pending_dependencies(), 2);
+    // Sequence 1 shares key 1: durable, but parked behind its predecessor.
+    let second = spawn_write(&core, fixture.operation(1, 2), vec![put(1, 2)]);
+    wait_for("dependent durable behind its predecessor", || {
+        core.publication_settled(1)
+    });
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Durable));
+    assert_eq!(
+        core.publisher.lock().dependents.get(&0).map(Vec::as_slice),
+        Some(&[1u64][..])
+    );
+    // Sequence 2 is independent and publishes beyond the unresolved floor.
+    let independent = core
+        .write(fixture.operation(2, 3), vec![put(9, 9)], None)
+        .unwrap();
+    assert_eq!(independent, version(&core, 2));
+    assert!(core.is_published(independent));
+    assert_eq!(core.published_next(), 0);
+    assert!(matches!(core.index.latest_cut(), IndexReadCut::Sparse(_)));
+    assert_eq!(value(&mut db, 9), Some(vec![9; 32]));
+    assert_eq!(value(&mut db, 1), None);
+    // The allocated head has neither resolved nor released: no slot returns.
+    assert_eq!(core.sequencer.reuse_next(), 0);
+    assert_eq!(core.admission.charges().slots, 3);
+
+    resume.send(()).unwrap();
+    let error = first.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert!(
+        error.message().contains("injected caller encoding failure"),
+        "{error}"
+    );
+    // An abort before READY has no remote effect: a definite failure.
+    assert_eq!(error.uncertain_version, None);
+    assert_eq!(
+        second.recv_timeout(WAIT).unwrap().unwrap(),
+        version(&core, 1)
+    );
+    core.wait_settled().unwrap();
+    assert_eq!(core.sequencer.resolution(0), Some(Resolution::Aborted));
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Published));
+    assert_eq!(core.published_next(), 3);
+    assert_eq!(core.sequencer.reuse_next(), 3);
+    assert!(!matches!(core.index.latest_cut(), IndexReadCut::Sparse(_)));
+    assert!(core.publisher.lock().dependents.is_empty());
+    assert!(
+        core.identities
+            .with_operation(aborted, |entries| entries.get(&aborted).copied())
+            .is_none()
+    );
+    assert_eq!(core.active_identities(), 0);
+    assert_eq!(core.pending_dependencies(), 0);
+    let charges = core.admission.charges();
+    // Two published identities and tail batches remain until checkpoint;
+    // the abort returned its own identity and tail charge.
+    assert_eq!((charges.identities, charges.replay_batches), (2, 2));
+    assert_eq!(value(&mut db, 1), Some(vec![2; 32]));
+    assert_eq!(value(&mut db, 2), None);
+    db.flush_index().unwrap();
+    assert_eq!(core.admission.charges(), AdmissionCharges::default());
+    // The aborted identity left no effect: its retry is a fresh allocation.
+    assert_eq!(
+        core.write(aborted, vec![put(1, 1), put(2, 1)], None)
+            .unwrap(),
+        version(&core, 3)
+    );
+    drop(core);
+    db.shutdown().unwrap();
+    drop(db);
+    // Sealed recovery tolerates the aborted sequence gap.
+    let mut reopened = fixture.open();
+    assert_eq!(value(&mut reopened, 1), Some(vec![1; 32]));
+    assert_eq!(value(&mut reopened, 2), Some(vec![1; 32]));
+    assert_eq!(value(&mut reopened, 9), Some(vec![9; 32]));
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn ring_wrap_under_full_slot_credits_waits_for_release_and_resolution() {
+    const CAPACITY: u64 = 4;
+    let fixture = Fixture::new_with_config(128, shape(), 2, |config| {
+        config.max_pending_batches = CAPACITY as usize;
+    });
+    let db = fixture.open();
+    let core = Arc::clone(&db.core);
+    // Sequence 0: published, caller paused before its release.
+    let (hook, releasing, resume_release) = gate();
+    core.test_hooks.lock().before_release = Some(hook);
+    let unreleased = spawn_write(&core, fixture.operation(0, 0), vec![put(0, 0)]);
+    releasing.recv_timeout(WAIT).unwrap();
+    assert_eq!(core.sequencer.resolution(0), Some(Resolution::Published));
+    // Sequence 1: caller released at return, owner 1 publication paused.
+    let (hook, publishing, resume_publish) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    assert_eq!(
+        core.submit(fixture.operation(1, 1), vec![put(1, 1)])
+            .unwrap(),
+        version(&core, 1)
+    );
+    publishing.recv_timeout(WAIT).unwrap();
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Ready));
+    // Sequences 2 and 3 publish and release; every slot grant is now held.
+    for seed in 2..CAPACITY {
+        assert_eq!(
+            core.write(fixture.operation(0, seed), vec![put(seed as u32, 1)], None)
+                .unwrap(),
+            version(&core, seed)
+        );
+    }
+    let stale_receipt = core.durable_receipt(2).unwrap();
+    assert_eq!(core.sequencer.reuse_next(), 0);
+    let charges = core.admission.charges();
+    assert_eq!((charges.slots, charges.requests), (CAPACITY as usize, 1));
+    // Request and byte credits are free; the slot dimension alone rejects.
+    let overflow = fixture.operation(0, 100);
+    assert_capacity_rejected(&core, overflow, 100);
+    assert_eq!(core.sequencer.generation(0), Some(0));
+    assert_eq!(core.sequencer.generation(1), Some(1));
+
+    let blocked = spawn_write(&core, overflow, vec![put(100, 100)]);
+    wait_for("full-credit writer parked in admission", || {
+        core.admission.queued_waiters() == 1
+    });
+    resume_release.send(()).unwrap();
+    assert_eq!(
+        unreleased.recv_timeout(WAIT).unwrap().unwrap(),
+        version(&core, 0)
+    );
+    // Only sequence 0's slot returned; the parked writer reuses it.
+    assert_eq!(
+        blocked.recv_timeout(WAIT).unwrap().unwrap(),
+        version(&core, CAPACITY)
+    );
+    assert_eq!(core.sequencer.reuse_next(), 1);
+    assert_eq!(core.sequencer.generation(0), Some(CAPACITY));
+    assert_eq!(core.sequencer.generation(1), Some(1));
+    assert!(core.is_published(version(&core, 0)));
+    assert_eq!(core.admission.charges().slots, CAPACITY as usize);
+    // The released-but-unresolved generation still pins its slot.
+    assert_capacity_rejected(&core, fixture.operation(0, 101), 101);
+
+    resume_publish.send(()).unwrap();
+    core.wait_settled().unwrap();
+    assert_eq!(core.published_next(), CAPACITY + 1);
+    assert_eq!(core.sequencer.reuse_next(), CAPACITY + 1);
+
+    // Several wraps with every slot contended, alternating owners and a
+    // same-key chain in each round.
+    let mut seen: HashSet<u64> = (0..=CAPACITY).collect();
+    for round in 0..4u64 {
+        let barrier = Arc::new(Barrier::new(CAPACITY as usize));
+        let results: Vec<_> = (0..CAPACITY)
+            .map(|index| {
+                let seed = 200 + round * 16 + index;
+                let operation = fixture.operation((index % 2) as u32, seed);
+                let key = if index < 2 { 300 } else { seed as u32 };
+                let barrier = Arc::clone(&barrier);
+                spawn(&core, move |core| {
+                    barrier.wait();
+                    core.write(operation, vec![put(key, index as u8)], None)
+                })
+            })
+            .collect();
+        for result in results {
+            let version = result.recv_timeout(WAIT).unwrap().unwrap();
+            assert_eq!(version.epoch, core.epoch);
+            assert!(
+                seen.insert(version.sequence),
+                "duplicate sequence {}",
+                version.sequence
+            );
+        }
+        core.wait_settled().unwrap();
+    }
+    let next = core.next_sequence();
+    assert_eq!(next, CAPACITY + 1 + 4 * CAPACITY);
+    assert_eq!(seen, (0..next).collect());
+    // Each owner formed its generations in strictly increasing global order,
+    // and every allocated sequence was formed exactly once.
+    let mut formed = Vec::new();
+    for worker in &core.clients {
+        let sequences: Vec<u64> = worker
+            .accounting
+            .formed_groups
+            .lock()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert!(
+            sequences.windows(2).all(|pair| pair[0] < pair[1]),
+            "owner order {sequences:?}"
+        );
+        formed.extend(sequences);
+    }
+    formed.sort_unstable();
+    assert_eq!(formed, (0..next).collect::<Vec<_>>());
+    // Every slot credit returned exactly once; an over-return would have
+    // failed the core with a release-exceeds-charge error.
+    let charges = core.admission.charges();
+    assert_eq!((charges.requests, charges.bytes, charges.slots), (0, 0, 0));
+    core.ensure_healthy().unwrap();
+
+    // Generation checks: a retired sequence has no outcome or receipt.
+    let stale = version(&core, 0);
+    let error = core.sequencer.wait(stale, Instant::now()).unwrap_err();
+    assert_eq!(error.uncertain_version, Some(stale));
+    assert!(error.message().contains("generation changed"), "{error}");
+    assert!(core.durable_receipt(2).is_none());
+    assert!(core.pending_encoded_len(2).is_none());
+    // A stale receipt for a retired generation fail-stops; it never becomes
+    // the outcome of the generation now occupying that slot.
+    let current = (0..next)
+        .rev()
+        .find(|sequence| sequence % CAPACITY == 2)
+        .unwrap();
+    core.on_durable(
+        fixture.config.endpoints[0].partition,
+        vec![(2, stale_receipt)],
+    );
+    assert!(core.ensure_healthy().is_err());
+    assert!(
+        core.first_failure
+            .get()
+            .unwrap()
+            .contains("receipt outside active admission window")
+    );
+    assert_eq!(
+        core.sequencer.resolution(current),
+        Some(Resolution::Published)
+    );
+    let expected = version(&core, current);
+    assert!(matches!(
+        &core.sequencer.slot(current).data.lock().outcome,
+        Some(Ok(outcome)) if *outcome == expected
+    ));
+    drop(core);
+    assert!(db.shutdown().is_err());
+}
+
+#[test]
+fn caller_timeout_then_late_resolution_reuses_only_after_both() {
+    const CAPACITY: u64 = 4;
+    // The caller deadline is the configured timeout. Resolution is held by a
+    // hook until after the caller returned, so the timeout always fires first.
+    let fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("write-core-caller-timeout").unwrap(),
+        2,
+        128,
+        shape(),
+        2,
+        |config| {
+            config.max_pending_batches = CAPACITY as usize;
+            config.timeout = Duration::from_secs(2);
+        },
+        |config| {
+            StorageNode::open(
+                config,
+                Metrics::new_in_enabled(&prometheus::Registry::new(), false),
+            )
+            .unwrap()
+        },
+    );
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let operation = fixture.operation(0, 1);
+    let (hook, publishing, resume) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let caller = spawn_write(&core, operation, vec![put(1, 1)]);
+    publishing.recv_timeout(WAIT).unwrap();
+    let original = version(&core, 0);
+    let error = caller.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert_eq!(error.uncertain_version, Some(original));
+    assert!(
+        error.message().contains("not resolved before deadline"),
+        "{error}"
+    );
+    // A caller timeout is not fail-stop. It released its caller credit, but
+    // the unresolved generation keeps its slot and identity.
+    core.ensure_healthy().unwrap();
+    assert_eq!(core.sequencer.resolution(0), Some(Resolution::Ready));
+    let charges = core.admission.charges();
+    assert_eq!((charges.requests, charges.bytes, charges.slots), (0, 0, 1));
+    assert_eq!(core.active_identities(), 1);
+    for seed in 1..CAPACITY {
+        assert_eq!(
+            core.write(
+                fixture.operation(1, 10 + seed),
+                vec![put(10 + seed as u32, 1)],
+                None
+            )
+            .unwrap(),
+            version(&core, seed)
+        );
+    }
+    assert_eq!(core.published_next(), 0);
+    assert_eq!(core.sequencer.reuse_next(), 0);
+    assert_capacity_rejected(&core, fixture.operation(1, 20), 20);
+    assert_eq!(core.sequencer.generation(0), Some(0));
+
+    resume.send(()).unwrap();
+    core.wait_settled().unwrap();
+    assert!(core.is_published(original));
+    assert_eq!(core.published_next(), CAPACITY);
+    assert_eq!(core.sequencer.reuse_next(), CAPACITY);
+    assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
+    // The same id and payload obtain the original version; a changed payload
+    // conflicts. Neither allocates.
+    assert_eq!(
+        core.write(operation, vec![put(1, 1)], None).unwrap(),
+        original
+    );
+    let error = core.write(operation, vec![put(1, 9)], None).unwrap_err();
+    assert!(
+        error.message().contains("retry changed original batch"),
+        "{error}"
+    );
+    assert_eq!(core.next_sequence(), CAPACITY);
+    // Release and resolution both hold: the slot is reused by a new generation.
+    assert_eq!(
+        core.write(fixture.operation(1, 21), vec![put(21, 1)], None)
+            .unwrap(),
+        version(&core, CAPACITY)
+    );
+    assert_eq!(core.sequencer.generation(0), Some(CAPACITY));
+    assert!(core.is_published(original));
+    assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
+    core.ensure_healthy().unwrap();
+    drop(core);
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn abort_and_checkpoint_return_one_identity_credit_and_retry_gets_new_version() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    assert_eq!(
+        core.write(fixture.operation(1, 1), vec![put(5, 5)], None)
+            .unwrap(),
+        version(&core, 0)
+    );
+    core.wait_settled().unwrap();
+    assert_eq!(core.admission.charges().identities, 1);
+    // A checkpoint freezes cut = sequence 0, then pauses before persistence.
+    let (hook, checkpointing, resume_checkpoint) = gate();
+    core.test_hooks.lock().checkpoint_pause = Some(hook);
+    core.start_checkpoint().unwrap();
+    checkpointing.recv_timeout(WAIT).unwrap();
+
+    let operation = fixture.operation(0, 2);
+    let (hook, encoding, resume_encoding) = gate();
+    {
+        let mut hooks = core.test_hooks.lock();
+        hooks.fail_prepared_operation = Some(operation);
+        hooks.before_preparation = Some(hook);
+    }
+    let first = spawn_write(&core, operation, vec![put(6, 6)]);
+    encoding.recv_timeout(WAIT).unwrap();
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Allocated));
+    assert_eq!(core.admission.charges().identities, 2);
+    // The retry finds the active identity: request credit only, then waits.
+    let retry = spawn_write(&core, operation, vec![put(6, 6)]);
+    wait_for("retry admitted against the active identity", || {
+        core.admission.charges().requests == 2
+    });
+    let charges = core.admission.charges();
+    assert_eq!((charges.slots, charges.identities), (1, 2));
+
+    resume_encoding.send(()).unwrap();
+    let error = first.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert!(
+        error.message().contains("injected caller encoding failure"),
+        "{error}"
+    );
+    // The abort removed its identity before exposing ABORTED, so the waiting
+    // retry became a fresh, effect-free first write with a new version.
+    let retried = retry.recv_timeout(WAIT).unwrap().unwrap();
+    assert_eq!(retried, version(&core, 2));
+    core.wait_settled().unwrap();
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Aborted));
+    assert_eq!(core.published_next(), 3);
+    // Baseline plus retry; the aborted identity's credit was returned once.
+    assert_eq!(core.admission.charges().identities, 2);
+
+    resume_checkpoint.send(()).unwrap();
+    core.progress_checkpoint(true).unwrap();
+    // The paused checkpoint retires only identities at or below its cut.
+    assert_eq!(core.admission.charges().identities, 1);
+    db.flush_index().unwrap();
+    // A second return of the aborted credit would fail the core here.
+    core.ensure_healthy().unwrap();
+    let charges = core.admission.charges();
+    assert_eq!(
+        (
+            charges.identities,
+            charges.replay_batches,
+            charges.replay_bytes
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        core.write(operation, vec![put(6, 6)], None).unwrap(),
+        retried
+    );
+    assert_eq!(core.next_sequence(), 3);
+    assert_eq!(value(&mut db, 6), Some(vec![6; 32]));
+    drop(core);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn concurrent_first_writes_of_one_id_allocate_once() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let operation = fixture.operation(0, 1);
+    let batch = vec![put(1, 1), put(2, 1)];
+    // The late writer missed the identity and holds a first-write grant.
+    let (hook, granted, resume_granted) = gate();
+    core.test_hooks.lock().after_grant = Some(hook);
+    let late = spawn_write(&core, operation, batch.clone());
+    granted.recv_timeout(WAIT).unwrap();
+    let charges = core.admission.charges();
+    assert_eq!((charges.slots, charges.identities), (1, 1));
+    // The winner allocates sequence 0 and is held before publication.
+    let (hook, publishing, resume_publish) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let winner = spawn_write(&core, operation, batch.clone());
+    publishing.recv_timeout(WAIT).unwrap();
+    let original = version(&core, 0);
+    assert_eq!(core.next_sequence(), 1);
+    let error = core.write(operation, vec![put(1, 9)], None).unwrap_err();
+    assert!(
+        error.message().contains("retry changed original batch"),
+        "{error}"
+    );
+
+    resume_granted.send(()).unwrap();
+    // The late writer replans as a retry and returns its slot and identity.
+    wait_for("late first writer replanned as a retry", || {
+        let charges = core.admission.charges();
+        charges.requests == 2 && charges.slots == 1 && charges.identities == 1
+    });
+    assert_eq!(core.next_sequence(), 1);
+    resume_publish.send(()).unwrap();
+    assert_eq!(winner.recv_timeout(WAIT).unwrap().unwrap(), original);
+    assert_eq!(late.recv_timeout(WAIT).unwrap().unwrap(), original);
+    core.wait_settled().unwrap();
+    assert_eq!(core.next_sequence(), 1);
+    assert_eq!(core.admission.charges().identities, 1);
+    assert_eq!(core.active_identities(), 0);
+    assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
+    assert_eq!(value(&mut db, 2), Some(vec![1; 32]));
+    drop(core);
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn sequence_zero_flush_checkpoint_and_publication_wait() {
+    let fixture = Fixture::new();
+    let db = fixture.open();
+    let core = Arc::clone(&db.core);
+    assert_eq!(
+        (
+            core.next_sequence(),
+            core.published_next(),
+            core.sequencer.reuse_next()
+        ),
+        (0, 0, 0)
+    );
+    // Exclusive bounds: every control operation sees the empty prefix.
+    core.wait_published_before(0).unwrap();
+    core.drain().unwrap();
+    core.flush_durable().unwrap();
+    core.flush_index().unwrap();
+    core.flush_index().unwrap();
+    assert_eq!(
+        (
+            core.next_sequence(),
+            core.published_next(),
+            core.sequencer.reuse_next()
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(core.admission.charges(), AdmissionCharges::default());
+
+    let operation = fixture.operation(0, 1);
+    let (hook, publishing, resume) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let first = spawn_write(&core, operation, vec![put(1, 1)]);
+    publishing.recv_timeout(WAIT).unwrap();
+    assert_eq!((core.next_sequence(), core.published_next()), (1, 0));
+    // Sequence 0 is unpublished; a wait before it is still the empty prefix.
+    core.wait_published_before(0).unwrap();
+    let (entered, draining) = mpsc::sync_channel(1);
+    core.test_hooks.lock().drain_wait_entered = Some(entered);
+    let drain = spawn(&core, |core| core.drain());
+    draining.recv_timeout(WAIT).unwrap();
+    let flush = spawn(&core, |core| core.flush_durable());
+    let index = spawn(&core, |core| core.flush_index());
+    resume.send(()).unwrap();
+    let original = first.recv_timeout(WAIT).unwrap().unwrap();
+    assert_eq!(original, version(&core, 0));
+    drain.recv_timeout(WAIT).unwrap().unwrap();
+    flush.recv_timeout(WAIT).unwrap().unwrap();
+    index.recv_timeout(WAIT).unwrap().unwrap();
+    assert_eq!(core.published_next(), 1);
+    core.wait_settled().unwrap();
+    {
+        // The index flush snapshotted next = 1, so its checkpoint covers 0.
+        let mut publisher = core.publisher.lock();
+        let state = publisher.checkpoint_state();
+        assert_eq!(*state.checkpoint_tail_batches, 0);
+        assert!(state.known.is_empty());
+    }
+    assert_eq!(core.admission.charges(), AdmissionCharges::default());
+    core.flush_index().unwrap();
+    drop(core);
+    db.shutdown().unwrap();
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(value(&mut reopened, 1), Some(vec![1; 32]));
+    assert_eq!(
+        reopened.write_batch(operation, vec![put(1, 1)]).unwrap(),
+        original
+    );
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn caller_granted_before_shutdown_gets_closed_error_and_returns_its_grant() {
+    let fixture = Fixture::new();
+    let db = fixture.open();
+    let core = Arc::clone(&db.core);
+    core.write(fixture.operation(0, 1), vec![put(1, 1)], None)
+        .unwrap();
+    core.wait_settled().unwrap();
+    let before = core.admission.charges();
+    let (hook, granted, resume_grant) = gate();
+    core.test_hooks.lock().after_grant = Some(hook);
+    let operation = fixture.operation(1, 2);
+    let paused = spawn_write(&core, operation, vec![put(2, 2)]);
+    granted.recv_timeout(WAIT).unwrap();
+    let held = core.admission.charges();
+    assert_eq!(
+        (held.requests, held.slots, held.identities),
+        (1, 1, before.identities + 1)
+    );
+    // Shutdown closes allocations, drains and pauses in its final checkpoint.
+    let (hook, checkpointing, resume_checkpoint) = gate();
+    core.test_hooks.lock().checkpoint_pause = Some(hook);
+    let shutdown = spawn(&core, |core| core.shutdown());
+    checkpointing.recv_timeout(WAIT).unwrap();
+    assert!(core.closing.load(Ordering::Acquire));
+    assert_eq!(core.next_sequence(), 1);
+
+    resume_grant.send(()).unwrap();
+    let error = paused.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert!(
+        error.message().contains("write authority closed"),
+        "{error}"
+    );
+    assert_eq!(error.uncertain_version, None);
+    // The whole grant returned and the shutdown snapshot is unchanged.
+    assert_eq!(core.admission.charges(), before);
+    assert_eq!(core.next_sequence(), 1);
+    resume_checkpoint.send(()).unwrap();
+    shutdown.recv_timeout(WAIT).unwrap().unwrap();
+    assert_eq!((core.next_sequence(), core.sequencer.reuse_next()), (1, 1));
+    drop(core);
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(value(&mut reopened, 1), Some(vec![1; 32]));
+    assert_eq!(value(&mut reopened, 2), None);
+    reopened.write_batch(operation, vec![put(2, 2)]).unwrap();
+    assert_eq!(value(&mut reopened, 2), Some(vec![2; 32]));
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn uncertain_append_fail_stops_with_unknown_everywhere() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    core.write(fixture.operation(1, 1), vec![put(1, 1)], None)
+        .unwrap();
+    core.wait_settled().unwrap();
+    // Sequence 1 on owner 2 is durable at its owner but held before publication.
+    let held_operation = fixture.operation(2, 2);
+    let held_version = version(&core, 1);
+    let (hook, publishing, resume) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let held = spawn_write(&core, held_operation, vec![put(2, 2)]);
+    publishing.recv_timeout(WAIT).unwrap();
+    // Sequence 2 on owner 0 loses its append reply: an uncertain append.
+    fixture.nodes[0].inject_drop_next_append_response();
+    let uncertain_operation = fixture.operation(0, 3);
+    let uncertain = version(&core, 2);
+    let error = core
+        .write(uncertain_operation, vec![put(3, 3)], None)
+        .unwrap_err();
+    assert_eq!(error.uncertain_version, Some(uncertain));
+    // Fail-stop resolves every unresolved generation as unknown, never abort.
+    let held_error = held.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert_eq!(held_error.uncertain_version, Some(held_version));
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Unknown));
+    assert_eq!(core.sequencer.resolution(2), Some(Resolution::Unknown));
+    resume.send(()).unwrap();
+    assert!(core.ensure_healthy().is_err());
+    assert!(core.reads.failed());
+    assert!(
+        core.write(fixture.operation(1, 4), vec![put(4, 4)], None)
+            .is_err()
+    );
+    assert!(
+        core.write(uncertain_operation, vec![put(3, 3)], None)
+            .is_err()
+    );
+    assert!(core.write(held_operation, vec![put(2, 2)], None).is_err());
+    assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
+    assert!(db.published_cut().is_err());
+    assert!(core.drain().is_err());
+    assert!(core.flush_durable().is_err());
+    assert!(core.flush_index().is_err());
+    assert!(core.wait_published_before(core.next_sequence()).is_err());
+    assert_eq!(core.next_sequence(), 3);
+    assert_eq!(core.published_next(), 1);
+    // UNKNOWN generations never pass the reuse floor or return their slot.
+    assert_eq!(core.sequencer.reuse_next(), 1);
+    assert_eq!(core.unresolved_slots(), 2);
+    assert_eq!(core.admission.charges().slots, 2);
+    assert!(core.shutdown().is_err());
+    // Workers are joined: the held worker's late receipt changed nothing.
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Unknown));
+    assert_eq!(core.sequencer.resolution(2), Some(Resolution::Unknown));
+    assert_eq!(core.published_next(), 1);
+    drop(core);
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .write_batch(uncertain_operation, vec![put(3, 3)])
+            .unwrap(),
+        uncertain
+    );
+    assert_eq!(
+        reopened
+            .write_batch(held_operation, vec![put(2, 2)])
+            .unwrap(),
+        held_version
+    );
+    for key in 1..=3u32 {
+        assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 32]));
+    }
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn identical_retry_during_flight_and_after_publication_returns_original() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let operation = fixture.operation(0, 1);
+    let batch = vec![put(1, 1), put(2, 1)];
+    let (hook, publishing, resume) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let first = spawn_write(&core, operation, batch.clone());
+    publishing.recv_timeout(WAIT).unwrap();
+    let original = version(&core, 0);
+    let retry = spawn_write(&core, operation, batch.clone());
+    wait_for("retry admitted during flight", || {
+        core.admission.charges().requests == 2
+    });
+    // The retry charged no slot or identity and allocated nothing.
+    let charges = core.admission.charges();
+    assert_eq!((charges.slots, charges.identities), (1, 1));
+    assert_eq!(core.next_sequence(), 1);
+    resume.send(()).unwrap();
+    assert_eq!(first.recv_timeout(WAIT).unwrap().unwrap(), original);
+    assert_eq!(retry.recv_timeout(WAIT).unwrap().unwrap(), original);
+    core.wait_settled().unwrap();
+
+    assert_eq!(
+        core.write(operation, batch.clone(), None).unwrap(),
+        original
+    );
+    assert_eq!(core.next_sequence(), 1);
+    // A published retry neither allocates nor overwrites a newer value.
+    assert_eq!(
+        core.write(fixture.operation(1, 2), vec![put(1, 2)], None)
+            .unwrap(),
+        version(&core, 1)
+    );
+    assert_eq!(
+        core.write(operation, batch.clone(), None).unwrap(),
+        original
+    );
+    assert_eq!(value(&mut db, 1), Some(vec![2; 32]));
+    assert_eq!(value(&mut db, 2), Some(vec![1; 32]));
+    let error = core.write(operation, vec![put(1, 9)], None).unwrap_err();
+    assert!(
+        error.message().contains("retry changed original batch"),
+        "{error}"
+    );
+    // After checkpoint retirement the retry is answered from the retained
+    // receipt window, still without allocation or identity charge.
+    // Publication returns index/partition charges after waking its caller.
+    core.wait_settled().unwrap();
+    db.flush_index().unwrap();
+    assert_eq!(core.active_identities(), 0);
+    assert!(core.recent_identity(operation));
+    assert_eq!(core.write(operation, batch, None).unwrap(), original);
+    assert_eq!(core.next_sequence(), 2);
+    assert_eq!(core.admission.charges(), AdmissionCharges::default());
+    assert_eq!(value(&mut db, 1), Some(vec![2; 32]));
+    drop(core);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn flush_waits_only_for_writes_allocated_before_it() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    // Sequence 0 on owner 0 is held before publication.
+    let (hook, first_publishing, resume_first) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let first = spawn_write(&core, fixture.operation(0, 1), vec![put(1, 1)]);
+    first_publishing.recv_timeout(WAIT).unwrap();
+    // Sequence 1 on owner 1 publishes beyond the held floor.
+    assert_eq!(
+        core.write(fixture.operation(1, 2), vec![put(2, 2)], None)
+            .unwrap(),
+        version(&core, 1)
+    );
+    assert_eq!(core.published_next(), 0);
+    // The drain snapshots next = 2 and waits.
+    let (entered, draining) = mpsc::sync_channel(1);
+    core.test_hooks.lock().drain_wait_entered = Some(entered);
+    let drain = spawn(&core, |core| core.drain());
+    draining.recv_timeout(WAIT).unwrap();
+    // Sequence 2 on owner 2, allocated after that snapshot, is also held.
+    let (hook, later_publishing, resume_later) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let later = spawn_write(&core, fixture.operation(2, 3), vec![put(3, 3)]);
+    later_publishing.recv_timeout(WAIT).unwrap();
+    // This durable flush snapshots next = 3, so it must wait for sequence 2.
+    let flush = spawn(&core, |core| core.flush_durable());
+
+    resume_first.send(()).unwrap();
+    assert_eq!(
+        first.recv_timeout(WAIT).unwrap().unwrap(),
+        version(&core, 0)
+    );
+    drain.recv_timeout(WAIT).unwrap().unwrap();
+    assert_eq!(core.published_next(), 2);
+    assert_eq!(core.sequencer.resolution(2), Some(Resolution::Ready));
+    assert!(matches!(flush.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    resume_later.send(()).unwrap();
+    assert_eq!(
+        later.recv_timeout(WAIT).unwrap().unwrap(),
+        version(&core, 2)
+    );
+    flush.recv_timeout(WAIT).unwrap().unwrap();
+    assert_eq!(core.published_next(), 3);
+    for key in 1..=3u32 {
+        assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
+    }
+    drop(core);
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+}

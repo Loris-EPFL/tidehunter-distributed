@@ -976,6 +976,10 @@ impl Db {
                 index.transient_metadata_bytes as u64,
             );
             set(
+                "index_reader_held_view_bytes",
+                index.reader_held_view_bytes as u64,
+            );
+            set(
                 "index_history_bytes",
                 remote.db.index_history_bytes() as u64,
             );
@@ -1139,14 +1143,7 @@ impl Db {
                 );
                 let pipeline = snapshot.pipeline;
                 set("write_append_requests", pipeline.append_requests);
-                set("write_direct_appends", pipeline.direct_appends);
-                set(
-                    "write_peak_inflight_nodes",
-                    pipeline.peak_inflight_nodes as u64,
-                );
-                set("write_durable_batches", pipeline.durable_batches);
                 set("write_concurrent_admitted", pipeline.concurrent_admitted);
-                set("write_concurrent_completed", pipeline.concurrent_completed);
                 set(
                     "write_concurrent_pending_peak",
                     pipeline.concurrent_pending_peak as u64,
@@ -1281,6 +1278,10 @@ impl Db {
             set(
                 "index_transient_metadata_bytes",
                 index.transient_metadata_bytes as u64,
+            );
+            set(
+                "index_reader_held_view_bytes",
+                index.reader_held_view_bytes as u64,
             );
             set("index_history_bytes", history_bytes as u64);
             set("index_retained_versions", index.retained_versions as u64);
@@ -1442,14 +1443,7 @@ impl Db {
                 );
                 let pipeline = snapshot.pipeline;
                 set("write_append_requests", pipeline.append_requests);
-                set("write_direct_appends", pipeline.direct_appends);
-                set(
-                    "write_peak_inflight_nodes",
-                    pipeline.peak_inflight_nodes as u64,
-                );
-                set("write_durable_batches", pipeline.durable_batches);
                 set("write_concurrent_admitted", pipeline.concurrent_admitted);
-                set("write_concurrent_completed", pipeline.concurrent_completed);
                 set(
                     "write_concurrent_pending_peak",
                     pipeline.concurrent_pending_peak as u64,

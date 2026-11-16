@@ -164,9 +164,6 @@ impl Fixture {
             pipelined_writes: true,
             read_cache_bytes: 0,
             read_memory_allowance_bytes: 128 * MIB,
-            preparation_workers: std::env::var("P11_BENCH_PREPARATION_WORKERS")
-                .map(|value| value.parse().unwrap())
-                .unwrap_or(1),
             scan_prefetch_pages: 1,
             read_lanes: Some(1),
             pin_read_lanes: false,
@@ -282,7 +279,7 @@ impl Fixture {
         )
         .unwrap();
         if arm != "A" {
-            for worker in &db.clients {
+            for worker in &db.core.clients {
                 let mut client = worker.client.lock();
                 client
                     .configure_live_nvme(
@@ -666,11 +663,7 @@ fn run_write(
         );
     }
     save_raw(output, &result.case, &samples);
-    println!(
-        "live_bench preparation_workers={} pipeline={:?}",
-        db.config.preparation_workers,
-        db.pipeline_stats()
-    );
+    println!("live_bench pipeline={:?}", db.pipeline_stats());
     db.shutdown().unwrap();
     result
 }
@@ -708,38 +701,31 @@ fn value_delta(after: &Value, before: &Value) -> Value {
             .collect(),
     )
 }
+/// The read core is immutable and a reopen would seal the live epoch that the
+/// inline route reads. Switch the inline-read policy and configure the
+/// existing read-lane clients for the local live route in place, on the same
+/// epoch and dataset.
 fn configure_reads(
-    db: &mut RemoteDatabase,
+    db: &RemoteDatabase,
     fixture: &Fixture,
     reference: ValueRecordReference,
     inline_reads: bool,
 ) {
-    db.config.live_nvme.as_mut().unwrap().inline_reads = inline_reads;
-    let clients = db
-        .reads
-        .stop_with_clients()
-        .into_iter()
-        .map(|shared| {
-            let mut client = match Arc::try_unwrap(shared) {
-                Ok(client) => client.into_inner(),
-                Err(_) => panic!("read client retained after stop"),
-            };
+    // Release every cached live grant and owner pin, as the removed rebuild's
+    // stop did; the returned admission pause resumes on drop.
+    drop(db.core.reads.pause_live_for_retirement().unwrap());
+    db.core.reads.set_inline_reads_for_test(inline_reads);
+    for node in 0..db.core.config.endpoints.len() {
+        for lane in 0..db.core.config.effective_read_lanes() {
+            let client = db.core.reads.lane_client(node, lane);
+            let mut client = client.lock();
             super::super::tcp::live_read::tests::configure_local_client(&mut client);
             client.set_live_metrics(fixture.live.clone()).unwrap();
-            client
-        })
-        .collect();
-    db.reads = Arc::new(
-        ReadService::from_clients(
-            &db.config,
-            db.epoch,
-            clients,
-            &mut RecoveryStats::default(),
-            db.first_failure.clone(),
-        )
-        .unwrap(),
-    );
-    db.reads.bench_install_owner_local(&fixture.node, reference);
+        }
+    }
+    db.core
+        .reads
+        .bench_install_owner_local(&fixture.node, reference);
 }
 #[test]
 fn leased_settled_dataset_matches_inline_lane_and_owner_rpc_in_both_tiers() {
@@ -758,11 +744,13 @@ fn leased_settled_dataset_matches_inline_lane_and_owner_rpc_in_both_tiers() {
             .unwrap()
             .unwrap();
         for inline_reads in [true, false] {
-            configure_reads(&mut db, &fixture, reference, inline_reads);
+            configure_reads(&db, &fixture, reference, inline_reads);
             db.set_read_profile_limit(32);
-            let parked = inline_reads.then(|| db.reads.bench_park_live_lane(0));
+            let parked = inline_reads.then(|| db.core.reads.bench_park_live_lane(0));
             if inline_reads {
-                db.reads.bench_install_owner_local(&fixture.node, reference);
+                db.core
+                    .reads
+                    .bench_install_owner_local(&fixture.node, reference);
             }
             let live_before = fixture.live.snapshot().counts.completed_read_ops;
             let before = profile(&db);
@@ -806,7 +794,7 @@ fn leased_settled_dataset_matches_inline_lane_and_owner_rpc_in_both_tiers() {
             &fixture.config.endpoints[0].address,
             &fixture.config.tls,
             fixture.config.timeout,
-            fixture.config.partition_config(db.epoch, 0),
+            fixture.config.partition_config(db.epoch(), 0),
             &fixture.shape,
         )
         .unwrap();
@@ -815,7 +803,9 @@ fn leased_settled_dataset_matches_inline_lane_and_owner_rpc_in_both_tiers() {
                 .index_reference(KeySpace(0), &key(sequence), IndexReadCut::Latest)
                 .unwrap()
                 .unwrap();
-            let (records, profile) = owner.read_records_profiled(db.epoch, &[reference]).unwrap();
+            let (records, profile) = owner
+                .read_records_profiled(db.epoch(), &[reference])
+                .unwrap();
             assert_eq!(records, vec![put(sequence, &value)]);
             assert_eq!(profile.requests, 1);
             assert!(profile.server_handler_available);
@@ -843,7 +833,7 @@ fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize])
         .index_reference(KeySpace(0), &key(0), IndexReadCut::Latest)
         .unwrap()
         .unwrap();
-    configure_reads(&mut db, &fixture, reference, true);
+    configure_reads(&db, &fixture, reference, true);
     let keys: Vec<_> = (0..4096).map(key).collect();
     let batch_keys: Vec<_> = (4096..4128).map(key).collect();
     // Warm every scalar key through the actual live route, not the value cache.
@@ -861,10 +851,12 @@ fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize])
                 continue;
             }
             let before_case = process_snapshot();
-            configure_reads(&mut db, &fixture, reference, arm == "R1");
-            let parked = (arm == "R1").then(|| db.reads.bench_park_live_lane(0));
+            configure_reads(&db, &fixture, reference, arm == "R1");
+            let parked = (arm == "R1").then(|| db.core.reads.bench_park_live_lane(0));
             if parked.is_some() {
-                db.reads.bench_install_owner_local(&fixture.node, reference);
+                db.core
+                    .reads
+                    .bench_install_owner_local(&fixture.node, reference);
             }
             // Warm the exact measured route after its final grant/queue setup.
             for key in &keys {
@@ -1362,7 +1354,6 @@ fn leased_checkpoint_tail_workstation() {
             },
             export_mode,
         );
-        fixture.config.preparation_workers = 8;
         fixture.config.owner_append_occupancy = fixture
             .config
             .owner_append_occupancy
@@ -1555,7 +1546,6 @@ fn small_put_multiowner_workstation() {
                 config.max_pending_bytes = 64 * MIB;
                 config.max_index_bytes = 256 * MIB;
                 config.read_cache_bytes = 0;
-                config.preparation_workers = 8;
                 config.storage.batch_limits.max_encoded_bytes = 128 * 1024;
                 config.storage.group_limits.max_encoded_bytes = 2 * MIB;
                 config.storage.fragment_bytes = 128 * MIB as u64;
@@ -1603,7 +1593,7 @@ fn small_put_multiowner_workstation() {
         }
         let original = fixture.open();
         let live = LiveNvmeMetrics::new();
-        for worker in &original.clients {
+        for worker in &original.core.clients {
             let mut client = worker.client.lock();
             client.bench_local_live_fixture(true);
             client.set_live_metrics(live.clone()).unwrap();
@@ -1614,13 +1604,15 @@ fn small_put_multiowner_workstation() {
         let stride = calls.div_ceil(512);
         db.arm_write_timeline(512, stride).unwrap();
         let gate = Barrier::new(writers + 1);
-        let authority_ticks = || -> u64 {
+        // Owner workers now frame, submit and publish; callers allocate and
+        // encode on the writer threads, which are not sampled here.
+        let owner_worker_ticks = || -> u64 {
             fs::read_dir("/proc/self/task")
                 .unwrap()
                 .take(1024)
                 .filter_map(|entry| {
                     let path = entry.ok()?.path();
-                    if fs::read_to_string(path.join("comm")).ok()?.trim() != "wal-write-owner" {
+                    if fs::read_to_string(path.join("comm")).ok()?.trim() != "value-wal-tcp" {
                         return None;
                     }
                     let stat = fs::read_to_string(path.join("stat")).ok()?;
@@ -1629,7 +1621,7 @@ fn small_put_multiowner_workstation() {
                 })
                 .sum()
         };
-        let cpu_ticks_before = authority_ticks();
+        let cpu_ticks_before = owner_worker_ticks();
         let (samples, elapsed) = thread::scope(|scope| {
             let handles: Vec<_> = (0..writers)
                 .map(|writer| {
@@ -1665,7 +1657,7 @@ fn small_put_multiowner_workstation() {
                 .collect();
             (samples, began.elapsed())
         });
-        let cpu_ticks_after = authority_ticks();
+        let cpu_ticks_after = owner_worker_ticks();
         let timeline = db
             .finish_write_timeline_until(Instant::now() + Duration::from_secs(60))
             .unwrap();
@@ -1684,7 +1676,7 @@ fn small_put_multiowner_workstation() {
         });
         let row = json!({
             "owners": 4, "writers": writers, "calls": calls, "value_bytes": 1024,
-            "authority_cpu_ticks": cpu_ticks_after - cpu_ticks_before,
+            "owner_worker_cpu_ticks": cpu_ticks_after - cpu_ticks_before,
             "clock_ticks_per_second": command("getconf", &["CLK_TCK"]).trim(),
             "elapsed_ns": elapsed.as_nanos(), "ops_per_second": calls as f64 / elapsed.as_secs_f64(),
             "mean_api_inflight": samples.iter().map(|n| *n as u128).sum::<u128>() as f64 / elapsed.as_nanos() as f64,

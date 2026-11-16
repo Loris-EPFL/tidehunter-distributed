@@ -217,7 +217,7 @@ def kv_case_policy(cfg, spec):
         max_admitted_batches=lifetime, max_index_bytes=128 * 1024**2,
         max_pending_batches=128, max_pending_bytes=64 * 1024**2, pipelined_writes=True,
         read_cache_bytes=int(arguments['--tcp-read-cache-bytes']),
-        read_memory_allowance_bytes=512 * 1024**2, preparation_workers=2, scan_prefetch_pages=2,
+        read_memory_allowance_bytes=512 * 1024**2, scan_prefetch_pages=2,
         read_lanes=2, max_pending_reads=256, max_pending_read_bytes=64 * 1024**2, write_profile_limit=0)
     shape = dict(key_spaces=[dict(inner=dict(
         id=0, name='root', key_indexing=('Fixed', 8), mutexes=16,

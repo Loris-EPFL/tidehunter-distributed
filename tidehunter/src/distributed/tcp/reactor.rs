@@ -1452,6 +1452,11 @@ impl ClientState {
             .ok_or_else(|| TcpError::new("request ID space exhausted"))?;
         Ok(self.next_id)
     }
+
+    #[cfg(test)]
+    pub(super) fn pending_append_count(&self) -> usize {
+        self.appends.len()
+    }
 }
 
 fn member_charge(reference: &ValueRecordReference) -> Result<usize, TcpError> {

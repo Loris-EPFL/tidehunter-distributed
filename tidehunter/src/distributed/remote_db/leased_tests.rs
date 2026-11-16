@@ -25,24 +25,33 @@ fn worker_with_failure_context(
     fixture: &Fixture,
     client: Client,
     capacity: usize,
-    first_failure: Arc<std::sync::OnceLock<String>>,
+    first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
 ) -> (ClientWorker, Arc<AtomicBool>) {
     let failure = Arc::new(AtomicBool::new(false));
-    let (wake, _) = mpsc::sync_channel(1);
-    let worker = ClientWorker::start(
+    let max_pending = capacity.max(crate::distributed::tcp::APPEND_COMMAND_WINDOW);
+    let completion = write_core::test_completion::TestCompletion::new(max_pending);
+    let mut worker = ClientWorker::start(
         client,
         capacity,
-        wake,
         failure.clone(),
         WorkerDiagnostics {
+            timeout: Duration::from_secs(5),
             write_profile_limit: 0,
             write_profile: Arc::new(Mutex::new(WriteProfileSnapshot::default())),
             write_timeline: Arc::new(WriteTimeline::default()),
             first_failure,
             partition: fixture.config.partition.partition,
+            policy: WorkerPolicy::new(
+                fixture.config.partition.clone(),
+                max_pending,
+                crate::distributed::tcp::APPEND_COMMAND_WINDOW,
+            )
+            .unwrap(),
         },
+        completion.clone(),
     )
     .unwrap();
+    worker.test_completion = Some(completion);
     (worker, failure)
 }
 
@@ -61,7 +70,7 @@ fn leased_worker_group_flush_replies_and_checkpoint_cover_the_durable_prefix() {
     let (worker, failure) = worker(&fixture, client);
     let guard = worker.client.lock();
     let replies: Vec<_> = (0..8)
-        .map(|sequence| worker.append(1, vec![fixture.batch(sequence)]).unwrap())
+        .map(|sequence| worker.enqueue(1, vec![fixture.batch(sequence)]).unwrap())
         .collect();
     drop(guard);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -102,6 +111,79 @@ fn leased_worker_group_flush_replies_and_checkpoint_cover_the_durable_prefix() {
 }
 
 #[test]
+fn full_local_controls_wake_on_ready_and_keep_each_owner_fence() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let (worker, failure) = worker_with_capacity(&fixture, fixture.writer_without_ahead(), 1);
+    let first = fixture.batch(0);
+    let second = fixture.batch(1);
+    let completion = worker.test_completion.as_ref().unwrap();
+    let first_reply = completion.register(std::slice::from_ref(&first)).unwrap();
+    let second_reply = completion.register(std::slice::from_ref(&second)).unwrap();
+    let guard = worker.client.lock();
+    let (first_owner, _) = worker.queue.reserve(|| first.version().sequence);
+    let (observed, observations) = mpsc::sync_channel(2);
+    let first_observed = observed.clone();
+    let metrics = Arc::clone(&fixture.metrics);
+    worker
+        .send(Command::Control(Box::new(move |_| {
+            let _ = first_observed.send((1, metrics.snapshot().counts.leased_frames));
+        })))
+        .unwrap();
+    let (second_owner, _) = worker.queue.reserve(|| second.version().sequence);
+    worker
+        .queue
+        .ready(second_owner, second.version().sequence, second.clone());
+    let (entered, parked) = mpsc::sync_channel(1);
+    let sender = worker.sender.as_ref().unwrap();
+    sender.observe_full_park(entered);
+    drop(guard);
+    parked.recv_timeout(Duration::from_secs(5)).unwrap();
+    let guard = worker.client.lock();
+    let metrics = Arc::clone(&fixture.metrics);
+    worker
+        .send(Command::Control(Box::new(move |_| {
+            let _ = observed.send((2, metrics.snapshot().counts.leased_frames));
+        })))
+        .unwrap();
+    assert!(matches!(
+        observations.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    // The earlier ALLOCATED entry held the local control; the later control
+    // fills the bounded channel. READY must wake without a channel permit.
+    worker
+        .queue
+        .ready(first_owner, first.version().sequence, first.clone());
+    assert!(matches!(
+        sender.try_send(Command::QueueReady),
+        Err(mpsc::TrySendError::Full(_))
+    ));
+    signal_worker_wake(&worker.worker_wake).unwrap();
+    drop(guard);
+    let first_receipts = first_reply
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let second_receipts = second_reply
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_receipts[0].appended().id(), first.id());
+    assert_eq!(second_receipts[0].appended().id(), second.id());
+    assert_eq!(
+        observations.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (1, 1)
+    );
+    assert_eq!(
+        observations.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (2, 2)
+    );
+    assert!(second_receipts[0].appended().address().offset >= 16384);
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
 fn leased_worker_merges_ready_appends_and_splits_receipts_in_order() {
     let fixture = Fixture::new(DurabilityTier::Synchronous, 16384);
     let mut writer = fixture.writer();
@@ -111,7 +193,7 @@ fn leased_worker_merges_ready_appends_and_splits_receipts_in_order() {
     let client = worker.client.lock();
     let replies: Vec<_> = batches
         .iter()
-        .map(|batch| worker.append(1, vec![batch.clone()]).unwrap())
+        .map(|batch| worker.enqueue(1, vec![batch.clone()]).unwrap())
         .collect();
     drop(client);
     for (batch, reply) in batches.iter().zip(replies) {
@@ -137,7 +219,7 @@ fn leased_worker_settles_checkpoint_and_closes_before_seal() {
         .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
         .unwrap();
     let (worker, failure) = worker(&fixture, fixture.writer());
-    let receipt = receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap()[0];
+    let receipt = receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap()[0];
     let (reply, checkpoint) = mpsc::sync_channel(1);
     worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
     let proof = checkpoint
@@ -188,7 +270,7 @@ fn leased_worker_settles_checkpoint_and_closes_before_seal() {
 fn leased_worker_clean_shutdown_closes_owner_allocation_guard() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
-    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
     let client = worker.client.clone();
     drop(worker);
     assert!(!client.lock().leased_test_frontier().1);
@@ -213,10 +295,10 @@ fn leased_worker_unknown_write_poison_stops_queued_commands() {
         }
         let (worker, failure) = worker(&fixture, client);
         let guard = worker.client.lock();
-        let first = worker.append(1, vec![fixture.batch(0)]).unwrap();
+        let first = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
         let (reply, checkpoint) = mpsc::sync_channel(1);
         worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-        let later = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        let later = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         drop(guard);
         assert!(first.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
         assert!(!matches!(
@@ -239,7 +321,7 @@ fn leased_worker_unknown_write_poison_stops_queued_commands() {
 fn leased_worker_harvests_last_adoption_while_idle() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer());
-    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let (_, _, pending) = worker.client.lock().leased_test_frontier();
@@ -261,17 +343,19 @@ fn leased_worker_failed_adoption_and_digest_mismatch_poison_while_idle() {
         let fixture = Fixture::new(DurabilityTier::Native, 16384);
         let mut client = fixture.writer();
         client.leased_test_corrupt_adoption(bad_token);
-        let (mut worker, failure) = worker(&fixture, client);
-        receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+        let (worker, failure) = worker(&fixture, client);
+        receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         // Failure publication precedes channel teardown. Join only after the
         // actual worker exit, so append rejection does not race receiver drop.
-        while !failure.load(Ordering::Acquire) || !worker.thread.as_ref().unwrap().is_finished() {
+        while !failure.load(Ordering::Acquire)
+            || !worker.thread.lock().as_ref().unwrap().is_finished()
+        {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(1));
         }
-        worker.thread.take().unwrap().join().unwrap();
-        assert!(worker.append(1, vec![fixture.batch(1)]).is_err());
+        worker.stop().unwrap();
+        assert!(worker.enqueue(1, vec![fixture.batch(1)]).is_err());
         assert_eq!(fixture.metrics.snapshot().counts.leased_frames, 1);
         let counts = fixture.metrics.snapshot().counts;
         assert_eq!(counts.adoption_async_samples, 0);
@@ -337,7 +421,7 @@ fn leased_measurement_gate_observations_keep_warm_extent() {
             worker.read_io_stats().unwrap();
             let gate = fixture.metrics.snapshot().counts;
             let open = worker.client.lock().leased_test_frontier().1;
-            let measured = receive(worker.append(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
+            let measured = receive(worker.enqueue(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
             let first = fixture.metrics.snapshot().counts;
             eprintln!(
                 "mode={mode:?} lease_ahead={ahead} timeline={timeline}: gate open={open}, skips={}, synchronous closes={}, first-put leases={}",
@@ -410,14 +494,14 @@ fn leased_measurement_gate_observations_keep_warm_extent() {
 fn leased_worker_control_closes_extent_but_stats_does_not() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
-    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
     receive(worker.stats().unwrap()).unwrap();
     assert!(worker.client.lock().leased_test_frontier().1);
     assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
     worker.control(|client| client.stats()).unwrap();
     assert!(!worker.client.lock().leased_test_frontier().1);
     assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 1);
-    let receipt = receive(worker.append(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
+    let receipt = receive(worker.enqueue(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
     assert!(receipt.appended().address().offset >= 16384);
     drop(worker);
     // Acquire observes the worker's fatal-outcome publication, if any.
@@ -429,7 +513,7 @@ fn leased_worker_queued_checkpoint_then_control_closes_at_dispatch() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
     let guard = worker.client.lock();
-    let append = worker.append(1, vec![fixture.batch(0)]).unwrap();
+    let append = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
     let (reply, checkpoint) = mpsc::sync_channel(1);
     worker
         .send(Command::CheckpointPosition(1, 1, 4096, reply))
@@ -460,7 +544,7 @@ fn leased_worker_queued_checkpoint_then_seal_closes_at_dispatch() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
     let guard = worker.client.lock();
-    let append = worker.append(1, vec![fixture.batch(0)]).unwrap();
+    let append = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
     let (reply, checkpoint) = mpsc::sync_channel(1);
     worker
         .send(Command::CheckpointPosition(1, 1, 4096, reply))
@@ -488,7 +572,7 @@ fn leased_worker_failed_checkpoint_never_dispatches_queued_stats_or_control() {
         let fixture = Fixture::new(DurabilityTier::Native, 16384);
         let (worker, failure) = worker(&fixture, fixture.writer());
         let guard = worker.client.lock();
-        let append = worker.append(1, vec![fixture.batch(0)]).unwrap();
+        let append = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
         let (reply, checkpoint) = mpsc::sync_channel(1);
         // Only one batch exists: the real owner must reject this proof request.
         worker.send(Command::Checkpoint(1, 1, 2, reply)).unwrap();
@@ -506,7 +590,7 @@ fn leased_worker_failed_checkpoint_never_dispatches_queued_stats_or_control() {
         for command in commands {
             worker.send(command).unwrap();
         }
-        let later = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        let later = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         drop(guard);
         receive(append).unwrap();
         assert!(
@@ -541,7 +625,7 @@ fn leased_worker_timeout_detaches_dma_before_blocking_drain() {
     let (release, resume) = mpsc::sync_channel(1);
     client.leased_test_pause_drain(entered, resume);
     let (worker, failure) = worker(&fixture, client);
-    let reply = worker.append(1, vec![fixture.batch(0)]).unwrap();
+    let reply = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
     assert!(reply.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
     draining.recv_timeout(Duration::from_secs(5)).unwrap();
     let mut guard = worker
@@ -578,7 +662,7 @@ fn leased_worker_failed_merged_frame_marks_every_command_unknown() {
         let batches = [fixture.batch(0), fixture.batch(1), fixture.batch(2)];
         let replies: Vec<_> = batches
             .iter()
-            .map(|batch| worker.append(1, vec![batch.clone()]).unwrap())
+            .map(|batch| worker.enqueue(1, vec![batch.clone()]).unwrap())
             .collect();
         drop(guard);
         for (batch, reply) in batches.iter().zip(replies) {
@@ -607,13 +691,13 @@ fn leased_worker_completes_flight_while_adoption_pending_without_timer_wait() {
         .log_for_test(1)
         .pause_live(LivePausePoint::FrameProbe);
     let (worker, failure) = worker(&fixture, client);
-    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     let before = worker.client.lock().leased_test_flight_adoption_waits();
     for sequence in 1..=20 {
         let batch = fixture.batch(sequence);
         let version = batch.version();
-        let replies = receive(worker.append(1, vec![batch]).unwrap()).unwrap();
+        let replies = receive(worker.enqueue(1, vec![batch]).unwrap()).unwrap();
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].appended().version(), version);
     }
@@ -727,7 +811,6 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             pipelined_writes: true,
             read_cache_bytes: 0,
             read_memory_allowance_bytes: 64 * 1024 * 1024,
-            preparation_workers: 1,
             scan_prefetch_pages: 1,
             read_lanes: Some(1),
             pin_read_lanes: false,
@@ -755,20 +838,20 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             }),
         };
         let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
-        let mut database = RemoteDatabase::open(
+        let database = RemoteDatabase::open(
             root.path(),
             &shape,
             config,
             Metrics::new_in_enabled(&prometheus::Registry::new(), false),
         )
         .unwrap();
-        let client = database.clients[0].client.clone();
+        let client = database.core.clients[0].client.clone();
         client.lock().bench_local_live_fixture(false);
         let batch = fixture.batch(0);
         database
             .write_batch(batch.id().operation, batch.mutations().to_vec())
             .unwrap();
-        let metrics = database.live_metrics.as_ref().unwrap().clone();
+        let metrics = database.core.live_metrics.as_ref().unwrap().clone();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if metrics.snapshot().counts.adoption_async_exchanges == 1
@@ -781,11 +864,14 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
         }
         let before = metrics.snapshot().counts;
         if already_poisoned {
-            database.healthy = false;
-            // Release publishes an existing authority failure before shutdown.
-            database.concurrent_failure.store(true, Ordering::Release);
+            // An existing authority failure is visible before shutdown starts;
+            // begin_failure is atomic-only and does not wake the idle worker.
+            database
+                .core
+                .begin_failure(&LocalDbError::new("injected existing failure"));
             assert!(
                 database
+                    .core
                     .shutdown_with(|_| panic!("poison cannot seal"))
                     .is_err()
             );
@@ -809,11 +895,18 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             client.leased_test_pause_drain(entered, resume);
         }
         // Skip the ordinary checkpoint so shutdown itself initiates the first
-        // failing marker write while the healthy owner worker is idle.
-        database.healthy = false;
+        // failing marker write while the healthy owner worker is idle. As the
+        // removed `healthy = false`, a non-write failure (read poison) is the
+        // primary shutdown error; write poison stays clear, so the close is a
+        // normal close rather than a poisoned DMA retirement.
+        database.core.test_hooks.lock().skip_shutdown_checkpoint = true;
+        database.core.reads.poison();
         thread::scope(|scope| {
-            let shutdown =
-                scope.spawn(|| database.shutdown_with(|_| panic!("a failed close must not seal")));
+            let shutdown = scope.spawn(|| {
+                database
+                    .core
+                    .shutdown_with(|_| panic!("a failed close must not seal"))
+            });
             draining.recv_timeout(Duration::from_secs(5)).unwrap();
             let mut guard = client
                 .try_lock_for(Duration::from_secs(1))
@@ -827,10 +920,13 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             drop(guard);
             release.send(()).unwrap();
             let error = shutdown.join().unwrap().unwrap_err();
-            assert!(error.to_string().contains("live writer drain failed"));
+            assert!(
+                error.to_string().contains("live writer drain failed"),
+                "{error}"
+            );
         });
         // Acquire observes shutdown's poison before any subsequent worker pass.
-        assert!(database.concurrent_failure.load(Ordering::Acquire));
+        assert!(database.core.concurrent_failure.load(Ordering::Acquire));
         let after = metrics.snapshot().counts;
         assert_eq!(leased_latencies(&after), leased_latencies(&before));
         assert_eq!(
@@ -854,6 +950,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
         // neither strand DMA nor double-publish the eventual terminal outcome.
         assert!(
             database
+                .core
                 .shutdown_with(|_| panic!("poison cannot seal"))
                 .is_err()
         );
@@ -910,7 +1007,7 @@ fn leased_rotation_profile_native_geometry() {
             .enumerate()
             .map(|(member, batch)| {
                 let started = Instant::now();
-                let reply = worker.append(1, vec![batch]).unwrap_or_else(|error| {
+                let reply = worker.enqueue(1, vec![batch]).unwrap_or_else(|error| {
                     panic!(
                         "profile enqueue failed: {error}; first_failure={:?}; counters={:#?}",
                         first_failure.get(),
@@ -988,23 +1085,23 @@ fn leased_worker_closes_old_extent_and_preleases_while_appends_continue() {
     use crate::distributed::storage::LivePausePoint;
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer());
-    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !worker.client.lock().leased_test_ahead_state().1 {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(1));
     }
     for sequence in 1..4 {
-        receive(worker.append(1, vec![fixture.batch(sequence)]).unwrap()).unwrap();
+        receive(worker.enqueue(1, vec![fixture.batch(sequence)]).unwrap()).unwrap();
     }
     let log = fixture.node.log_for_test(1);
     let (entered, resume) = log.pause_live(LivePausePoint::CloseSuffix);
     let before = fixture.metrics.snapshot().counts.adoption_sync_exchanges;
-    receive(worker.append(1, vec![fixture.batch(4)]).unwrap()).unwrap();
+    receive(worker.enqueue(1, vec![fixture.batch(4)]).unwrap()).unwrap();
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     // The old close holds no state lock or coordinator reply. New-extent data
     // reaches its CQE while that close is deliberately blocked.
-    receive(worker.append(1, vec![fixture.batch(5)]).unwrap()).unwrap();
+    receive(worker.enqueue(1, vec![fixture.batch(5)]).unwrap()).unwrap();
     assert_eq!(
         fixture.metrics.snapshot().counts.adoption_sync_exchanges,
         before
@@ -1053,7 +1150,7 @@ fn wal_replay_leased_checkpoint_does_not_settle_the_extent() {
             receipt.appended().address().offset + u64::from(receipt.appended().address().len);
         for n in 1..=8 {
             let guard = worker.client.lock();
-            let append = worker.append(1, vec![fixture.batch(n)]).unwrap();
+            let append = worker.enqueue(1, vec![fixture.batch(n)]).unwrap();
             let (reply, checkpoint) = mpsc::sync_channel(1);
             worker
                 .send(Command::CheckpointPosition(1, 1, through, reply))
@@ -1111,7 +1208,7 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
         let mut receipts = Vec::new();
         for n in 1..=8 {
             let append = worker
-                .append(1, vec![fixture.batch(n)])
+                .enqueue(1, vec![fixture.batch(n)])
                 .map_err(|error| error.to_string())?;
             let result = append
                 .recv_timeout(Duration::from_secs(5))
@@ -1197,7 +1294,7 @@ fn wal_replay_leased_extent_control_progresses_during_position_sync() {
         .unwrap();
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     let before = fixture.metrics.snapshot().counts;
-    let append = worker.append(1, vec![fixture.batch(4)]).unwrap();
+    let append = worker.enqueue(1, vec![fixture.batch(4)]).unwrap();
     let early = append.recv_timeout(Duration::from_secs(5));
     let pending = fixture.metrics.snapshot().counts;
     release.send(()).unwrap();
@@ -1250,14 +1347,14 @@ fn position_is_submitted_during_adoption_and_preserves_control_order() {
         worker
             .send(Command::CheckpointPosition(1, 1, through, reply))
             .unwrap();
-        let passing = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        let passing = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         let (reply, control) = mpsc::sync_channel(1);
         worker
             .send(Command::Control(Box::new(move |client| {
                 let _ = reply.send(client.leased_test_frontier().1);
             })))
             .unwrap();
-        let later = worker.append(1, vec![fixture.batch(2)]).unwrap();
+        let later = worker.enqueue(1, vec![fixture.batch(2)]).unwrap();
         drop(guard);
         let position_submitted = position_entered.recv_timeout(Duration::from_secs(5));
         let passed = passing.recv_timeout(Duration::from_secs(5));
@@ -1360,7 +1457,7 @@ fn parked_position_requests_prelease_without_blocking_appends_or_shutdown() {
         worker
             .send(Command::CheckpointPosition(1, 1, through, reply))
             .unwrap();
-        let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        let append = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         drop(guard);
         let passed = append.recv_timeout(Duration::from_secs(5));
         let proof_pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
@@ -1405,7 +1502,7 @@ fn parked_receipt_checkpoint_keeps_its_captured_prefix() {
     let guard = worker.client.lock();
     let (reply, proof) = mpsc::sync_channel(1);
     worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-    let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+    let append = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
     drop(guard);
     let passed = append.recv_timeout(Duration::from_secs(5));
     release.send(()).unwrap();
@@ -1439,7 +1536,7 @@ fn failed_append_poison_replies_to_inflight_position() {
         .send(Command::CheckpointPosition(1, 1, through, reply))
         .unwrap();
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+    let append = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
     let result = append.recv_timeout(Duration::from_secs(5));
     let proof_result = proof.recv_timeout(Duration::from_secs(5));
     release.send(()).unwrap();
@@ -1473,7 +1570,7 @@ fn failed_append_poison_replies_to_parked_receipt_checkpoint() {
     let guard = worker.client.lock();
     let (reply, proof) = mpsc::sync_channel(1);
     worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-    let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+    let append = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
     drop(guard);
     // The receipt proof cannot leave its parked slot while adoption is held.
     // The failed passing append must finalize that proof before owner progress.
@@ -1516,7 +1613,7 @@ fn actual_frame_can_use_runway_smaller_than_the_maximum_frame() {
         .send(Command::CheckpointPosition(1, 1, through, reply))
         .unwrap();
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let append = worker.append(1, vec![fixture.batch(2)]).unwrap();
+    let append = worker.enqueue(1, vec![fixture.batch(2)]).unwrap();
     let result = append.recv_timeout(Duration::from_secs(5));
     let pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
     release.send(()).unwrap();
@@ -1538,7 +1635,7 @@ fn leased_worker_keeps_window_full_and_replies_in_admission_order() {
         let (worker, failure) = worker(&fixture, client);
         let guard = worker.client.lock();
         let replies: Vec<_> = (0..8)
-            .map(|n| worker.append(1, vec![fixture.batch(n)]).unwrap())
+            .map(|n| worker.enqueue(1, vec![fixture.batch(n)]).unwrap())
             .collect();
         drop(guard);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1577,7 +1674,7 @@ fn leased_worker_without_window_reaches_credit_bound_and_preserves_admission_ord
         let (worker, failure) = worker(&fixture, client);
         let guard = worker.client.lock();
         let replies: Vec<_> = (0..16)
-            .map(|sequence| worker.append(1, vec![fixture.batch(sequence)]).unwrap())
+            .map(|sequence| worker.enqueue(1, vec![fixture.batch(sequence)]).unwrap())
             .collect();
         drop(guard);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1621,7 +1718,7 @@ fn leased_window_failed_middle_write_marks_every_flight_unknown() {
         let (worker, failure) = worker(&fixture, client);
         let guard = worker.client.lock();
         let replies: Vec<_> = (0..4)
-            .map(|n| worker.append(1, vec![fixture.batch(n)]).unwrap())
+            .map(|n| worker.enqueue(1, vec![fixture.batch(n)]).unwrap())
             .collect();
         drop(guard);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1675,8 +1772,8 @@ fn leased_worker_position_proof_bypasses_an_unreleased_frame() {
         client.leased_test_hold_completions(&[1]);
         let (worker, failure) = worker(&fixture, client);
         let guard = worker.client.lock();
-        let first = worker.append(1, vec![fixture.batch(0)]).unwrap();
-        let second = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        let first = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
+        let second = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         drop(guard);
         let deadline = Instant::now() + Duration::from_secs(5);
         while fixture.metrics.snapshot().counts.completed_write_ops < 2 {
