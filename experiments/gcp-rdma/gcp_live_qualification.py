@@ -660,9 +660,9 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
             name = launch['tls'].get(field)
             if name:
                 path = Path(name)
-                if path.parent != root / 'tls' or not re.fullmatch(r'[A-Za-z0-9_.-]+', path.name):
+                if path.parent != root / 'node-0/tls' or not re.fullmatch(r'[A-Za-z0-9_.-]+', path.name):
                     raise ValueError('owner TLS path outside root')
-                data = (prepared / 'tls' / path.name).read_bytes()
+                data = (prepared / 'node-0/tls' / path.name).read_bytes()
                 if not data or len(data) > 65536:
                     raise ValueError('invalid owner TLS material')
                 capsule['tls'][path.name] = base64.b64encode(data).decode()
@@ -747,7 +747,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         data = base64.b64decode(encoded, validate=True)
         if not data or len(data) > 65536:
             raise ValueError('invalid owner TLS capsule member')
-        _write_secret(root / 'tls' / name, data)
+        _write_secret(node / 'tls' / name, data)
     launch_file = node / 'launch.yaml'
     _write_secret(launch_file, launch_text.encode())
     daemon_script = package / 'source/experiments/nvmeof/live_spdk_daemon.py'

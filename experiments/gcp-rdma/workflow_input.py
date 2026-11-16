@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Admit explicit campaign selections and retrieve an immutable real fixture."""
+"""Admit explicit KV campaign selections."""
 import argparse
 import copy
 from datetime import datetime, timedelta, timezone
-import hashlib
 import json
 from pathlib import Path
 import re
@@ -15,20 +14,18 @@ import cloud_campaign
 BACKENDS = {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native',
             'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma',
             'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
-FIXTURE_SHA = '7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15'
 
 
-def specification(suite, backends, mode, fixture=None, sui_transports='tcp', selection=None):
+def specification(suite, backends, mode, selection=None):
     selected = backends.split(',')
-    if suite not in {'kv', 'sui', 'both'} or mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
+    if suite != 'kv' or mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise ValueError('unsupported suite or matrix mode')
     if not selected or len(set(selected)) != len(selected) or any(x not in BACKENDS for x in selected):
         raise ValueError('select unique supported backend IDs; EFA is not a GCP backend')
     if mode == 'focused':
         import manual_campaign
         if (suite != 'kv' or selection not in cloud_campaign.FOCUSED_SELECTIONS
-                or selected != manual_campaign.REVIEWED_SPECS[selection]['backends']
-                or (fixture and (fixture.get('key') or fixture.get('generation'))) or sui_transports != 'tcp'):
+                or selected != manual_campaign.REVIEWED_SPECS[selection]['backends']):
             raise ValueError('focused mode requires the exact reviewed selection and backends')
         spec = copy.deepcopy(manual_campaign.REVIEWED_SPECS[selection])
         manual_campaign._reviewed_jobs(spec)
@@ -46,17 +43,7 @@ def specification(suite, backends, mode, fixture=None, sui_transports='tcp', sel
             'keys': 4096, 'max_cases': 2000, 'offered_rates': [1000, 10000, 50000],
             'offered_seconds': 8, 'case_deadline_seconds': 600, 'hard_deadline_seconds': 10800,
             'export_reserve_seconds': 600, 'diagnostics': {'write_profile_limit': 256, 'read_profile_limit': 256}}
-    if suite in {'kv', 'both'}:
-        cloud_campaign.make_matrix({key: value for key, value in spec.items() if key != 'suite'})
-    if suite in {'sui', 'both'}:
-        if not fixture or not fixture.get('key') or not re.fullmatch('[1-9][0-9]*', str(fixture.get('generation', ''))) or fixture.get('sha256') != FIXTURE_SHA:
-            raise ValueError('Sui requires the exact reviewed real fixture key, generation and SHA-256')
-        transports = sui_transports.split(',')
-        supported = {'tcp', 'tidehunter_verbs', 'tidehunter_verbs_native'}
-        if not transports or len(transports) > 4 or len(set(transports)) != len(transports) or any(t not in supported for t in transports):
-            raise ValueError('unsupported or duplicate Sui transport')
-        spec['sui_transports'] = transports
-        spec['sui_fixture'] = fixture
+    cloud_campaign.make_matrix({key: value for key, value in spec.items() if key != 'suite'})
     return spec
 
 
@@ -83,21 +70,6 @@ def deployment_configuration(config_path, image, qualification, output):
         json.dump(config, destination, sort_keys=True, indent=2)
 
 
-def download_fixture(config_path, spec_path, destination):
-    from gcp_api import GoogleApi
-    config = json.loads(Path(config_path).read_text())
-    fixture = json.loads(Path(spec_path).read_text())['sui_fixture']
-    destination = Path(destination)
-    if destination.exists():
-        raise ValueError('fixture destination already exists')
-    GoogleApi(config['project_id']).objects(config['bucket']).download(
-        fixture['key'], destination, generation=fixture['generation'], max_bytes=1 << 30)
-    with destination.open('rb') as stream:
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    if digest != fixture['sha256']:
-        destination.unlink()
-        raise ValueError('downloaded fixture SHA-256 differs')
-
 
 def validate_policy(config_path, budget_path):
     import gcp_campaign
@@ -117,14 +89,7 @@ def main():
     choose.add_argument('--backends', required=True)
     choose.add_argument('--mode', required=True)
     choose.add_argument('--selection', choices=cloud_campaign.FOCUSED_SELECTIONS)
-    choose.add_argument('--fixture-key', default='')
-    choose.add_argument('--fixture-generation', default='')
     choose.add_argument('--output', type=Path, required=True)
-    download = sub.add_parser('fixture')
-    download.add_argument('--config', type=Path, required=True)
-    choose.add_argument('--sui-transports', default='tcp')
-    download.add_argument('--spec', type=Path, required=True)
-    download.add_argument('--output', type=Path, required=True)
     policy = sub.add_parser('policy')
     policy.add_argument('--config', type=Path, required=True)
     policy.add_argument('--budget', type=Path, required=True)
@@ -136,11 +101,8 @@ def main():
     configuration.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.action == 'spec':
-        fixture = {'key': args.fixture_key, 'generation': args.fixture_generation, 'sha256': FIXTURE_SHA}
-        value = specification(args.suite, args.backends, args.mode, fixture, args.sui_transports, args.selection)
+        value = specification(args.suite, args.backends, args.mode, args.selection)
         args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
-    elif args.action == 'fixture':
-        download_fixture(args.config, args.spec, args.output)
     elif args.action == 'configuration':
         deployment_configuration(args.config, args.image, args.qualification, args.output)
     else:

@@ -129,6 +129,8 @@ def validate_runtime(config):
         or not re.fullmatch(r'[0-9a-f]{40}', str(package.get('source_revision', '')))):
         raise RuntimeSafetyError('package source, revision or immutable object identity mismatch')
     _sha(package.get('sha256'))
+    if config['spec'].get('suite') != 'kv':
+        raise RuntimeSafetyError('invalid campaign suite')
     backends = config['spec'].get('backends', [])
     if not isinstance(backends, list) or not set(backends) <= {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
         raise RuntimeSafetyError('invalid GCP backend selection')
@@ -136,28 +138,23 @@ def validate_runtime(config):
     if mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise RuntimeSafetyError('invalid matrix mode')
     if len(config['fleet']) == 2:
-        if config['spec'].get('suite') in ('sui', 'both'):
-            import manual_sui
-            if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(config['spec'])):
-                raise RuntimeSafetyError('compact fleet requires a focused KV selection')
-        else:
-            if mode != 'focused' or config['spec'].get('suite') != 'kv':
-                raise RuntimeSafetyError('compact fleet requires a focused KV selection')
-            forbidden = {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'garnet', 'kvrocks'}
-            if config['spec'].get('selection') != 'valkey_rdma_reads':
-                forbidden.add('valkey_rdma')
-            if set(backends) & forbidden:
-                raise RuntimeSafetyError('backend requires five owner hosts')
-            import workflow_input
-            selection = config['spec'].get('selection')
-            owners = config['spec'].get('owner_hosts', 5)
-            if owners != 1 or (selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5')
-                    and workflow_input.cloud_campaign.selection_owner_hosts(selection) != 1):
-                raise RuntimeSafetyError('selection does not admit a compact fleet')
-            import manual_campaign
-            jobs = manual_campaign._reviewed_jobs(config['spec'])
-            if any(workflow_input.cloud_campaign.job_owner_hosts(job) > 1 for job in jobs):
-                raise RuntimeSafetyError('selection contains a multi-host owner job')
+        if mode != 'focused' or config['spec'].get('suite') != 'kv':
+            raise RuntimeSafetyError('compact fleet requires a focused KV selection')
+        forbidden = {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'garnet', 'kvrocks'}
+        if config['spec'].get('selection') != 'valkey_rdma_reads':
+            forbidden.add('valkey_rdma')
+        if set(backends) & forbidden:
+            raise RuntimeSafetyError('backend requires five owner hosts')
+        import workflow_input
+        selection = config['spec'].get('selection')
+        owners = config['spec'].get('owner_hosts', 5)
+        if owners != 1 or (selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5')
+                and workflow_input.cloud_campaign.selection_owner_hosts(selection) != 1):
+            raise RuntimeSafetyError('selection does not admit a compact fleet')
+        import manual_campaign
+        jobs = manual_campaign._reviewed_jobs(config['spec'])
+        if any(workflow_input.cloud_campaign.job_owner_hosts(job) > 1 for job in jobs):
+            raise RuntimeSafetyError('selection contains a multi-host owner job')
     if mode == 'focused':
         import manual_campaign
         manual_campaign._reviewed_jobs(config['spec'])
@@ -202,7 +199,7 @@ def validate_runtime(config):
                 or pair[0]['zone'] != pair[1]['zone'] or pair[0]['zone'] != config['fleet'][0]['zone']
                 or len({host[key] for host in pair for key in ('internal_ip', 'rdma_ip')}) != 4):
             raise RuntimeSafetyError('live pair guests and addresses must be distinct, bound to the receipt and zonal')
-        if (mode == 'focused' or config['spec'].get('suite') in ('sui', 'both')) and any(
+        if mode == 'focused' and any(
                 any(str(pair[i][key]) != str(config['fleet'][i][key])
                     for key in ('name', 'id', 'zone', 'internal_ip', 'rdma_ip'))
                 for i in range(2)):
@@ -274,24 +271,14 @@ def admit_live_qualification(runtime):
     image_config = {'project_id': runtime['project_id'], 'bucket': runtime['bucket'],
                     'image': binding['image'], 'image_qualification': binding['image_qualification'],
                     'service_account': binding['service_account']}
-    import manual_sui
-    if manual_sui.focused_qualification(spec):
+    if spec.get('mode') == 'focused':
         image_config['qualification_profile'] = 'focused'
-    if spec.get('suite') in ('sui', 'both'):
-        image_config['sui_extra_libraries'] = manual_sui.extra_libraries(runtime['package'])
-        image_config['sui_needed_libraries'] = runtime['package']['sui_abi']['needed']
     qualification = gcp_image.admit_image(api, image_config, image)
     if qualification.get('runtime_sha256') != runtime['package'].get('manifest_sha256'):
         raise RuntimeSafetyError('live pair qualification does not bind this package manifest')
     gcp_image.admit_nvme_transports(qualification, spec['backends'], live=True)
     gcp_image.admit_spdk(qualification, spec)
     records, hosts = qualification['_records'], binding['pair_hosts']
-    if spec.get('suite') in ('sui', 'both'):
-        import gcp_worker
-        index = gcp_worker.identify(runtime)['index']
-        proof = records[index]['outputs']['package']['sui_library_linkage']
-        if os.environ.get('LD_LIBRARY_PATH') != proof.get('ld_library_path'):
-            raise RuntimeSafetyError('Sui library search path differs from guest qualification')
     for index, record in enumerate(records):
         if (record.get('instance_id') != str(hosts[index]['id'])
                 or record.get('peer_instance_id') != str(hosts[1 - index]['id'])
@@ -611,13 +598,7 @@ def admit_fabrics(config, index, clients, root):
     nvme_live = (live_mode(config['spec'])
                  and (nvme_requested or nvme_tcp_requested))
     valkey_requested = 'valkey_rdma' in backends
-    runtime_spec = config.get('platform', {}).get('runtime', {}).get('spec', {})
-    sui_verbs = False
-    if runtime_spec.get('suite') in ('sui', 'both'):
-        import gcp_sui
-        sui_verbs = any(cell['transport'] in ('tidehunter_verbs', 'tidehunter_verbs_native')
-                        for cell in gcp_sui.sui_cells(runtime_spec))
-    requested = nvme_requested or valkey_requested or sui_verbs or bool(
+    requested = nvme_requested or valkey_requested or bool(
         backends & {'tidehunter_verbs', 'tidehunter_verbs_native'})
     evidence = {'provider': 'gcp', 'nvme_rdma_requested': nvme_requested,
                 'nvme_tcp_requested': nvme_tcp_requested,
@@ -780,7 +761,7 @@ def _controller_spec(spec):
     Launcher projection and guest validation must use this one function.
     """
     return {k: v for k, v in spec.items()
-            if k not in ('suite', 'reservation_hours') and not k.startswith('sui_')}
+            if k not in ('suite', 'reservation_hours')}
 
 
 def _controller_config(runtime):
@@ -840,7 +821,6 @@ def _controller_config(runtime):
 
 
 def execute_campaign(runtime_config, *, api=None):
-    import tarfile
     import gcp_api
     validate_runtime(runtime_config)
     runtime = runtime_config
@@ -849,44 +829,16 @@ def execute_campaign(runtime_config, *, api=None):
     if gcp_worker.identify(runtime)['index'] != 0:
         raise RuntimeSafetyError('campaign may only run on the admitted coordinator')
     api = api or gcp_api.GoogleApi(runtime['project_id'], token_provider=gcp_api.metadata_token)
-    mailbox = RemoteMailbox(api, runtime['bucket'], runtime['run_id'], runtime['fleet'], runtime['source_sha256'], runtime['deadline_utc'])
-    suite = runtime['spec'].get('suite', 'kv')
-    if suite not in ('kv', 'sui', 'both'):
-        raise RuntimeSafetyError('unknown suite')
     results = {}
-    if suite in ('kv', 'both'):
-        _put_once(api.objects(runtime['bucket']), 'runs/' + runtime['run_id'] + '/poweroff/kv-started.json',
-                  _encode({'run_id': runtime['run_id'], 'source_sha256': runtime['source_sha256'], 'suite': 'kv'}))
-        import cloud_controller
-        config = _controller_config(runtime)
-        clients = make_clients(config, guest=True, api=api)
-        report = cloud_controller.Controller(config, clients).run()
-        results['kv'] = {key: report[key] for key in ('complete', 'planned_cases', 'completed_cases')}
-        if runtime['spec'].get('valkey_reproduction_profiles'):
-            results['kv']['native_valkey_reproduction'] = report['native_valkey_reproduction']
-    if suite in ('sui', 'both'):
-        admit_live_qualification(runtime)
-        _put_once(api.objects(runtime['bucket']), 'runs/' + runtime['run_id'] + '/poweroff/sui-started.json',
-                  _encode({'run_id': runtime['run_id'], 'source_sha256': runtime['source_sha256'], 'suite': 'sui'}))
-        import gcp_sui
-        root = Path('/mnt/tidehunter') / runtime['run_id'] / 'sui-results'
-        fleet = verify_fleet({'platform': {'runtime': runtime}}, {'platform': api})
-        try:
-            sui_config = {**runtime, 'deadline_utc': runtime['campaign_deadline_utc']}
-            results['sui'] = gcp_sui.run_suite(sui_config, mailbox, runtime['package'], runtime['spec']['sui_fixture'], output_root=root)
-        finally:
-            if root.exists():
-                (root / 'fleet-observations.json').write_text(json.dumps(fleet, sort_keys=True, indent=2) + '\n')
-                archive = root.parent / 'sui-results.tar.gz'
-                with tarfile.open(archive, 'x:gz') as out:
-                    for path in sorted(root.iterdir()):
-                        if path.name != 'inputs':
-                            out.add(path, arcname='sui-results/' + path.name)
-                key = runtime['run_id'] + '/results/sui-results.tar.gz'
-                receipt = api.objects(runtime['bucket']).upload(key, archive, if_generation_match=0)
-                with archive.open('rb') as stream:
-                    checksum = hashlib.file_digest(stream, 'sha256').hexdigest()
-                results['sui_archive'] = {'key': key, 'generation': str(receipt['generation']), 'sha256': checksum}
+    _put_once(api.objects(runtime['bucket']), 'runs/' + runtime['run_id'] + '/poweroff/kv-started.json',
+              _encode({'run_id': runtime['run_id'], 'source_sha256': runtime['source_sha256'], 'suite': 'kv'}))
+    import cloud_controller
+    config = _controller_config(runtime)
+    clients = make_clients(config, guest=True, api=api)
+    report = cloud_controller.Controller(config, clients).run()
+    results['kv'] = {key: report[key] for key in ('complete', 'planned_cases', 'completed_cases')}
+    if runtime['spec'].get('valkey_reproduction_profiles'):
+        results['kv']['native_valkey_reproduction'] = report['native_valkey_reproduction']
     return results
 
 

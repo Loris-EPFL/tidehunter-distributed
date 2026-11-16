@@ -26,7 +26,7 @@ class SuiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / 'suite.json'
             for value in ({'schema_version': 1, 'suite': 'all'}, {'schema_version': True, 'suite': 'kv-comparison'},
-                          {'schema_version': 1, 'suite': 'kv-comparison', 'other': 'sui-transport'}):
+                          {'schema_version': 1, 'suite': 'kv-comparison', 'other': 'unexpected'}):
                 config.write_text(json.dumps(value))
                 with self.subTest(value=value), self.assertRaises(ValueError):
                     suite.selection(config)
@@ -51,9 +51,9 @@ class SuiteTests(unittest.TestCase):
                 suite.settings(environment | {'GITHUB_REF': 'refs/heads/main'})
             self.assertFalse(suite.settings(environment | {'AWS_BENCH_ENABLED': 'false'})['enabled'])
 
-    def test_sui_override_preserves_existing_strict_preparation_settings(self):
-        environment = self.environment() | {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'AWS_BENCH_SUITE': 'sui-transport'}
-        with self.assertRaisesRegex(ValueError, 'AWS_BENCH_INPUT_ROLE_ARN'):
+    def test_removed_suite_override_is_rejected(self):
+        environment = self.environment() | {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'AWS_BENCH_SUITE': 'removed'}
+        with self.assertRaisesRegex(ValueError, 'unknown campaign override'):
             suite.settings(environment)
 
     def test_workflow_has_one_paid_job_and_credential_free_current_source_kv_build(self):
@@ -62,12 +62,12 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(workflow['on']['workflow_dispatch']['inputs']['suite']['options'], ['configured', *suite.SUITES])
         self.assertEqual(workflow['concurrency']['cancel-in-progress'], 'false')
         jobs = workflow['jobs']
-        self.assertIn("outputs.suite == 'sui-transport'", jobs['prepare']['if'])
+        self.assertNotIn('prepare', jobs)
         self.assertIn("outputs.suite == 'kv-comparison'", jobs['prepare-kv']['if'])
         self.assertEqual(jobs['prepare-kv']['permissions'], {'contents': 'read'})
         self.assertEqual(jobs['prepare-kv']['environment'], 'rdma-bench-inputs')
         self.assertEqual(jobs['benchmark']['environment'], 'rdma-bench')
-        self.assertEqual(jobs['benchmark']['needs'], ['selection', 'prepare', 'prepare-kv'])
+        self.assertEqual(jobs['benchmark']['needs'], ['selection', 'prepare-kv'])
         kv_steps = jobs['prepare-kv']['steps']
         self.assertEqual(kv_steps[0]['with']['ref'], '${{ github.sha }}')
         self.assertFalse(any('configure-aws-credentials' in step.get('uses', '') for step in kv_steps))

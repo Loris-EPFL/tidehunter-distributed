@@ -157,7 +157,7 @@ pub(super) fn run(
     };
     'lane: loop {
         if inbox.waiting.is_empty() && inbox.flying.is_empty() {
-            if inbox.disconnected {
+            if inbox.disconnected || state.failed.load(Ordering::Acquire) {
                 break;
             }
             if !inbox.wait_one(IDLE_GRANT_RELEASE) {
@@ -305,15 +305,97 @@ pub(super) fn run(
     if cache.shutdown(&mut client, epoch, &mut inbox.done).is_err() {
         state.poison();
     }
+    let unreleased = cache.take_unreleased();
+    drop(cache);
+    drop(driver);
+    // Poison publication never waits for idle connection pins. This existing
+    // bounded lane worker retires them after dropping its I/O and grant leases.
+    if state.failed.load(Ordering::Acquire)
+        && let Err(error) = client.drain_poisoned_live_pool()
+    {
+        super::super::record_first_failure(
+            &state.first_failure,
+            None,
+            None,
+            "live_poison_pool_drain",
+            &error,
+        );
+        eprintln!("live poison controller cleanup failed; pins retained until fence: {error}");
+    }
     drop(client);
     inbox.deliver();
     inbox.fail_all("live read lane stopped");
-    let unreleased = cache.take_unreleased();
     if !unreleased.is_empty() {
         state
             .live_unreleased
             .lock()
             .push((lane.client, epoch, unreleased));
         state.poison();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_live_actor_releases_idle_pool_after_terminal_publication() {
+        use crate::distributed::remote_db::pipeline_tests::Fixture;
+        use crate::distributed::tcp::{StorageNode, export_pin_tests::HistoryPool};
+        let mut history = HistoryPool::new();
+        let base = Fixture::new_with_root(
+            tempdir::TempDir::new("poison-idle-pool").unwrap(),
+            1,
+            128,
+            KeyShape::from_yaml(&history.owner.config.shape_yaml).unwrap(),
+            2,
+            |_| {},
+            |config| {
+                StorageNode::open(
+                    config,
+                    crate::distributed::remote_db::tests::recovery_metrics(),
+                )
+                .unwrap()
+            },
+        );
+        let client = std::mem::replace(&mut history.client, history.owner.client());
+        let mut config = base.config.clone();
+        let owner = &history.owner.config.partition;
+        config.storage.database = owner.inventory.database;
+        config.storage.partitions = owner.inventory.partitions.clone();
+        config.storage.batch_limits = owner.batch_limits;
+        config.storage.group_limits = owner.group_limits;
+        config.storage.fragment_bytes = owner.fragment_bytes;
+        config.storage.wal_file_bytes = owner.wal_file_bytes;
+        config.storage.max_batches_per_partition = owner.max_batches;
+        config.storage.max_reference_metadata_bytes = owner.max_reference_metadata_bytes;
+        config.endpoints[0].partition = owner.partition;
+        config.endpoints[0].address = history.owner.endpoint.clone();
+        config.endpoints[0].server_name = history.owner.tls.server_name.clone();
+        config.tls = history.owner.tls.clone();
+        config.read_lanes = 1;
+        config.live_nvme = client.live_config_for_test();
+        let readers = ReadService::from_clients(
+            &config,
+            2,
+            vec![client],
+            &mut RecoveryStats::default(),
+            Arc::new(std::sync::OnceLock::new()),
+        )
+        .unwrap();
+        assert!(
+            history.poison_owner(),
+            "idle export pin must not delay terminal publication"
+        );
+        assert_eq!(history.pin_count(), 1);
+        readers.poison();
+        // Joining the existing actor is a deterministic cleanup barrier, not a
+        // timeout/sleep assertion about background scheduling.
+        drop(readers.stop_with_clients());
+        assert_eq!(history.pin_count(), 0);
+        history
+            .pool
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .unwrap();
     }
 }

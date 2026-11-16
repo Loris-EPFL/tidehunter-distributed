@@ -122,6 +122,14 @@ pub struct NodeInventory {
             Vec<super::super::nvmeof::live_storage::LiveRecordLease>,
         ),
     >,
+    // Connection pins are distinct from record/page pins. One bounded pool
+    // entry owns one token until its controller is confirmed disconnected.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) live_export_pins: BTreeMap<[u8; 16], (u64, (u64, u64))>,
+    // At most 1024 outstanding tokens are fenced per retained epoch. Keep
+    // tombstones so only tokens actually cleared by a fence are idempotent.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fenced_export_pins: BTreeMap<[u8; 16], u64>,
     lock: Arc<DbLock>,
 }
 
@@ -574,6 +582,10 @@ impl NodeInventory {
             idle_history_exports: std::collections::VecDeque::new(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pins: BTreeMap::new(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_export_pins: BTreeMap::new(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            fenced_export_pins: BTreeMap::new(),
             lock,
         })
     }
@@ -742,7 +754,13 @@ impl NodeInventory {
                 readers.logs.clear();
             }
             self.revoke_live_targets()?;
+            self.fenced_export_pins.extend(
+                self.live_export_pins
+                    .iter()
+                    .map(|(token, (epoch, _))| (*token, *epoch)),
+            );
             self.live_pins.clear();
+            self.live_export_pins.clear();
         }
         if let Some(old) = self
             .manifest
@@ -886,6 +904,7 @@ impl NodeInventory {
             if key.0 == epoch
                 && *writable
                 && !binding.permanent
+                && !self.live_export_pins.values().any(|(_, file)| *file == key)
                 && !self.live_pins.values().any(|(_, leases)| {
                     leases
                         .iter()
@@ -1040,12 +1059,13 @@ impl NodeInventory {
         Ok(())
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn revoke_live_epoch(&mut self, epoch: u64) -> Result<(), TcpError> {
+    fn revoke_live_files(&mut self, epoch: u64, files: &[u64]) -> Result<(), TcpError> {
         let Some(target) = self.live_target.as_mut() else {
             return Ok(());
         };
-        for ((binding_epoch, _), (segment, binding, _)) in &self.live_bindings {
-            if *binding_epoch == epoch {
+        let bytes = self.config.partition.wal_file_bytes;
+        for ((binding_epoch, file), (segment, binding, _)) in &self.live_bindings {
+            if *binding_epoch == epoch && files.contains(&(file * bytes)) {
                 let revoke_span = super::super::owner_events::OwnerEventSpan::new(
                     super::super::owner_events::OwnerEventKind::RevokeStart,
                     super::super::owner_events::OwnerEventKind::RevokeEnd,
@@ -1057,25 +1077,109 @@ impl NodeInventory {
                 revoke_span.end_at(segment.file_index);
             }
         }
-        self.live_bindings
-            .retain(|(binding_epoch, _), _| *binding_epoch != epoch);
-        self.idle_history_exports
-            .retain(|(binding_epoch, _)| *binding_epoch != epoch);
+        self.live_bindings.retain(|(binding_epoch, file), _| {
+            *binding_epoch != epoch || !files.contains(&(file * bytes))
+        });
+        self.idle_history_exports.retain(|(binding_epoch, file)| {
+            *binding_epoch != epoch || !files.contains(&(file * bytes))
+        });
+        Ok(())
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn acquire_live_export_pin(
+        &mut self,
+        epoch: u64,
+        segment: &super::super::nvmeof::live_storage::LiveWalSegment,
+        binding: &super::super::nvmeof::live_target::LiveTargetBinding,
+    ) -> Result<[u8; 16], TcpError> {
+        self.active(epoch)?;
+        let key = (segment.epoch, segment.file_index);
+        if !self
+            .live_bindings
+            .get(&key)
+            .is_some_and(|(current, exported, _)| {
+                current == segment && exported == binding && !exported.permanent
+            })
+        {
+            return Err(TcpError::new("export pin binding identity mismatch"));
+        }
+        if self.live_export_pins.len() >= 1024 {
+            return Err(TcpError::new("live export pin capacity reached"));
+        }
+        let token = (0..16)
+            .find_map(|_| {
+                let token = rand::random::<[u8; 16]>();
+                (token != [0; 16]
+                    && !self.live_export_pins.contains_key(&token)
+                    && !self.fenced_export_pins.contains_key(&token))
+                .then_some(token)
+            })
+            .ok_or_else(|| TcpError::new("live export pin token allocation failed"))?;
+        self.live_export_pins.insert(token, (epoch, key));
+        // A connected history export cannot be an idle-owner eviction victim.
+        self.idle_history_exports.retain(|file| *file != key);
+        Ok(token)
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn release_live_export_pin(
+        &mut self,
+        epoch: u64,
+        token: [u8; 16],
+    ) -> Result<(), TcpError> {
+        let Some(&(authority, key)) = self.live_export_pins.get(&token) else {
+            return if self.fenced_export_pins.get(&token) == Some(&epoch) {
+                Ok(())
+            } else {
+                Err(TcpError::new("unknown live export pin"))
+            };
+        };
+        if authority != epoch {
+            return Err(TcpError::new(
+                "export pin belongs to another authority epoch",
+            ));
+        }
+        self.release_live_bindings([key], Some(token))?;
+        self.live_export_pins.remove(&token);
         Ok(())
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn release_live_pin(&mut self, epoch: u64, token: [u8; 16]) -> Result<(), TcpError> {
-        let Some((owner, leases)) = self.live_pins.get(&token) else {
+        let Some((owner, _)) = self.live_pins.get(&token) else {
             return Ok(());
         };
         if *owner != epoch {
             return Err(TcpError::new("live pin belongs to another authority epoch"));
         }
+        let (authority, leases) = self
+            .live_pins
+            .remove(&token)
+            .ok_or_else(|| TcpError::new("live pin disappeared"))?;
+        let result = self.release_live_bindings(
+            leases
+                .iter()
+                .map(|lease| (lease.segment.epoch, lease.segment.file_index)),
+            None,
+        );
+        if result.is_err() {
+            // A revoke can fail after a partial target change. Restore the
+            // record leases, keeping their inode/read pins until a fence.
+            self.live_pins.insert(token, (authority, leases));
+        }
+        result
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn release_live_bindings(
+        &mut self,
+        keys: impl IntoIterator<Item = (u64, u64)>,
+        export_token: Option<[u8; 16]>,
+    ) -> Result<(), TcpError> {
         let mut revoke = std::collections::BTreeSet::new();
         let mut retain = std::collections::BTreeSet::new();
-        for lease in leases {
-            let key = (lease.segment.epoch, lease.segment.file_index);
+        for key in keys {
             let releasable = match self.live_bindings.get(&key) {
                 Some((_, binding, _)) if binding.permanent => false,
                 Some((_, _, false)) => self
@@ -1090,12 +1194,15 @@ impl NodeInventory {
                     .map_err(TcpError::component)?,
                 None => false,
             };
-            if !self.live_pins.iter().any(|(other, (_, leases))| {
-                *other != token
-                    && leases
-                        .iter()
-                        .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
-            }) {
+            if !self.live_pins.values().any(|(_, leases)| {
+                leases
+                    .iter()
+                    .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
+            }) && !self
+                .live_export_pins
+                .iter()
+                .any(|(other, (_, file))| Some(*other) != export_token && *file == key)
+            {
                 if releasable {
                     revoke.insert(key);
                 } else if self
@@ -1134,7 +1241,6 @@ impl NodeInventory {
         for key in retain {
             self.retain_idle_history_export(key)?;
         }
-        self.live_pins.remove(&token);
         Ok(())
     }
 
@@ -1203,7 +1309,7 @@ impl NodeInventory {
     ) -> Result<(), TcpError> {
         self.ensure_healthy()?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if !self.live_pins.is_empty() {
+        if !self.live_pins.is_empty() || !self.live_export_pins.is_empty() {
             return Err(TcpError::new("live NVMe-oF pins must drain before sealing"));
         }
         if self.manifest.epochs.iter().any(|e| {
@@ -1404,7 +1510,15 @@ impl NodeInventory {
             ));
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Err(error) = self.revoke_live_epoch(epoch) {
+        if self.live_export_pins.values().any(|(_, (source, file))| {
+            *source == epoch && files.contains(&(file * self.config.partition.wal_file_bytes))
+        }) {
+            return Err(TcpError::new(
+                "live connection pins must drain before retirement",
+            ));
+        }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Err(error) = self.revoke_live_files(epoch, files) {
             self.healthy = false;
             return Err(error);
         }

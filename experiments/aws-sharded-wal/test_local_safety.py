@@ -232,8 +232,9 @@ class SafetyTests(unittest.TestCase):
                         if defect != 'missing-shape':
                             names.append('shape.yaml')
                         for p in range(5):
-                            names += [f'node-{p}/launch.yaml', f'tls/tidehunter-node-{p}.der',
-                                      f'tls/tidehunter-node-{p}.pk8']
+                            names += [f'node-{p}/launch.yaml', f'node-{p}/tls/ca.der',
+                                      f'node-{p}/tls/tidehunter-node-{p}.der',
+                                      f'node-{p}/tls/tidehunter-node-{p}.pk8']
                         for name in names:
                             path = root / name
                             path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,8 +258,16 @@ class SafetyTests(unittest.TestCase):
                         output.mkdir()
                         (output / 'COMPLETE').write_text('verified payload\n')
 
+                def upload(client, archive, cfg, key):
+                    with tarfile.open(archive) as bundle:
+                        self.assertEqual(set(bundle.getnames()), {'launch.yaml', 'tls/ca.der',
+                            *{f'tls/tidehunter-node-{part}.{suffix}'
+                              for part in range(5) for suffix in ('der', 'pk8')
+                              if f'node-{part}.tar.gz' in key}})
+                    return {'sha256': 'archive-hash'}
+
                 with patch.object(guest, 'run_recorded', side_effect=run), \
-                     patch.object(guest, 'upload', return_value={'sha256': 'archive-hash'}):
+                     patch.object(guest, 'upload', side_effect=upload):
                     args = (spec['build'], (spec['value'], spec['batch'], spec['window']), spec['rep'])
                     if defect:
                         with self.assertRaises(FileNotFoundError if defect == 'missing-shape' else RuntimeError):
@@ -791,7 +800,8 @@ class SafetyTests(unittest.TestCase):
                            'binary_sha256': 'main-hash',
                            'node_archives': {'0': {'sha256': 'archive-hash', 'key': 'owned-key'}}}
 
-                def extract(*args):
+                def extract(archive, destination, max_bytes):
+                    self.assertEqual(destination, node_dir)
                     node_dir.mkdir()
                     (node_dir / 'ready').write_text('authenticated-ready')
 

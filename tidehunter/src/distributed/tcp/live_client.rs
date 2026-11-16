@@ -881,13 +881,20 @@ impl super::Client {
                     let needs_controller = true;
                     if needs_controller {
                         let (lease, acquisition) = pool
-                            .get_or_connect(
+                            .acquire_pinned(
                                 &target,
                                 host_nqn,
                                 host_id,
                                 LiveNamespaceAccess::ReadWrite,
                                 Instant::now() + Duration::from_millis(connect_timeout_ms),
+                                super::LiveExportPinRequest {
+                                    recipe: &self.live_pin_recipe,
+                                    epoch,
+                                    segment: &reserved.reservation.segment,
+                                    binding,
+                                },
                             )
+                            .map(|(lease, acquisition, _)| (lease, acquisition))
                             .map_err(super::TcpError::component)?;
                         let namespace =
                             lease.open_namespace().map_err(super::TcpError::component)?;
@@ -1944,13 +1951,20 @@ impl super::Client {
             )
             .map(|(lease, acquisition, _)| (lease, acquisition))
         } else {
-            pool.get_or_connect(
+            pool.acquire_pinned(
                 &target,
                 &config.host_nqn,
                 config.host_id,
                 LiveNamespaceAccess::ReadWrite,
                 deadline,
+                super::LiveExportPinRequest {
+                    recipe: &self.live_pin_recipe,
+                    epoch: leased.extent.segment.epoch,
+                    segment: &leased.extent.segment,
+                    binding,
+                },
             )
+            .map(|(lease, acquisition, _)| (lease, acquisition))
         }
         .map_err(super::TcpError::component)?;
         let namespace = if shared {

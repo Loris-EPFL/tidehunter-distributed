@@ -352,68 +352,6 @@ class ImageAdmissionTests(unittest.TestCase):
                 gcp_image.validate_pair(records, identity, runtime, self.config['service_account'])
 
 
-class RealSuiAbiRegressionTests(unittest.TestCase):
-    def setUp(self):
-        self.fixture = json.loads((Path(__file__).parent/'fixtures/sui-library-abi.json').read_text())
-        self.records = self.fixture['records']
-        for record in self.records:
-            record['recipes'] = gcp_image.recipe_hashes()
-        self.abi = self.fixture['sui_abi']
-
-    def test_hardware_baseline_lacks_libstdcpp_and_sui_proof_is_separate(self):
-        with self.assertRaisesRegex(ValueError, r'libstdc\+\+\.so\.6'):
-            gcp_image.admit_abi({'_records':self.records}, self.abi)
-        for record in self.records:
-            package = record['outputs']['package']
-            proof = copy.deepcopy(package['linkage'])
-            proof['resolved'].update(self.fixture['supplemental']['resolved'])
-            proof['ldd'] += '\n'+self.fixture['supplemental']['ldd']
-            proof['ld_library_path'] = None
-            package['sui_library_linkage'] = proof
-            package['sui_needed_libraries'] = self.abi['needed']
-        # The original KV envelope must not borrow the Sui-only library.
-        with self.assertRaisesRegex(ValueError, 'libstdc'):
-            gcp_image.admit_abi({'_records':self.records}, self.abi)
-        gcp_image.admit_abi({'_records':self.records}, self.abi, sui=True)
-        first = self.records[0]
-        gcp_image.validate_pair(self.records, first['image'], first['outputs']['package']['manifest_sha256'],
-            first['service_account'], qualification_profile='focused', sui_needed_libraries=self.abi['needed'])
-        self.records[1]['outputs']['package']['sui_library_linkage']['ld_library_path'] = '/different'
-        with self.assertRaisesRegex(ValueError, 'Sui library linkage'):
-            gcp_image.validate_pair(self.records, first['image'], first['outputs']['package']['manifest_sha256'],
-                first['service_account'], qualification_profile='focused', sui_needed_libraries=self.abi['needed'])
-
-    def test_sui_required_proof_cannot_fall_back_to_kv_envelope(self):
-        first = self.records[0]
-        with self.assertRaisesRegex(ValueError, 'Sui library proof'):
-            gcp_image.validate_pair(self.records, first['image'], first['outputs']['package']['manifest_sha256'],
-                first['service_account'], qualification_profile='focused', sui_needed_libraries=self.abi['needed'])
-
-
-    def test_guest_sui_proof_uses_inherited_environment_and_all_needed_names(self):
-        import cloud_package
-        proof = copy.deepcopy(self.records[0]['outputs']['package']['linkage'])
-        supplemented = copy.deepcopy(proof)
-        supplemented['resolved'].update(self.fixture['supplemental']['resolved'])
-        with patch.dict('os.environ', {'LD_LIBRARY_PATH':'/inherited'}, clear=True), \
-             patch.object(cloud_package, 'linked_libraries', side_effect=[proof,supplemented]) as loader:
-            result = gcp_image_qualify.sui_library_linkage('/package', self.abi['needed'])
-        self.assertEqual(result['ld_library_path'], '/inherited')
-        self.assertEqual(loader.call_args.kwargs['extra_names'], ['libstdc++.so.6'])
-        self.assertEqual(loader.call_args.args[1]['LD_LIBRARY_PATH'], '/inherited')
-        with patch.dict('os.environ', {}, clear=True), \
-             patch.object(cloud_package, 'linked_libraries', side_effect=ValueError('libfabric.so.1 not found')):
-            with self.assertRaisesRegex(ValueError, 'libfabric'):
-                gcp_image_qualify.sui_library_linkage('/package', self.abi['needed'])
-
-    def test_local_admission_rejects_sui_abi_newer_than_rocky9(self):
-        import prepare
-        prepare.admit_rocky9_abi(self.abi)
-        for family, version in [('GLIBC','2.35'),('GLIBCXX','3.4.30')]:
-            changed = copy.deepcopy(self.abi)
-            changed['version_requirements'][family].append(version)
-            with self.assertRaisesRegex(ValueError, 'Rocky 9'):
-                prepare.admit_rocky9_abi(changed)
 
 
 if __name__ == '__main__':

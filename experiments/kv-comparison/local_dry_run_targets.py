@@ -3,10 +3,12 @@
 The caller owns the fixture directory, prepared exports and live owner processes.
 The helpers own target and initiator identities. No global cleanup is performed.
 """
+import errno
 import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import time
 import uuid
@@ -301,11 +303,30 @@ def qualify_kernel_live(fixture, binary, *, transport="rdma", deadline_seconds=6
     return json.loads(result.stdout)
 
 
+def _kernel_live_ports(address, *, commissioning_address, control_address):
+    """Bind-check each actual listener and the preparer's consecutive pair."""
+    for _ in range(32):
+        with socket.socket() as control, socket.socket() as service, socket.socket() as commissioning:
+            try:
+                control.bind((control_address, 0))
+                service.bind((address, 0))
+                control_port = control.getsockname()[1]
+                service_port = service.getsockname()[1]
+                if service_port == 65535 or control_port in (service_port, service_port + 1):
+                    continue
+                commissioning.bind((commissioning_address, service_port + 1))
+                return control_port, service_port, service_port + 1
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+    raise TargetError("could not bind a distinct control port and consecutive "
+                      "service/commissioning pair after 32 attempts")
+
+
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch):
     import hashlib
     import shutil
     import signal
-    import socket
     import sys
     import threading
     import time
@@ -350,17 +371,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch):
                               f"stdout={result.stdout!r}; stderr={result.stderr!r}")
         return result.stdout
 
-    def ports():
-        sockets = []
-        try:
-            for _ in range(3):
-                s = socket.socket()
-                s.bind(("127.0.0.1", 0))
-                sockets.append(s)
-            return [s.getsockname()[1] for s in sockets]
-        finally:
-            for s in sockets:
-                s.close()
 
     def controllers(address, services, hostnqn):
         rows = []
@@ -387,10 +397,13 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch):
         evidence.mkdir(mode=0o700)
         guest, prepared = directory / "guest", directory / "prepared"
         node = guest / "node-0"
-        control, service, commissioning = ports()
         # Unique candidate IDs; the Rust target refuses existing configfs objects.
         port_id = 20000 + int(token[index * 4:index * 4 + 4], 16) % 20000
         addr = "10.99.0.2"
+        # The kernel target commissions locally, on the same loopback as control.
+        control_address = "127.0.0.1"
+        control, service, commissioning = _kernel_live_ports(
+            addr, commissioning_address=control_address, control_address=control_address)
         unit = "tidehunter-local-kernel-" + token + "-" + tier
         description = "Tidehunter local kernel " + token + " " + tier
         record = {"tier": tier, "unit": unit, "cleanup_complete": False, "errors": []}
@@ -428,7 +441,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch):
                         sample_errors.append(repr(error))
 
         try:
-            prep = {"guest_root": str(guest), "addresses": [f"127.0.0.1:{control}"],
+            prep = {"guest_root": str(guest), "addresses": [f"{control_address}:{control}"],
                 "transport": {"kind": "tcp"}, "durability_tier": tier,
                 "owner_wal_geometry": "research",
                 "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
@@ -448,20 +461,20 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch):
             launch = yaml.safe_load((prepared / "node-0/launch.yaml").read_text())
             launch["launch_nonce"] = uuid.uuid4().hex
             target = launch["node"]["live_target"]
-            if (launch["listen"] != f"127.0.0.1:{control}" or target["address"] != addr
+            if (launch["listen"] != f"{control_address}:{control}" or target["address"] != addr
                     or target["transport"] != transport or target.get("spdk") is not None
                     or target["port_id"] != port_id or target["commissioning_port_id"] != port_id + 1):
                 raise TargetError("generated kernel owner identity differs from requested fixture")
             node.mkdir(mode=0o700, parents=True)
             Path(target["state_dir"]).mkdir(mode=0o700)
-            for tls in (remote["tls"], launch["tls"]):
+            for tls, tls_root in ((remote["tls"], guest), (launch["tls"], node)):
                 for name in ("ca", "cert", "key"):
                     if not tls.get(name):
                         continue
                     dest = Path(tls[name])
-                    if dest.parent != guest / "tls" or not re.fullmatch(r"[A-Za-z0-9_.-]+", dest.name):
+                    if dest.parent != tls_root / "tls" or not re.fullmatch(r"[A-Za-z0-9_.-]+", dest.name):
                         raise TargetError("TLS path outside fixture")
-                    source = prepared / "tls" / dest.name
+                    source = prepared / dest.relative_to(guest)
                     data = source.read_bytes()
                     if source.is_symlink() or not data or len(data) > 65536:
                         raise TargetError("invalid TLS source")

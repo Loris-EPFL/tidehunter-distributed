@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run four host-local kernel NVMe/TCP owners through cloud harness helpers.
+"""Run host-local kernel NVMe/TCP owners through cloud harness helpers.
 
 Functional evidence only: one host, file backing, TCP control, no RDMA claim.
 Run in the documented privileged host namespace with the project Python.
@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -36,11 +37,53 @@ class MultiownerMode(LocalMode):
         return proof
 
 
+def capture_kernel_log(path, errors):
+    """A diagnostic failure must not prevent the one-shot run's final proof."""
+    try:
+        text = subprocess.check_output(['dmesg', '--raw'], text=True, errors='replace',
+                                       stderr=subprocess.STDOUT)
+        path.write_text(text)
+        return text
+    except (OSError, subprocess.CalledProcessError) as error:
+        errors.append(f'kernel capture {path.name} failed: {error}; '
+                      + str(getattr(error, 'output', ''))[-2000:])
+        return None
+
+
+def kernel_log_interval(before, after):
+    """Use the last pre-run timestamp; rotation of older records is harmless."""
+    def timestamp(line):
+        match = re.match(r'^(?:<\d+>)?\[\s*(\d+)(?:\.(\d+))?\]', line)
+        return (int(match[1]) * 1_000_000_000
+                + int((match[2] or '').ljust(9, '0')[:9])) if match else None
+    before_times = [value for line in (before or '').splitlines()
+                    if (value := timestamp(line)) is not None]
+    after_times = []
+    added = []
+    boundary = before_times[-1] if before_times else None
+    current = None
+    for line in (after or '').splitlines():
+        value = timestamp(line)
+        if value is not None:
+            after_times.append(value)
+            current = value
+        if boundary is not None and current is not None and current > boundary:
+            added.append(line)
+    errors = [line for line in added if re.search(
+        r'starting error recovery|Property Set error|no (?:available|usable) path|'
+        r'buffer I/O error|nvme.*(?:I/O error|controller.*(?:reset|recovery))', line, re.IGNORECASE)]
+    return {'boundary_monotonic_ns': boundary,
+            'complete_interval': bool(boundary is not None and after_times
+                                      and after_times[0] <= boundary <= after_times[-1]),
+            'io_errors_or_controller_recovery': errors}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--libs', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--owners', type=int, choices=(4, 16), default=16)
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise SystemExit('requires the privileged host namespace wrapper')
@@ -62,11 +105,11 @@ def main():
                     if j.get('owner_count') == 16 and j.get('owner_topology') == 'colocated')
     case = topology['case_id']
     job = dict(topology)
-    job.update(owner_count=4, owner_topology='colocated')
+    job.update(owner_count=args.owners, owner_topology='colocated')
     for key in ('case_kind', 'measurement_sizing', 'device_counters', 'thread_cpu_sampling'):
         job.pop(key, None)
-    job.update(selection='local_functional', backend='tidehunter_nvme_tcp', keys=4,
-               warmup_operations=0, measurement_operations=4, concurrency=4,
+    job.update(selection='local_functional', backend='tidehunter_nvme_tcp', keys=args.owners,
+               warmup_operations=0, measurement_operations=args.owners, concurrency=args.owners,
                owner_wal_geometry='research', owner_wal_file_bytes=8388608,
                owner_read_memory_allowance_bytes=128 * 1024**2)
     now = datetime.now(timezone.utc)
@@ -94,21 +137,23 @@ def main():
     evidence = {'scope': __doc__, 'uptime_before': uptime, 'load_before': load,
                 'binary': str(binary), 'binary_sha256': cloud.digest(binary),
                 'route': 'kernel NVMe/TCP leased FUA writes; buffered kernel target reads; TCP/TLS control',
-                'owner_count': 4, 'complete': False, 'cleanup_complete': False,
+                'owner_count': args.owners, 'complete': False, 'cleanup_complete': False,
                 'fixture': str(fixture), 'errors': []}
     save_json(output / 'input.json', {'config': config, 'job': job})
+    kernel_before = capture_kernel_log(output / 'dmesg-before.txt', evidence['errors'])
     try:
         options = controller.prepare_tide(job, directory)
         identities = options['external_remote_config']['live_nvme']['owner_identities']
-        if len(identities) != 4 or len({x['host_nqn'] for x in identities.values()}) != 4:
-            raise RuntimeError('four unique owner initiator identities required')
+        if (len(identities) != args.owners
+                or len({x['host_nqn'] for x in identities.values()}) != args.owners):
+            raise RuntimeError('one unique initiator identity required per owner')
         # Build a generic TCP config, then use the exact cloud admission runner.
         # The matrix job supplies only the shared slice/placement topology.
         import copy
         cell = directory / 'owner-admission'
         cell.mkdir()
         selected = copy.deepcopy(options)
-        selected.update(path=str(cell / 'database'), evidence=str(cell / 'read-evidence'),
+        selected.update(path=str(directory / 'database'), evidence=str(cell / 'read-evidence'),
                         coordinator_read_cache_bytes=0)
         template = {key: job[key] for key in ('repeat', 'case_id', 'keys', 'value_size', 'mix',
                     'concurrency', 'measurement_operations', 'warmup_operations',
@@ -118,6 +163,25 @@ def main():
             config['source_revision'], cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS)
         controller.run_logical_owner_admission(job, directory, admission_config)
         evidence['admission'] = json.loads((directory / 'owner-admission.json').read_text())
+        # The owners stay live. A second coordinator must recover the exact
+        # authority that granted their admission epoch, just as the fleet does.
+        measured = directory / 'second-open'
+        measured.mkdir()
+        second_template = {**template, 'mix': cloud_campaign.mix(read=100)}
+        second = cloud_campaign.make_run_config(second_template, measured, options,
+            config['source_revision'], cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS)
+        second.update(namespace='local-second-open', measurement_gate=None,
+                      measurement_completion_gate=None)
+        second['phases'].update(warmup_operations=0, measurement_operations=args.owners,
+                                measurement_key_sweep=True)
+        save_json(measured / 'config.json', second)
+        cloud.command([str(binary), '--config', measured / 'config.json', '--output', measured / 'result'],
+            timeout=cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, env=cloud.environment(config))
+        summary = json.loads((measured / 'result/summary.json').read_text())
+        if summary.get('status') != 'completed':
+            raise RuntimeError('second coordinator did not complete the benchmark namespace')
+        evidence['second_open'] = {'status': summary['status'],
+            'authority_database': options['path'], 'owners_remained_live': True}
         slice_name, expected_limits = cloud.owner_slice_limits(config, case)
         evidence['slice'] = {'name': slice_name, 'expected_limits': expected_limits,
             'observed': cloud.command(['systemctl', 'show', slice_name,
@@ -131,6 +195,12 @@ def main():
             evidence['cleanup_complete'] = True
         except Exception:
             evidence['errors'].append(traceback.format_exc())
+        kernel_after = capture_kernel_log(output / 'dmesg-after.txt', evidence['errors'])
+        kernel = kernel_log_interval(kernel_before, kernel_after)
+        evidence['kernel_log'] = {'before': 'dmesg-before.txt', 'after': 'dmesg-after.txt', **kernel}
+        if not kernel['complete_interval'] or kernel['io_errors_or_controller_recovery']:
+            evidence['complete'] = False
+            evidence['errors'].append('kernel log interval incomplete or contains I/O/controller errors')
         evidence['uptime_after'] = subprocess.check_output(['uptime'], text=True).strip()
         evidence['load_after'] = os.getloadavg()
         shutil.copytree(controller.root, output / 'harness-results')

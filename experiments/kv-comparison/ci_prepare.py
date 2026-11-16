@@ -217,6 +217,7 @@ def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environme
                        durability_tier=cloud_campaign.DEFAULT_DURABILITY_TIER):
     """Exercise the built binary against five real local TCP owner processes."""
     binary = Path(binary).resolve(strict=True)
+    import yaml
     work, proof = Path(work).absolute(), Path(proof).absolute()
     work.mkdir(mode=0o700, parents=True, exist_ok=False)
     guest = work / 'guest'
@@ -245,6 +246,9 @@ def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environme
             shutil.copytree(prepared / 'tls', guest / 'tls')
         for index in range(5):
             (guest / f'node-{index}').mkdir(mode=0o700)
+            tls = prepared / f'node-{index}/tls'
+            if tls.is_dir():
+                shutil.copytree(tls, guest / f'node-{index}/tls')
         remote = json.loads((prepared / 'remote.json').read_text())
         owner_configs = json.loads((prepared / 'external_owner_read_config.json').read_text())
         options = {'path': str(work / 'database'), 'evidence': str(work / 'read-evidence'),
@@ -270,7 +274,6 @@ def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environme
         if remaining <= 0:
             raise TimeoutError('TCP diagnostic admission deadline exhausted')
         campaign.admit_config(binary, work / 'config.json', work, environment, timeout=min(30, remaining))
-        import yaml
         for index in range(5):
             # The receipt must echo this launch's nonce; an empty nonce is never accepted.
             launch_path = prepared / f'node-{index}' / 'launch.yaml'

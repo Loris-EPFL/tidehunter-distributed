@@ -135,18 +135,6 @@ class PoweroffTests(unittest.TestCase):
         self.terminal()
         self.assertEqual(poweroff.evaluate(self.config, self.owner, self.store, now=1600), 'poweroff_no_acknowledgement')
 
-    def test_sui_requires_archive(self):
-        self.config['spec']['suite'] = 'sui'
-        for key in list(self.store.items):
-            if '/results/' in key:
-                self.store.items.pop(key)
-        self.store.put(self.base + 'sui-started.json', encode({'run_id': 'bench-test',
-                       'source_sha256': 'a' * 64, 'suite': 'sui'}))
-        with self.assertRaises(gcp_api.ApiError):
-            self.terminal()
-        self.store.put('bench-test/results/sui-results.tar.gz', b'sui')
-        self.terminal()
-        self.assertEqual(poweroff.evaluate(self.config, self.owner, self.store, now=1600), 'poweroff_no_acknowledgement')
 
     def test_unknown_storage_error_fails_closed(self):
         self.terminal()

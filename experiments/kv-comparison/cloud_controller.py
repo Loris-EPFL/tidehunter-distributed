@@ -1900,9 +1900,9 @@ def validate_launch(config, launch, case, index, polling=None):
         expected_tls = {"ca": "ca.der", "cert": f"tidehunter-node-{index}.der",
                         "key": f"tidehunter-node-{index}.pk8"}
         for field, name in expected_tls.items():
-            if tls.get(field) != str(root / "tls" / name):
+            if tls.get(field) != str(node / "tls" / name):
                 raise SafetyError("node capsule may contain only CA certificate and its own leaf identity")
-            guarded(tls[field], root)
+            guarded(tls[field], node)
 
 
 def bounded_capture(argv, *, max_bytes, timeout):
@@ -2954,7 +2954,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
         download_object(clients, config, expected_key, archive)
         if digest(archive) != request["sha256"]:
             raise SafetyError("node capsule bytes differ from admission")
-        safe_extract_capsule(archive, guest_root, request["files"])
+        safe_extract_capsule(archive, capsule_root, request["files"])
         archive.unlink()
         import yaml
         launch = yaml.safe_load((capsule_root / "launch.yaml").read_text())
@@ -3738,7 +3738,7 @@ class Controller:
                 raise SafetyError("unexpected live target in non-live campaign case")
             launch["launch_nonce"] = nonces[index] = secrets.token_hex(16)
             launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
-            files = {f"node-{index}/launch.yaml": launch_path}
+            files = {"launch.yaml": launch_path}
             # Typed helper already embeds final guest paths. Only these three TLS
             # files may cross the machine boundary; never its CA signing key.
             tls = launch["tls"]
@@ -3746,8 +3746,8 @@ class Controller:
                 if not tls.get(field):
                     continue
                 target = Path(tls[field])
-                relative = target.relative_to(Path(guest_root))
-                source = guarded(prepared / "tls" / target.name, prepared, must_exist=True)
+                relative = target.relative_to(Path(guest_root) / f"node-{index}")
+                source = guarded(prepared / f"node-{index}" / relative, prepared, must_exist=True)
                 files[str(relative)] = source
             archive = directory / f"storage-{index}.tar.gz"
             with tarfile.open(archive, "w:gz") as bundle:
@@ -3794,7 +3794,7 @@ class Controller:
         cell = directory / "owner-admission"
         cell.mkdir(parents=True, exist_ok=False)
         selected = copy.deepcopy(options)
-        selected.update(path=str(cell / "database"), evidence=str(cell / "read-evidence"),
+        selected.update(path=str(directory / "database"), evidence=str(cell / "read-evidence"),
                         coordinator_read_cache_bytes=0)
         config = cloud_campaign.make_run_config(job, cell, selected, self.config["source_revision"],
                                                 cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS)
@@ -3804,19 +3804,11 @@ class Controller:
         """Run a typed full-topology admission, shared with local TCP checks."""
         import importlib.util
         cell = directory / "owner-admission"
+        config = cloud_campaign.make_owner_admission_config(config, job["owner_count"])
         remote = config["backend"]["options"]["external_remote_config"]
-        remote["read_cache_bytes"] = 0
         identities = remote["live_nvme"]["owner_identities"]
         expected_nqns = {identities[str(index)]["host_nqn"] for index in range(job["owner_count"])}
         keys = 16 * job["owner_count"]
-        config.update(namespace="owner-admission", qualification_only=False)
-        config["dataset"].update(keys=keys, value_size=1024)
-        config["workload"].update(mix=cloud_campaign.mix(read=100))
-        config["execution"].update(concurrency=job["owner_count"], queue_capacity=job["owner_count"])
-        config["phases"].update(warmup_operations=0, measurement_operations=keys,
-                                measurement_key_sweep=True)
-        for key in ("measurement_gate", "measurement_completion_gate", "warmup_key_sweep", "diagnostics"):
-            config.pop(key, None)
         dump(cell / "config.json", config)
         began = self.clock()
         command([self.config["binary"], "--config", cell / "config.json", "--output", cell / "result"],
@@ -3856,7 +3848,8 @@ class Controller:
             for route in routes)]
         if remaining:
             raise SafetyError("admission coordinator left live controllers: " + ", ".join(remaining))
-        shutil.rmtree(guarded(cell / "database", cell, must_exist=True))
+        # Owners retain the granted epochs. The measured coordinator must reopen
+        # this authority, not create a new manifest with no knowledge of them.
         proofs = [{"owner_index": index, "host_index": owner_host_index(self.config, job, index),
                    "host_nqn": identities[str(index)]["host_nqn"], "endpoint": remote["endpoints"][index],
                    "config": str((cell / "config.json").relative_to(directory)),
@@ -3864,7 +3857,8 @@ class Controller:
                   for index in range(job["owner_count"])]
         dump(directory / "owner-admission.json", {"owners": proofs, "elapsed_seconds": elapsed,
              "preload_puts": keys, "verified_reads": keys, "concurrency": job["owner_count"],
-             "coordinator_exited": True, "coordinator_database_removed": not (cell / "database").exists(),
+             "coordinator_exited": True, "coordinator_database_retained": (directory / "database").is_dir(),
+             "authority_database": "database",
              "remaining_controllers": remaining,
              "scope": "one full-inventory authority; parallel verified cache-disabled reads of every preloaded key; every owner has read and write routes; crash qualification is per physical VM"})
 
@@ -3909,6 +3903,12 @@ class Controller:
             cleaned = self.request(0, {"action": "tide_slice_cleanup", "case_id": job["case_id"]},
                 case=job["case_id"], timeout=self.cleanup_timeout(deadline), export=True)
             dump(directory / "server-proofs" / "slice-stop.json", cleaned)
+        if job.get("selection") in cloud_campaign.M3_SELECTIONS:
+            # The authority is still needed while any owner can report its
+            # epochs. Only confirmed fleet-wide stop permits its removal.
+            database = guarded(directory / "database", self.root)
+            if database.exists():
+                shutil.rmtree(database)
         if self.shared_tide is not None:
             database = guarded(directory / "database", self.root)
             if database.exists():
@@ -5459,8 +5459,9 @@ class Controller:
                             "native dataset cleanup unconfirmed: " + repr(exc)))
             database = guarded(directory / "database", directory)
             receipt["database_files_retained"] = database.exists()
-            if database.exists() and (not started or client_quiesced) and not (
-                    job.get("nvmeof_route") == "live" and self.tide_cleanup_forbidden):
+            if (job.get("selection") not in cloud_campaign.M3_SELECTIONS
+                    and database.exists() and (not started or client_quiesced) and not (
+                        job.get("nvmeof_route") == "live" and self.tide_cleanup_forbidden)):
                 try:
                     shutil.rmtree(database)
                     receipt["database_files_retained"] = False
@@ -5481,6 +5482,7 @@ class Controller:
                                 "status": target_status})
                 if "sealed_dataset" not in job:
                     self.stop_tide()
+                    receipt["database_files_retained"] = database.exists()
             except Exception as exc:
                 record_cleanup_error("owner_storage", exc)
             if (job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS

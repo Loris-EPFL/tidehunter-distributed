@@ -60,42 +60,30 @@ def publish_terminal(config, host, store, result, response_key):
         raise ValueError('campaign response mismatch')
     refs = [response_ref]
     owner_suites = {}
-    suites = config['spec'].get('suite', 'kv')
-    for suite in ('kv', 'sui'):
-        if suite not in (('kv', 'sui') if suites == 'both' else (suites,)):
-            continue
-        started = _optional(store, base + suite + '-started.json')
-        if started is None:
-            if result['exit_code'] == 0:
-                raise ValueError('successful suite missing start record')
-            continue
+    started = _optional(store, base + 'kv-started.json')
+    if started is None:
+        if result['exit_code'] == 0:
+            raise ValueError('successful suite missing start record')
+    else:
         marker, marker_ref = started
-        if json.loads(marker) != {'run_id': config['run_id'], 'source_sha256': config['source_sha256'], 'suite': suite}:
+        if json.loads(marker) != {'run_id': config['run_id'], 'source_sha256': config['source_sha256'], 'suite': 'kv'}:
             raise ValueError('suite start identity mismatch')
         refs.append(marker_ref)
         prefix = config['run_id'] + '/results/'
-        if suite == 'kv':
-            raw, receipt_ref = _read(store, prefix + 'receipt.json')
-            receipt = json.loads(raw)
-            inventory = receipt.get('inventory')
-            if (receipt.get('schema_version') != 2 or receipt.get('status') not in ('completed', 'incomplete')
-                    or receipt.get('monitoring_complete') is not True
-                    or receipt.get('source_sha256') != config['source_sha256']
-                    or receipt.get('binary_blake2b512') != config['package']['binary_blake2b512']
-                    or receipt.get('key') != prefix + 'controller.tar.gz'
-                    or not isinstance(inventory, dict)
-                    or inventory.get('key') != prefix + 'controller-inventory.json'):
-                raise ValueError('controller export is not terminal')
-            refs.extend([receipt_ref, _bound(store, receipt['key'], receipt.get('bytes'), receipt.get('sha256')),
-                         _bound(store, inventory['key'], inventory.get('bytes'), inventory.get('sha256'), inventory.get('generation'))])
-            owner_suites['kv'] = [receipt_ref['key'], receipt['key'], inventory['key']]
-        else:
-            if result['exit_code'] != 0:
-                raise ValueError('failed Sui run has no complete owner export proof')
-            key = prefix + 'sui-results.tar.gz'
-            meta = store.head(key)
-            refs.append(_bound(store, key, int(meta.get('size', -1)), meta.get('metadata', {}).get('sha256')))
-            owner_suites['sui'] = [key]
+        raw, receipt_ref = _read(store, prefix + 'receipt.json')
+        receipt = json.loads(raw)
+        inventory = receipt.get('inventory')
+        if (receipt.get('schema_version') != 2 or receipt.get('status') not in ('completed', 'incomplete')
+                or receipt.get('monitoring_complete') is not True
+                or receipt.get('source_sha256') != config['source_sha256']
+                or receipt.get('binary_blake2b512') != config['package']['binary_blake2b512']
+                or receipt.get('key') != prefix + 'controller.tar.gz'
+                or not isinstance(inventory, dict)
+                or inventory.get('key') != prefix + 'controller-inventory.json'):
+            raise ValueError('controller export is not terminal')
+        refs.extend([receipt_ref, _bound(store, receipt['key'], receipt.get('bytes'), receipt.get('sha256')),
+                     _bound(store, inventory['key'], inventory.get('bytes'), inventory.get('sha256'), inventory.get('generation'))])
+        owner_suites['kv'] = [receipt_ref['key'], receipt['key'], inventory['key']]
     owners = {str(owner['id']): {'status': 'exported' if owner_suites else 'not_required',
                                   'suites': dict(owner_suites)} for owner in config['fleet'][1:]}
     terminal = {'schema_version': 1, 'run_id': config['run_id'], 'source_sha256': config['source_sha256'],

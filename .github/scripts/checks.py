@@ -164,9 +164,8 @@ def check(profile, env):
         if env.get("TH_TEST_SYSTEMD") == "1":
             raise RuntimeError("harness is offline: unset TH_TEST_SYSTEMD; run real-systemd checks separately")
         print("Offline harnesses: optional MCP SDK tests may skip if absent; real-systemd exercise is excluded.", flush=True)
-        for directory in ("experiments/aws-sharded-wal", "experiments/sui-checkpoint"):
-            run([sys.executable, "-m", "unittest", "discover", "-s", directory,
-                 "-p", "test_*.py", "-v"], env)
+        run([sys.executable, "-m", "unittest", "discover", "-s", "experiments/aws-sharded-wal",
+             "-p", "test_*.py", "-v"], env)
 
 
 def main():

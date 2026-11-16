@@ -1625,7 +1625,7 @@ class FocusedMatrixTests(unittest.TestCase):
     def test_strict_admission(self):
         job = campaign.make_focused_matrix('full')[0]
         for change in ({'unexpected': 1}, {'repeat': True}, {'case_id': 'wrong'},
-                       {'target_io': 'direct'}, {'case_kind': 'sui_trace_replay'},
+                       {'target_io': 'direct'}, {'case_kind': 'unknown'},
                        {'value_size': 1025}, {'execution': {'queue_capacity': 256, 'extra': 1}}):
             candidate = copy.deepcopy(job)
             candidate.update(change)

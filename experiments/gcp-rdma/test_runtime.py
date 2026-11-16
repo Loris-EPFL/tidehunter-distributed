@@ -582,19 +582,6 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(runtime.prepare_transport(config, {'transport': {'kind': 'tcp'}}),
                          {'transport': {'kind': 'tcp'}})
 
-    def test_sui_only_verbs_admits_the_active_rdma_interface(self):
-        config = {'spec': {'backends': ['native']},
-                  'platform': {'runtime': {'fleet': fleet(),
-                              'spec': {'suite': 'sui', 'backends': ['native'],
-                                       'sui_transports': ['tidehunter_verbs_native']}}}}
-        addresses = json.dumps([{'ifname': 'eth1', 'addr_info': [{'local': '10.1.0.2'}]}])
-        with patch('subprocess.check_output',
-                   side_effect=['link rdma0/1 state ACTIVE netdev eth1', addresses]):
-            self.assertTrue(runtime.admit_fabrics(config, 0, {}, '/tmp')['rdma_requested'])
-        with patch('subprocess.check_output',
-                   side_effect=['link rdma0/1 state DOWN netdev eth1', addresses]):
-            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'active RDMA'):
-                runtime.admit_fabrics(config, 0, {}, '/tmp')
 
     def test_valkey_rdma_requires_cm_and_its_admitted_nic(self):
         config = {'spec': {'backends': ['valkey_tcp', 'valkey_rdma']},
@@ -619,14 +606,14 @@ class MailboxTests(unittest.TestCase):
                   'package_root': '/mnt/tidehunter/run/package',
                   'package': {'source_sha256': 'a' * 64, 'source_revision': 'b' * 40,
                               'object_key': 'runs/run/package.tar', 'generation': '1', 'sha256': 'c' * 64},
-                  'spec': {'backends': ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
+                  'spec': {'suite': 'kv', 'backends': ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
                                         'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma',
                                         'garnet', 'kvrocks']}}
         self.assertIs(runtime.validate_runtime(config), config)
         config['spec']['backends'].append('tidehunter_efa')
         with self.assertRaises(runtime.RuntimeSafetyError):
             runtime.validate_runtime(config)
-        config['spec'] = {'backends': ['native', 'tidehunter_nvme_rdma'], 'mode': 'standard'}
+        config['spec'] = {'suite': 'kv', 'backends': ['native', 'tidehunter_nvme_rdma'], 'mode': 'standard'}
         with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'NVMe-oF mode'):
             runtime.validate_runtime(config)
         config['spec']['mode'] = 'nvmeof-focused'
@@ -778,158 +765,6 @@ class MailboxTests(unittest.TestCase):
 
 
 
-class ReviewedSuiRuntimeTests(unittest.TestCase):
-    def config(self):
-        import copy
-        import manual_sui
-        run = 'bench-aaaaaaaaaaaaaaaa'
-        hosts = [{**host, 'name': f'{run}-{i}'} for i, host in enumerate(fleet()[:2])]
-        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
-        spec['sui_fixture'].update(key='fixture', generation='1')
-        spec['sui_verification'] = dict(key='proof', generation='2', sha256='f'*64)
-        return dict(project_id='project', project_number='123', bucket='bucket',
-            machine_type='z4m-highmem-16', run_id=run, fleet=hosts,
-            source_sha256='a'*64, deadline_utc=deadline(),
-            campaign_deadline_utc=(datetime.now(timezone.utc)+timedelta(minutes=2)).isoformat(),
-            package_root=f'/mnt/tidehunter/{run}/package',
-            package=dict(source_sha256='a'*64, source_revision='b'*40,
-                object_key=f'runs/{run}/package.tar', generation='1', sha256='c'*64), spec=spec,
-            live_qualification=dict(image='projects/project/global/images/qualified',
-                image_qualification=dict(bucket='bucket', object=f'runs/{run}/qualification/image-receipt.json',
-                                         generation='1', sha256='d'*64),
-                pair_hosts=[{k: h[k] for k in ('name','id','zone','internal_ip','rdma_ip')} for h in hosts],
-                rdma_device='irdma0', service_account='guest@example.test'))
-
-    def test_reviewed_compact_sui_requires_live_pair_bound_to_fleet(self):
-        config = self.config()
-        self.assertTrue(runtime.live_mode(config['spec']))
-        self.assertIs(runtime.validate_runtime(config), config)
-        config['live_qualification']['pair_hosts'][0]['id'] = '999'
-        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'match the campaign fleet'):
-            runtime.validate_runtime(config)
-        config = self.config()
-        config.pop('live_qualification')
-        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'live pair qualification'):
-            runtime.validate_runtime(config)
-        config = self.config()
-        config['spec']['sui_cells'][0]['owner_tier'] = 'synchronous'
-        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'compact fleet'):
-            runtime.validate_runtime(config)
-
-    def test_sui_worker_admits_nvme_cells_and_live_proof_before_storage(self):
-        import gcp_worker
-        config = self.config()
-        host = config['fleet'][1]
-        with patch.object(runtime, 'validate_runtime'), \
-             patch.object(gcp_worker, 'identify', return_value=host), \
-             patch.object(gcp_worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a'*64}), \
-             patch.object(runtime, 'verify_fleet'), patch.object(runtime, 'admit_nvmet_fix'), \
-             patch.object(runtime, 'admit_fabrics') as fabrics, \
-             patch.object(runtime, 'admit_live_qualification') as proof, \
-             patch.object(gcp_worker, 'prepare_storage', side_effect=RuntimeError('storage boundary')):
-            with self.assertRaisesRegex(RuntimeError, 'storage boundary'):
-                gcp_worker.serve(config, api=object())
-        self.assertEqual(fabrics.call_args.args[0]['spec']['backends'], ['tidehunter_nvme_rdma'])
-        proof.assert_called_once_with(config)
-
-    def test_sui_guest_revalidates_focused_live_image_receipt(self):
-        import gcp_api
-        import gcp_image
-        import manual_campaign
-        config = self.config()
-        config['package']['manifest_sha256'] = 'e'*64
-        fixture = json.loads((Path(__file__).parent/'fixtures/sui-library-abi.json').read_text())
-        config['package']['abi'] = fixture['records'][0]['outputs']['package']['abi']
-        config['package']['sui_abi'] = fixture['sui_abi']
-        hosts = config['live_qualification']['pair_hosts']
-        records = [dict(instance_id=host['id'], peer_instance_id=hosts[1-i]['id'],
-                        local_rdma=host['rdma_ip'], peer=hosts[1-i]['rdma_ip'])
-                   for i, host in enumerate(hosts)]
-        for record in records:
-            record['outputs'] = {'package': {'sui_library_linkage': {'ld_library_path': None}}}
-        qualification = dict(runtime_sha256='e'*64, _records=records)
-        api = SimpleNamespace(request=lambda *args: {'id': '1'})
-        with patch.object(gcp_api, 'GoogleApi', return_value=api), \
-             patch.object(gcp_image, 'admit_image', return_value=qualification) as image, \
-             patch.object(gcp_image, 'admit_nvme_transports'), \
-             patch.object(manual_campaign, '_admit_live_pair'), \
-             patch('gcp_worker.identify', return_value={'index':0}), patch.dict('os.environ', {}, clear=True):
-            runtime.admit_live_qualification(config)
-            with patch.dict('os.environ', {'LD_LIBRARY_PATH':'/changed'}):
-                with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'search path differs'):
-                    runtime.admit_live_qualification(config)
-        self.assertEqual(image.call_args.args[1]['qualification_profile'], 'focused')
-
-
-class ReviewedCombinedRuntimeTests(ReviewedSuiRuntimeTests):
-    spec_name = 'sui_nvmeof_with_kv'
-
-    def config(self):
-        import copy
-        import manual_sui
-        config=super().config()
-        config['spec']=copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS[self.spec_name])
-        config['spec']['sui_fixture'].update(key='fixture',generation='1')
-        config['spec']['sui_verification']=dict(key='proof',generation='2',sha256='f'*64)
-        return config
-
-    def test_controller_gets_only_the_exact_focused_kv_spec(self):
-        import manual_sui
-        config=self.config()
-        import cloud_package
-        manifest=dict(revision='b'*40,source_sha256=config['source_sha256'],
-                      binary_sha256='c'*64,binary_blake2b512='d'*128,build_profile='focused',
-                      features=cloud_package.FOCUSED_FEATURES,
-                      files={'source/experiments/kv-comparison/nvme_campaign_owner.py':{}})
-        with patch.object(Path,'read_text',return_value=json.dumps(manifest)):
-            controller=runtime._controller_config(config)
-        expected=manual_sui.kv_spec(config['spec'])
-        expected.pop('suite')
-        self.assertEqual(controller['spec'],expected)
-        self.assertFalse(any(key.startswith('sui_') for key in controller['spec']))
-
-
-    def test_kv_report_continues_to_sui_but_kv_exception_does_not(self):
-        import gcp_sui
-        import cloud_controller
-        from unittest.mock import Mock
-        config=self.config()
-        api=Mock()
-        for failed in (False, True):
-            controller=Mock()
-            if failed:
-                controller.run.side_effect=RuntimeError('KV exception')
-            else:
-                controller.run.return_value=dict(complete=False,planned_cases=config['spec']['job_count'],
-                                                 completed_cases=config['spec']['job_count']-1)
-            with self.subTest(failed=failed), patch.object(runtime,'validate_runtime'), \
-                 patch('gcp_worker.identify',return_value={'index':0}), \
-                 patch.object(runtime,'RemoteMailbox'), patch.object(runtime,'_controller_config',return_value={}), \
-                 patch.object(runtime,'make_clients'), patch.object(runtime,'verify_fleet',return_value=[]), \
-                 patch.object(runtime,'admit_live_qualification'), patch.object(runtime,'_put_once'), \
-                 patch.object(cloud_controller,'Controller',return_value=controller), \
-                 patch.object(gcp_sui,'run_suite',return_value={'complete':True}) as sui:
-                if failed:
-                    with self.assertRaisesRegex(RuntimeError,'KV exception'):
-                        runtime.execute_campaign(config,api=api)
-                    sui.assert_not_called()
-                else:
-                    result=runtime.execute_campaign(config,api=api)
-                    self.assertFalse(result['kv']['complete'])
-                    self.assertTrue(result['sui']['complete'])
-                    sui.assert_called_once()
-
-
-class ReviewedContractsRuntimeTests(ReviewedCombinedRuntimeTests):
-    spec_name = 'sui_nvmeof_with_contracts'
-
-
-class CrossingSuiTests(ReviewedCombinedRuntimeTests):
-    spec_name = 'sui_nvmeof_with_contracts_crossing'
-
-
-class Crossing2SuiTests(ReviewedCombinedRuntimeTests):
-    spec_name = 'sui_nvmeof_with_contracts_crossing2'
 
 
 if __name__ == '__main__':

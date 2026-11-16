@@ -791,7 +791,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_f8": {"G32W": 16, "G32H": 8, "G32S": 4, "G32N": 8},
     "nvmeof_m3_t1": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_m3_t2_2": {"G33W": 3, "G33R": 4, "G33M": 1},
-    "nvmeof_m3_t2_5": {"G33W": 4, "G33R": 3, "G33M": 1},
+    "nvmeof_m3_t2_5": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -2073,7 +2073,7 @@ def _nvmeof_m3_owners():
             if job["concurrency"] == 256:
                 return operation == "put" and job["value_size"] == 1024
             if job["concurrency"] == 16 and job["repeat"] == 1:
-                return operation != "put" and job["value_size"] != 65536
+                return False
         return True
     retained_jobs = [job for job in result if retained(job)]
     # Include the 720s campaign/cleanup margin. Keep all o16 cells, the write
@@ -2090,8 +2090,8 @@ def _nvmeof_m3_owners():
             if job["concurrency"] == 64 and (job["mix"]["read"] == 50
                     or job["mix"]["put"] == 100 and job["value_size"] == 1024):
                 continue
-            if (job["concurrency"] == 16 and job["mix"]["read"] == 100
-                    and job["value_size"] == 1024):
+            if (job["concurrency"] == 64 and job["mix"]["put"] == 100
+                    and job["value_size"] == 65536):
                 continue
         # Size only retained cells; the superseded full grid must not shorten
         # the surviving low-rate reads to five-second windows.
@@ -2131,6 +2131,13 @@ def _nvmeof_m3_owners():
                        diagnostics={"read_profile_limit": 1024}, measurement_sizing=sizing,
                        measurement_operations=sizing["measurement_operations"],
                        warmup_operations=sizing["warmup_operations"])
+    # Match the four historical Valkey c16 workloads before diagnostic probes.
+    matched = sorted((job for job in result if job["selection"] == "nvmeof_m3_t2_5"),
+        key=lambda job: (0 if job["concurrency"] == 16 and job["mix"]["read"] == 100 else
+                         1 if job["concurrency"] == 16 and job["mix"]["put"] == 100 else
+                         2 if job["concurrency"] == 16 else 3,
+                         job["concurrency"], job["value_size"], job["coordinator_cache_bytes"]))
+    result = [job for job in result if job["selection"] != "nvmeof_m3_t2_5"] + matched
     for selection in M3_SELECTIONS:
         if sum(job["measurement_sizing"]["expected_archive_bytes"]
                for job in result if job["selection"] == selection) > 3_000_000_000:
@@ -2660,8 +2667,6 @@ def validate_focused_job(job):
     if not isinstance(job, dict):
         raise ValueError("focused job must be an object")
     active_owner_count(job)
-    if job.get("case_kind") == "sui_trace_replay":
-        raise ValueError("Sui trace replay is reserved and not admitted")
     case_id = job.get("case_id")
     if not isinstance(case_id, str):
         raise ValueError("focused case_id is required")
@@ -2677,6 +2682,32 @@ def validate_media_sample_count(media, samples, config):
     successful_reads = analyze.successful_read_keys(samples, config["workload"]["batch_size"])
     if media["successful_reads"] != successful_reads:
         raise ValueError("media successful reads differ from raw samples")
+
+
+def make_owner_admission_config(config, owner_count):
+    """Keep prepared owner authority, but never inherit a measured workload."""
+    keys = 16 * owner_count
+    backend = copy.deepcopy(config["backend"])
+    options = backend["options"]
+    options["coordinator_read_cache_bytes"] = 0
+    options["external_remote_config"].update(read_cache_bytes=0, read_lanes=1,
+                                              pin_read_lanes=False)
+    return {"schema_version": 1, "backend": backend, "seed": 1775,
+        "namespace": "owner-admission",
+        "dataset": {"keys": keys, "value_size": 1024, "entropy": 1.0},
+        "workload": {"distribution": "uniform", "mix": mix(read=100),
+                     "batch_size": 32, "put_key_policy": "overwrite"},
+        "execution": {"mode": "closed_loop", "concurrency": owner_count,
+            "queue_capacity": owner_count, "request_timeout_ms": 10000,
+            "offered_ops_per_second": None},
+        "phases": {"preload": True, "verify_existing_dataset": False,
+            "evict_mapped_wal_before_measurement": False, "warmup_operations": 0,
+            "warmup_key_sweep": False, "measurement_key_sweep": True,
+            "aging_operations": 0, "measurement_operations": keys},
+        "qualification_only": False, "source_revision": config["source_revision"],
+        "limits": {"max_keys": keys, "max_bytes": keys * 1024,
+            "max_operations": 2 * keys, "deadline_seconds": M3_OWNER_ADMISSION_TIMEOUT_SECONDS,
+            "shutdown_grace_seconds": 20}}
 
 
 def make_run_config(job, case_root, options, source_revision, deadline_seconds=180):

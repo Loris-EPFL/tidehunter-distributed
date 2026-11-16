@@ -36,7 +36,7 @@ class MultiOwnerTests(unittest.TestCase):
         jobs = [job for job in self.jobs if job["selection"] == "nvmeof_m3_t2_5"]
         puts = [job for job in jobs if job["mix"]["put"] == 100]
         self.assertEqual({(job["concurrency"], job["value_size"], job["repeat"]) for job in puts},
-                         {(16, 1024, 0), (16, 65536, 0), (64, 65536, 0), (256, 1024, 0)})
+                         {(16, 1024, 0), (16, 65536, 0), (256, 1024, 0)})
         mixed, = [job for job in jobs if job["mix"]["read"] == 50]
         self.assertEqual((mixed["concurrency"], mixed["value_size"]), (16, 1024))
         self.assertTrue(all(job["durability_tier"] == "synchronous" for job in puts))
@@ -44,6 +44,52 @@ class MultiOwnerTests(unittest.TestCase):
         t1 = [job for job in self.jobs if job["selection"] == "nvmeof_m3_t1"]
         self.assertEqual(len(t1), 8)
         self.assertTrue(all(job["owner_count"] == 16 for job in t1))
+
+    def test_valkey_matched_cells_run_before_mixed_and_probes(self):
+        jobs = campaign.make_focused_matrix("nvmeof_m3_t2_5")
+        self.assertEqual([(job["mix"]["read"], job["value_size"]) for job in jobs[:4]],
+                         [(100, 1024), (100, 65536), (0, 1024), (0, 65536)])
+        for job in jobs[:4]:
+            self.assertEqual((job["owner_count"], job["concurrency"], job["keys"], job["distribution"],
+                              job["durability_tier"], job["coordinator_cache_bytes"]),
+                             (5, 16, 4096, "uniform", "synchronous", 0))
+        self.assertEqual(jobs[0]["measurement_sizing"]["measurement_seconds"], 5)
+        self.assertEqual(jobs[4]["mix"]["read"], 50)
+        self.assertEqual([(job["concurrency"], job["coordinator_cache_bytes"]) for job in jobs[5:]],
+                         [(64, 0), (64, 8 * 1024**2), (256, 0)])
+
+    def test_authority_is_removed_only_after_every_owner_stops(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as tmp:
+                instance = object.__new__(controller.Controller)
+                instance.root = Path(tmp)
+                directory = instance.root / "case"
+                database = directory / "database"
+                database.mkdir(parents=True)
+                (database / "authority").write_text("granted epoch 1")
+                job = {"case_id": "case", "selection": "nvmeof_m3_t2_2",
+                       "owner_topology": "separate", "owner_count": 2}
+                instance.active_tide = (job, directory, [0, 1])
+                instance.active_nvme = instance.shared_tide = None
+                instance.tide_cleanup_forbidden = False
+                instance.cleanup_deadline = lambda: 30
+                instance.cleanup_timeout = lambda deadline: 30
+                calls = []
+                def request(index, payload, **kwargs):
+                    self.assertTrue(database.exists())
+                    calls.append(index)
+                    if fail and index == 1:
+                        raise controller.InfrastructureError("owner stop unconfirmed")
+                    return {"stop_command_completed": True}
+                instance.request = request
+                if fail:
+                    with self.assertRaisesRegex(controller.InfrastructureError, "cleanup incomplete"):
+                        instance.stop_tide()
+                    self.assertTrue(database.exists())
+                else:
+                    instance.stop_tide()
+                    self.assertFalse(database.exists())
+                self.assertEqual(sorted(calls), [0, 1])
 
     def test_unreviewed_owner_count_fails_closed(self):
         job = copy.deepcopy(self.jobs[0])
@@ -200,6 +246,30 @@ class MultiOwnerTests(unittest.TestCase):
         self.assertEqual(len(missing['missing']), 16)
         self.assertIn('cannot observe unit', missing['missing'][0]['reason'])
 
+    def test_admission_does_not_inherit_case_workload(self):
+        job = self.jobs[0]
+        options = {'coordinator_read_cache_bytes': 999,
+                   'external_remote_config': {'read_cache_bytes': 999, 'read_lanes': 8,
+                                              'pin_read_lanes': True}}
+        original = campaign.make_run_config(job, Path('/case'), options, 'a' * 40)
+        expected = campaign.make_owner_admission_config(original, job['owner_count'])
+        mutated = copy.deepcopy(original)
+        mutated.update(seed=999, namespace='measured', qualification_only=True,
+                       diagnostics={'read_profile_limit': 512}, interference={'unexpected': True})
+        mutated['dataset'] = {'keys': 999, 'value_size': 65536, 'entropy': 0.1}
+        mutated['workload'] = {'distribution': {'zipf': {'exponent': 0.99}},
+                               'mix': campaign.mix(put=100), 'batch_size': 256, 'put_key_policy': 'new'}
+        mutated['execution'] = {'mode': 'open_loop', 'concurrency': 256}
+        mutated['phases'] = {'preload': False, 'verify_existing_dataset': True,
+            'evict_mapped_wal_before_measurement': True, 'warmup_key_sweep': True,
+            'measurement_key_sweep': False, 'measurement_operations': 999}
+        mutated['limits'] = {'deadline_seconds': 999}
+        self.assertEqual(campaign.make_owner_admission_config(mutated, job['owner_count']), expected)
+        self.assertEqual(original['backend']['options']['external_remote_config']['read_cache_bytes'], 999)
+        self.assertNotIn('measurement_gate', expected)
+        self.assertNotIn('measurement_completion_gate', expected)
+        self.assertNotIn('diagnostics', expected)
+
     def test_short_admission_connects_writes_and_reads_each_slot(self):
         job = next(j for j in self.jobs if j['owner_count'] == 16 and j['owner_topology'] == 'colocated')
         identities = {str(i): {'host_nqn': 'owner-' + str(i), 'host_id': [i + 1] * 16} for i in range(16)}
@@ -220,7 +290,8 @@ class MultiOwnerTests(unittest.TestCase):
             selected = config['backend']['options']
             # Status compares the server's complete immutable partition inventory.
             self.assertEqual(selected['external_remote_config'], {
-                **options['external_remote_config'], 'read_cache_bytes': 0})
+                **options['external_remote_config'], 'read_cache_bytes': 0,
+                'read_lanes': 1, 'pin_read_lanes': False})
             self.assertEqual(selected['external_owner_durability_receipts'],
                              options['external_owner_durability_receipts'])
             self.assertEqual(selected['external_owner_read_config'], options['external_owner_read_config'])
@@ -251,8 +322,10 @@ class MultiOwnerTests(unittest.TestCase):
             self.assertEqual(len(configs), 1)
             self.assertEqual(len(proofs['owners']), 16)
             self.assertTrue(proofs['coordinator_exited'])
-            self.assertTrue(proofs['coordinator_database_removed'])
-            self.assertEqual(proofs['remaining_controllers'], [])
+            self.assertTrue(proofs['coordinator_database_retained'])
+            self.assertEqual(proofs['authority_database'], 'database')
+            self.assertEqual(Path(configs[0]['backend']['options']['path']), root / 'database')
+            self.assertTrue((root / 'database').is_dir())
             self.assertFalse((root / 'owner-admission/database').exists())
             # Grouped transport writes are not the API preload-put population.
             completed_writes = 16
@@ -272,7 +345,7 @@ class MultiOwnerTests(unittest.TestCase):
             failed.mkdir()
             with self.assertRaisesRegex(controller.SafetyError, 'left live controllers'):
                 controller.Controller.admit_logical_owners(instance, job, failed, options)
-            self.assertTrue((failed / 'owner-admission/database').exists())
+            self.assertTrue((failed / 'database').is_dir())
         config = configs[0]
         self.assertFalse(config['qualification_only'])
         self.assertTrue(config['phases']['preload'])
