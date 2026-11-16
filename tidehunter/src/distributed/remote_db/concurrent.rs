@@ -108,6 +108,7 @@ struct Admission {
     max_bytes: usize,
     first_failure: Arc<std::sync::OnceLock<String>>,
     authority: AuthorityCounters,
+    timeline: Arc<WriteTimeline>,
 }
 struct WriteCredit {
     admission: Arc<Admission>,
@@ -115,10 +116,22 @@ struct WriteCredit {
 }
 impl Drop for WriteCredit {
     fn drop(&mut self) {
+        let started = self.admission.timeline.block_started();
         let mut budget = self.admission.budget.lock();
+        self.admission.timeline.block_finished(
+            super::super::write_timeline::WriteBlockStage::CreditReleaseLock,
+            started,
+            budget.requests,
+        );
         budget.requests -= 1;
         budget.bytes -= self.bytes;
+        let started = self.admission.timeline.block_started();
         self.admission.changed.notify_all();
+        self.admission.timeline.block_finished(
+            super::super::write_timeline::WriteBlockStage::CreditNotify,
+            started,
+            budget.requests,
+        );
     }
 }
 
@@ -378,8 +391,14 @@ impl ConcurrentRemoteDatabase {
         self.live_metrics.as_ref().map(|metrics| metrics.snapshot())
     }
 
-    pub(crate) fn arm_write_timeline(&self, limit: usize) -> Result<(), LocalDbError> {
-        self.write_timeline.arm(limit).map_err(LocalDbError::new)?;
+    pub(crate) fn arm_write_timeline(
+        &self,
+        limit: usize,
+        sample_every: usize,
+    ) -> Result<(), LocalDbError> {
+        self.write_timeline
+            .arm(limit, sample_every)
+            .map_err(LocalDbError::new)?;
         if limit == 0 {
             return Ok(());
         }
@@ -591,6 +610,7 @@ impl ConcurrentRemoteDatabase {
             max_bytes: db.config.max_pending_bytes,
             first_failure: db.first_failure.clone(),
             authority: AuthorityCounters::default(),
+            timeline: db.write_timeline.clone(),
         });
         let snapshot = Arc::new(Mutex::new(Snapshot {
             stats: db.stats(),
@@ -866,7 +886,13 @@ impl ConcurrentRemoteDatabase {
             self.write_timeline
                 .event(sample, WriteTimelineStage::AdmissionWaitStarted);
         }
+        let block_started = self.write_timeline.block_started();
         let credit = self.reserve(bytes)?;
+        self.write_timeline.block_finished(
+            super::super::write_timeline::WriteBlockStage::AdmissionCredit,
+            block_started,
+            0,
+        );
         if let Some(sample) = sample {
             self.write_timeline
                 .event(sample, WriteTimelineStage::AdmissionAcquired);
@@ -1275,6 +1301,7 @@ impl Drop for ConcurrentRemoteDatabase {
 }
 
 fn refresh_snapshot(db: &RemoteDatabase, snapshot: &Mutex<Snapshot>) {
+    let block_started = db.write_timeline.block_started();
     *snapshot.lock() = Snapshot {
         stats: db.stats(),
         pipeline: db.pipeline_stats(),
@@ -1282,6 +1309,11 @@ fn refresh_snapshot(db: &RemoteDatabase, snapshot: &Mutex<Snapshot>) {
         metadata_history_bytes: db.metadata_history_bytes(),
         checkpoint_diagnostics: db.checkpoint_diagnostic_summary(),
     };
+    db.write_timeline.block_finished(
+        super::super::write_timeline::WriteBlockStage::Snapshot,
+        block_started,
+        db.submissions.len(),
+    );
 }
 
 #[allow(clippy::needless_pass_by_value)] // Receiver ownership resolves queued replies on every exit.
@@ -1359,7 +1391,13 @@ fn drive_owner(
                         None,
                         None,
                     );
+                    let block_started = db.write_timeline.block_started();
                     reply.finish(Ok(version));
+                    db.write_timeline.block_finished(
+                        super::super::write_timeline::WriteBlockStage::ReplyCreditRelease,
+                        block_started,
+                        pending.len(),
+                    );
                 } else {
                     pending.push_back(reply);
                 }
@@ -1525,7 +1563,13 @@ fn drive_owner(
                         {
                             let started = Instant::now();
                             let before = db.authority_write_stats();
+                            let block_started = db.write_timeline.block_started();
                             let result = db.admit_prepared_with_progress(write.prepared, false);
+                            db.write_timeline.block_finished(
+                                super::super::write_timeline::WriteBlockStage::OrderedAdmission,
+                                block_started,
+                                db.submissions.len(),
+                            );
                             db.record_admission_span(started, before);
                             Some(result)
                         }

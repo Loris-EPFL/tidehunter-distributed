@@ -1370,7 +1370,7 @@ fn leased_checkpoint_tail_workstation() {
             .min(fixture.config.effective_owner_append_occupancy());
         let db = ConcurrentRemoteDatabase::new(fixture.open("C-buf")).unwrap();
         let (samples, elapsed) = if timeline_output.is_some() {
-            db.arm_write_timeline(calls).unwrap();
+            db.arm_write_timeline(calls, 1).unwrap();
             let gate = Barrier::new(17);
             thread::scope(|scope| {
                 let handles: Vec<_> = (0..16)
@@ -1519,4 +1519,194 @@ fn leased_checkpoint_tail_workstation() {
         "checkpoint_tail_workstation_cleanup {}",
         data_path.display()
     );
+}
+
+#[test]
+#[ignore = "explicit four-owner small-put contention diagnosis; not hardware evidence"]
+fn small_put_multiowner_workstation() {
+    let calls = std::env::var("TH_SMALL_PUT_CALLS")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(8192);
+    assert!((256..=262_144).contains(&calls));
+    let output = PathBuf::from(std::env::var_os("TH_SMALL_PUT_OUTPUT").unwrap());
+    fs::create_dir_all(&output).unwrap();
+    let value: Bytes = vec![0x5a; 1024].into();
+    for writers in [16, 256] {
+        let fixture = super::pipeline_tests::Fixture::new_with_root(
+            tempdir::TempDir::new("small-put-multiowner").unwrap(),
+            4,
+            calls + 4096,
+            KeyShape::new_single(32, 1, KeyType::uniform(1)),
+            16,
+            |config| {
+                config.max_pending_batches = 128;
+                config.max_pending_bytes = 64 * MIB;
+                config.max_index_bytes = 256 * MIB;
+                config.read_cache_bytes = 0;
+                config.preparation_workers = 8;
+                config.storage.batch_limits.max_encoded_bytes = 128 * 1024;
+                config.storage.group_limits.max_encoded_bytes = 2 * MIB;
+                config.storage.fragment_bytes = 128 * MIB as u64;
+                config.storage.wal_file_bytes = 256 * MIB as u64;
+                config.storage.max_reference_metadata_bytes = 64 * MIB;
+                config.replay_limits = ReplayLimits {
+                    max_batches: calls + 4096,
+                    max_encoded_bytes: 256 * MIB,
+                };
+                let mut live = live_config(LiveWriteMode::Leased, DurabilityTier::Synchronous);
+                live.leased_write_window = None;
+                live.leased_sync = LeasedSync::GroupFlush;
+                live.leased_flush_min_frame_bytes = 65536;
+                config.live_nvme = Some(live);
+            },
+            |config| StorageNode::open(config, metrics()).unwrap(),
+        )
+        .synchronous();
+        for (owner, node) in fixture.nodes.iter().enumerate() {
+            let root = fixture.temp.path().join(format!("target-{owner}"));
+            let state_dir = root.join("state");
+            let configfs = root.join("configfs");
+            fs::create_dir_all(&state_dir).unwrap();
+            for name in ["hosts", "ports", "subsystems"] {
+                fs::create_dir_all(configfs.join(name)).unwrap();
+            }
+            node.bench_install_live_target(
+                LiveTargetManager::open_fixture(
+                    LiveTargetConfig {
+                        address: "127.0.0.1".into(),
+                        service: 4420 + owner as u16 * 2,
+                        transport: NvmeofTransport::Tcp,
+                        host_nqn: "nqn.2026-01.test:p11-bench".into(),
+                        port_id: 42 + owner as u16 * 2,
+                        state_dir,
+                        commissioning_port_id: 43 + owner as u16 * 2,
+                        commissioning_service: 4421 + owner as u16 * 2,
+                        spdk: None,
+                        export_mode: Default::default(),
+                    },
+                    configfs,
+                )
+                .unwrap(),
+            );
+        }
+        let original = fixture.open();
+        let live = LiveNvmeMetrics::new();
+        for worker in &original.clients {
+            let mut client = worker.client.lock();
+            client.bench_local_live_fixture(true);
+            client.set_live_metrics(live.clone()).unwrap();
+        }
+        let db = ConcurrentRemoteDatabase::new(original).unwrap();
+        // Retain calls across the entire deterministic sequence, not just its
+        // first prefix. Whole-window span counters do not depend on this sample.
+        let stride = calls.div_ceil(512);
+        db.arm_write_timeline(512, stride).unwrap();
+        let gate = Barrier::new(writers + 1);
+        let authority_ticks = || -> u64 {
+            fs::read_dir("/proc/self/task")
+                .unwrap()
+                .take(1024)
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    if fs::read_to_string(path.join("comm")).ok()?.trim() != "wal-write-owner" {
+                        return None;
+                    }
+                    let stat = fs::read_to_string(path.join("stat")).ok()?;
+                    let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+                    Some(fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap())
+                })
+                .sum()
+        };
+        let cpu_ticks_before = authority_ticks();
+        let (samples, elapsed) = thread::scope(|scope| {
+            let handles: Vec<_> = (0..writers)
+                .map(|writer| {
+                    let db = &db;
+                    let value = &value;
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        let mut samples = Vec::with_capacity(calls.div_ceil(writers));
+                        gate.wait();
+                        for sequence in (writer..calls).step_by(writers) {
+                            let began = Instant::now();
+                            let operation = operation(sequence);
+                            let sample = db.write_timeline.begin(sequence as u64);
+                            if let Some(sample) = sample {
+                                db.write_timeline.operation(sample, operation);
+                            }
+                            db.write_batch_traced(operation, vec![put(sequence, value)], sample)
+                                .unwrap();
+                            if let Some(sample) = sample {
+                                db.write_timeline.complete(sample, None);
+                            }
+                            samples.push(began.elapsed().as_nanos() as u64);
+                        }
+                        samples
+                    })
+                })
+                .collect();
+            let began = Instant::now();
+            gate.wait();
+            let samples: Vec<u64> = handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect();
+            (samples, began.elapsed())
+        });
+        let cpu_ticks_after = authority_ticks();
+        let timeline = db
+            .finish_write_timeline_until(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let quantile = |p: usize, scale: usize| sorted[(p * sorted.len()).div_ceil(scale) - 1];
+        let mut counters = json!({});
+        db.visit_write_metrics(|metrics| {
+            counters = json!({
+                "authority_prepare_ns": metrics.authority.authority_prepare_ns,
+                "authority_admit_ns": metrics.authority.authority_admit_ns,
+                "authority_windows": metrics.authority.authority_windows,
+                "authority_batches": metrics.authority.authority_batches,
+                "concurrent_pending_peak": metrics.pipeline.concurrent_pending_peak,
+            });
+        });
+        let row = json!({
+            "owners": 4, "writers": writers, "calls": calls, "value_bytes": 1024,
+            "authority_cpu_ticks": cpu_ticks_after - cpu_ticks_before,
+            "clock_ticks_per_second": command("getconf", &["CLK_TCK"]).trim(),
+            "elapsed_ns": elapsed.as_nanos(), "ops_per_second": calls as f64 / elapsed.as_secs_f64(),
+            "mean_api_inflight": samples.iter().map(|n| *n as u128).sum::<u128>() as f64 / elapsed.as_nanos() as f64,
+            "p50_ns": quantile(50, 100), "p99_ns": quantile(99, 100),
+            "p999_ns": quantile(999, 1000), "api_ns": samples,
+            "live": live.snapshot().counts, "counters": counters, "timeline": timeline,
+            "scope": "one workstation; four owners; mTLS control; local-file io_uring; FUA; not remote hardware decision data"
+        });
+        fs::write(
+            output.join(format!("c{writers}.json")),
+            serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+        println!(
+            "small_put_multiowner {}",
+            json!({
+                "writers": writers, "calls": calls, "ops_per_second": row["ops_per_second"],
+                "p50_ns": row["p50_ns"], "p99_ns": row["p99_ns"], "mean_api_inflight": row["mean_api_inflight"],
+            })
+        );
+        db.flush_durable().unwrap();
+        for sequence in 0..calls {
+            let reference = db
+                .index_reference(KeySpace(0), &key(sequence), IndexReadCut::Latest)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fixture.nodes[reference.batch_address.partition as usize]
+                    .log_for_test(1)
+                    .read_record(&reference)
+                    .unwrap(),
+                put(sequence, &value),
+            );
+        }
+        db.shutdown().unwrap();
+    }
 }

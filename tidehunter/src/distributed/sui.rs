@@ -789,10 +789,13 @@ impl Db {
         Ok(())
     }
     /// Arm request-linked coordinator diagnostics at a quiescent benchmark boundary.
-    pub fn arm_write_timeline(&self, limit: usize) -> Result<()> {
+    pub fn arm_write_timeline(&self, limit: usize, sample_every: usize) -> Result<()> {
         let _gate = self.write_gate();
         match &self.backend {
-            Backend::Remote(remote) => remote.db.arm_write_timeline(limit).map_err(error),
+            Backend::Remote(remote) => remote
+                .db
+                .arm_write_timeline(limit, sample_every)
+                .map_err(error),
             Backend::Native(_) => Err(error("write timeline requires a remote backend")),
         }
     }

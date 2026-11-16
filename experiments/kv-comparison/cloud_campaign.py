@@ -259,15 +259,21 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
         raise ValueError("full campaign requires all three offered rates without duplicates")
     diagnostics = spec.get("diagnostics", {})
     if (not isinstance(diagnostics, dict)
-            or set(diagnostics) - {"write_profile_limit", "read_profile_limit", "write_timeline_limit", "valkey_profile_limit"}
+            or set(diagnostics) - {"write_profile_limit", "read_profile_limit", "write_timeline_limit", "write_timeline_sample_every", "valkey_profile_limit"}
             or ("diagnostics" in spec and not diagnostics)
             or any(type(value) is not int or not 0 <= value <= 65536
-                   for value in diagnostics.values())):
+                   for key, value in diagnostics.items() if key != "write_timeline_sample_every")):
         raise ValueError("diagnostics limits must be integers between 0 and 65536")
+    stride = diagnostics.get("write_timeline_sample_every", 1)
+    if type(stride) is not int or not 1 <= stride <= 1_000_000:
+        raise ValueError("write_timeline_sample_every must be an integer between 1 and 1000000")
+    stride_option = ({"write_timeline_sample_every": stride}
+                     if "write_timeline_sample_every" in diagnostics else {})
     diagnostics = {"write_profile_limit": diagnostics.get("write_profile_limit", 0),
                    "read_profile_limit": diagnostics.get("read_profile_limit", 0),
                    "write_timeline_limit": diagnostics.get("write_timeline_limit", 0),
                    "valkey_profile_limit": diagnostics.get("valkey_profile_limit", 0)}
+    diagnostics.update(stride_option)
     if spec.get("shapes") == "contract_core":
         if spec.get("mode", "standard") not in ("standard", "standard-with-nvmeof", "standard-with-live-nvmeof"):
             raise ValueError("contract_core requires a standard campaign")
@@ -453,7 +459,9 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     if diagnostics["write_timeline_limit"]:
         jobs.extend(job | {"cohort": "write_timeline_diagnostics",
                            "diagnostics": {"write_profile_limit": 0,
-                                           "write_timeline_limit": diagnostics["write_timeline_limit"]}}
+                                           "write_timeline_limit": diagnostics["write_timeline_limit"],
+                                           **({"write_timeline_sample_every": diagnostics["write_timeline_sample_every"]}
+                                              if "write_timeline_sample_every" in diagnostics else {})}}
                     for job in list(jobs) if job["backend"] in TRANSPORTS
                     and job["cohort"] == "primary_rf1"
                     and job["value_size"] == 1024 and job["profile"] == "write-concurrent")
@@ -615,7 +623,9 @@ def make_nvmeof_matrix(spec, backends, diagnostics):
         jobs.extend(job | {"cohort": "write_timeline_diagnostics",
                            "profile": job["profile"].replace("-baseline", "-timeline"),
                            "diagnostics": {"write_profile_limit": 0,
-                                           "write_timeline_limit": diagnostics["write_timeline_limit"]}}
+                                           "write_timeline_limit": diagnostics["write_timeline_limit"],
+                                           **({"write_timeline_sample_every": diagnostics["write_timeline_sample_every"]}
+                                              if "write_timeline_sample_every" in diagnostics else {})}}
                     for job in writes if job["backend"] in TRANSPORTS
                     and ((job["value_size"] == 1024 and job["profile"] == "write-c16-baseline")
                          or (job["value_size"] == 8192 and job["profile"] == "write-batch32-c16-baseline")))

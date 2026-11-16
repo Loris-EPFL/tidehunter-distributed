@@ -1292,7 +1292,7 @@ fn timeline_links_real_tls_wal_receipt_and_keeps_running_after_cap() {
     let fixture = Fixture::new().synchronous();
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     let trace = &db.write_timeline;
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let operation = fixture.operation(1, 901);
     let sample = trace.begin(17).unwrap();
     trace.operation(sample, operation);
@@ -1385,7 +1385,7 @@ fn timeline_links_real_tls_wal_receipt_and_keeps_running_after_cap() {
 fn wait_metrics_reconcile_concurrent_tcp_puts_beyond_timeline_limit() {
     let fixture = Fixture::new().synchronous();
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let gate = std::sync::Barrier::new(4);
     std::thread::scope(|scope| {
         for worker in 0..4 {
@@ -1435,7 +1435,7 @@ fn timeline_preserves_validation_error_without_inventing_batch() {
     let fixture = Fixture::new();
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     let trace = &db.write_timeline;
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let operation = fixture.operation(1, 903);
     let sample = trace.begin(19).unwrap();
     trace.operation(sample, operation);
@@ -1459,7 +1459,7 @@ fn sui_traced_write_exports_correlated_owner_record() {
         fixture.config.clone(),
     )
     .unwrap();
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let mut batch = db.write_batch();
     batch.write(db.ks("root"), 911u32.to_be_bytes().to_vec(), vec![3u8; 32]);
     batch.commit_traced(42).unwrap();
@@ -1495,14 +1495,14 @@ fn sui_timeline_finish_deadline_does_not_wait_for_shared_gate() {
         fixture.config.clone(),
     )
     .unwrap();
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let guard = db.shared_write_gate_for_test();
     assert!(
         db.finish_write_timeline_until(Instant::now() + Duration::from_millis(20))
             .is_err()
     );
     drop(guard);
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     db.finish_write_timeline_until(Instant::now() + Duration::from_secs(5))
         .unwrap();
     db.wait_for_background_threads_to_finish().unwrap();
@@ -1804,7 +1804,7 @@ fn concurrent_scalar_window_duplicate_identity_admits_once() {
 fn concurrent_scalar_window_does_not_move_writes_across_barrier() {
     let fixture = scalar_window_fixture(8);
     let (db, resume) = paused_owner(fixture.open());
-    db.write_timeline.arm(2).unwrap();
+    db.write_timeline.arm(2, 1).unwrap();
     let before = enqueue_window_write(&db, fixture.operation(0, 1), vec![large_put(1)]);
     let (sender, barrier) = mpsc::sync_channel(1);
     assert!(

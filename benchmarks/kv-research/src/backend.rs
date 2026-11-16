@@ -295,7 +295,7 @@ pub trait KvBackend: Send + Sync + 'static {
     }
 
     /// Independent, bounded request-linked measurement timeline.
-    fn arm_write_timeline(&self, limit: usize) -> BackendResult<()> {
+    fn arm_write_timeline(&self, limit: usize, _sample_every: usize) -> BackendResult<()> {
         if limit == 0 {
             Ok(())
         } else {

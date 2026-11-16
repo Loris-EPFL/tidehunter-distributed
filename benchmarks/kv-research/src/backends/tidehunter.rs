@@ -2100,12 +2100,13 @@ impl KvBackend for TidehunterBackend {
         Ok(evidence)
     }
 
-    fn arm_write_timeline(&self, limit: usize) -> BackendResult<()> {
+    fn arm_write_timeline(&self, limit: usize, sample_every: usize) -> BackendResult<()> {
         let db = self
             .db
             .as_ref()
             .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
-        db.arm_write_timeline(limit).map_err(native_error)
+        db.arm_write_timeline(limit, sample_every)
+            .map_err(native_error)
     }
 
     fn finish_write_timeline(

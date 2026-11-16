@@ -2034,7 +2034,9 @@ impl RemoteDatabase {
             expected_connections: clients.len(),
             ..WriteProfileSnapshot::default()
         }));
-        let write_timeline = Arc::new(WriteTimeline::default());
+        let write_timeline = Arc::new(WriteTimeline::with_owners(
+            config.endpoints.iter().map(|endpoint| endpoint.partition),
+        ));
         let concurrent_failure = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first_failure = Arc::new(std::sync::OnceLock::new());
         let (wake_sender, completion_wake) = mpsc::sync_channel(clients.len());
@@ -2454,6 +2456,7 @@ impl RemoteDatabase {
         if let Some(identity) = self.recent_ids.get(&id) {
             return Ok(Some(*identity));
         }
+        let block_started = self.write_timeline.block_started();
         if let Some(receipt) = self
             .receipt_history
             .as_ref()
@@ -2475,6 +2478,11 @@ impl RemoteDatabase {
         {
             return Ok(Some((receipt.version(), receipt.digest())));
         }
+        self.write_timeline.block_finished(
+            super::write_timeline::WriteBlockStage::IdentityLookup,
+            block_started,
+            self.known.len(),
+        );
         Ok(self.active_identities.get(&id).map(|i| {
             let batch = self.submissions[*i - self.submission_base as usize]
                 .batch
@@ -2983,7 +2991,13 @@ impl RemoteDatabase {
             // between the preflight and the growth; the growth then reports
             // `Capacity` before any WAL effect, and an already grown reservation
             // only holds more headroom for later admissions.
+            let block_started = self.write_timeline.block_started();
             let index = self.index.writer();
+            self.write_timeline.block_finished(
+                super::write_timeline::WriteBlockStage::AdmissionIndexLock,
+                block_started,
+                self.submissions.len(),
+            );
             let exclusive = Instant::now();
             index
                 .check_publication_view_capacity(additional)
@@ -3234,10 +3248,22 @@ impl RemoteDatabase {
     }
 
     fn progress_pipeline(&mut self, flush_tails: bool) -> Result<(), LocalDbError> {
+        let block_started = self.write_timeline.block_started();
         self.healthy = false;
         let result = (|| {
             self.completed_nodes.fill(false);
             for node in 0..self.inflight.len() {
+                let owner = self.config.endpoints[node].partition;
+                self.write_timeline.owner_queue(
+                    owner,
+                    super::write_timeline::WriteOwnerQueue::AuthorityStaged,
+                    self.staged[node].len(),
+                );
+                self.write_timeline.owner_queue(
+                    owner,
+                    super::write_timeline::WriteOwnerQueue::AuthorityOutstanding,
+                    self.inflight[node].len(),
+                );
                 let mut position = 0;
                 while position < self.inflight[node].len() {
                     let pending = &self.inflight[node][position];
@@ -3391,6 +3417,7 @@ impl RemoteDatabase {
                         }
                     }
                     let first = batches[0].version();
+                    let send_started = self.write_timeline.block_started();
                     let reply = match self.clients[node].append(self.epoch, batches) {
                         Ok(reply) => reply,
                         Err(error) => {
@@ -3398,6 +3425,11 @@ impl RemoteDatabase {
                             return Err(LocalDbError::unknown(first, error));
                         }
                     };
+                    self.write_timeline.block_finished(
+                        super::write_timeline::WriteBlockStage::AppendSend,
+                        send_started,
+                        self.inflight[node].len(),
+                    );
                     self.inflight_bytes[node] += charge;
                     self.inflight[node].push_back(PendingAppend {
                         first,
@@ -3446,6 +3478,11 @@ impl RemoteDatabase {
                 self.start_checkpoint()?;
             }
         }
+        self.write_timeline.block_finished(
+            super::write_timeline::WriteBlockStage::Progress,
+            block_started,
+            self.submissions.len(),
+        );
         result
     }
 
@@ -3459,7 +3496,13 @@ impl RemoteDatabase {
         let submissions = &mut self.submissions;
         let submission_base = self.submission_base;
         let mut contiguous_next = self.publication.published_prefix().next_sequence();
+        let block_started = self.write_timeline.block_started();
         let mut index_guard = self.index.writer();
+        self.write_timeline.block_finished(
+            super::write_timeline::WriteBlockStage::PublicationIndexLock,
+            block_started,
+            submissions.len(),
+        );
         let _poison = concurrent::FailureOnPanic(self.concurrent_failure.clone());
         let index = &mut index_guard;
         let known = &mut self.known;
@@ -5505,8 +5548,18 @@ impl ClientWorker {
                             Err(mpsc::TryRecvError::Disconnected) => disconnected = true,
                         }
                     }
+                    write_timeline.owner_queue(
+                        partition,
+                        super::write_timeline::WriteOwnerQueue::WorkerQueued,
+                        queued.len(),
+                    );
                     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if client.live_leased_mode() {
+                        write_timeline.owner_queue(
+                            partition,
+                            super::write_timeline::WriteOwnerQueue::LeasedFlights,
+                            client.leased_flights_in_flight(),
+                        );
                         // Acquire observes authority failure before another control
                         // exchange or write can be admitted by this worker.
                         if failure.load(std::sync::atomic::Ordering::Acquire) {
