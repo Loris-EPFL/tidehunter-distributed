@@ -22,6 +22,15 @@ from local_dry_run import LocalMode, LocalObjects, save_json
 
 
 class MultiownerMode(LocalMode):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.prewrite_receipts = {}
+
+    def stop_owner(self, index, request, case):
+        proof = super().stop_owner(index, request, case)
+        self.prewrite_receipts[index] = proof.get('live_target_shutdown', {}).get('preparation', {})
+        return proof
+
     def request(self, index, request, *, case, timeout, export):
         if request['action'] == 'tide_slice_cleanup':
             return cloud.cleanup_owner_slice(self.config, case, index)
@@ -35,6 +44,15 @@ class MultiownerMode(LocalMode):
         proof['slice_observed'] = cloud.command(['systemctl', 'show', name,
             '--property=Slice,ControlGroup,MemoryMax,CPUQuotaPerSecUSec'], timeout=10)
         return proof
+
+
+def validate_prewrite_receipts(receipts, owners):
+    if set(receipts) != set(range(owners)):
+        raise ValueError('wal-prewrite requires preparation evidence from every owner')
+    for owner, receipt in receipts.items():
+        for field in ('wal_prewrite_bytes', 'wal_prewrite_ns', 'wal_prewrite_files'):
+            if type(receipt.get(field)) is not int or receipt[field] <= 0:
+                raise ValueError(f'wal-prewrite owner {owner} has no positive {field} evidence')
 
 
 def capture_kernel_log(path, errors):
@@ -84,6 +102,8 @@ def main():
     parser.add_argument('--libs', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--owners', type=int, choices=(4, 16), default=16)
+    parser.add_argument('--wal-prewrite', action='store_true',
+                        help='pre-write and sync owner WAL files before grants')
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise SystemExit('requires the privileged host namespace wrapper')
@@ -115,6 +135,7 @@ def main():
     now = datetime.now(timezone.utc)
     config = {'prefix': token, 'binary': str(binary), 'binary_sha256': cloud.digest(binary),
               'source_revision': 'local-functional-unsealed',
+              'wal_prewrite': args.wal_prewrite,
               'repository_root': str(Path(__file__).resolve().parents[2]),
               'fdb_library_dir': str(libs), 'deadline_utc': (now + timedelta(seconds=600)).isoformat(),
               'fleet': {'run_id': token, 'data_root': str(fixture),
@@ -138,6 +159,7 @@ def main():
                 'binary': str(binary), 'binary_sha256': cloud.digest(binary),
                 'route': 'kernel NVMe/TCP leased FUA writes; buffered kernel target reads; TCP/TLS control',
                 'owner_count': args.owners, 'complete': False, 'cleanup_complete': False,
+                'wal_prewrite': args.wal_prewrite,
                 'fixture': str(fixture), 'errors': []}
     save_json(output / 'input.json', {'config': config, 'job': job})
     kernel_before = capture_kernel_log(output / 'dmesg-before.txt', evidence['errors'])
@@ -195,6 +217,13 @@ def main():
             evidence['cleanup_complete'] = True
         except Exception:
             evidence['errors'].append(traceback.format_exc())
+        if args.wal_prewrite:
+            evidence['wal_prewrite_owners'] = mode.prewrite_receipts
+            try:
+                validate_prewrite_receipts(mode.prewrite_receipts, args.owners)
+            except ValueError as error:
+                evidence['complete'] = False
+                evidence['errors'].append(str(error))
         kernel_after = capture_kernel_log(output / 'dmesg-after.txt', evidence['errors'])
         kernel = kernel_log_interval(kernel_before, kernel_after)
         evidence['kernel_log'] = {'before': 'dmesg-before.txt', 'after': 'dmesg-after.txt', **kernel}

@@ -173,6 +173,7 @@ pub(super) fn config(root: &Path) -> NodeConfig {
         },
         read_workers: Some(2),
         wal_member_read: Default::default(),
+        wal_prewrite: false,
         read_resident_first: false,
         read_memory_allowance_bytes: default_read_memory_allowance_bytes(),
         read_max_inflight_requests: default_read_requests(),
@@ -1503,4 +1504,20 @@ fn memory_only_owner_rpc_accepts_4096_puts_and_checkpoint() {
     drop(client);
     shutdown.store(true, Ordering::Release);
     server_thread.join().unwrap();
+}
+
+#[test]
+fn node_wal_prewrite_defaults_off_and_round_trips() {
+    let temp = tempdir::TempDir::new("node-wal-prewrite").unwrap();
+    let config = config(temp.path());
+    let mut value = serde_yaml::to_value(&config).unwrap();
+    value.as_mapping_mut().unwrap().remove("wal_prewrite");
+    let restored: NodeConfig = serde_yaml::from_value(value).unwrap();
+    assert!(!restored.wal_prewrite);
+    let mut enabled = restored;
+    enabled.wal_prewrite = true;
+    enabled.validate().unwrap();
+    let restored: NodeConfig =
+        serde_yaml::from_str(&serde_yaml::to_string(&enabled).unwrap()).unwrap();
+    assert!(restored.wal_prewrite);
 }

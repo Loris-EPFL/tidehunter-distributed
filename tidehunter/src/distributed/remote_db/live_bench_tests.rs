@@ -195,6 +195,7 @@ impl Fixture {
                 max_epochs: 8,
                 read_workers: Some(1),
                 wal_member_read: Default::default(),
+                wal_prewrite: false,
                 read_resident_first: false,
                 read_memory_allowance_bytes: 128 * MIB,
                 read_max_inflight_requests: 64,

@@ -102,6 +102,13 @@ pub struct NodeInventory {
     pub(super) live_target: Option<super::super::nvmeof::live_target::LiveTargetManager>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_shutdown: bool,
+    // Keep preparation costs when fencing replaces an active log with recovery.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    retired_prewrite_bytes: u64,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    retired_prewrite_ns: u64,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    retired_prewrite_files: u64,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_bindings: BTreeMap<
         (u64, u64),
@@ -577,6 +584,12 @@ impl NodeInventory {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_shutdown: false,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            retired_prewrite_bytes: 0,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            retired_prewrite_ns: 0,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            retired_prewrite_files: 0,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_bindings: BTreeMap::new(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             idle_history_exports: std::collections::VecDeque::new(),
@@ -789,6 +802,16 @@ impl NodeInventory {
                         "old live stream still has outstanding handles; reopen required",
                     ));
                 }
+                let preparation = previous.live_file_preparation_stats();
+                self.retired_prewrite_bytes = self
+                    .retired_prewrite_bytes
+                    .saturating_add(preparation.live_file_prewrite_bytes);
+                self.retired_prewrite_ns = self
+                    .retired_prewrite_ns
+                    .saturating_add(preparation.live_file_prewrite_ns);
+                self.retired_prewrite_files = self
+                    .retired_prewrite_files
+                    .saturating_add(preparation.live_file_prewrite_files);
                 drop(previous);
                 let path = epoch_path(&self.config.root, old.epoch);
                 let expected = partition_at(&self.config.partition, old.epoch);
@@ -827,11 +850,12 @@ impl NodeInventory {
         persist(&self.config.root, &self.manifest)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let log = if self.live_target.is_some() {
-            PartitionLog::create_live(
+            PartitionLog::create_live_with_prewrite(
                 &epoch_path(&self.config.root, epoch),
                 partition_at(&self.config.partition, epoch),
                 &self.shape,
                 self.metrics.clone(),
+                self.config.wal_prewrite,
             )
         } else {
             PartitionLog::create(
@@ -1382,6 +1406,20 @@ impl NodeInventory {
             self.seal(epoch)?;
         }
         self.finish_target_shutdown()
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn wal_prewrite_stats(&self) -> (u64, u64, u64) {
+        let mut bytes = self.retired_prewrite_bytes;
+        let mut ns = self.retired_prewrite_ns;
+        let mut files = self.retired_prewrite_files;
+        for log in self.logs.values() {
+            let preparation = log.live_file_preparation_stats();
+            bytes = bytes.saturating_add(preparation.live_file_prewrite_bytes);
+            ns = ns.saturating_add(preparation.live_file_prewrite_ns);
+            files = files.saturating_add(preparation.live_file_prewrite_files);
+        }
+        (bytes, ns, files)
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

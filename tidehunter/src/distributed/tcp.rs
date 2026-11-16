@@ -162,6 +162,9 @@ pub struct NodeConfig {
     pub read_workers: Option<usize>,
     #[serde(default = "default_async_read_policy")]
     pub wal_member_read: super::storage::WalMemberReadPolicy,
+    /// Write and sync zeros across each external WAL file before it is usable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wal_prewrite: bool,
     /// Opt-in NOWAIT prefix reads; compare with forced-async on the target host.
     #[serde(default)]
     pub read_resident_first: bool,
@@ -1069,6 +1072,21 @@ impl StorageNode {
             Ok(None)
         }
     }
+
+    /// Owner-process preparation totals (bytes, nanoseconds, completed files),
+    /// including streams replaced by fencing. Not part of the wire protocol.
+    pub fn wal_prewrite_stats(&self) -> (u64, u64, u64) {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            self.inventory.lock().wal_prewrite_stats()
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            // These builds cannot prepare or grant external NVMe-oF WAL files.
+            (0, 0, 0)
+        }
+    }
+
     /// Enable local maintenance diagnostics for current and later epochs.
     /// This does not change the wire protocol or enable per-write clocks.
     pub fn set_history_maintenance_diagnostics(&self, enabled: bool) {

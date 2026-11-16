@@ -188,6 +188,7 @@ pub fn prepare_external_case_with_durability(
                 max_epochs: storage.max_epochs,
                 read_workers,
                 wal_member_read,
+                wal_prewrite: false,
                 read_resident_first,
                 read_memory_allowance_bytes,
                 read_max_inflight_requests: 32,
@@ -623,6 +624,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             .and_then(|(_, fields)| fields.split_whitespace().nth(19))
             .ok_or_else(|| io::Error::other("missing process start time"))?
             .parse::<u64>()?;
+        let (wal_prewrite_bytes, wal_prewrite_ns, wal_prewrite_files) = node.wal_prewrite_stats();
         let mut proof = serde_json::json!({
             "schema_version": 1,
             "scope": scope,
@@ -632,6 +634,11 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             "process_id": std::process::id(),
             "process_start_ticks": process_start_ticks,
             "target": target,
+            "preparation": {
+                "wal_prewrite_bytes": wal_prewrite_bytes,
+                "wal_prewrite_ns": wal_prewrite_ns,
+                "wal_prewrite_files": wal_prewrite_files,
+            },
             "serve_error": result.as_ref().err().map(ToString::to_string),
             "cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
         });
@@ -963,6 +970,7 @@ impl LoopbackCluster {
                     max_epochs: storage.max_epochs,
                     read_workers: Some(read_workers),
                     wal_member_read,
+                    wal_prewrite: false,
                     read_resident_first,
                     read_memory_allowance_bytes,
                     read_max_inflight_requests: 32,

@@ -790,6 +790,28 @@ mod live_fencing {
         (config, node)
     }
 
+    #[test]
+    fn prewrite_shutdown_diagnostics_include_fenced_streams() {
+        let temp = tempdir::TempDir::new("prewrite-shutdown-diagnostics").unwrap();
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
+        assert_eq!(node.wal_prewrite_stats(), (0, 0, 0));
+        node.inventory.lock().config.wal_prewrite = true;
+        fence(&node, 2).unwrap();
+        let first = node.wal_prewrite_stats();
+        assert!(first.0 >= config.partition.wal_file_bytes);
+        assert!(first.1 > 0);
+        assert!(first.2 > 0);
+        // Fencing drops the original log and recovers a new sealed handle.
+        // Costs from that original handle must remain in the owner receipt.
+        fence(&node, 3).unwrap();
+        node.finish_live_target_shutdown().unwrap();
+        let final_stats = node.wal_prewrite_stats();
+        assert!(final_stats.0 >= first.0 + config.partition.wal_file_bytes);
+        assert!(final_stats.1 > first.1);
+        assert!(final_stats.2 > first.2);
+        assert_eq!(node.wal_prewrite_stats(), final_stats);
+    }
+
     fn wait_prepared(log: &crate::distributed::storage::PartitionLog, published: u64) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

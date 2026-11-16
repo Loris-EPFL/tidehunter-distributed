@@ -159,6 +159,7 @@ impl Fixture {
                 max_epochs: config.storage.max_epochs,
                 read_workers: Some(2),
                 wal_member_read: Default::default(),
+                wal_prewrite: false,
                 read_resident_first: false,
                 read_memory_allowance_bytes: 512 * 1024 * 1024,
                 read_max_inflight_requests: 32,

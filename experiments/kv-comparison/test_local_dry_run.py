@@ -8,6 +8,49 @@ import local_dry_run
 import cloud_controller
 
 
+
+class OwnerPrewriteTests(unittest.TestCase):
+    def test_prewrite_proof_requires_positive_cost_for_every_owner(self):
+        from local_multiowner_check import validate_prewrite_receipts
+        valid = {owner: {"wal_prewrite_bytes": 8192, "wal_prewrite_ns": 1, "wal_prewrite_files": 1}
+                 for owner in range(4)}
+        validate_prewrite_receipts(valid, 4)
+        with self.assertRaisesRegex(ValueError, "every owner"):
+            validate_prewrite_receipts({0: valid[0]}, 4)
+        for field in ("wal_prewrite_bytes", "wal_prewrite_ns", "wal_prewrite_files"):
+            for missing in (None, 0, -1, True):
+                invalid = copy.deepcopy(valid)
+                invalid[0][field] = missing
+                with self.subTest(field=field, value=missing), \
+                        self.assertRaisesRegex(ValueError, field):
+                    validate_prewrite_receipts(invalid, 4)
+
+    def test_local_owner_receives_prewrite_flag_before_validation(self):
+        import yaml
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temporary:
+                mode = object.__new__(local_dry_run.LocalMode)
+                mode.fixture = Path(temporary)
+                mode.config = {"prefix": "owned", "wal_prewrite": enabled}
+                mode.controller = mock.Mock()
+                mode.cloud = mock.Mock()
+                mode.cloud.digest.return_value = "digest"
+                mode.cloud.download_object.side_effect = (
+                    lambda clients, config, key, destination: destination.touch())
+                def extract(archive, guest, files):
+                    guest.mkdir()
+                    (guest / "launch.yaml").write_text(yaml.safe_dump({"node": {}}))
+                mode.cloud.safe_extract_capsule.side_effect = extract
+                mode.cloud.validate_launch.side_effect = RuntimeError("stop before launch")
+                request = {"case_id": "case", "key": "owned/deploy/cells/case/storage-0.tar.gz",
+                           "sha256": "digest", "files": []}
+                with self.assertRaisesRegex(RuntimeError, "stop before launch"):
+                    mode.start_owner(0, request, "case", 10)
+                launch = mode.cloud.validate_launch.call_args.args[1]
+                self.assertEqual(launch["node"].get("wal_prewrite", False), enabled)
+                saved = yaml.safe_load((mode.fixture / "cells/case/node-0/launch.yaml").read_text())
+                self.assertEqual(saved, launch)
+
 class OperationScalingTests(unittest.TestCase):
     def test_layout_inventory_does_not_own_local_client_lifecycle(self):
         mode = object.__new__(local_dry_run.LocalMode)

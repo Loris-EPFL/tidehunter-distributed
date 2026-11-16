@@ -1,5 +1,7 @@
 // Submodules
 pub(crate) mod allocator;
+#[cfg(feature = "experimental-nvmeof")]
+mod external;
 pub(crate) mod files;
 pub mod layout;
 mod mapper;
@@ -54,6 +56,8 @@ pub struct Wal {
     background_health: Arc<BackgroundHealth>,
     #[cfg(feature = "experimental-distributed")]
     retained: bool,
+    #[cfg(feature = "experimental-nvmeof")]
+    external_preparation: Arc<external::ExternalPreparation>,
 }
 
 /// Sampled native benchmark barrier work, not isolated device latency.
@@ -379,8 +383,47 @@ impl Wal {
         metrics: Arc<Metrics>,
         background_health: Arc<BackgroundHealth>,
     ) -> io::Result<Arc<Self>> {
+        Self::open_inner(
+            base_path,
+            layout,
+            metrics,
+            background_health,
+            #[cfg(feature = "experimental-nvmeof")]
+            false,
+        )
+    }
+
+    /// Only newly created owner streams use this entry point. Recovery opens
+    /// retained WALs instead: it must never zero acknowledged historical bytes.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn open_external_prewrite(
+        base_path: &Path,
+        layout: WalLayout,
+        metrics: Arc<Metrics>,
+    ) -> io::Result<Arc<Self>> {
+        Self::open_inner(base_path, layout, metrics, Arc::default(), true)
+    }
+
+    fn open_inner(
+        base_path: &Path,
+        layout: WalLayout,
+        metrics: Arc<Metrics>,
+        background_health: Arc<BackgroundHealth>,
+        #[cfg(feature = "experimental-nvmeof")] prewrite: bool,
+    ) -> io::Result<Arc<Self>> {
         layout.assert_layout();
         let files = WalFiles::new(base_path, &layout)?;
+        #[cfg(feature = "experimental-nvmeof")]
+        let external_preparation = {
+            let preparation = Arc::new(external::ExternalPreparation::new(prewrite));
+            if prewrite {
+                let registry = files.load();
+                for (&id, file) in &registry.files {
+                    preparation.prepare(file, id, layout.wal_file_size, &mut Vec::new())?;
+                }
+            }
+            preparation
+        };
         let wal = Wal {
             files,
             layout,
@@ -389,6 +432,8 @@ impl Wal {
             background_health,
             #[cfg(feature = "experimental-distributed")]
             retained: false,
+            #[cfg(feature = "experimental-nvmeof")]
+            external_preparation,
         };
         Ok(Arc::new(wal))
     }
@@ -411,7 +456,14 @@ impl Wal {
             metrics,
             background_health: Arc::default(),
             retained: true,
+            #[cfg(feature = "experimental-nvmeof")]
+            external_preparation: Arc::new(external::ExternalPreparation::new(false)),
         }))
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn external_prewrite_stats(&self) -> (u64, u64, u64) {
+        self.external_preparation.stats()
     }
 
     fn is_retained(&self) -> bool {
@@ -1181,6 +1233,8 @@ impl WalIterator {
             syncer,
             self.wal.metrics.clone(),
             self.wal.background_health.clone(),
+            #[cfg(feature = "experimental-nvmeof")]
+            self.wal.external_preparation.clone(),
         );
         // The writer doesn't use `self.map` directly — it looks up the
         // correct map via `get_writeable_map` against `self.wal.maps`,

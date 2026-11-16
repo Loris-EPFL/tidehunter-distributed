@@ -145,6 +145,7 @@ fn fixture(
                 max_epochs: 4,
                 read_workers: Some(2),
                 wal_member_read: Default::default(),
+                wal_prewrite: false,
                 read_resident_first: false,
                 read_memory_allowance_bytes: 134217728,
                 read_max_inflight_requests: 64,

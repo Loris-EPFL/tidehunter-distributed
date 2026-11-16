@@ -1,3 +1,5 @@
+#[cfg(feature = "experimental-nvmeof")]
+use super::external::ExternalPreparation;
 use super::layout::WalLayout;
 use super::position::{MapId, WalFileId};
 use super::tracking_mmap::TrackingMMapMut;
@@ -10,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 #[cfg(feature = "experimental-nvmeof")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
@@ -35,7 +37,7 @@ pub(crate) struct WalMapper {
     jh: Option<JoinHandle<()>>,
     sender: Option<mpsc::SyncSender<WalMapperMessage>>,
     #[cfg(feature = "experimental-nvmeof")]
-    external_preallocated: Arc<AtomicU64>,
+    external_preparation: Arc<ExternalPreparation>,
     #[cfg(feature = "experimental-nvmeof")]
     files: Arc<ArcSwap<WalFiles>>,
 }
@@ -46,7 +48,7 @@ pub(crate) struct WalMapper {
 #[derive(Clone)]
 pub(crate) struct ExternalFilePreparer {
     sender: mpsc::SyncSender<WalMapperMessage>,
-    external_preallocated: Arc<AtomicU64>,
+    external_preparation: Arc<ExternalPreparation>,
     files: Arc<ArcSwap<WalFiles>>,
 }
 
@@ -57,7 +59,7 @@ impl ExternalFilePreparer {
         // Acquire pairs with the mapper's Release after allocation. An existing
         // id is never replaced (with_file rejects collisions), and
         // extend_to_map_id only grows files. Deleted ids must use the fallback.
-        self.external_preallocated.load(Ordering::Acquire) > id.0
+        self.external_preparation.ready.load(Ordering::Acquire) > id.0
             && self.files.load().get_checked(id).is_some()
     }
 
@@ -96,7 +98,9 @@ struct WalMapperThread {
     metrics: Arc<Metrics>,
     unlinker: UnlinkWorker,
     #[cfg(feature = "experimental-nvmeof")]
-    external_preallocated: Arc<AtomicU64>,
+    external_preparation: Arc<ExternalPreparation>,
+    #[cfg(feature = "experimental-nvmeof")]
+    prewrite_buffer: Vec<u8>,
     #[cfg(all(test, feature = "experimental-nvmeof"))]
     map_pause: Option<(MapId, mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
 }
@@ -216,13 +220,14 @@ pub struct WalMaps {
 }
 
 impl WalMapper {
-    pub fn start(
+    pub(super) fn start(
         maps_arc: Arc<ArcSwap<WalMaps>>,
         files: Arc<ArcSwap<WalFiles>>,
         layout: WalLayout,
         syncer: WalSyncer,
         metrics: Arc<Metrics>,
         health: Arc<BackgroundHealth>,
+        #[cfg(feature = "experimental-nvmeof")] external_preparation: Arc<ExternalPreparation>,
     ) -> Self {
         let maps = maps_arc.load();
         assert!(
@@ -241,8 +246,6 @@ impl WalMapper {
         let this_files = files.clone();
         let (sender, receiver) = mpsc::sync_channel(5);
         let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name(), health.clone());
-        #[cfg(feature = "experimental-nvmeof")]
-        let external_preallocated = Arc::new(AtomicU64::new(0));
         let this = WalMapperThread {
             maps,
             maps_arc,
@@ -253,13 +256,24 @@ impl WalMapper {
             syncer,
             unlinker,
             #[cfg(feature = "experimental-nvmeof")]
-            external_preallocated: external_preallocated.clone(),
+            external_preparation: external_preparation.clone(),
+            #[cfg(feature = "experimental-nvmeof")]
+            prewrite_buffer: Vec::new(),
             #[cfg(all(test, feature = "experimental-nvmeof"))]
             map_pause: None,
         };
         let jh = thread::Builder::new()
             .name("wal-mapper".to_string())
-            .spawn(move || health.run(BackgroundThread::WalMapper, || this.run()))
+            .spawn(move || {
+                health.run(BackgroundThread::WalMapper, || {
+                    if let Err(error) = this.run() {
+                        health.record_error(
+                            BackgroundThread::WalMapper,
+                            &crate::db::DbError::Io(error),
+                        );
+                    }
+                });
+            })
             .expect("failed to start wal-mapper thread");
         let sender = Some(sender);
         let jh = Some(jh);
@@ -267,7 +281,7 @@ impl WalMapper {
             jh,
             sender,
             #[cfg(feature = "experimental-nvmeof")]
-            external_preallocated,
+            external_preparation,
             #[cfg(feature = "experimental-nvmeof")]
             files: this_files,
         }
@@ -291,7 +305,7 @@ impl WalMapper {
                 jh: None,
                 sender: Some(sender),
                 #[cfg(feature = "experimental-nvmeof")]
-                external_preallocated: Arc::new(AtomicU64::new(0)),
+                external_preparation: Arc::new(ExternalPreparation::new(false)),
                 #[cfg(feature = "experimental-nvmeof")]
                 files: Arc::new(ArcSwap::from_pointee(WalFiles {
                     base_path: PathBuf::new(),
@@ -347,7 +361,7 @@ impl WalMapper {
     pub(crate) fn external_file_preparer(&self) -> ExternalFilePreparer {
         ExternalFilePreparer {
             sender: self.sender.as_ref().expect("WAL mapper dropped").clone(),
-            external_preallocated: self.external_preallocated.clone(),
+            external_preparation: self.external_preparation.clone(),
             files: self.files.clone(),
         }
     }
@@ -368,7 +382,7 @@ impl Drop for WalMapper {
 }
 
 impl WalMapperThread {
-    pub fn run(mut self) {
+    pub fn run(mut self) -> std::io::Result<()> {
         let mut map_id = *self
             .maps
             .maps
@@ -377,7 +391,7 @@ impl WalMapperThread {
             .0;
         for _ in 0..INITIAL_MAPS_BUFFER {
             map_id = map_id.next_map();
-            self.make_map(map_id);
+            self.make_map(map_id)?;
         }
         while let Ok(message) = self.receiver.recv() {
             let _timer = self.metrics.wal_mapper_time_mcs.clone().mcs_timer();
@@ -407,7 +421,7 @@ impl WalMapperThread {
                         self.layout.map_range(map_to_sync_id).end,
                     );
                     map_id = map_id.next_map();
-                    self.make_map(map_id);
+                    self.make_map(map_id)?;
                 }
                 WalMapperMessage::MinWalPositionUpdated(watermark, _cb) => {
                     self.min_wal_position_updated(watermark);
@@ -429,12 +443,13 @@ impl WalMapperThread {
                 }
             }
         }
+        Ok(())
     }
 
     #[cfg(feature = "experimental-nvmeof")]
     fn ensure_external_file(&mut self, id: WalFileId) -> std::io::Result<()> {
         // Relaxed is sufficient on the sole writer; readers use Acquire below.
-        if self.external_preallocated.load(Ordering::Relaxed) > id.0
+        if self.external_preparation.ready.load(Ordering::Relaxed) > id.0
             && self.files.load().get_checked(id).is_some()
         {
             return Ok(());
@@ -450,37 +465,12 @@ impl WalMapperThread {
         let file = files
             .get_checked(id)
             .ok_or_else(|| std::io::Error::other("WAL file missing"))?;
-        let len = self.layout.wal_file_size;
-        if len == 0 || len > i64::MAX as u64 || file.metadata()?.len() > len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid external WAL file size",
-            ));
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: file owns a valid descriptor for the duration of the call;
-            // the checked nonnegative range fits off_t. The mapper serializes
-            // this operation with its own fragment extension and file removal.
-            let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
-            if result != 0 {
-                return Err(std::io::Error::from_raw_os_error(result));
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "live NVMe-oF requires Linux",
-        ));
-        #[cfg(target_os = "linux")]
-        {
-            // Release publishes the registry entry and successful allocation to
-            // external request handles. File ids increase on this sole writer.
-            self.external_preallocated
-                .fetch_max(id.0 + 1, Ordering::Release);
-            Ok(())
-        }
+        self.external_preparation.prepare(
+            file,
+            id,
+            self.layout.wal_file_size,
+            &mut self.prewrite_buffer,
+        )
     }
 
     /// Delete files forming a prefix below `watermark`.
@@ -565,7 +555,7 @@ impl WalMapperThread {
         // with writeable maps were filtered out.
     }
 
-    fn make_map(&mut self, map_id: MapId) {
+    fn make_map(&mut self, map_id: MapId) -> std::io::Result<()> {
         #[cfg(all(test, feature = "experimental-nvmeof"))]
         if self
             .map_pause
@@ -581,14 +571,21 @@ impl WalMapperThread {
         if file_id > files.current_file_id() {
             assert_eq!(file_id, WalFileId(files.current_file_id().0 + 1));
             let new_file_path = self.layout.wal_file_name(&files.base_path, file_id);
-            let new_file = Wal::open_file(&new_file_path, &self.layout)
-                .expect("Failed to create new wal file");
+            let new_file = Wal::open_file(&new_file_path, &self.layout)?;
             let new_wal_files = files.with_file(file_id, Arc::new(new_file));
             self.files.store(Arc::new(new_wal_files));
             files = self.files.load();
         }
+        #[cfg(feature = "experimental-nvmeof")]
+        if self.external_preparation.prewrite {
+            // Lookahead must prepare before publishing a writable map, too:
+            // mixing owner writes and later leases cannot erase earlier bytes.
+            drop(files);
+            self.ensure_external_file(file_id)?;
+            files = self.files.load();
+        }
         let file = files.get(file_id);
-        Wal::extend_to_map_id(&self.layout, file, map_id).expect("Failed to extend wal file");
+        Wal::extend_to_map_id(&self.layout, file, map_id)?;
         self.maps.map(
             file,
             &self.layout,
@@ -597,6 +594,7 @@ impl WalMapperThread {
         );
 
         self.publish_maps();
+        Ok(())
     }
 
     fn publish_maps(&self) {

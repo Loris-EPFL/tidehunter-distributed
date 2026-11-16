@@ -469,6 +469,9 @@ pub struct LiveFilePreparationStats {
     pub live_files_prepared: u64,
     pub live_files_published: u64,
     pub live_file_prepare_failures: u64,
+    pub live_file_prewrite_bytes: u64,
+    pub live_file_prewrite_ns: u64,
+    pub live_file_prewrite_files: u64,
 }
 
 #[cfg(all(test, feature = "experimental-nvmeof"))]
@@ -1006,6 +1009,23 @@ impl PartitionLog {
         shape: &KeyShape,
         metrics: Arc<Metrics>,
     ) -> Result<Self, StorageError> {
+        Self::create_inner(
+            path,
+            config,
+            shape,
+            metrics,
+            #[cfg(feature = "experimental-nvmeof")]
+            false,
+        )
+    }
+
+    fn create_inner(
+        path: &Path,
+        config: PartitionConfig,
+        shape: &KeyShape,
+        metrics: Arc<Metrics>,
+        #[cfg(feature = "experimental-nvmeof")] prewrite: bool,
+    ) -> Result<Self, StorageError> {
         config.validate()?;
         let shape_yaml = shape
             .to_yaml()
@@ -1034,6 +1054,13 @@ impl PartitionLog {
             true,
             HistoryPersistence::default(),
         )?;
+        #[cfg(feature = "experimental-nvmeof")]
+        let wal = if prewrite {
+            Wal::open_external_prewrite(&path, registration.config.layout(), metrics)?
+        } else {
+            Wal::open(&path, registration.config.layout(), metrics)?
+        };
+        #[cfg(not(feature = "experimental-nvmeof"))]
         let wal = Wal::open(&path, registration.config.layout(), metrics)?;
         wal.persist_registered_files()?;
         install_metadata(&path, REGISTRATION, &metadata)?;
@@ -1126,6 +1153,17 @@ impl PartitionLog {
         shape: &KeyShape,
         metrics: Arc<Metrics>,
     ) -> Result<Self, StorageError> {
+        Self::create_live_with_prewrite(path, config, shape, metrics, false)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn create_live_with_prewrite(
+        path: &Path,
+        config: PartitionConfig,
+        shape: &KeyShape,
+        metrics: Arc<Metrics>,
+        prewrite: bool,
+    ) -> Result<Self, StorageError> {
         let max_frame = config
             .group_limits
             .max_encoded_bytes
@@ -1140,7 +1178,7 @@ impl PartitionLog {
         {
             return Err(StorageError::Invalid("invalid live WAL geometry"));
         }
-        let mut log = Self::create(path, config, shape, metrics)?;
+        let mut log = Self::create_inner(path, config, shape, metrics, prewrite)?;
         install_metadata(
             &log.path,
             LIVE_FRONTIER,
@@ -4810,7 +4848,13 @@ impl PartitionLog {
 
     #[cfg(feature = "experimental-nvmeof")]
     pub fn live_file_preparation_stats(&self) -> LiveFilePreparationStats {
-        self.state.lock().live_file_preparation
+        let mut stats = self.state.lock().live_file_preparation;
+        (
+            stats.live_file_prewrite_bytes,
+            stats.live_file_prewrite_ns,
+            stats.live_file_prewrite_files,
+        ) = self.wal.external_prewrite_stats();
+        stats
     }
 
     #[cfg(all(test, feature = "experimental-nvmeof"))]
