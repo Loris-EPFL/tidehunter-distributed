@@ -197,9 +197,9 @@ REVIEWED_SPECS['nvmeof_f7_highmem32'].update(
 
 # One immutable matrix and one fleet size per M3 selection.
 M3_MATRIX_BINDINGS = {
-    1: ("nvmeof_m3_t1", 11, "a0315c29b6e6a00a5df6fe41a7fb31418823d1d176e383f1c67569c7c301966a"),
-    2: ("nvmeof_m3_t2_2", 8, "f36366496e564b8fe303ef1dba03d2797c8a700f91cca2054ac11ee94eed42b6"),
-    5: ("nvmeof_m3_t2_5", 11, "6a1c63730a74ab97b232b1b947f6b9149098f76f63336cfad6447b95019d7402"),
+    1: ("nvmeof_m3_t1", 8, "df343feef5fc4568d44e98f28ad1486f5882e559ac23d935ea6a4ac4b5a5ac21"),
+    2: ("nvmeof_m3_t2_2", 8, "115bc93da0f8bca91cd1c5c09214e9ef5c4d91153f940218f7fef0cf0fff548a"),
+    5: ("nvmeof_m3_t2_5", 8, "92e704fe9d8a8faf0eb7e1f89f59ca1d2a09598186acfec7bcc98f73c7d19930"),
 }
 for owners, (selection, count, digest) in M3_MATRIX_BINDINGS.items():
     REVIEWED_SPECS[selection] = {
