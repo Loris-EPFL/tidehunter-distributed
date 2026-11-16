@@ -256,39 +256,56 @@ fn workload(case: &Case) -> Vec<Vec<Edit>> {
         .collect()
 }
 
-/// Only leased writes need separate owner-RPC readers. The RPC route retains
-/// its original coordinator read API, lanes and protected-cut validation.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+type PassiveReadProbe = (Arc<super::super::tcp::StorageNode>, Arc<Mutex<Client>>);
+
+/// Product reads always use the captured cut. Separate owner-RPC readers exist
+/// only for explicit read-route comparison or passive failure diagnosis.
 struct Readers {
     clients: Option<BTreeMap<u32, Mutex<Client>>>,
     epoch: u64,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    probes: Option<Vec<PassiveReadProbe>>,
 }
 
 impl Readers {
     fn new(config: &RemoteDatabaseConfig, shape: &KeyShape, epoch: u64) -> Self {
-        let clients = config.live_nvme.as_ref().map(|_| {
-            config
-                .endpoints
-                .iter()
-                .map(|endpoint| {
-                    let mut tls = config.tls.clone();
-                    tls.server_name = endpoint.server_name.clone();
-                    (
-                        endpoint.partition,
-                        Mutex::new(
-                            Client::connect(
-                                &endpoint.address,
-                                &tls,
-                                config.timeout,
-                                config.partition_config(1, endpoint.partition),
-                                shape,
-                            )
-                            .unwrap(),
-                        ),
-                    )
-                })
-                .collect()
-        });
-        Self { clients, epoch }
+        let clients = config
+            .live_nvme
+            .as_ref()
+            .filter(|_| {
+                std::env::var_os("TH_MODEL_COMPARE_READS").is_some()
+                    || std::env::var_os("TH_MODEL_PASSIVE_READS").is_some()
+            })
+            .map(|_| {
+                config
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| {
+                        let mut tls = config.tls.clone();
+                        tls.server_name = endpoint.server_name.clone();
+                        (
+                            endpoint.partition,
+                            Mutex::new(
+                                Client::connect(
+                                    &endpoint.address,
+                                    &tls,
+                                    config.timeout,
+                                    config.partition_config(1, endpoint.partition),
+                                    shape,
+                                )
+                                .unwrap(),
+                            ),
+                        )
+                    })
+                    .collect()
+            });
+        Self {
+            clients,
+            epoch,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            probes: None,
+        }
     }
 }
 
@@ -307,13 +324,50 @@ fn snapshot(db: &ConcurrentRemoteDatabase, readers: &Readers) -> Vec<Option<u64>
             .unwrap();
         let value = if let Some(clients) = &readers.clients {
             reference.map(|reference| {
-                match clients
+                let product = std::env::var_os("TH_MODEL_COMPARE_READS").map(|_| {
+                    db.submit_get_cut(KeySpace(0), &bytes, cut.clone())
+                        .and_then(|pending| db.finish_ready_get(pending.wait()))
+                });
+                let rpc = clients
                     .get(&reference.batch_address.partition)
                     .unwrap()
                     .lock()
-                    .read_record(readers.epoch, &reference)
-                    .unwrap()
+                    .read_record(readers.epoch, &reference);
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                if rpc.is_err()
+                    && let Some(probes) = &readers.probes
                 {
+                    let (node, writer) = &probes[reference.batch_address.partition as usize];
+                    let log = node.log_for_test(reference.batch_version.epoch);
+                    let appended = log.appended_frontier();
+                    let synced = log.synced_frontier();
+                    let root = log.position_root_for_test();
+                    let end = reference.batch_address.offset + u64::from(reference.batch_address.len);
+                    let writer = writer.lock();
+                    eprintln!(
+                        "passive_read key={key} cut={cut:?} reference={reference:?} appended={appended} synced={synced} root={root:?} beyond_appended={} beyond_synced={} beyond_root={} completed_released_durable={:?} current_written_pending={:?} closing_next={:?} flights={} rpc={rpc:?}",
+                        end > appended,
+                        end > synced,
+                        end > root.2,
+                        writer.leased_test_completion_prefixes(),
+                        writer.leased_test_frontier(),
+                        writer.leased_test_ahead_state(),
+                        writer.leased_flights_in_flight(),
+                    );
+                }
+                if let Some(product) = product {
+                    eprintln!(
+                        "compare_read key={key} cut={cut:?} reference={reference:?} product={:?} rpc={:?}",
+                        product
+                            .as_ref()
+                            .map(|value| value.as_ref().map(|value| (&value[..8], value.len()))),
+                        rpc.as_ref().map(|mutation| match mutation {
+                            Mutation::Put { value, .. } => Some((&value[..8], value.len())),
+                            Mutation::Delete { .. } => None,
+                        }),
+                    );
+                }
+                match rpc.unwrap() {
                     Mutation::Put {
                         keyspace,
                         key,
@@ -478,6 +532,21 @@ fn write_child(directory: &Path, case: &Case) {
         .map(|worker| worker.client.clone())
         .collect();
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    let readers = {
+        let mut readers = readers;
+        if std::env::var_os("TH_MODEL_PASSIVE_READS").is_some() && case.leased.is_some() {
+            readers.probes = Some(
+                fixture
+                    .nodes
+                    .iter()
+                    .cloned()
+                    .zip(clients.iter().cloned())
+                    .collect(),
+            );
+        }
+        readers
+    };
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     let live_metrics = original.live_metrics.clone();
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let recorder = Recorder::open(&directory.join("history.jsonl"));
@@ -620,12 +689,15 @@ fn recover_child(directory: &Path) {
     )
     .unwrap();
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let db = {
+    let (db, recovery_pins) = {
         let mut db = db;
-        if case.leased.is_some() {
+        let pins = if case.leased.is_some() {
             leased::prepare_database(&mut db);
-        }
-        db
+            leased::prepare_recovery_reads(&db)
+        } else {
+            Vec::new()
+        };
+        (db, pins)
     };
     let readers = Readers::new(&restart.config, &restart.shape, db.epoch());
     let db = ConcurrentRemoteDatabase::new(db).unwrap();
@@ -663,6 +735,13 @@ fn recover_child(directory: &Path) {
         serde_json::to_vec(&values).unwrap(),
     )
     .unwrap();
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    for (client, token) in recovery_pins {
+        client
+            .lock()
+            .release_live_epoch_pin(readers.epoch, token)
+            .unwrap();
+    }
     db.shutdown().unwrap();
     shutdown.store(true, std::sync::atomic::Ordering::Release);
     for server in servers {

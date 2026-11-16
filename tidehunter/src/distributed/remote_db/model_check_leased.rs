@@ -119,6 +119,42 @@ pub(super) fn prepare_database(db: &mut RemoteDatabase) {
     }
 }
 
+pub(super) type RecoveryReadPin = (Arc<Mutex<Client>>, [u8; 16]);
+
+/// Recovery has no write-created local controller to share with live readers.
+/// Register actual owner-resolved WAL paths in the existing file-backed pool
+/// fixture; product read planning, pinning, I/O and validation remain unchanged.
+pub(super) fn prepare_recovery_reads(db: &RemoteDatabase) -> Vec<RecoveryReadPin> {
+    let page = db
+        .index_page(KeySpace(0), None, false, db.published_cut().unwrap())
+        .unwrap();
+    assert!(page.len() <= KEYS);
+    let mut by_owner = BTreeMap::<_, Vec<_>>::new();
+    for (_, reference) in page {
+        by_owner
+            .entry(reference.batch_address.partition)
+            .or_default()
+            .push(reference);
+    }
+    let pool = db.live_pool.as_ref().unwrap();
+    let mut pins = Vec::with_capacity(by_owner.len());
+    for (partition, references) in by_owner {
+        let client = db.clients[db.partition_indexes[&partition]].client.clone();
+        let resolved = client
+            .lock()
+            .resolve_live_records(db.epoch(), &references)
+            .unwrap();
+        for location in resolved.entries {
+            pool.register_local_target(&location.binding.nqn, location.segment.path);
+        }
+        // Retain the preparation pin until product reads acquired their own
+        // pins. Otherwise re-export can replace the NQN before the local
+        // controller fixture connects to the registered identity.
+        pins.push((client, resolved.epoch_pin_token));
+    }
+    pins
+}
+
 pub(super) fn quiesce(clients: &[Arc<Mutex<Client>>]) {
     for client in clients {
         let mut released = Vec::new();
