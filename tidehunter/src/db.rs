@@ -1,3 +1,5 @@
+use crate::background_health::BackgroundHealth;
+pub use crate::background_health::{BackgroundFailure, BackgroundFailureReason, BackgroundThread};
 use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch};
 use crate::cell::CellId;
 use crate::checkpoint::DbCheckpoint;
@@ -83,6 +85,7 @@ pub struct Db {
     /// One handle per pending-promotion shard, for waking threads after batch commits.
     /// Index `i` owns mutex shards where `mutex_idx % len == i`.
     pending_promotion_threads: Box<[OnceLock<thread::Thread>]>,
+    pub(crate) background_health: Arc<BackgroundHealth>,
     _lock: Mutex<Option<DbLock>>,
 }
 
@@ -124,6 +127,24 @@ impl Db {
         metrics: Arc<Metrics>,
         check_benchmark_geometry: bool,
     ) -> DbResult<Arc<Self>> {
+        Self::open_with_background_health(
+            path,
+            key_shape,
+            config,
+            metrics,
+            check_benchmark_geometry,
+            Arc::default(),
+        )
+    }
+
+    fn open_with_background_health(
+        path: &Path,
+        key_shape: KeyShape,
+        config: Arc<Config>,
+        metrics: Arc<Metrics>,
+        check_benchmark_geometry: bool,
+        background_health: Arc<BackgroundHealth>,
+    ) -> DbResult<Arc<Self>> {
         config.validate();
         let path = path.canonicalize()?;
         let lock = DbLock::acquire(&path, config.open_lock_retry_timeout)?;
@@ -132,8 +153,18 @@ impl Db {
         }
         let (key_shape, keyspaces, registry_dirty) = Self::reconcile_key_shape(&path, key_shape)?;
         Self::maybe_create_config_file(&path, &config)?;
-        let wal = Wal::open(&path, config.wal_layout(WalKind::Replay), metrics.clone())?;
-        let indexes = Wal::open(&path, config.wal_layout(WalKind::Index), metrics.clone())?;
+        let wal = Wal::open_with_background_health(
+            &path,
+            config.wal_layout(WalKind::Replay),
+            metrics.clone(),
+            background_health.clone(),
+        )?;
+        let indexes = Wal::open_with_background_health(
+            &path,
+            config.wal_layout(WalKind::Index),
+            metrics.clone(),
+            background_health.clone(),
+        )?;
         let (control_region_store, control_region) =
             Self::read_or_create_control_region(path.join(CONTROL_REGION_FILE), &key_shape)?;
         if registry_dirty {
@@ -159,6 +190,7 @@ impl Db {
             flusher,
             metrics.clone(),
             indexes.as_ref(),
+            background_health.clone(),
         );
         let contexts = KsContextVec::new(&key_shape, config.clone(), metrics.clone());
         let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position())?;
@@ -220,6 +252,7 @@ impl Db {
             decompress_cache,
             commit_pool,
             pending_promotion_threads,
+            background_health,
             _lock: Mutex::new(Some(lock)),
         };
         this.report_memory_estimates();
@@ -252,9 +285,19 @@ impl Db {
         }
         let _flat_handle = Self::start_flat_promotion_job(Arc::downgrade(&this));
 
-        // todo: store handles and wait for them on Db drop
+        // Worker wrappers publish failures even though these handles are detached.
 
         Ok(this)
+    }
+
+    /// Returns the first native background failure, if any.
+    ///
+    /// A failure permanently rejects subsequent mutations and commits on this
+    /// instance. Close and reopen the database to recover from the WAL.
+    /// Operations already in flight when a worker fails can still complete.
+    #[inline]
+    pub fn check_background_health(&self) -> DbResult<()> {
+        self.background_health.check()
     }
 
     /// Deletes the database directory at `path` if no other process holds the lock.
@@ -452,9 +495,14 @@ impl Db {
         // todo account number of bytes read during wal replay
         let position = self.wal_writer.position();
         let weak = Arc::downgrade(self);
+        let health = Arc::clone(&self.background_health);
         thread::Builder::new()
             .name("snapshot".to_string())
-            .spawn(move || Self::periodic_snapshot_thread(weak, position))
+            .spawn(move || {
+                health.run(BackgroundThread::Snapshot, || {
+                    Self::periodic_snapshot_thread(weak, position)
+                })
+            })
             .unwrap();
     }
 
@@ -485,7 +533,6 @@ impl Db {
                     false
                 };
             if timed_snapshot || written > db.config.snapshot_written_bytes() {
-                // todo taint storage instance on failure?
                 let snapshot_position = db
                     .rebuild_control_region()
                     .expect("Failed to rebuild control region");
@@ -515,6 +562,7 @@ impl Db {
         v: impl Into<Bytes>,
         profile: &mut NativeWriteStages,
     ) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Insert);
         let k = k.into();
@@ -559,6 +607,7 @@ impl Db {
         k: impl Into<Bytes>,
         profile: &mut NativeWriteStages,
     ) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Remove);
         let k = k.into();
@@ -586,6 +635,7 @@ impl Db {
         result
     }
     pub fn insert(&self, ks: KeySpace, k: impl Into<Bytes>, v: impl Into<Bytes>) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Insert);
         let k = k.into();
@@ -605,6 +655,7 @@ impl Db {
     }
 
     pub fn remove(&self, ks: KeySpace, k: impl Into<Bytes>) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Remove);
         let k = k.into();
@@ -617,6 +668,9 @@ impl Db {
     }
 
     pub fn get(&self, ks: KeySpace, k: &[u8]) -> DbResult<Option<Bytes>> {
+        // Reads remain available: they do not acknowledge new writes or advance
+        // recovery metadata. Existing WAL data remains the source of truth;
+        // read-side corruption and I/O errors still propagate normally.
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Get);
         let reduced_key = context.ks_config.reduce_key(k);
@@ -726,6 +780,7 @@ impl Db {
         from_inclusive: &[u8],
         to_inclusive: &[u8],
     ) -> DbResult<()> {
+        self.check_background_health()?;
         let ksd = self.key_shape.ks(ks);
 
         // Convert keys from user format to index format
@@ -741,7 +796,7 @@ impl Db {
 
         let context = self.ks_context(ks);
         self.large_table
-            .drop_cells_in_range(context, &from_cell, &to_cell);
+            .drop_cells_in_range(context, &from_cell, &to_cell)?;
 
         Ok(())
     }
@@ -770,10 +825,11 @@ impl Db {
     /// frames. Like [`Db::drop_cells_in_range`], this intentionally does
     /// not preserve data for held checkpoints.
     pub fn destroy_key_space(&self, name: &str) -> DbResult<()> {
+        self.check_background_health()?;
         let Some(ks) = self.tombstone_key_space(name)? else {
             return Ok(());
         };
-        self.large_table.drop_all_cells(self.ks_context(ks));
+        self.large_table.drop_all_cells(self.ks_context(ks))?;
         Ok(())
     }
 
@@ -825,6 +881,7 @@ impl Db {
     }
 
     pub(crate) fn do_write_batch(&self, batch: WriteBatch) -> DbResult<()> {
+        self.check_background_health()?;
         let WriteBatch {
             transaction,
             mut writes,
@@ -1440,6 +1497,7 @@ impl Db {
     /// Native asynchronous acknowledgement remains unchanged.
     #[cfg(feature = "experimental-distributed")]
     pub fn persist_value_wal_for_benchmark(&self) -> DbResult<()> {
+        self.check_background_health()?;
         self.wal.persist_registered_files()?;
         Ok(())
     }
@@ -1466,6 +1524,7 @@ impl Db {
         &self,
         profile: &mut ValueWalPersistenceProfile,
     ) -> DbResult<()> {
+        self.check_background_health()?;
         self.wal.persist_registered_files_profiled(profile)?;
         Ok(())
     }
@@ -1541,6 +1600,7 @@ impl Db {
     }
 
     pub fn force_rebuild_control_region(&self) -> DbResult<u64> {
+        self.check_background_health()?;
         // Wait for the async WAL tracker to catch up so all recent writes are included in the snapshot.
         self.wal_writer.wal_tracker_barrier();
         self.rebuild_control_region_from(self.wal_writer.position())
@@ -1552,6 +1612,7 @@ impl Db {
     }
 
     pub(crate) fn rebuild_control_region_from(&self, threshold_position: u64) -> DbResult<u64> {
+        self.check_background_health()?;
         // Capture index writer position before pass 1 so files created by the
         // pass-1 flushes (and pass-2 force-relocations) are excluded from the
         // relocation candidate set built from the accumulator.
@@ -1733,24 +1794,33 @@ impl Db {
         shard_idx: usize,
         num_shards: usize,
     ) -> thread::JoinHandle<()> {
+        let health = Arc::clone(
+            &db.upgrade()
+                .expect("opener keeps the database alive")
+                .background_health,
+        );
         thread::Builder::new()
             .name(format!("pending-promotion-{shard_idx}"))
             .spawn(move || {
-                loop {
-                    thread::park();
-                    let Some(db) = db.upgrade() else { break };
-                    let _timer = db
-                        .metrics
-                        .pending_promotion_job_time_mcs
-                        .clone()
-                        .mcs_timer();
-                    if let Err(e) =
-                        db.large_table
-                            .promote_dirty_pending(db.as_ref(), shard_idx, num_shards)
-                    {
-                        eprintln!("Error in pending promotion job: {:?}", e);
+                health.run(BackgroundThread::PendingPromotion, || {
+                    loop {
+                        thread::park();
+                        let Some(db) = db.upgrade() else { break };
+                        let _timer = db
+                            .metrics
+                            .pending_promotion_job_time_mcs
+                            .clone()
+                            .mcs_timer();
+                        if let Err(e) =
+                            db.large_table
+                                .promote_dirty_pending(db.as_ref(), shard_idx, num_shards)
+                        {
+                            db.background_health
+                                .record_error(BackgroundThread::PendingPromotion, &e);
+                            eprintln!("Error in pending promotion job: {:?}", e);
+                        }
                     }
-                }
+                });
             })
             .unwrap()
     }
@@ -1758,24 +1828,34 @@ impl Db {
     /// Starts a background thread that compacts BTreeMap index entries into flat arrays.
     /// Runs on a 10-second polling cadence, independently of the pending-promotion thread.
     fn start_flat_promotion_job(db: Weak<Db>) -> thread::JoinHandle<()> {
+        let health = Arc::clone(
+            &db.upgrade()
+                .expect("opener keeps the database alive")
+                .background_health,
+        );
         thread::Builder::new()
             .name("flat-promotion".to_string())
             .spawn(move || {
-                loop {
-                    thread::sleep(Duration::from_secs(10));
-                    // Plain drop is asynchronous; use wait_for_background_threads_to_finish for synchronous close.
-                    let Some(db) = db.upgrade() else { break };
-                    let _timer = db.metrics.flat_promotion_job_time_mcs.clone().mcs_timer();
-                    if let Err(e) = db.large_table.promote_flat_job(db.as_ref()) {
-                        eprintln!("Error in flat promotion job: {:?}", e);
+                health.run(BackgroundThread::FlatPromotion, || {
+                    loop {
+                        thread::sleep(Duration::from_secs(10));
+                        // Plain drop is asynchronous; use wait_for_background_threads_to_finish for synchronous close.
+                        let Some(db) = db.upgrade() else { break };
+                        let _timer = db.metrics.flat_promotion_job_time_mcs.clone().mcs_timer();
+                        if let Err(e) = db.large_table.promote_flat_job(db.as_ref()) {
+                            db.background_health
+                                .record_error(BackgroundThread::FlatPromotion, &e);
+                            eprintln!("Error in flat promotion job: {:?}", e);
+                        }
                     }
-                }
+                });
             })
             .unwrap()
     }
 
     /// Create a snapshot of the current db state
     pub fn create_state_snapshot(&self, snapshot_path: PathBuf) -> DbResult<()> {
+        self.check_background_health()?;
         let guard = self.control_region_store.lock();
         let control_region_path = guard.path().clone();
         drop(guard);
@@ -2090,6 +2170,7 @@ pub enum DbError {
     CrCorrupted,
     WalError(WalError),
     CorruptedIndexEntry(bincode::Error),
+    BackgroundFailure(Arc<BackgroundFailure>),
 }
 
 impl WalEntry {
@@ -2228,6 +2309,10 @@ mod tests;
 #[cfg(test)]
 #[path = "db_tests/test_cache_refill.rs"]
 mod cache_refill_tests;
+
+#[cfg(test)]
+#[path = "db_tests/test_background_health.rs"]
+mod background_health_tests;
 
 #[cfg(test)]
 mod multi_flusher_tests {

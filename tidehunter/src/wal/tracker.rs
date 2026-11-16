@@ -1,6 +1,7 @@
 use super::WalPosition;
 use super::position::LastProcessed;
 use crate::WalLayout;
+use crate::background_health::{BackgroundHealth, BackgroundThread};
 use crate::latch::LatchGuard;
 use crate::metrics::{MetricIntGauge, Metrics, TimerExt};
 use crate::wal::allocator::AllocationResult;
@@ -151,6 +152,7 @@ impl WalTracker {
         mapper: WalMapper,
         last_processed: LastProcessed,
         metrics: Arc<Metrics>,
+        health: Arc<BackgroundHealth>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let atomic_last_processed = Arc::new(AtomicU64::new(last_processed.as_u64()));
@@ -179,7 +181,7 @@ impl WalTracker {
         };
         let jh = thread::Builder::new()
             .name("wal-tracker".to_string())
-            .spawn(move || thread.run())
+            .spawn(move || health.run(BackgroundThread::WalTracker, || thread.run()))
             .expect("failed to start wal-tracker thread");
         Self {
             jh: Some(jh),
@@ -611,6 +613,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            Arc::default(),
         );
         let guard1 = tracker.allocated(a.clone());
         let guard2 = tracker.allocated(b.clone());
@@ -623,6 +626,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            Arc::default(),
         );
         let guard1 = tracker.allocated(a.clone());
         let guard3 = tracker.allocated(c.clone());
@@ -634,6 +638,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            Arc::default(),
         );
         let guard3 = tracker.allocated(c.clone());
         let guard2 = tracker.allocated(b.clone());
@@ -665,6 +670,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            Arc::default(),
         );
         assert_eq!(tracker.last_processed().as_u64(), 0);
 
@@ -690,6 +696,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            Arc::default(),
         );
 
         // Process `a`: internal and external advance to a.next_position().
@@ -727,6 +734,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            Arc::default(),
         );
 
         // internal -> a.next_position(); take the older latch l0 here.
@@ -776,6 +784,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            Arc::default(),
         );
 
         // Process `a`, then deliver `c` out of order so it sits in `pending`
