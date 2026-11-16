@@ -92,6 +92,10 @@ pub const MAX_KEY_LEN: usize = u16::MAX as usize;
 pub const CONTROL_REGION_FILE: &str = "cr";
 
 impl Db {
+    /// Opens a database and registers its pending-promotion workers before returning.
+    /// Active background jobs may extend the database's lifetime beyond the last
+    /// caller-owned `Arc`; use [`Db::wait_for_background_threads_to_finish`] when
+    /// a synchronous close is needed before deleting or reopening the directory.
     pub fn open(
         path: &Path,
         key_shape: KeyShape,
@@ -236,11 +240,16 @@ impl Db {
         // Start the event-driven pending-promotion threads (one per shard) and the flat-promotion
         // polling thread.
         let num_shards = this.pending_promotion_threads.len();
-        let _pending_handles: Vec<_> = (0..num_shards)
-            .map(|shard_idx| {
-                Self::start_pending_promotion_job(Arc::downgrade(&this), shard_idx, num_shards)
-            })
-            .collect();
+        for shard_idx in 0..num_shards {
+            let handle =
+                Self::start_pending_promotion_job(Arc::downgrade(&this), shard_idx, num_shards);
+            // Register from the opener: a startup Weak::upgrade in the worker can
+            // otherwise keep the database locked after the caller drops its Arc.
+            // Registration before returning also prevents lost batch wakeups.
+            this.pending_promotion_threads[shard_idx]
+                .set(handle.thread().clone())
+                .expect("Pending-promotion thread registered twice");
+        }
         let _flat_handle = Self::start_flat_promotion_job(Arc::downgrade(&this));
 
         // todo: store handles and wait for them on Db drop
@@ -1727,12 +1736,6 @@ impl Db {
         thread::Builder::new()
             .name(format!("pending-promotion-{shard_idx}"))
             .spawn(move || {
-                let Some(initial) = db.upgrade() else { return };
-                // OnceLock::set can only fail if set twice; this thread runs once so it always succeeds.
-                initial.pending_promotion_threads[shard_idx]
-                    .set(thread::current())
-                    .ok();
-                drop(initial);
                 loop {
                     thread::park();
                     let Some(db) = db.upgrade() else { break };
@@ -1760,6 +1763,7 @@ impl Db {
             .spawn(move || {
                 loop {
                     thread::sleep(Duration::from_secs(10));
+                    // Plain drop is asynchronous; use wait_for_background_threads_to_finish for synchronous close.
                     let Some(db) = db.upgrade() else { break };
                     let _timer = db.metrics.flat_promotion_job_time_mcs.clone().mcs_timer();
                     if let Err(e) = db.large_table.promote_flat_job(db.as_ref()) {
@@ -1821,31 +1825,37 @@ impl Db {
     /// The caller is responsible to make sure there are no other live user-owned
     /// `Arc` references to the database.
     ///
-    /// This method panics after a certain period to avoid hanging forever.
+    /// Panics if other owners exceed the shutdown poll limit; their database
+    /// remains locked. Joining storage workers afterward can wait indefinitely.
     pub fn wait_for_background_threads_to_finish(self: Arc<Self>) {
-        use std::thread;
-        use std::time::Duration;
         #[cfg(test)]
         const POLL_LIMIT: usize = 10_000;
         #[cfg(not(test))]
         const POLL_LIMIT: usize = 100_000;
+        self.wait_for_background_threads_to_finish_with_poll_limit(POLL_LIMIT);
+    }
 
+    fn wait_for_background_threads_to_finish_with_poll_limit(self: Arc<Self>, poll_limit: usize) {
         // Keep the database alive while transient background owners finish,
         // then run its destructor here so field drops and worker joins complete
         // before the database lock is released.
-        let lock = self._lock.lock().take();
         let mut db = self;
         let mut poll_count = 0usize;
         loop {
             match Arc::try_unwrap(db) {
                 Ok(db) => {
+                    // Transfer the lock only after all other owners are gone.
+                    // A timeout panic must leave it inside the surviving Db.
+                    let lock = db._lock.lock().take();
                     drop(db);
-                    break;
+                    // Field drops and storage-worker joins finish before unlock.
+                    drop(lock);
+                    return;
                 }
                 Err(shared) => {
                     db = shared;
                     poll_count += 1;
-                    if poll_count > POLL_LIMIT {
+                    if poll_count > poll_limit {
                         panic!(
                             "Database shutdown timeout: background threads not terminating after {poll_count} polls"
                         );
@@ -1854,9 +1864,6 @@ impl Db {
                 }
             }
         }
-
-        // Drop the lock only after the database and its workers are fully dropped.
-        drop(lock);
     }
 
     /// Test utility accessor methods
