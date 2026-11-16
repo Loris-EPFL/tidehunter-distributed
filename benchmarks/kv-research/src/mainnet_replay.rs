@@ -70,7 +70,13 @@ impl ReplayConfig {
         ensure(self.schema_version == 1, "replay schema_version must be 1")?;
         if !matches!(
             self.backend.kind.as_str(),
-            "native" | "tidehunter_tcp" | "valkey_tcp" | "garnet" | "kvrocks"
+            "native"
+                | "tidehunter_tcp"
+                | "valkey_tcp"
+                | "valkey_rdma"
+                | "garnet"
+                | "kvrocks"
+                | "foundationdb"
         ) {
             return Err(Box::new(UnsupportedReplayBackend(
                 self.backend.kind.clone(),
@@ -81,7 +87,7 @@ impl ReplayConfig {
         }
         if matches!(
             self.backend.kind.as_str(),
-            "valkey_tcp" | "garnet" | "kvrocks"
+            "valkey_tcp" | "valkey_rdma" | "garnet" | "kvrocks" | "foundationdb"
         ) {
             crate::backends::validate_options(&self.backend.kind, &self.backend.options)?;
         }
@@ -184,14 +190,24 @@ impl ReplayConfig {
         let mut prepared = prepare(&trace, self.workload.repetitions)?;
         if matches!(
             self.backend.kind.as_str(),
-            "valkey_tcp" | "garnet" | "kvrocks"
+            "valkey_tcp" | "valkey_rdma" | "garnet" | "kvrocks"
         ) {
             prepare_physical_keys(&mut prepared, self.backend.options["cluster"] == true);
-            #[cfg(any(feature = "valkey-tcp", feature = "garnet", feature = "kvrocks"))]
+            #[cfg(any(
+                feature = "valkey-tcp",
+                feature = "garnet",
+                feature = "kvrocks",
+                feature = "valkey-rdma"
+            ))]
             {
                 resources["resp_admission"] =
                     crate::backends::resp_replay::admit(&prepared, &self.backend.kind)?;
             }
+        }
+        #[cfg(feature = "foundationdb")]
+        if self.backend.kind == "foundationdb" {
+            resources["foundationdb_admission"] =
+                crate::backends::foundationdb::replay::admit(&mut prepared)?;
         }
         if self.backend.kind == "native" {
             resources["native_index_geometry"] = NativeReplayBackend::validate_geometry(
@@ -1338,8 +1354,22 @@ async fn open_backend(
             let info = backend.info();
             Ok((Arc::new(backend), info))
         }
-        #[cfg(any(feature = "valkey-tcp", feature = "garnet", feature = "kvrocks"))]
-        "valkey_tcp" | "garnet" | "kvrocks" => {
+        #[cfg(feature = "foundationdb")]
+        "foundationdb" => {
+            let backend = crate::backends::foundationdb::replay::FoundationDbReplayBackend::open(
+                &config.backend.options,
+            )
+            .await?;
+            let info = backend.info();
+            Ok((Arc::new(backend), info))
+        }
+        #[cfg(any(
+            feature = "valkey-tcp",
+            feature = "garnet",
+            feature = "kvrocks",
+            feature = "valkey-rdma"
+        ))]
+        "valkey_tcp" | "valkey_rdma" | "garnet" | "kvrocks" => {
             let backend = crate::backends::resp_replay::RespReplayBackend::open(
                 &config.backend.kind,
                 &config.backend.options,

@@ -133,10 +133,27 @@ enum Reader {
     Valkey(super::valkey_tcp::ValkeyTcpBackend),
     #[cfg(any(feature = "garnet", feature = "kvrocks"))]
     Industry(super::industry::IndustryBackend),
+    #[cfg(feature = "valkey-rdma")]
+    Libvalkey(std::sync::Arc<super::valkey_rdma::ValkeyRdmaBackend>),
 }
 impl Reader {
     async fn open(kind: &str, options: &Value) -> BackendResult<Self> {
         match kind {
+            #[cfg(feature = "valkey-rdma")]
+            "valkey_rdma" => Ok(Self::Libvalkey(std::sync::Arc::new(
+                super::valkey_rdma::ValkeyRdmaBackend::open(options, &prometheus::Registry::new())
+                    .await?,
+            ))),
+            #[cfg(feature = "valkey-rdma")]
+            "valkey_tcp" if options["client"] == "libvalkey" => {
+                Ok(Self::Libvalkey(std::sync::Arc::new(
+                    super::valkey_rdma::ValkeyRdmaBackend::open_tcp(
+                        options,
+                        &prometheus::Registry::new(),
+                    )
+                    .await?,
+                )))
+            }
             #[cfg(feature = "valkey-tcp")]
             "valkey_tcp" => Ok(Self::Valkey(
                 super::valkey_tcp::ValkeyTcpBackend::open(options, &prometheus::Registry::new())
@@ -157,6 +174,8 @@ impl Reader {
     }
     fn info(&self) -> BackendInfo {
         match self {
+            #[cfg(feature = "valkey-rdma")]
+            Self::Libvalkey(backend) => backend.info(),
             #[cfg(feature = "valkey-tcp")]
             Self::Valkey(backend) => backend.info(),
             #[cfg(any(feature = "garnet", feature = "kvrocks"))]
@@ -165,10 +184,103 @@ impl Reader {
     }
     async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
         match self {
+            #[cfg(feature = "valkey-rdma")]
+            Self::Libvalkey(backend) => backend.get(key).await,
             #[cfg(feature = "valkey-tcp")]
             Self::Valkey(backend) => backend.get(key).await,
             #[cfg(any(feature = "garnet", feature = "kvrocks"))]
             Self::Industry(backend) => backend.get(key).await,
+        }
+    }
+}
+
+enum Writer {
+    Redis(MultiplexedConnection),
+    #[cfg(feature = "valkey-rdma")]
+    Libvalkey(std::sync::Arc<super::valkey_rdma::ValkeyRdmaBackend>, usize),
+}
+impl Writer {
+    async fn request<T: redis::FromRedisValue>(
+        &mut self,
+        args: &[&[u8]],
+        deadline: Instant,
+    ) -> BackendResult<T> {
+        match self {
+            Self::Redis(conn) => {
+                let mut cmd = redis::cmd(std::str::from_utf8(args[0])?);
+                for arg in &args[1..] {
+                    cmd.arg(*arg);
+                }
+                Ok(tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    cmd.query_async(conn),
+                )
+                .await??)
+            }
+            #[cfg(feature = "valkey-rdma")]
+            Self::Libvalkey(backend, owner) => {
+                let replies = super::valkey_rdma::replay::pipeline(
+                    backend,
+                    *owner,
+                    vec![args.iter().map(|a| a.to_vec()).collect()],
+                    deadline,
+                )
+                .await?;
+                Ok(redis::from_redis_value(
+                    replies
+                        .into_iter()
+                        .next()
+                        .ok_or("missing libvalkey reply")?,
+                )?)
+            }
+        }
+    }
+    async fn send(
+        &mut self,
+        rows: &[Row],
+        transaction: bool,
+        count: usize,
+        deadline: Instant,
+    ) -> BackendResult<Vec<redis::Value>> {
+        match self {
+            Self::Redis(conn) => {
+                let mut pipeline = redis::pipe();
+                if transaction {
+                    pipeline.cmd("MULTI");
+                }
+                for row in rows {
+                    pipeline
+                        .cmd("SET")
+                        .arg(row.backend_key.as_ref())
+                        .arg(row.value.as_ref());
+                }
+                if transaction {
+                    pipeline.cmd("EXEC");
+                }
+                Ok(tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    conn.send_packed_commands(&pipeline, 0, count),
+                )
+                .await??)
+            }
+            #[cfg(feature = "valkey-rdma")]
+            Self::Libvalkey(backend, owner) => {
+                let mut commands = Vec::with_capacity(count);
+                if transaction {
+                    commands.push(vec![b"MULTI".to_vec()]);
+                }
+                for row in rows {
+                    commands.push(vec![
+                        b"SET".to_vec(),
+                        row.backend_key.to_vec(),
+                        row.value.to_vec(),
+                    ]);
+                }
+                if transaction {
+                    commands.push(vec![b"EXEC".to_vec()]);
+                }
+                super::valkey_rdma::replay::pipeline(backend, *owner, commands, deadline).await
+            }
         }
     }
 }
@@ -179,7 +291,7 @@ impl Reader {
 /// Any failed/unknown mutation permanently poisons the writer, with no reconnect/retry.
 pub struct RespReplayBackend {
     reader: Reader,
-    writers: Mutex<Option<Vec<MultiplexedConnection>>>,
+    writers: Mutex<Option<Vec<Writer>>>,
     runtime: tokio::runtime::Handle,
     timeout: Duration,
     cluster: bool,
@@ -283,15 +395,26 @@ impl RespReplayBackend {
         let mut limits = Vec::with_capacity(nodes.len());
         let mut initial_population = Vec::with_capacity(nodes.len());
         for (owner, node) in nodes.iter().enumerate() {
-            let client =
-                redis::Client::open(format!("redis://{}/", node.as_str().ok_or("invalid node")?))?;
-            let mut conn = timeout(duration, client.get_multiplexed_async_connection()).await??;
+            let mut conn = match &reader {
+                #[cfg(feature = "valkey-rdma")]
+                Reader::Libvalkey(backend) => {
+                    Writer::Libvalkey(std::sync::Arc::clone(backend), owner)
+                }
+                #[allow(unreachable_patterns)]
+                _ => {
+                    let client = redis::Client::open(format!(
+                        "redis://{}/",
+                        node.as_str().ok_or("invalid node")?
+                    ))?;
+                    Writer::Redis(
+                        timeout(duration, client.get_multiplexed_async_connection()).await??,
+                    )
+                }
+            };
             if cluster {
-                let view: String = timeout(
-                    duration,
-                    redis::cmd("CLUSTER").arg("NODES").query_async(&mut conn),
-                )
-                .await??;
+                let view: String = conn
+                    .request(&[b"CLUSTER", b"NODES"], Instant::now() + duration)
+                    .await?;
                 for index in local_slots(&view)? {
                     if slot_owner[index] != usize::MAX {
                         return Err("duplicate replay slot ownership".into());
@@ -301,19 +424,19 @@ impl RespReplayBackend {
             }
             let mut observed_limits = BTreeMap::new();
             let keys: &[&str] = match kind {
-                "valkey_tcp" => &["proto-max-bulk-len", "client-query-buffer-limit"],
+                "valkey_tcp" | "valkey_rdma" => {
+                    &["proto-max-bulk-len", "client-query-buffer-limit"]
+                }
                 "kvrocks" => &["proto-max-bulk-len"],
                 _ => &[],
             };
             for key in keys {
-                let values: Vec<String> = timeout(
-                    duration,
-                    redis::cmd("CONFIG")
-                        .arg("GET")
-                        .arg(key)
-                        .query_async(&mut conn),
-                )
-                .await??;
+                let values: Vec<String> = conn
+                    .request(
+                        &[b"CONFIG", b"GET", key.as_bytes()],
+                        Instant::now() + duration,
+                    )
+                    .await?;
                 if values.len() != 2
                     || values[0] != *key
                     || values[1].parse::<usize>()? < MAX_REQUEST
@@ -327,15 +450,9 @@ impl RespReplayBackend {
             limits.push(observed_limits);
             // Kvrocks DBSIZE can be a stale cached estimate. Require a terminal,
             // empty real scan; a nonterminal empty page does not prove freshness.
-            let (cursor, keys): (u64, Vec<Vec<u8>>) = timeout(
-                duration,
-                redis::cmd("SCAN")
-                    .arg(0)
-                    .arg("COUNT")
-                    .arg(1)
-                    .query_async(&mut conn),
-            )
-            .await??;
+            let (cursor, keys): (u64, Vec<Vec<u8>>) = conn
+                .request(&[b"SCAN", b"0", b"COUNT", b"1"], Instant::now() + duration)
+                .await?;
             require_empty_scan(cursor, &keys)?;
             initial_population
                 .push(json!({"node":node,"cursor":cursor,"returned_keys":keys.len()}));
@@ -347,7 +464,14 @@ impl RespReplayBackend {
         if !cluster {
             slot_owner.fill(0);
         }
-        info.topology["replay_transport"] = json!("TCP");
+        info.topology["replay_transport"] = json!(match &reader {
+            #[cfg(feature = "valkey-rdma")]
+            Reader::Libvalkey(_) if kind == "valkey_rdma" => "RDMA",
+            #[cfg(feature = "valkey-rdma")]
+            Reader::Libvalkey(_) => "libvalkey TCP",
+            #[allow(unreachable_patterns)]
+            _ => "TCP",
+        });
         info.topology["physical_hosts"] = json!("unverified; local lifecycle receipt required");
         info.topology["independent_ssds"] = Value::Null;
         info.topology["callers_per_ssd"] = Value::Null;
@@ -377,14 +501,14 @@ impl RespReplayBackend {
     pub fn info(&self) -> BackendInfo {
         self.info.clone()
     }
-    fn checkout(&self) -> BackendResult<Vec<MultiplexedConnection>> {
+    fn checkout(&self) -> BackendResult<Vec<Writer>> {
         self.writers
             .lock()
             .map_err(|_| "RESP writer checkout poisoned")?
             .take()
             .ok_or_else(|| "RESP writer busy or poisoned by a prior unknown outcome".into())
     }
-    fn restore(&self, writers: Vec<MultiplexedConnection>) -> BackendResult<()> {
+    fn restore(&self, writers: Vec<Writer>) -> BackendResult<()> {
         *self
             .writers
             .lock()
@@ -393,23 +517,11 @@ impl RespReplayBackend {
     }
     async fn send(
         &self,
-        conn: &mut MultiplexedConnection,
+        conn: &mut Writer,
         rows: &[Row],
         transaction: bool,
+        deadline: Instant,
     ) -> BackendResult<()> {
-        let mut pipeline = redis::pipe();
-        if transaction {
-            pipeline.cmd("MULTI");
-        }
-        for row in rows {
-            pipeline
-                .cmd("SET")
-                .arg(row.backend_key.as_ref())
-                .arg(row.value.as_ref());
-        }
-        if transaction {
-            pipeline.cmd("EXEC");
-        }
         let count = rows.len() + if transaction { 2 } else { 0 };
         self.sets.fetch_add(rows.len() as u64, Ordering::Relaxed);
         self.commands.fetch_add(count as u64, Ordering::Relaxed);
@@ -428,7 +540,7 @@ impl RespReplayBackend {
         } else {
             self.runs.fetch_add(1, Ordering::Relaxed);
         }
-        let replies = conn.send_packed_commands(&pipeline, 0, count).await?;
+        let replies = conn.send(rows, transaction, count, deadline).await?;
         check_replies(&replies, rows.len(), transaction)?;
         self.completed_sets
             .fetch_add(rows.len() as u64, Ordering::Relaxed);
@@ -496,9 +608,10 @@ impl ReplayBackend for RespReplayBackend {
         }
         let mut writers = self.checkout()?;
         let result: BackendResult<()> = self.runtime.block_on(async {
+            let deadline = Instant::now() + self.timeout;
             timeout(self.timeout, async {
                 if !self.cluster {
-                    return self.send(&mut writers[0], entries, true).await;
+                    return self.send(&mut writers[0], entries, true, deadline).await;
                 }
                 let mut start = 0;
                 while start < entries.len() {
@@ -506,7 +619,7 @@ impl ReplayBackend for RespReplayBackend {
                     let length = run_length(&entries[start..]);
                     let conn = writers.get_mut(owner).ok_or("unadmitted primary owner")?;
                     // No later owner run is sent until every reply of this run is checked.
-                    self.send(conn, &entries[start..start + length], false)
+                    self.send(conn, &entries[start..start + length], false, deadline)
                         .await?;
                     start += length;
                 }
@@ -568,15 +681,13 @@ impl ReplayBackend for RespReplayBackend {
                     let remaining = deadline
                         .checked_duration_since(Instant::now())
                         .ok_or("final SCAN deadline expired")?;
-                    let (next, keys): (u64, Vec<Vec<u8>>) = timeout(
-                        remaining.min(self.timeout),
-                        redis::cmd("SCAN")
-                            .arg(cursor)
-                            .arg("COUNT")
-                            .arg(256)
-                            .query_async(conn),
-                    )
-                    .await??;
+                    let cursor_text = cursor.to_string();
+                    let (next, keys): (u64, Vec<Vec<u8>>) = conn
+                        .request(
+                            &[b"SCAN", cursor_text.as_bytes(), b"COUNT", b"256"],
+                            Instant::now() + remaining.min(self.timeout),
+                        )
+                        .await?;
                     for key in keys {
                         let key = Bytes::from(key);
                         if !desired.contains(&key) {
