@@ -5846,6 +5846,14 @@ mod leased_rollover_tests {
             assert_ne!(Some(writer.target.uuid), first_binding);
             let closing = client.live_leased.closing.as_ref().unwrap();
             assert_eq!(closing.lease.extent.segment.file_index, 0);
+            // Old-file frames 0..8 precede the new-file frame 8 in the WAL.
+            let appended: Vec<_> = receipts.iter().map(|receipt| receipt.appended()).collect();
+            assert!(
+                appended[..8]
+                    .iter()
+                    .all(|batch| batch.address().offset < 32768)
+            );
+            assert!(appended[8].address().offset >= 32768);
             // Drive the background close, not a synchronous settle. Its reply
             // must adopt every old-file frame while the new queue stays bound.
             client.wait_closing_extent(false).unwrap();
@@ -5853,7 +5861,22 @@ mod leased_rollover_tests {
             assert_eq!(fixture.metrics.snapshot().counts.adoption_sync_exchanges, 0);
             assert_eq!(fixture.metrics.snapshot().counts.extent_switch_waits, 0);
             assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
-            assert_eq!(fixture.node.log_for_test(1).receipt_count(), 8);
+            // The close reply covered the whole old-file prefix, and the close made
+            // the new-file extent the owner's open extent. The owner's opportunistic
+            // self-adoption (`self_adopt_live_extent`, run by the background syncer's
+            // `persist_appended` and by flush barriers) scans only that open extent,
+            // so a syncer run that is late may already have adopted the complete
+            // new-file frame here. One consistent page snapshot (taken under the
+            // receipt authority's lock) must be the client's receipts in WAL order:
+            // every old-file frame exactly once, then at most the new-file frame.
+            let owner = fixture.node.log_for_test(1);
+            let adopted = owner.receipt_page(0, 16).unwrap();
+            assert!(
+                matches!(adopted.len(), 8 | 9),
+                "{tier:?}: owner adopted {} frames",
+                adopted.len()
+            );
+            assert_eq!(adopted[..], appended[..adopted.len()], "{tier:?}");
             let mut reader = fixture.client();
             for (sequence, receipt) in receipts.into_iter().enumerate() {
                 let batch = fixture.batch(sequence as u64);
@@ -5866,7 +5889,11 @@ mod leased_rollover_tests {
                 );
             }
             client.close_leased_extent(&mut Vec::new(), None).unwrap();
-            assert_eq!(fixture.node.log_for_test(1).receipt_count(), 9);
+            // Closing the new-file extent adopts its frame if the syncer or the
+            // reads above did not, and never adopts it a second time.
+            let owner = fixture.node.log_for_test(1);
+            assert_eq!(owner.receipt_count(), 9, "{tier:?}");
+            assert_eq!(owner.receipt_page(0, 16).unwrap(), appended, "{tier:?}");
         }
     }
 
