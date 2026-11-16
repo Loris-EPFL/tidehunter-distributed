@@ -2101,10 +2101,7 @@ fn owner_read_of_preleased_extent_frame_while_old_extent_closes() {
                     log.plan_record_read(&reference),
                     Err(StorageError::NeedsPersistence)
                 ));
-                assert!(matches!(
-                    log.resolve_live_record(&reference),
-                    Err(StorageError::NeedsPersistence)
-                ));
+                assert!(log.resolve_live_record(&reference).is_ok());
             }
             let mut invalid = reference;
             invalid.batch_address.len += 8;
@@ -2987,4 +2984,392 @@ fn default_live_preparation_does_not_prewrite() {
     let stats = log.live_file_preparation_stats();
     assert_eq!(stats.live_file_prewrite_bytes, 0);
     assert_eq!(stats.live_file_prewrite_ns, 0);
+}
+
+fn cold_record(
+    config: &PartitionConfig,
+    extent: &LiveWriteExtent,
+    sequence: u64,
+) -> (ValueRecordReference, Vec<u8>) {
+    let (group, frame) = encoded(config, vec![batch(config, sequence)]);
+    write(extent, extent.start, &frame);
+    let receipt = expected(config, &group, extent.start, frame.len())[0];
+    (
+        group.batches()[0]
+            .record_reference(receipt.address(), 0)
+            .unwrap(),
+        frame,
+    )
+}
+
+fn cold_frontiers(log: &PartitionLog) -> (u64, u64, u64, u64, usize) {
+    let state = log.state.lock();
+    (
+        state.appended_end,
+        state.durable_end,
+        state.wal_root.as_ref().map_or(0, |root| root.synced_end),
+        log.readable_frontier(),
+        log.receipt_count(),
+    )
+}
+
+#[test]
+fn cold_grant_bypasses_close_and_metadata_gate_without_promoting_a_prefix() {
+    for next_file in [false, true] {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let (temp, config, log) = fixture();
+            log.set_history_persistence(HistoryPersistence::WalReplay)
+                .unwrap();
+            log.attach_frontier(&DurabilityConfig::with_tier(tier))
+                .unwrap();
+            let log = Arc::new(log);
+            if next_file {
+                let initial = log.lease_live_extent(authority(&config)).unwrap().0;
+                close_for_preparation(&log, &config, &initial, 0);
+            }
+            let current = log.lease_live_extent(authority(&config)).unwrap().0;
+            let next = log
+                .prelease_live_extent(authority(&config), current.token)
+                .unwrap()
+                .0;
+            assert_eq!(
+                current.segment.file_index != next.segment.file_index,
+                next_file
+            );
+            let (_, frame) = cold_record(&config, &current, 1);
+            skip(&current, current.start + frame.len() as u64);
+            let (reference, _) = cold_record(&config, &next, 2);
+            let (entered, resume) = log.pause_live(LivePausePoint::CloseSuffix);
+            let closer = log.clone();
+            let auth = authority(&config);
+            let close = std::thread::spawn(move || {
+                closer.adopt_live_extent(
+                    auth,
+                    current.token,
+                    current.start + frame.len() as u64,
+                    true,
+                )
+            });
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let before = cold_frontiers(&log);
+            assert!(
+                before.1 < reference.batch_address.offset + u64::from(reference.batch_address.len)
+            );
+            // Holding both unrelated gates proves the cold read does not join
+            // adoption or durable metadata installation, even for Synchronous.
+            let round = log
+                .state
+                .lock()
+                .open_live_extent
+                .as_ref()
+                .unwrap()
+                .round
+                .clone();
+            let round_guard = round.lock();
+            let persistence = log.persistence.lock();
+            let lease = log.resolve_live_record(&reference).unwrap();
+            assert_eq!(cold_frontiers(&log), before);
+            assert!(lease._plan.authority_bytes() > 0);
+            log.evict_authority_cache();
+            let mut member = vec![0; lease.len as usize];
+            lease
+                ._plan
+                .member
+                .file
+                .read_exact_at(&mut member, lease.offset)
+                .unwrap();
+            assert_eq!(
+                CompleteBatch::decode_record(&shape(), &reference, member.into()).unwrap(),
+                batch(&config, 2).mutations()[0],
+            );
+            assert_eq!(log.live_read_pins.load(Ordering::Acquire), 1);
+            drop(lease);
+            assert_eq!(log.live_read_pins.load(Ordering::Acquire), 0);
+            drop(persistence);
+            drop(round_guard);
+            // Process-crash image while predecessor close is unfinished.
+            // Native does not claim an owner-power-loss guarantee.
+            let image = temp.path().join("cold-crash-image");
+            fs::create_dir(&image).unwrap();
+            for entry in fs::read_dir(temp.path().join("stream")).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    fs::copy(entry.path(), image.join(entry.file_name())).unwrap();
+                }
+            }
+            resume.send(()).unwrap();
+            close.join().unwrap().unwrap();
+            let recovered =
+                PartitionLog::recover_live_sealed(&image, &config, metrics(), || Ok(())).unwrap();
+            assert_eq!(recovered.receipt_count(), if next_file { 3 } else { 2 });
+            assert_eq!(
+                recovered.read_record(&reference).unwrap(),
+                batch(&config, 2).mutations()[0]
+            );
+        }
+    }
+}
+
+#[test]
+fn cold_grant_rejects_foreign_exact_membership_and_torn_native_frames() {
+    let (_temp, config, log) = fixture();
+    let log = Arc::new(log);
+    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+    let (reference, frame) = cold_record(&config, &extent, 0);
+    let mut invalid = Vec::new();
+    let mut changed = reference;
+    changed.batch_digest.0[0] ^= 1;
+    let mut member = vec![0; reference.descriptor.len as usize];
+    File::open(&extent.segment.path)
+        .unwrap()
+        .read_exact_at(
+            &mut member,
+            reference.batch_address.offset + 8 + u64::from(reference.descriptor.offset),
+        )
+        .unwrap();
+    // Scalar checksums do not authenticate the complete-batch digest.
+    assert!(CompleteBatch::decode_record(&shape(), &changed, member.into()).is_ok());
+    invalid.push(changed);
+    let mut changed = reference;
+    changed.batch_id.operation[0] ^= 1;
+    invalid.push(changed);
+    let mut changed = reference;
+    changed.batch_version.sequence += 1;
+    invalid.push(changed);
+    let mut changed = reference;
+    changed.batch_version.epoch += 1;
+    invalid.push(changed);
+    let mut changed = reference;
+    changed.descriptor.offset += 1;
+    invalid.push(changed);
+    let mut changed = reference;
+    changed.batch_address.segment_generation += 1;
+    invalid.push(changed);
+    let mut changed = reference;
+    changed.batch_address.offset = extent.end;
+    invalid.push(changed);
+    let mut changed = reference;
+    changed.batch_address.len = u32::MAX;
+    invalid.push(changed);
+    for changed in invalid {
+        assert!(log.resolve_live_record(&changed).is_err());
+        assert_eq!(log.live_read_pins.load(Ordering::Acquire), 0);
+    }
+    // Preserve the scalar bytes/checksum but tear a different part of the full
+    // native batch: self-consistent scalar verification is not membership.
+    let scalar_start = reference.batch_address.offset + 8 + u64::from(reference.descriptor.offset);
+    assert!(scalar_start > reference.batch_address.offset + 8);
+    write(&extent, reference.batch_address.offset + 8, &[0xff]);
+    log.evict_authority_cache();
+    assert!(log.resolve_live_record(&reference).is_err());
+    write(&extent, extent.start, &frame);
+    // Tear the inner native frame, not the outer live group's zero padding.
+    let half = reference.batch_address.len / 2;
+    write(
+        &extent,
+        reference.batch_address.offset + u64::from(half),
+        &vec![0; (reference.batch_address.len - half) as usize],
+    );
+    assert!(log.resolve_live_record(&reference).is_err());
+    log.poison_writer();
+    assert!(matches!(
+        log.resolve_live_record(&reference),
+        Err(StorageError::Poisoned)
+    ));
+}
+
+#[test]
+fn cold_grant_failure_cuts_discard_authority_and_pins() {
+    for point in [
+        LivePausePoint::ColdReadBeforeSync,
+        LivePausePoint::ColdReadAfterSync,
+        LivePausePoint::ColdReadBeforePin,
+        LivePausePoint::ColdReadAfterPin,
+    ] {
+        for sealing in [false, true] {
+            let (_temp, config, log) = fixture();
+            let log = Arc::new(log);
+            let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+            let (reference, _) = cold_record(&config, &extent, 0);
+            let before = cold_frontiers(&log);
+            let (entered, resume) = log.pause_live(point);
+            let reader = log.clone();
+            let read = std::thread::spawn(move || reader.resolve_live_record(&reference));
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            if sealing {
+                log.state.lock().sealing = true;
+            } else {
+                log.poison_writer();
+            }
+            resume.send(()).unwrap();
+            assert!(read.join().unwrap().is_err());
+            assert_eq!(log.live_read_pins.load(Ordering::Acquire), 0);
+            assert_eq!(cold_frontiers(&log), before);
+            log.state.lock().sealing = false;
+        }
+    }
+}
+
+#[test]
+fn cold_grant_rechecks_promotion_and_retains_pin_through_retirement() {
+    let (_temp, config, log) = fixture();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    let log = Arc::new(log);
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    let next = log
+        .prelease_live_extent(authority(&config), first.token)
+        .unwrap()
+        .0;
+    let (_, bytes) = cold_record(&config, &first, 0);
+    skip(&first, first.start + bytes.len() as u64);
+    let (reference, _) = cold_record(&config, &next, 1);
+    let (entered, resume) = log.pause_live(LivePausePoint::ColdReadAfterSync);
+    let reader = log.clone();
+    let read = std::thread::spawn(move || reader.resolve_live_record(&reference));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    log.adopt_live_extent(
+        authority(&config),
+        first.token,
+        first.start + bytes.len() as u64,
+        true,
+    )
+    .unwrap();
+    log.adopt_live_extent(authority(&config), next.token, next.start + 4096, false)
+        .unwrap();
+    resume.send(()).unwrap();
+    let lease = read.join().unwrap().unwrap();
+    log.evict_authority_cache();
+    log.seal_live_epoch(authority(&config), || Ok(())).unwrap();
+    log.checkpoint_prefix(2).unwrap();
+    assert!(log.retire_files(2, &[0]).is_err());
+    let mut bytes = vec![0; lease.len as usize];
+    lease
+        ._plan
+        .member
+        .file
+        .read_exact_at(&mut bytes, lease.offset)
+        .unwrap();
+    assert_eq!(
+        CompleteBatch::decode_record(&shape(), &reference, bytes.into()).unwrap(),
+        batch(&config, 1).mutations()[0]
+    );
+    drop(lease);
+    log.retire_files(2, &[0]).unwrap();
+    assert!(log.resolve_live_record(&reference).is_err());
+}
+
+#[test]
+fn cold_grant_uses_existing_owner_coverage_and_native_never_syncs() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        for covered in [false, true] {
+            let (_temp, config, log) = fixture();
+            log.set_history_persistence(HistoryPersistence::WalReplay)
+                .unwrap();
+            log.attach_frontier(&DurabilityConfig::with_tier(tier))
+                .unwrap();
+            let log = Arc::new(log);
+            let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+            let (reference, frame) = cold_record(&config, &extent, 0);
+            if covered {
+                log.persist_wal_through(frame.len() as u64).unwrap();
+            }
+            let before = cold_frontiers(&log);
+            let lease = log.resolve_live_record(&reference).unwrap();
+            assert_eq!(cold_frontiers(&log), before);
+            assert_eq!(
+                log.state.lock().live_test_diagnostics.cold_read_syncs,
+                u64::from(tier == DurabilityTier::Synchronous && !covered),
+            );
+            assert_eq!(log.receipt_count(), 0);
+            drop(lease);
+        }
+    }
+}
+
+#[test]
+fn cold_grant_sync_failure_is_fail_stop_without_frontier_or_pin_publication() {
+    let (_temp, config, log) = fixture();
+    let log = Arc::new(log);
+    log.attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Synchronous))
+        .unwrap();
+    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+    let (reference, _) = cold_record(&config, &extent, 0);
+    let before = cold_frontiers(&log);
+    log.fail_next_persist();
+    assert!(matches!(
+        log.resolve_live_record(&reference),
+        Err(StorageError::Unknown(_))
+    ));
+    assert_eq!(cold_frontiers(&log), before);
+    assert_eq!(log.live_read_pins.load(Ordering::Acquire), 0);
+    assert!(log.frontier().unwrap().failure().is_some());
+    assert!(matches!(
+        log.resolve_live_record(&reference),
+        Err(StorageError::Poisoned)
+    ));
+}
+
+#[test]
+fn cold_grant_reloads_normal_authority_after_healthy_extent_close() {
+    for point in [
+        LivePausePoint::ColdReadAfterSync,
+        LivePausePoint::ColdReadAfterPin,
+    ] {
+        let (_temp, config, log) = fixture();
+        let log = Arc::new(log);
+        let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+        let (reference, frame) = cold_record(&config, &extent, 0);
+        skip(&extent, extent.start + frame.len() as u64);
+        let (entered, resume) = log.pause_live(point);
+        let reader = log.clone();
+        let read = std::thread::spawn(move || reader.resolve_live_record(&reference));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        log.adopt_live_extent(
+            authority(&config),
+            extent.token,
+            extent.start + frame.len() as u64,
+            true,
+        )
+        .unwrap();
+        let next = log.lease_live_extent(authority(&config)).unwrap().0;
+        assert_ne!(next.token, extent.token);
+        resume.send(()).unwrap();
+        let lease = read.join().unwrap().unwrap();
+        assert_eq!(log.live_read_pins.load(Ordering::Acquire), 1);
+        let mut bytes = vec![0; lease.len as usize];
+        lease
+            ._plan
+            .member
+            .file
+            .read_exact_at(&mut bytes, lease.offset)
+            .unwrap();
+        assert_eq!(
+            CompleteBatch::decode_record(&shape(), &reference, bytes.into()).unwrap(),
+            batch(&config, 0).mutations()[0],
+        );
+        drop(lease);
+        assert_eq!(log.live_read_pins.load(Ordering::Acquire), 0);
+    }
+}
+
+#[test]
+fn cold_grant_rejects_completed_seal_instead_of_reloading_authority() {
+    for point in [
+        LivePausePoint::ColdReadAfterSync,
+        LivePausePoint::ColdReadAfterPin,
+    ] {
+        let (_temp, config, log) = fixture();
+        let log = Arc::new(log);
+        let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+        let (reference, _) = cold_record(&config, &extent, 0);
+        let (entered, resume) = log.pause_live(point);
+        let reader = log.clone();
+        let read = std::thread::spawn(move || reader.resolve_live_record(&reference));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        log.seal_live_epoch(authority(&config), || Ok(())).unwrap();
+        resume.send(()).unwrap();
+        assert!(matches!(read.join().unwrap(), Err(StorageError::Sealed)));
+        assert_eq!(log.live_read_pins.load(Ordering::Acquire), 0);
+    }
 }

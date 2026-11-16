@@ -494,6 +494,19 @@ impl PartitionLog {
         &self,
         address: PhysicalValueAddress,
     ) -> Result<Arc<RegisteredBatch>, StorageError> {
+        let file = self
+            .open_replay_file(address.offset)
+            .map_err(|_| StorageError::Invalid(MEMBER_MISMATCH))?;
+        self.member_authority_from_file(address, &file)
+    }
+
+    /// Validate against a captured final inode, not a pathname reopened after
+    /// the extent snapshot. This builds charged membership, never a WAL prefix.
+    pub(super) fn member_authority_from_file(
+        &self,
+        address: PhysicalValueAddress,
+        file: &File,
+    ) -> Result<Arc<RegisteredBatch>, StorageError> {
         let invalid = || StorageError::Invalid(MEMBER_MISMATCH);
         let end = address
             .offset
@@ -509,8 +522,7 @@ impl PartitionLog {
             return Err(invalid());
         }
         let bytes = self
-            .open_replay_file(address.offset)
-            .and_then(|file| self.read_checked_frame(&file, address.offset, address.len as usize))
+            .read_checked_frame(file, address.offset, address.len as usize)
             .map_err(|_| invalid())?;
         let batch = CompleteBatch::decode(&self.shape, bytes, self.config().batch_limits)
             .map_err(|_| invalid())?;
