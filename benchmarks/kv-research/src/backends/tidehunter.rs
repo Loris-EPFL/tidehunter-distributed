@@ -370,9 +370,15 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             || live.port_id == 0
             || live.commissioning_service == 0
             || live.commissioning_port_id == 0
-            || live.commissioning_service.checked_add(2 * (input.addresses.len() as u16 - 1)).is_none()
+            || live
+                .commissioning_service
+                .checked_add(2 * (input.addresses.len() as u16 - 1))
+                .is_none()
             || live.commissioning_service != live.service.checked_add(1).unwrap_or(0)
-            || live.commissioning_port_id.checked_add(2 * (input.addresses.len() as u16 - 1)).is_none()
+            || live
+                .commissioning_port_id
+                .checked_add(2 * (input.addresses.len() as u16 - 1))
+                .is_none()
             || live.commissioning_port_id != live.port_id.checked_add(1).unwrap_or(0)
             || live.max_inflight_requests == 0
             || live.max_inflight_bytes == 0
@@ -478,7 +484,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     remote.pin_read_lanes = input.pin_read_lanes;
     remote.read_cache_bytes = input.coordinator_cache_bytes;
     remote.read_memory_allowance_bytes = input.coordinator_read_memory_allowance_bytes;
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     if let Some(live) = &input.live_nvmeof {
         let (host_id, host_nqn) = &live_identities[0];
         remote.live_nvme = Some(tidehunter::distributed::tcp::LiveClientConfig {
@@ -487,11 +492,19 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             export_mode: live.export_mode,
             host_nqn: host_nqn.clone(),
             host_id: *host_id,
-            owner_identities: live_identities.iter().enumerate().map(|(partition, (id, nqn))| {
-                (partition as u32, tidehunter::distributed::tcp::LiveInitiatorIdentity {
-                    host_id: *id, host_nqn: nqn.clone(),
+            owner_identities: live_identities
+                .iter()
+                .enumerate()
+                .map(|(partition, (id, nqn))| {
+                    (
+                        partition as u32,
+                        tidehunter::distributed::tcp::LiveInitiatorIdentity {
+                            host_id: *id,
+                            host_nqn: nqn.clone(),
+                        },
+                    )
                 })
-            }).collect(),
+                .collect(),
             max_inflight_requests: live.max_inflight_requests,
             leased_write_window: live.leased_write_window,
             leased_sync: live.leased_sync,
@@ -2869,9 +2882,16 @@ mod tests {
                     format!("10.1.0.{}", partition + 1)
                 );
                 assert_eq!(target["transport"].as_str().unwrap(), "rdma");
-                let owner_identity = &remote["live_nvme"]["owner_identities"][partition.to_string()];
-                assert_eq!(target["host_nqn"].as_str(), owner_identity["host_nqn"].as_str());
-                assert_eq!(target["commissioning_service"].as_u64(), Some(4421 + 2 * partition));
+                let owner_identity =
+                    &remote["live_nvme"]["owner_identities"][partition.to_string()];
+                assert_eq!(
+                    target["host_nqn"].as_str(),
+                    owner_identity["host_nqn"].as_str()
+                );
+                assert_eq!(
+                    target["commissioning_service"].as_u64(),
+                    Some(4421 + 2 * partition)
+                );
             }
             config["live_nvmeof"]["export_mode"] = serde_json::json!("per_owner");
             config["live_nvmeof"]["write_mode"] = serde_json::json!("leased");
@@ -2892,32 +2912,45 @@ mod tests {
                 );
             }
             for count in [1, 2, 4, 16] {
-                config["addresses"] = serde_json::json!((0..count)
-                    .map(|owner| format!("10.1.0.1:{}", 9400 + owner)).collect::<Vec<_>>());
+                config["addresses"] = serde_json::json!(
+                    (0..count)
+                        .map(|owner| format!("10.1.0.1:{}", 9400 + owner))
+                        .collect::<Vec<_>>()
+                );
                 config["live_nvmeof"]["addresses"] = serde_json::json!(vec!["10.1.0.1"; count]);
                 write_input(&config);
                 let colocated = root.join(format!("colocated-{count}"));
                 prepare_external_case_file(&input, &colocated).unwrap();
-                let remote: serde_json::Value = serde_json::from_slice(
-                    &fs::read(colocated.join("remote.json")).unwrap()).unwrap();
+                let remote: serde_json::Value =
+                    serde_json::from_slice(&fs::read(colocated.join("remote.json")).unwrap())
+                        .unwrap();
                 let identities = remote["live_nvme"]["owner_identities"].as_object().unwrap();
                 assert_eq!(identities.len(), count);
                 let mut nqns = HashSet::new();
                 for owner in 0..count {
                     let launch: serde_yaml::Value = serde_yaml::from_slice(
-                        &fs::read(colocated.join(format!("node-{owner}/launch.yaml"))).unwrap()).unwrap();
+                        &fs::read(colocated.join(format!("node-{owner}/launch.yaml"))).unwrap(),
+                    )
+                    .unwrap();
                     let target = &launch["node"]["live_target"];
                     assert!(nqns.insert(target["host_nqn"].as_str().unwrap().to_owned()));
                     assert_eq!(target["service"].as_u64(), Some(4420 + 2 * owner as u64));
                     assert_eq!(target["port_id"].as_u64(), Some(4420 + 2 * owner as u64));
-                    assert_eq!(target["state_dir"].as_str().unwrap(),
-                               root.join(format!("guest/node-{owner}/live-nvmeof")).to_str().unwrap());
+                    assert_eq!(
+                        target["state_dir"].as_str().unwrap(),
+                        root.join(format!("guest/node-{owner}/live-nvmeof"))
+                            .to_str()
+                            .unwrap()
+                    );
                 }
             }
-            config["addresses"] = serde_json::json!((1..=5)
-                .map(|owner| format!("10.1.0.{owner}:9400")).collect::<Vec<_>>());
-            config["live_nvmeof"]["addresses"] = serde_json::json!(
-                ["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"]);
+            config["addresses"] = serde_json::json!(
+                (1..=5)
+                    .map(|owner| format!("10.1.0.{owner}:9400"))
+                    .collect::<Vec<_>>()
+            );
+            config["live_nvmeof"]["addresses"] =
+                serde_json::json!(["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"]);
             config["live_nvmeof"]["export_mode"] = serde_json::json!("on_demand");
             config["live_nvmeof"]["queue_geometry"] =
                 serde_json::json!({"io_queues": 2, "queue_size": 32, "poll_queues": 0});

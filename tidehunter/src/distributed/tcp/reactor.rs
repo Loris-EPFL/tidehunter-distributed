@@ -1728,11 +1728,11 @@ impl Client {
     pub(crate) fn checkpoint_pending(&self) -> bool {
         self.reactor.control.is_some() || self.reactor.position.is_some()
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn checkpoint_control_pending(&self) -> bool {
         self.reactor.control.is_some()
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn checkpoint_position_pending(&self) -> bool {
         self.reactor.position.is_some()
     }
@@ -2349,7 +2349,7 @@ impl Client {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn expire_position_for_test(&mut self) {
         self.reactor.position.as_mut().unwrap().1 = Instant::now();
     }

@@ -14,6 +14,7 @@ An existing compatible prefix is reused without replacing its providers.
 TIDEHUNTER_SETUP_JOBS sets build concurrency (default: 2, maximum: 32).
 TIDEHUNTER_SETUP_SKIP_APT=1 skips apt when dependencies are already installed.
 TIDEHUNTER_SETUP_SKIP_AWS_SDK=1 skips boto3 for provider-independent builds.
+TIDEHUNTER_SETUP_HARNESS_PLOTS=1 adds matplotlib for CI-only plotting suites.
 Run checks.py separately; setup does not run tests or claim hardware coverage.
 HELP
 }
@@ -42,6 +43,7 @@ if [[ ${TIDEHUNTER_SETUP_SKIP_APT:-0} != 1 ]]; then
     packages=(build-essential pkg-config libfontconfig1-dev libssl-dev
         python3 python3-pip python3-yaml openssl ca-certificates curl bzip2)
     if [[ ${TIDEHUNTER_SETUP_SKIP_AWS_SDK:-0} != 1 ]]; then packages+=(python3-boto3); fi
+    if [[ ${TIDEHUNTER_SETUP_HARNESS_PLOTS:-0} == 1 ]]; then packages+=(python3-matplotlib); fi
     # Hosted runners also install tools outside apt; do not download duplicates.
     for tool in clang cmake; do
         if ! command -v "$tool" >/dev/null; then packages+=("$tool"); fi
@@ -82,6 +84,10 @@ fi
 python3 -c 'import tomllib' || { echo 'Python 3.11 or newer is required' >&2; exit 1; }
 modules=(tomllib yaml)
 pip_packages=('PyYAML==6.0.2')
+if [[ ${TIDEHUNTER_SETUP_HARNESS_PLOTS:-0} == 1 ]]; then
+    modules+=(matplotlib)
+    pip_packages+=('matplotlib==3.11.2')
+fi
 if [[ ${TIDEHUNTER_SETUP_SKIP_AWS_SDK:-0} != 1 ]]; then
     modules+=(boto3)
     pip_packages+=('boto3==1.35.99')

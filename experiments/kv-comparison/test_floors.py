@@ -11,7 +11,43 @@ import floors
 
 class FloorTests(unittest.TestCase):
     def test_real_perftest_row(self):
-        log = (Path(__file__).resolve().parents[3] / 'checkpoint-work/focused-launch-20261109-g10b/fleet-output/qualification/bench-6e40ca83d74146cf/bench-6e40ca83d74146cf-0/tidehunter-qualify-send.log').read_text()
+        # Captured ib_send_lat output; keep the fixture independent of local
+        # checkpoint-work/focused-launch-20261109-g10b campaign artifacts.
+        log = """Conflicting CPU frequency values detected: 2993.135000 != 3100.000000. CPU Frequency is not max.
+Conflicting CPU frequency values detected: 3000.000000 != 2100.000000. CPU Frequency is not max.
+Disabling dynamic polling
+
+************************************
+* Waiting for client to connect... *
+************************************
+---------------------------------------------------------------------------------------
+                    Send Latency Test
+ Dual-port       : OFF		Device         : irdma0
+ Number of qps   : 1		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : OFF		Using Enhanced Reorder      : OFF
+ RX depth        : 512
+ Mtu             : 4096[B]
+ Link type       : Ethernet
+ GID index       : 1
+ Max inline data : 101[B]
+ rdma_cm QPs	 : ON
+ Data ex. method : rdma_cm
+---------------------------------------------------------------------------------------
+ Waiting for client rdma_cm QP to connect
+ Please run the same command with the IB/RoCE interface IP
+ NUMA node       : 0
+---------------------------------------------------------------------------------------
+ local address: LID 0x01 QPN 0x0011 PSN 0x13cea1
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:20:00:40
+ remote address: LID 0x01 QPN 0x0011 PSN 0x7711de
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:20:00:41
+---------------------------------------------------------------------------------------
+ #bytes #iterations    t_min[usec]    t_max[usec]  t_typical[usec]    t_avg[usec]    t_stdev[usec]   99% percentile[usec]   99.9% percentile[usec] 
+ 1024    1000          5.83           9.44         6.03     	       6.08        	0.24   		8.39    		9.44   
+---------------------------------------------------------------------------------------
+"""
         row = floors.parse_perftest(log, 1024, 1000)
         self.assertEqual((row['min'], row['p50'], row['avg'], row['p99'], row['p999']), (5.83, 6.03, 6.08, 8.39, 9.44))
         self.assertIsNone(row['p90'])

@@ -30,6 +30,8 @@ SOFTWARE_STREAM_TESTS = (
     "software_provider_idle_wait_wakes_once_and_transfers_both_ways",
     "software_provider_pending_send_disables_idle_cq_wait",
     "software_provider_buffered_receive_disables_idle_cq_wait",
+    "software_provider_records_effective_geometry_and_rxm_parameters",
+    "software_provider_transfers_with_a_larger_slot_count",
 )
 SOFTWARE_ENGINE_TESTS = (
     "fabric_mtls_authentication_lost_response_and_recovery",
@@ -125,6 +127,7 @@ def check(profile, env):
                          ("--features", "experimental-nvmeof,test-utils")):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "tidehunter-fabric", "--all-targets", "--", "-D", "warnings")
+        cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--", "-D", "warnings")
     elif profile == "native":
         cargo(env, "test", "-p", "tidehunter")
     elif profile == "distributed":
@@ -132,14 +135,11 @@ def check(profile, env):
     elif profile == "fabric":
         fabric = fabric_environment(env)
         for package, features in (("tidehunter-fabric", "native"),
-                                  ("tidehunter", "experimental-fabric,test-utils")):
+                                  ("tidehunter", "experimental-nvmeof,experimental-fabric,test-utils"),
+                                  ("kv-research", "nvmeof,fabric,test-utils")):
             cargo(fabric, "clippy", "-p", package, "--all-targets", "--features", features,
                   "--", "-D", "warnings")
-            cargo(fabric, "test", "-p", package, "--lib", "--features", features)
-        # Default integration tests include missing-provider rejection; their
-        # software transfers and real-EFA discovery remain explicitly ignored.
-        cargo(fabric, "test", "-p", "tidehunter-fabric", "--features", "native",
-              "--test", "software_provider")
+            cargo(fabric, "test", "-p", package, "--features", features)
     elif profile == "software-fabric":
         fabric = software_fabric_environment(fabric_environment(env), software=True)
         stream = ("-p", "tidehunter-fabric", "--features", "native", "--test", "software_provider")

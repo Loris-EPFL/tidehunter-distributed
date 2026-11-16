@@ -3880,7 +3880,7 @@ impl PartitionLog {
     }
 
     /// Generation, scan origin and fixed cut for root/lease interleaving tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn position_root_for_test(&self) -> (u64, u64, u64) {
         let state = self.state.lock();
         let root = state.wal_root.as_ref().unwrap();

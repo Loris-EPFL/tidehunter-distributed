@@ -361,7 +361,7 @@ class RealSuiAbiRegressionTests(unittest.TestCase):
         self.abi = self.fixture['sui_abi']
 
     def test_hardware_baseline_lacks_libstdcpp_and_sui_proof_is_separate(self):
-        with self.assertRaisesRegex(ValueError, 'libstdc\+\+\.so\.6'):
+        with self.assertRaisesRegex(ValueError, r'libstdc\+\+\.so\.6'):
             gcp_image.admit_abi({'_records':self.records}, self.abi)
         for record in self.records:
             package = record['outputs']['package']
