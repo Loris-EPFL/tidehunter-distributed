@@ -41,6 +41,7 @@ def interrupted(signum, _frame):
 def run(args):
     sys.path.insert(0, str(ROOT / "experiments/kv-comparison"))
     import local_multiowner_check
+    import local_dry_run_targets
 
     dump(args.state / "before.json", inventory())
     dump(args.state / "host.json", {"kernel": os.uname().release,
@@ -53,6 +54,10 @@ def run(args):
                 "--libs", str(args.state / "libs"), "--owners", "4",
                 "--output", str(args.state / "proof")]
     result = 1
+    # sudo already runs this wrapper in the hosted runner's host namespace.
+    # The local development Docker image is not installed on hosted runners.
+    original_root = local_dry_run_targets.ROOT
+    local_dry_run_targets.ROOT = []
     try:
         result = local_multiowner_check.main()
         first = json.loads((args.state / "proof/proof.json").read_text())
@@ -73,6 +78,7 @@ def run(args):
         dump(args.state / "prewrite-result.json", prewrite)
         return result
     finally:
+        local_dry_run_targets.ROOT = original_root
         dump(args.state / "after.json", inventory())
         dump(args.state / "result.json", {"exit_code": result, "passed": result == 0})
 
