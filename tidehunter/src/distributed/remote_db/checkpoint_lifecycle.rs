@@ -1329,12 +1329,15 @@ impl RemoteDatabase {
                         }
                     }
                     if !retired.is_empty() {
-                        self.clients[node].control(move |client| {
-                            if replay {
-                                client.retire_wal_files(authority_epoch, epoch, retired)
-                            } else {
-                                client.retire_files(authority_epoch, epoch, prefix, retired)
-                            }
+                        let _retirement = self.clients[node].control(move |client| {
+                            // Busy controllers defer only this batch. The next
+                            // checkpoint scans it again; other errors propagate.
+                            client.retire_files_if_idle(
+                                authority_epoch,
+                                epoch,
+                                (!replay).then_some(prefix),
+                                retired,
+                            )
                         })?;
                     }
                 }
@@ -1355,6 +1358,142 @@ mod tests {
             key: 1u32.to_be_bytes().to_vec().into(),
             value: vec![value; 32].into(),
         }
+    }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[test]
+    fn checkpoint_defers_busy_controller_retirement_and_retries_without_poisoning() {
+        use crate::distributed::nvmeof::{
+            LiveTargetConfig, NvmeofTransport,
+            live_connect::{LiveConnectTarget, LiveConnectionRegistry},
+            live_namespace::LiveNamespaceAccess,
+            live_pool::LiveControllerPool,
+            live_target::LiveTargetManager,
+        };
+        let fixture = Fixture::new_with_root(
+            tempdir::TempDir::new("checkpoint-export-pin").unwrap(),
+            1,
+            128,
+            KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
+            2,
+            |_| {},
+            |config| {
+                super::super::super::tcp::StorageNode::open(
+                    config,
+                    super::super::tests::recovery_metrics(),
+                )
+                .unwrap()
+            },
+        )
+        .history(HistoryPersistence::OnDisk);
+        let mut first = fixture.open();
+        first
+            .write_batch(fixture.operation(0, 1), vec![put(1)])
+            .unwrap();
+        let reference = first
+            .index
+            .get(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap();
+        drop(first);
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 2), vec![put(2)])
+            .unwrap();
+        // The RPC fixture does not materialize a full NVMe backing allocation.
+        // Write the unchanged bytes and zero tail before real export validation.
+        let wal_bytes = fixture.config.storage.wal_file_bytes;
+        let wal = fixture.startups[0]
+            .0
+            .root
+            .join(format!("epoch_{:016x}", reference.batch_version.epoch))
+            .join(format!(
+                "wal_{:016x}",
+                reference.batch_address.offset / wal_bytes
+            ));
+        let mut contents = fs::read(&wal).unwrap();
+        assert!(contents.len() as u64 <= wal_bytes);
+        contents.resize(wal_bytes as usize, 0);
+        let file = fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&file, &contents, 0).unwrap();
+        let root = fixture.temp.path();
+        let configfs = root.join("pin-configfs");
+        for name in ["hosts", "ports", "subsystems"] {
+            fs::create_dir_all(configfs.join(name)).unwrap();
+        }
+        let state_dir = root.join("pin-target");
+        fs::create_dir(&state_dir).unwrap();
+        fixture.nodes[0].bench_install_live_target(
+            LiveTargetManager::open_fixture(
+                LiveTargetConfig {
+                    address: "127.0.0.1".into(),
+                    service: 4420,
+                    transport: NvmeofTransport::Tcp,
+                    host_nqn: "nqn.2026-01.test:checkpoint-pin".into(),
+                    port_id: 42,
+                    state_dir,
+                    commissioning_port_id: 43,
+                    commissioning_service: 4421,
+                    spdk: None,
+                    export_mode: Default::default(),
+                },
+                configfs,
+            )
+            .unwrap(),
+        );
+        let epoch = db.epoch;
+        let locations = db.clients[0]
+            .control(move |client| client.resolve_live_records(epoch, &[reference]))
+            .unwrap();
+        let location = locations.entries[0].clone();
+        let path = location.segment.path.clone();
+        let pool = Arc::new(
+            LiveControllerPool::new(
+                LiveConnectionRegistry::open(&root.join("pin-connections")).unwrap(),
+                2,
+                1,
+            )
+            .unwrap(),
+        );
+        pool.register_local_target(&location.binding.nqn, path.clone());
+        let worker_pool = pool.clone();
+        let lease = db.clients[0]
+            .control(move |client| {
+                client.set_live_pool(worker_pool.clone());
+                let binding = &location.binding;
+                let target = LiveConnectTarget {
+                    nqn: binding.nqn.clone(),
+                    uuid: binding.uuid,
+                    nsid: binding.nsid,
+                    bytes: binding.bytes,
+                    block_size: binding.block_size,
+                    address: binding.address.clone(),
+                    service: binding.service,
+                    transport: binding.transport,
+                    spdk: binding.spdk.clone(),
+                    geometry: Default::default(),
+                };
+                let (lease, _, _) = worker_pool.acquire_pinned(
+                    &target,
+                    "nqn.2026-01.test:checkpoint-pin",
+                    [1; 16],
+                    LiveNamespaceAccess::ReadOnly,
+                    Instant::now() + Duration::from_secs(5),
+                    client.export_pin_request(epoch, &location.segment, binding),
+                )?;
+                client.release_live_epoch_pin(epoch, locations.epoch_pin_token)?;
+                Ok(lease)
+            })
+            .unwrap();
+        db.live_pool = Some(pool);
+        db.retire_history_before(IndexReadCut::Latest).unwrap();
+        assert!(db.healthy);
+        assert!(path.exists(), "busy controller must defer file retirement");
+        drop(lease);
+        db.retire_history_before(IndexReadCut::Latest).unwrap();
+        assert!(db.healthy);
+        assert!(
+            !path.exists(),
+            "next checkpoint must retire the released file"
+        );
     }
 
     #[test]

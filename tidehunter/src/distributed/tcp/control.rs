@@ -1564,8 +1564,11 @@ impl ControlContext {
     fn permits_recovery_control(&self, request: &Request) -> bool {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
-            self.recoverable_live_failure.load(Ordering::Acquire)
-                && matches!(request, Request::Status { .. } | Request::Fence { .. })
+            // Terminal publication does not revoke idle exports. Their pool
+            // must still be able to release pins after confirmed disconnects.
+            matches!(request, Request::ReleaseLiveExportPin { .. })
+                || (self.recoverable_live_failure.load(Ordering::Acquire)
+                    && matches!(request, Request::Status { .. } | Request::Fence { .. }))
         }
         #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
         {
@@ -1600,7 +1603,8 @@ impl ControlContext {
         if !self.poison_pending.load(Ordering::Acquire) {
             return;
         }
-        // Existing NVMe pins must drain before terminal authority is published.
+        // Record/sealed pins protect in-flight I/O. Idle controller pins protect
+        // exports only and must not delay terminal authority publication.
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let Some(leases) = self.nvmeof_leases.try_lock() else {
             return;
@@ -2120,6 +2124,19 @@ impl ControlContext {
             self.finish_poison_if_quiescent();
             return Ok(Response::NvmeofEpochReleased);
         }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Request::ReleaseLiveExportPin { epoch, token } = &request {
+            let result = self
+                .inventory
+                .lock()
+                .release_live_export_pin(*epoch, *token);
+            if result.is_err() && !self.inventory.lock().healthy {
+                self.poison_readers();
+            }
+            result?;
+            self.finish_poison_if_quiescent();
+            return Ok(Response::NvmeofEpochReleased);
+        }
         // Admission can precede an earlier command's panic or uncertain I/O.
         // Queued work must recheck terminal health before decoding or mutation.
         if (self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire))
@@ -2467,6 +2484,16 @@ impl ControlContext {
                 )
             }
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::AcquireLiveExportPin {
+                epoch,
+                segment,
+                binding,
+            } => self
+                .inventory
+                .lock()
+                .acquire_live_export_pin(epoch, &segment, &binding)
+                .map(Response::NvmeofEpochPinned),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::LiveTargetStats => {
                 let inventory = self.inventory.lock();
                 let target = inventory
@@ -2510,7 +2537,9 @@ impl ControlContext {
                 Ok(Response::NvmeofEpochPinned(token))
             }
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ReleaseNvmeofEpochPin { .. } | Request::ReleaseLiveEpochPin { .. } => {
+            Request::ReleaseNvmeofEpochPin { .. }
+            | Request::ReleaseLiveEpochPin { .. }
+            | Request::ReleaseLiveExportPin { .. } => {
                 unreachable!("release handled before health check")
             }
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

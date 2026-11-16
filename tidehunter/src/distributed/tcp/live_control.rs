@@ -6,6 +6,179 @@ use crate::distributed::nvmeof::live_storage::{
 };
 use crate::distributed::nvmeof::live_target::LiveTargetBinding;
 
+/// Immutable authenticated connection recipe shared by cold pool operations.
+pub(crate) struct LivePinRecipe {
+    pub(crate) key: (String, [u8; 32], u32),
+    tls: TlsFiles,
+    config: ClientTlsConfig,
+    timeout: Duration,
+    expected: PartitionConfig,
+    shape: KeyShape,
+}
+
+impl LivePinRecipe {
+    pub(crate) fn new(
+        endpoint: &str,
+        tls: &TlsFiles,
+        config: &ClientTlsConfig,
+        timeout: Duration,
+        expected: &PartitionConfig,
+        shape: &KeyShape,
+    ) -> Self {
+        Self {
+            key: (endpoint.to_owned(), config.identity, expected.partition),
+            tls: tls.clone(),
+            config: config.clone(),
+            timeout,
+            expected: expected.clone(),
+            shape: shape.clone(),
+        }
+    }
+}
+
+pub(crate) struct LiveExportPinRequest<'a> {
+    pub(crate) recipe: &'a Arc<LivePinRecipe>,
+    pub(crate) epoch: u64,
+    pub(crate) segment: &'a LiveWalSegment,
+    pub(crate) binding: &'a LiveTargetBinding,
+}
+
+/// One metadata session per owner, never a caller's data/control session.
+/// This per-owner lock is cold-path only; cache hits never acquire it.
+pub(crate) struct LiveExportPinControl {
+    #[cfg(test)]
+    lose_next_reply: std::sync::atomic::AtomicBool,
+    recipe: Arc<LivePinRecipe>,
+    client: Mutex<Option<Client>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LivePinAcquireError {
+    pub(crate) error: io::Error,
+    pub(crate) outcome_unknown: bool,
+}
+
+impl LiveExportPinControl {
+    pub(crate) fn new(recipe: Arc<LivePinRecipe>) -> Self {
+        Self {
+            recipe,
+            client: Mutex::new(None),
+            #[cfg(test)]
+            lose_next_reply: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lose_next_reply(&self) {
+        // Independent test fault flag, read only after a real owner reply.
+        self.lose_next_reply.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn acquire(
+        self: &Arc<Self>,
+        request: &LiveExportPinRequest<'_>,
+    ) -> Result<LiveExportPin, LivePinAcquireError> {
+        let mut slot = self.client.lock();
+        // Only a new acquisition may replace a failed session. Release must
+        // retain an uncertain token for the next authority fence, not reconnect.
+        if slot.as_ref().is_none_or(|client| client.broken) {
+            *slot = Some(
+                Client::connect_shared(
+                    &self.recipe.key.0,
+                    &self.recipe.tls,
+                    self.recipe.config.clone(),
+                    self.recipe.timeout,
+                    self.recipe.expected.clone(),
+                    &self.recipe.shape,
+                )
+                .map_err(|error| LivePinAcquireError {
+                    error: io::Error::other(error),
+                    outcome_unknown: false,
+                })?,
+            );
+        }
+        let client = slot.as_mut().ok_or_else(|| LivePinAcquireError {
+            error: io::Error::other("export pin session unavailable"),
+            outcome_unknown: false,
+        })?;
+        let response = client
+            .request(Request::AcquireLiveExportPin {
+                epoch: request.epoch,
+                segment: request.segment.clone(),
+                binding: request.binding.clone(),
+            })
+            .map_err(|error| LivePinAcquireError {
+                error: io::Error::other(error),
+                outcome_unknown: client.broken,
+            })?;
+        #[cfg(test)]
+        // Independent test fault flag; the owner has already executed the RPC.
+        if self.lose_next_reply.swap(false, Ordering::Relaxed) {
+            client.broken = true;
+            client
+                .stream
+                .sock
+                .socket
+                .shutdown(std::net::Shutdown::Both)
+                .map_err(|error| LivePinAcquireError {
+                    error,
+                    outcome_unknown: true,
+                })?;
+            return Err(LivePinAcquireError {
+                error: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "injected lost export pin reply",
+                ),
+                outcome_unknown: true,
+            });
+        }
+        match response {
+            Response::NvmeofEpochPinned(token) if token != [0; 16] => Ok(LiveExportPin {
+                control: self.clone(),
+                epoch: request.epoch,
+                token,
+            }),
+            _ => {
+                client.broken = true;
+                Err(LivePinAcquireError {
+                    error: io::Error::other("invalid live export pin response"),
+                    outcome_unknown: true,
+                })
+            }
+        }
+    }
+}
+
+pub(crate) struct LiveExportPin {
+    control: Arc<LiveExportPinControl>,
+    epoch: u64,
+    token: [u8; 16],
+}
+
+impl LiveExportPin {
+    /// Caller has confirmed that the controller is gone. An error retains the
+    /// token; it may only be discarded after a subsequent authority fence.
+    pub(crate) fn release(&mut self) -> io::Result<()> {
+        let mut slot = self.control.client.lock();
+        let client = slot
+            .as_mut()
+            .ok_or_else(|| io::Error::other("export pin release session unavailable"))?;
+        match client
+            .request(Request::ReleaseLiveExportPin {
+                epoch: self.epoch,
+                token: self.token,
+            })
+            .map_err(io::Error::other)?
+        {
+            Response::NvmeofEpochReleased => Ok(()),
+            _ => {
+                client.broken = true;
+                Err(io::Error::other("invalid live export pin release response"))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LiveExportInfo {
     pub mode: LiveExportMode,
@@ -129,6 +302,35 @@ pub(super) struct LiveRecoveryWire {
 }
 
 impl Client {
+    /// Runs on the live lane owner after its CQEs and grant leases retire.
+    pub(crate) fn drain_poisoned_live_pool(&self) -> Result<(), TcpError> {
+        if let Some(pool) = &self.live_pool {
+            pool.drain_idle(Instant::now() + self.timeout)
+                .map_err(TcpError::component)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_config_for_test(&self) -> Option<LiveClientConfig> {
+        self.live_config.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn export_pin_request<'a>(
+        &'a self,
+        epoch: u64,
+        segment: &'a LiveWalSegment,
+        binding: &'a LiveTargetBinding,
+    ) -> LiveExportPinRequest<'a> {
+        LiveExportPinRequest {
+            recipe: &self.live_pin_recipe,
+            epoch,
+            segment,
+            binding,
+        }
+    }
+
     pub(crate) fn open_live_exports(&mut self, authority_epoch: u64) -> Result<(), TcpError> {
         use super::super::nvmeof::live_metrics::LiveTimingStage;
         let started = Instant::now();

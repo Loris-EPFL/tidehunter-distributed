@@ -1192,7 +1192,7 @@ impl LiveReadCache {
         let since = *state.connect_since.get_or_insert_with(Instant::now);
         let connect_deadline = state.deadline.min(since + connect_timeout);
         let id = self.next_grant;
-        match Self::connect_grant(client, location, pin, id, connect_deadline) {
+        match Self::connect_grant(client, epoch, location, pin, id, connect_deadline) {
             Ok(mut grant) => {
                 self.next_grant += 1;
                 self.clock += 1;
@@ -1351,6 +1351,7 @@ impl LiveReadCache {
         };
         match Self::connect_scope(
             client,
+            epoch,
             target,
             scope,
             None,
@@ -1384,6 +1385,7 @@ impl LiveReadCache {
 
     fn connect_grant(
         client: &Client,
+        authority_epoch: u64,
         location: LiveRecordLocation,
         token: [u8; 16],
         id: u64,
@@ -1414,6 +1416,7 @@ impl LiveReadCache {
         };
         Self::connect_scope(
             client,
+            authority_epoch,
             target,
             GrantScope::File(location),
             Some(token),
@@ -1429,6 +1432,7 @@ impl LiveReadCache {
     #[allow(clippy::too_many_arguments)]
     fn connect_scope(
         client: &Client,
+        authority_epoch: u64,
         target: LiveConnectTarget,
         mut scope: GrantScope,
         token: Option<[u8; 16]>,
@@ -1448,6 +1452,22 @@ impl LiveReadCache {
                 config.host_id,
                 access,
                 connect_deadline,
+            )
+        } else if let GrantScope::File(location) = &scope
+            && !location.binding.permanent
+        {
+            pool.acquire_pinned(
+                &target,
+                &config.host_nqn,
+                config.host_id,
+                access,
+                connect_deadline,
+                super::LiveExportPinRequest {
+                    recipe: &client.live_pin_recipe,
+                    epoch: authority_epoch,
+                    segment: &location.segment,
+                    binding: &location.binding,
+                },
             )
         } else {
             pool.acquire(
@@ -1899,6 +1919,292 @@ pub(crate) mod tests {
     use crate::distributed::nvmeof::live_namespace::LiveNamespace;
     use crate::distributed::types::PhysicalValueAddress;
     use std::io::{Seek, SeekFrom, Write};
+
+    struct ExportPoolFixture {
+        owner: super::super::leased_tests::Fixture,
+        client: Client,
+        pool: Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>,
+        leased: super::super::LiveLeased,
+        target: LiveConnectTarget,
+        _dir: tempdir::TempDir,
+    }
+
+    impl ExportPoolFixture {
+        fn new() -> Self {
+            use crate::distributed::durability::DurabilityTier;
+            use crate::distributed::nvmeof::{
+                live_connect::LiveConnectionRegistry, live_pool::LiveControllerPool,
+            };
+            let owner = super::super::leased_tests::Fixture::single_partition(
+                DurabilityTier::Native,
+                16384,
+            );
+            let mut client = owner.writer();
+            let leased = client.lease_live_extent(1).unwrap();
+            let binding = &leased.binding;
+            let target = LiveConnectTarget {
+                nqn: binding.nqn.clone(),
+                uuid: binding.uuid,
+                nsid: binding.nsid,
+                bytes: binding.bytes,
+                block_size: binding.block_size,
+                address: binding.address.clone(),
+                service: binding.service,
+                transport: binding.transport,
+                spdk: binding.spdk.clone(),
+                geometry: Default::default(),
+            };
+            let dir = tempdir::TempDir::new("export-pool-regression").unwrap();
+            let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+            let pool = Arc::new(LiveControllerPool::new(registry, 1, 1).unwrap());
+            pool.register_local_target(&target.nqn, leased.extent.segment.path.clone());
+            client.live_pool = Some(pool.clone());
+            Self {
+                owner,
+                client,
+                pool,
+                leased,
+                target,
+                _dir: dir,
+            }
+        }
+
+        fn acquire(&self) -> Arc<LiveControllerLease> {
+            let config = self.client.live_config.as_ref().unwrap();
+            self.pool
+                .acquire_pinned(
+                    &self.target,
+                    &config.host_nqn,
+                    config.host_id,
+                    LiveNamespaceAccess::ReadWrite,
+                    Instant::now() + Duration::from_secs(5),
+                    super::super::LiveExportPinRequest {
+                        recipe: &self.client.live_pin_recipe,
+                        epoch: 1,
+                        segment: &self.leased.extent.segment,
+                        binding: &self.leased.binding,
+                    },
+                )
+                .unwrap()
+                .0
+        }
+
+        fn pin_count(&self) -> usize {
+            self.owner.node.inventory.lock().live_export_pins.len()
+        }
+
+        fn has_export(&self) -> bool {
+            let segment = &self.leased.extent.segment;
+            let file = crate::distributed::nvmeof::live_target::LiveFileIdentity {
+                path: segment.path.clone(),
+                device: segment.device,
+                inode: segment.inode,
+                bytes: segment.bytes,
+                block_size: segment.block_size,
+            };
+            self.owner
+                .node
+                .inventory
+                .lock()
+                .live_target
+                .as_ref()
+                .unwrap()
+                .binding_for_file(&file)
+                .is_some()
+        }
+
+        fn close_extent(
+            &mut self,
+            lease: &super::super::LiveLeased,
+            frame: &[u8],
+        ) -> super::super::LiveLeased {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lease.extent.segment.path)
+                .unwrap();
+            let offset = lease.extent.start % lease.extent.segment.bytes;
+            if !frame.is_empty() {
+                file.write_all_at(frame, offset).unwrap();
+            }
+            let mut skip = [0; 4096];
+            skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+            file.write_all_at(&skip, offset + frame.len() as u64)
+                .unwrap();
+            self.client
+                .adopt_live_extent(
+                    1,
+                    lease.extent.token,
+                    lease.extent.start + frame.len() as u64,
+                    true,
+                    true,
+                )
+                .unwrap()
+                .next
+                .unwrap()
+        }
+
+        fn rollover(&mut self) -> super::super::LiveLeased {
+            let first = self.leased.clone();
+            let next = self.close_extent(&first, &[]);
+            let next = self.close_extent(&next, &[]);
+            assert_eq!(next.extent.segment.file_index, 1);
+            self.owner
+                .node
+                .inventory
+                .lock()
+                .reap_idle_live_segments(1)
+                .unwrap();
+            next
+        }
+    }
+
+    #[test]
+    fn idle_pooled_controller_keeps_export_across_rollover_until_disconnect() {
+        let mut fixture = ExportPoolFixture::new();
+        let started = Instant::now();
+        drop(fixture.acquire());
+        let cold_acquire = started.elapsed();
+        fixture.rollover();
+        assert_eq!(fixture.pin_count(), 1);
+        assert!(fixture.has_export());
+        let started = Instant::now();
+        fixture
+            .pool
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        eprintln!(
+            "export_pin_local cold_acquire_with_handshake_us={} disconnect_and_release_us={}",
+            cold_acquire.as_micros(),
+            started.elapsed().as_micros()
+        );
+        assert_eq!(fixture.pin_count(), 0);
+        assert!(!fixture.has_export());
+    }
+
+    #[test]
+    fn capacity_eviction_releases_only_disconnected_entry_and_drop_releases_last() {
+        let mut fixture = ExportPoolFixture::new();
+        drop(fixture.acquire());
+        let next = fixture.rollover();
+        let mut target = fixture.target.clone();
+        target.nqn = next.binding.nqn.clone();
+        target.uuid = next.binding.uuid;
+        target.nsid = next.binding.nsid;
+        fixture
+            .pool
+            .register_local_target(&target.nqn, next.extent.segment.path.clone());
+        let config = fixture.client.live_config.as_ref().unwrap();
+        let (lease, _, timings) = fixture
+            .pool
+            .acquire_pinned(
+                &target,
+                &config.host_nqn,
+                config.host_id,
+                LiveNamespaceAccess::ReadWrite,
+                Instant::now() + Duration::from_secs(5),
+                super::super::LiveExportPinRequest {
+                    recipe: &fixture.client.live_pin_recipe,
+                    epoch: 1,
+                    segment: &next.extent.segment,
+                    binding: &next.binding,
+                },
+            )
+            .unwrap();
+        assert!(timings.disconnect.is_some());
+        assert_eq!(fixture.pin_count(), 1);
+        assert!(!fixture.has_export());
+        drop(lease);
+        fixture.client.live_pool.take();
+        drop(fixture.pool);
+        assert!(
+            fixture
+                .owner
+                .node
+                .inventory
+                .lock()
+                .live_export_pins
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn export_pin_eviction_disconnects_before_release_and_failed_delete_keeps_pin() {
+        let mut fixture = ExportPoolFixture::new();
+        drop(fixture.acquire());
+        fixture.rollover();
+        let result = fixture.pool.evict_for_test(&fixture.target.nqn, || {
+            assert_eq!(fixture.pin_count(), 1);
+            assert!(fixture.has_export());
+            Err(std::io::Error::other("injected delete failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fixture.pin_count(), 1);
+        assert!(fixture.has_export());
+        fixture
+            .pool
+            .evict_for_test(&fixture.target.nqn, || {
+                assert_eq!(fixture.pin_count(), 1);
+                assert!(fixture.has_export());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fixture.pin_count(), 0);
+        assert!(!fixture.has_export());
+    }
+
+    #[test]
+    fn writer_and_reader_share_one_connection_pin_released_once() {
+        use crate::distributed::group::CompleteGroup;
+        use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
+        let mut fixture = ExportPoolFixture::new();
+        let writer = fixture.acquire();
+        let batch = fixture.owner.batch(0);
+        let group = CompleteGroup::new_live(
+            &fixture.client.shape,
+            vec![batch.clone()],
+            fixture.owner.config.partition.batch_limits,
+            fixture.owner.config.partition.group_limits,
+        )
+        .unwrap();
+        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let leased = fixture.leased.clone();
+        let _next = fixture.close_extent(&leased, &frame);
+        let log = fixture.owner.node.inventory.lock().active(1).unwrap();
+        let receipt = log.receipt_page(0, 1).unwrap()[0];
+        let reference = batch.record_reference(receipt.address(), 0).unwrap();
+        let locations = fixture
+            .client
+            .resolve_live_records(1, &[reference])
+            .unwrap();
+        let grant = LiveReadCache::connect_grant(
+            &fixture.client,
+            1,
+            locations.entries[0].clone(),
+            locations.epoch_pin_token,
+            1,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .map_err(|_| "reader setup failed")
+        .unwrap();
+        assert!(Arc::ptr_eq(&writer, grant.lease.as_ref().unwrap()));
+        assert_eq!(fixture.pin_count(), 1);
+        let mut cache = LiveReadCache::default();
+        cache.grants.push(grant);
+        cache.close(&mut fixture.client, 1).unwrap();
+        assert!(fixture.owner.node.inventory.lock().live_pins.is_empty());
+        assert_eq!(fixture.pin_count(), 1);
+        drop(writer);
+        fixture
+            .pool
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(fixture.pin_count(), 0);
+        fixture
+            .pool
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    }
 
     pub(crate) fn pause_inline_submitted(
         cache: &mut LiveReadCache,
