@@ -24,6 +24,8 @@ use tidehunter::minibytes::Bytes;
 use scylla::errors::PrepareError;
 use scylla::errors::{DbError, ExecutionError, RequestAttemptError};
 
+pub mod replay;
+
 fn is_cql_request_timeout(error: &RequestAttemptError) -> bool {
     matches!(
         error,
@@ -78,6 +80,8 @@ struct Options {
     #[serde(default)]
     password_env: Option<String>,
     tls_ca_file: Option<PathBuf>,
+    #[serde(default)]
+    replay_server_config_receipt: Option<PathBuf>,
 }
 fn default_consistency() -> String {
     "quorum".to_owned()

@@ -77,6 +77,8 @@ impl ReplayConfig {
                 | "garnet"
                 | "kvrocks"
                 | "foundationdb"
+                | "tikv"
+                | "cassandra"
         ) {
             return Err(Box::new(UnsupportedReplayBackend(
                 self.backend.kind.clone(),
@@ -87,7 +89,13 @@ impl ReplayConfig {
         }
         if matches!(
             self.backend.kind.as_str(),
-            "valkey_tcp" | "valkey_rdma" | "garnet" | "kvrocks" | "foundationdb"
+            "valkey_tcp"
+                | "valkey_rdma"
+                | "garnet"
+                | "kvrocks"
+                | "foundationdb"
+                | "tikv"
+                | "cassandra"
         ) {
             crate::backends::validate_options(&self.backend.kind, &self.backend.options)?;
         }
@@ -208,6 +216,19 @@ impl ReplayConfig {
         if self.backend.kind == "foundationdb" {
             resources["foundationdb_admission"] =
                 crate::backends::foundationdb::replay::admit(&mut prepared)?;
+        }
+        if self.backend.kind == "tikv" {
+            prepare_physical_keys(&mut prepared, false);
+            #[cfg(feature = "tikv")]
+            {
+                resources["tikv_admission"] = crate::backends::tikv::replay::admit(&prepared)?;
+            }
+        }
+        #[cfg(feature = "cassandra")]
+        if self.backend.kind == "cassandra" {
+            crate::backends::cassandra::replay::prepare_keys(&mut prepared);
+            resources["cassandra_admission"] =
+                crate::backends::cassandra::replay::admit(&prepared)?;
         }
         if self.backend.kind == "native" {
             resources["native_index_geometry"] = NativeReplayBackend::validate_geometry(
@@ -1372,6 +1393,23 @@ async fn open_backend(
         "valkey_tcp" | "valkey_rdma" | "garnet" | "kvrocks" => {
             let backend = crate::backends::resp_replay::RespReplayBackend::open(
                 &config.backend.kind,
+                &config.backend.options,
+            )
+            .await?;
+            let info = backend.info();
+            Ok((Arc::new(backend), info))
+        }
+        #[cfg(feature = "tikv")]
+        "tikv" => {
+            let backend =
+                crate::backends::tikv::replay::TikvReplayBackend::open(&config.backend.options)
+                    .await?;
+            let info = backend.info();
+            Ok((Arc::new(backend), info))
+        }
+        #[cfg(feature = "cassandra")]
+        "cassandra" => {
+            let backend = crate::backends::cassandra::replay::CassandraReplayBackend::open(
                 &config.backend.options,
             )
             .await?;

@@ -13,6 +13,8 @@ use crate::backend::{BackendInfo, BackendResult, BatchAtomicity, KvBackend, unsu
 use reqwest::Url;
 use tonic::Code;
 
+pub mod replay;
+
 fn invalid(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     io::Error::new(io::ErrorKind::InvalidInput, message.into()).into()
 }
