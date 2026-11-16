@@ -4027,16 +4027,22 @@ class Controller:
         return mirrors
 
     def prepared_tide_options(self, job, directory, spans=None):
-        source = job["sealed_dataset"]["source_id"]
-        focused_hybrid = (job.get("case_kind") is not None and job["backend"] in cloud_campaign.NVME_BACKENDS
-                          and job.get("nvmeof_route") == "sealed_read")
-        transport = ("tidehunter_verbs_native" if focused_hybrid else
-                     "tcp" if job["backend"] == "tidehunter_tcp" or job["backend"] in cloud_campaign.NVME_BACKENDS
-                     else job["backend"])
-        polling = job.get("owner_polling", "adaptive")
+        def shared_identity(candidate):
+            source = candidate["sealed_dataset"]["source_id"]
+            focused_hybrid = (candidate.get("case_kind") is not None
+                              and candidate["backend"] in cloud_campaign.NVME_BACKENDS
+                              and candidate.get("nvmeof_route") == "sealed_read")
+            transport = ("tidehunter_verbs_native" if focused_hybrid else
+                         "tcp" if candidate["backend"] == "tidehunter_tcp"
+                         or candidate["backend"] in cloud_campaign.NVME_BACKENDS
+                         else candidate["backend"])
+            return (source, transport, cloud_campaign.durability_tier(candidate),
+                    candidate.get("owner_polling", "adaptive"))
+
+        identity = shared_identity(job)
+        transport, polling = identity[1], identity[3]
         if polling not in ("adaptive", "busy"):
             raise ValueError("owner_polling must be adaptive or busy")
-        identity = (source, transport, cloud_campaign.durability_tier(job), polling)
         if self.shared_tide is not None and self.shared_tide["identity"] != identity:
             if self.active_nvme is not None:
                 raise SafetyError("cannot replace a dataset with outstanding NVMe namespaces")
@@ -4048,7 +4054,23 @@ class Controller:
                 name += "-" + polling + "-" + job["case_id"]
             block = guarded(self.root / "datasets" / name, self.root)
             block.mkdir(parents=True, exist_ok=False)
-            options = record_phase_span(spans, "backend_deploy", self.prepare_tide, job, block)
+            group = [job] + [
+                candidate for candidate in controller_matrix(self.config["spec"])
+                if "sealed_dataset" in candidate
+                and shared_identity(candidate) == identity
+                and candidate["case_id"] != job["case_id"]
+            ]
+            # Match RemoteDatabaseConfig::MAX_AUTO_READ_LANES. Missing/None
+            # stays automatic on each reader, but owners reserve for its cap.
+            read_lanes = max(64 if candidate.get("read_lanes") is None
+                             else candidate["read_lanes"] for candidate in group)
+            dump(block / "preparation-sizing.json", {
+                "read_lanes": read_lanes,
+                "job_ids": [candidate["case_id"] for candidate in group],
+            })
+            preparation_job = dict(job, read_lanes=read_lanes)
+            options = record_phase_span(
+                spans, "backend_deploy", self.prepare_tide, preparation_job, block)
             prep_config = cloud_campaign.make_run_config(job, block, options, self.config["source_revision"],
                                                         min(600, int(self.remaining())))
             if job.get("case_kind") == "hybrid_put":
@@ -4101,7 +4123,10 @@ class Controller:
                                 "options": options, "prepared": prepared, "ready": ready, "mirror_roots": mirrors}
         options = copy.deepcopy(self.shared_tide["options"])
         options["evidence"] = str(directory / "read-evidence")
-        options["external_remote_config"]["read_lanes"] = job["read_lanes"]
+        if "read_lanes" in job:
+            options["external_remote_config"]["read_lanes"] = job["read_lanes"]
+        else:
+            options["external_remote_config"].pop("read_lanes", None)
         if "live_pin_read_lanes" in job:
             options["external_remote_config"]["pin_read_lanes"] = job["live_pin_read_lanes"]
         else:

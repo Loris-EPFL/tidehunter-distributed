@@ -784,14 +784,25 @@ class ControllerBoundaryTests(unittest.TestCase):
         self.assertEqual(self.c.shared_tide['options'], options)
         self.c.prepare_tide.assert_not_called()
 
+    def test_shared_auto_reader_does_not_inherit_preparation_lane_pin(self):
+        options = {'external_remote_config': {'read_lanes': 64}, 'evidence': 'old'}
+        self.c.shared_tide = {'identity': ('source', 'tcp', 'synchronous', 'adaptive'),
+                              'options': copy.deepcopy(options)}
+        job = {'backend': 'tidehunter_tcp', 'sealed_dataset': {'source_id': 'source'},
+               'durability_tier': 'synchronous'}
+        actual = self.c.prepared_tide_options(job, self.root / 'case')
+        self.assertNotIn('read_lanes', actual['external_remote_config'])
+        self.assertEqual(self.c.shared_tide['options'], options)
+
     def test_a_different_durability_tier_never_reuses_the_prepared_owners(self):
         # Owners run one tier for their whole life; a case at another tier needs fresh owners.
         self.c.shared_tide = {'identity': ('source', 'tcp', 'native'), 'options': {}}
         job = {'backend': 'tidehunter_nvme_tcp', 'sealed_dataset': {'source_id': 'source'},
-               'durability_tier': 'synchronous', 'read_lanes': 1}
+               'durability_tier': 'synchronous', 'read_lanes': 1, 'case_id': 'fresh'}
         self.c.stop_tide = Mock()
         self.c.prepare_tide = Mock(side_effect=RuntimeError('fresh owners requested'))
-        with self.assertRaisesRegex(RuntimeError, 'fresh owners requested'):
+        with patch.object(controller, 'controller_matrix', return_value=[job]), \
+                self.assertRaisesRegex(RuntimeError, 'fresh owners requested'):
             self.c.prepared_tide_options(job, self.root / 'case')
         self.c.stop_tide.assert_called_once_with()
 
