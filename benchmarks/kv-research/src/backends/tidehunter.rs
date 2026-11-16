@@ -606,15 +606,12 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
 }
 // Checkpoint phase sums are charged on completion, including work begun before
 // the measurement boundary. They are not per-request latency or network clocks.
-const COORDINATOR_INTERVAL_COUNTERS: [&str; 36] = [
+const COORDINATOR_INTERVAL_COUNTERS: [&str; 33] = [
     "write_storage_wait_ns",
     "write_publication_ns",
     "write_dispatch_ns",
     "write_preparation_admission_ns",
     "write_authority_prepare_ns",
-    "write_pool_prepare_ns",
-    "write_pool_suffix_replans",
-    "write_pool_suffix_replanned_batches",
     "write_authority_admit_ns",
     "write_authority_windows",
     "write_authority_batches",
@@ -1586,9 +1583,6 @@ impl KvBackend for TidehunterBackend {
                     name,
                     "read_profile_live_inline"
                         | "write_authority_prepare_ns"
-                        | "write_pool_prepare_ns"
-                        | "write_pool_suffix_replans"
-                        | "write_pool_suffix_replanned_batches"
                         | "write_authority_admit_ns"
                         | "write_authority_windows"
                         | "write_authority_batches"
@@ -3194,9 +3188,6 @@ mod tests {
         assert!(delta.values().all(|value| *value == 5));
         for name in [
             "write_authority_prepare_ns",
-            "write_pool_prepare_ns",
-            "write_pool_suffix_replans",
-            "write_pool_suffix_replanned_batches",
             "write_authority_admit_ns",
             "write_authority_windows",
             "write_authority_batches",

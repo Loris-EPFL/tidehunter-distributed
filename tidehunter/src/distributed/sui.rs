@@ -1047,15 +1047,6 @@ impl Db {
                 );
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
-                set("write_pool_prepare_ns", snapshot.pipeline.prepare_task_ns);
-                set(
-                    "write_pool_suffix_replans",
-                    snapshot.pipeline.prepare_suffix_replans,
-                );
-                set(
-                    "write_pool_suffix_replanned_batches",
-                    snapshot.pipeline.prepare_suffix_replanned_batches,
-                );
                 set("write_authority_admit_ns", authority.authority_admit_ns);
                 set("write_authority_windows", authority.authority_windows);
                 set("write_authority_batches", authority.authority_batches);
@@ -1359,15 +1350,6 @@ impl Db {
                 );
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
-                set("write_pool_prepare_ns", snapshot.pipeline.prepare_task_ns);
-                set(
-                    "write_pool_suffix_replans",
-                    snapshot.pipeline.prepare_suffix_replans,
-                );
-                set(
-                    "write_pool_suffix_replanned_batches",
-                    snapshot.pipeline.prepare_suffix_replanned_batches,
-                );
                 set("write_authority_admit_ns", authority.authority_admit_ns);
                 set("write_authority_windows", authority.authority_windows);
                 set("write_authority_batches", authority.authority_batches);

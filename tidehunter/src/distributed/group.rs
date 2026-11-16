@@ -157,71 +157,6 @@ impl LiveFrame {
         frame[4..8].copy_from_slice(&crc.to_be_bytes());
         Ok(())
     }
-
-    /// Fill disjoint final member slices on the bounded preparation pool.
-    /// The guard's mutable borrow and every worker end before I/O submission.
-    pub(crate) fn encode_into_parallel(
-        &self,
-        frame: &mut [u8],
-        pool: &rayon::ThreadPool,
-    ) -> Result<(), GroupError> {
-        if frame.len() != self.len {
-            return Err(GroupError::InvalidFormat);
-        }
-        debug_assert!(pool.current_thread_index().is_none());
-        let mut checksums: smallvec::SmallVec<[crc32fast::Hasher; 16]> = self
-            .batches
-            .iter()
-            .map(|_| crc32fast::Hasher::new())
-            .collect();
-        let mut remaining = &mut frame[FRAME_HEADER_LEN + GROUP_HEADER_LEN..];
-        pool.in_place_scope(|scope| {
-            for (batch, checksum) in self.batches.iter().zip(&mut checksums) {
-                let encoded = batch.encoded();
-                // Construction checked each aligned member's size and the sum.
-                let len = (encoded.len() + FRAME_HEADER_LEN + 7) & !7;
-                let (member, rest) = remaining.split_at_mut(len);
-                remaining = rest;
-                scope.spawn(move |_| {
-                    let bytes = &mut member[FRAME_HEADER_LEN..FRAME_HEADER_LEN + encoded.len()];
-                    bytes.copy_from_slice(encoded);
-                    checksum.update(bytes);
-                });
-            }
-        });
-        let payload = &mut frame[FRAME_HEADER_LEN..];
-        payload[..8].copy_from_slice(MAGIC);
-        payload[8..10].copy_from_slice(&LIVE_FORMAT_VERSION.to_be_bytes());
-        payload[10..12].copy_from_slice(&LIVE_BLOCK_SHIFT.to_be_bytes());
-        payload[12..16].copy_from_slice(&(self.batches.len() as u32).to_be_bytes());
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&payload[..GROUP_HEADER_LEN]);
-        let mut end = GROUP_HEADER_LEN;
-        for ((batch, offset), checksum) in self
-            .batches
-            .iter()
-            .zip(self.batch_offsets())
-            .zip(&checksums)
-        {
-            let offset = offset as usize;
-            let len = batch.encoded().len();
-            payload[offset..offset + 4].copy_from_slice(&(len as u32).to_be_bytes());
-            payload[offset + 4..offset + FRAME_HEADER_LEN]
-                .copy_from_slice(&checksum.clone().finalize().to_be_bytes());
-            crc.update(&payload[offset..offset + FRAME_HEADER_LEN]);
-            crc.combine(checksum);
-            end = offset + FRAME_HEADER_LEN + len;
-            let padded = (end + 7) & !7;
-            payload[end..padded].fill(0);
-            crc.update(&payload[end..padded]);
-            end = padded;
-        }
-        payload[end..].fill(0);
-        crc.update(&payload[end..]);
-        frame[..4].copy_from_slice(&((self.len - FRAME_HEADER_LEN) as u32).to_be_bytes());
-        frame[4..8].copy_from_slice(&crc.finalize().to_be_bytes());
-        Ok(())
-    }
 }
 
 impl CompleteGroup {
@@ -577,10 +512,6 @@ mod tests {
         };
         let shape = shape();
         let keyspace = shape.iter_ks().next().unwrap().id();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
         for count in [1, 2, 31] {
             // Each uniform size plus one mixed-size group.
             for variant in 0..=sizes.len() {
@@ -615,9 +546,6 @@ mod tests {
                 let frame = LiveFrame::new(&shape, batches, bl, gl).unwrap();
                 let mut encoded = vec![0xa5; frame.len()];
                 frame.encode_into(&mut encoded).unwrap();
-                let mut parallel = vec![0x5a; frame.len()];
-                frame.encode_into_parallel(&mut parallel, &pool).unwrap();
-                assert_eq!(parallel, encoded, "count={count} variant={variant}");
                 assert_eq!(
                     encoded,
                     canonical.live_frame().unwrap(),

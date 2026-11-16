@@ -16,6 +16,9 @@ type PreparationPlan<'a> = (
 );
 type EncodedPreparation = Result<(CompleteBatch, u64), LocalDbError>;
 
+// Below 128 KiB the worker hand-off costs more than the digest computation.
+pub(super) const PARALLEL_PREPARATION_MIN_BYTES: usize = 128 * 1024;
+
 impl RemoteDatabase {
     /// Prepare a bounded borrowed window in parallel, then admit in input order.
     /// Caller-owned inputs are borrowed only until this synchronous call returns.
@@ -212,7 +215,7 @@ impl RemoteDatabase {
         let pool = self
             .preparation_pool
             .as_ref()
-            .filter(|_| parallel)
+            .filter(|_| parallel && plans.len() > 1)
             .and_then(|owner| owner.pool.clone());
         let parallel = pool.is_some();
         let prepared = if let Some(pool) = pool {
