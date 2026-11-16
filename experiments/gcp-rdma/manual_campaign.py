@@ -1002,6 +1002,10 @@ async def recover_cleanup(config, *, run_id, state_path, execute, artifacts=None
     path, parent = await _blocking(campaign.StateFile.recover, state_path, artifacts, run_id)
     if parent.get('run_id') != run_id or parent.get('project_id') != config.get('project_id'):
         raise ValueError('recovered parent identity mismatch')
+    if campaign.is_admission_refusal(parent):
+        if await _blocking(gcp_lease.read, artifacts, run_id) is not None:
+            raise RuntimeError('admission refusal has an unexpected active lease')
+        return parent
     if parent.get('cleanup_verified') is True and await _blocking(gcp_lease.read, artifacts, run_id) is None:
         return parent
     await _cleanup_joined(config, parent, path, artifacts, execute)
@@ -1399,6 +1403,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
                          'non_compute_quote_cents': surcharge_cents, 'weekly_limit_cents': weekly_limit,
                          'reservation_hours': duration // 3600},
               'reservation': {'cents': ceiling, 'region': 'us-central1',
+                              'instances': host_count,
                               'vcpus': int(config['machine_type'].rsplit('-', 1)[-1]) * host_count,
                               'local_ssds': gcp_runtime.LOCAL_SSD_COUNTS[config['machine_type']] * host_count,
                               'local_ssd_gib': gcp_runtime.LOCAL_SSD_COUNTS[config['machine_type']] * host_count * 14000},
@@ -1414,10 +1419,18 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     error = None
     result = None
     try:
-        quotas = await gcp_manual_preflight.quota_preflight(config, execute)
-        await _blocking(_start_lease, store, parent, path,
-                        max_runs=config.get('max_concurrent_runs', 3),
-                        ceiling_cents=config.get('active_run_limit_cents', CEILING_CENTS), quotas=quotas)
+        try:
+            quotas = await gcp_manual_preflight.quota_preflight(config, execute)
+            await _blocking(_start_lease, store, parent, path,
+                            max_runs=config.get('max_concurrent_runs', 3),
+                            ceiling_cents=config.get('active_run_limit_cents', CEILING_CENTS), quotas=quotas)
+        except BaseException:
+            # Every operation above is read-only or lifecycle-state storage.
+            # Child creation, package upload, create_policy and create_vm occur
+            # only below, after _start_lease returns. No compute resource can
+            # exist at this boundary; the recorder also proves no lease exists.
+            await _blocking(campaign.record_admission_refusal, store, parent, path)
+            raise
         await _blocking(_lease_owned, store, parent)
         await _blocking(_record, path, parent, 'budget')
         report = await _blocking(gcp_budget.reserve, store, parent['run_id'], ceiling, weekly_limit)

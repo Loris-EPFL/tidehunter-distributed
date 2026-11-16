@@ -23,7 +23,13 @@ PROJECT = 'mysten-research'
 MCP_CALL_SECONDS = 30
 READ_ATTEMPTS = 3
 CLEANUP_SECONDS = 600
+CREATE_ABSENCE_ROUNDS = 3
+CREATE_ABSENCE_SECONDS = 30
 TOCTOU = 'Name-based delete has a residual describe/delete TOCTOU race.'
+DEFINITIVE_CREATE_REJECTIONS = frozenset({
+    'QUOTA_EXCEEDED', 'ZONE_RESOURCE_POOL_EXHAUSTED',
+    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+})
 
 
 class ComputeError(RuntimeError):
@@ -32,6 +38,42 @@ class ComputeError(RuntimeError):
 
 class CreateConflict(ComputeError):
     pass
+
+
+class CommandFailed(ComputeError):
+    def __init__(self, response):
+        self.response = response
+        super().__init__('gcloud command failed: ' + str(response))
+
+
+class CreateRejected(ComputeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__('instance create rejected: ' + code)
+
+
+def _definitive_create_rejection(response):
+    """Accept only machine codes in an error JSON object, never error prose."""
+    value = response
+    if isinstance(value, dict) and 'error' not in value:
+        value = value.get('stdout') or value.get('text') or value.get('stderr')
+    if isinstance(value, (str, bytes)):
+        try:
+            value = json.loads(value)
+        except (ValueError, UnicodeError):
+            return None
+    error = value.get('error') if isinstance(value, dict) else None
+    if not isinstance(error, dict):
+        return None
+    codes = [error['code']] if isinstance(error.get('code'), str) else []
+    entries = error.get('errors', [])
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get('code'), str):
+            return None
+        codes.append(entry['code'])
+    return codes[0] if codes and all(code in DEFINITIVE_CREATE_REJECTIONS for code in codes) else None
 
 
 def _id(value):
@@ -57,7 +99,7 @@ def _json_response(response):
             diagnostic = ' '.join(str(response.get(k, '')) for k in ('stderr', 'stdout', 'text'))
             if re.search(r'(?i)\b(?:HTTP\s*409|code[=: ]+409|already exists|alreadyexists)\b', diagnostic):
                 raise CreateConflict('resource name collision')
-            raise ComputeError('gcloud command failed: ' + str(response))
+            raise CommandFailed(response)
         if 'stdout' in response:
             response = response['stdout']
         elif 'text' in response:
@@ -142,7 +184,7 @@ class Compute:
         if parse_time(self.state['deadline']) <= dt.datetime.now(dt.timezone.utc):
             raise ComputeError('absolute deadline already passed')
 
-    async def _call(self, argv, *, guest=False, read_only=False, deadline=None, allow_empty=False):
+    async def _call(self, argv, *, guest=False, read_only=False, deadline=None, allow_empty=False, creation=False):
         args = argv + ['--project=' + PROJECT, '--quiet', '--format=json', '--verbosity=error']
         if guest:
             args.append('--impersonate-service-account=' + GUEST_SERVICE_ACCOUNT)
@@ -161,6 +203,10 @@ class Compute:
                 if not read_only or attempt + 1 == READ_ATTEMPTS:
                     raise ComputeError('MCP call timed out; outcome may be unknown') from exc
                 continue
+            if creation:
+                rejection = _definitive_create_rejection(response)
+                if rejection is not None:
+                    raise CreateRejected(rejection)
             if allow_empty and response in ({'text': ''}, {'stdout': '', 'exit_code': 0}):
                 return {}
             return _json_response(response)
@@ -298,6 +344,60 @@ class Compute:
         elif disk_id != _id(rec.get('disk_id')):
             raise ComputeError('guest disk ID mismatch')
         return disk
+
+    async def _resolve_failed_create(self, rec):
+        """Resolve a synchronous CLI failure by scoped observations, not its prose."""
+        target = 'projects/' + PROJECT + '/zones/' + ZONE + '/instances/' + rec['name']
+        target_url = 'https://www.googleapis.com/compute/v1/' + target
+        end = time.monotonic() + CREATE_ABSENCE_SECONDS
+        for round_index in range(CREATE_ABSENCE_ROUNDS):
+            try:
+                description = await self._call(
+                    ['compute', 'instances', 'describe', rec['name'], '--zone=' + ZONE],
+                    read_only=True, deadline=end)
+            except CommandFailed as exc:
+                # gcloud emits describe-notFound as prose even with --format=json.
+                # Require the exact queried resource; arbitrary 404 text is not proof.
+                try:
+                    result = _json_response({'stdout': exc.response.get('stdout', '')})
+                except ComputeError:
+                    result = None
+                error = result.get('error') if isinstance(result, dict) else None
+                diagnostic = str(exc.response.get('stderr', ''))
+                if not (isinstance(error, dict) and error.get('code') == 404
+                        or re.search(r"The resource '" + re.escape(target) + r"' was not found\b", diagnostic)):
+                    raise ComputeError('instance absence query failed') from exc
+            else:
+                error = description.get('error') if isinstance(description, dict) else None
+                if not isinstance(error, dict) or error.get('code') != 404:
+                    raise ComputeError('instance absence not confirmed')
+            operations = await self._call(
+                ['compute', 'operations', 'list', '--zones=' + ZONE,
+                 '--filter=targetLink=' + target_url + ' AND operationType=insert'],
+                read_only=True, deadline=end)
+            if not isinstance(operations, list) or len(operations) > 1:
+                raise ComputeError('ambiguous create operation list')
+            if operations:
+                operation = operations[0]
+                if (not isinstance(operation, dict)
+                        or not re.fullmatch(r'operation-[a-z0-9-]+', str(operation.get('name', '')))
+                        or not _end(operation.get('zone'), ZONE)
+                        or not _end(operation.get('targetLink'), target)
+                        or operation.get('operationType') != 'insert'):
+                    raise ComputeError('invalid create operation list')
+                rec['operation_name'] = operation['name']
+                self._save()
+                return
+            if round_index + 1 < CREATE_ABSENCE_ROUNDS:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    raise ComputeError('create absence verification deadline exhausted')
+                await asyncio.sleep(min(CREATE_ABSENCE_SECONDS / CREATE_ABSENCE_ROUNDS, remaining))
+        # Every round confirmed both absence and no insert. Normal cleanup must
+        # still verify VM/disk/policy absence before releasing the lease.
+        rec['uncertain'] = False
+        rec['create_absence_verified'] = True
+        self._save()
 
     async def _operation_done(self, rec):
         name = rec['operation_name']
@@ -442,11 +542,31 @@ class Compute:
         error = None
         response = None
         try:
-            response = await self._call(argv)
+            response = await self._call(argv, creation=True)
         except CreateConflict:
             rec['conflict'] = True
             self._save()
             raise
+        except CreateRejected as exc:
+            rec['uncertain'] = False
+            rec['create_rejection'] = exc.code
+            self._save()
+            raise
+        except CommandFailed as exc:
+            error = exc
+            if type(exc.response.get('exit_code')) is not int or exc.response['exit_code'] == 0:
+                raise  # An untyped transport failure is not a synchronous rejection.
+            # A failed CLI can still carry the accepted operation on stdout.
+            try:
+                response = _json_response({'stdout': exc.response.get('stdout', '')})
+            except ComputeError:
+                response = None
+            if not (isinstance(response, dict) and isinstance(response.get('name'), str)
+                    or isinstance(response, list) and len(response) == 1
+                    and isinstance(response[0], dict) and isinstance(response[0].get('name'), str)):
+                await self._resolve_failed_create(rec)
+                if not rec.get('operation_name'):
+                    raise ComputeError('instance create failed; absence verified') from exc
         except Exception as exc:
             error = exc
         if isinstance(response, list) and len(response) == 1:
@@ -457,6 +577,7 @@ class Compute:
                 raise ComputeError('invalid create operation name')
             rec['operation_name'] = operation_name
             self._save()
+        if rec.get('operation_name'):
             await self._operation_done(rec)
         try:
             vm = await self._ready_vm(rec)

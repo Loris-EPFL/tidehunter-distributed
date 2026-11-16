@@ -27,7 +27,7 @@ def state(index, cents=4000):
             'source_sha256': 'a' * 64, 'deadline': '2099-01-01T00:00:00Z',
             'instances': [], 'children': {},
             'reservation': {'cents': cents, 'region': 'us-central1', 'vcpus': 32,
-                            'local_ssds': 2, 'local_ssd_gib': 28000}}
+                            'instances': 2, 'local_ssds': 2, 'local_ssd_gib': 28000}}
 
 
 class RacingStore(CasStore):
@@ -145,7 +145,7 @@ class FleetAdmissionTests(unittest.TestCase):
             gcp_lease.acquire(store, state(2), ceiling_cents=14500, quotas=QUOTAS)
 
     def test_quota_sums_active_pending_fleets_and_observed_usage(self):
-        for metric, limit in (('Z4M_CPUS', 63), ('LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY', 55999)):
+        for metric, limit in (('CPUS', 67), ('LOCAL_SSD_TOTAL_GB', 55999), ('INSTANCES', 6)):
             store = CasStore()
             quotas = copy.deepcopy(QUOTAS)
             next(row for row in quotas if row['metric'] == metric)['limit'] = limit
@@ -155,10 +155,43 @@ class FleetAdmissionTests(unittest.TestCase):
             self.assertEqual(gcp_lease.owned(store, state(1)), first)
         quotas = copy.deepcopy(QUOTAS)
         quotas[0].update(limit=64, usage=33)
-        with self.assertRaisesRegex(ValueError, 'Z4M_CPUS'):
+        with self.assertRaisesRegex(ValueError, 'CPUS'):
             gcp_lease.acquire(CasStore(), state(1), ceiling_cents=14500, quotas=quotas)
         with self.assertRaisesRegex(ValueError, 'missing or ambiguous'):
             gcp_lease.acquire(CasStore(), state(1), ceiling_cents=14500, quotas=[])
+
+    def test_observed_metrics_are_required_and_family_metrics_are_optional(self):
+        reservation = state(1)['reservation']
+        gcp_lease.check_quota(QUOTAS, [reservation])
+        for metric in ('CPUS', 'LOCAL_SSD_TOTAL_GB', 'INSTANCES'):
+            with self.subTest(metric=metric):
+                without = [row for row in QUOTAS if row['metric'] != metric]
+                with self.assertRaisesRegex(ValueError, 'missing or ambiguous: ' + metric):
+                    gcp_lease.check_quota(without, [reservation])
+                duplicated = [*QUOTAS, next(row for row in QUOTAS if row['metric'] == metric)]
+                with self.assertRaisesRegex(ValueError, 'missing or ambiguous: ' + metric):
+                    gcp_lease.check_quota(duplicated, [reservation])
+        for metric, needed in (('Z4M_CPUS', 32), ('LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY', 28000)):
+            with self.subTest(metric=metric):
+                family = {'metric': metric, 'limit': needed, 'usage': 0}
+                gcp_lease.check_quota([*QUOTAS, family], [reservation])
+                with self.assertRaisesRegex(ValueError, 'quota exceeded: ' + metric):
+                    gcp_lease.check_quota([*QUOTAS, dict(family, limit=needed-1)], [reservation])
+                with self.assertRaisesRegex(ValueError, 'missing or ambiguous: ' + metric):
+                    gcp_lease.check_quota([*QUOTAS, family, family], [reservation])
+        # Neither launch path allocates external addresses.
+        without_addresses = [row for row in QUOTAS if row['metric'] != 'IN_USE_ADDRESSES']
+        gcp_lease.check_quota(without_addresses, [reservation])
+        gcp_lease.check_quota([*without_addresses,
+                              {'metric': 'IN_USE_ADDRESSES', 'limit': 0, 'usage': 0}], [reservation])
+
+    def test_old_reservations_without_vm_count_remain_conservative(self):
+        old = state(1)
+        old['reservation'].pop('instances')
+        old['reservation']['local_ssds'] = 4
+        self.assertEqual(gcp_lease.reservation(old)['instances'], 4)
+        old['children']['fleet'] = {'host_count': 2}
+        self.assertEqual(gcp_lease.reservation(old)['instances'], 2)
 
     def test_release_preserves_sibling_and_rejects_changed_token(self):
         store = CasStore()
