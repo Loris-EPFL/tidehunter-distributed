@@ -37,6 +37,47 @@ class MultiownerMode(LocalMode):
         return proof
 
 
+def capture_kernel_log(path, errors):
+    """A diagnostic failure must not prevent the one-shot run's final proof."""
+    try:
+        text = subprocess.check_output(['dmesg', '--raw'], text=True, errors='replace',
+                                       stderr=subprocess.STDOUT)
+        path.write_text(text)
+        return text
+    except (OSError, subprocess.CalledProcessError) as error:
+        errors.append(f'kernel capture {path.name} failed: {error}; '
+                      + str(getattr(error, 'output', ''))[-2000:])
+        return None
+
+
+def kernel_log_interval(before, after):
+    """Use the last pre-run timestamp; rotation of older records is harmless."""
+    def timestamp(line):
+        match = re.match(r'^(?:<\d+>)?\[\s*(\d+)(?:\.(\d+))?\]', line)
+        return (int(match[1]) * 1_000_000_000
+                + int((match[2] or '').ljust(9, '0')[:9])) if match else None
+    before_times = [value for line in (before or '').splitlines()
+                    if (value := timestamp(line)) is not None]
+    after_times = []
+    added = []
+    boundary = before_times[-1] if before_times else None
+    current = None
+    for line in (after or '').splitlines():
+        value = timestamp(line)
+        if value is not None:
+            after_times.append(value)
+            current = value
+        if boundary is not None and current is not None and current > boundary:
+            added.append(line)
+    errors = [line for line in added if re.search(
+        r'starting error recovery|Property Set error|no (?:available|usable) path|'
+        r'buffer I/O error|nvme.*(?:I/O error|controller.*(?:reset|recovery))', line, re.IGNORECASE)]
+    return {'boundary_monotonic_ns': boundary,
+            'complete_interval': bool(boundary is not None and after_times
+                                      and after_times[0] <= boundary <= after_times[-1]),
+            'io_errors_or_controller_recovery': errors}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -99,8 +140,7 @@ def main():
                 'owner_count': args.owners, 'complete': False, 'cleanup_complete': False,
                 'fixture': str(fixture), 'errors': []}
     save_json(output / 'input.json', {'config': config, 'job': job})
-    kernel_before = subprocess.check_output(['dmesg', '--raw'], text=True)
-    (output / 'dmesg-before.txt').write_text(kernel_before)
+    kernel_before = capture_kernel_log(output / 'dmesg-before.txt', evidence['errors'])
     try:
         options = controller.prepare_tide(job, directory)
         identities = options['external_remote_config']['live_nvme']['owner_identities']
@@ -155,16 +195,10 @@ def main():
             evidence['cleanup_complete'] = True
         except Exception:
             evidence['errors'].append(traceback.format_exc())
-        kernel_after = subprocess.check_output(['dmesg', '--raw'], text=True)
-        (output / 'dmesg-after.txt').write_text(kernel_after)
-        kernel_complete = kernel_after.startswith(kernel_before)
-        added = kernel_after[len(kernel_before):] if kernel_complete else kernel_after
-        kernel_errors = [line for line in added.splitlines() if re.search(
-            r'starting error recovery|Property Set error|no (?:available|usable) path|'
-            r'buffer I/O error|nvme.*(?:I/O error|controller.*(?:reset|recovery))', line, re.IGNORECASE)]
-        evidence['kernel_log'] = {'before': 'dmesg-before.txt', 'after': 'dmesg-after.txt',
-            'complete_interval': kernel_complete, 'io_errors_or_controller_recovery': kernel_errors}
-        if not kernel_complete or kernel_errors:
+        kernel_after = capture_kernel_log(output / 'dmesg-after.txt', evidence['errors'])
+        kernel = kernel_log_interval(kernel_before, kernel_after)
+        evidence['kernel_log'] = {'before': 'dmesg-before.txt', 'after': 'dmesg-after.txt', **kernel}
+        if not kernel['complete_interval'] or kernel['io_errors_or_controller_recovery']:
             evidence['complete'] = False
             evidence['errors'].append('kernel log interval incomplete or contains I/O/controller errors')
         evidence['uptime_after'] = subprocess.check_output(['uptime'], text=True).strip()

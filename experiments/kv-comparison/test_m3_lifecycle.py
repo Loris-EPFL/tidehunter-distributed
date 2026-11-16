@@ -16,7 +16,40 @@ from unittest.mock import patch
 import yaml
 import cloud_campaign as campaign
 import cloud_controller as cloud
+import local_multiowner_check as multiowner
 from test_cloud_controller import config_fixture
+
+class KernelLogTests(unittest.TestCase):
+    def test_failed_capture_returns_evidence_instead_of_raising(self):
+        errors = []
+        with patch.object(multiowner.subprocess, 'check_output', side_effect=
+                subprocess.CalledProcessError(1, ['dmesg'], output='permission denied')):
+            self.assertIsNone(multiowner.capture_kernel_log(Path('/unused/dmesg-after.txt'), errors))
+        self.assertIn('dmesg-after.txt', errors[0])
+        self.assertIn('permission denied', errors[0])
+
+    def test_rotation_of_older_messages_preserves_the_run_interval(self):
+        before = '<6>[1.000000] old\n<6>[2.000000] boundary\n'
+        after = '<6>[2.000000] boundary\n<6>[3.000000] new controller\n'
+        interval = multiowner.kernel_log_interval(before, after)
+        self.assertTrue(interval['complete_interval'])
+        self.assertEqual(interval['boundary_monotonic_ns'], 2_000_000_000)
+        self.assertEqual(interval['io_errors_or_controller_recovery'], [])
+
+    def test_detects_recovery_and_io_errors_only_after_the_boundary(self):
+        before = '[1.000000] Buffer I/O error from an older run\n[2.000000] boundary\n'
+        after = before + '[3.000000] nvme nvme2: starting error recovery\n' + (
+            '[3.100000] nvme nvme2: Property Set error: 880\n'
+            '[3.200000] Buffer I/O error on dev nvme2n1\n')
+        interval = multiowner.kernel_log_interval(before, after)
+        self.assertTrue(interval['complete_interval'])
+        self.assertEqual(len(interval['io_errors_or_controller_recovery']), 3)
+
+    def test_rotation_past_the_boundary_is_reported_as_missing_evidence(self):
+        interval = multiowner.kernel_log_interval('[2.000000] boundary\n', '[3.000000] newest\n')
+        self.assertFalse(interval['complete_interval'])
+        self.assertFalse(multiowner.kernel_log_interval(None, '[3.000000] newest\n')['complete_interval'])
+
 
 
 class CapsuleLayoutTests(unittest.TestCase):
