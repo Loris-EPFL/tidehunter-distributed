@@ -161,10 +161,12 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
         raise ValueError('unknown qualification profile')
     if not isinstance(members, (list, tuple)) or len(members) - 1 not in gcp_runtime.owner_host_counts():
         raise ValueError('fleet must have one or five owner hosts')
+    if selection == 'nvmeof_p9_write_engine' and len(members) != 3:
+        raise ValueError('write-engine fleet requires one coordinator and two owner hosts')
     if qualification_profile == 'focused' and (live_transports or live_spdk):
         if (not gcp_runtime.live_mode({'mode': 'focused', 'selection': selection})
                 or list(live_transports) != ['rdma'] or live_spdk
-                or (len(members) != 2 and selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5', 'nvmeof_p9_small_put'))):
+                or (len(members) != 2 and selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5', 'nvmeof_p9_small_put', 'nvmeof_p9_write_engine'))):
             raise ValueError('focused qualification forbids unreviewed live and Valkey probes')
     normalized = []
     for member in members:
@@ -495,7 +497,7 @@ def _fleet_cleanup(run_id):
 
 
 def _fleet_pair(package, cfg, deadline):
-    seconds = M3_PAIR_SECONDS if cfg.get("selection") in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5', 'nvmeof_p9_small_put') else 1200
+    seconds = M3_PAIR_SECONDS if cfg.get("selection") in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5', 'nvmeof_p9_small_put', 'nvmeof_p9_write_engine') else 1200
     pair_cfg = {**cfg, 'mode': 'fleet-pair',
                 'phase_deadline': min(deadline - PAIR_EXIT_SECONDS, time.time() + seconds)}
     module = package / 'source/experiments/gcp-rdma/gcp_qualify_bootstrap.py'

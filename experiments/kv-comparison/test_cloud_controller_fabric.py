@@ -89,7 +89,7 @@ class FabricControllerTests(unittest.TestCase):
         runtime.active_nvme = None
         runtime.stop_tide = Mock()
         job = {'sealed_dataset': {'source_id': 'source'}, 'backend': 'tidehunter_tcp_trusted',
-               'durability_tier': 'synchronous', 'owner_polling': 'busy'}
+               'durability_tier': 'synchronous', 'owner_polling': 'busy', 'case_id': 'new-owner'}
         with tempfile.TemporaryDirectory() as tmp:
             runtime.root = Path(tmp)
             runtime.prepare_tide = Mock(side_effect=RuntimeError('new owner'))

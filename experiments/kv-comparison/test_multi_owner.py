@@ -20,8 +20,8 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 31)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 31)
+        self.assertEqual(len(self.jobs), 49)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 49)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
                          {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:
@@ -145,7 +145,12 @@ class MultiOwnerTests(unittest.TestCase):
     def test_measurement_windows_and_admission_cap(self):
         for job in self.jobs:
             sizing = job["measurement_sizing"]
-            if job["selection"] == "nvmeof_p9_small_put":
+            if job["case_kind"] == "mainnet_replay":
+                self.assertEqual(job["measurement_operations"], 4096 * 510)
+                self.assertEqual(sizing["case_deadline_seconds"], 600)
+                continue
+            if job["selection"] == "nvmeof_p9_small_put" or (
+                    job["selection"] == "nvmeof_p9_write_engine" and job["case_kind"] == "remote_put"):
                 self.assertEqual(sizing["measurement_seconds"],
                                  job["measurement_operations"] / sizing["rate_calls_per_second"])
             else:
@@ -158,8 +163,11 @@ class MultiOwnerTests(unittest.TestCase):
             if job["mix"]["put"]:
                 self.assertLessEqual(4096 + job["warmup_operations"] + job["measurement_operations"], 1_000_000)
         for selection in campaign.M3_SELECTIONS:
-            self.assertLessEqual(sum(job["measurement_sizing"]["expected_archive_bytes"]
-                                     for job in self.jobs if job["selection"] == selection), 3_000_000_000)
+            arms = ("file", "prewritten") if selection == "nvmeof_p9_write_engine" else (None,)
+            for arm in arms:
+                self.assertLessEqual(sum(job["measurement_sizing"]["expected_archive_bytes"]
+                                         for job in self.jobs if job["selection"] == selection
+                                         and (arm is None or job["arm"] == arm)), 3_000_000_000)
 
     def test_cache_pair_has_explicit_hit_window_and_remote_deadline_rates(self):
         pairs = [job for job in self.jobs

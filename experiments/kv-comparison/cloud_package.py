@@ -110,6 +110,11 @@ REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.to
             "experiments/nvmeof/spdk_measurement.py", "experiments/nvmeof/live_spdk_daemon.py",
             "experiments/nvmeof/patches/spdk-26.01-nvmf-remove-ns-status.patch",
             "experiments/nvmeof/test_spdk_remove_ns_status.c"}
+REPLAY_FIXTURE_FILES = {
+    "experiments/sui-mainnet/fixture/" + name
+    for name in ("manifest.json", "trace.bin", "preload.bin", "profile.json", "345683547.binpb.zst")
+}
+REQUIRED |= REPLAY_FIXTURE_FILES
 NVMET_FILES = ("nvmet.ko", "abi-admission.json", "source.json", "partial-nowait-read.patch")
 NVMET_HELPER = "experiments/nvmeof/kernel_fix.py"
 NVMET_PATCH = "experiments/nvmeof/patches/linux-nvmet-file-short-nowait-read.patch"
@@ -161,7 +166,7 @@ def allowed(name):
         return False
     if any("credential" in x or "secret" in x for x in lowered):
         return False
-    return path.suffix in SUFFIXES or path.name in {".gitignore", "Dockerfile", "LICENSE"} or path.name.startswith("Dockerfile.")
+    return name in REPLAY_FIXTURE_FILES or path.suffix in SUFFIXES or path.name in {".gitignore", "Dockerfile", "LICENSE"} or path.name.startswith("Dockerfile.")
 
 
 def source_paths(repo):

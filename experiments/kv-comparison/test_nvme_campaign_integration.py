@@ -284,6 +284,9 @@ class CampaignModeTests(unittest.TestCase):
                'read_lanes': 1, 'live_inline_reads': False, 'live_write_mode': 'leased',
                'durability_tier': 'native', 'live_export_mode': 'per_owner',
                'live_io_queues': 1, 'live_io_queue_size': 32, 'live_poll_queues': 0}
+        if selection == 'nvmeof_p9_write_engine':
+            job = next(j for j in cloud_campaign.make_focused_matrix(selection)
+                       if j['case_kind'] == 'live_read' and j['arm'] == 'file')
         names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'reserve_exchanges',
                  'complete_exchanges', 'leased_frames', 'leased_skip_markers', 'fua_writes',
                  'grant_misses', 'controller_connect_ns', 'controller_connect_samples')
@@ -297,15 +300,20 @@ class CampaignModeTests(unittest.TestCase):
                                'counters': {'read_profile_live_inline': 0}}},
                     'live_nvmeof': {'available': True, 'counters': dict(end)}}
         if selection in cloud_campaign.M3_SELECTIONS:
+            owner_count = cloud_campaign.active_owner_count(job)
             for boundary in ('start', 'end', 'deltas'):
                 evidence[boundary]['owner_executor'] = {'available': True, 'partitions': {
-                    str(i): {'available': True, 'counters': {}} for i in range(5)}}
+                    str(i): {'available': True, 'counters': {}} for i in range(owner_count)}}
             incomplete = copy.deepcopy(evidence)
-            incomplete['deltas']['owner_executor']['partitions'].pop('4')
+            incomplete['deltas']['owner_executor']['partitions'].pop(str(owner_count - 1))
             self.assertIn('per-owner measurement counter population unavailable',
                 cloud_campaign.qualify_live_nvme_measurement(incomplete, job, self.exported(job))['reasons'])
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job, self.exported(job))['qualified'])
         mixed = dict(job, mix={'read': 50, 'put': 50})
+        if selection == 'nvmeof_p9_write_engine':
+            mixed = next(j for j in cloud_campaign.make_focused_matrix(selection)
+                         if j['case_kind'] == 'mainnet_replay' and j['arm'] == job['arm']
+                         and j['durability_tier'] == 'native')
         current = copy.deepcopy(evidence)
         current['end']['live_nvmeof'].update(completed_write_ops=1, completed_write_bytes=1024)
         current['live_nvmeof']['counters'].update(completed_write_ops=1, completed_write_bytes=1024)
@@ -323,7 +331,7 @@ class CampaignModeTests(unittest.TestCase):
         current['deltas']['coordinator']['counters']['read_rpc_count'] = 0
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(current, mixed, self.exported(mixed))['qualified'])
         for name, value, reason in (
-                ('metadata_requests', 557, 'permanent export sent owner requests for reads'),
+                ('metadata_requests', 554 + mixed['read_lanes'] + 2, 'permanent export sent owner requests for reads'),
                 ('payload_rpc_requests', 1, 'payload RPC observed on live NVMe route')):
             bad = copy.deepcopy(current)
             bad['end']['live_nvmeof'][name] = bad['start']['live_nvmeof'][name] + value
@@ -351,8 +359,8 @@ class CampaignModeTests(unittest.TestCase):
             self.assertIn(f'invalid live NVMe counter {name}',
                           cloud_campaign.qualify_live_nvme_measurement(current, job, self.exported(job))['reasons'])
         for field, value, reason in (
-                ('namespace_connects', 2, 'permanent export made more than one controller connect'),
-                ('metadata_requests', 3, 'permanent export sent owner requests for reads')):
+                ('namespace_connects', job.get('owner_count', 1) + 1, 'permanent export made more than one controller connect'),
+                ('metadata_requests', job['read_lanes'] + 2, 'permanent export sent owner requests for reads')):
             bad = copy.deepcopy(evidence)
             bad['end']['live_nvmeof'][field] = value
             bad['live_nvmeof']['counters'][field] = value
@@ -360,10 +368,14 @@ class CampaignModeTests(unittest.TestCase):
         info = {'configuration': {'live_export_mode': 'per_owner',
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
                 'live_write': {'write_mode': 'leased',
-                               'acknowledgement_contract': 'leased extent: page-cache write'}}}
+                               'acknowledgement_contract': (
+                                   'leased extent: page-cache write' if job['durability_tier'] == 'native'
+                                   else 'synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous')}}}
         info['configuration'].update(
             live_leased_sync=cloud_campaign.requested_leased_sync(job),
             live_leased_flush_min_frame_bytes=cloud_campaign.requested_leased_flush_min_frame_bytes(job))
+        info['configuration'].update({key: job[key] for key in ('live_lease_ahead', 'live_polled_writes')
+                                      if key in job})
         if job['selection'] in ('nvmeof_parallel_writes', 'nvmeof_single_caller', 'nvmeof_f6', 'nvmeof_f6b', 'nvmeof_f8', 'nvmeof_f7_highmem32', 'nvmeof_reads_geometry', 'nvmeof_reads_geometry_rest', 'nvmeof_reads_geometry_rest2'):
             window = job.get('live_leased_write_window')
             info['configuration'].update(live_leased_write_window=window,
@@ -381,8 +393,10 @@ class CampaignModeTests(unittest.TestCase):
                 cloud_campaign.admit_live_write_contract(job, bad)
         for field, default in (('live_lease_ahead', True), ('live_polled_writes', False)):
             explicit_job = dict(job, **{field: default})
+            missing_info = copy.deepcopy(info)
+            missing_info['configuration'].pop(field, None)
             with self.assertRaisesRegex(ValueError, 'live export mode or queue geometry differs'):
-                cloud_campaign.admit_live_write_contract(explicit_job, info)
+                cloud_campaign.admit_live_write_contract(explicit_job, missing_info)
             explicit_info = copy.deepcopy(info)
             explicit_info['configuration'][field] = default
             cloud_campaign.admit_live_write_contract(explicit_job, explicit_info)
@@ -784,14 +798,25 @@ class ControllerBoundaryTests(unittest.TestCase):
         self.assertEqual(self.c.shared_tide['options'], options)
         self.c.prepare_tide.assert_not_called()
 
+    def test_shared_auto_reader_does_not_inherit_preparation_lane_pin(self):
+        options = {'external_remote_config': {'read_lanes': 64}, 'evidence': 'old'}
+        self.c.shared_tide = {'identity': ('source', 'tcp', 'synchronous', 'adaptive'),
+                              'options': copy.deepcopy(options)}
+        job = {'backend': 'tidehunter_tcp', 'sealed_dataset': {'source_id': 'source'},
+               'durability_tier': 'synchronous'}
+        actual = self.c.prepared_tide_options(job, self.root / 'case')
+        self.assertNotIn('read_lanes', actual['external_remote_config'])
+        self.assertEqual(self.c.shared_tide['options'], options)
+
     def test_a_different_durability_tier_never_reuses_the_prepared_owners(self):
         # Owners run one tier for their whole life; a case at another tier needs fresh owners.
         self.c.shared_tide = {'identity': ('source', 'tcp', 'native'), 'options': {}}
         job = {'backend': 'tidehunter_nvme_tcp', 'sealed_dataset': {'source_id': 'source'},
-               'durability_tier': 'synchronous', 'read_lanes': 1}
+               'durability_tier': 'synchronous', 'read_lanes': 1, 'case_id': 'fresh'}
         self.c.stop_tide = Mock()
         self.c.prepare_tide = Mock(side_effect=RuntimeError('fresh owners requested'))
-        with self.assertRaisesRegex(RuntimeError, 'fresh owners requested'):
+        with patch.object(controller, 'controller_matrix', return_value=[job]), \
+                self.assertRaisesRegex(RuntimeError, 'fresh owners requested'):
             self.c.prepared_tide_options(job, self.root / 'case')
         self.c.stop_tide.assert_called_once_with()
 
