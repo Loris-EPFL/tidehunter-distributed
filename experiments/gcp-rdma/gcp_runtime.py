@@ -804,10 +804,11 @@ def _controller_config(runtime):
                 'rdma_address': item['rdma_ip']}
     nodes = [{**host(item), 'index': i} for i, item in enumerate(raw_hosts[1:])]
     region = raw_hosts[0]['zone'].rsplit('-', 1)[0]
+    cpus = int(runtime['machine_type'].rsplit('-', 1)[-1])
     fleet = {'schema_version': 1, 'run_id': runtime['run_id'], 'provider': 'gcp', 'replication_factor': 1,
              'qualification_only': False, 'data_root': '/mnt/tidehunter-kv-comparison/' + runtime['run_id'],
              'region': region, 'instance_type': runtime['machine_type'], 'coordinator': host(raw_hosts[0]), 'nodes': nodes,
-             'server_cpus': 8, 'client_cpus': 8, 'server_memory_mib': 16384, 'client_memory_mib': 16384}
+             'server_cpus': cpus, 'client_cpus': cpus, 'server_memory_mib': 16384, 'client_memory_mib': 16384}
     if 'valkey_rdma' in runtime['spec']['backends']:
         fleet['valkey_rdma_package'] = True
     spec = _controller_spec(runtime['spec'])

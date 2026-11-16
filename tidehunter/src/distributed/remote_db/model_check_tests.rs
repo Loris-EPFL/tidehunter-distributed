@@ -16,6 +16,8 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::Barrier;
 
+#[path = "model_check_concurrent.rs"]
+mod concurrent_model;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[path = "model_check_leased.rs"]
 mod leased;
@@ -52,6 +54,10 @@ struct Case {
     gate_waves: usize,
     on_disk_history: bool,
     leased: Option<LeasedCase>,
+    #[serde(default)]
+    concurrent: bool,
+    #[serde(default)]
+    native: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -71,6 +77,8 @@ impl Case {
             gate_waves: 2 + (seed as usize & 1),
             on_disk_history: false,
             leased: None,
+            concurrent: false,
+            native: false,
         }
     }
     fn value_bytes(&self) -> usize {
@@ -88,7 +96,8 @@ impl Case {
         )
     }
     fn gate_acks(&self) -> usize {
-        1 + self.gate_waves * 3 + 2 * usize::from(self.flush_cut())
+        1 + self.gate_waves * if self.concurrent { 8 } else { 3 }
+            + 2 * usize::from(self.flush_cut())
     }
 }
 
@@ -197,10 +206,14 @@ fn workload(case: &Case) -> Vec<Vec<Edit>> {
     let total: f64 = weights.iter().sum();
     (0..WAVES * 2)
         .map(|operation| {
-            let size = [1, 2, 22, 57][operation % 4];
+            let size = if case.concurrent {
+                [1, 8, 32][operation % 3]
+            } else {
+                [1, 2, 22, 57][operation % 4]
+            };
             let mut keys = Vec::with_capacity(size);
-            // Weighted sampling without replacement guarantees genuinely multi-key
-            // 22/57-member batches, while small batches retain Zipf 0.99 conflicts.
+            // Sampling without replacement preserves the requested batch size,
+            // while small batches retain the selected key distribution.
             for _ in 0..KEYS * 1024 {
                 if keys.len() == size {
                     break;
@@ -398,7 +411,7 @@ fn write_child(directory: &Path, case: &Case) {
     } else {
         HistoryPersistence::WalReplay
     });
-    let synchronous = case.leased.is_none_or(|profile| profile.synchronous);
+    let synchronous = !case.native && case.leased.is_none_or(|profile| profile.synchronous);
     let fixture = if synchronous {
         fixture.synchronous()
     } else {
@@ -423,7 +436,9 @@ fn write_child(directory: &Path, case: &Case) {
     }]);
     let operations: Vec<_> = (0..plan.len())
         .map(|id| {
-            let owner = if id < WAVES * 2 {
+            let owner = if case.concurrent && id < WAVES * 2 {
+                (case.seed as usize + id) % case.owners
+            } else if id < WAVES * 2 {
                 id % case.owners
             } else {
                 3 % case.owners
@@ -456,7 +471,7 @@ fn write_child(directory: &Path, case: &Case) {
         }
         original
     };
-    let readers = Readers::new(&fixture.config, &fixture.shape, original.epoch);
+    let readers = Readers::new(&fixture.config, &fixture.shape, original.epoch());
     let clients: Vec<_> = original
         .clients
         .iter()
@@ -474,36 +489,40 @@ fn write_child(directory: &Path, case: &Case) {
         case.gate_acks(),
     );
     for wave in 0..case.gate_waves {
-        let mut rng = StdRng::seed_from_u64(case.seed ^ wave as u64);
-        let retry = if wave == 0 {
-            0
+        if case.concurrent {
+            concurrent_model::wave(&db, &readers, &recorder, case, &operations, &plan, wave);
         } else {
-            rng.gen_range(0..wave * 2)
-        };
-        let mut ids = [wave * 2, wave * 2 + 1, retry];
-        for index in (1..ids.len()).rev() {
-            ids.swap(index, rng.gen_range(0..=index));
-        }
-        let barrier = Barrier::new(4);
-        thread::scope(|scope| {
-            for id in ids {
-                let (db, recorder, operations, plan, barrier) =
-                    (&db, &recorder, &operations, &plan, &barrier);
-                scope.spawn(move || {
-                    let call = recorder.begin(Action::Write {
-                        operation: id,
-                        edits: plan[id].clone(),
-                    });
-                    barrier.wait();
-                    let receipt = db
-                        .write_batch(operations[id], mutations(&plan[id], case.value_bytes()))
-                        .unwrap();
-                    recorder.ack(call, format!("{receipt:?}"));
-                });
+            let mut rng = StdRng::seed_from_u64(case.seed ^ wave as u64);
+            let retry = if wave == 0 {
+                0
+            } else {
+                rng.gen_range(0..wave * 2)
+            };
+            let mut ids = [wave * 2, wave * 2 + 1, retry];
+            for index in (1..ids.len()).rev() {
+                ids.swap(index, rng.gen_range(0..=index));
             }
-            barrier.wait();
-            observe(&db, &readers, &recorder);
-        });
+            let barrier = Barrier::new(4);
+            thread::scope(|scope| {
+                for id in ids {
+                    let (db, recorder, operations, plan, barrier) =
+                        (&db, &recorder, &operations, &plan, &barrier);
+                    scope.spawn(move || {
+                        let call = recorder.begin(Action::Write {
+                            operation: id,
+                            edits: plan[id].clone(),
+                        });
+                        barrier.wait();
+                        let receipt = db
+                            .write_batch(operations[id], mutations(&plan[id], case.value_bytes()))
+                            .unwrap();
+                        recorder.ack(call, format!("{receipt:?}"));
+                    });
+                }
+                barrier.wait();
+                observe(&db, &readers, &recorder);
+            });
+        }
         observe(&db, &readers, &recorder);
         // Deliberately NO checkpoint here: the gate must have acknowledged large
         // batches recoverable only from the WAL tail behind the baseline image.
@@ -577,7 +596,7 @@ fn recover_child(directory: &Path) {
         node.set_history_persistence(restart.config.history_persistence)
             .unwrap();
         node.set_durability(super::super::durability::DurabilityConfig::with_tier(
-            if case.leased.is_none_or(|profile| profile.synchronous) {
+            if !case.native && case.leased.is_none_or(|profile| profile.synchronous) {
                 super::super::durability::DurabilityTier::Synchronous
             } else {
                 super::super::durability::DurabilityTier::Native
@@ -608,7 +627,7 @@ fn recover_child(directory: &Path) {
         }
         db
     };
-    let readers = Readers::new(&restart.config, &restart.shape, db.epoch);
+    let readers = Readers::new(&restart.config, &restart.shape, db.epoch());
     let db = ConcurrentRemoteDatabase::new(db).unwrap();
     let values = snapshot(&db, &readers);
     // Retry every externally acknowledged identity after a real owner restart.
@@ -915,10 +934,15 @@ fn run_case(case: &Case) {
         acknowledged.len() >= case.gate_acks(),
         "gate has no acknowledged WAL tail"
     );
-    for size in [22, 57] {
+    let sizes: &[usize] = if case.concurrent {
+        &[1, 8, 32]
+    } else {
+        &[22, 57]
+    };
+    for size in sizes {
         assert!(
             acknowledged.iter().any(
-                |call| matches!(&call.action, Action::Write { edits, .. } if edits.len() == size)
+                |call| matches!(&call.action, Action::Write { edits, .. } if edits.len() == *size)
             ),
             "no acknowledged {size}-key batch before the crash"
         );

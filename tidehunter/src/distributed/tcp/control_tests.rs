@@ -54,10 +54,10 @@ fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
     let config = config(&temp.path().join("node"));
     let node = open_synchronous(&config);
     node.inventory.lock().fence_to(1).unwrap();
-    let (entered, entries) = mpsc::sync_channel(config.read_workers);
-    let (release, released) = mpsc::sync_channel(config.read_workers);
+    let (entered, entries) = mpsc::sync_channel(config.effective_read_workers());
+    let (release, released) = mpsc::sync_channel(config.effective_read_workers());
     let released = Arc::new(Mutex::new(released));
-    for _ in 0..config.read_workers {
+    for _ in 0..config.effective_read_workers() {
         let entered = entered.clone();
         let released = released.clone();
         node.read_pool.spawn(move || {
@@ -68,13 +68,13 @@ fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
                 .unwrap();
         });
     }
-    for _ in 0..config.read_workers {
+    for _ in 0..config.effective_read_workers() {
         entries.recv_timeout(Duration::from_secs(5)).unwrap();
     }
     let (completed, completions) = mpsc::sync_channel(1);
     assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
     let response = receive(&completions, 1).response;
-    for _ in 0..config.read_workers {
+    for _ in 0..config.effective_read_workers() {
         release.send(()).unwrap();
     }
     let Response::Appended(receipts) = response.unwrap() else {
@@ -788,6 +788,28 @@ mod live_fencing {
             inventory.fence_to(1).unwrap();
         }
         (config, node)
+    }
+
+    #[test]
+    fn prewrite_shutdown_diagnostics_include_fenced_streams() {
+        let temp = tempdir::TempDir::new("prewrite-shutdown-diagnostics").unwrap();
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
+        assert_eq!(node.wal_prewrite_stats(), (0, 0, 0));
+        node.inventory.lock().config.wal_prewrite = true;
+        fence(&node, 2).unwrap();
+        let first = node.wal_prewrite_stats();
+        assert!(first.0 >= config.partition.wal_file_bytes);
+        assert!(first.1 > 0);
+        assert!(first.2 > 0);
+        // Fencing drops the original log and recovers a new sealed handle.
+        // Costs from that original handle must remain in the owner receipt.
+        fence(&node, 3).unwrap();
+        node.finish_live_target_shutdown().unwrap();
+        let final_stats = node.wal_prewrite_stats();
+        assert!(final_stats.0 >= first.0 + config.partition.wal_file_bytes);
+        assert!(final_stats.1 > first.1);
+        assert!(final_stats.2 > first.2);
+        assert_eq!(node.wal_prewrite_stats(), final_stats);
     }
 
     fn wait_prepared(log: &crate::distributed::storage::PartitionLog, published: u64) {

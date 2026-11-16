@@ -41,7 +41,7 @@ fn config(root: &Path) -> ReplayConfig {
         execution: ExecutionConfig {
             mode: ExecutionMode::ClosedLoop,
             concurrency: 1,
-            client_shards: 1,
+            client_shards: Some(1),
             queue_capacity: 8,
             request_timeout_ms: 30000,
             offered_ops_per_second: None,
@@ -204,6 +204,28 @@ async fn native_report_keeps_parent_batches_and_rejects_short_window() {
     ));
     std::fs::remove_dir_all(root).unwrap();
 }
+#[test]
+fn replay_client_shards_validation_is_host_independent() {
+    let root = temp("replay-shards");
+    let mut cfg = config(&root);
+    cfg.execution.concurrency = 16;
+    cfg.execution.queue_capacity = 16;
+    for shards in [None, Some(1)] {
+        cfg.execution.client_shards = shards;
+        cfg.validate().unwrap();
+    }
+    for shards in [0, 2, 16] {
+        cfg.execution.client_shards = Some(shards);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("client_shards=1")
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn discriminant_and_manifest_bounds_reject_mixed_synthetic_options() {
     let root = temp("config");

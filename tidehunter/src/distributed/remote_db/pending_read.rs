@@ -2707,10 +2707,11 @@ impl ReadService {
             epoch,
         };
         let mut clients = clients.into_iter();
+        let read_lanes = config.effective_read_lanes();
         for node in 0..config.endpoints.len() {
-            let base = node * config.read_lanes;
-            let mut lanes = Vec::with_capacity(config.read_lanes);
-            for _ in 0..config.read_lanes {
+            let base = node * read_lanes;
+            let mut lanes = Vec::with_capacity(read_lanes);
+            for _ in 0..read_lanes {
                 let client = clients.next().unwrap();
                 recovery_stats.add_connection(client.connect_profile());
                 let client = Arc::new(Mutex::new(client));
@@ -4455,7 +4456,7 @@ mod live_worker_tests {
     #[test]
     fn live_grant_barrier_waits_for_lane_owner() {
         let mut fixture = Fixture::new();
-        fixture.config.read_lanes = 1;
+        fixture.config.read_lanes = Some(1);
         let mut db = fixture.open();
         let lanes = db.reads.lanes.read()[0].clone();
         let client = lanes[0].client.clone();
@@ -4491,7 +4492,7 @@ mod live_worker_tests {
     fn retirement_pause_preserves_outstanding_read_and_can_retry() {
         let mut fixture = Fixture::new();
         fixture.config.read_cache_bytes = 0;
-        fixture.config.read_lanes = 1;
+        fixture.config.read_lanes = Some(1);
         let mut db = fixture.open();
         db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
             .unwrap();
@@ -4520,7 +4521,7 @@ mod live_worker_tests {
         // A normal authenticated TCP connection is deliberately not configured
         // as live. This exercises the real worker failure, not a fake device.
         let mut fixture = Fixture::new();
-        fixture.config.read_lanes = 1;
+        fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
         let mut db = fixture.open();
         db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
@@ -4558,7 +4559,7 @@ mod live_worker_tests {
     #[test]
     fn missing_and_before_all_cut_do_not_send_live_payload_work() {
         let mut fixture = Fixture::new();
-        fixture.config.read_lanes = 1;
+        fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
         let mut original = fixture.open();
         original
@@ -4601,7 +4602,7 @@ mod live_worker_tests {
     #[test]
     fn full_lane_inbox_never_blocks_the_actor() {
         let mut fixture = Fixture::new();
-        fixture.config.read_lanes = 1;
+        fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
         let mut db = fixture.open();
         // A batch holds at most four operations; two batches put eight members

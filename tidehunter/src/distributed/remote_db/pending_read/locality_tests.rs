@@ -454,7 +454,7 @@ fn nvmeof_reader_cannot_serve_after_owner_fence() {
 fn identical_misses_share_one_physical_credit_and_survive_leader_drop() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 1;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(7, 9)])
@@ -482,7 +482,7 @@ fn identical_misses_share_one_physical_credit_and_survive_leader_drop() {
 fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let mut db = fixture.open();
     db.write_batch(
         fixture.operation(0, 0),
@@ -535,7 +535,7 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
 fn old_and_current_cut_misses_never_merge_versions() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();
@@ -566,7 +566,7 @@ fn old_and_current_cut_misses_never_merge_versions() {
 fn abandoned_shared_failure_poison_and_all_owned_credits_retire() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();
@@ -628,7 +628,7 @@ fn wait_read_retirement(reads: &ReadService) {
 fn actual_sui_iterator_dispatches_second_page_while_first_page_is_blocked() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let db = open_sui_scan_fixture(&fixture);
     let ks = db.ks("root");
     let remote = db.remote_for_test();
@@ -668,7 +668,7 @@ fn actual_sui_iterator_dispatches_second_page_while_first_page_is_blocked() {
 fn dropping_sui_iterator_cancels_delivery_but_keeps_pending_page_ownership() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let db = open_sui_scan_fixture(&fixture);
     let ks = db.ks("root");
     let remote = db.remote_for_test();

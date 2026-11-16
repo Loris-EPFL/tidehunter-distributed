@@ -422,6 +422,9 @@ class LocalMode:
         archive.unlink()
         launch_path = guest / "launch.yaml"
         launch = yaml.safe_load(launch_path.read_text())
+        if self.config.get("wal_prewrite", False):
+            launch["node"]["wal_prewrite"] = True
+            launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
         self.cloud.validate_launch(self.config, launch, case, index)
         live = launch.get("node", {}).get("live_target")
         daemon = None

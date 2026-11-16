@@ -40,6 +40,11 @@ class CompactReadLifecycleTests(unittest.TestCase):
                     # The external preparer maps verbs+trusted to ofi-verbs-trusted TLS.
                     self.assertEqual(transport["fabric"]["backend"], "verbs")
                     self.assertEqual(transport["security"], "trusted")
+                    if "read_lanes" in job:
+                        self.assertEqual(prep["read_lanes"], job["read_lanes"])
+                    else:
+                        self.assertNotIn("read_lanes", prep)
+                    self.assertNotIn("owner_read_workers", prep)
 
     def test_cache_coordinator_allowance_is_independent_of_owner_allowance(self):
         jobs = [j for j in controller.cloud_campaign.make_focused_matrix("nvmeof_reads_geometry")

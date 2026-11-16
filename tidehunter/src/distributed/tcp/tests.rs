@@ -171,14 +171,41 @@ pub(super) fn config(root: &Path) -> NodeConfig {
             max_batches: 64,
             max_reference_metadata_bytes: 1024 * 1024,
         },
-        read_workers: 2,
+        read_workers: Some(2),
         wal_member_read: Default::default(),
+        wal_prewrite: false,
         read_resident_first: false,
         read_memory_allowance_bytes: default_read_memory_allowance_bytes(),
         read_max_inflight_requests: default_read_requests(),
         read_max_inflight_bytes: default_read_bytes(),
         read_max_device_reads: default_device_reads(),
         live_target: None,
+    }
+}
+
+#[test]
+fn read_workers_default_to_parallelism_and_validate_bounds() {
+    let mut serialized = serde_json::to_value(config(Path::new("/unused"))).unwrap();
+    serialized.as_object_mut().unwrap().remove("read_workers");
+    let mut config: NodeConfig = serde_json::from_value(serialized).unwrap();
+    assert_eq!(config.read_workers, None);
+    assert_eq!(
+        config.effective_read_workers(),
+        crate::parallelism::available()
+    );
+    assert!(
+        serde_json::to_value(&config)
+            .unwrap()
+            .get("read_workers")
+            .is_none()
+    );
+    for workers in [1, 1024] {
+        config.read_workers = Some(workers);
+        config.validate().unwrap();
+    }
+    for workers in [0, 1025] {
+        config.read_workers = Some(workers);
+        assert!(config.validate().is_err());
     }
 }
 
@@ -190,7 +217,7 @@ fn static_node_validation_opens_no_runtime_resources() {
     for fault in 0..5 {
         let mut invalid = config.clone();
         match fault {
-            0 => invalid.read_workers = 0,
+            0 => invalid.read_workers = Some(0),
             1 => invalid.partition.inventory.epoch = 2,
             2 => invalid.max_epochs = 0,
             3 => invalid.read_max_inflight_bytes = usize::MAX,
@@ -1477,4 +1504,20 @@ fn memory_only_owner_rpc_accepts_4096_puts_and_checkpoint() {
     drop(client);
     shutdown.store(true, Ordering::Release);
     server_thread.join().unwrap();
+}
+
+#[test]
+fn node_wal_prewrite_defaults_off_and_round_trips() {
+    let temp = tempdir::TempDir::new("node-wal-prewrite").unwrap();
+    let config = config(temp.path());
+    let mut value = serde_yaml::to_value(&config).unwrap();
+    value.as_mapping_mut().unwrap().remove("wal_prewrite");
+    let restored: NodeConfig = serde_yaml::from_value(value).unwrap();
+    assert!(!restored.wal_prewrite);
+    let mut enabled = restored;
+    enabled.wal_prewrite = true;
+    enabled.validate().unwrap();
+    let restored: NodeConfig =
+        serde_yaml::from_str(&serde_yaml::to_string(&enabled).unwrap()).unwrap();
+    assert!(restored.wal_prewrite);
 }

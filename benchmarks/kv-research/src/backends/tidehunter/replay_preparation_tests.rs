@@ -17,6 +17,7 @@ fn synthetic_input() -> serde_json::Value {
         "transport":{"kind":"tcp-trusted"}, "owner_wal_geometry":"research",
         "max_batches_per_partition":16384,"max_admitted_batches":16384,"max_index_bytes":536870912,
         "coordinator_cache_bytes":0,"owner_read_workers":2,"owner_wal_member_read":"async",
+        "read_lanes":2,
         "owner_read_memory_allowance_bytes":268435456,"polling":"adaptive"
     })
 }
@@ -51,10 +52,12 @@ fn absent_replay_preparation_inputs_preserve_every_synthetic_output_byte() {
     prepare_external_case_file(&input, &output).unwrap();
     // Captured from the pre-extension 3bbd706 CLI using this exact trusted-TCP
     // input. No paths, identities, fields or bytes are normalized by this check.
+    // Only the launch hash is re-pinned for the uniform overlap budget:
+    // explicit 2 lanes plus 2 controls, doubled, now needs 8 connections.
     let expected = [
         ("durability.json", "389117a6498def40a97d89ca4fa7ed4a116597a762532440e391ebddc3d1dd2b155fd923f57db426aa1de4becd585f59767614b7d7bddb4ee58376453035487a"),
         ("external_owner_read_config.json", "1cdb078424efc8a57b42df8f41b193f87d8f5e4efc4fbdc15819bac2bfa919bbb956b58f220a0a60741625016003b163b7d4fda5cd7ea9755069516292da6571"),
-        ("node-0/launch.yaml", "1f10f55153f44477af5dd92da201de086e72966260da3b3ee86d226e19d16f5bf3da60d3384415603f61134b80f44a26a5bc3668de73cc9c9133574329038b7d"),
+        ("node-0/launch.yaml", "e9349a3d6a7fab70a8afc411cb52b62dcaf575683c69bfd60731ac2b014f78c0e70deaf25ed9042d1e0a0ea10312e6ff890b2142522779d0a83b1c5f94888503"),
         ("owner_transports.json", "5c3f7f89d4ec1232155e1e5899765fb285a47198b950f7c9b174c8151bb6d1403c17c839ac9a2ab7b943d62f28c2f8423dd1ca792ebe6c087916156ee3ca54f7"),
         ("remote.json", "fc902545d2c0eca6eac9807efdd974af6e274f645944e1099be6862a60315f11bb2025ffe6426bb5bf2a4fcddbcf916ca3d3594aa766f920ebe8a4613e0bed16"),
         ("remote.yaml", "bfc1b7fc1673c55417110f20695522abf8dbe5110b8ed1c8ddb7996c4f059fffad12dc374e3c6cfdda639dd90ff0dfb32456462bf562aab102b56ed60a962a59"),
@@ -65,6 +68,75 @@ fn absent_replay_preparation_inputs_preserve_every_synthetic_output_byte() {
     assert_eq!(actual, expected);
     fs::remove_dir_all(root).unwrap();
 }
+#[test]
+fn automatic_preparation_keeps_runtime_counts_out_of_generated_configs() {
+    let root = temp();
+    let input = root.join("input.json");
+    let mut config = synthetic_input();
+    config.as_object_mut().unwrap().remove("read_lanes");
+    config.as_object_mut().unwrap().remove("owner_read_workers");
+    fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut previous = None;
+    for name in ["first", "second"] {
+        let output = root.join(name);
+        prepare_external_case_file(&input, &output).unwrap();
+        let remote: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
+        assert!(remote.get("read_lanes").is_none());
+        let launch: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
+        assert!(launch["node"].get("read_workers").is_none());
+        let owners: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join("external_owner_read_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(owners[0].get("read_workers").is_none());
+        let mut hashes = BTreeMap::new();
+        collect_hashes(&output, &output, &mut hashes);
+        if let Some(previous) = &previous {
+            assert_eq!(&hashes, previous);
+        }
+        previous = Some(hashes);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap() {
+    use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
+    let root = temp();
+    let input = root.join("input.json");
+    let mut config = synthetic_input();
+    for (name, lanes, expected) in [("auto", None, 132), ("explicit", Some(100), 204)] {
+        if let Some(lanes) = lanes {
+            config["read_lanes"] = serde_json::json!(lanes);
+        } else {
+            config.as_object_mut().unwrap().remove("read_lanes");
+        }
+        fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
+        let output = root.join(name);
+        prepare_external_case_file(&input, &output).unwrap();
+        let launch: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
+        assert_eq!(launch["limits"]["max_connections"].as_u64(), Some(expected));
+        assert_eq!(
+            expected,
+            2 * (lanes.unwrap_or(RemoteDatabaseConfig::MAX_AUTO_READ_LANES as u64) + 2)
+        );
+    }
+    config["read_lanes"] = serde_json::json!(127);
+    fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
+    let rejected = root.join("rejected");
+    let error = prepare_external_case_file(&input, &rejected)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("read_lanes=127"));
+    assert!(error.contains("require 258 connections"));
+    assert!(error.contains("ceiling 256"));
+    assert!(!rejected.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn replay_preparation_rejects_implicit_identity_limits_and_unknown_node_db() {
     let root = temp();

@@ -26,7 +26,7 @@ impl Case {
     }
     fn with_inline_reads(inline_reads: bool) -> Self {
         let mut fixture = Fixture::new();
-        fixture.config.read_lanes = 1;
+        fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
         let mut db = fixture.open();
         db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])

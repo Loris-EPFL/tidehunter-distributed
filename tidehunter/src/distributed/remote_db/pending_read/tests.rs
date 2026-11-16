@@ -83,7 +83,7 @@ fn flight_retirement_cannot_publish_reusable_slot_before_subscription_drain() {
 #[test]
 fn cancelled_coalesced_batch_subscriptions_do_not_accumulate() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -121,7 +121,7 @@ fn cancelled_coalesced_batch_subscriptions_do_not_accumulate() {
 #[test]
 fn unrelated_flight_completion_does_not_notify_waiting_batch() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -177,7 +177,7 @@ fn unrelated_flight_completion_does_not_notify_waiting_batch() {
 fn poison_and_stop_wake_waiting_batch_without_forging_readiness() {
     for stop in [false, true] {
         let mut fixture = Fixture::new();
-        fixture.config.read_lanes = 1;
+        fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
         let mut db = fixture.open();
         db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -876,7 +876,7 @@ fn sui_bulk_accepts_borrowed_keys_with_duplicates() {
 #[test]
 fn cancelled_batch_keeps_accepted_flight_until_completion() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -921,7 +921,7 @@ fn cancelled_batch_keeps_accepted_flight_until_completion() {
 #[test]
 fn traced_fenced_read_records_failure_and_retires_transport() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -967,7 +967,7 @@ fn traced_fenced_read_records_failure_and_retires_transport() {
 #[test]
 fn cancelled_owned_batch_hands_accepted_transport_work_back_to_actor() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -1022,7 +1022,7 @@ fn cancelled_owned_batch_hands_accepted_transport_work_back_to_actor() {
 #[test]
 fn completed_wave_releases_owner_for_credit_blocking_foreign_read() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 4;
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
@@ -1121,7 +1121,7 @@ fn completed_wave_releases_owner_for_credit_blocking_foreign_read() {
 #[test]
 fn grouped_owner_accepts_other_requests_without_losing_order_or_credits() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 2;
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
@@ -1189,7 +1189,7 @@ fn grouped_owner_accepts_other_requests_without_losing_order_or_credits() {
 #[test]
 fn joined_lane_is_handed_back_before_another_ready_owner_returns() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(2, 9)])
@@ -1272,7 +1272,7 @@ fn joined_lane_is_handed_back_before_another_ready_owner_returns() {
 #[test]
 fn joined_grouped_read_hands_progress_to_actor_before_owner_completes() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
@@ -1327,7 +1327,7 @@ fn joined_grouped_read_hands_progress_to_actor_before_owner_completes() {
 #[test]
 fn busy_scalar_reservation_remains_exclusive() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
@@ -1368,7 +1368,7 @@ fn busy_scalar_reservation_remains_exclusive() {
 #[test]
 fn cancelled_grouped_owner_hands_joined_request_to_actor() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 2;
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
@@ -1413,7 +1413,7 @@ fn cancelled_grouped_owner_hands_joined_request_to_actor() {
 #[test]
 fn empty_caller_progress_hands_accepted_work_to_actor_and_preserves_order() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
@@ -1484,7 +1484,7 @@ fn empty_caller_progress_hands_accepted_work_to_actor_and_preserves_order() {
 #[test]
 fn grouped_join_of_inline_flight_notifies_admission_after_readiness() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -1569,7 +1569,7 @@ fn inline_joiner_releases_credit_before_producer_returns() {
 #[test]
 fn batch_retires_ready_owner_before_blocked_owner_and_preserves_duplicates() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 4;
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
@@ -1645,7 +1645,7 @@ fn batch_retires_ready_owner_before_blocked_owner_and_preserves_duplicates() {
 #[test]
 fn blocked_owner_driver_does_not_block_another_owners_read() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -1694,7 +1694,7 @@ fn blocked_owner_driver_does_not_block_another_owners_read() {
 #[test]
 fn inline_reads_reserve_idle_lanes_with_unrelated_retained_credits() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 4;
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
@@ -1745,7 +1745,7 @@ fn inline_reads_reserve_idle_lanes_with_unrelated_retained_credits() {
 #[test]
 fn lane_reservation_backpressure_does_not_signal_false_capacity() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 4;
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
@@ -1833,7 +1833,7 @@ fn cached_hit_and_same_shard_miss_progress_while_first_miss_is_blocked() {
 #[test]
 fn one_connection_admits_several_reads_and_retains_completion_credits() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.read_cache_bytes = 0;
     fixture.config.max_pending_reads = 4;
     let mut db = fixture.open();
@@ -1896,7 +1896,7 @@ fn pending_read_keeps_submission_reference_across_overwrite_and_delete() {
 fn dropped_handle_retains_worker_credit_and_shutdown_joins_before_release() {
     let mut fixture = Fixture::new();
     fixture.config.max_pending_reads = 1;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
         .unwrap();
@@ -2032,7 +2032,7 @@ fn published_result_stays_unavailable_until_credit_retirement() {
 fn subset_joiner_keeps_cancelled_initiators_full_result_credit() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
         .unwrap();
@@ -2075,7 +2075,7 @@ fn subset_joiner_keeps_cancelled_initiators_full_result_credit() {
 fn exact_flight_index_shares_cancellation_and_reuses_retired_slot() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 1;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
@@ -2215,7 +2215,7 @@ fn duplicate_map_resize_is_charged_at_group_budget_boundaries() {
 #[test]
 fn dropped_failed_read_poison_cannot_be_hidden_by_a_cached_hit() {
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();

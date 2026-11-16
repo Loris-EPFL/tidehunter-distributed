@@ -3631,7 +3631,7 @@ class Controller:
                 "transport": owner_control_settings(job)["owner_transport"],
                 "max_batches_per_partition": max(16384, storage_batches),
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
-                "coordinator_cache_bytes": job["coordinator_cache_bytes"], "owner_read_workers": 4,
+                "coordinator_cache_bytes": job["coordinator_cache_bytes"],
                 "owner_wal_member_read": "async",
                 "owner_read_resident_first": job.get("owner_read_resident_first", False),
                 "owner_read_memory_allowance_bytes": allowance,
@@ -3659,6 +3659,8 @@ class Controller:
                     prep["live_nvmeof"][key] = job["live_" + key]
         if "live_pin_read_lanes" in job:
             prep["pin_read_lanes"] = job["live_pin_read_lanes"]
+        if "read_lanes" in job:
+            prep["read_lanes"] = job["read_lanes"]
         if "sealed_dataset" in job:
             # Preparation and each planned reader consume one retained epoch.
             source = job["sealed_dataset"]["source_id"]

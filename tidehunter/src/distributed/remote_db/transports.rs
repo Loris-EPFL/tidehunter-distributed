@@ -216,7 +216,7 @@ impl ReadSetup {
                     &config,
                     &shape,
                     &tls_config,
-                    config.read_lanes,
+                    config.effective_read_lanes(),
                     retained,
                     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     pool,
