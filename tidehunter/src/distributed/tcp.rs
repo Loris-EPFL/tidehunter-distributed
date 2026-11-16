@@ -316,7 +316,12 @@ impl Default for TcpLimits {
     fn default() -> Self {
         Self {
             max_frame_bytes: 16 * 1024 * 1024,
-            max_connections: 16,
+            // Two automatic coordinator session sets (MAX_AUTO_READ_LANES read lanes plus the
+            // append/control and operational connections each), so a coordinator that omits
+            // `read_lanes` can open, and reopen while old sessions drain, against default limits.
+            max_connections: 2
+                * (super::remote_db::RemoteDatabaseConfig::MAX_AUTO_READ_LANES
+                    + super::remote_db::RemoteDatabaseConfig::NON_READ_CONNECTIONS),
             max_reads: 256,
             recovery_page_batches: 128,
             io_timeout: Duration::from_secs(10),
