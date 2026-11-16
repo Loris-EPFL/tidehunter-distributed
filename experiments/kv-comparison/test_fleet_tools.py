@@ -1,4 +1,5 @@
 import copy
+import errno
 import hashlib
 import itertools
 import json
@@ -112,17 +113,179 @@ class FleetToolsTests(unittest.TestCase):
     def test_hardware_queue_cpu_map_and_insufficient_queues_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); mq = root / 'nvme3n1' / 'mq'
-            for index, cpus in enumerate(('0-1,8-9', '2-3', '4-5', '6-7')):
+            for index, cpus in enumerate(('0-1, 8-9', '2, 3', '4, 5', '6, 7')):
                 (mq / str(index)).mkdir(parents=True)
                 (mq / str(index) / 'cpu_list').write_text(cpus)
-            result = fleet_tools.queue_cpus('/dev/nvme3n1', 4, root, set(range(1, 8)))
+            result = fleet_tools.queue_cpus(root / 'nvme3n1', 4, set(range(1, 8)))
             self.assertEqual([r['cpu'] for r in result], [1, 2, 4, 6])
             self.assertEqual(len({r['queue'] for r in result}), 4)
             with self.assertRaises(ValueError):
-                fleet_tools.queue_cpus('/dev/nvme3n1', 4, root, {1, 2})
+                fleet_tools.queue_cpus(root / 'nvme3n1', 4, {1, 2})
             (mq / '0' / 'cpu_list').write_text('0-9999999')
             with self.assertRaises(ValueError):
-                fleet_tools.queue_cpus('/dev/nvme3n1', 1, root, {1})
+                fleet_tools.queue_cpus(root / 'nvme3n1', 1, {1})
+            (mq / '0' / 'cpu_list').write_text('0, ,1')
+            with self.assertRaisesRegex(ValueError, 'cpu_list'):
+                fleet_tools.queue_cpus(root / 'nvme3n1', 1, {1})
+
+    def test_real_kernel_tcp_cpu_lists_preserve_four_distinct_queue_maps(self):
+        captured = ('0, 1, 2, 3, 4\n', '5, 6, 7, 8, 9\n',
+                    '10, 11, 12, 13, 14\n', '15, 16, 17, 18, 19\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'nvme2c2n1'
+            for index, text in enumerate(captured):
+                queue = path / 'mq' / str(index); queue.mkdir(parents=True)
+                (queue / 'cpu_list').write_text(text)
+            queues = fleet_tools.queue_cpus(path, 4, set(range(20)))
+            self.assertEqual([q['cpu'] for q in queues], [0, 5, 10, 15])
+            self.assertEqual([q['cpu_list'] for q in queues], [text.strip() for text in captured])
+
+    def readiness_fixture(self, root):
+        m = fleet_tools.manager(Path(__file__).resolve().parents[2])
+        m.SYS_NVME = root / 'controllers'; m.DEV = root / 'dev'; m.DEV.mkdir()
+        ctrl = m.SYS_NVME / 'nvme3'; ctrl.mkdir(parents=True)
+        head = root / 'heads/nvme3n1'; head.mkdir(parents=True)
+        (head / 'size').write_text(str(fleet_tools.REGION_BYTES // 512))
+        (head / 'ro').write_text('0')
+        (m.DEV / head.name).touch()
+        (ctrl / 'queue_count').write_text('5'); (ctrl / 'sqsize').write_text('127')
+        expected = dict(nqn='nqn.2026-11.io.tidehunter:test', uuid='unique-uuid', nsid=1,
+                        transport='tcp', address='127.0.0.1', service=29137)
+        identity = dict(nqn=expected['nqn'], transport='tcp', inode=ctrl.stat().st_ino,
+                        address='traddr=127.0.0.1,trsvcid=29137')
+        m.controller_snapshot = MagicMock(return_value={'nvme3': identity})
+        m.namespace_candidates = MagicMock(return_value=[head])
+        path = ctrl / 'nvme3c7n1'; path.mkdir()
+        (path / 'device').symlink_to(ctrl)
+        for key, value in [('nsid', '1'), ('uuid', expected['uuid']), ('wwid', 'uuid.' + expected['uuid'])]:
+            (path / key).write_text(value)
+        for index in range(4):
+            queue = path / 'mq' / str(index); queue.mkdir(parents=True)
+            (queue / 'cpu_list').write_text(str(index))
+        return m, expected, identity, ctrl, head, path
+
+    def ready(self, m, expected, connection=None, seconds=1):
+        with patch.object(fleet_tools.stat, 'S_ISBLK', return_value=True), \
+                patch.object(fleet_tools.os, 'sched_getaffinity', return_value={0, 1, 2, 3}):
+            return fleet_tools.writable_namespace_ready(
+                m, {}, expected, connection if connection is not None else {}, 4,
+                m.DEV.parent, cloud_controller, time.monotonic() + seconds)
+
+    def test_multipath_head_uses_proven_controller_namespace_queues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m, expected, identity, ctrl, head, path = self.readiness_fixture(Path(tmp))
+            self.assertFalse((head / 'mq').exists())
+            connection = {}
+            device, geometry, queues = self.ready(m, expected, connection)
+            self.assertEqual(device, m.DEV / head.name)
+            self.assertEqual(geometry['queue_namespace'], str(path))
+            self.assertEqual([q['cpu'] for q in queues], [0, 1, 2, 3])
+            self.assertEqual(connection['controller_inode'], identity['inode'])
+            for call in m.controller_snapshot.call_args_list + m.namespace_candidates.call_args_list:
+                self.assertGreater(call.kwargs['timeout'], 0)
+                self.assertLessEqual(call.kwargs['timeout'], 1)
+
+    def test_readiness_retries_only_transient_publication_errors(self):
+        for code in (errno.ENOENT, errno.ENODEV, errno.EACCES, errno.EIO):
+            with self.subTest(errno=code), tempfile.TemporaryDirectory() as tmp:
+                m, expected, _, _, head, _ = self.readiness_fixture(Path(tmp))
+                original = Path.stat
+                attempts = []
+                def device_stat(path, *args, **kwargs):
+                    if path == m.DEV / head.name:
+                        attempts.append(path)
+                        if len(attempts) == 1:
+                            raise OSError(code, 'controlled devnode publication', str(path))
+                    return original(path, *args, **kwargs)
+                with patch.object(Path, 'stat', device_stat):
+                    if code in (errno.ENOENT, errno.ENODEV):
+                        self.ready(m, expected)
+                        self.assertEqual(len(attempts), 2)
+                    else:
+                        with self.assertRaises(OSError) as caught:
+                            self.ready(m, expected)
+                        self.assertEqual(caught.exception.errno, code)
+                        self.assertEqual(len(attempts), 1)
+
+    def test_missing_queue_publication_times_out_with_path_and_one_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m, expected, _, _, _, path = self.readiness_fixture(Path(tmp))
+            clock = iter(i * .001 for i in range(1000))
+            missing = path / 'mq'
+            with patch.object(fleet_tools, 'queue_cpus', side_effect=FileNotFoundError(errno.ENOENT, 'publication', str(missing))), \
+                    patch.object(fleet_tools.time, 'monotonic', side_effect=lambda: next(clock)), \
+                    patch.object(fleet_tools.time, 'sleep'):
+                with self.assertRaises(cloud_controller.InfrastructureError) as caught:
+                    self.ready(m, expected, seconds=.03)
+            self.assertEqual(caught.exception.__cause__.filename, str(missing))
+            self.assertLess(m.controller_snapshot.call_count, 30)
+
+    def test_real_inventory_deadline_tail_keeps_last_queue_publication_path(self):
+        for kind in ('namespace', 'controller'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                m, expected, identity, _, head, path = self.readiness_fixture(Path(tmp))
+                scanner = fleet_tools.manager(Path(__file__).resolve().parents[2])
+                m.InventoryTimeout = scanner.InventoryTimeout
+                missing = path / 'mq'
+                publication = FileNotFoundError(errno.ENOENT, 'queue publication', str(missing))
+                now = [0.0]
+                if kind == 'namespace':
+                    calls = []
+                    def namespace_probe(*args, **kwargs):
+                        calls.append(True)
+                        return [head] if len(calls) == 1 else scanner.namespace_candidates(*args, **kwargs)
+                    m.namespace_candidates = namespace_probe
+                else:
+                    calls = []
+                    def controller_probe(*args, **kwargs):
+                        calls.append(True)
+                        return {'nvme3': identity} if len(calls) == 1 else scanner.controller_snapshot(*args, **kwargs)
+                    m.controller_snapshot = controller_probe
+                with patch.object(scanner, '_namespace_candidates_once', side_effect=OSError(errno.ENODEV, 'controlled namespace churn')), \
+                        patch.object(scanner, 'controllers', side_effect=OSError(errno.ENODEV, 'controlled controller churn')), \
+                        patch.object(fleet_tools, 'queue_cpus', side_effect=publication), \
+                        patch.object(fleet_tools.time, 'monotonic', side_effect=lambda: now[0]), \
+                        patch.object(fleet_tools.time, 'sleep', side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+                    with self.assertRaises(cloud_controller.InfrastructureError) as caught:
+                        self.ready(m, expected, seconds=.055)
+                self.assertIsInstance(caught.exception.__cause__, scanner.InventoryTimeout)
+                self.assertIn(kind, str(caught.exception.__cause__))
+                self.assertIn('errno=2', str(caught.exception))
+                self.assertIn(str(missing), str(caught.exception))
+                self.assertAlmostEqual(now[0], .055)
+
+    def test_queue_identity_ambiguity_and_permanent_geometry_errors_fail_closed(self):
+        for error in ('uuid', 'parent', 'ambiguous', 'readonly', 'geometry', 'replacement'):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                m, expected, identity, ctrl, head, path = self.readiness_fixture(Path(tmp))
+                if error == 'uuid':
+                    (path / 'uuid').write_text('wrong')
+                elif error == 'parent':
+                    (path / 'device').unlink(); (path / 'device').symlink_to(head)
+                elif error == 'ambiguous':
+                    (ctrl / 'nvme3c8n1').symlink_to(path, target_is_directory=True)
+                elif error == 'readonly':
+                    (head / 'ro').write_text('1')
+                elif error == 'geometry':
+                    (ctrl / 'queue_count').write_text('4')
+                else:
+                    m.controller_snapshot.side_effect = [
+                        {'nvme3': identity}, {'nvme3': dict(identity, inode=identity['inode'] + 1)}]
+                with self.assertRaises((cloud_controller.SafetyError, ValueError)):
+                    self.ready(m, expected)
+
+    def test_failure_evidence_keeps_bounded_traceback_and_os_paths(self):
+        try:
+            try:
+                raise FileNotFoundError(errno.ENOENT, 'missing publication', '/sys/block/nvme2n1/mq')
+            except OSError as exc:
+                raise cloud_controller.InfrastructureError('wrapped ' + 'x' * 20000) from exc
+        except cloud_controller.InfrastructureError as exc:
+            evidence = fleet_tools.failure_evidence(exc)
+        self.assertEqual(evidence['causes'][1]['filename'], '/sys/block/nvme2n1/mq')
+        self.assertEqual(evidence['causes'][1]['errno'], errno.ENOENT)
+        self.assertLessEqual(len(evidence['traceback']), 16384)
+        self.assertTrue(evidence['traceback_truncated'])
 
     def test_fio_runtime_units_and_invalid_populations(self):
         spec = self.jobs('nvmeof_write_ceiling')[0]['fio_write']
@@ -249,8 +412,7 @@ class FleetToolsTests(unittest.TestCase):
                 directory = root / str(failed); directory.mkdir()
                 ctl.request = MagicMock(side_effect=[target, {}, cpu, {'complete': True}])
                 raw = self.raw_fio(job['fio_write'])
-                with patch.object(fleet_tools, 'connect', return_value=({}, Path('/dev/nvme3n1'), {'verified': True})), \
-                        patch.object(fleet_tools, 'queue_cpus', return_value=queues), \
+                with patch.object(fleet_tools, 'connect', return_value=({}, Path('/dev/nvme3n1'), {'verified': True}, queues)), \
                         patch.object(fleet_tools, 'disconnect', return_value=identity) as disconnect, \
                         patch.object(fleet_tools.shutil, 'which', return_value='/usr/bin/fio'), \
                         patch.object(cloud_controller, 'digest', return_value='b' * 64), \
@@ -270,6 +432,30 @@ class FleetToolsTests(unittest.TestCase):
                     self.assertEqual(ctl.request.call_args_list[-1].args[1]['host_disconnected'], identity)
                 self.assertTrue((directory / 'fio_raw.json').is_file())
                 self.assertTrue((directory / 'owner-cpu.json').is_file())
+
+    def test_publication_failure_archives_path_and_preserves_cleanup_abort(self):
+        job = self.jobs('nvmeof_write_ceiling')[0]
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); ctl = self.controller(root)
+                ctl.config.update(prefix='bench-test', repository_root='/repo',
+                                  fleet={'nodes': [{'rdma_address': '10.0.0.2'}]})
+                identity = fleet_tools.target_identity(ctl.config, job)
+                ctl.request = MagicMock(side_effect=[identity, {'complete': True}])
+                error = FileNotFoundError(errno.ENOENT, 'queue publication', '/sys/block/nvme2n1/mq')
+                with patch.object(fleet_tools, 'connect', side_effect=error), \
+                        patch.object(fleet_tools, 'disconnect', return_value=identity,
+                                     side_effect=cloud_controller.InfrastructureError('unproved absence') if cleanup_fails else None), \
+                        patch.object(cloud_controller, 'floor_client_command') as fio:
+                    with self.assertRaises(cloud_controller.InfrastructureError):
+                        fleet_tools.run_case(ctl, job, cloud_controller)
+                    fio.assert_not_called()
+                directory = root / 'cases' / job['case_id']
+                measurement = json.loads((directory / 'measurement-failure.json').read_text())
+                self.assertEqual(measurement['causes'][0]['filename'], error.filename)
+                self.assertTrue((directory / 'failure.json').is_file())
+                self.assertEqual(ctl.request.call_count, 1 if cleanup_fails else 2)
+                self.assertEqual(json.loads((directory / 'receipt.json').read_text())['status'], 'failed')
 
     def test_optional_sealed_admission_recipe_and_elf_binding(self):
         command = ['cargo', '--config', 'build.rustflags=["-C","target-cpu=x86-64"]',

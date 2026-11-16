@@ -3,6 +3,7 @@
 Never opens a TideHunter WAL. The writable target is a fresh, exactly owned file;
 its nvmet buffered_io=1 contract matches the owner's live file exports.
 """
+import errno
 import hashlib
 import importlib.util
 import itertools
@@ -16,6 +17,7 @@ import stat
 import subprocess
 import statistics
 import time
+import traceback
 import uuid
 
 import floors
@@ -88,22 +90,23 @@ def _measurement_jobs(*, repetitions, cell_filter, options=ADMISSION_OPTIONS, se
     return jobs
 
 
-def queue_cpus(device, jobs, sys_block=Path('/sys/block'), allowed=None):
-    """Choose one allowed CPU from each distinct non-admin hardware queue."""
-    if jobs not in (1, 4) or not re.fullmatch(r'nvme[0-9]+n[0-9]+', Path(device).name):
+def queue_cpus(namespace, jobs, allowed=None):
+    """Choose allowed CPUs from the verified controller namespace, not its head."""
+    namespace = Path(namespace)
+    if jobs not in (1, 4) or not re.fullmatch(r'nvme[0-9]+(?:c[0-9]+)?n[0-9]+', namespace.name):
         raise ValueError('exact NVMe namespace and reviewed job count required')
     allowed = set(os.sched_getaffinity(0) if allowed is None else allowed)
     queues = []
-    for entry in sorted((Path(sys_block) / Path(device).name / 'mq').iterdir(), key=lambda p: int(p.name)):
+    for entry in sorted((namespace / 'mq').iterdir(), key=lambda p: int(p.name)):
         text = (entry / 'cpu_list').read_text().strip()
         cpus = set()
         for part in text.split(','):
-            bounds = part.split('-')
+            bounds = part.strip().split('-')
             if len(bounds) not in (1, 2) or any(not value.isdigit() for value in bounds):
-                raise ValueError('invalid hardware queue CPU list')
+                raise ValueError('invalid hardware queue CPU list at %s: %r' % (entry / 'cpu_list', text[:256]))
             first, last = int(bounds[0]), int(bounds[-1])
             if not 0 <= first <= last < 4096:
-                raise ValueError('hardware queue CPU range exceeds bound')
+                raise ValueError('hardware queue CPU range exceeds bound at ' + str(entry / 'cpu_list'))
             cpus.update(range(first, last + 1))
         candidates = sorted((cpus & allowed) - {q['cpu'] for q in queues})
         if candidates:
@@ -319,6 +322,118 @@ def guest(config, request, api):
     raise api.SafetyError('unsupported F9 guest action')
 
 
+def queue_namespace(ctrl, manifest, api):
+    """Resolve the sole controller-owned namespace by identity, never by alias."""
+    ctrl_path = ctrl.resolve(strict=True)
+    candidates = []
+    with os.scandir(ctrl) as entries:
+        paths = [ctrl / entry.name for entry in entries
+                 if re.fullmatch(r'nvme[0-9]+(?:c[0-9]+)?n[0-9]+', entry.name)]
+    for path in paths:
+        if (path / 'device').resolve(strict=True) != ctrl_path:
+            raise api.SafetyError('F9 queue namespace has an unexpected controller: ' + str(path))
+        if (path / 'nsid').read_text().strip() != str(manifest['nsid']):
+            continue
+        if ((path / 'uuid').read_text().strip().lower() != manifest['uuid_string']
+                or (path / 'wwid').read_text().strip() != 'uuid.' + manifest['uuid_string']):
+            raise api.SafetyError('F9 queue namespace UUID mismatch: ' + str(path))
+        candidates.append(path)
+    if len(candidates) > 1:
+        raise api.SafetyError('F9 controller has ambiguous queue namespaces: ' + str(ctrl))
+    if not candidates:
+        raise FileNotFoundError(errno.ENOENT, 'controller namespace not published', str(ctrl))
+    return candidates[0]
+
+
+def writable_namespace_ready(m, before, expected, connection, jobs, directory, api, deadline):
+    """Admit writable device and real queues within one publication deadline.
+
+    The shared scanner proves head/subsystem identity. Multipath heads have no
+    mq directory: queue mappings belong to their exact controller namespace.
+    """
+    manifest = dict(nqn=expected['nqn'], uuid_string=expected['uuid'], nsid=expected['nsid'])
+    last_transient = None
+    def inventory(probe, *args, **kwargs):
+        try:
+            return probe(*args, **kwargs)
+        except m.InventoryTimeout as exc:
+            detail = ''
+            if last_transient is not None:
+                detail = '; last publication error errno=%r path=%r: %s' % (
+                    last_transient.errno, last_transient.filename, last_transient)
+            raise api.InfrastructureError('F9 writable inventory readiness timed out' + detail) from exc
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise api.InfrastructureError('F9 writable namespace/queues did not become ready') from last_transient
+        current = inventory(m.controller_snapshot, timeout=remaining)
+        matches = m.new_controller_matches(before, current, expected['nqn'], expected['transport'],
+                                           expected['address'], expected['service'])
+        if connection.get('controller') is not None:
+            ctrl = connection['controller']
+            if (matches != [ctrl] or current[ctrl]['inode'] != connection['controller_inode']
+                    or current[ctrl]['address'] != connection['controller_address']):
+                raise api.SafetyError('F9 owned controller disappeared or changed during readiness')
+        elif matches:
+            ctrl = matches[0]
+            connection.update(controller=ctrl, controller_inode=current[ctrl]['inode'],
+                              controller_address=current[ctrl]['address'])
+            api.dump(directory / 'initiator-state.json', connection)
+        if matches:
+            ctrl = m.SYS_NVME / connection['controller']
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                namespaces = inventory(m.namespace_candidates, ctrl, manifest, timeout=remaining)
+                if len(namespaces) > 1:
+                    raise api.SafetyError('F9 writable namespace identity is ambiguous')
+                if namespaces:
+                    block = namespaces[0]
+                    device = m.DEV / block.name
+                    if not stat.S_ISBLK(device.stat().st_mode):
+                        raise api.SafetyError('F9 namespace is not a block device: ' + str(device))
+                    if int((block / 'size').read_text()) * 512 != REGION_BYTES:
+                        raise api.SafetyError('F9 namespace size differs from exact scratch file: ' + str(block))
+                    if (block / 'ro').read_text().strip() != '0':
+                        raise api.SafetyError('F9 scratch namespace is unexpectedly read-only: ' + str(block))
+                    geometry = m.verify_queue_geometry(ctrl, (4, 128))
+                    queue_path = queue_namespace(ctrl, manifest, api)
+                    queues = queue_cpus(queue_path, jobs)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        continue
+                    after = inventory(m.controller_snapshot, timeout=remaining)
+                    if after.get(connection['controller']) != current[connection['controller']]:
+                        raise api.SafetyError('F9 owned controller changed during queue discovery')
+                    if time.monotonic() >= deadline:
+                        continue
+                    geometry['queue_namespace'] = str(queue_path.resolve(strict=True))
+                    return device, geometry, queues
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                    raise
+                last_transient = exc
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(.05, remaining))
+
+
+def failure_evidence(exc):
+    """Keep bounded chained diagnostics, including paths lost by repr(OSError)."""
+    causes, seen, current = [], set(), exc
+    while current is not None and id(current) not in seen and len(causes) < 8:
+        seen.add(id(current))
+        causes.append(dict(type=type(current).__name__, message=str(current)[-4096:],
+                           errno=getattr(current, 'errno', None),
+                           filename=str(current.filename)[-4096:] if getattr(current, 'filename', None) is not None else None,
+                           filename2=str(current.filename2)[-4096:] if getattr(current, 'filename2', None) is not None else None))
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    text = ''.join(traceback.TracebackException.from_exception(exc, capture_locals=False).format())
+    return dict(schema_version=1, causes=causes, traceback=text[-16384:], traceback_truncated=len(text) > 16384)
+
+
 def connect(config, job, directory, api, state):
     """Connect a writable scratch namespace; never use the sealed RO connector."""
     m = manager(config['repository_root'])
@@ -333,35 +448,14 @@ def connect(config, job, directory, api, state):
         raise api.SafetyError('F9 scratch controller already exists')
     connection = dict(nqn=expected['nqn'], hostnqn=expected['hostnqn'], transport='rdma')
     try:
+        deadline = time.monotonic() + 30
         api.command(['nvme', 'connect', '-t', 'rdma', '-a', expected['address'], '-s', str(expected['service']),
                      '-q', expected['hostnqn'], '-I', str(uuid.uuid5(uuid.NAMESPACE_URL, expected['hostnqn'])),
-                     '-n', expected['nqn'], '-l', '0', '-i', '4', '-Q', '128'], timeout=30)
-        deadline = time.monotonic() + 30
-        manifest = dict(nqn=expected['nqn'], uuid_string=expected['uuid'], nsid=1,
-                        image_len=REGION_BYTES, block_size=4096)
-        while time.monotonic() < deadline:
-            current = m.controller_snapshot()
-            matches = m.new_controller_matches(before, current, expected['nqn'], 'rdma', expected['address'], expected['service'])
-            if matches:
-                ctrl = matches[0]
-                connection.update(controller=ctrl, controller_inode=current[ctrl]['inode'],
-                                  controller_address=current[ctrl]['address'])
-                api.dump(directory / 'initiator-state.json', connection)
-                namespaces = m.namespace_candidates(m.SYS_NVME / ctrl, manifest)
-                if len(namespaces) == 1:
-                    device = m.DEV / namespaces[0].name
-                    info = device.stat()
-                    if not stat.S_ISBLK(info.st_mode):
-                        raise api.SafetyError('F9 namespace is not a block device')
-                    block = Path('/sys/block') / device.name
-                    if int((block / 'size').read_text()) * 512 != REGION_BYTES:
-                        raise api.SafetyError('F9 namespace size differs from exact scratch file')
-                    if (Path('/sys/block') / device.name / 'ro').read_text().strip() != '0':
-                        raise api.SafetyError('F9 scratch namespace is unexpectedly read-only')
-                    geometry = m.verify_queue_geometry(m.SYS_NVME / ctrl, (4, 128))
-                    return connection, device, geometry
-            time.sleep(.05)
-        raise api.InfrastructureError('F9 writable namespace did not become ready')
+                     '-n', expected['nqn'], '-l', '0', '-i', '4', '-Q', '128'],
+                    timeout=max(.001, deadline - time.monotonic()))
+        device, geometry, queues = writable_namespace_ready(
+            m, before, expected, connection, job['fio_write']['jobs'], directory, api, deadline)
+        return connection, device, geometry, queues
     except BaseException:
         disconnect(config, job, connection, api, before=before)
         raise
@@ -404,8 +498,7 @@ def run_fio(controller, job, directory, api, deadline):
         except Exception as exc:
             raise api.InfrastructureError('F9 target setup outcome uncertain; preserving exact target: ' + repr(exc)) from exc
         api.dump(directory / 'target-state.json', target)
-        connection, device, geometry = connect(controller.config, job, directory, api, target)
-        queues = queue_cpus(device, job['fio_write']['jobs'])
+        connection, device, geometry, queues = connect(controller.config, job, directory, api, target)
         binary = shutil.which('fio')
         if binary is None:
             raise api.InfrastructureError('fio unavailable on coordinator')
@@ -432,6 +525,7 @@ def run_fio(controller, job, directory, api, deadline):
                         raw_path='fio_raw.json', raw_sha256=hashlib.sha256(raw).hexdigest())
     except BaseException as exc:
         failure = exc
+        api.dump(directory / 'measurement-failure.json', failure_evidence(exc))
     finally:
         cpu, cpu_error = {'available': False}, None
         if cpu_started:
@@ -516,6 +610,7 @@ def run_case(controller, job, api):
     except Exception as exc:
         failure = exc
         receipt['error'] = type(exc).__name__ + ': ' + str(exc)
+        api.dump(directory / 'failure.json', failure_evidence(exc))
     finally:
         path = directory / 'phase_timing.json'
         spent[job['case_kind']] = spent.get(job['case_kind'], 0) + time.monotonic() - started

@@ -29,6 +29,10 @@ NQN = re.compile(r'^nqn\.[A-Za-z0-9][A-Za-z0-9.:-]{1,218}$')
 CONTROLLER = re.compile(r'^nvme[0-9]+$')
 
 
+class InventoryTimeout(ValueError):
+    """A complete controller or namespace inventory exceeded its deadline."""
+
+
 def fail(message):
     raise ValueError(message)
 
@@ -473,7 +477,7 @@ def controller_snapshot(timeout=5.0):
         previous = current
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            fail('controller inventory did not stabilize; controller identity remains unknown')
+            raise InventoryTimeout('controller inventory did not stabilize; controller identity remains unknown')
         time.sleep(min(.02, remaining))
 
 
@@ -599,7 +603,7 @@ def namespace_candidates(ctrl, m, timeout=5.0):
         previous = current
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            fail('namespace inventory did not stabilize; identity remains unknown')
+            raise InventoryTimeout('namespace inventory did not stabilize; identity remains unknown')
         time.sleep(min(.02, remaining))
 
 
@@ -737,12 +741,14 @@ def host_connect(args):
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                fail('namespace not uniquely present in sysfs')
+                raise InventoryTimeout('namespace not uniquely present in sysfs')
             namespaces = namespace_candidates(ctrl, m, timeout=min(5.0, remaining))
             if len(namespaces) == 1:
                 break
-            if len(namespaces) > 1 or time.monotonic() >= deadline:
+            if len(namespaces) > 1:
                 fail('namespace not uniquely present in sysfs')
+            if time.monotonic() >= deadline:
+                raise InventoryTimeout('namespace not uniquely present in sysfs')
             time.sleep(.1)
         ns = namespaces[0]
         # The block readonly flag is an independent initiator-side guard.
