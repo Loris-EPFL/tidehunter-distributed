@@ -580,6 +580,18 @@ def stop(state):
     dump(Path(state["directory"]) / "cleanup.json", {"completed_at_unix": time.time(), "project": state["project"], "owner": state["owner"]})
 
 
+def resolve_images(state, spec, cached_only=False):
+    """Resolve pinned local images; cached-only runs never contact a registry."""
+    if not cached_only:
+        compose(state, "pull", timeout=300)
+    images = []
+    for image in sorted({x["image"] for x in spec["services"].values()}):
+        observed = json.loads(command(["docker", "image", "inspect", image]))[0]
+        images.append({"requested": image, "resolved": observed["RepoDigests"],
+                       "image_id": observed["Id"]})
+    return images
+
+
 def start(args):
     contract = ack_contract.selected(args.backend, getattr(args, "ack_contract", "synced"))
     if args.backend == "valkey_rdma" or (args.backend == "valkey_tcp" and getattr(args, "paired_valkey", False)):
@@ -644,10 +656,8 @@ def start(args):
     coordinators = ",".join(f"127.0.0.1:{4500+i}" for i in range(count))
     (directory / "fdb.cluster").write_text(f"kvcomparison:{owner}@{coordinators}\n")
     try:
-        compose(state, "pull", timeout=300)
-        used = sorted({x["image"] for x in spec["services"].values()})
-        dump(directory / "images.json", [{"requested": image, "resolved": json.loads(command(["docker", "image", "inspect", image]))[0]["RepoDigests"],
-              "image_id": json.loads(command(["docker", "image", "inspect", image]))[0]["Id"]} for image in used])
+        dump(directory / "images.json", resolve_images(
+            state, spec, getattr(args, "cached_images_only", False)))
         if args.backend == "cassandra":
             for i in range(count):
                 compose(state, "up", "-d", f"cassandra{i}")
@@ -732,6 +742,7 @@ def main():
     launch.add_argument("--layout", choices=["distributed", "qualification"], default="distributed")
     launch.add_argument("--state", type=Path, required=True)
     launch.add_argument("--timeout", type=int, default=180)
+    launch.add_argument("--cached-images-only", action="store_true")
     for action in ("ready", "export", "stop"):
         p = sub.add_parser(action)
         p.add_argument("--state", type=Path, required=True)

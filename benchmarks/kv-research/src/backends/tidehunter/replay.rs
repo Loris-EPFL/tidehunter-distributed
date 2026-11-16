@@ -1,7 +1,8 @@
 //! Three independent node DBs, named table keyspaces and one complete remote batch per commit.
 use super::{Options, TidehunterBackend, open_with_shape, parse_options};
 use crate::backend::{BackendInfo, BackendResult, native_error};
-use crate::backends::native::replay::{ReplayBackend, table_mutexes};
+use crate::backends::native::replay::table_mutexes;
+use crate::backends::replay::ReplayBackend;
 use crate::mainnet_trace::{Row, Table, Trace};
 use serde::Deserialize;
 use std::collections::BTreeSet;

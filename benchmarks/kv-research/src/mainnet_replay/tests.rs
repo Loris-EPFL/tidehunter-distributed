@@ -455,3 +455,58 @@ async fn injected_background_failure_rejects_each_replay_boundary() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// Inject an uncertain acknowledgement only after a real engine mutation.
+struct PartialNative(Arc<NativeReplayBackend>);
+impl ReplayBackend for PartialNative {
+    fn check_background_health(&self) -> BackendResult<()> {
+        self.0.check_background_health()
+    }
+    fn get(&self, table: u16, key: &[u8]) -> BackendResult<Option<Bytes>> {
+        self.0.get(table, key)
+    }
+    fn commit(&self, db: u16, entries: &[Row]) -> BackendResult<()> {
+        if entries.last().is_some_and(|row| row.table == 11) {
+            self.0.commit(db, &entries[..1])?;
+            return Err(Box::new(UnknownReplayMutation(
+                "injected loss after partial application".into(),
+            )));
+        }
+        self.0.commit(db, entries)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_partial_commit_stops_without_retry_or_final_get_recovery() {
+    let root = temp("partial");
+    let mut cfg = config(&root);
+    cfg.workload.repetitions = 1;
+    let trace = cfg.validate().unwrap();
+    let prepared = Arc::new(prepare(&trace, 1).unwrap());
+    let native = Arc::new(NativeReplayBackend::open(&cfg.backend.options, &trace.tables).unwrap());
+    let result = run_prepared(
+        cfg,
+        &root.join("result"),
+        trace,
+        prepared,
+        Arc::new(PartialNative(Arc::clone(&native))),
+        serde_json::Value::Null,
+        (Instant::now(), now_unix(), None),
+    )
+    .await;
+    assert!(result.is_err());
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("result/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["phase_counts"]["unknown_outcomes"], 1);
+    assert_eq!(summary["phase_counts"]["counts"]["write_calls"], 7);
+    assert_eq!(summary["phase_counts"]["counts"]["checkpoints"], 0);
+    assert_eq!(
+        summary["phase_counts"]["profile"]["functional_qualification"],
+        false
+    );
+    assert!(summary["phase_counts"]["profile"]["final_verification"].is_null());
+    assert!(native.get(11, b"").unwrap().is_none());
+    assert!(native.get(16, &2_u32.to_be_bytes()).unwrap().is_none());
+    drop(native);
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -1,7 +1,8 @@
 //! W=1 checkpoint-commit replay. The scheduler alone owns the DAG and dirty overlay.
 use crate::backend::{BackendInfo, BackendResult, BatchAtomicity};
-use crate::backends::native::replay::{
-    NativeReplayBackend, ReplayBackend, UnsupportedReplayBackend,
+use crate::backends::native::replay::NativeReplayBackend;
+use crate::backends::replay::{
+    FinalRows, ReplayBackend, UnknownReplayMutation, UnsupportedReplayBackend, physical_key,
 };
 use crate::backends::tidehunter::replay::TidehunterReplayBackend;
 use crate::config::{
@@ -67,13 +68,22 @@ fn ensure(ok: bool, message: &str) -> BackendResult<()> {
 impl ReplayConfig {
     pub fn validate(&self) -> BackendResult<Trace> {
         ensure(self.schema_version == 1, "replay schema_version must be 1")?;
-        if !matches!(self.backend.kind.as_str(), "native" | "tidehunter_tcp") {
+        if !matches!(
+            self.backend.kind.as_str(),
+            "native" | "tidehunter_tcp" | "valkey_tcp" | "garnet" | "kvrocks"
+        ) {
             return Err(Box::new(UnsupportedReplayBackend(
                 self.backend.kind.clone(),
             )));
         }
         if self.backend.kind == "native" {
             NativeReplayBackend::validate(&self.backend.options)?;
+        }
+        if matches!(
+            self.backend.kind.as_str(),
+            "valkey_tcp" | "garnet" | "kvrocks"
+        ) {
+            crate::backends::validate_options(&self.backend.kind, &self.backend.options)?;
         }
         ensure(
             self.execution.mode == ExecutionMode::ClosedLoop
@@ -171,7 +181,18 @@ impl ReplayConfig {
     pub fn admit(&self) -> BackendResult<(Trace, Vec<Prepared>, serde_json::Value)> {
         let trace = self.validate()?;
         let mut resources = resource_admission(self, &trace)?;
-        let prepared = prepare(&trace, self.workload.repetitions)?;
+        let mut prepared = prepare(&trace, self.workload.repetitions)?;
+        if matches!(
+            self.backend.kind.as_str(),
+            "valkey_tcp" | "garnet" | "kvrocks"
+        ) {
+            prepare_physical_keys(&mut prepared, self.backend.options["cluster"] == true);
+            #[cfg(any(feature = "valkey-tcp", feature = "garnet", feature = "kvrocks"))]
+            {
+                resources["resp_admission"] =
+                    crate::backends::resp_replay::admit(&prepared, &self.backend.kind)?;
+            }
+        }
         if self.backend.kind == "native" {
             resources["native_index_geometry"] = NativeReplayBackend::validate_geometry(
                 &self.backend.options,
@@ -200,6 +221,7 @@ pub fn prepare(trace: &Trace, repetitions: u64) -> BackendResult<Vec<Prepared>> 
         let row = |r: &Row| -> Row {
             Row {
                 key: keys[&(r.table, r.key.clone())].clone(),
+                backend_key: keys[&(r.table, r.key.clone())].clone(),
                 ..r.clone()
             }
         };
@@ -246,6 +268,23 @@ pub fn prepare(trace: &Trace, repetitions: u64) -> BackendResult<Vec<Prepared>> 
         });
     }
     Ok(result)
+}
+
+fn prepare_physical_keys(prepared: &mut [Prepared], cluster: bool) {
+    let mut keys = BTreeMap::new();
+    for p in prepared {
+        for row in p
+            .preload
+            .iter_mut()
+            .chain(p.batches.iter_mut().flat_map(|b| &mut b.entries))
+            .chain(p.reads.iter_mut().flatten().map(|r| &mut r.row))
+        {
+            row.backend_key = keys
+                .entry((row.table, row.key.clone()))
+                .or_insert_with(|| physical_key(row.table, &row.key, cluster))
+                .clone();
+        }
+    }
 }
 #[derive(Clone, Copy)]
 enum Operation {
@@ -546,7 +585,7 @@ fn execute_work<B: ReplayBackend + ?Sized>(
                 duration_ns(dispatched.saturating_duration_since(origin)) + 1,
                 Ordering::Release,
             );
-            let actual = backend.get(read.row.table, &read.row.key);
+            let actual = backend.get(read.row.table, &read.row.backend_key);
             let completed = Instant::now();
             let outcome = if completed >= work.deadline {
                 "timeout"
@@ -589,7 +628,12 @@ fn execute_work<B: ReplayBackend + ?Sized>(
             );
             let result = backend.commit(batch.db, &batch.entries);
             let completed = Instant::now();
-            let outcome = if completed >= work.deadline {
+            let outcome = if completed >= work.deadline
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.is::<UnknownReplayMutation>())
+            {
                 "unknown_mutation"
             } else if result.is_ok() {
                 "success"
@@ -978,8 +1022,10 @@ fn native_disk_reservation(payload: u64, fragment_size: u64) -> BackendResult<(u
 fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<serde_json::Value> {
     let geometry = if config.backend.kind == "native" {
         NativeReplayBackend::geometry(&config.backend.options)?
-    } else {
+    } else if config.backend.kind == "tidehunter_tcp" {
         TidehunterReplayBackend::geometry(&config.backend.options)?
+    } else {
+        serde_json::json!({"wal_file_size":0,"admission_path":"."})
     };
     let payload = trace
         .preload
@@ -995,7 +1041,10 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         .checked_mul(config.workload.repetitions)
         .and_then(|n| n.checked_mul(128))
         .ok_or("replay index bound overflow")?;
-    let (reserve, wal) = if config.backend.kind == "native" {
+    let network_store = !matches!(config.backend.kind.as_str(), "native" | "tidehunter_tcp");
+    let (reserve, wal) = if network_store {
+        (0, 0)
+    } else if config.backend.kind == "native" {
         let fragment_size = geometry["fragment_size"]
             .as_u64()
             .ok_or("missing native fragment geometry")?;
@@ -1087,16 +1136,17 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         "estimated_memory_reservation_bytes":memory,"memory_available_bytes":memory_available,
         "payload_key_value_bytes":payload,"index_reservation_bytes":index,"wal_fragment_reservation_bytes":wal,
         "disk_payload_amplification_factor":2,
-        "reservation_model":if config.backend.kind == "native" {"2x key/value payload for framing/index amplification + six open WAL fragments; empirical conservative native estimate, not physical I/O measurement; memory additionally reserves 128 bytes per row for indexes"} else {"2x key/value payload + 128 bytes per row + six whole WAL files, checked on every coordinator root; owner device capacity is not observable; memory additionally reserves 128 bytes per row for indexes"}}),
+        "reservation_model":if network_store {"client memory admission only; remote engine/disk budgets require the exact-owned lifecycle receipt"} else if config.backend.kind == "native" {"2x key/value payload for framing/index amplification + six open WAL fragments; empirical conservative native estimate, not physical I/O measurement; memory additionally reserves 128 bytes per row for indexes"} else {"2x key/value payload + 128 bytes per row + six whole WAL files, checked on every coordinator root; owner device capacity is not observable; memory additionally reserves 128 bytes per row for indexes"}}),
     )
 }
 
 pub async fn run(config: ReplayConfig, output: &Path) -> BackendResult<()> {
     let started_unix = now_unix();
     let started = Instant::now();
-    let (trace, prepared, resources) = config.admit()?;
-    let prepared = Arc::new(prepared);
+    let (trace, mut prepared, mut resources) = config.admit()?;
     let (backend, info) = open_backend(&config, &trace).await?;
+    resources["prepared_placement"] = backend.prepare_case(&mut prepared)?;
+    let prepared = Arc::new(prepared);
     run_prepared(
         config,
         output,
@@ -1124,6 +1174,7 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         None => native_info(&config.backend.options)?,
     };
     let deadline = started + Duration::from_secs(config.limits.deadline_seconds);
+    let capability = backend.commit_capability().labels(&info)?;
     let mut reporter = Reporter::create(
         output,
         prometheus::Registry::new(),
@@ -1141,6 +1192,8 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     let mut preload_ns = 0;
     let mut window_start = None;
     let mut elapsed = Duration::ZERO;
+    let mut physical_before = serde_json::Value::Null;
+    let mut physical_after = serde_json::Value::Null;
     let mut result: BackendResult<()> = async {
         for rep in 0..prepared.len() {
             pool.dispatch(0, rep, Operation::Preload, Instant::now(), deadline)?;
@@ -1152,6 +1205,7 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
             crate::runner::wait_for_measurement_gate(gate, deadline).await?;
         }
         backend.check_background_health()?;
+        physical_before = backend.physical_counts();
         reporter.set_phase("measurement");
         let begin = Instant::now();
         window_start = Some(begin);
@@ -1159,6 +1213,7 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
             checkpoint(&mut pool, &trace, p, rep, deadline, &mut m).await?;
         }
         elapsed = begin.elapsed();
+        physical_after = backend.physical_counts();
         backend.check_background_health()?;
         if let Some(gate) = &config.measurement_completion_gate {
             crate::runner::wait_for_measurement_gate(gate, deadline).await?;
@@ -1184,6 +1239,26 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         .await?;
     }
     let unresolved_workers = pool.close().await?;
+    let mut final_verification = serde_json::Value::Null;
+    if result.is_ok() {
+        let mut expected = FinalRows::new();
+        for p in prepared.iter() {
+            for row in p
+                .preload
+                .iter()
+                .chain(p.batches.iter().flat_map(|b| &b.entries))
+            {
+                expected.insert((row.table, row.key.clone()), row.clone());
+            }
+        }
+        let verifier = Arc::clone(&backend);
+        match tokio::task::spawn_blocking(move || verifier.verify_final(&expected, deadline))
+            .await?
+        {
+            Ok(receipt) => final_verification = receipt,
+            Err(error) => result = Err(error),
+        }
+    }
     for (s, id) in &m.calls {
         reporter.offered(s.phase, s.operation, s.logical_keys);
         reporter.record_replay(s.clone(), id.clone()).await?;
@@ -1203,6 +1278,30 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         window_start.map_or(0, |s| duration_ns(s.saturating_duration_since(started))),
         elapsed,
     );
+    let mut metrics = metrics;
+    metrics["replay_contract"] = capability;
+    metrics["physical"] = serde_json::json!({"before_measurement":physical_before,"after_measurement":physical_after,"including_preload":backend.physical_counts()});
+    metrics["final_verification"] = final_verification;
+    metrics["functional_qualification"] =
+        serde_json::json!(result.is_ok() && unresolved_workers == 0);
+    metrics["minimum_measurement_seconds"] =
+        serde_json::json!(config.workload.minimum_measurement_seconds);
+    metrics["logical_key_bytes"] = serde_json::json!(
+        prepared
+            .iter()
+            .flat_map(|p| p.batches.iter().flat_map(|b| &b.entries))
+            .map(|r| r.key.len() as u64)
+            .sum::<u64>()
+    );
+    metrics["client_physical_key_bytes"] = serde_json::json!(
+        prepared
+            .iter()
+            .flat_map(|p| p.batches.iter().flat_map(|b| &b.entries))
+            .map(|r| r.backend_key.len() as u64)
+            .sum::<u64>()
+    );
+    metrics["topology"] = info.topology.clone();
+    metrics["case_identity"] = serde_json::json!({"scope":SCOPE,"fixture_sha256":config.workload.manifest_sha256,"source":trace.manifest["source"],"repeat_domain":std::str::from_utf8(crate::mainnet_trace::DOMAIN)?,"repeat_version":1,"repetitions":prepared.len(),"N":config.execution.concurrency,"W":1,"table_mapping":trace.tables,"device_counters":"unmeasured"});
     let unknown_outcomes = m
         .calls
         .iter()
@@ -1236,6 +1335,16 @@ async fn open_backend(
         )),
         "tidehunter_tcp" => {
             let backend = TidehunterReplayBackend::open(&config.backend.options, trace).await?;
+            let info = backend.info();
+            Ok((Arc::new(backend), info))
+        }
+        #[cfg(any(feature = "valkey-tcp", feature = "garnet", feature = "kvrocks"))]
+        "valkey_tcp" | "garnet" | "kvrocks" => {
+            let backend = crate::backends::resp_replay::RespReplayBackend::open(
+                &config.backend.kind,
+                &config.backend.options,
+            )
+            .await?;
             let info = backend.info();
             Ok((Arc::new(backend), info))
         }

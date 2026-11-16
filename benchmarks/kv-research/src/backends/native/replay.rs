@@ -1,6 +1,7 @@
 //! Real node DB boundaries; no synthetic root keyspace or cross-DB atomicity.
 use super::{Durability, NativeWalGeometry, native_config, parse_options};
 use crate::backend::{BackendResult, native_error};
+use crate::backends::replay::{ReplayBackend, UnsupportedReplayBackend};
 use crate::mainnet_trace::{Row, Table};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -9,25 +10,6 @@ use tidehunter::key_shape::{KeyIndexing, KeyShapeBuilder, KeySpace, KeySpaceConf
 use tidehunter::metrics::Metrics;
 use tidehunter::minibytes::Bytes;
 
-#[derive(Debug)]
-pub struct UnsupportedReplayBackend(pub String);
-impl std::fmt::Display for UnsupportedReplayBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "mainnet replay unsupported backend/configuration: {}",
-            self.0
-        )
-    }
-}
-impl std::error::Error for UnsupportedReplayBackend {}
-
-/// A commit is atomic within exactly one node DB, never across DBs.
-pub trait ReplayBackend: Send + Sync + 'static {
-    fn get(&self, table: u16, key: &[u8]) -> BackendResult<Option<Bytes>>;
-    fn commit(&self, db: u16, entries: &[Row]) -> BackendResult<()>;
-    fn check_background_health(&self) -> BackendResult<()>;
-}
 /// Pin the production adapter defaults, not its debug/test overrides:
 /// typed-store/src/tidehunter_util.rs:870-877,1035-1037.
 pub const ADAPTER_MUTEXES: usize = 1024;
