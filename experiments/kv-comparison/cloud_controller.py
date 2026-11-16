@@ -1888,6 +1888,14 @@ def bind_owner_wal_prewrite(job, launch):
             launch["node"].pop("wal_prewrite", None)
 
 
+def load_owner_launch(job, launch_path):
+    """Read a prepared owner launch and bind the case's WAL prewrite choice before any validation."""
+    import yaml
+    launch = yaml.safe_load(Path(launch_path).read_text())
+    bind_owner_wal_prewrite(job, launch)
+    return launch
+
+
 def validate_launch(config, launch, case, index, polling=None):
     root = Path(config["fleet"]["data_root"]) / "cells" / case
     node = root / f"node-{index}"
@@ -3763,7 +3771,7 @@ class Controller:
             target.chmod(0o600)
         def start(index):
             launch_path = prepared / f"node-{index}" / "launch.yaml"
-            launch = yaml.safe_load(launch_path.read_text())
+            launch = load_owner_launch(job, launch_path)
             if job.get("nvmeof_route") == "live" and job.get("nvmeof_target") == "spdk":
                 validate_launch(self.config, launch, case, index, polling)
                 nqn = owner_identities.get(str(index), {}).get("host_nqn", host_nqn)
@@ -3781,7 +3789,6 @@ class Controller:
                     raise SafetyError("prepared live target is missing or differs from selected transport")
             elif launch.get("node", {}).get("live_target") is not None:
                 raise SafetyError("unexpected live target in non-live campaign case")
-            bind_owner_wal_prewrite(job, launch)
             launch["launch_nonce"] = nonces[index] = secrets.token_hex(16)
             launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
             files = {"launch.yaml": launch_path}

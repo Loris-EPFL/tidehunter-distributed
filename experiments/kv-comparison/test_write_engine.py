@@ -141,6 +141,26 @@ class WriteEngineTests(unittest.TestCase):
             self.assertEqual(prep["batch_limits"], {"max_operations": 519, "max_encoded_bytes": 500000})
             self.assertEqual(prep["durability_tier"], job["durability_tier"])
 
+    def test_prepared_owner_launch_validates_for_both_arms(self):
+        # Prepared launches never carry wal_prewrite (false is not serialized); the loaded
+        # launch must already match the case before validate_launch runs.
+        config = {"spec": {"selection": SELECTION}, "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * 2}}
+        for job in campaign.make_focused_matrix(SELECTION):
+            node = Path(config["fleet"]["data_root"]) / "cells" / job["case_id"] / "node-0"
+            tls = {"transport": campaign.TRANSPORTS[job["backend"]], "ca": str(node / "tls" / "ca.der"),
+                   "cert": str(node / "tls" / "tidehunter-node-0.der"),
+                   "key": str(node / "tls" / "tidehunter-node-0.pk8")}
+            prepared = {"ready_file": str(node / "ready"), "stop_file": str(node / "stop"),
+                        "listen": "10.0.0.1:9400", "node": {"root": str(node / "storage")}, "tls": tls}
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "launch.yaml"
+                path.write_text(json.dumps(prepared))
+                launch = controller.load_owner_launch(job, path)
+            self.assertEqual(launch["node"].get("wal_prewrite", False), job["owner_wal_prewrite"])
+            with patch.object(controller, "guarded", side_effect=lambda path, *_args, **_kwargs: Path(path)), \
+                 patch.object(controller, "logical_owner_hosts", return_value=[{"address": "10.0.0.1"}]):
+                controller.validate_launch(config, launch, job["case_id"], 0)
+
     def test_owner_launch_binds_and_validates_prewrite_boolean(self):
         for job in campaign.make_focused_matrix(SELECTION):
             launch = {"node": {"wal_prewrite": False}}
