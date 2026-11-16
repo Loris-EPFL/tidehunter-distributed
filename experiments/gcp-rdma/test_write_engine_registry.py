@@ -1,4 +1,5 @@
 """Seal binding for file and prewritten write-engine arms."""
+import ast
 import copy
 import hashlib
 import json
@@ -16,11 +17,12 @@ class WriteEngineRegistryTests(unittest.TestCase):
         selection = "nvmeof_p9_write_engine"
         jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
         digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        self.assertEqual(digest, "f64324a08713b8167fd6216948be8c7b5d44b48643d28537294dc6280cdcf3fa")
+        self.assertEqual(digest, "7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9")
         self.assertEqual(digest, manual.FOCUSED_MATRIX_SHA256[selection])
         spec = workflow_input.specification("kv", "tidehunter_nvme_rdma", "focused", selection)
         self.assertEqual(spec["job_count"], 18)
         self.assertEqual(spec["arms"], ["file"])
+        self.assertEqual(spec["owner_hosts"], 2)
         self.assertEqual(manual._reviewed_jobs(spec), [job for job in jobs if job["arm"] == "file"])
         for arms in (["file"], ["prewritten"]):
             selected = {**copy.deepcopy(spec), "arms": arms}
@@ -35,6 +37,7 @@ class WriteEngineRegistryTests(unittest.TestCase):
         spec = workflow_input.specification("kv", "tidehunter_nvme_rdma", "focused",
                                             "nvmeof_p9_write_engine")
         self.assertEqual(manual.reservation_seconds(spec), 7200)
+        self.assertEqual(manual.reservation_quote(spec, spec["machine_type"]), (7200, 1973, 2418))
         fixed = (bootstrap.M3_PAIR_SECONDS + manual.PAIR_CLEANUP_SECONDS
                  + manual.EXPORT_RESERVE_SECONDS + manual.PREPARATION_SECONDS
                  + manual.CAMPAIGN_MARGIN_SECONDS)
@@ -51,10 +54,26 @@ class WriteEngineRegistryTests(unittest.TestCase):
             self.assertEqual(archive_bytes, 2339917824)
             self.assertLessEqual(archive_bytes, 3_000_000_000)
 
-    def test_six_host_pair_has_m3_window(self):
+    def test_three_host_pair_has_m3_window(self):
         with patch.object(bootstrap, "_call") as call, patch.object(bootstrap.time, "time", return_value=100):
             bootstrap._fleet_pair(Path("/package"), {"selection": "nvmeof_p9_write_engine"}, 10000)
         self.assertEqual(call.call_args.args[2], bootstrap.M3_PAIR_SECONDS + bootstrap.PAIR_EXIT_SECONDS)
+
+    def test_focused_bootstrap_requires_one_coordinator_and_two_owners(self):
+        members = [{"name": f"run-1-{i}", "id": str(i + 1), "rdma_ip": f"10.0.0.{i + 1}"}
+                   for i in range(6)]
+        args = ("test-bucket", "run-1", "a" * 64, "2030-01-01T00:00:00Z", "b" * 64, "c" * 64)
+        options = {"rdma_device": "irdma0", "machine_type": "z4m-highmem-16",
+                   "qualification_profile": "focused", "selection": "nvmeof_p9_write_engine",
+                   "live_transports": ["rdma"]}
+        script = bootstrap.fleet_startup_script(*args, members=members[:3], **options)
+        program = script.split("<<'TIDEHUNTER_BOOTSTRAP'\n", 1)[1].rsplit("\nTIDEHUNTER_BOOTSTRAP", 1)[0]
+        compile(program, "<three-host-write-engine-bootstrap>", "exec")
+        config = json.loads(ast.literal_eval(program.splitlines()[0].split(" = ", 1)[1]))
+        self.assertEqual(len(config["members"]), 3)
+        for count in (2, 6):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "two owner hosts"):
+                bootstrap.fleet_startup_script(*args, members=members[:count], **options)
 
 if __name__ == "__main__":
     unittest.main()

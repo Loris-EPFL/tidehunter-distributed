@@ -65,7 +65,7 @@ def active_owner_count(job):
     count = job.get("owner_count", 5)
     if type(count) is not int or count not in LOGICAL_OWNER_COUNTS:
         raise ValueError("unsupported logical owner_count")
-    if count not in (1, 5):
+    if count not in (1, 5) or job.get("selection") == "nvmeof_p9_write_engine":
         expected = _m3_cases().get(job.get("case_id"))
         if expected is None or not _focused_exact(job, expected):
             raise ValueError("multiple owners require an exact reviewed M3 case")
@@ -847,7 +847,7 @@ _FOCUSED_GROUP_COUNTS = {
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
-        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 5)))[selection]
+        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2)))[selection]
     return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
 
 
@@ -860,7 +860,7 @@ def job_owner_hosts(job):
     count = job.get("owner_count", 5)
     if type(count) is not int or count not in LOGICAL_OWNER_COUNTS:
         raise ValueError("unsupported logical owner_count")
-    if count not in (1, 5):
+    if count not in (1, 5) or job.get("selection") == "nvmeof_p9_write_engine":
         active_owner_count(job)
     return 1 if job.get("owner_topology") == "colocated" else count
 
@@ -2117,7 +2117,7 @@ def _nvmeof_p9_write_engine():
              and job["value_size"] == 1024 and job["concurrency"] == 16]
     for arm, prewrite in (("file", False), ("prewritten", True)):
         common = dict(arm=arm, owner_wal_prewrite=prewrite,
-                      owner_count=5, owner_topology="separate", coordinator_cache_bytes=0,
+                      owner_count=2, owner_topology="separate", coordinator_cache_bytes=0,
                       thread_cpu_sampling=True)
         for source in puts:
             for tier in ("synchronous", "native"):
@@ -2134,13 +2134,16 @@ def _nvmeof_p9_write_engine():
                                   expected_archive_bytes=(4096 + clean["warmup_operations"] + measurement) * 256 + 8 * 1024**2)
                     clean.update(measurement_operations=measurement, measurement_sizing=sizing)
                 _clone_job(result, "nvmeof_p9_write_engine", clean, "G35W",
+                           profile=f"G35W-put-c{clean['concurrency']}-separate-o2",
                            durability_tier=tier, **common)
         for source in reads:
             clean = {key: value for key, value in source.items() if key != "diagnostics"}
-            _clone_job(result, "nvmeof_p9_write_engine", clean, "G35R", **common)
+            _clone_job(result, "nvmeof_p9_write_engine", clean, "G35R",
+                       profile="G35R-read-c16-separate-o2", **common)
         for tier in ("synchronous", "native"):
             source = {key: value for key, value in puts[0].items() if key != "diagnostics"}
             _clone_job(result, "nvmeof_p9_write_engine", source, "G35S",
+                       profile="G35S-mainnet-perpetual-separate-o2",
                        case_kind="mainnet_replay", concurrency=16, durability_tier=tier,
                        replay_node_db_id=0, repetitions=4096, minimum_measurement_seconds=15,
                        mix=mix(read=50, put=50),

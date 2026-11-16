@@ -161,6 +161,8 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
         raise ValueError('unknown qualification profile')
     if not isinstance(members, (list, tuple)) or len(members) - 1 not in gcp_runtime.owner_host_counts():
         raise ValueError('fleet must have one or five owner hosts')
+    if selection == 'nvmeof_p9_write_engine' and len(members) != 3:
+        raise ValueError('write-engine fleet requires one coordinator and two owner hosts')
     if qualification_profile == 'focused' and (live_transports or live_spdk):
         if (not gcp_runtime.live_mode({'mode': 'focused', 'selection': selection})
                 or list(live_transports) != ['rdma'] or live_spdk

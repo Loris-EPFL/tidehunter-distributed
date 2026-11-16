@@ -123,7 +123,7 @@ FOCUSED_MATRIX_SHA256 = {
     'valkey_rdma_reads': 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2',
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
-    'nvmeof_p9_write_engine': 'f64324a08713b8167fd6216948be8c7b5d44b48643d28537294dc6280cdcf3fa',
+    'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -221,8 +221,8 @@ REVIEWED_SPECS["nvmeof_p9_small_put"] = {
     "diagnostics": {"write_timeline_limit": 2048, "write_timeline_sample_every": 256},
 }
 REVIEWED_SPECS["nvmeof_p9_write_engine"] = {
-    **copy.deepcopy(REVIEWED_SPECS["nvmeof_m3_t2_5"]),
-    "selection": "nvmeof_p9_write_engine", "job_count": 18, "max_cases": 18, "repeats": 1,
+    **copy.deepcopy(REVIEWED_SPECS["nvmeof_m3_t2_2"]),
+    "selection": "nvmeof_p9_write_engine", "owner_hosts": 2, "job_count": 18, "max_cases": 18, "repeats": 1,
     "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p9_write_engine"],
     "case_deadline_seconds": 600, "arms": ["file"],
 }

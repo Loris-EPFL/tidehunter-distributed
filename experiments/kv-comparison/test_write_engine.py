@@ -39,8 +39,10 @@ class WriteEngineTests(unittest.TestCase):
                 self.assertNotIn("owner_wal_backing", job)
                 self.assertNotIn("storage_layout", job)
                 self.assertNotIn("diagnostics", job)
-                self.assertEqual((job["owner_count"], job["owner_topology"]), (5, "separate"))
-        self.assertEqual(campaign.selection_owner_hosts(SELECTION), 5)
+                self.assertEqual((job["owner_count"], job["owner_topology"]), (2, "separate"))
+                self.assertEqual(campaign.active_owner_count(job), 2)
+                self.assertEqual(campaign.job_owner_hosts(job), 2)
+        self.assertEqual(campaign.selection_owner_hosts(SELECTION), 2)
         for arms in (["file"], ["prewritten"]):
             selected = controller.controller_matrix({"mode": "focused", "selection": SELECTION, "arms": arms})
             self.assertEqual(len(selected), 9)
@@ -49,6 +51,16 @@ class WriteEngineTests(unittest.TestCase):
             controller.controller_matrix({"mode": "focused", "selection": SELECTION, "arms": ["raw"]})
         with self.assertRaises(controller.SafetyError):
             controller.controller_matrix({"mode": "focused", "selection": SELECTION, "arms": ["file", "prewritten"]})
+
+    def test_two_owner_topology_is_exactly_admitted(self):
+        job = campaign.make_focused_matrix(SELECTION)[0]
+        for mutation in ({"owner_count": 1}, {"owner_count": 5},
+                         {"owner_topology": "colocated"}, {"selection": "unreviewed"}):
+            changed = {**copy.deepcopy(job), **mutation}
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                campaign.active_owner_count(changed)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                campaign.job_owner_hosts(changed)
 
     def test_c256_only_reduction_and_archive_guard(self):
         sources = campaign._nvmeof_p9_small_put()
@@ -94,7 +106,7 @@ class WriteEngineTests(unittest.TestCase):
             summary["phase_counts"]["counts"]["put_members"] += 1
             with self.assertRaises(ValueError):
                 campaign.admit_replay_summary(config, summary)
-            self.assertEqual(controller.planned_write_batches_per_partition(job), 8192)
+            self.assertEqual(controller.planned_write_batches_per_partition(job), 14336)
         for name in cloud_package.REPLAY_FIXTURE_FILES:
             self.assertIn(name, cloud_package.REQUIRED)
             self.assertTrue(cloud_package.allowed(name))
@@ -104,7 +116,7 @@ class WriteEngineTests(unittest.TestCase):
         job = next(j for j in campaign.make_focused_matrix(SELECTION) if j["case_kind"] == "mainnet_replay")
         with tempfile.TemporaryDirectory() as tmp:
             instance = SimpleNamespace(config={"fleet": {"data_root": tmp, "nodes": [
-                {"index": i, "address": f"10.0.0.{i + 1}", "rdma_address": f"10.1.0.{i + 1}"} for i in range(5)],
+                {"index": i, "address": f"10.0.0.{i + 1}", "rdma_address": f"10.1.0.{i + 1}"} for i in range(2)],
                 "server_cpus": 16, "server_memory_mib": 16384}, "binary": "/bin/kv-research"}, remaining=lambda: 100)
             with patch.object(controller, "platform_module", return_value=None), \
                  patch.object(controller, "live_nvme_preparation", return_value={}), \
@@ -113,6 +125,7 @@ class WriteEngineTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "captured typed preparation"):
                     controller.Controller.prepare_tide(instance, job, Path(tmp))
             prep = json.loads((Path(tmp) / "prepare-input.json").read_text())
+            self.assertEqual(len(prep["addresses"]), 2)
             self.assertEqual(prep["replay_node_db_id"], 0)
             self.assertEqual(len(prep["database"]), 16)
             self.assertEqual(prep["batch_limits"], {"max_operations": 519, "max_encoded_bytes": 500000})
@@ -130,7 +143,7 @@ class WriteEngineTests(unittest.TestCase):
             invalid["owner_wal_prewrite"] = 1
             with self.assertRaises(controller.SafetyError):
                 controller.bind_owner_wal_prewrite(invalid, launch)
-            config = {"spec": {"selection": SELECTION}, "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * 5}}
+            config = {"spec": {"selection": SELECTION}, "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * 2}}
             node = Path(config["fleet"]["data_root"]) / "cells" / job["case_id"] / "node-0"
             launch.update(ready_file=str(node / "ready"), stop_file=str(node / "stop"))
             launch["node"].update(root=str(node / "storage"), wal_prewrite=not job["owner_wal_prewrite"])
