@@ -589,3 +589,114 @@ fn permanent_export_rejects_spdk() {
         "permanent live export requires the kernel target"
     );
 }
+
+fn extra_wal(f: &Fixture, name: &str) -> LiveFileIdentity {
+    let path = f._tmp.path().join(name);
+    fs::write(&path, [9; 4096]).unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+    LiveFileIdentity {
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+        block_size: 4096,
+    }
+}
+
+#[test]
+fn stale_registry_after_batched_revoke_recovers_and_keeps_markers() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let files = [
+        f.file.clone(),
+        extra_wal(&f, "wal-1"),
+        extra_wal(&f, "wal-2"),
+    ];
+    let writable = [
+        manager.export_writable(files[0].clone()).unwrap(),
+        manager.export_writable(files[1].clone()).unwrap(),
+    ];
+    let readonly = manager.export_readonly(files[2].clone()).unwrap();
+    let registry = f.config.state_dir.join(STATE);
+    let before = fs::read(&registry).unwrap();
+    manager
+        .revoke_all(&[&writable[0], &readonly, &writable[1]])
+        .unwrap();
+    assert_eq!(
+        fs::read_dir(f.configfs.join("subsystems")).unwrap().count(),
+        0
+    );
+    assert!(manager.state.exports.is_empty());
+    // A crash after the configfs removals but before any later save leaves
+    // the older registry, which still lists every removed object.
+    drop(manager);
+    fs::write(&registry, before).unwrap();
+    let mut reopened = f.open().unwrap();
+    assert!(reopened.state.exports.is_empty());
+    assert!(
+        !reopened
+            .state
+            .objects
+            .iter()
+            .any(|object| object.path.starts_with("subsystems"))
+    );
+    for file in &files[..2] {
+        assert_eq!(
+            reopened.sealed_file(&file.path).unwrap().as_ref(),
+            Some(file)
+        );
+        assert!(reopened.export_writable(file.clone()).is_err());
+    }
+    assert!(reopened.sealed_file(&files[2].path).unwrap().is_none());
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn batched_revoke_removes_only_fully_drained_permanent_subsystems() {
+    use super::super::live_storage::wal_export_name;
+    let mut f = Fixture::new();
+    f.config.export_mode = LiveExportMode::PerOwner;
+    let mut manager = f.open().unwrap();
+    let names: Vec<_> = (0..4)
+        .map(|file| wal_export_name(2, [1; 16], 2, 3, file))
+        .collect();
+    let bindings: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let file = if index == 0 {
+                f.file.clone()
+            } else {
+                extra_wal(&f, &format!("wal-{index}"))
+            };
+            manager.export_permanent(name, file).unwrap()
+        })
+        .collect();
+    assert_eq!(names[0].nqn, names[1].nqn);
+    assert_eq!(names[2].nqn, names[3].nqn);
+    assert_ne!(names[0].nqn, names[2].nqn);
+    let first = f.configfs.join("subsystems").join(&names[0].nqn);
+    let second = f.configfs.join("subsystems").join(&names[2].nqn);
+    // One batch drains the first subsystem and half of the second.
+    manager
+        .revoke_all(&[&bindings[1], &bindings[2], &bindings[0]])
+        .unwrap();
+    assert!(!first.exists());
+    assert!(second.is_dir());
+    assert!(
+        !second
+            .join(format!("namespaces/{}", bindings[2].nsid))
+            .exists()
+    );
+    assert!(
+        second
+            .join(format!("namespaces/{}", bindings[3].nsid))
+            .is_dir()
+    );
+    assert_eq!(manager.stats().unwrap().owned_namespace_count, 1);
+    manager.revoke_all(&[&bindings[3]]).unwrap();
+    assert!(!second.exists());
+    assert!(manager.state.exports.is_empty());
+    manager.revoke_all(&[]).unwrap();
+    manager.shutdown().unwrap();
+}

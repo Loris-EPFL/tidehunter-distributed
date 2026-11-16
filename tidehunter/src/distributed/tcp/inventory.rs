@@ -941,24 +941,32 @@ impl NodeInventory {
                 revoke.push(key);
             }
         }
-        for key in revoke {
+        if revoke.is_empty() {
+            return Ok(());
+        }
+        let mut spans = Vec::with_capacity(revoke.len());
+        let mut bindings = Vec::with_capacity(revoke.len());
+        for key in &revoke {
             let (segment, binding, _) = self
                 .live_bindings
-                .get(&key)
+                .get(key)
                 .ok_or_else(|| TcpError::new("live binding disappeared"))?;
-            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
+            spans.push(super::super::owner_events::OwnerEventSpan::new(
                 super::super::owner_events::OwnerEventKind::RevokeStart,
                 super::super::owner_events::OwnerEventKind::RevokeEnd,
                 segment.partition,
                 segment.file_index,
                 segment.inode,
-            );
-            self.live_target
-                .as_mut()
-                .ok_or_else(|| TcpError::new("live target disappeared"))?
-                .revoke(binding)
-                .map_err(TcpError::component)?;
-            revoke_span.end_at(segment.file_index);
+            ));
+            bindings.push(binding);
+        }
+        self.live_target
+            .as_mut()
+            .ok_or_else(|| TcpError::new("live target disappeared"))?
+            .revoke_all(&bindings)
+            .map_err(TcpError::component)?;
+        drop(spans);
+        for key in revoke {
             self.live_bindings.remove(&key);
         }
         Ok(())
@@ -1067,17 +1075,22 @@ impl NodeInventory {
         let Some(target) = self.live_target.as_mut() else {
             return Ok(());
         };
-        for (segment, binding, _) in self.live_bindings.values() {
-            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
-                super::super::owner_events::OwnerEventKind::RevokeStart,
-                super::super::owner_events::OwnerEventKind::RevokeEnd,
-                segment.partition,
-                segment.file_index,
-                segment.inode,
-            );
-            target.revoke(binding).map_err(TcpError::component)?;
-            revoke_span.end_at(segment.file_index);
-        }
+        let (spans, bindings): (Vec<_>, Vec<_>) = self
+            .live_bindings
+            .values()
+            .map(|(segment, binding, _)| {
+                let span = super::super::owner_events::OwnerEventSpan::new(
+                    super::super::owner_events::OwnerEventKind::RevokeStart,
+                    super::super::owner_events::OwnerEventKind::RevokeEnd,
+                    segment.partition,
+                    segment.file_index,
+                    segment.inode,
+                );
+                (span, binding)
+            })
+            .unzip();
+        target.revoke_all(&bindings).map_err(TcpError::component)?;
+        drop(spans);
         self.live_bindings.clear();
         self.idle_history_exports.clear();
         Ok(())
@@ -1088,19 +1101,25 @@ impl NodeInventory {
             return Ok(());
         };
         let bytes = self.config.partition.wal_file_bytes;
-        for ((binding_epoch, file), (segment, binding, _)) in &self.live_bindings {
-            if *binding_epoch == epoch && files.contains(&(file * bytes)) {
-                let revoke_span = super::super::owner_events::OwnerEventSpan::new(
+        let (spans, bindings): (Vec<_>, Vec<_>) = self
+            .live_bindings
+            .iter()
+            .filter(|((binding_epoch, file), _)| {
+                *binding_epoch == epoch && files.contains(&(file * bytes))
+            })
+            .map(|(_, (segment, binding, _))| {
+                let span = super::super::owner_events::OwnerEventSpan::new(
                     super::super::owner_events::OwnerEventKind::RevokeStart,
                     super::super::owner_events::OwnerEventKind::RevokeEnd,
                     segment.partition,
                     segment.file_index,
                     segment.inode,
                 );
-                target.revoke(binding).map_err(TcpError::component)?;
-                revoke_span.end_at(segment.file_index);
-            }
-        }
+                (span, binding)
+            })
+            .unzip();
+        target.revoke_all(&bindings).map_err(TcpError::component)?;
+        drop(spans);
         self.live_bindings.retain(|(binding_epoch, file), _| {
             *binding_epoch != epoch || !files.contains(&(file * bytes))
         });

@@ -1032,11 +1032,16 @@ impl LiveTargetManager {
             }
         }
         self.state.objects.remove(index);
-        self.save()
+        // The caller persists the registry once after its removal batch. A
+        // durable record of an object that is already gone is harmless:
+        // `verify_object` reports it absent and recovery skips it. Only a
+        // creation needs its durable record first.
+        Ok(())
     }
-    fn fence(&mut self, group: Option<[u8; 16]>) -> io::Result<()> {
+    /// `groups: None` selects every registered object and export.
+    fn fence(&mut self, groups: Option<&[[u8; 16]]>) -> io::Result<()> {
         if self.state.config.spdk.is_some() {
-            return self.spdk_fence(group);
+            return self.spdk_fence(groups);
         }
         // Check shared parents as well as the selected namespace before mutation.
         for object in &self.state.objects {
@@ -1048,7 +1053,7 @@ impl LiveTargetManager {
             .objects
             .iter()
             .filter(|o| {
-                group.is_none_or(|g| o.group == g)
+                groups.is_none_or(|g| g.contains(&o.group))
                     && o.kind == Kind::Link
                     && o.path.components().any(|c| c.as_os_str() == "ports")
             })
@@ -1061,7 +1066,7 @@ impl LiveTargetManager {
             .state
             .exports
             .iter()
-            .filter(|e| group.is_none_or(|g| e.binding.uuid == g))
+            .filter(|e| groups.is_none_or(|g| g.contains(&e.binding.uuid)))
             .collect();
         let mut disabled = false;
         for export in &exports {
@@ -1105,10 +1110,16 @@ impl LiveTargetManager {
                 // kills lookup references and waits for target I/O to drain.
             }
         }
+        let sealed = exports.iter().any(|export| !export.readonly);
         for export in exports {
             if !export.readonly {
                 self.write_sealed(&export.file)?;
             }
+        }
+        // One barrier makes every marker durable before a registry save can
+        // retire its export record.
+        if sealed {
+            self.sealed_directory.sync_all()?;
         }
         self.save()?;
         if disabled {
@@ -1116,16 +1127,16 @@ impl LiveTargetManager {
         }
         Ok(())
     }
-    fn cleanup(&mut self, group: Option<[u8; 16]>) -> io::Result<()> {
+    fn cleanup(&mut self, groups: Option<&[[u8; 16]]>) -> io::Result<()> {
         if self.state.config.spdk.is_some() {
-            return self.spdk_cleanup(group);
+            return self.spdk_cleanup(groups);
         }
-        self.fence(group)?;
+        self.fence(groups)?;
         let mut paths: Vec<_> = self
             .state
             .objects
             .iter()
-            .filter(|o| group.is_none_or(|g| o.group == g))
+            .filter(|o| groups.is_none_or(|g| g.contains(&o.group)))
             .map(|o| o.path.clone())
             .collect();
         paths.reverse();
@@ -1134,9 +1145,11 @@ impl LiveTargetManager {
         }
         self.state
             .exports
-            .retain(|e| group.is_some_and(|g| e.binding.uuid != g));
-        if let Some(g) = group {
-            self.pins.remove(&g);
+            .retain(|e| groups.is_some_and(|g| !g.contains(&e.binding.uuid)));
+        if let Some(groups) = groups {
+            for group in groups {
+                self.pins.remove(group);
+            }
         } else {
             self.pins.clear();
         }
@@ -1144,20 +1157,38 @@ impl LiveTargetManager {
     }
     /// Caller has stopped admission and retains read pins until CQ retirement.
     pub fn revoke(&mut self, binding: &LiveTargetBinding) -> io::Result<()> {
+        self.revoke_all(&[binding])
+    }
+    /// Revoke several bindings with one fence and one cleanup pass, so the
+    /// registry is persisted a fixed number of times instead of once per
+    /// binding. Same caller contract as `revoke`.
+    pub fn revoke_all(&mut self, bindings: &[&LiveTargetBinding]) -> io::Result<()> {
+        if bindings.is_empty() {
+            return Ok(());
+        }
         if self.poisoned {
             return Err(invalid("target manager is quarantined"));
         }
-        if !self.state.exports.iter().any(|e| e.binding == *binding) {
+        if bindings
+            .iter()
+            .any(|binding| !self.state.exports.iter().any(|e| e.binding == **binding))
+        {
             return Err(invalid("unknown target binding"));
         }
-        let result = self.cleanup(Some(binding.uuid)).and_then(|()| {
-            if binding.permanent
-                && !self
-                    .state
-                    .exports
-                    .iter()
-                    .any(|export| export.binding.nqn == binding.nqn)
-            {
+        let namespaces: Vec<_> = bindings.iter().map(|binding| binding.uuid).collect();
+        let result = self.cleanup(Some(&namespaces)).and_then(|()| {
+            // A permanent subsystem goes with its last namespace.
+            let mut subsystems = Vec::new();
+            for binding in bindings {
+                if !binding.permanent
+                    || self
+                        .state
+                        .exports
+                        .iter()
+                        .any(|export| export.binding.nqn == binding.nqn)
+                {
+                    continue;
+                }
                 let sub = PathBuf::from("subsystems").join(&binding.nqn);
                 let group = self
                     .state
@@ -1166,9 +1197,15 @@ impl LiveTargetManager {
                     .find(|object| object.path == sub)
                     .ok_or_else(|| invalid("missing subsystem registration"))?
                     .group;
-                self.cleanup(Some(group))?;
+                if !subsystems.contains(&group) {
+                    subsystems.push(group);
+                }
             }
-            Ok(())
+            if subsystems.is_empty() {
+                Ok(())
+            } else {
+                self.cleanup(Some(&subsystems))
+            }
         });
         if result.is_err() {
             self.poisoned = true;
@@ -1245,13 +1282,14 @@ impl LiveTargetManager {
         }
         Ok(Some(identity))
     }
+    /// The caller syncs `sealed_directory` once after its marker batch and
+    /// before it persists a registry that retires the matching exports.
     fn write_sealed(&self, identity: &LiveFileIdentity) -> io::Result<()> {
         if let Some(old) = self.sealed_file(&identity.path)? {
+            // A preceding process may have published the marker but died
+            // before its directory barrier; the caller's barrier covers it.
             return if old == *identity {
-                // A preceding process may have published the marker but died
-                // before its directory barrier. Do not retire its registry
-                // recovery record until this visible marker is durable.
-                self.sealed_directory.sync_all()
+                Ok(())
             } else {
                 Err(invalid("sealed WAL path identity changed"))
             };
@@ -1279,8 +1317,7 @@ impl LiveTargetManager {
             output.write_all(&data)?;
             output.sync_all()?;
             fs::hard_link(&temp, &destination)?;
-            fs::remove_file(&temp)?;
-            self.sealed_directory.sync_all()
+            fs::remove_file(&temp)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp);
