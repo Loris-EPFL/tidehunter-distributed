@@ -2313,6 +2313,11 @@ mod live_fencing {
                 ),
             );
             let reference = item.record_reference(receipt.address(), 0).unwrap();
+            let before = (
+                log.appended_frontier(),
+                log.synced_frontier(),
+                log.receipt_count(),
+            );
             let Response::LiveRecords(locations) = extent_exchange(
                 &node,
                 Request::ResolveLiveRecords {
@@ -2324,7 +2329,16 @@ mod live_fencing {
             };
             assert_eq!(locations.entries.len(), 1);
             assert_eq!(locations.entries[0].reference, reference);
-            assert_eq!(log.synced_frontier(), 12288);
+            assert_eq!(log.synced_frontier(), 8192);
+            assert_eq!(
+                (
+                    log.appended_frontier(),
+                    log.synced_frontier(),
+                    log.receipt_count(),
+                ),
+                before,
+                "cold grants must not promote sparse authority into an owner prefix",
+            );
             extent_exchange(
                 &node,
                 Request::ReleaseLiveEpochPin {
@@ -2334,6 +2348,154 @@ mod live_fencing {
             );
             drop(log);
             shutdown(&node, 1);
+        }
+    }
+
+    #[test]
+    fn cold_resolver_overlaps_close_and_excludes_lifecycle_controls() {
+        use crate::distributed::storage::{LivePausePoint, member_position, receipt_for};
+
+        for lifecycle in [
+            Request::Seal { epoch: 1 },
+            Request::Fence { epoch: 2 },
+            Request::RetireFiles {
+                authority_epoch: 1,
+                epoch: 1,
+                prefix: 0,
+                files: vec![0],
+            },
+        ] {
+            let sealing = matches!(lifecycle, Request::Seal { .. });
+            let retirement = matches!(lifecycle, Request::RetireFiles { .. });
+            let temp = tempdir::TempDir::new("cold-control-stream").unwrap();
+            let (config, node) = open_live(temp.path(), DurabilityTier::Synchronous);
+            let Response::LiveLeased(first) =
+                extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+            else {
+                panic!("expected leased extent")
+            };
+            let Response::LiveLeased(next) = extent_exchange(
+                &node,
+                Request::PreleaseLiveExtent {
+                    epoch: 1,
+                    after: first.extent.token,
+                },
+            ) else {
+                panic!("expected preleased extent")
+            };
+            let mut reference = None;
+            for (sequence, extent) in [(0, &first.extent), (1, &next.extent)] {
+                let group = CompleteGroup::new_live(
+                    &node.control_context.append_shape,
+                    vec![batch(&config, 1, sequence)],
+                    config.partition.batch_limits,
+                    config.partition.group_limits,
+                )
+                .unwrap();
+                let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&extent.segment.path)
+                    .unwrap()
+                    .write_all_at(&frame, extent.start % extent.segment.bytes)
+                    .unwrap();
+                let batch = &group.batches()[0];
+                let receipt = receipt_for(
+                    &config.partition,
+                    batch,
+                    member_position(
+                        crate::WalPosition::new(extent.start, frame.len() as u32),
+                        group.batch_offsets()[0],
+                        batch,
+                    ),
+                );
+                reference = Some(batch.record_reference(receipt.address(), 0).unwrap());
+            }
+            let mut marker = [0; 4096];
+            marker[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&first.extent.segment.path)
+                .unwrap()
+                .write_all_at(&marker, 4096)
+                .unwrap();
+            let log = node.log_for_test(1);
+            let (close_entered, close_resume) = log.pause_live(LivePausePoint::CloseSuffix);
+            let (completed, completions) = mpsc::sync_channel(3);
+            assert!(
+                command(
+                    &node,
+                    1,
+                    Request::AdoptLiveExtent {
+                        epoch: 1,
+                        token: first.extent.token,
+                        through: 4096,
+                        close: true,
+                        lease_next: false,
+                    },
+                    4096,
+                    &completed
+                )
+                .is_ok()
+            );
+            close_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (root_entered, root_resume) = log.pause_live(LivePausePoint::PositionRootLocked);
+            let prover = log.clone();
+            let proof = std::thread::spawn(move || prover.persist_wal_through(4096));
+            root_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (read_entered, read_resume) = log.pause_live(LivePausePoint::ColdReadAfterSync);
+            let request = Request::ResolveLiveRecords {
+                authority_epoch: 1,
+                references: vec![reference.unwrap()],
+            };
+            assert!(is_stream_request(&request));
+            assert!(!is_stream_request(&lifecycle));
+            assert!(command(&node, 2, request, 4096, &completed).is_ok());
+            // Positive handler hook while close owns its stream slot AND the
+            // position proof owns durable-metadata persistence. No preflush
+            // through the generic control flusher may run for this resolver.
+            read_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(node.control.shared.queue.lock().active_appends, 2);
+            assert!(command(&node, 3, lifecycle, 4096, &completed).is_ok());
+            {
+                let queue = node.control.shared.queue.lock();
+                assert!(!queue.control_active);
+                assert!(queue.work.iter().any(|work| work.id == 3));
+            }
+            root_resume.send(()).unwrap();
+            assert_eq!(proof.join().unwrap().unwrap(), 4096);
+            close_resume.send(()).unwrap();
+            assert!(matches!(
+                receive(&completions, 1).response.unwrap(),
+                Response::LiveAdopted(_)
+            ));
+            {
+                let queue = node.control.shared.queue.lock();
+                assert_eq!(queue.active_appends, 1);
+                assert!(queue.work.iter().any(|work| work.id == 3));
+            }
+            drop(log);
+            read_resume.send(()).unwrap();
+            assert!(matches!(
+                receive(&completions, 2).response.unwrap(),
+                Response::LiveRecords(_)
+            ));
+            let result = receive(&completions, 3).response;
+            // Retirement rejects an active stream, but only after the resolver
+            // has installed its ordinary bounded owner file/epoch pin.
+            if retirement {
+                assert!(result.is_err());
+            } else if sealing {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    "live NVMe-oF pins must drain before sealing"
+                );
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    Response::Sealed | Response::Status(_)
+                ));
+            }
         }
     }
 

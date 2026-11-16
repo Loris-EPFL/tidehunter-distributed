@@ -11,8 +11,10 @@
 //! Adoption publishes only APPENDED authority. Synchronous adoption requests a
 //! later root sync without waiting. Native adoption requests no per-frame sync:
 //! it keeps fragment-boundary (extent-close) and on-demand persistence.
-//! Synchronous serving and checkpoint proofs still require a covering owner
-//! barrier. Recovery scans the complete valid prefix beyond the root: it cannot
+//! Synchronous cold record grants require a covering owner barrier on the pinned
+//! inode; its scoped proof never advances the adopted or durable prefix.
+//! Checkpoint proofs still require the contiguous owner barrier. Recovery scans
+//! the complete valid prefix beyond the root: it cannot
 //! distinguish corruption of acknowledged data there from a torn tail. A live
 //! coordinator must fail stop on a receipt mismatch or adopted-prefix shortfall.
 //! Alignment is not a power-fail atomicity guarantee.

@@ -44,7 +44,7 @@ fn case(seed: u64, owners: usize, hot: bool, native: bool) -> Case {
     Case {
         concurrent: true,
         native,
-        gate_waves: 2,
+        gate_waves: 1 + (seed as usize & 1),
         ..Case::rpc(seed, owners, hot)
     }
 }
@@ -66,22 +66,52 @@ fn write_model_concurrent_bounded() {
     assert!(started.elapsed() < Duration::from_secs(60));
 }
 
+/// Optional filters leave the default 1000-schedule matrix unchanged. Start and
+/// count select an exact subrange for replaying one retained failing schedule.
+fn schedule_range() -> std::ops::Range<u64> {
+    let start = env_number("TH_MODEL_START", 0);
+    let count = env_number("TH_MODEL_ITERATIONS", 1000);
+    assert!(start < 1000 && (1..=1000 - start).contains(&count));
+    start..start + count
+}
+
+fn selection(name: &str, all: u64) -> u64 {
+    let value = env_number(name, all);
+    assert!(value <= all, "{name} out of range");
+    value
+}
+
 #[test]
 #[ignore = "1000 seeded schedules per owner count/distribution/tier; real subprocess crashes"]
 fn write_model_concurrent_thousand_schedules() {
-    // Each configuration gets exactly 1000 generated schedules. Rotate all
-    // exposed RPC cuts, with a no-cut control, rather than sampling away a cut.
+    // Unfiltered, each configuration gets exactly 1000 generated schedules.
+    // Rotate all exposed cuts plus a no-cut control; never sample away a cut.
+    let owner_filter = env_number("TH_MODEL_OWNERS", 0);
+    assert!(owner_filter <= 16, "TH_MODEL_OWNERS must be 0..=16");
+    let hot_filter = selection("TH_MODEL_HOT", 2);
+    let native_filter = selection("TH_MODEL_NATIVE", 2);
+    let seed = env_number("TH_MODEL_SEED", 0xc011);
+    let schedules = schedule_range();
     for owners in 1..=16 {
+        if owner_filter != 0 && owner_filter != owners as u64 {
+            continue;
+        }
         for hot in [false, true] {
+            if hot_filter != 2 && hot_filter != u64::from(hot) {
+                continue;
+            }
             for native in [false, true] {
-                for schedule in 0..1000 {
-                    let boundary = schedule % (BOUNDARIES.len() + 1);
+                if native_filter != 2 && native_filter != u64::from(native) {
+                    continue;
+                }
+                for schedule in schedules.clone() {
+                    let boundary = schedule as usize % (BOUNDARIES.len() + 1);
                     run_case(&Case {
                         boundary: boundary
                             .checked_sub(1)
                             .map_or_else(String::new, |index| BOUNDARIES[index].into()),
                         on_disk_history: schedule % 2 != 0,
-                        ..case(0xc011 + schedule as u64, owners, hot, native)
+                        ..case(seed.wrapping_add(schedule), owners, hot, native)
                     });
                 }
             }
@@ -93,16 +123,39 @@ fn write_model_concurrent_thousand_schedules() {
 #[test]
 #[ignore = "1000 seeded schedules per leased owner count/distribution/durability policy"]
 fn write_model_concurrent_leased_thousand_schedules() {
+    let owner_filter = env_number("TH_MODEL_OWNERS", 0);
+    assert!(owner_filter <= 16, "TH_MODEL_OWNERS must be 0..=16");
+    let hot_filter = selection("TH_MODEL_HOT", 2);
+    let native_filter = selection("TH_MODEL_NATIVE", 2);
+    let profile_filter = selection("TH_MODEL_LEASED", 8);
+    let seed = env_number("TH_MODEL_SEED", 0xc011);
+    let schedules = schedule_range();
+    assert!(
+        profile_filter == 8 || native_filter == 2 || u64::from(profile_filter < 4) == native_filter,
+        "TH_MODEL_NATIVE conflicts with TH_MODEL_LEASED"
+    );
     for owners in 1..=16 {
+        if owner_filter != 0 && owner_filter != owners as u64 {
+            continue;
+        }
         for hot in [false, true] {
+            if hot_filter != 2 && hot_filter != u64::from(hot) {
+                continue;
+            }
             for profile in 0..8 {
-                for schedule in 0..1000 {
+                if profile_filter != 8 && profile_filter != profile as u64 {
+                    continue;
+                }
+                if native_filter != 2 && native_filter != u64::from(profile < 4) {
+                    continue;
+                }
+                for schedule in schedules.clone() {
                     let case = Case {
                         leased: Some(leased::profile(profile)),
-                        ..case(0xc011 + schedule as u64, owners, hot, false)
+                        ..case(seed.wrapping_add(schedule), owners, hot, false)
                     };
                     let boundaries = leased::boundaries(&case);
-                    let boundary = schedule % (boundaries.len() + 1);
+                    let boundary = schedule as usize % (boundaries.len() + 1);
                     run_case(&Case {
                         boundary: boundary
                             .checked_sub(1)
@@ -360,4 +413,88 @@ fn write_model_uncertain_append_fail_stops_and_recovers_identity() {
         );
     }
     reopened.shutdown().unwrap();
+}
+
+/// A fresh lane has no file grant to bypass owner reference admission. This
+/// keeps close paused after the coordinator has synced and acknowledged bytes
+/// in its pre-leased successor, so the cold-grant check is not a timing race.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
+    use crate::distributed::storage::LivePausePoint;
+    let fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("cold-leased-read").unwrap(),
+        1,
+        128,
+        KeyShape::new_single(4, 8, KeyType::uniform(8)),
+        1,
+        |config| {
+            config.storage.batch_limits.max_operations = 57;
+            config.max_index_bytes = 16 * 1024 * 1024;
+            config.timeout = Duration::from_secs(5);
+            leased::configure(config, leased::profile(4));
+        },
+        leased::open_node,
+    )
+    .synchronous();
+    let mut original = fixture.open();
+    leased::prepare_database(&mut original);
+    let writer = original.clients[0].client.clone();
+    let log = fixture.nodes[0].log_for_test(original.epoch());
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    let first: Vec<_> = (0..57)
+        .map(|key| Edit {
+            key,
+            value: Some(1),
+        })
+        .collect();
+    db.write_batch(fixture.operation(0, 500), mutations(&first, 4096))
+        .unwrap();
+    let (entered, release) = log.pause_live(LivePausePoint::CloseSuffix);
+    let second: Vec<_> = (32..54)
+        .map(|key| Edit {
+            key,
+            value: Some(2),
+        })
+        .collect();
+    let operation = fixture.operation(0, 501);
+    let (written, result) = mpsc::sync_channel(1);
+    let read = thread::scope(|scope| {
+        let db = &db;
+        scope.spawn(|| {
+            written
+                .send(db.write_batch(operation, mutations(&second, 4096)))
+                .unwrap()
+        });
+        let paused = entered.recv_timeout(Duration::from_secs(5));
+        let acknowledged = result.recv_timeout(Duration::from_secs(5));
+        let read = if acknowledged.as_ref().is_ok_and(|result| result.is_ok()) {
+            let (cut, _pin) = db.protected_published_cut().unwrap();
+            let reference = db
+                .index_reference(KeySpace(0), &key_bytes(32), cut.clone())
+                .unwrap()
+                .unwrap();
+            eprintln!(
+                "cold_live_read cut={cut:?} reference={reference:?} owner_appended={} owner_synced={} completed_released_durable={:?}",
+                log.appended_frontier(),
+                log.synced_frontier(),
+                writer.lock().leased_test_completion_prefixes(),
+            );
+            Some(
+                db.submit_get_cut(KeySpace(0), &key_bytes(32), cut)
+                    .and_then(|pending| db.finish_ready_get(pending.wait())),
+            )
+        } else {
+            None
+        };
+        // Always unblock the adoption worker before assertions or shutdown.
+        release.send(()).unwrap();
+        paused.unwrap();
+        acknowledged.unwrap().unwrap();
+        read.unwrap()
+    });
+    let shutdown = db.shutdown();
+    let value = read.expect("a cold live read must return the synchronously acknowledged value");
+    assert_eq!(value.unwrap().as_ref(), 2u64.to_le_bytes().repeat(512));
+    shutdown.unwrap();
 }
