@@ -729,7 +729,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             read_memory_allowance_bytes: 64 * 1024 * 1024,
             preparation_workers: 1,
             scan_prefetch_pages: 1,
-            read_lanes: 1,
+            read_lanes: Some(1),
             pin_read_lanes: false,
             max_pending_reads: 4,
             max_pending_read_bytes: 128 * 1024,

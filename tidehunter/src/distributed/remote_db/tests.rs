@@ -34,13 +34,23 @@ fn read_lanes_default_to_parallelism_and_validate_bounds() {
     let mut serialized = serde_json::to_value(&fixture.config).unwrap();
     serialized.as_object_mut().unwrap().remove("read_lanes");
     let mut config: RemoteDatabaseConfig = serde_json::from_value(serialized).unwrap();
-    assert_eq!(config.read_lanes, crate::parallelism::available());
+    assert_eq!(config.read_lanes, None);
+    assert_eq!(
+        config.effective_read_lanes(),
+        crate::parallelism::available().min(RemoteDatabaseConfig::MAX_AUTO_READ_LANES)
+    );
+    assert!(
+        serde_json::to_value(&config)
+            .unwrap()
+            .get("read_lanes")
+            .is_none()
+    );
     for lanes in [1, 1024] {
-        config.read_lanes = lanes;
+        config.read_lanes = Some(lanes);
         config.validate().unwrap();
     }
     for lanes in [0, 1025] {
-        config.read_lanes = lanes;
+        config.read_lanes = Some(lanes);
         assert!(config.validate().is_err());
     }
 }
@@ -1253,7 +1263,7 @@ fn sui_scan_filters_reduced_boundary_candidates_by_verified_full_key() {
 fn sui_grouped_scan_keeps_order_while_one_storage_lane_is_stalled() {
     use crate::distributed::sui::Db;
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let db = Db::open_remote(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),

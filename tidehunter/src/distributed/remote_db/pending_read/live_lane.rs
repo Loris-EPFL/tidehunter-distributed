@@ -373,7 +373,7 @@ mod tests {
         config.endpoints[0].address = history.owner.endpoint.clone();
         config.endpoints[0].server_name = history.owner.tls.server_name.clone();
         config.tls = history.owner.tls.clone();
-        config.read_lanes = 1;
+        config.read_lanes = Some(1);
         config.live_nvme = client.live_config_for_test();
         let readers = ReadService::from_clients(
             &config,

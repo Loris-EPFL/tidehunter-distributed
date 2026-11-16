@@ -143,7 +143,7 @@ fn fixture(
                 },
                 shape_yaml: serde_yaml::to_string(&shape).unwrap(),
                 max_epochs: 4,
-                read_workers: 2,
+                read_workers: Some(2),
                 wal_member_read: Default::default(),
                 read_resident_first: false,
                 read_memory_allowance_bytes: 134217728,

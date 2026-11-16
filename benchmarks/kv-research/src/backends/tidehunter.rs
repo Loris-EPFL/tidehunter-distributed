@@ -95,7 +95,8 @@ pub fn maybe_run_storage_node() -> BackendResult<bool> {
 #[serde(deny_unknown_fields)]
 struct ExternalOwnerReadConfig {
     partition: u32,
-    read_workers: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_workers: Option<usize>,
     wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     read_resident_first: bool,
     read_memory_allowance_bytes: usize,
@@ -220,8 +221,8 @@ struct ExternalPreparationInput {
     read_lanes: Option<usize>,
     #[serde(default)]
     pin_read_lanes: bool,
-    #[serde(default = "tidehunter::parallelism::available")]
-    owner_read_workers: usize,
+    #[serde(default)]
+    owner_read_workers: Option<usize>,
     owner_wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     owner_read_memory_allowance_bytes: usize,
     #[serde(default = "default_resident_first")]
@@ -334,17 +335,8 @@ impl Drop for ExternalPreparationStaging {
 
 /// Generate external node launch files with the exact engine harness schema.
 // Keep emitted owner budgets beside their admission checks to prevent drift.
-pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<()> {
-    prepare_external_case_with_parallelism(input, output, tidehunter::parallelism::available())
-}
-
-// Inject only the default lane count so preparation tests do not depend on the host CPU quota.
 #[allow(clippy::too_many_lines)]
-fn prepare_external_case_with_parallelism(
-    input: &Path,
-    output: &Path,
-    parallelism: usize,
-) -> BackendResult<()> {
+pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<()> {
     let input: ExternalPreparationInput = serde_json::from_slice(&fs::read(input)?)?;
     if input.replay_node_db_id.is_some_and(|id| id > 2) {
         return Err("replay_node_db_id must be 0, 1 or 2".into());
@@ -369,7 +361,12 @@ fn prepare_external_case_with_parallelism(
         || input.max_admitted_batches == 0
         || input.max_admitted_batches > 1_000_000
         || input.max_index_bytes == 0
-        || input.owner_read_workers == 0
+        || input
+            .read_lanes
+            .is_some_and(|lanes| !(1..=1024).contains(&lanes))
+        || input
+            .owner_read_workers
+            .is_some_and(|workers| !(1..=1024).contains(&workers))
         || input.owner_read_memory_allowance_bytes == 0
         || input.owner_read_memory_allowance_bytes < 64 * 1024 * 1024
         || input
@@ -498,6 +495,7 @@ fn prepare_external_case_with_parallelism(
         input.transport.clone(),
         &owner_transports,
         input.owner_read_workers,
+        input.read_lanes,
         input.owner_wal_member_read,
         input.owner_read_memory_allowance_bytes,
         input.polling,
@@ -523,7 +521,7 @@ fn prepare_external_case_with_parallelism(
     remote.history_persistence = input.history_persistence;
     remote.preparation_workers = 8;
     remote.pin_read_lanes = input.pin_read_lanes;
-    remote.read_lanes = input.read_lanes.unwrap_or(parallelism);
+    remote.read_lanes = input.read_lanes;
     remote.read_cache_bytes = input.coordinator_cache_bytes;
     remote.read_memory_allowance_bytes = input.coordinator_read_memory_allowance_bytes;
     if let Some(live) = &input.live_nvmeof {
@@ -613,7 +611,11 @@ fn prepare_external_case_with_parallelism(
         };
         let owner = ExternalOwnerReadConfig {
             partition,
-            read_workers: serde_yaml::from_value(field("read_workers")?)?,
+            read_workers: serde_yaml::from_value(
+                node.get("read_workers")
+                    .cloned()
+                    .unwrap_or(serde_yaml::Value::Null),
+            )?,
             wal_member_read: serde_yaml::from_value(field("wal_member_read")?)?,
             read_resident_first: serde_yaml::from_value(field("read_resident_first")?)?,
             read_memory_allowance_bytes: serde_yaml::from_value(field(
@@ -869,7 +871,9 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
             return Err("invalid external remote owner configuration".into());
         }
         for owner in owner_configs {
-            if owner.read_workers == 0
+            if owner
+                .read_workers
+                .is_some_and(|workers| !(1..=1024).contains(&workers))
                 || owner.read_memory_allowance_bytes == 0
                 || owner.read_max_inflight_requests == 0
                 || owner.read_max_inflight_bytes == 0
@@ -1257,7 +1261,7 @@ async fn open_with_shape(
             "read_memory_allowance_bytes": remote_config.read_memory_allowance_bytes,
             "preparation_workers": remote_config.preparation_workers,
             "scan_prefetch_pages": remote_config.scan_prefetch_pages,
-            "read_lanes": remote_config.read_lanes,
+            "read_lanes": remote_config.effective_read_lanes(),
             "pin_read_lanes": remote_config.pin_read_lanes,
             "max_pending_reads": remote_config.max_pending_reads,
             "max_pending_read_bytes": remote_config.max_pending_read_bytes,
@@ -2598,10 +2602,7 @@ mod tests {
             let launch: serde_yaml::Value =
                 serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap())
                     .unwrap();
-            assert_eq!(
-                launch["node"]["read_workers"].as_u64(),
-                Some(tidehunter::parallelism::available() as u64)
-            );
+            assert_eq!(launch["node"].get("read_workers"), None);
             assert_eq!(
                 launch["history_persistence"].as_str(),
                 Some(mode.unwrap_or("on_disk"))
@@ -2943,12 +2944,12 @@ mod tests {
             });
             write_input(&config);
             let output = root.join("live");
-            prepare_external_case_with_parallelism(&input, &output, 16).unwrap();
+            prepare_external_case_file(&input, &output).unwrap();
             let remote: serde_json::Value =
                 serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
             assert_eq!(remote["live_nvme"]["write_mode"], "reserved");
             assert_eq!(remote["pin_read_lanes"], false);
-            assert_eq!(remote["read_lanes"], 16);
+            assert!(remote.get("read_lanes").is_none());
             assert_eq!(remote["live_nvme"]["inline_reads"], true);
             assert_eq!(remote["live_nvme"]["export_mode"], "on_demand");
             assert_eq!(remote["live_nvme"]["lease_ahead"], true);
@@ -3061,7 +3062,7 @@ mod tests {
                     config["durability_tier"] = serde_json::json!(tier);
                     write_input(&config);
                     let output = root.join(format!("live-{mode}-{tier}-{inline_reads}"));
-                    prepare_external_case_with_parallelism(&input, &output, 16).unwrap();
+                    prepare_external_case_file(&input, &output).unwrap();
                     let remote: serde_json::Value =
                         serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap())
                             .unwrap();

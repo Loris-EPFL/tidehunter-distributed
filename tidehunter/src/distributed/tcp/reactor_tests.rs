@@ -1503,7 +1503,7 @@ fn ram_probe_does_not_acquire_inventory_or_dispatch_read_workers() {
     // A reactor-local diagnostic must still produce the real response.
     let (started_tx, started_rx) = mpsc::channel();
     let mut releases = Vec::new();
-    for _ in 0..server.config.read_workers {
+    for _ in 0..server.config.effective_read_workers() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         releases.push(release_tx);
         let started = started_tx.clone();
@@ -1514,7 +1514,7 @@ fn ram_probe_does_not_acquire_inventory_or_dispatch_read_workers() {
             let _ = release_rx.recv();
         });
     }
-    for _ in 0..server.config.read_workers {
+    for _ in 0..server.config.effective_read_workers() {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
     let inventory = server.node.inventory.lock();

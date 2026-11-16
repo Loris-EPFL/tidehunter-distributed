@@ -114,7 +114,7 @@ pub struct ExecutionConfig {
     /// never a sum or mean of client windows. Interference requires one client.
     /// Absent selects the smaller of caller concurrency and available CPUs,
     /// except interference mode, which retains one scheduling client.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_shards: Option<usize>,
     /// Maximum admitted in-flight requests. Arrivals beyond this bound are recorded rejected.
     pub queue_capacity: usize,

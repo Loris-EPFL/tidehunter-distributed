@@ -157,8 +157,9 @@ pub struct NodeConfig {
     pub max_epochs: usize,
     /// Bounded workers for cold authority planning and explicit mapped/positional
     /// diagnostics. Append/control persistence has its own per-log owner.
-    #[serde(default = "default_read_workers")]
-    pub read_workers: usize,
+    /// Absent resolves on the owner host when it starts, not on the preparing host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_workers: Option<usize>,
     #[serde(default = "default_async_read_policy")]
     pub wal_member_read: super::storage::WalMemberReadPolicy,
     /// Opt-in NOWAIT prefix reads; compare with forced-async on the target host.
@@ -181,6 +182,10 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    pub fn effective_read_workers(&self) -> usize {
+        crate::parallelism::resolve_count(self.read_workers, crate::parallelism::available())
+    }
+
     /// Validate static owner settings without opening files, sockets or nvmet.
     pub fn validate(&self) -> Result<(), TcpError> {
         self.validated_shape()?;
@@ -212,7 +217,10 @@ impl NodeConfig {
                 "live NVMe-oF target requires experimental-nvmeof on Linux",
             ));
         }
-        if !(1..=1024).contains(&self.read_workers) {
+        if self
+            .read_workers
+            .is_some_and(|workers| !(1..=1024).contains(&workers))
+        {
             return Err(TcpError::new("read_workers must be in 1..=1024"));
         }
         if self.read_resident_first
@@ -230,9 +238,6 @@ impl NodeConfig {
     }
 }
 
-fn default_read_workers() -> usize {
-    crate::parallelism::available()
-}
 fn default_async_read_policy() -> super::storage::WalMemberReadPolicy {
     super::storage::WalMemberReadPolicy::Async
 }
@@ -969,7 +974,7 @@ impl StorageNode {
     pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>, TcpError> {
         let read_config = config.read_config()?;
         let read_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.read_workers)
+            .num_threads(config.effective_read_workers())
             .thread_name(|i| format!("wal-record-read-{i}"))
             .build()
             .map_err(TcpError::component)?;

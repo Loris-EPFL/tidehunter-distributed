@@ -54,10 +54,10 @@ fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
     let config = config(&temp.path().join("node"));
     let node = open_synchronous(&config);
     node.inventory.lock().fence_to(1).unwrap();
-    let (entered, entries) = mpsc::sync_channel(config.read_workers);
-    let (release, released) = mpsc::sync_channel(config.read_workers);
+    let (entered, entries) = mpsc::sync_channel(config.effective_read_workers());
+    let (release, released) = mpsc::sync_channel(config.effective_read_workers());
     let released = Arc::new(Mutex::new(released));
-    for _ in 0..config.read_workers {
+    for _ in 0..config.effective_read_workers() {
         let entered = entered.clone();
         let released = released.clone();
         node.read_pool.spawn(move || {
@@ -68,13 +68,13 @@ fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
                 .unwrap();
         });
     }
-    for _ in 0..config.read_workers {
+    for _ in 0..config.effective_read_workers() {
         entries.recv_timeout(Duration::from_secs(5)).unwrap();
     }
     let (completed, completions) = mpsc::sync_channel(1);
     assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
     let response = receive(&completions, 1).response;
-    for _ in 0..config.read_workers {
+    for _ in 0..config.effective_read_workers() {
         release.send(()).unwrap();
     }
     let Response::Appended(receipts) = response.unwrap() else {

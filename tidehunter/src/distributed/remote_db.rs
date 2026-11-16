@@ -419,8 +419,9 @@ pub struct RemoteDatabaseConfig {
     /// Bounded scan-page lookahead; one is the serial control.
     #[serde(default = "default_scan_prefetch_pages")]
     pub scan_prefetch_pages: usize,
-    #[serde(default = "default_read_lanes")]
-    pub read_lanes: usize,
+    /// Absent resolves to the coordinator host's available CPU parallelism at open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_lanes: Option<usize>,
     /// Pin live read workers to hardware-queue CPUs once a namespace is known.
     /// Best effort: affinity failures are counted and do not fail reads.
     #[serde(default)]
@@ -437,9 +438,6 @@ pub struct RemoteDatabaseConfig {
     pub live_nvme: Option<super::tcp::LiveClientConfig>,
 }
 
-fn default_read_lanes() -> usize {
-    crate::parallelism::available()
-}
 fn default_max_pending_reads() -> usize {
     256
 }
@@ -477,6 +475,59 @@ fn default_index_shards() -> usize {
 impl RemoteDatabaseConfig {
     pub const MAX_OWNER_APPEND_OCCUPANCY: usize = super::tcp::APPEND_COMMAND_WINDOW;
     pub const DEFAULT_OWNER_APPEND_OCCUPANCY: usize = DEFAULT_OWNER_APPEND_OCCUPANCY;
+    /// Each lane retains a connection to every owner. Owners must budget for
+    /// an automatic coordinator without knowing that coordinator's CPU count.
+    pub const MAX_AUTO_READ_LANES: usize = 64;
+    /// One session from `transports::connect(..., 1)` is shared by append,
+    /// checkpoint and lifecycle control; live pins reuse read/control sessions.
+    const APPEND_CONTROL_CONNECTIONS: usize = 1;
+    /// The optional operational sampler owns one additional session per owner.
+    const OPERATIONAL_CONNECTIONS: usize = 1;
+    pub const NON_READ_CONNECTIONS: usize =
+        Self::APPEND_CONTROL_CONNECTIONS + Self::OPERATIONAL_CONNECTIONS;
+    /// Budget two complete coordinator session sets so a reopen can overlap
+    /// old sessions until their owner permits observe EOF. Auto configs use
+    /// the cap, not the preparing host's CPU count.
+    pub fn generated_owner_connection_limit(
+        read_lanes: Option<usize>,
+    ) -> Result<usize, LocalDbError> {
+        let lanes = read_lanes.unwrap_or(Self::MAX_AUTO_READ_LANES);
+        let required = lanes
+            .checked_add(Self::NON_READ_CONNECTIONS)
+            .and_then(|sessions| sessions.checked_mul(2))
+            .ok_or_else(|| {
+                LocalDbError::new(format!(
+                    "read_lanes={lanes}: overlapping owner connection budget overflows"
+                ))
+            })?;
+        if required > 256 {
+            return Err(LocalDbError::new(format!(
+                "read_lanes={lanes}: two session sets require {required} connections, exceeding owner max_connections ceiling 256"
+            )));
+        }
+        Ok(required)
+    }
+
+    pub fn effective_read_lanes(&self) -> usize {
+        crate::parallelism::resolve_count(
+            self.read_lanes,
+            crate::parallelism::available().min(Self::MAX_AUTO_READ_LANES),
+        )
+    }
+
+    fn validate_read_lane_pinning(&self, read_lanes: usize) -> Result<(), LocalDbError> {
+        if self.pin_read_lanes
+            && self
+                .live_nvme
+                .as_ref()
+                .is_some_and(|live| read_lanes > live.queue_geometry.io_queues as usize)
+        {
+            return Err(LocalDbError::new(
+                "pin_read_lanes requires read_lanes <= live I/O queues",
+            ));
+        }
+        Ok(())
+    }
 
     fn effective_owner_append_occupancy(&self) -> usize {
         if self.live_nvme.as_ref().is_some_and(|live| {
@@ -541,10 +592,8 @@ impl RemoteDatabaseConfig {
         }
         if let Some(live) = &self.live_nvme {
             live.validate().map_err(LocalDbError::new)?;
-            if self.pin_read_lanes && self.read_lanes > live.queue_geometry.io_queues as usize {
-                return Err(LocalDbError::new(
-                    "pin_read_lanes requires read_lanes <= live I/O queues",
-                ));
+            if let Some(read_lanes) = self.read_lanes {
+                self.validate_read_lane_pinning(read_lanes)?;
             }
             if !live.owner_identities.is_empty()
                 && (live.owner_identities.len() != self.storage.partitions.len()
@@ -645,7 +694,7 @@ impl RemoteDatabaseConfig {
                 .read_cache_bytes
                 .checked_add(self.max_pending_read_bytes)
                 .is_none_or(|bytes| bytes > self.read_memory_allowance_bytes)
-            || !(1..=1024).contains(&self.read_lanes)
+            || self.read_lanes.is_some_and(|lanes| !(1..=1024).contains(&lanes))
             || self.max_pending_reads == 0
             || self.write_profile_limit > 65_536
             || !(ReadService::MIN_FLIGHT_BYTES..=256 * 1024 * 1024)
@@ -1707,6 +1756,7 @@ impl RemoteDatabase {
         interruption: Option<OpenInterruption>,
     ) -> Result<Self, LocalDbError> {
         config.validate()?;
+        config.validate_read_lane_pinning(config.effective_read_lanes())?;
         // Live queues and namespace grants cannot be returned to the TCP pool.
         let transport_pool = if config.live_nvme.is_some() {
             None
@@ -1824,7 +1874,7 @@ impl RemoteDatabase {
             let clients = config
                 .endpoints
                 .len()
-                .checked_mul(config.read_lanes + 1)
+                .checked_mul(config.effective_read_lanes() + 1)
                 .ok_or_else(|| LocalDbError::new("live client capacity overflow"))?;
             let controllers = clients
                 .checked_mul(super::tcp::live_read::LIVE_READ_CACHE_CAPACITY + 1)
