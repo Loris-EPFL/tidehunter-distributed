@@ -399,6 +399,45 @@ def observer_snapshot(requested):
         return {"requested": requested, "state": "unknown", "error_type": type(exc).__name__, "services": []}
 
 
+def qualify_mainnet_resp(binary, state, output):
+    """Replay on this cell's exact-owned servers before its normal teardown."""
+    import mainnet_replay_resp as replay
+
+    output.mkdir()
+    reset = {"reason": "clear completed synthetic cell before replay fresh-empty admission",
+             "acknowledged_flushes": []}
+    local.dump(output / "reset.json", reset)
+
+    def flush():
+        local.inspect_owned(state)
+        for endpoint in state["backend_options"]["nodes"]:
+            if replay.industry_service.request(endpoint, "FLUSHALL") != "OK":
+                raise RuntimeError("owned replay database reset failed")
+            reset["acknowledged_flushes"].append(endpoint)
+            local.dump(output / "reset.json", reset)
+
+    flush()
+    freshness = replay.check_nonempty_rejection(
+        binary, output, replay.configuration(state["backend"], state["backend_options"], 1))
+    evidence = []
+    for concurrency in (1, 4):
+        flush()
+        config = replay.configuration(state["backend"], state["backend_options"], concurrency)
+        path = output / f"N{concurrency}.json"
+        local.dump(path, config)
+        result = output / f"N{concurrency}"
+        with (output / f"N{concurrency}.log").open("w") as log:
+            subprocess.run([str(binary), "--config", str(path), "--output", str(result)],
+                           stdout=log, stderr=subprocess.STDOUT, timeout=75, check=True)
+        evidence.append(replay.check_result(result))
+    if evidence[0]["verification"] != evidence[1]["verification"]:
+        raise RuntimeError("N=1 and N=4 replay final contents differ")
+    receipt = {"status": "completed", "runs": evidence, "freshness_regression": freshness,
+               "reset": reset, "reused_exact_owned_synthetic_lifecycle": True}
+    local.dump(output / "results.json", receipt)
+    return receipt
+
+
 def run_one(args, spec, base, job, index):
     run_dir = args.output / f"{index:04d}-{job['backend']}-{job['profile']['name']}-r{job['rate']}-n{job['repeat']}"
     run_dir.mkdir()
@@ -511,6 +550,10 @@ def run_one(args, spec, base, job, index):
         receipt["validated_timing_rows_by_phase"] = verify_timing_result(result_dir, config)
         if external:
             local.ready(state, 60)
+        if (getattr(args, "mainnet_replay_resp", False)
+                and job["backend"] in ("valkey_tcp", "garnet", "kvrocks")):
+            receipt["mainnet_replay"] = qualify_mainnet_resp(
+                args.binary, state, run_dir / "mainnet-replay")
         receipt["status"] = "completed"
     except BaseException as exc:
         receipt["status"] = "failed"
@@ -545,6 +588,8 @@ def main():
     p.add_argument("--reuse-state", type=Path, help="reuse exact-owned ready deployment; implies explicitly labeled nonfresh storage and leaves it running")
     p.add_argument("--qualification", action="store_true", help="real API qualification, not performance")
     p.add_argument("--observe", action="store_true", help="explicitly configure/start monitoring per cell before timing")
+    p.add_argument("--mainnet-replay-resp", action="store_true",
+                   help="qualify two-repetition N=1/N=4 RESP replay within each owned server lifecycle")
     args = p.parse_args()
     args.output = args.output.resolve()
     args.binary = args.binary.resolve()

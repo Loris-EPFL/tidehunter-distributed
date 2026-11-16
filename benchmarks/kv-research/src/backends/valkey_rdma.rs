@@ -22,6 +22,8 @@ use std::{
 use tidehunter::minibytes::Bytes;
 use tokio::{sync::Mutex, time::timeout};
 
+pub mod replay;
+
 const POOL_SIZE: usize = 4;
 const COMMIT: &str = "fe8d406c0b5a64ec897f6455e4de684629883764";
 #[derive(Clone, Deserialize)]

@@ -43,6 +43,21 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-${{ runner.arch }}-kv-rust-1.90-${{ hashFiles('Cargo.lock') }}
+      - name: Record actual shared-host resources
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kv-results"
+          {
+            uname -a
+            lscpu
+            cat /proc/meminfo
+            df -B1 "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+            findmnt -T "$GITHUB_WORKSPACE"
+            cat /proc/self/status
+            for limit in /sys/fs/cgroup/{cpu.max,memory.max,memory.swap.max}; do
+              if [ -f "$limit" ]; then printf '%s: ' "$limit"; cat "$limit"; fi
+            done
+          } > "$RUNNER_TEMP/kv-results/host-resources.txt"
       - name: Prepare explicit native build prerequisites
         timeout-minutes: 15
         run: |
@@ -74,12 +89,15 @@ jobs:
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/kv-results/fdb-client/lib" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$RUNNER_TEMP/kv-results/fdb-client/lib" >> "$GITHUB_ENV"
       - name: Admission and accounting behavior tests
-        run: python3 -m unittest discover -s experiments/kv-comparison -p 'test_*.py'
+        run: |
+          python3 -m unittest discover -s experiments/kv-comparison -p 'test_*.py'
+          python3 -B -m unittest discover -s .github/scripts -p 'test_replay_ci.py'
       - name: Build actual external adapters
         timeout-minutes: 25
         run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks
       - name: Test the comparison crate with actual adapter features
-        timeout-minutes: 10
+        # 7m14s at 31d4845; the mainnet replay suites (native, distributed, RESP) exceed 10 minutes.
+        timeout-minutes: 20
         run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks
       - name: Check monitoring freshness and metric semantics
         run: python3 -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
@@ -103,7 +121,7 @@ jobs:
           fi
           python3 experiments/kv-comparison/campaign.py \
             --manifest experiments/kv-comparison/ci.json \
-            --binary target/debug/kv-research --qualification --observe \
+            --binary target/debug/kv-research --qualification --observe --mainnet-replay-resp \
             "${backend_args[@]}" --output "$RUNNER_TEMP/kv-results/selected"
           python3 experiments/kv-comparison/observability/stack.py verify \
             --output "$RUNNER_TEMP/kv-results/selected-monitoring.json"

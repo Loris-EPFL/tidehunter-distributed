@@ -30,6 +30,8 @@ fn actual_index_serializer_confirms_geometry_rejection_before_open() {
             Row {
                 table: 13,
                 tx: 0,
+                backend_key: Bytes::from(key.clone()),
+                backend_owner: 0,
                 key: Bytes::from(key),
                 value: Bytes::new(),
             }

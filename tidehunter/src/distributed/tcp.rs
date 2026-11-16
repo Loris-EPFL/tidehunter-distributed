@@ -1137,6 +1137,28 @@ impl StorageNode {
         .map_err(TcpError::component)?;
         Ok(())
     }
+    /// Install the ordinary-file live target fixture before serving any requests.
+    /// This exercises the protocol, not a kernel NVMe target.
+    #[cfg(all(
+        feature = "test-utils",
+        feature = "experimental-nvmeof",
+        target_os = "linux"
+    ))]
+    pub fn set_live_target_fixture(
+        &self,
+        config: super::nvmeof::LiveTargetConfig,
+        configfs: std::path::PathBuf,
+    ) -> Result<(), TcpError> {
+        let mut inventory = self.inventory.lock();
+        if inventory.live_target.is_some() {
+            return Err(TcpError::new("live target fixture already installed"));
+        }
+        inventory.live_target = Some(
+            super::nvmeof::live_target::LiveTargetManager::open_fixture(config, configfs)
+                .map_err(TcpError::component)?,
+        );
+        Ok(())
+    }
     pub(super) fn reader_authority_valid(&self, epoch: u64, generation: Option<u64>) -> bool {
         if self.control_context.poison_pending.load(Ordering::Acquire) {
             return false;
@@ -1615,7 +1637,11 @@ pub struct Client {
     live_leased: live_client::LeasedWriter,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_write_failed: bool,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(all(
+        any(test, feature = "test-utils"),
+        feature = "experimental-nvmeof",
+        target_os = "linux"
+    ))]
     live_write_local_fixture: bool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
@@ -1890,7 +1916,11 @@ impl Client {
             live_leased: live_client::LeasedWriter::default(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_write_failed: false,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(all(
+                any(test, feature = "test-utils"),
+                feature = "experimental-nvmeof",
+                target_os = "linux"
+            ))]
             live_write_local_fixture: false,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_counters: None,

@@ -7,6 +7,14 @@ pub mod foundationdb;
 #[cfg(any(feature = "garnet", feature = "kvrocks"))]
 pub mod industry;
 pub mod native;
+pub mod replay;
+#[cfg(any(
+    feature = "valkey-tcp",
+    feature = "garnet",
+    feature = "kvrocks",
+    feature = "valkey-rdma"
+))]
+pub mod resp_replay;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
 pub mod tidehunter;

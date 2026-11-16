@@ -55,7 +55,7 @@ pub struct LiveControllerLease {
     // Cold-path lock only: first file open is serialized and bounded by the
     // connect deadline. In-flight reads hold an Arc and never take this lock.
     namespaces: Mutex<HashMap<(u32, bool), Arc<LiveNamespace>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     local_fixture: bool,
 }
 impl LiveControllerLease {
@@ -67,7 +67,7 @@ impl LiveControllerLease {
         self.instance
     }
     pub fn open_namespace(&self) -> io::Result<LiveNamespace> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if self.local_fixture {
             let mut namespace = LiveNamespace::open_local_file(
                 &self.binding.namespace_path,
@@ -171,12 +171,12 @@ pub struct LiveControllerPool {
     max_pending: usize,
     state: Mutex<State>,
     changed: Condvar,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     local_targets: Mutex<HashMap<String, std::path::PathBuf>>,
 }
 impl LiveControllerPool {
     /// Local-file pool fixture. It does not create or qualify a kernel controller.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn cache_local_shared_namespace(
         &self,
         target: &LiveConnectTarget,
@@ -268,7 +268,7 @@ impl LiveControllerPool {
     }
 
     /// Local-file fixture for a nonshared recovery controller identity.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn cache_local_namespace(
         &self,
         target: &LiveConnectTarget,
@@ -308,7 +308,7 @@ impl LiveControllerPool {
                 closing: false,
             }),
             changed: Condvar::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             local_targets: Mutex::new(HashMap::new()),
         })
     }
@@ -729,7 +729,7 @@ impl LiveControllerPool {
                     instance: controller.instance(),
                     resolver: controller.resolver(),
                     namespaces: Mutex::new(HashMap::new()),
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-utils"))]
                     local_fixture: self
                         .local_targets
                         .lock()
