@@ -79,7 +79,7 @@ class ObserverMatrixQualification(unittest.TestCase):
                 if selection == 'nvmeof_parallel_writes':
                     self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 jobs = qualification.cloud_campaign.make_focused_matrix(selection)
-                if selection.startswith('nvmeof_m3_'):
+                if selection in qualification.cloud_campaign.M3_SELECTIONS:
                     jobs = [job for job in jobs if qualification.cloud_campaign.job_owner_hosts(job) == spec['owner_hosts']]
                 self.assertEqual(len(jobs), expected_count)
                 self.assertEqual({job['backend'] for job in jobs},

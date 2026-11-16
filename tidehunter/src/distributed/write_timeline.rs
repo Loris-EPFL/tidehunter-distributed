@@ -9,6 +9,200 @@ use std::time::Instant;
 
 const MAX_EVENTS: usize = 32;
 
+/// Fixed-size, whole-window wall spans. Stages can nest; these are not CPU
+/// timings. Bucket 63 includes everything at or beyond 63 seconds.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WriteBlockStage {
+    AdmissionCredit,
+    ReplyCreditRelease,
+    IdentityLookup,
+    AdmissionIndexLock,
+    PublicationIndexLock,
+    AppendSend,
+    Progress,
+    OrderedAdmission,
+    Checkpoint,
+    Snapshot,
+    CreditReleaseLock,
+    CreditNotify,
+}
+const BLOCK_STAGES: [WriteBlockStage; 12] = [
+    WriteBlockStage::AdmissionCredit,
+    WriteBlockStage::ReplyCreditRelease,
+    WriteBlockStage::IdentityLookup,
+    WriteBlockStage::AdmissionIndexLock,
+    WriteBlockStage::PublicationIndexLock,
+    WriteBlockStage::AppendSend,
+    WriteBlockStage::Progress,
+    WriteBlockStage::OrderedAdmission,
+    WriteBlockStage::Checkpoint,
+    WriteBlockStage::Snapshot,
+    WriteBlockStage::CreditReleaseLock,
+    WriteBlockStage::CreditNotify,
+];
+const BLOCK_BUCKETS: usize = 64;
+
+#[derive(Default)]
+struct BlockCounter {
+    calls: AtomicU64,
+    ns: AtomicU64,
+    max_ns: AtomicU64,
+    max_depth: AtomicU64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteBlockBucket {
+    stage: WriteBlockStage,
+    second: usize,
+    calls: u64,
+    ns: u64,
+    max_ns: u64,
+    max_depth: u64,
+}
+
+struct BlockCounters {
+    origin_ns: AtomicU64,
+    buckets: [BlockCounter; BLOCK_STAGES.len() * BLOCK_BUCKETS],
+}
+impl Default for BlockCounters {
+    fn default() -> Self {
+        Self {
+            origin_ns: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| BlockCounter::default()),
+        }
+    }
+}
+impl BlockCounters {
+    fn reset(&self, origin_ns: u64) {
+        // Relaxed: arming is quiescent; enabled's release publishes this reset.
+        self.origin_ns.store(origin_ns, Ordering::Relaxed);
+        for bucket in &self.buckets {
+            bucket.calls.store(0, Ordering::Relaxed);
+            bucket.ns.store(0, Ordering::Relaxed);
+            bucket.max_ns.store(0, Ordering::Relaxed);
+            bucket.max_depth.store(0, Ordering::Relaxed);
+        }
+    }
+    fn snapshot(&self) -> Vec<WriteBlockBucket> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bucket)| {
+                let calls = bucket.calls.load(Ordering::Relaxed);
+                (calls != 0).then(|| WriteBlockBucket {
+                    stage: BLOCK_STAGES[index / BLOCK_BUCKETS],
+                    second: index % BLOCK_BUCKETS,
+                    calls,
+                    ns: bucket.ns.load(Ordering::Relaxed),
+                    max_ns: bucket.max_ns.load(Ordering::Relaxed),
+                    max_depth: bucket.max_depth.load(Ordering::Relaxed),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WriteOwnerQueue {
+    AuthorityStaged,
+    AuthorityOutstanding,
+    WorkerQueued,
+    LeasedFlights,
+}
+const OWNER_QUEUES: [WriteOwnerQueue; 4] = [
+    WriteOwnerQueue::AuthorityStaged,
+    WriteOwnerQueue::AuthorityOutstanding,
+    WriteOwnerQueue::WorkerQueued,
+    WriteOwnerQueue::LeasedFlights,
+];
+
+#[derive(Default)]
+struct QueueCounter {
+    samples: AtomicU64,
+    depth_sum: AtomicU64,
+    max_depth: AtomicU64,
+}
+
+#[repr(align(64))]
+struct OwnerCounters {
+    owner: u32,
+    queues: [QueueCounter; OWNER_QUEUES.len() * BLOCK_BUCKETS],
+    frames: AtomicU64,
+    fua_frames: AtomicU64,
+    batches: AtomicU64,
+    puts: AtomicU64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteOwnerQueueBucket {
+    queue: WriteOwnerQueue,
+    second: usize,
+    samples: u64,
+    depth_sum: u64,
+    max_depth: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteOwnerDiagnostics {
+    owner: u32,
+    submitted_frames: u64,
+    submitted_fua_frames: u64,
+    submitted_batches: u64,
+    submitted_puts: u64,
+    queues: Vec<WriteOwnerQueueBucket>,
+}
+
+impl OwnerCounters {
+    fn new(owner: u32) -> Self {
+        Self {
+            owner,
+            queues: std::array::from_fn(|_| QueueCounter::default()),
+            frames: AtomicU64::new(0),
+            fua_frames: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
+            puts: AtomicU64::new(0),
+        }
+    }
+    fn reset(&self) {
+        // Relaxed: quiescent reset is published by enabled's Release store.
+        for queue in &self.queues {
+            queue.samples.store(0, Ordering::Relaxed);
+            queue.depth_sum.store(0, Ordering::Relaxed);
+            queue.max_depth.store(0, Ordering::Relaxed);
+        }
+        self.frames.store(0, Ordering::Relaxed);
+        self.fua_frames.store(0, Ordering::Relaxed);
+        self.batches.store(0, Ordering::Relaxed);
+        self.puts.store(0, Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> WriteOwnerDiagnostics {
+        WriteOwnerDiagnostics {
+            owner: self.owner,
+            submitted_frames: self.frames.load(Ordering::Relaxed),
+            submitted_fua_frames: self.fua_frames.load(Ordering::Relaxed),
+            submitted_batches: self.batches.load(Ordering::Relaxed),
+            submitted_puts: self.puts.load(Ordering::Relaxed),
+            queues: self
+                .queues
+                .iter()
+                .enumerate()
+                .filter_map(|(index, queue)| {
+                    let samples = queue.samples.load(Ordering::Relaxed);
+                    (samples != 0).then(|| WriteOwnerQueueBucket {
+                        queue: OWNER_QUEUES[index / BLOCK_BUCKETS],
+                        second: index % BLOCK_BUCKETS,
+                        samples,
+                        depth_sum: queue.depth_sum.load(Ordering::Relaxed),
+                        max_depth: queue.max_depth.load(Ordering::Relaxed),
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Exact local batch counts for the three coordinator write waits.
 ///
 /// Observations count entries. Depth is the number of batches inside the wait
@@ -329,6 +523,9 @@ pub struct OwnerTimelineError {
 pub struct WriteTimelineExport {
     pub origin_monotonic_ns: u64,
     pub limit: usize,
+    pub sample_every: usize,
+    pub seen_calls: u64,
+    pub skipped_calls: u64,
     pub records: Vec<WriteTimelineRecord>,
     pub dropped_calls: u64,
     pub dropped_events: u64,
@@ -348,6 +545,8 @@ pub struct WriteTimelineExport {
     pub owner_captured_connections: usize,
     pub owner_errors: Vec<OwnerTimelineError>,
     pub write_wait_metrics: WriteWaitMetrics,
+    pub blocking_spans: Vec<WriteBlockBucket>,
+    pub owner_diagnostics: Vec<WriteOwnerDiagnostics>,
 }
 
 pub(crate) struct OwnerTimelineCollection {
@@ -388,11 +587,66 @@ pub(crate) struct WriteTimeline {
     generation: AtomicU64,
     session: Mutex<Option<Session>>,
     waits: WriteWaitCounters,
+    blocks: BlockCounters,
+    owners: Vec<OwnerCounters>,
+    sample_every: AtomicU64,
+    seen_calls: AtomicU64,
 }
 impl WriteTimeline {
-    pub fn arm(&self, limit: usize) -> Result<(), &'static str> {
+    pub(crate) fn with_owners(owners: impl Iterator<Item = u32>) -> Self {
+        Self {
+            owners: owners.map(OwnerCounters::new).collect(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn owner_queue(&self, owner: u32, queue: WriteOwnerQueue, depth: usize) {
+        if !self.enabled() {
+            return;
+        }
+        let Some(owner) = self.owners.iter().find(|counters| counters.owner == owner) else {
+            return;
+        };
+        let second = super::owner_events::monotonic_now_ns()
+            .saturating_sub(self.blocks.origin_ns.load(Ordering::Relaxed))
+            / 1_000_000_000;
+        let counter = &owner.queues
+            [queue as usize * BLOCK_BUCKETS + second.min((BLOCK_BUCKETS - 1) as u64) as usize];
+        // Relaxed: independent queue samples, never authority or wake state.
+        counter.samples.fetch_add(1, Ordering::Relaxed);
+        counter.depth_sum.fetch_add(depth as u64, Ordering::Relaxed);
+        counter.max_depth.fetch_max(depth as u64, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "experimental-nvmeof"))]
+    pub(crate) fn owner_frame(
+        &self,
+        owner: u32,
+        batches: usize,
+        puts: impl FnOnce() -> usize,
+        fua: bool,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        let Some(owner) = self.owners.iter().find(|counters| counters.owner == owner) else {
+            return;
+        };
+        // Relaxed: matched submission-window counts. Skip markers are excluded.
+        owner.frames.fetch_add(1, Ordering::Relaxed);
+        owner
+            .fua_frames
+            .fetch_add(u64::from(fua), Ordering::Relaxed);
+        owner.batches.fetch_add(batches as u64, Ordering::Relaxed);
+        owner.puts.fetch_add(puts() as u64, Ordering::Relaxed);
+    }
+
+    pub fn arm(&self, limit: usize, sample_every: usize) -> Result<(), &'static str> {
         if limit > 65_536 {
             return Err("write timeline limit exceeds 65536");
+        }
+        if !(1..=1_000_000).contains(&sample_every) {
+            return Err("write timeline sample interval must be between 1 and 1000000");
         }
         let mut session = self.session.lock();
         if session.is_some() {
@@ -415,6 +669,13 @@ impl WriteTimeline {
             self.waits.reset();
             let origin = Instant::now();
             let origin_monotonic_ns = super::owner_events::monotonic_now_ns();
+            self.blocks.reset(origin_monotonic_ns);
+            self.sample_every
+                .store(sample_every as u64, Ordering::Relaxed);
+            self.seen_calls.store(0, Ordering::Relaxed);
+            for owner in &self.owners {
+                owner.reset();
+            }
             *session = Some(Session {
                 generation,
                 origin,
@@ -422,6 +683,9 @@ impl WriteTimeline {
                     origin_monotonic_ns,
                     write_wait_metrics: self.waits.snapshot(),
                     limit,
+                    sample_every,
+                    seen_calls: 0,
+                    skipped_calls: 0,
                     records: Vec::with_capacity(limit),
                     dropped_calls: 0,
                     dropped_events: 0,
@@ -440,6 +704,8 @@ impl WriteTimeline {
                     owner_expected_connections: 0,
                     owner_captured_connections: 0,
                     owner_errors: Vec::new(),
+                    blocking_spans: Vec::new(),
+                    owner_diagnostics: Vec::new(),
                 },
                 operations: HashMap::new(),
                 versions: HashMap::new(),
@@ -580,6 +846,10 @@ impl WriteTimeline {
         let complete = self.drain_completion_wakes_until(deadline);
         session.export.write_wait_metrics = self.waits.snapshot();
         session.export.write_wait_metrics.complete = complete;
+        session.export.blocking_spans = self.blocks.snapshot();
+        self.snapshot_sampling(&mut session.export);
+        session.export.owner_diagnostics =
+            self.owners.iter().map(OwnerCounters::snapshot).collect();
         Ok(session.export)
     }
     pub fn finish(&self) -> Result<WriteTimelineExport, &'static str> {
@@ -590,6 +860,10 @@ impl WriteTimeline {
             .take()
             .ok_or("write timeline is not armed")?;
         session.export.write_wait_metrics = self.waits.snapshot();
+        session.export.blocking_spans = self.blocks.snapshot();
+        self.snapshot_sampling(&mut session.export);
+        session.export.owner_diagnostics =
+            self.owners.iter().map(OwnerCounters::snapshot).collect();
         session.export.incomplete_calls = session
             .export
             .records
@@ -598,8 +872,46 @@ impl WriteTimeline {
             .count() as u64;
         Ok(session.export)
     }
+    /// Disabled captures take no clock, lock, or allocation. Counters have fixed
+    /// storage, and export allocates only after the workload has drained.
+    pub(crate) fn block_started(&self) -> Option<Instant> {
+        self.enabled().then(Instant::now)
+    }
+
+    pub(crate) fn block_finished(
+        &self,
+        stage: WriteBlockStage,
+        started: Option<Instant>,
+        depth: usize,
+    ) {
+        let Some(started) = started else { return };
+        let ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let second = super::owner_events::monotonic_now_ns()
+            .saturating_sub(self.blocks.origin_ns.load(Ordering::Relaxed))
+            / 1_000_000_000;
+        let bucket = &self.blocks.buckets
+            [stage as usize * BLOCK_BUCKETS + second.min((BLOCK_BUCKETS - 1) as u64) as usize];
+        // Relaxed: independent diagnostics, never admission/durability authority.
+        bucket.calls.fetch_add(1, Ordering::Relaxed);
+        bucket.ns.fetch_add(ns, Ordering::Relaxed);
+        bucket.max_ns.fetch_max(ns, Ordering::Relaxed);
+        bucket.max_depth.fetch_max(depth as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot_sampling(&self, export: &mut WriteTimelineExport) {
+        export.seen_calls = self.seen_calls.load(Ordering::Relaxed);
+        export.skipped_calls =
+            export.seen_calls - export.seen_calls.div_ceil(export.sample_every as u64);
+    }
+
     pub fn begin(&self, id: u64) -> Option<WriteTimelineSample> {
         if !self.enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        // Relaxed: this ordinal selects diagnostics only. Skipped calls take no
+        // recorder mutex, avoiding a new shared lock on unsampled puts.
+        let ordinal = self.seen_calls.fetch_add(1, Ordering::Relaxed);
+        if !ordinal.is_multiple_of(self.sample_every.load(Ordering::Relaxed)) {
             return None;
         }
         let mut guard = self.session.lock();
@@ -1031,7 +1343,7 @@ mod tests {
         window.depth_max.store(4, Ordering::Relaxed);
         window.wake_attempts.store(3, Ordering::Relaxed);
         window.wake_coalesced.store(2, Ordering::Relaxed);
-        timeline.arm(0).unwrap();
+        timeline.arm(0, 1).unwrap();
         timeline.wait_enter(WriteWait::OwnerEnqueueToDequeue, 2);
         timeline.wait_leave(WriteWait::OwnerEnqueueToDequeue, 1);
         timeline.wait_wake(WriteWait::OwnerEnqueueToDequeue, true);
@@ -1052,7 +1364,7 @@ mod tests {
     #[test]
     fn wait_counts_follow_entries_exits_and_actual_coalesced_hints() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         for wait in [
             WriteWait::OwnerEnqueueToDequeue,
             WriteWait::AdmittedToAppendEnqueue,
@@ -1096,7 +1408,7 @@ mod tests {
     #[test]
     fn wait_counters_saturate_and_flag_the_cap() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let window = &timeline.waits.windows[0];
         for counter in [
             &window.depth,
@@ -1126,7 +1438,7 @@ mod tests {
     #[test]
     fn wait_counters_are_monotone_until_finish_and_reset_on_rearm() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         timeline.wait_enter(WriteWait::OwnerEnqueueToDequeue, 1);
         let first = timeline.waits.snapshot();
         timeline.wait_leave(WriteWait::OwnerEnqueueToDequeue, 1);
@@ -1144,7 +1456,7 @@ mod tests {
         timeline.wait_wake(WriteWait::OwnerEnqueueToDequeue, true);
         assert_eq!(timeline.waits.snapshot().windows[0].observations, 2);
         assert_eq!(timeline.waits.snapshot().windows[0].wake_attempts, 1);
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let next = timeline.finish().unwrap();
         assert_eq!(next.write_wait_metrics.windows[0].observations, 0);
         assert_eq!(next.write_wait_metrics.windows[0].wake_attempts, 0);
@@ -1164,7 +1476,7 @@ mod tests {
     #[test]
     fn finish_drains_the_armed_hint_after_recording_is_disabled() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let wake = timeline.completion_wake_started().unwrap();
         std::thread::scope(|scope| {
             let finish = scope.spawn(|| {
@@ -1192,7 +1504,7 @@ mod tests {
     #[test]
     fn pending_hint_at_deadline_is_incomplete_and_blocks_rearm_until_drop() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let wake = timeline.completion_wake_started().unwrap();
         let export = timeline
             .finish_with_owner_until(
@@ -1202,9 +1514,9 @@ mod tests {
             .unwrap();
         assert!(!export.write_wait_metrics.complete);
         assert_eq!(export.write_wait_metrics.windows[2].wake_attempts, 0);
-        assert!(timeline.arm(1).is_err());
+        assert!(timeline.arm(1, 1).is_err());
         wake.complete(false);
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let next = timeline.finish().unwrap();
         assert!(next.write_wait_metrics.complete);
         assert_eq!(next.write_wait_metrics.windows[2].wake_attempts, 0);
@@ -1213,13 +1525,13 @@ mod tests {
     #[test]
     fn dropped_hint_guard_does_not_invent_a_wake_or_hold_the_next_arm() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let wake = timeline.completion_wake_started().unwrap();
         drop(wake);
         let export = timeline.finish().unwrap();
         assert!(export.write_wait_metrics.complete);
         assert_eq!(export.write_wait_metrics.windows[2].wake_attempts, 0);
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         assert!(timeline.finish().unwrap().write_wait_metrics.complete);
     }
 
@@ -1238,7 +1550,7 @@ mod tests {
             },
         ];
         assert!(timeline.live_group(3, versions.into_iter()).is_none());
-        timeline.arm(2).unwrap();
+        timeline.arm(2, 1).unwrap();
         let a = timeline.begin(11).unwrap();
         let b = timeline.begin(12).unwrap();
         timeline.operation(a, [1; 16]);
@@ -1286,7 +1598,7 @@ mod tests {
             epoch: 1,
             sequence: 1,
         };
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let sample = timeline.begin(1).unwrap();
         timeline.operation(sample, [1; 16]);
         timeline.batch([1; 16], version);
@@ -1294,7 +1606,7 @@ mod tests {
         assert!(timeline.live_group(1, [version].into_iter()).is_none());
         let first = timeline.finish().unwrap();
         assert_eq!(first.dropped_live_groups, 1);
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let sample = timeline.begin(2).unwrap();
         timeline.operation(sample, [2; 16]);
         timeline.batch([2; 16], version);
@@ -1310,7 +1622,7 @@ mod tests {
     fn checkpoint_events_are_bounded_and_keep_generation() {
         let timeline = WriteTimeline::default();
         timeline.checkpoint_generation("disabled", None, 1, None, Some(9));
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         for _ in 0..65 {
             timeline.checkpoint_generation("capture_start", None, 1, None, Some(9));
         }
@@ -1336,7 +1648,7 @@ mod tests {
             prefix: None,
         };
         timeline.control_event("submit", 2, 7, target, None);
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         for id in 0..9 {
             timeline.control_event("submit", 2, id, target, None);
         }
@@ -1350,7 +1662,7 @@ mod tests {
     #[test]
     fn bounded_events_and_incomplete_calls_are_explicit() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let sample = timeline.begin(7).unwrap();
         for _ in 0..MAX_EVENTS {
             timeline.event(sample, WriteTimelineStage::GateAcquired);
@@ -1367,11 +1679,11 @@ mod tests {
     #[test]
     fn stale_sample_cannot_mutate_rearmed_session() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let stale = timeline.begin(1).unwrap();
         let first = timeline.finish().unwrap();
         assert_eq!(first.incomplete_calls, 1);
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let current = timeline.begin(2).unwrap();
         timeline.operation(stale, [7; 16]);
         timeline.event(stale, WriteTimelineStage::GateAcquired);
@@ -1389,7 +1701,7 @@ mod tests {
     #[test]
     fn expired_finish_retains_collected_owner_page_as_incomplete() {
         let timeline = WriteTimeline::default();
-        timeline.arm(1).unwrap();
+        timeline.arm(1, 1).unwrap();
         let sample = timeline.begin(19).unwrap();
         timeline.complete(sample, None);
         let record = OwnerTimelineRecord {
@@ -1444,5 +1756,81 @@ mod tests {
         assert_eq!(export.records[0].caller_sample_id, 19);
         assert_eq!(export.owner_records[0].envelope_id, 7);
         assert_eq!(export.owner_captured_connections, 0);
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    #[test]
+    fn block_spans_are_disabled_bounded_and_reset_on_arm() {
+        let timeline = WriteTimeline::default();
+        assert!(timeline.block_started().is_none());
+        timeline.arm(1, 1).unwrap();
+        timeline.block_finished(WriteBlockStage::AppendSend, timeline.block_started(), 7);
+        let export = timeline.finish().unwrap();
+        assert_eq!(export.blocking_spans.len(), 1);
+        assert_eq!(export.blocking_spans[0].calls, 1);
+        assert_eq!(export.blocking_spans[0].max_depth, 7);
+        assert!(timeline.block_started().is_none());
+        timeline.arm(1, 1).unwrap();
+        timeline.blocks.origin_ns.store(0, Ordering::Relaxed);
+        timeline.block_finished(WriteBlockStage::Progress, timeline.block_started(), 128);
+        let export = timeline.finish().unwrap();
+        assert_eq!(export.blocking_spans.len(), 1);
+        assert_eq!(export.blocking_spans[0].second, BLOCK_BUCKETS - 1);
+        assert_eq!(export.blocking_spans[0].max_depth, 128);
+    }
+}
+
+#[cfg(test)]
+mod distributed_sample_tests {
+    use super::*;
+
+    #[test]
+    fn stride_retains_calls_across_window_and_stays_bounded() {
+        let timeline = WriteTimeline::default();
+        assert!(timeline.arm(3, 0).is_err());
+        timeline.arm(3, 3).unwrap();
+        for id in 0..10 {
+            if let Some(sample) = timeline.begin(id) {
+                timeline.complete(sample, None);
+            }
+        }
+        let export = timeline.finish().unwrap();
+        assert_eq!(
+            export
+                .records
+                .iter()
+                .map(|record| record.caller_sample_id)
+                .collect::<Vec<_>>(),
+            [0, 3, 6]
+        );
+        assert_eq!(export.seen_calls, 10);
+        assert_eq!(export.skipped_calls, 6);
+        assert_eq!(export.dropped_calls, 1);
+    }
+
+    #[test]
+    fn owner_diagnostics_are_window_matched_and_disabled_by_default() {
+        let timeline = WriteTimeline::with_owners([2, 7].into_iter());
+        timeline.owner_frame(2, 1, || panic!("disabled diagnostics evaluated puts"), true);
+        timeline.arm(1, 1).unwrap();
+        timeline.owner_frame(2, 2, || 3, true);
+        timeline.owner_frame(7, 1, || 1, false);
+        timeline.owner_queue(2, WriteOwnerQueue::LeasedFlights, 3);
+        let export = timeline.finish().unwrap();
+        assert_eq!(export.owner_diagnostics[0].submitted_frames, 1);
+        assert_eq!(export.owner_diagnostics[0].submitted_fua_frames, 1);
+        assert_eq!(export.owner_diagnostics[0].submitted_batches, 2);
+        assert_eq!(export.owner_diagnostics[0].submitted_puts, 3);
+        assert_eq!(export.owner_diagnostics[0].queues[0].max_depth, 3);
+        assert_eq!(export.owner_diagnostics[1].submitted_frames, 1);
+        assert_eq!(export.owner_diagnostics[1].submitted_fua_frames, 0);
+        timeline.arm(1, 1).unwrap();
+        let export = timeline.finish().unwrap();
+        assert_eq!(export.owner_diagnostics[0].submitted_frames, 0);
+        assert!(export.owner_diagnostics[0].queues.is_empty());
     }
 }

@@ -20,8 +20,8 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 24)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 24)
+        self.assertEqual(len(self.jobs), 31)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 31)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
                          {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:
@@ -145,11 +145,15 @@ class MultiOwnerTests(unittest.TestCase):
     def test_measurement_windows_and_admission_cap(self):
         for job in self.jobs:
             sizing = job["measurement_sizing"]
-            self.assertIn(sizing["measurement_seconds"], (5, 10))
-            if sizing["rate_calls_per_second"] >= 90000:
-                self.assertEqual(sizing["measurement_seconds"], 5)
-            elif job["mix"]["read"] != 50:
-                self.assertEqual(sizing["measurement_seconds"], 10)
+            if job["selection"] == "nvmeof_p9_small_put":
+                self.assertEqual(sizing["measurement_seconds"],
+                                 job["measurement_operations"] / sizing["rate_calls_per_second"])
+            else:
+                self.assertIn(sizing["measurement_seconds"], (5, 10))
+                if sizing["rate_calls_per_second"] >= 90000:
+                    self.assertEqual(sizing["measurement_seconds"], 5)
+                elif job["mix"]["read"] != 50:
+                    self.assertEqual(sizing["measurement_seconds"], 10)
             self.assertGreaterEqual(job["warmup_operations"] / sizing["rate_calls_per_second"], 2)
             if job["mix"]["put"]:
                 self.assertLessEqual(4096 + job["warmup_operations"] + job["measurement_operations"], 1_000_000)

@@ -180,13 +180,13 @@ class FocusedAdmissionTest(unittest.TestCase):
                 self.assertEqual(spec['max_cases'], expected_count)
                 self.assertEqual(spec['owner_hosts'], workflow_input.cloud_campaign.selection_owner_hosts(selection))
                 self.assertFalse(spec['spdk_comparison'])
-                self.assertEqual(spec['backends'], ['tidehunter_nvme_rdma'] if selection.startswith('nvmeof_m3_') or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
+                self.assertEqual(spec['backends'], ['tidehunter_nvme_rdma'] if selection in workflow_input.cloud_campaign.M3_SELECTIONS or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
                 self.assertEqual(workflow_input.specification(
                     'kv', ','.join(spec['backends']), 'focused', selection=selection),
-                    dict(spec, reservation_hours=2) if selection.startswith("nvmeof_m3_") else spec)
+                    dict(spec, reservation_hours=2) if selection in workflow_input.cloud_campaign.M3_SELECTIONS else spec)
                 self.assertTrue(gcp_runtime.live_mode(spec))
                 for mutation in ({'job_count': expected_count - 1}, {'matrix_sha256': '0' * 64},
-                                 {'owner_hosts': 6 if selection.startswith('nvmeof_m3_') else 5}, {'spdk_comparison': True},
+                                 {'owner_hosts': 6 if selection in workflow_input.cloud_campaign.M3_SELECTIONS else 5}, {'spdk_comparison': True},
                                  {'backends': ['tidehunter_verbs_native', 'tidehunter_nvme_rdma']}):
                     with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                         manual._reviewed_jobs({**spec, **mutation})

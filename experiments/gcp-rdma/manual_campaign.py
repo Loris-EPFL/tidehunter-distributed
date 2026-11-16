@@ -122,6 +122,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
     'valkey_rdma_reads': 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2',
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
+    'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -210,6 +211,14 @@ for owners, (selection, count, digest) in M3_MATRIX_BINDINGS.items():
                                      for job in workflow_input.cloud_campaign.make_focused_matrix(selection)),
     }
     FOCUSED_MATRIX_SHA256[selection] = digest
+
+REVIEWED_SPECS["nvmeof_p9_small_put"] = {
+    **copy.deepcopy(REVIEWED_SPECS["nvmeof_m3_t2_5"]),
+    "selection": "nvmeof_p9_small_put", "job_count": 7, "max_cases": 7, "repeats": 2,
+    "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p9_small_put"],
+    "case_deadline_seconds": 386,
+    "diagnostics": {"write_timeline_limit": 2048, "write_timeline_sample_every": 256},
+}
 
 
 def m3_spec(owner_hosts):

@@ -2874,6 +2874,28 @@ impl super::Client {
             .current
             .as_mut()
             .ok_or_else(|| super::TcpError::new("lease missing"))?;
+        timeline.owner_frame(
+            owner,
+            group.batches().len(),
+            || {
+                group
+                    .batches()
+                    .iter()
+                    .map(|batch| {
+                        batch
+                            .mutations()
+                            .iter()
+                            .filter(|mutation| {
+                                matches!(mutation, crate::distributed::codec::Mutation::Put { .. })
+                            })
+                            .count()
+                    })
+                    .sum()
+            },
+            durable_at_completion
+                && current.lease.tier
+                    == crate::distributed::durability::DurabilityTier::Synchronous,
+        );
         timeline.live_group_position(
             sample,
             cursor,
@@ -3866,7 +3888,7 @@ pub(crate) mod leased_tests {
             let mut client = fixture.writer();
             client.leased_test_fail_write(result);
             let timeline = WriteTimeline::default();
-            timeline.arm(1).unwrap();
+            timeline.arm(1, 1).unwrap();
             let batch = fixture.batch(0);
             let sample = timeline.begin(0).unwrap();
             timeline.operation(sample, batch.id().operation);
@@ -4632,7 +4654,7 @@ pub(crate) mod leased_tests {
                 client.leased_test_fail_write(-libc::EIO);
             }
             let timeline = WriteTimeline::default();
-            timeline.arm(3).unwrap();
+            timeline.arm(3, 1).unwrap();
             let batches: Vec<_> = (1..=3).map(|n| fixture.big_batch(n)).collect();
             let samples: Vec<_> = batches
                 .iter()
@@ -4769,7 +4791,7 @@ pub(crate) mod leased_tests {
         let timeline = Arc::new(WriteTimeline::default());
         client.trace_controls(timeline.clone(), 2);
         client.owner_timeline_arm(32).unwrap();
-        timeline.arm(32).unwrap();
+        timeline.arm(32, 1).unwrap();
         let first = client
             .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &timeline, 2)
             .unwrap()[0];
@@ -4873,7 +4895,7 @@ pub(crate) mod leased_tests {
             let mut client = fixture.writer_without_ahead();
             client.leased_test_set_window(1);
             let timeline = WriteTimeline::default();
-            timeline.arm(1).unwrap();
+            timeline.arm(1, 1).unwrap();
             assert!(matches!(
                 client
                     .submit_leased_group(1, vec![fixture.batch(0)], &timeline, 2, true)
@@ -4927,7 +4949,7 @@ pub(crate) mod leased_tests {
             client.leased_test_set_window(4);
             client.leased_test_hold_completions(&[1]);
             let timeline = WriteTimeline::default();
-            timeline.arm(4).unwrap();
+            timeline.arm(4, 1).unwrap();
             let mut calls = Vec::new();
             for sequence in 0..4 {
                 let batch = fixture.batch(sequence);

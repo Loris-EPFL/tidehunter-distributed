@@ -296,7 +296,7 @@ class CampaignModeTests(unittest.TestCase):
                     'deltas': {'coordinator': {'available': True,
                                'counters': {'read_profile_live_inline': 0}}},
                     'live_nvmeof': {'available': True, 'counters': dict(end)}}
-        if selection.startswith('nvmeof_m3_'):
+        if selection in cloud_campaign.M3_SELECTIONS:
             for boundary in ('start', 'end', 'deltas'):
                 evidence[boundary]['owner_executor'] = {'available': True, 'partitions': {
                     str(i): {'available': True, 'counters': {}} for i in range(5)}}
