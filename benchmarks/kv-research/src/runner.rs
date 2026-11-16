@@ -631,6 +631,9 @@ pub async fn run<B: KvBackend>(
         finished_unix_seconds: finished_wall,
         durability,
         backend: info,
+        execution: serde_json::json!({
+            "effective_client_shards": config.execution.effective_client_shards()
+        }),
         phase_counts: serde_json::json!({
             "offered": totals.0, "completed_terminal": totals.1, "succeeded": totals.6, "rejected": totals.2,
             "timeouts_or_unknown_mutations": totals.3, "errors_or_wrong_values": totals.4,
@@ -2541,7 +2544,7 @@ fn client_generators(config: &RunConfig) -> Vec<WorkloadGenerator> {
     // Reserve new-key IDs across every client and phase. This atomic allocates IDs
     // only; oracle tracking is separate. K=1 retains the original seed and stream.
     let next_put_index = Arc::new(AtomicU64::new(0));
-    (0..config.execution.client_shards)
+    (0..config.execution.effective_client_shards())
         .map(|shard| {
             WorkloadGenerator::new(
                 (config.seed ^ 0x6b76_7265_7365_6172)
@@ -2585,7 +2588,7 @@ async fn run_phase<B: KvBackend>(
     oracle: &Arc<KeyOracle>,
     reporter: &mut Reporter,
 ) -> BackendResult<()> {
-    let clients = config.execution.client_shards;
+    let clients = config.execution.effective_client_shards();
     if clients == 1 {
         let mut pool = WorkerPool::new(backend, config, namespace, origin, oracle)?;
         let schedule = ClientSchedule {
@@ -3823,7 +3826,7 @@ mod tests {
             let mut config = read_test_config();
             config.execution.concurrency = 7;
             config.execution.queue_capacity = 11;
-            config.execution.client_shards = 3;
+            config.execution.client_shards = Some(3);
             config.execution.request_timeout_ms = if overload { 1000 } else { 1 };
             if overload {
                 config.execution.mode = ExecutionMode::OpenLoop;
@@ -3881,6 +3884,7 @@ mod tests {
     #[test]
     fn client_shards_one_keeps_original_workload_sequence() {
         let mut config = read_test_config();
+        config.execution.client_shards = Some(1);
         config.dataset.keys = 31;
         config.workload.mix = crate::config::OperationMix {
             read: 7,
@@ -3916,12 +3920,12 @@ mod tests {
         let mut config = read_test_config();
         config.execution.concurrency = 7;
         config.execution.queue_capacity = 11;
-        config.execution.client_shards = 3;
+        config.execution.client_shards = Some(3);
         config.workload.mix.put = 1;
         let mut first = client_generators(&config);
         let mut second = client_generators(&config);
         for index in 0..101 {
-            let shard = index % config.execution.client_shards;
+            let shard = index % config.execution.effective_client_shards();
             let left = first[shard].next_item().unwrap();
             let right = second[shard].next_item().unwrap();
             assert_eq!(left.operation, right.operation);
@@ -3963,7 +3967,7 @@ mod tests {
                 let mut config = read_test_config();
                 config.execution.concurrency = 7;
                 config.execution.queue_capacity = 11;
-                config.execution.client_shards = clients;
+                config.execution.client_shards = Some(clients);
                 config.dataset.keys = 31;
                 config.phases.warmup_operations = 62;
                 config.phases.aging_operations = 19;
@@ -4006,6 +4010,7 @@ mod tests {
                 let summary: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(output.join("summary.json")).unwrap())
                         .unwrap();
+                assert_eq!(summary["execution"]["effective_client_shards"], clients);
                 let mix = summary["phase_counts"]["realized_mix"].as_object().unwrap();
                 let measurement_count: u64 = mix
                     .iter()
@@ -4033,7 +4038,7 @@ mod tests {
                 let mut config = read_test_config();
                 config.execution.concurrency = 7;
                 config.execution.queue_capacity = 11;
-                config.execution.client_shards = clients;
+                config.execution.client_shards = Some(clients);
                 config.dataset.keys = 31;
                 config.phases.warmup_operations = 62;
                 config.phases.warmup_key_sweep = true;
@@ -4069,7 +4074,7 @@ mod tests {
             config.execution.mode = ExecutionMode::OpenLoop;
             config.execution.concurrency = 7;
             config.execution.queue_capacity = 11;
-            config.execution.client_shards = clients;
+            config.execution.client_shards = Some(clients);
             config.execution.offered_ops_per_second = Some(200.0);
             config.phases.measurement_operations = 17;
             run(
@@ -4108,7 +4113,7 @@ mod tests {
         let mut config = read_test_config();
         config.execution.concurrency = 7;
         config.execution.queue_capacity = 11;
-        config.execution.client_shards = 3;
+        config.execution.client_shards = Some(3);
         let backend = Arc::new(MemoryBackend::new(false, false));
         let oracle = Arc::new(KeyOracle::new(false, 0, false).unwrap());
         let mut reporter = Reporter::create(
@@ -5211,6 +5216,7 @@ mod tests {
                 started_unix_seconds: 0.0,
                 finished_unix_seconds: 0.0,
                 backend: backend.info(),
+                execution: serde_json::json!({}),
                 phase_counts: serde_json::json!({}),
                 distributions: reporter.distribution_summaries(),
                 limitations: Vec::new(),
@@ -5418,6 +5424,7 @@ mod tests {
             started_unix_seconds: 0.0,
             finished_unix_seconds: 0.0,
             backend: backend.info(),
+            execution: serde_json::json!({}),
             phase_counts: serde_json::json!({}),
             distributions: reporter.distribution_summaries(),
             limitations: Vec::new(),
@@ -5504,6 +5511,7 @@ mod tests {
                 started_unix_seconds: 0.0,
                 finished_unix_seconds: 0.0,
                 backend: backend.info(),
+                execution: serde_json::json!({}),
                 phase_counts: serde_json::json!({}),
                 distributions: reporter.distribution_summaries(),
                 limitations: Vec::new(),

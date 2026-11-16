@@ -29,6 +29,33 @@ pub(super) fn reopen_result(fixture: &Fixture) -> Result<RemoteDatabase, LocalDb
     )
 }
 #[test]
+fn read_lanes_default_to_parallelism_and_validate_bounds() {
+    let fixture = Fixture::new();
+    let mut serialized = serde_json::to_value(&fixture.config).unwrap();
+    serialized.as_object_mut().unwrap().remove("read_lanes");
+    let mut config: RemoteDatabaseConfig = serde_json::from_value(serialized).unwrap();
+    assert_eq!(config.read_lanes, None);
+    assert_eq!(
+        config.effective_read_lanes(),
+        crate::parallelism::available().min(RemoteDatabaseConfig::MAX_AUTO_READ_LANES)
+    );
+    assert!(
+        serde_json::to_value(&config)
+            .unwrap()
+            .get("read_lanes")
+            .is_none()
+    );
+    for lanes in [1, 1024] {
+        config.read_lanes = Some(lanes);
+        config.validate().unwrap();
+    }
+    for lanes in [0, 1025] {
+        config.read_lanes = Some(lanes);
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
 fn recorded_live_identity_cannot_reopen_as_tcp() {
     let fixture = Fixture::new();
     let db = fixture.open();
@@ -864,27 +891,31 @@ fn failed_setup_joins_owned_workers_and_next_open_reserves_a_new_epoch() {
 fn endpoint_fanout_is_bounded_ordered_and_joins_even_failed_waves() {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let barrier = Barrier::new(8);
+    let parallelism = crate::parallelism::available();
+    let barrier = Barrier::new(parallelism);
     let completed = AtomicUsize::new(0);
-    let mut inputs = [0usize; 16];
+    let mut inputs = vec![0usize; parallelism * 2];
     let result: Result<Vec<usize>, _> = endpoint_map(&mut inputs, |index, value| {
-        assert!(index < 8, "a failed wave must prevent later waves");
+        assert!(
+            index < parallelism,
+            "a failed wave must prevent later waves"
+        );
         barrier.wait();
         *value = index;
         completed.fetch_add(1, Ordering::SeqCst);
-        if index == 3 {
+        if index == 0 {
             Err(LocalDbError::new("injected endpoint failure"))
         } else {
             Ok(index)
         }
     });
     assert!(result.is_err());
-    assert_eq!(completed.load(Ordering::SeqCst), 8);
-    assert_eq!(inputs[7], 7);
-    assert_eq!(inputs[8], 0);
+    assert_eq!(completed.load(Ordering::SeqCst), parallelism);
+    assert_eq!(inputs[parallelism - 1], parallelism - 1);
+    assert_eq!(inputs[parallelism], 0);
     let ordered = endpoint_map(&mut inputs, |index, _| Ok(index)).unwrap();
-    assert_eq!(ordered, (0..16).collect::<Vec<_>>());
-    let result: Result<Vec<usize>, _> = endpoint_map(&mut inputs[..8], |index, _| {
+    assert_eq!(ordered, (0..parallelism * 2).collect::<Vec<_>>());
+    let result: Result<Vec<usize>, _> = endpoint_map(&mut inputs[..parallelism], |index, _| {
         barrier.wait();
         if index == 0 {
             panic!("injected endpoint panic");
@@ -893,7 +924,7 @@ fn endpoint_fanout_is_bounded_ordered_and_joins_even_failed_waves() {
         Ok(index)
     });
     assert!(result.is_err());
-    assert_eq!(completed.load(Ordering::SeqCst), 15);
+    assert_eq!(completed.load(Ordering::SeqCst), parallelism * 2 - 1);
 }
 
 #[test]
@@ -1232,7 +1263,7 @@ fn sui_scan_filters_reduced_boundary_candidates_by_verified_full_key() {
 fn sui_grouped_scan_keeps_order_while_one_storage_lane_is_stalled() {
     use crate::distributed::sui::Db;
     let mut fixture = Fixture::new();
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     let db = Db::open_remote(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),

@@ -167,7 +167,7 @@ class AdmissionConfigTests(unittest.TestCase):
                             'max_batches_per_partition': max(16384, cloud.planned_write_batches_per_partition(job)),
                             'max_admitted_batches': 1000000, 'max_index_bytes': 512 * 1024**2,
                             'coordinator_cache_bytes': job['coordinator_cache_bytes'],
-                            'owner_read_workers': 4, 'owner_wal_member_read': 'async',
+                            'owner_wal_member_read': 'async',
                             'owner_read_memory_allowance_bytes': 128 * 1024**2,
                             'polling': job['owner_polling'], 'history_persistence': job['history_persistence'],
                             'owner_read_resident_first': job.get('owner_read_resident_first', False),

@@ -2277,7 +2277,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             remote.scan_prefetch_pages = pages;
         }
         if let Some(lanes) = args.tcp_read_lanes {
-            remote.read_lanes = lanes;
+            remote.read_lanes = Some(lanes);
         }
         if let Some(count) = args.tcp_max_pending_reads {
             remote.max_pending_reads = count;
@@ -2366,10 +2366,13 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     }
     drop(load);
     if args.bounded_hot_pass || args.bounded_hot_reads.is_some() {
-        let read_lanes = parameters
-            .remote
-            .as_ref()
-            .map_or(args.tcp_read_lanes.unwrap_or(2), |remote| remote.read_lanes);
+        let read_lanes = parameters.remote.as_ref().map_or_else(
+            || {
+                args.tcp_read_lanes
+                    .unwrap_or_else(tidehunter::parallelism::available)
+            },
+            RemoteDatabaseConfig::effective_read_lanes,
+        );
         cache_workloads::bounded_hot(
             &mut backend,
             case,
@@ -2982,7 +2985,8 @@ fn main() -> Result<()> {
             parameters.local.max_index_bytes,
             args.transport.clone(),
             &owner_transports,
-            args.tcp_server_read_workers.unwrap_or(2),
+            args.tcp_server_read_workers,
+            args.tcp_read_lanes,
             args.tcp_wal_member_read
                 .unwrap_or(tidehunter::distributed::storage::WalMemberReadPolicy::Async),
             args.shard_read_memory_allowance_bytes.unwrap_or(512 * MIB),
@@ -2995,7 +2999,7 @@ fn main() -> Result<()> {
         let mut config: RemoteDatabaseConfig = serde_yaml::from_slice(&fs::read(&config_path)?)?;
         config.read_memory_allowance_bytes = args.read_memory_allowance_bytes;
         if let Some(lanes) = args.tcp_read_lanes {
-            config.read_lanes = lanes;
+            config.read_lanes = Some(lanes);
         }
         if let Some(count) = args.tcp_max_pending_reads {
             config.max_pending_reads = count;
@@ -3076,9 +3080,9 @@ fn main() -> Result<()> {
     )?;
     let default_read_lanes = if let Some(path) = &args.remote_config {
         let remote: RemoteDatabaseConfig = serde_yaml::from_slice(&fs::read(path)?)?;
-        remote.read_lanes
+        remote.effective_read_lanes()
     } else {
-        2
+        tidehunter::parallelism::available()
     };
     let bounded_enabled = args.bounded_hot_pass || args.bounded_hot_reads.is_some();
     let bounded_policy = cache_workloads::hot_policy(

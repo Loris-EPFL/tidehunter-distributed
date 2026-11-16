@@ -55,6 +55,22 @@ def run(args):
     result = 1
     try:
         result = local_multiowner_check.main()
+        first = json.loads((args.state / "proof/proof.json").read_text())
+        prewrite = {"attempted": False}
+        if (first.get("cleanup_complete") is True and first.get("fixture_removed") is True
+                and json.loads((args.state / "before.json").read_text()) == inventory()):
+            prewrite["attempted"] = True
+            sys.argv = [str(local_multiowner_check.__file__), "--binary", str(args.binary.resolve(strict=True)),
+                        "--libs", str(args.state / "libs"), "--owners", "4",
+                        "--output", str(args.state / "proof-prewrite"), "--wal-prewrite"]
+            try:
+                prewrite["exit_code"] = local_multiowner_check.main()
+            except (Exception, SystemExit) as error:
+                prewrite["error"] = str(error)
+            prewrite["passed"] = prewrite.get("exit_code") == 0
+        else:
+            prewrite["reason"] = "first pass cleanup unconfirmed; second pass is unsafe"
+        dump(args.state / "prewrite-result.json", prewrite)
         return result
     finally:
         dump(args.state / "after.json", inventory())
@@ -69,6 +85,13 @@ def cleanup(args):
     proof = json.loads((args.state / "proof/proof.json").read_text())
     complete = (proof.get("cleanup_complete") is True and proof.get("fixture_removed") is True
                 and before == after)
+    prewrite_path = args.state / "proof-prewrite"
+    if prewrite_path.exists():
+        prewrite = json.loads((prewrite_path / "proof.json").read_text())
+        prewrite_clean = (prewrite.get("cleanup_complete") is True
+                          and prewrite.get("fixture_removed") is True)
+        complete = complete and prewrite_clean
+        dump(args.state / "prewrite-cleanup.json", {"complete": prewrite_clean})
     dump(args.state / "cleanup.json", {"complete": complete,
          "proof_cleanup_complete": proof.get("cleanup_complete"),
          "fixture_removed": proof.get("fixture_removed"), "inventory_restored": before == after})

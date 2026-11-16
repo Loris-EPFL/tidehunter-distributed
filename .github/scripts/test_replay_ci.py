@@ -84,6 +84,60 @@ class ReplayCITests(unittest.TestCase):
                 kernel.interrupted(15, None)
             self.assertEqual(handler.call_count, 2)
 
+    def test_prewrite_pass_is_non_gating_but_cleanup_is_required(self):
+        import argparse
+        import local_multiowner_check
+        for clean in (True, False):
+            with self.subTest(clean=clean), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                binary = state / "binary"
+                binary.touch()
+                args = argparse.Namespace(state=state, binary=binary)
+                calls = []
+                def proof():
+                    prewrite = "--wal-prewrite" in sys.argv
+                    calls.append(prewrite)
+                    output = Path(sys.argv[sys.argv.index("--output") + 1])
+                    output.mkdir()
+                    kernel.dump(output / "proof.json", {
+                        "cleanup_complete": clean if prewrite else True,
+                        "fixture_removed": clean if prewrite else True,
+                    })
+                    return 1 if prewrite else 0
+                with patch.object(kernel, "inventory", return_value={}), \
+                        patch.object(kernel.signal, "signal"), \
+                        patch.object(sys, "argv", ["test"]), \
+                        patch.object(local_multiowner_check, "main", side_effect=proof):
+                    self.assertEqual(kernel.run(args), 0)
+                    self.assertEqual(calls, [False, True])
+                    self.assertFalse(json.loads((state / "prewrite-result.json").read_text())["passed"])
+                    if clean:
+                        self.assertEqual(kernel.cleanup(args), 0)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
+                            kernel.cleanup(args)
+                        self.assertFalse(json.loads((state / "cleanup.json").read_text())["complete"])
+
+    def test_prewrite_pass_does_not_start_after_incomplete_cleanup(self):
+        import argparse
+        import local_multiowner_check
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            def proof():
+                output = state / "proof"
+                output.mkdir()
+                kernel.dump(output / "proof.json", {"cleanup_complete": False})
+                return 1
+            with patch.object(kernel, "inventory", return_value={}), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof) as run:
+                self.assertEqual(kernel.run(argparse.Namespace(state=state, binary=binary)), 1)
+                run.assert_called_once()
+                self.assertFalse(json.loads((state / "prewrite-result.json").read_text())["attempted"])
+
 
 if __name__ == "__main__":
     unittest.main()

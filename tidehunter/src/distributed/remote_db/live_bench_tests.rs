@@ -168,7 +168,7 @@ impl Fixture {
                 .map(|value| value.parse().unwrap())
                 .unwrap_or(1),
             scan_prefetch_pages: 1,
-            read_lanes: 1,
+            read_lanes: Some(1),
             pin_read_lanes: false,
             max_pending_reads: 64,
             max_pending_read_bytes: 16 * MIB,
@@ -193,8 +193,9 @@ impl Fixture {
                 partition: config.partition_config(1, 0),
                 shape_yaml: shape.to_yaml().unwrap(),
                 max_epochs: 8,
-                read_workers: 1,
+                read_workers: Some(1),
                 wal_member_read: Default::default(),
+                wal_prewrite: false,
                 read_resident_first: false,
                 read_memory_allowance_bytes: 128 * MIB,
                 read_max_inflight_requests: 64,
@@ -328,13 +329,24 @@ fn pin_read_lanes_defaults_off_and_validates_queue_count() {
         DurabilityTier::Synchronous,
     ));
     fixture.config.pin_read_lanes = true;
-    fixture.config.read_lanes = 4;
+    fixture.config.read_lanes = Some(4);
     fixture.config.validate().unwrap();
-    fixture.config.read_lanes = 5;
+    fixture.config.read_lanes = Some(5);
     assert!(
         fixture
             .config
             .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("pin_read_lanes")
+    );
+    fixture.config.read_lanes = None;
+    fixture.config.validate().unwrap();
+    fixture.config.validate_read_lane_pinning(1).unwrap();
+    assert!(
+        fixture
+            .config
+            .validate_read_lane_pinning(16)
             .unwrap_err()
             .to_string()
             .contains("pin_read_lanes")
@@ -349,9 +361,9 @@ fn pin_read_lanes_defaults_off_and_validates_queue_count() {
         .unwrap()
         .queue_geometry
         .io_queues = 1;
-    fixture.config.read_lanes = 1;
+    fixture.config.read_lanes = Some(1);
     fixture.config.validate().unwrap();
-    fixture.config.read_lanes = 2;
+    fixture.config.read_lanes = Some(2);
     assert!(fixture.config.validate().is_err());
 }
 

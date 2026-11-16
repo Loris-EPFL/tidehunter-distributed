@@ -2936,3 +2936,55 @@ fn leased_many_small_frames_respect_the_round_frame_budget() {
     );
     assert_eq!(diagnostics.parallel_rounds, 2);
 }
+
+#[test]
+fn prewritten_live_files_are_ready_before_inline_and_background_grants() {
+    let temp = tempdir::TempDir::new("live-prewritten-files").unwrap();
+    let mut config = live_config();
+    config.fragment_bytes = 16 * 1024;
+    config.wal_file_bytes = 32 * 1024;
+    let log = PartitionLog::create_live_with_prewrite(
+        &temp.path().join("stream"),
+        config.clone(),
+        &shape(),
+        metrics(),
+        true,
+    )
+    .unwrap();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    let file = File::open(&first.segment.path).unwrap();
+    let mut bytes = vec![1; config.wal_file_bytes as usize];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert!(bytes.iter().all(|byte| *byte == 0));
+    close_for_preparation(&log, &config, &first, 0);
+    let mut written = vec![0; config.wal_file_bytes as usize];
+    file.read_exact_at(&mut written, 0).unwrap();
+    assert!(written.iter().any(|byte| *byte != 0));
+    let second = log.lease_live_extent(authority(&config)).unwrap().0;
+    assert_eq!(second.segment.file_index, 0);
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(
+        bytes, written,
+        "a later grant must not zero an earlier write"
+    );
+    assert_eq!(log.prepare_next_live_file().unwrap(), Some(1));
+    let prepared = log.live_segment(1).unwrap();
+    File::open(&prepared.path)
+        .unwrap()
+        .read_exact_at(&mut bytes, 0)
+        .unwrap();
+    assert!(bytes.iter().all(|byte| *byte == 0));
+    let stats = log.live_file_preparation_stats();
+    assert!(stats.live_file_prewrite_bytes >= 2 * config.wal_file_bytes);
+    assert!(stats.live_file_prewrite_ns > 0);
+}
+
+#[test]
+fn default_live_preparation_does_not_prewrite() {
+    let (_temp, config, log) = fixture();
+    log.lease_live_extent(authority(&config)).unwrap();
+    log.prepare_next_live_file().unwrap();
+    let stats = log.live_file_preparation_stats();
+    assert_eq!(stats.live_file_prewrite_bytes, 0);
+    assert_eq!(stats.live_file_prewrite_ns, 0);
+}

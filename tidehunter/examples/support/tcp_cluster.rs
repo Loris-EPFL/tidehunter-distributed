@@ -41,7 +41,8 @@ pub fn prepare_external_case(
     max_index_bytes: usize,
     transport: Transport,
     owner_transports: &[Transport],
-    read_workers: usize,
+    read_workers: Option<usize>,
+    read_lanes: Option<usize>,
     wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     read_memory_allowance_bytes: usize,
     polling: PollingPolicy,
@@ -58,6 +59,7 @@ pub fn prepare_external_case(
         transport,
         owner_transports,
         read_workers,
+        read_lanes,
         wal_member_read,
         read_memory_allowance_bytes,
         polling,
@@ -79,13 +81,15 @@ pub fn prepare_external_case_with_durability(
     max_index_bytes: usize,
     transport: Transport,
     owner_transports: &[Transport],
-    read_workers: usize,
+    read_workers: Option<usize>,
+    read_lanes: Option<usize>,
     wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     read_memory_allowance_bytes: usize,
     polling: PollingPolicy,
     read_resident_first: bool,
     durability: DurabilityConfig,
 ) -> Result<()> {
+    let max_connections = RemoteDatabaseConfig::generated_owner_connection_limit(read_lanes)?;
     if !guest_root.is_absolute()
         || addresses.len() != storage.partitions.len()
         || owner_transports.len() != addresses.len()
@@ -184,6 +188,7 @@ pub fn prepare_external_case_with_durability(
                 max_epochs: storage.max_epochs,
                 read_workers,
                 wal_member_read,
+                wal_prewrite: false,
                 read_resident_first,
                 read_memory_allowance_bytes,
                 read_max_inflight_requests: 32,
@@ -199,6 +204,7 @@ pub fn prepare_external_case_with_durability(
                 server_name: server_name.clone(),
             },
             limits: TcpLimits {
+                max_connections,
                 io_timeout: Duration::from_secs(60),
                 polling,
                 ..TcpLimits::default()
@@ -256,7 +262,7 @@ pub fn prepare_external_case_with_durability(
         read_memory_allowance_bytes: 512 * 1024 * 1024,
         preparation_workers: 2,
         scan_prefetch_pages: 2,
-        read_lanes: 2,
+        read_lanes,
         pin_read_lanes: false,
         max_pending_reads: 256,
         max_pending_read_bytes: 64 * 1024 * 1024,
@@ -520,6 +526,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
     let partition = config.node.partition.partition;
     let database = config.node.partition.inventory.database;
+    let owner_read_workers = config.node.effective_read_workers();
     let owner_events =
         if std::env::var_os("TIDEHUNTER_OWNER_EVENTS").is_some_and(|value| value == "1") {
             tidehunter::distributed::owner_events::enable(65_536);
@@ -617,7 +624,8 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             .and_then(|(_, fields)| fields.split_whitespace().nth(19))
             .ok_or_else(|| io::Error::other("missing process start time"))?
             .parse::<u64>()?;
-        let proof = serde_json::json!({
+        let (wal_prewrite_bytes, wal_prewrite_ns, wal_prewrite_files) = node.wal_prewrite_stats();
+        let mut proof = serde_json::json!({
             "schema_version": 1,
             "scope": scope,
             "complete": complete,
@@ -626,9 +634,15 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             "process_id": std::process::id(),
             "process_start_ticks": process_start_ticks,
             "target": target,
+            "preparation": {
+                "wal_prewrite_bytes": wal_prewrite_bytes,
+                "wal_prewrite_ns": wal_prewrite_ns,
+                "wal_prewrite_files": wal_prewrite_files,
+            },
             "serve_error": result.as_ref().err().map(ToString::to_string),
             "cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
         });
+        record_owner_threads(&mut proof, owner_read_workers);
         let path = Path::new(&file).with_extension("live-target-shutdown.json");
         let pending = path.with_extension(format!("pending-{}", rand::random::<u64>()));
         let mut output = OpenOptions::new()
@@ -905,6 +919,7 @@ impl LoopbackCluster {
             )?)
         };
         let limits = TcpLimits {
+            max_connections: RemoteDatabaseConfig::generated_owner_connection_limit(None)?,
             io_timeout: Duration::from_secs(60),
             polling,
             ..TcpLimits::default()
@@ -953,8 +968,9 @@ impl LoopbackCluster {
                     },
                     shape_yaml: serde_yaml::to_string(shape)?,
                     max_epochs: storage.max_epochs,
-                    read_workers,
+                    read_workers: Some(read_workers),
                     wal_member_read,
+                    wal_prewrite: false,
                     read_resident_first,
                     read_memory_allowance_bytes,
                     read_max_inflight_requests: 32,
@@ -1030,7 +1046,7 @@ impl LoopbackCluster {
             read_memory_allowance_bytes: 512 * 1024 * 1024,
             preparation_workers: 2,
             scan_prefetch_pages: 2,
-            read_lanes: 2,
+            read_lanes: None,
             pin_read_lanes: false,
             max_pending_reads: 256,
             max_pending_read_bytes: 64 * 1024 * 1024,
@@ -1277,10 +1293,30 @@ mod durability_receipt_tests {
     }
 }
 
+/// JSON-only owner evidence; deliberately independent of target/preparation counters.
+fn record_owner_threads(proof: &mut serde_json::Value, read_workers: usize) {
+    proof["owner_threads"] = serde_json::json!({ "read_workers": read_workers });
+}
+
 #[cfg(test)]
 mod live_shutdown_tests {
     use super::qualified_live_target_shutdown;
     use tidehunter::distributed::nvmeof::{LiveTargetImplementation, LiveTargetStats};
+
+    #[test]
+    fn shutdown_receipt_records_resolved_owner_threads() {
+        let mut proof = serde_json::json!({
+            "preparation": { "requested": 7 },
+            "target": { "complete": true }
+        });
+        for explicit in [None, Some(3)] {
+            let resolved = explicit.unwrap_or_else(tidehunter::parallelism::available);
+            super::record_owner_threads(&mut proof, resolved);
+            assert_eq!(proof["owner_threads"]["read_workers"], resolved);
+            assert_eq!(proof["preparation"]["requested"], 7);
+            assert_eq!(proof["target"]["complete"], true);
+        }
+    }
 
     #[test]
     fn shutdown_requires_actual_matching_backend_and_clean_counters() {
