@@ -1643,6 +1643,24 @@ impl RemoteDatabase {
     ) -> Result<Self, LocalDbError> {
         Self::open_inner(path, shape, config, None, None)
     }
+    /// Enable the existing ordinary-file live I/O fixture before exposing the DB.
+    /// No kernel controller or physical NVMe device is qualified by this hook.
+    #[cfg(all(
+        feature = "test-utils",
+        feature = "experimental-nvmeof",
+        target_os = "linux"
+    ))]
+    pub(crate) fn enable_local_live_fixture(&mut self, buffered: bool) -> Result<(), LocalDbError> {
+        if self.config.live_nvme.is_none() {
+            return Err(LocalDbError::new(
+                "local live fixture requires live_nvme configuration",
+            ));
+        }
+        for worker in &self.clients {
+            worker.client.lock().bench_local_live_fixture(buffered);
+        }
+        Ok(())
+    }
 
     /// Open a fresh authority epoch using an optional process-owned transport
     /// lifetime. Only clean, quiescent connections can be reused; credentials,

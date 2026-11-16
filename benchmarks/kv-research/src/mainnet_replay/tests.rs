@@ -372,7 +372,7 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
         prepared,
         backend,
         serde_json::Value::Null,
-        (started, now_unix()),
+        (started, now_unix(), None),
     )
     .await;
     assert!(result.is_err());
@@ -432,7 +432,7 @@ async fn injected_background_failure_rejects_each_replay_boundary() {
             prepared,
             backend,
             serde_json::Value::Null,
-            (Instant::now(), now_unix()),
+            (Instant::now(), now_unix(), None),
         )
         .await;
         assert!(result.is_err());

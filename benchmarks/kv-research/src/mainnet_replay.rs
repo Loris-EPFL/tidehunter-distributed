@@ -3,6 +3,7 @@ use crate::backend::{BackendInfo, BackendResult, BatchAtomicity};
 use crate::backends::native::replay::{
     NativeReplayBackend, ReplayBackend, UnsupportedReplayBackend,
 };
+use crate::backends::tidehunter::replay::TidehunterReplayBackend;
 use crate::config::{
     BackendSpec, DiagnosticsConfig, ExecutionConfig, ExecutionMode, LimitsConfig,
     MeasurementGateConfig,
@@ -66,12 +67,14 @@ fn ensure(ok: bool, message: &str) -> BackendResult<()> {
 impl ReplayConfig {
     pub fn validate(&self) -> BackendResult<Trace> {
         ensure(self.schema_version == 1, "replay schema_version must be 1")?;
-        if self.backend.kind != "native" {
+        if !matches!(self.backend.kind.as_str(), "native" | "tidehunter_tcp") {
             return Err(Box::new(UnsupportedReplayBackend(
                 self.backend.kind.clone(),
             )));
         }
-        NativeReplayBackend::validate(&self.backend.options)?;
+        if self.backend.kind == "native" {
+            NativeReplayBackend::validate(&self.backend.options)?;
+        }
         ensure(
             self.execution.mode == ExecutionMode::ClosedLoop
                 && self.execution.client_shards == 1
@@ -125,6 +128,9 @@ impl ReplayConfig {
             )?;
         }
         let trace = Trace::load(&self.workload.manifest_path, &self.workload.manifest_sha256)?;
+        if self.backend.kind == "tidehunter_tcp" {
+            TidehunterReplayBackend::validate(&self.backend.options, &trace)?;
+        }
         let reads = trace
             .reads
             .iter()
@@ -166,15 +172,17 @@ impl ReplayConfig {
         let trace = self.validate()?;
         let mut resources = resource_admission(self, &trace)?;
         let prepared = prepare(&trace, self.workload.repetitions)?;
-        resources["native_index_geometry"] = NativeReplayBackend::validate_geometry(
-            &self.backend.options,
-            &trace.tables,
-            prepared.iter().flat_map(|p| {
-                p.preload
-                    .iter()
-                    .chain(p.batches.iter().flat_map(|b| &b.entries))
-            }),
-        )?;
+        if self.backend.kind == "native" {
+            resources["native_index_geometry"] = NativeReplayBackend::validate_geometry(
+                &self.backend.options,
+                &trace.tables,
+                prepared.iter().flat_map(|p| {
+                    p.preload
+                        .iter()
+                        .chain(p.batches.iter().flat_map(|b| &b.entries))
+                }),
+            )?;
+        }
         Ok((trace, prepared, resources))
     }
 }
@@ -279,7 +287,7 @@ struct Pool {
     markers: Vec<Arc<AtomicU64>>,
 }
 impl Pool {
-    fn new<B: ReplayBackend>(
+    fn new<B: ReplayBackend + ?Sized>(
         backend: Arc<B>,
         prepared: Arc<Vec<Prepared>>,
         n: usize,
@@ -518,7 +526,7 @@ impl Pool {
         .await?
     }
 }
-fn execute_work<B: ReplayBackend>(
+fn execute_work<B: ReplayBackend + ?Sized>(
     backend: &B,
     prepared: &Prepared,
     work: &mut Work,
@@ -898,7 +906,7 @@ async fn checkpoint(
 }
 
 /// Native fixture evidence and tests use this same scheduler, not a mock execution path.
-pub async fn execute<B: ReplayBackend>(
+pub async fn execute<B: ReplayBackend + ?Sized>(
     backend: Arc<B>,
     trace: &Trace,
     prepared: Arc<Vec<Prepared>>,
@@ -968,7 +976,11 @@ fn native_disk_reservation(payload: u64, fragment_size: u64) -> BackendResult<(u
 }
 
 fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<serde_json::Value> {
-    let geometry = NativeReplayBackend::geometry(&config.backend.options)?;
+    let geometry = if config.backend.kind == "native" {
+        NativeReplayBackend::geometry(&config.backend.options)?
+    } else {
+        TidehunterReplayBackend::geometry(&config.backend.options)?
+    };
     let payload = trace
         .preload
         .iter()
@@ -983,14 +995,31 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         .checked_mul(config.workload.repetitions)
         .and_then(|n| n.checked_mul(128))
         .ok_or("replay index bound overflow")?;
-    let fragment_size = geometry["fragment_size"]
-        .as_u64()
-        .ok_or("missing native fragment geometry")?;
-    let (reserve, wal) = native_disk_reservation(payload, fragment_size)?;
+    let (reserve, wal) = if config.backend.kind == "native" {
+        let fragment_size = geometry["fragment_size"]
+            .as_u64()
+            .ok_or("missing native fragment geometry")?;
+        native_disk_reservation(payload, fragment_size)?
+    } else {
+        // Distributed owners reserve whole WAL files; keep the conservative whole-file bound.
+        let wal = geometry["wal_file_size"]
+            .as_u64()
+            .ok_or("missing distributed WAL geometry")?
+            .checked_mul(6)
+            .ok_or("replay WAL reservation overflow")?;
+        let reserve = payload
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(index))
+            .and_then(|n| n.checked_add(wal))
+            .ok_or("replay disk reservation overflow")?;
+        TidehunterReplayBackend::validate_disk_paths(&config.backend.options, reserve)?;
+        (reserve, wal)
+    };
     let mut path = PathBuf::from(
-        config.backend.options["path"]
+        geometry["admission_path"]
             .as_str()
-            .ok_or("native path is required")?,
+            .or_else(|| config.backend.options["path"].as_str())
+            .ok_or("replay admission path is required")?,
     );
     while !path.exists() {
         if !path.pop() {
@@ -1058,7 +1087,7 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         "estimated_memory_reservation_bytes":memory,"memory_available_bytes":memory_available,
         "payload_key_value_bytes":payload,"index_reservation_bytes":index,"wal_fragment_reservation_bytes":wal,
         "disk_payload_amplification_factor":2,
-        "reservation_model":"2x key/value payload for framing/index amplification + six open WAL fragments; empirical conservative native estimate, not physical I/O measurement; memory additionally reserves 128 bytes per row for indexes"}),
+        "reservation_model":if config.backend.kind == "native" {"2x key/value payload for framing/index amplification + six open WAL fragments; empirical conservative native estimate, not physical I/O measurement; memory additionally reserves 128 bytes per row for indexes"} else {"2x key/value payload + 128 bytes per row + six whole WAL files, checked on every coordinator root; owner device capacity is not observable; memory additionally reserves 128 bytes per row for indexes"}}),
     )
 }
 
@@ -1067,10 +1096,7 @@ pub async fn run(config: ReplayConfig, output: &Path) -> BackendResult<()> {
     let started = Instant::now();
     let (trace, prepared, resources) = config.admit()?;
     let prepared = Arc::new(prepared);
-    let backend = Arc::new(NativeReplayBackend::open(
-        &config.backend.options,
-        &trace.tables,
-    )?);
+    let (backend, info) = open_backend(&config, &trace).await?;
     run_prepared(
         config,
         output,
@@ -1078,23 +1104,31 @@ pub async fn run(config: ReplayConfig, output: &Path) -> BackendResult<()> {
         prepared,
         backend,
         resources,
-        (started, started_unix),
+        (started, started_unix, Some(info)),
     )
     .await
 }
 
-async fn run_prepared<B: ReplayBackend>(
+async fn run_prepared<B: ReplayBackend + ?Sized>(
     config: ReplayConfig,
     output: &Path,
     trace: Trace,
     prepared: Arc<Vec<Prepared>>,
     backend: Arc<B>,
     resources: serde_json::Value,
-    clock: (Instant, f64),
+    clock: (Instant, f64, Option<BackendInfo>),
 ) -> BackendResult<()> {
-    let (started, started_unix) = clock;
+    let (started, started_unix, info) = clock;
+    let info = match info {
+        Some(info) => info,
+        None => native_info(&config.backend.options)?,
+    };
     let deadline = started + Duration::from_secs(config.limits.deadline_seconds);
-    let mut reporter = Reporter::create(output, prometheus::Registry::new(), "native".into())?;
+    let mut reporter = Reporter::create(
+        output,
+        prometheus::Registry::new(),
+        config.backend.kind.clone(),
+    )?;
     let mut pool = Pool::new(
         Arc::clone(&backend),
         Arc::clone(&prepared),
@@ -1169,7 +1203,6 @@ async fn run_prepared<B: ReplayBackend>(
         window_start.map_or(0, |s| duration_ns(s.saturating_duration_since(started))),
         elapsed,
     );
-    let info = native_info(&config.backend.options)?;
     let unknown_outcomes = m
         .calls
         .iter()
@@ -1183,12 +1216,35 @@ async fn run_prepared<B: ReplayBackend>(
     } else {
         "failed"
     };
-    let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:NativeReplayBackend::geometry(&config.backend.options)?,started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
+    let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:info.configuration.clone(),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
         phase_counts:serde_json::json!({"scope":SCOPE,"profile":metrics,"preload_ns":preload_ns,"counts":m.counts,"error":result.as_ref().err().map(ToString::to_string),"resources":resources,"sustained_30s_qualified":result.is_ok() && unresolved_workers==0 && elapsed.as_secs_f64()>=30.0,"run_status":run_status,"unknown_outcomes":unknown_outcomes,"unresolved_workers":unresolved_workers,"shutdown_contract":"join completed callers; after deadline plus grace detach only unresolved calls, under external process supervision; no cancellation or rollback"}),
         distributions:reporter.distribution_summaries(),limitations:vec![SCOPE.into(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
     reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":SCOPE,"config":config,"trace_manifest":trace.manifest,"profile":metrics}))?;
     result
 }
+async fn open_backend(
+    config: &ReplayConfig,
+    trace: &Trace,
+) -> BackendResult<(Arc<dyn ReplayBackend>, BackendInfo)> {
+    match config.backend.kind.as_str() {
+        "native" => Ok((
+            Arc::new(NativeReplayBackend::open(
+                &config.backend.options,
+                &trace.tables,
+            )?),
+            native_info(&config.backend.options)?,
+        )),
+        "tidehunter_tcp" => {
+            let backend = TidehunterReplayBackend::open(&config.backend.options, trace).await?;
+            let info = backend.info();
+            Ok((Arc::new(backend), info))
+        }
+        _ => Err(Box::new(UnsupportedReplayBackend(
+            config.backend.kind.clone(),
+        ))),
+    }
+}
+
 fn native_info(options: &serde_json::Value) -> BackendResult<BackendInfo> {
     let geometry = NativeReplayBackend::geometry(options)?;
     let synced = geometry["durability"] == "value_wal_barrier";

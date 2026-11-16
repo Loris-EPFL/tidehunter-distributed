@@ -304,7 +304,7 @@ impl LiveNamespace {
     }
 
     /// Buffered regular-file control for workstation measurements, not NVMe qualification.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn open_local_file_buffered(
         path: &Path,
         bytes: u64,

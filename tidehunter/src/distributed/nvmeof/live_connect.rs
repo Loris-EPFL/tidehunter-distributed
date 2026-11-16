@@ -1185,7 +1185,7 @@ impl LiveController {
         self.registry.remove_intent(&self.intent_path)
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl LiveController {
     /// A controller whose kernel object is already gone, so `disconnect` only
     /// retires its (absent) intent. For controller-pool state tests.
