@@ -124,7 +124,7 @@ fn batch_limits(opts: &Options) -> BackendResult<BatchLimits> {
         .or(opts.batch_limits)
         .ok_or_else(|| "distributed replay requires explicit complete-batch limits".into())
 }
-fn shape(tables: &[Table], db: u16) -> KeyShape {
+pub(super) fn shape(tables: &[Table], db: u16) -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
     for table in tables.iter().filter(|t| t.db_id == db) {
         // Match the pinned production Sui declarations used by native replay,
