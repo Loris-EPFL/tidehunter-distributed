@@ -2,7 +2,7 @@
 // with the two-pass snapshot mechanism.
 use crate::cell::CellId;
 use crate::context::KsContext;
-use crate::db::Db;
+use crate::db::{BackgroundThread, Db};
 use crate::index::index_format::IndexFormat;
 use crate::index::index_table::IndexTable;
 use crate::index::levels::{IndexLevels, IndexShard};
@@ -118,10 +118,15 @@ impl IndexFlusher {
             .map(|(thread_id, receiver)| {
                 let flusher_thread =
                     IndexFlusherThread::new(db.clone(), receiver, metrics.clone(), thread_id);
+                let health = Arc::clone(
+                    &db.upgrade()
+                        .expect("opener keeps the database alive")
+                        .background_health,
+                );
 
                 thread::Builder::new()
                     .name(format!("flusher-{thread_id}"))
-                    .spawn(move || flusher_thread.run())
+                    .spawn(move || health.run(BackgroundThread::Flusher, || flusher_thread.run()))
                     .unwrap()
             })
             .collect()

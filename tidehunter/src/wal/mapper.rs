@@ -2,6 +2,7 @@ use super::layout::WalLayout;
 use super::position::{MapId, WalFileId};
 use super::tracking_mmap::TrackingMMapMut;
 use super::{Map, Wal, WalFiles};
+use crate::background_health::{BackgroundHealth, BackgroundThread};
 use crate::metrics::{MetricIntCounter, MetricIntGauge, Metrics, TimerExt};
 use crate::wal::syncer::WalSyncer;
 use arc_swap::ArcSwap;
@@ -119,7 +120,7 @@ struct UnlinkMessage {
 }
 
 impl UnlinkWorker {
-    fn start(metrics: Arc<Metrics>, kind: &'static str) -> Self {
+    fn start(metrics: Arc<Metrics>, kind: &'static str, health: Arc<BackgroundHealth>) -> Self {
         let (sender, receiver) = mpsc::channel::<UnlinkMessage>();
         let time_mcs = metrics.wal_unlinker_time_mcs.with_label_values(&[kind]);
         let retry_count = metrics
@@ -128,13 +129,15 @@ impl UnlinkWorker {
         let jh = thread::Builder::new()
             .name("wal-unlinker".to_string())
             .spawn(move || {
-                for msg in receiver {
-                    let _timer = time_mcs.clone().mcs_timer();
-                    drop_arc_file(msg.file, &msg.path, &retry_count);
-                    if msg.path.exists() {
-                        std::fs::remove_file(&msg.path).expect("Failed to remove wal file");
+                health.run(BackgroundThread::WalUnlinker, || {
+                    for msg in receiver {
+                        let _timer = time_mcs.clone().mcs_timer();
+                        drop_arc_file(msg.file, &msg.path, &retry_count);
+                        if msg.path.exists() {
+                            std::fs::remove_file(&msg.path).expect("Failed to remove wal file");
+                        }
                     }
-                }
+                });
             })
             .expect("failed to start wal-unlinker thread");
         Self {
@@ -219,6 +222,7 @@ impl WalMapper {
         layout: WalLayout,
         syncer: WalSyncer,
         metrics: Arc<Metrics>,
+        health: Arc<BackgroundHealth>,
     ) -> Self {
         let maps = maps_arc.load();
         assert!(
@@ -236,7 +240,7 @@ impl WalMapper {
         #[cfg(feature = "experimental-nvmeof")]
         let this_files = files.clone();
         let (sender, receiver) = mpsc::sync_channel(5);
-        let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name());
+        let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name(), health.clone());
         #[cfg(feature = "experimental-nvmeof")]
         let external_preallocated = Arc::new(AtomicU64::new(0));
         let this = WalMapperThread {
@@ -255,7 +259,7 @@ impl WalMapper {
         };
         let jh = thread::Builder::new()
             .name("wal-mapper".to_string())
-            .spawn(move || this.run())
+            .spawn(move || health.run(BackgroundThread::WalMapper, || this.run()))
             .expect("failed to start wal-mapper thread");
         let sender = Some(sender);
         let jh = Some(jh);

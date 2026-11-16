@@ -1,6 +1,6 @@
 use crate::WalPosition;
 use crate::batch::RelocatedWriteBatch;
-use crate::db::{Db, DbResult, WalEntry};
+use crate::db::{BackgroundThread, Db, DbResult, WalEntry};
 use crate::index::index_table::IndexTable;
 use crate::key_shape::KeySpace;
 use crate::metrics::Metrics;
@@ -145,6 +145,11 @@ impl RelocationDriver {
         receiver: mpsc::Receiver<RelocationCommand>,
         metrics: Arc<Metrics>,
     ) -> JoinHandle<()> {
+        let health = Arc::clone(
+            &db.upgrade()
+                .expect("opener keeps the database alive")
+                .background_health,
+        );
         let driver = Self {
             db,
             path,
@@ -153,7 +158,7 @@ impl RelocationDriver {
         };
         std::thread::Builder::new()
             .name("relocator".to_string())
-            .spawn(move || driver.run())
+            .spawn(move || health.run(BackgroundThread::Relocator, || driver.run()))
             .unwrap()
     }
 
@@ -161,7 +166,6 @@ impl RelocationDriver {
         while let Ok(command) = self.receiver.recv() {
             match command {
                 RelocationCommand::Start(strategy) => {
-                    // TODO: better error handling and retries
                     self.relocation_run(strategy).expect("relocation error");
                 }
                 RelocationCommand::Cancel(callback) => {

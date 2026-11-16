@@ -4337,6 +4337,79 @@ fn test_drop_cells_in_range_prefixed_uniform() {
 }
 
 #[test]
+fn test_shutdown_timeout_keeps_database_locked() {
+    let dir = tempdir::TempDir::new("test-shutdown-timeout-lock").unwrap();
+    let key_shape = default_key_shape();
+    let mut config = Config::small();
+    config.open_lock_retry_timeout = Duration::ZERO;
+    let config = Arc::new(config);
+    let db = Db::open(
+        dir.path(),
+        key_shape.clone(),
+        config.clone(),
+        Metrics::new(),
+    )
+    .unwrap();
+    let survivor = db.clone();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        db.wait_for_background_threads_to_finish_with_poll_limit(0);
+    }))
+    .unwrap_err();
+    let message = panic.downcast_ref::<String>().unwrap();
+    assert!(message.contains("Database shutdown timeout"));
+    assert!(message.contains("after 1 polls"));
+
+    assert!(matches!(
+        Db::open(dir.path(), key_shape.clone(), config.clone(), Metrics::new()),
+        Err(DbError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(
+        Db::drop_db(dir.path()).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+
+    let ks = survivor.single_ks();
+    survivor.insert(ks, vec![1, 2, 3, 4], vec![5, 6]).unwrap();
+    survivor.wait_for_background_threads_to_finish();
+    let reopened = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    assert_eq!(
+        reopened.get(ks, &[1, 2, 3, 4]).unwrap(),
+        Some(vec![5, 6].into())
+    );
+    reopened.wait_for_background_threads_to_finish();
+}
+
+#[test]
+fn test_pending_promotion_threads_registered_before_open_returns() {
+    for num_threads in [0, 1, 4, 16] {
+        let dir = tempdir::TempDir::new("test-pending-promotion-startup").unwrap();
+        let mut config = Config::small();
+        config.num_pending_promotion_threads = num_threads;
+        let db = Db::open(
+            dir.path(),
+            default_key_shape(),
+            Arc::new(config),
+            Metrics::new(),
+        )
+        .unwrap();
+
+        assert_eq!(db.pending_promotion_threads.len(), num_threads.max(1));
+        for (shard_idx, slot) in db.pending_promotion_threads.iter().enumerate() {
+            let worker = slot
+                .get()
+                .expect("Worker must be registered before open returns");
+            assert_eq!(
+                worker.name(),
+                Some(format!("pending-promotion-{shard_idx}").as_str())
+            );
+        }
+
+        db.wait_for_background_threads_to_finish();
+        Db::drop_db(dir.path()).unwrap();
+    }
+}
+
+#[test]
 fn test_drop_db() {
     drop_db(default_key_shape())
 }
@@ -4355,8 +4428,8 @@ pub(super) fn drop_db(key_shape: KeyShape) {
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert!(path.exists());
 
-    // DB is closed — drop_db must remove the directory
-    drop(db);
+    // Explicitly close before deleting: background jobs can outlive the caller's Arc.
+    db.wait_for_background_threads_to_finish();
     Db::drop_db(&path).unwrap();
     assert!(!path.exists());
 

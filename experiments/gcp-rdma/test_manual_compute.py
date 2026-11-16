@@ -246,6 +246,31 @@ class ManualComputeTests(unittest.IsolatedAsyncioTestCase):
                 await self.compute._describe('disk', name, guest=True)
             self.assertEqual(len(calls), 1)
 
+    async def test_read_transport_crash_is_retried_but_mutation_is_not(self):
+        name = self.state['run_id'] + '-0'
+        crash = {'exit_code': 1, 'stdout': '', 'stderr': "ERROR: gcloud crashed (ConnectionError): ('Connection aborted.', "
+                                                          "RemoteDisconnected('Remote end closed connection without response'))"}
+        calls = []
+        async def flaky(argv):
+            calls.append(list(argv))
+            return crash if len(calls) == 1 else {'text': '[]'}
+        self.compute.execute = flaky
+        self.assertFalse(await self.compute._exists('disk', name))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        calls.clear()
+        async def broken(argv):
+            calls.append(list(argv))
+            return crash
+        self.compute.execute = broken
+        with self.assertRaisesRegex(ComputeError, 'read transport failed'):
+            await self.compute._exists('disk', name)
+        self.assertEqual(len(calls), 3)
+        calls.clear()
+        with self.assertRaises(ComputeError):
+            await self.compute._call(['compute', 'disks', 'delete', name, '--zone=us-central1-a'])
+        self.assertEqual(len(calls), 1)
+
     async def test_guest_disk_source_mismatch_is_not_retried(self):
         await self.make_vm()
         name = self.state['instances'][0]['name']
