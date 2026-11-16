@@ -548,7 +548,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G29R', 'G29G', 'G30R', 'G30S', 'G30W', 'G30V', 'G31W', 'G31H', 'G31S', 'G31X', 'G31G', 'G32W', 'G32H', 'G32S', 'G32N', 'G33W', 'G33R', 'G33M', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G29R', 'G29G', 'G30R', 'G30S', 'G30W', 'G30V', 'G31W', 'G31H', 'G31S', 'G31X', 'G31G', 'G32W', 'G32H', 'G32S', 'G32N', 'G33W', 'G33R', 'G33M', 'G34W', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
