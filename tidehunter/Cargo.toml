@@ -44,6 +44,8 @@ hex = "0.4.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 # Benchmark JSONL uses the same vetted version without adding a native runtime edge.
 serde_json = "1.0.140"
+# Fixed-size benchmark runtime multiplexes logical callers; same locked Tokio.
+tokio = { version = "1.36.0", features = ["rt-multi-thread", "sync", "time"] }
 
 [features]
 experimental-fabric = ["experimental-distributed", "tidehunter-fabric/native", "dep:serde_json"]
@@ -104,6 +106,10 @@ required-features = ["test-utils"]
 name = "index_insert_benchmarks"
 harness = false
 required-features = ["test-utils"]
+
+[[bench]]
+name = "admission_options"
+harness = false
 
 [lints.clippy]
 len_without_is_empty = "allow"
