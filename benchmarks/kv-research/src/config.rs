@@ -451,10 +451,10 @@ impl RunConfig {
         }
         if !matches!(
             self.dataset.value_size,
-            64 | 256 | 1024 | 4096 | 8192 | 16_384 | 65_536
+            64 | 256 | 512 | 1024 | 4096 | 8192 | 16_384 | 65_536
         ) {
             return invalid(
-                "dataset.value_size must be 64, 256, 1024, 4096, 8192, 16384, or 65536 bytes",
+                "dataset.value_size must be 64, 256, 512, 1024, 4096, 8192, 16384, or 65536 bytes",
             );
         }
         if self.backend.kind == "tidehunter" {
@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn admits_only_value_sizes_and_tidehunter_batch_limits_that_fit() {
         let mut config = config();
-        for size in [64, 4096, 16_384, 65_536] {
+        for size in [64, 512, 4096, 16_384, 65_536] {
             config.dataset.value_size = size;
             config.limits.max_bytes = config.dataset.keys * size as u64;
             assert!(config.validate().is_ok(), "value size {size}");
