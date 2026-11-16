@@ -2035,8 +2035,11 @@ impl Client {
         Ok(completions)
     }
     fn progress_correlated(&mut self) -> Result<(), TcpError> {
+        self.progress_correlated_at(Instant::now())
+    }
+
+    pub(super) fn progress_correlated_at(&mut self, now: Instant) -> Result<(), TcpError> {
         self.ensure_connection()?;
-        let now = Instant::now();
         if self
             .reactor
             .appends
@@ -2452,7 +2455,7 @@ impl Client {
             return Err(TcpError::new("control exchange already active"));
         }
         let id = self.reactor.allocate_id()?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + request.timeout(self.timeout);
         let size_began = profile.as_ref().map(|_| Instant::now());
         let queue_size = self.stream.queue_size(id, request, self.frame_limit)?;
         let size_ns = size_began.map_or(0, elapsed_ns);
@@ -2944,7 +2947,8 @@ pub(super) fn serve_session(
                     if let Some(profile) = diagnostics.as_mut() {
                         profile.request_decode_ns += began.map_or(0, elapsed_ns);
                     }
-                    (envelope, frame_bytes, Instant::now() + limits.io_timeout)
+                    let timeout = envelope.body.timeout(limits.io_timeout);
+                    (envelope, frame_bytes, Instant::now() + timeout)
                 };
                 if envelope.protocol != PROTOCOL || envelope.id <= last_id {
                     return Err(TcpError::new(

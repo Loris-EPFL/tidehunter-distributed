@@ -6020,7 +6020,7 @@ impl ClientWorker {
                             break;
                         }
                         let deadline = *checkpoint_admission_deadline
-                            .get_or_insert_with(|| client.checkpoint_deadline());
+                            .get_or_insert_with(|| client.position_deadline());
                         match client
                             .submit_checkpoint_position(*authority, *epoch, *through, deadline)
                         {

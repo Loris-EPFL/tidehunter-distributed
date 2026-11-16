@@ -1206,6 +1206,12 @@ async fn open_for(
         },
         "coordinator_path": coordinator_path
     });
+    effective_configuration["client"]["lifecycle_timeout_ms"] = serde_json::json!(
+        remote_config
+            .timeout
+            .max(tidehunter::distributed::tcp::LIFECYCLE_TIMEOUT)
+            .as_millis()
+    );
     effective_configuration["live_leased_write_window"] = serde_json::json!(
         remote_config
             .live_nvme
