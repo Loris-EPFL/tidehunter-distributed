@@ -302,7 +302,7 @@ fn wal_replay_retires_sealed_file_only_after_complete_image() {
 fn wal_replay_checkpoint_timeline_has_control_without_receipt_io() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
-    db.write_timeline.arm(1).unwrap();
+    db.write_timeline.arm(1, 1).unwrap();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();

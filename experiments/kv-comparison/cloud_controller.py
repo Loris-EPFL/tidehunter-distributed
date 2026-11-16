@@ -127,7 +127,7 @@ def logical_owner_hosts(config, job):
 
 
 def case_owner_job(config, case):
-    if config.get("spec", {}).get("selection") in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+    if config.get("spec", {}).get("selection") in cloud_campaign.M3_SELECTIONS:
         job = cloud_campaign._m3_cases().get(case, {})
         if job and cloud_campaign.job_owner_hosts(job) == len(config["fleet"]["nodes"]):
             return job
@@ -148,7 +148,7 @@ def owner_host_index(config, job, index):
 def controller_matrix(spec):
     if spec.get("mode") == "focused":
         jobs = cloud_campaign.make_focused_matrix(spec["selection"])
-        if spec["selection"] in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5') and "owner_hosts" in spec:
+        if spec["selection"] in cloud_campaign.M3_SELECTIONS and "owner_hosts" in spec:
             jobs = [job for job in jobs if cloud_campaign.job_owner_hosts(job) == spec["owner_hosts"]]
         return jobs
     return cloud_campaign.make_matrix(spec)
@@ -3785,7 +3785,7 @@ class Controller:
                 "durability_tier": tier,
                 "external_owner_durability_receipts": receipt_paths,
                 "external_owner_read_config": json.loads((prepared / "external_owner_read_config.json").read_text())}
-        if job.get("selection", "").startswith("nvmeof_m3_"):
+        if job.get("selection") in cloud_campaign.M3_SELECTIONS:
             self.admit_logical_owners(job, directory, options)
         return options
 

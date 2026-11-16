@@ -220,7 +220,7 @@ pub struct MeasurementGateConfig {
     pub timeout_seconds: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     /// Maximum write operations to sample in the measured phase. Zero disables profiling.
@@ -229,12 +229,31 @@ pub struct DiagnosticsConfig {
     /// Maximum measurement-phase mutations with request-linked timelines; zero disables.
     #[serde(default)]
     pub write_timeline_limit: usize,
+    /// Retain every Nth mutation across the measurement; one retains a prefix.
+    #[serde(default = "default_write_timeline_sample_every")]
+    pub write_timeline_sample_every: usize,
     /// Maximum remote read requests to sample in the measured phase. Zero disables profiling.
     #[serde(default)]
     pub read_profile_limit: usize,
     /// Maximum retained Valkey owner-pipeline timing records; zero disables.
     #[serde(default)]
     pub valkey_profile_limit: usize,
+}
+
+fn default_write_timeline_sample_every() -> usize {
+    1
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            write_profile_limit: 0,
+            write_timeline_limit: 0,
+            write_timeline_sample_every: 1,
+            read_profile_limit: 0,
+            valkey_profile_limit: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -378,6 +397,11 @@ impl RunConfig {
         if self.diagnostics.write_timeline_limit > 65_536 {
             return invalid("diagnostics.write_timeline_limit must not exceed 65536");
         }
+        if !(1..=1_000_000).contains(&self.diagnostics.write_timeline_sample_every) {
+            return invalid(
+                "diagnostics.write_timeline_sample_every must be between 1 and 1000000",
+            );
+        }
         if self.diagnostics.write_timeline_limit > 0 && self.backend.kind != "tidehunter" {
             return invalid("diagnostics.write_timeline_limit is only supported by tidehunter");
         }
@@ -427,10 +451,10 @@ impl RunConfig {
         }
         if !matches!(
             self.dataset.value_size,
-            64 | 256 | 1024 | 4096 | 8192 | 16_384 | 65_536
+            64 | 256 | 512 | 1024 | 4096 | 8192 | 16_384 | 65_536
         ) {
             return invalid(
-                "dataset.value_size must be 64, 256, 1024, 4096, 8192, 16384, or 65536 bytes",
+                "dataset.value_size must be 64, 256, 512, 1024, 4096, 8192, 16384, or 65536 bytes",
             );
         }
         if self.backend.kind == "tidehunter" {
@@ -1123,7 +1147,7 @@ mod tests {
     #[test]
     fn admits_only_value_sizes_and_tidehunter_batch_limits_that_fit() {
         let mut config = config();
-        for size in [64, 4096, 16_384, 65_536] {
+        for size in [64, 512, 4096, 16_384, 65_536] {
             config.dataset.value_size = size;
             config.limits.max_bytes = config.dataset.keys * size as u64;
             assert!(config.validate().is_ok(), "value size {size}");
@@ -1190,6 +1214,16 @@ mod tests {
     fn write_timeline_requires_tidehunter_and_is_bounded_independently() {
         let mut config = config();
         assert_eq!(config.diagnostics.write_timeline_limit, 0);
+        assert_eq!(config.diagnostics.write_timeline_sample_every, 1);
+        assert_eq!(
+            serde_json::from_str::<DiagnosticsConfig>("{}")
+                .unwrap()
+                .write_timeline_sample_every,
+            1
+        );
+        config.diagnostics.write_timeline_sample_every = 0;
+        assert!(config.validate().is_err());
+        config.diagnostics.write_timeline_sample_every = 1;
         config.diagnostics.write_timeline_limit = 1;
         assert!(config.validate().is_err());
         config.backend.kind = "tidehunter".to_owned();

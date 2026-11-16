@@ -93,8 +93,14 @@ impl RemoteDatabase {
     }
 
     pub(super) fn start_checkpoint(&mut self) -> Result<(), LocalDbError> {
+        let block_started = self.write_timeline.block_started();
         let _poison = concurrent::FailureOnPanic(self.concurrent_failure.clone());
         let result = self.start_checkpoint_with_floor(None);
+        self.write_timeline.block_finished(
+            super::super::write_timeline::WriteBlockStage::Checkpoint,
+            block_started,
+            self.submissions.len(),
+        );
         if result.is_err() {
             self.healthy = false;
             self.concurrent_failure
@@ -1007,6 +1013,7 @@ impl RemoteDatabase {
             return Ok(());
         }
         let started = Instant::now();
+        let block_started = self.write_timeline.block_started();
         let _poison = concurrent::FailureOnPanic(self.concurrent_failure.clone());
         let result = (|| {
             if !self.progress_capture(wait)? {
@@ -1200,6 +1207,11 @@ impl RemoteDatabase {
                 "checkpoint exceeded its two-phase progress bound",
             ))
         })();
+        self.write_timeline.block_finished(
+            super::super::write_timeline::WriteBlockStage::Checkpoint,
+            block_started,
+            self.submissions.len(),
+        );
         self.write_stats.checkpoint_ns += elapsed(started);
         if let Err(error) = &result {
             record_first_failure(
@@ -1501,7 +1513,7 @@ mod tests {
         let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
         let mut db = fixture.open();
         assert_eq!(db.config.write_profile_limit, 0);
-        db.write_timeline.arm(4).unwrap();
+        db.write_timeline.arm(4, 1).unwrap();
         db.write_batch(fixture.operation(0, 1), vec![put(1)])
             .unwrap();
         db.flush_index().unwrap();
@@ -1629,7 +1641,7 @@ mod tests {
         let batches = db.checkpoint_tail_batches;
         let bytes = db.checkpoint_tail_bytes;
         let floor = db.index.retention_floor();
-        db.write_timeline.arm(4).unwrap();
+        db.write_timeline.arm(4, 1).unwrap();
         db.checkpoint_interruption = Some(5);
         assert!(db.flush_index().is_err());
         let generation = db.snapshot_generation;

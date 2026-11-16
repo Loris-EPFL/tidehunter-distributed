@@ -1292,7 +1292,7 @@ fn timeline_links_real_tls_wal_receipt_and_keeps_running_after_cap() {
     let fixture = Fixture::new().synchronous();
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     let trace = &db.write_timeline;
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let operation = fixture.operation(1, 901);
     let sample = trace.begin(17).unwrap();
     trace.operation(sample, operation);
@@ -1385,7 +1385,7 @@ fn timeline_links_real_tls_wal_receipt_and_keeps_running_after_cap() {
 fn wait_metrics_reconcile_concurrent_tcp_puts_beyond_timeline_limit() {
     let fixture = Fixture::new().synchronous();
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let gate = std::sync::Barrier::new(4);
     std::thread::scope(|scope| {
         for worker in 0..4 {
@@ -1435,7 +1435,7 @@ fn timeline_preserves_validation_error_without_inventing_batch() {
     let fixture = Fixture::new();
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     let trace = &db.write_timeline;
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let operation = fixture.operation(1, 903);
     let sample = trace.begin(19).unwrap();
     trace.operation(sample, operation);
@@ -1459,7 +1459,7 @@ fn sui_traced_write_exports_correlated_owner_record() {
         fixture.config.clone(),
     )
     .unwrap();
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let mut batch = db.write_batch();
     batch.write(db.ks("root"), 911u32.to_be_bytes().to_vec(), vec![3u8; 32]);
     batch.commit_traced(42).unwrap();
@@ -1495,14 +1495,14 @@ fn sui_timeline_finish_deadline_does_not_wait_for_shared_gate() {
         fixture.config.clone(),
     )
     .unwrap();
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     let guard = db.shared_write_gate_for_test();
     assert!(
         db.finish_write_timeline_until(Instant::now() + Duration::from_millis(20))
             .is_err()
     );
     drop(guard);
-    db.arm_write_timeline(1).unwrap();
+    db.arm_write_timeline(1, 1).unwrap();
     db.finish_write_timeline_until(Instant::now() + Duration::from_secs(5))
         .unwrap();
     db.wait_for_background_threads_to_finish().unwrap();
@@ -1804,7 +1804,7 @@ fn concurrent_scalar_window_duplicate_identity_admits_once() {
 fn concurrent_scalar_window_does_not_move_writes_across_barrier() {
     let fixture = scalar_window_fixture(8);
     let (db, resume) = paused_owner(fixture.open());
-    db.write_timeline.arm(2).unwrap();
+    db.write_timeline.arm(2, 1).unwrap();
     let before = enqueue_window_write(&db, fixture.operation(0, 1), vec![large_put(1)]);
     let (sender, barrier) = mpsc::sync_channel(1);
     assert!(
@@ -1849,6 +1849,252 @@ fn concurrent_scalar_window_does_not_move_writes_across_barrier() {
     db.shutdown().unwrap();
 }
 
+fn fifo_admission(requests: usize, bytes: usize) -> Arc<Admission> {
+    Arc::new(Admission {
+        budget: Mutex::new(WriteBudget::default()),
+        #[cfg(all(target_os = "linux", feature = "test-utils"))]
+        drained: parking_lot::Condvar::new(),
+        max_requests: requests,
+        max_bytes: bytes,
+        first_failure: Arc::new(std::sync::OnceLock::new()),
+        authority: AuthorityCounters::default(),
+        timeline: Arc::new(WriteTimeline::default()),
+    })
+}
+
+fn await_waiters(admission: &Admission, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while admission.budget.lock().waiters.len() != expected {
+        assert!(Instant::now() < deadline, "admission waiters did not queue");
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn fifo_admission_heterogeneous_head_blocks_smaller_reservations() {
+    let admission = fifo_admission(4, 10);
+    let mut budget = admission.budget.lock();
+    Admission::charge(&mut budget, 8);
+    let first = admission.enqueue(&mut budget, 5);
+    let second = admission.enqueue(&mut budget, 2);
+    let third = admission.enqueue(&mut budget, 1);
+    assert!(admission.grant_waiters(&mut budget).is_empty());
+    assert_eq!(budget.bytes, 8);
+    assert_eq!(budget.waiters.len(), 3);
+    // Make the existing credit available, then inspect actual grant order. The
+    // caller guards below cancel the unclaimed grants and return their credits.
+    budget.requests -= 1;
+    budget.bytes -= 8;
+    let granted = admission.grant_waiters(&mut budget);
+    assert_eq!(granted.len(), 3);
+    assert!(Arc::ptr_eq(&granted[0], &first.waiter));
+    assert!(Arc::ptr_eq(&granted[1], &second.waiter));
+    assert!(Arc::ptr_eq(&granted[2], &third.waiter));
+    assert_eq!((budget.requests, budget.bytes), (3, 8));
+    drop(budget);
+    wake_granted(granted);
+    drop((first, second, third));
+    let budget = admission.budget.lock();
+    assert_eq!(
+        (budget.requests, budget.bytes, budget.live_waiters),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn fifo_admission_cancelled_head_does_not_strand_eligible_waiter() {
+    let admission = fifo_admission(4, 10);
+    let credit = admission.reserve(8, || Ok(())).unwrap();
+    let mut budget = admission.budget.lock();
+    let first = admission.enqueue(&mut budget, 5);
+    let second = admission.enqueue(&mut budget, 2);
+    drop(budget);
+    drop(first);
+    assert_eq!(second.waiter.state.load(Ordering::Acquire), WAITER_GRANTED);
+    assert_eq!(admission.budget.lock().bytes, 10);
+    drop(second);
+    drop(credit);
+    assert_eq!(admission.budget.lock().bytes, 0);
+}
+
+#[test]
+fn fifo_admission_cancelled_grant_hands_exact_credit_to_successor() {
+    let admission = fifo_admission(1, 8);
+    let credit = admission.reserve(8, || Ok(())).unwrap();
+    let mut budget = admission.budget.lock();
+    let first = admission.enqueue(&mut budget, 7);
+    let second = admission.enqueue(&mut budget, 3);
+    drop(budget);
+    drop(credit);
+    assert_eq!(first.waiter.state.load(Ordering::Acquire), WAITER_GRANTED);
+    assert_eq!(second.waiter.state.load(Ordering::Acquire), WAITER_QUEUED);
+    // Cancellation between grant and claim (including unwinding) must transfer
+    // the reserved bytes, not merely remove the caller's queue node.
+    drop(first);
+    assert_eq!(second.waiter.state.load(Ordering::Acquire), WAITER_GRANTED);
+    assert_eq!(admission.budget.lock().bytes, 3);
+    drop(second);
+    let budget = admission.budget.lock();
+    assert_eq!(
+        (budget.requests, budget.bytes, budget.live_waiters),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn fifo_admission_close_wakes_every_blocked_caller() {
+    let admission = fifo_admission(1, 8);
+    let credit = admission.reserve(8, || Ok(())).unwrap();
+    let (finished, received) = mpsc::sync_channel(8);
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let admission = admission.clone();
+            let finished = finished.clone();
+            thread::spawn(move || {
+                finished
+                    .send(admission.reserve(1, || Ok(())).is_err())
+                    .unwrap();
+            })
+        })
+        .collect();
+    await_waiters(&admission, 8);
+    admission.close();
+    for _ in 0..8 {
+        assert!(received.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    drop(credit);
+    let budget = admission.budget.lock();
+    assert!(budget.waiters.is_empty());
+    assert_eq!(
+        (budget.requests, budget.bytes, budget.live_waiters),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn fifo_admission_concurrent_reserve_release_has_no_lost_wakeup() {
+    let admission = fifo_admission(2, 7);
+    let start = Arc::new(std::sync::Barrier::new(9));
+    let (finished, received) = mpsc::sync_channel(8);
+    let threads: Vec<_> = (0..8)
+        .map(|writer| {
+            let admission = admission.clone();
+            let start = start.clone();
+            let finished = finished.clone();
+            thread::spawn(move || {
+                start.wait();
+                for index in 0..256 {
+                    let bytes = (writer + index) % 7 + 1;
+                    let credit = admission.reserve(bytes, || Ok(())).unwrap();
+                    {
+                        let budget = admission.budget.lock();
+                        assert!(budget.requests <= 2 && budget.bytes <= 7);
+                        assert!(budget.waiters.len() <= budget.live_waiters);
+                    }
+                    thread::yield_now();
+                    drop(credit);
+                }
+                finished.send(()).unwrap();
+            })
+        })
+        .collect();
+    start.wait();
+    for _ in 0..8 {
+        if received.recv_timeout(Duration::from_secs(10)).is_err() {
+            admission.close();
+            panic!("bounded admission stress lost a wakeup");
+        }
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let budget = admission.budget.lock();
+    assert!(budget.waiters.is_empty());
+    assert_eq!(
+        (budget.requests, budget.bytes, budget.live_waiters),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn fifo_admission_serves_blocked_callers_in_order() {
+    let admission = fifo_admission(1, 8);
+    let credit = admission.reserve(8, || Ok(())).unwrap();
+    let (finished, received) = mpsc::sync_channel(3);
+    let mut releases = Vec::new();
+    let mut threads = Vec::new();
+    for (index, bytes) in [7, 3, 1].into_iter().enumerate() {
+        let thread_admission = admission.clone();
+        let finished = finished.clone();
+        let (release, released) = mpsc::sync_channel(1);
+        releases.push(release);
+        threads.push(thread::spawn(move || {
+            let credit = thread_admission.reserve(bytes, || Ok(())).unwrap();
+            finished.send(index).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(credit);
+        }));
+        await_waiters(&admission, index + 1);
+    }
+    drop(credit);
+    for (index, release) in releases.into_iter().enumerate() {
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            index
+        );
+        release.send(()).unwrap();
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let budget = admission.budget.lock();
+    assert_eq!(
+        (budget.requests, budget.bytes, budget.live_waiters),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn fifo_admission_failed_claim_returns_grant_and_wakes_successor() {
+    let admission = fifo_admission(1, 8);
+    let credit = admission.reserve(8, || Ok(())).unwrap();
+    let (finished, received) = mpsc::sync_channel(2);
+    let first_admission = admission.clone();
+    let first_finished = finished.clone();
+    let first = thread::spawn(move || {
+        let checks = AtomicU64::new(0);
+        let result = first_admission.reserve(7, || {
+            if checks.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(())
+            } else {
+                Err(LocalDbError::new("cancelled before claiming credit"))
+            }
+        });
+        first_finished.send(result.is_err()).unwrap();
+    });
+    await_waiters(&admission, 1);
+    let second_admission = admission.clone();
+    let second = thread::spawn(move || {
+        let credit = second_admission.reserve(3, || Ok(())).unwrap();
+        drop(credit);
+        finished.send(true).unwrap();
+    });
+    await_waiters(&admission, 2);
+    drop(credit);
+    for _ in 0..2 {
+        assert!(received.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    first.join().unwrap();
+    second.join().unwrap();
+    let budget = admission.budget.lock();
+    assert_eq!(
+        (budget.requests, budget.bytes, budget.live_waiters),
+        (0, 0, 0)
+    );
+}
 #[test]
 fn concurrent_scalar_window_all_invalid_releases_budget_and_keeps_owner_healthy() {
     let mut fixture = scalar_window_fixture(8);

@@ -44,7 +44,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
-M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5")
+M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put")
 M3_OWNER_ADMISSION_TIMEOUT_SECONDS = 95
 M3_OWNER_ADMISSION_MARGIN_SECONDS = 5
 NVMEOF_PATH_SELECTIONS += M3_SELECTIONS
@@ -259,15 +259,21 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
         raise ValueError("full campaign requires all three offered rates without duplicates")
     diagnostics = spec.get("diagnostics", {})
     if (not isinstance(diagnostics, dict)
-            or set(diagnostics) - {"write_profile_limit", "read_profile_limit", "write_timeline_limit", "valkey_profile_limit"}
+            or set(diagnostics) - {"write_profile_limit", "read_profile_limit", "write_timeline_limit", "write_timeline_sample_every", "valkey_profile_limit"}
             or ("diagnostics" in spec and not diagnostics)
             or any(type(value) is not int or not 0 <= value <= 65536
-                   for value in diagnostics.values())):
+                   for key, value in diagnostics.items() if key != "write_timeline_sample_every")):
         raise ValueError("diagnostics limits must be integers between 0 and 65536")
+    stride = diagnostics.get("write_timeline_sample_every", 1)
+    if type(stride) is not int or not 1 <= stride <= 1_000_000:
+        raise ValueError("write_timeline_sample_every must be an integer between 1 and 1000000")
+    stride_option = ({"write_timeline_sample_every": stride}
+                     if "write_timeline_sample_every" in diagnostics else {})
     diagnostics = {"write_profile_limit": diagnostics.get("write_profile_limit", 0),
                    "read_profile_limit": diagnostics.get("read_profile_limit", 0),
                    "write_timeline_limit": diagnostics.get("write_timeline_limit", 0),
                    "valkey_profile_limit": diagnostics.get("valkey_profile_limit", 0)}
+    diagnostics.update(stride_option)
     if spec.get("shapes") == "contract_core":
         if spec.get("mode", "standard") not in ("standard", "standard-with-nvmeof", "standard-with-live-nvmeof"):
             raise ValueError("contract_core requires a standard campaign")
@@ -453,7 +459,9 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     if diagnostics["write_timeline_limit"]:
         jobs.extend(job | {"cohort": "write_timeline_diagnostics",
                            "diagnostics": {"write_profile_limit": 0,
-                                           "write_timeline_limit": diagnostics["write_timeline_limit"]}}
+                                           "write_timeline_limit": diagnostics["write_timeline_limit"],
+                                           **({"write_timeline_sample_every": diagnostics["write_timeline_sample_every"]}
+                                              if "write_timeline_sample_every" in diagnostics else {})}}
                     for job in list(jobs) if job["backend"] in TRANSPORTS
                     and job["cohort"] == "primary_rf1"
                     and job["value_size"] == 1024 and job["profile"] == "write-concurrent")
@@ -615,7 +623,9 @@ def make_nvmeof_matrix(spec, backends, diagnostics):
         jobs.extend(job | {"cohort": "write_timeline_diagnostics",
                            "profile": job["profile"].replace("-baseline", "-timeline"),
                            "diagnostics": {"write_profile_limit": 0,
-                                           "write_timeline_limit": diagnostics["write_timeline_limit"]}}
+                                           "write_timeline_limit": diagnostics["write_timeline_limit"],
+                                           **({"write_timeline_sample_every": diagnostics["write_timeline_sample_every"]}
+                                              if "write_timeline_sample_every" in diagnostics else {})}}
                     for job in writes if job["backend"] in TRANSPORTS
                     and ((job["value_size"] == 1024 and job["profile"] == "write-c16-baseline")
                          or (job["value_size"] == 8192 and job["profile"] == "write-batch32-c16-baseline")))
@@ -738,6 +748,7 @@ FOCUSED_COUNTS["nvmeof_f6"] = 42
 FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
+FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -792,6 +803,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_m3_t1": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_m3_t2_2": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_m3_t2_5": {"G33W": 3, "G33R": 4, "G33M": 1},
+    "nvmeof_p9_small_put": {"G34W": 7},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -805,7 +817,7 @@ _FOCUSED_GROUP_COUNTS = {
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
-        return dict(zip(M3_SELECTIONS, (1, 2, 5)))[selection]
+        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5)))[selection]
     return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
 
 
@@ -2027,10 +2039,49 @@ def _m3_source():
                 and job["value_size"] == 1024 and job["concurrency"] == 64
                 and "live_leased_sync" not in job and job["repeat"] == 0)
 
+def _nvmeof_p9_small_put():
+    """Seven matched small-put cells; 6100s including the 720s cleanup margin."""
+    source, result = _m3_source(), []
+    cells = [(size, concurrency, 0) for concurrency in (16, 64, 256)
+             for size in (512, 1024)] + [(1024, 256, 1)]
+    for size, concurrency, repeat in cells:
+        measurement = 262144 if concurrency == 256 else 524288
+        warmup = 131072 if concurrency == 16 else 65536
+        # C3 measured78.1k/s and C8 measured17.3k/s. The c64 and512B
+        # floor is a conservative planning assumption, not a measured rate.
+        rate = 65536 if concurrency == 16 else 16384
+        expected = (4096 + warmup + measurement) / rate + 28
+        sizing = {
+            "source": "checkpoint-work/research/T25-ANALYSIS-2026-11-16.md#2-cpu-queues-device-traffic-and-write-stages",
+            "source_concurrency": 16 if concurrency == 16 else 256,
+            "rate_calls_per_second": rate,
+            "rate_scope": "conservative C3/C8 planning floor;512B and c64 unmeasured",
+            "measurement_seconds": measurement / rate,
+            "warmup_seconds": warmup / rate,
+            "measurement_operations": measurement,
+            "warmup_operations": warmup,
+            "expected_case_seconds": expected,
+            "case_deadline_seconds": max(180, math.ceil(6 * expected)),
+            "expected_archive_bytes": (4096 + measurement + warmup) * 256 + 8 * 1024**2,
+            "archive_model": "256B per row plus8MiB bounded timeline and non-sample evidence",
+        }
+        _clone_job(result, "nvmeof_p9_small_put", source, "G34W",
+                   profile=f"G34W-put-c{concurrency}-separate-o5",
+                   case_kind="remote_put", owner_count=5, owner_topology="separate",
+                   value_size=size, concurrency=concurrency, repeat=repeat,
+                   durability_tier="synchronous", coordinator_cache_bytes=0, mix=mix(put=100),
+                   measurement_operations=measurement, warmup_operations=warmup,
+                   measurement_sizing=sizing, thread_cpu_sampling=True,
+                   execution={"queue_capacity": max(128, concurrency)},
+                   diagnostics={"write_timeline_limit": 2048,
+                                "write_timeline_sample_every": measurement // 2048})
+    return result
+
+
 
 @functools.cache
 def _m3_cases():
-    return {job["case_id"]: job for job in _nvmeof_m3_owners()}
+    return {job["case_id"]: job for job in _nvmeof_m3_owners() + _nvmeof_p9_small_put()}
 
 
 def _nvmeof_m3_owners():
@@ -2253,7 +2304,7 @@ def _valkey_rdma_reads():
 def make_focused_matrix(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
-    if selection in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+    if selection in M3_SELECTIONS:
         return copy.deepcopy([job for job in _m3_cases().values() if job["selection"] == selection])
     if selection == "valkey_rdma_reads":
         return _valkey_rdma_reads()
@@ -2913,7 +2964,7 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
             ["F8 default arm did not run the engine default"] if f8_default else [])}
     start = data.get("start") or {}
     end = data.get("end") or {}
-    if job.get("selection") in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
+    if job.get("selection") in M3_SELECTIONS:
         partitions = {str(i) for i in range(active_owner_count(job))}
         for boundary in (data.get("start"), data.get("end"), data.get("deltas")):
             owner = (boundary or {}).get("owner_executor") or {}

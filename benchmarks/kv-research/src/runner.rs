@@ -227,7 +227,10 @@ pub async fn run<B: KvBackend>(
             reporter.snapshot()?;
         }
         if fatal_reason.is_none() && config.diagnostics.write_timeline_limit > 0 {
-            match backend.arm_write_timeline(config.diagnostics.write_timeline_limit) {
+            match backend.arm_write_timeline(
+                config.diagnostics.write_timeline_limit,
+                config.diagnostics.write_timeline_sample_every,
+            ) {
                 Ok(()) => timeline_armed = true,
                 Err(error) => {
                     failed = true;
@@ -2407,7 +2410,8 @@ async fn run_interference_phase<B: KvBackend>(
                 }
                 let work = generator.interference_item(Some(result.put.offered))?;
                 let profile = is_profile_candidate("measurement", OperationKind::Put, profile_selected, config.diagnostics.write_profile_limit);
-                let timeline = is_timeline_candidate("measurement", OperationKind::Put, timeline_selected, config.diagnostics.write_timeline_limit);
+                let timeline = is_timeline_candidate("measurement", OperationKind::Put, timeline_selected,
+                    config.diagnostics.write_timeline_limit.saturating_mul(config.diagnostics.write_timeline_sample_every));
                 // Keep caller ids distinct across both pools.
                 let caller_id = measured_caller_id(config, "measurement", OperationKind::Put, timeline, config.phases.measurement_operations + puts.next_id);
                 reporter.offered("measurement", "put", 1);
@@ -2802,7 +2806,10 @@ async fn run_client_phase(
                     phase,
                     work.operation,
                     timeline_selected,
-                    config.diagnostics.write_timeline_limit,
+                    config
+                        .diagnostics
+                        .write_timeline_limit
+                        .saturating_mul(config.diagnostics.write_timeline_sample_every),
                 );
                 let caller_id =
                     measured_caller_id(config, phase, work.operation, timeline, pool.next_id);
@@ -2889,7 +2896,10 @@ async fn run_client_phase(
                     phase,
                     work.operation,
                     timeline_selected,
-                    config.diagnostics.write_timeline_limit,
+                    config
+                        .diagnostics
+                        .write_timeline_limit
+                        .saturating_mul(config.diagnostics.write_timeline_sample_every),
                 );
                 let caller_id =
                     measured_caller_id(config, phase, work.operation, timeline, pool.next_id);
@@ -4849,8 +4859,9 @@ mod tests {
             self.inner.info()
         }
 
-        fn arm_write_timeline(&self, limit: usize) -> BackendResult<()> {
+        fn arm_write_timeline(&self, limit: usize, sample_every: usize) -> BackendResult<()> {
             assert!(limit > 0);
+            assert!(sample_every > 0);
             let mut state = self.state.lock().unwrap();
             assert!(!state.armed);
             state.armed = true;
