@@ -454,14 +454,14 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch):
                 raise TargetError("generated kernel owner identity differs from requested fixture")
             node.mkdir(mode=0o700, parents=True)
             Path(target["state_dir"]).mkdir(mode=0o700)
-            for tls in (remote["tls"], launch["tls"]):
+            for tls, tls_root in ((remote["tls"], guest), (launch["tls"], node)):
                 for name in ("ca", "cert", "key"):
                     if not tls.get(name):
                         continue
                     dest = Path(tls[name])
-                    if dest.parent != guest / "tls" or not re.fullmatch(r"[A-Za-z0-9_.-]+", dest.name):
+                    if dest.parent != tls_root / "tls" or not re.fullmatch(r"[A-Za-z0-9_.-]+", dest.name):
                         raise TargetError("TLS path outside fixture")
-                    source = prepared / "tls" / dest.name
+                    source = prepared / dest.relative_to(guest)
                     data = source.read_bytes()
                     if source.is_symlink() or not data or len(data) > 65536:
                         raise TargetError("invalid TLS source")

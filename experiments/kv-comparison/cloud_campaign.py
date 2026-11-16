@@ -791,7 +791,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_f8": {"G32W": 16, "G32H": 8, "G32S": 4, "G32N": 8},
     "nvmeof_m3_t1": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_m3_t2_2": {"G33W": 3, "G33R": 4, "G33M": 1},
-    "nvmeof_m3_t2_5": {"G33W": 4, "G33R": 3, "G33M": 1},
+    "nvmeof_m3_t2_5": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -2073,7 +2073,7 @@ def _nvmeof_m3_owners():
             if job["concurrency"] == 256:
                 return operation == "put" and job["value_size"] == 1024
             if job["concurrency"] == 16 and job["repeat"] == 1:
-                return operation != "put" and job["value_size"] != 65536
+                return False
         return True
     retained_jobs = [job for job in result if retained(job)]
     # Include the 720s campaign/cleanup margin. Keep all o16 cells, the write
@@ -2090,8 +2090,8 @@ def _nvmeof_m3_owners():
             if job["concurrency"] == 64 and (job["mix"]["read"] == 50
                     or job["mix"]["put"] == 100 and job["value_size"] == 1024):
                 continue
-            if (job["concurrency"] == 16 and job["mix"]["read"] == 100
-                    and job["value_size"] == 1024):
+            if (job["concurrency"] == 64 and job["mix"]["put"] == 100
+                    and job["value_size"] == 65536):
                 continue
         # Size only retained cells; the superseded full grid must not shorten
         # the surviving low-rate reads to five-second windows.
@@ -2131,6 +2131,13 @@ def _nvmeof_m3_owners():
                        diagnostics={"read_profile_limit": 1024}, measurement_sizing=sizing,
                        measurement_operations=sizing["measurement_operations"],
                        warmup_operations=sizing["warmup_operations"])
+    # Match the four historical Valkey c16 workloads before diagnostic probes.
+    matched = sorted((job for job in result if job["selection"] == "nvmeof_m3_t2_5"),
+        key=lambda job: (0 if job["concurrency"] == 16 and job["mix"]["read"] == 100 else
+                         1 if job["concurrency"] == 16 and job["mix"]["put"] == 100 else
+                         2 if job["concurrency"] == 16 else 3,
+                         job["concurrency"], job["value_size"], job["coordinator_cache_bytes"]))
+    result = [job for job in result if job["selection"] != "nvmeof_m3_t2_5"] + matched
     for selection in M3_SELECTIONS:
         if sum(job["measurement_sizing"]["expected_archive_bytes"]
                for job in result if job["selection"] == selection) > 3_000_000_000:

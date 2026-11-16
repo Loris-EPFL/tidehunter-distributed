@@ -2608,6 +2608,25 @@ mod tests {
                 let storage = &launch["node"]["partition"];
                 assert_eq!(storage["fragment_bytes"].as_u64(), Some(fragment_bytes));
                 assert_eq!(storage["wal_file_bytes"].as_u64(), Some(wal_file_bytes));
+                for (field, name) in [
+                    ("ca", "ca.der".to_owned()),
+                    ("cert", format!("tidehunter-node-{partition}.der")),
+                    ("key", format!("tidehunter-node-{partition}.pk8")),
+                ] {
+                    assert_eq!(
+                        launch["tls"][field].as_str(),
+                        root.join(format!("guest/node-{partition}/tls/{name}"))
+                            .to_str()
+                    );
+                    assert!(
+                        output
+                            .join(format!("node-{partition}/tls/{name}"))
+                            .is_file()
+                    );
+                    if field != "ca" {
+                        assert!(!output.join("tls").join(&name).exists());
+                    }
+                }
             }
         }
         fs::remove_dir_all(root).unwrap();

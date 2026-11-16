@@ -199,20 +199,20 @@ def kv_case_policy(cfg, spec):
     case_root = Path(arguments['--guest-case-root'])
     transport = transport_for_case(spec['transport'])
     owner_transports = select_transports(transport, None, len(cfg['nodes']))
-    def tls(identity, server_name, selected):
+    def tls(tls_root, identity, server_name, selected):
         base = dict(transport=selected, server_name=server_name)
         if is_trusted(selected):
             return base | dict(ca='', cert='', key='')
-        return base | dict(ca=str(case_root / 'tls/ca.der'),
-                    cert=str(case_root / 'tls' / (identity + '.der')),
-                    key=str(case_root / 'tls' / (identity + '.pk8')))
+        return base | dict(ca=str(tls_root / 'tls/ca.der'),
+                    cert=str(tls_root / 'tls' / (identity + '.der')),
+                    key=str(tls_root / 'tls' / (identity + '.pk8')))
     remote = dict(
         storage=common_partition | dict(database=[42] * 16, partitions=partitions,
             max_batches_per_partition=resident, max_epochs=4),
         endpoints=[dict(partition=node['partition'], address=node['private_ip'] + ':7700',
                         server_name=f"tidehunter-node-{node['partition']}")
                    for node in sorted(cfg['nodes'], key=lambda node: node['partition'])],
-        tls=tls('tidehunter-authority', 'unused-client-template', transport),
+        tls=tls(case_root, 'tidehunter-authority', 'unused-client-template', transport),
         timeout=dict(secs=10, nanos=0),
         max_admitted_batches=lifetime, max_index_bytes=128 * 1024**2,
         max_pending_batches=128, max_pending_bytes=64 * 1024**2, pipelined_writes=True,
@@ -237,7 +237,7 @@ def kv_case_policy(cfg, spec):
                 read_resident_first=arguments['--tcp-resident-first'] == 'true',
                 read_memory_allowance_bytes=512 * 1024**2, read_max_inflight_requests=32,
                 read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128),
-            tls=tls(f'tidehunter-node-{partition}', f'tidehunter-node-{partition}', owner_transports[owner_index]),
+            tls=tls(node_root, f'tidehunter-node-{partition}', f'tidehunter-node-{partition}', owner_transports[owner_index]),
             limits=dict(max_frame_bytes=16 * 1024**2, max_connections=16, max_reads=256,
                         recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0),
                         polling=arguments['--tcp-polling']),
@@ -603,7 +603,7 @@ def node_action(payload):
                 download(s3, cfg, artifact['key'], artifact['sha256'], staged)
                 case.parent.mkdir(exist_ok=True)
                 case.mkdir(mode=0o700)
-                safe_extract(staged, case, 2 * 1024 * 1024)
+                safe_extract(staged, node_dir, 2 * 1024 * 1024)
             binary = root / 'cloud-bin' / payload['build'] / 'sharded_wal_bench'
             if sha(binary) != payload['binary_sha256']:
                 raise ValueError('node executable differs from campaign build')
@@ -1298,11 +1298,12 @@ class Campaign:
             part = node['partition']
             archive = self.root / (case_id + f'-node-{part}.tar.gz')
             with tarfile.open(archive, 'w:gz') as stream:
-                names = [f'node-{part}/launch.yaml']
+                files = {'launch.yaml': case_root / f'node-{part}/launch.yaml'}
                 if transport != 'efa-native':
-                    names += ['tls/ca.der', f'tls/tidehunter-node-{part}.der', f'tls/tidehunter-node-{part}.pk8']
-                for name in names:
-                    stream.add(case_root / name, arcname=name, recursive=False)
+                    for name in ('ca.der', f'tidehunter-node-{part}.der', f'tidehunter-node-{part}.pk8'):
+                        files['tls/' + name] = case_root / f'node-{part}/tls' / name
+                for name, source in files.items():
+                    stream.add(source, arcname=name, recursive=False)
             node_archives[str(part)] = upload(self.s3, archive, self.cfg,
                         f"{self.cfg['s3_prefix']}/case-artifacts/{case_id}/node-{part}.tar.gz")
         payload = {'config': self.cfg, 'case_id': case_id, 'action': 'start', 'build': label,

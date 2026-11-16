@@ -170,7 +170,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_f8': '30e7121a926003ebe18e691425db063c4093a942efdf5528913003720b9d5e1a',
                     'nvmeof_m3_t1': 'df343feef5fc4568d44e98f28ad1486f5882e559ac23d935ea6a4ac4b5a5ac21',
                     'nvmeof_m3_t2_2': '115bc93da0f8bca91cd1c5c09214e9ef5c4d91153f940218f7fef0cf0fff548a',
-                    'nvmeof_m3_t2_5': '92e704fe9d8a8faf0eb7e1f89f59ca1d2a09598186acfec7bcc98f73c7d19930',
+                    'nvmeof_m3_t2_5': '9ec5b0dcf21131e3e4c1296862561a2660389b30aed0cbac18f548cc18cbf094',
                     'nvmeof_f7_highmem32': '25ef27bc334edc0d07a84061427893063e162f16f8f1a986ea99d758ca2c05dd',
                     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
                     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',

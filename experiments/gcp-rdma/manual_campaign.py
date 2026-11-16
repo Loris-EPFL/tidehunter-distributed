@@ -199,7 +199,7 @@ REVIEWED_SPECS['nvmeof_f7_highmem32'].update(
 M3_MATRIX_BINDINGS = {
     1: ("nvmeof_m3_t1", 8, "df343feef5fc4568d44e98f28ad1486f5882e559ac23d935ea6a4ac4b5a5ac21"),
     2: ("nvmeof_m3_t2_2", 8, "115bc93da0f8bca91cd1c5c09214e9ef5c4d91153f940218f7fef0cf0fff548a"),
-    5: ("nvmeof_m3_t2_5", 8, "92e704fe9d8a8faf0eb7e1f89f59ca1d2a09598186acfec7bcc98f73c7d19930"),
+    5: ("nvmeof_m3_t2_5", 8, "9ec5b0dcf21131e3e4c1296862561a2660389b30aed0cbac18f548cc18cbf094"),
 }
 for owners, (selection, count, digest) in M3_MATRIX_BINDINGS.items():
     REVIEWED_SPECS[selection] = {
