@@ -58,8 +58,6 @@ jobs:
           # The workflow token avoids the Claude app token exchange, which refuses any workflow
           # that is not on the default branch; this repository keeps review workflows off main.
           github_token: ${{ github.token }}
-          # Temporary: print the API error of the failing first request; removed after diagnosis.
-          show_full_output: true
           allowed_bots: chatgpt-codex-connector
           prompt: |
             REPO: ${{ github.repository }}
