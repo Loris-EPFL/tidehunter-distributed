@@ -741,6 +741,26 @@ mod live_fencing {
     use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
     use std::os::unix::fs::FileExt;
 
+    /// Block until at most `streams` stream slots are active, or 5 s pass, and
+    /// return the queue guard so the caller asserts on that same snapshot.
+    /// `Slot::drop` decrements the count and calls `ready.notify_all()` under
+    /// the queue lock, so this predicate wait cannot miss the release. A
+    /// waiter here could absorb the `notify_one` that `try_submit` meant for a
+    /// worker; forwarding a `notify_all` on exit hands that wakeup back.
+    fn wait_active_streams_at_most(
+        node: &StorageNode,
+        streams: usize,
+    ) -> parking_lot::MutexGuard<'_, Queue> {
+        let shared = &node.control.shared;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut queue = shared.queue.lock();
+        while queue.active_appends > streams
+            && !shared.ready.wait_until(&mut queue, deadline).timed_out()
+        {}
+        shared.ready.notify_all();
+        queue
+    }
+
     // Exercise the actual WAL/control lifecycle with the existing journal-only
     // target fixture. This is not evidence of kernel namespace I/O drain.
     fn open_live(root: &std::path::Path, tier: DurabilityTier) -> (NodeConfig, Arc<StorageNode>) {
@@ -2383,6 +2403,10 @@ mod live_fencing {
             ) else {
                 panic!("expected preleased extent")
             };
+            // The lease replies can precede their slot releases (see
+            // `wait_active_streams_at_most`). Start from an idle stream count
+            // so the close/resolver count below is exact.
+            assert_eq!(wait_active_streams_at_most(&node, 0).active_appends, 0);
             let mut reference = None;
             for (sequence, extent) in [(0, &first.extent), (1, &next.extent)] {
                 let group = CompleteGroup::new_live(
@@ -2470,8 +2494,14 @@ mod live_fencing {
                 Response::LiveAdopted(_)
             ));
             {
-                let queue = node.control.shared.queue.lock();
+                // `run` sends a command's completion before that worker's
+                // `Slot` binding drops, so the close reply alone does not
+                // order the close slot's release before this read. Wait for
+                // the release event itself; the paused resolver keeps one
+                // slot, so the exact count below is still the contract.
+                let queue = wait_active_streams_at_most(&node, 1);
                 assert_eq!(queue.active_appends, 1);
+                assert!(!queue.control_active);
                 assert!(queue.work.iter().any(|work| work.id == 3));
             }
             drop(log);
