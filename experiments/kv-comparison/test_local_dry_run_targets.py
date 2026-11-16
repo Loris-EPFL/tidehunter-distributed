@@ -1,8 +1,9 @@
 """Contract tests only; no hardware or target processes are started."""
+import errno
 import tempfile
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import local_dry_run_targets as targets
 
@@ -163,6 +164,67 @@ class TargetsContractTests(unittest.TestCase):
                 targets._kernel_live_worker(self.root, self.root / 'missing-binary',
                                             'rdma', 120, 0)
         self.assertEqual(set(self.root.iterdir()), before)
+
+
+class KernelPortsContractTests(unittest.TestCase):
+    def sockets(self):
+        sockets = [MagicMock() for _ in range(3)]
+        for candidate in sockets:
+            candidate.__enter__.return_value = candidate
+        sockets[0].getsockname.return_value = ("127.0.0.1", 41000)
+        sockets[1].getsockname.return_value = ("10.99.0.2", 42000)
+        return sockets
+
+    def test_consecutive_pair_and_distinct_control_are_bind_checked(self):
+        sockets = self.sockets()
+        with patch.object(targets.socket, "socket", side_effect=sockets):
+            control, service, commissioning = targets._kernel_live_ports(
+                "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1")
+        self.assertEqual((control, service, commissioning), (41000, 42000, 42001))
+        self.assertNotIn(control, (service, commissioning))
+        sockets[0].bind.assert_called_once_with(("127.0.0.1", 0))
+        sockets[1].bind.assert_called_once_with(("10.99.0.2", 0))
+        sockets[2].bind.assert_called_once_with(("127.0.0.1", service + 1))
+        for candidate in sockets:
+            candidate.__exit__.assert_called_once()
+
+    def test_pair_collision_exhausts_bounded_attempts_and_closes_sockets(self):
+        sockets = self.sockets()
+        sockets[2].bind.side_effect = OSError(errno.EADDRINUSE, "port busy")
+        with patch.object(targets.socket, "socket", side_effect=sockets * 32) as factory:
+            with self.assertRaisesRegex(targets.TargetError, "after 32 attempts"):
+                targets._kernel_live_ports(
+                    "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1")
+        self.assertEqual(factory.call_count, 96)
+        for candidate in sockets:
+            self.assertEqual(candidate.__exit__.call_count, 32)
+
+    def test_loopback_only_commissioning_listener_is_detected(self):
+        real_socket = targets.socket.socket
+        with real_socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            busy_port = listener.getsockname()[1]
+            sockets = self.sockets()
+            sockets[0].getsockname.return_value = ("127.0.0.1", 1)
+            sockets[1].getsockname.return_value = ("10.99.0.2", busy_port - 1)
+            commissioning_sockets = []
+
+            def candidates():
+                for _ in range(32):
+                    yield sockets[0]
+                    yield sockets[1]
+                    candidate = real_socket()
+                    commissioning_sockets.append(candidate)
+                    yield candidate
+
+            with patch.object(targets.socket, "socket", side_effect=candidates()) as factory:
+                with self.assertRaisesRegex(targets.TargetError, "after 32 attempts"):
+                    targets._kernel_live_ports(
+                        "10.99.0.2", commissioning_address="127.0.0.1",
+                        control_address="127.0.0.1")
+            self.assertEqual(factory.call_count, 96)
+            self.assertTrue(all(candidate.fileno() == -1 for candidate in commissioning_sockets))
 
 
 if __name__ == '__main__':
