@@ -916,9 +916,9 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                 campaign_deadline = build_runtime.call_args.kwargs['campaign_deadline_utc']
                 expiry = manual.campaign.parse_time(state['deadline']).timestamp()
                 campaign_end = manual.campaign.parse_time(campaign_deadline).timestamp()
-                self.assertEqual(campaign_end, expiry - 120)
+                self.assertEqual(campaign_end, expiry - manual.CAMPAIGN_MARGIN_SECONDS)
                 self.assertEqual(campaign_end - manual.REVIEWED_SPEC['export_reserve_seconds'],
-                                 expiry - 120 - 900)
+                                 expiry - manual.CAMPAIGN_MARGIN_SECONDS - 900)
                 self.assertNotIn('campaign_submitted', state)
                 self.assertFalse(any('/mailbox/' in key for key in store.objects))
 

@@ -293,7 +293,7 @@ class FocusedAdmissionTest(unittest.TestCase):
         self.assertEqual(spec['case_deadline_seconds'], 600)
         self.assertEqual(spec['export_reserve_seconds'], 900)
         self.assertEqual(manual.FLEET_SECONDS - manual.CAMPAIGN_MARGIN_SECONDS -
-                         manual.EXPORT_RESERVE_SECONDS - spec['case_deadline_seconds'], 19980)
+                         manual.EXPORT_RESERVE_SECONDS - spec['case_deadline_seconds'], 19380)
 
     def test_append_floors_planning_estimate_fits_fleet_and_reserve(self):
         spec = manual.REVIEWED_SPECS['append_floors']

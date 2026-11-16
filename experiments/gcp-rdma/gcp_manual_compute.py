@@ -21,6 +21,9 @@ ZONE = 'us-central1-a'
 REGION = 'us-central1'
 PROJECT = 'mysten-research'
 MCP_CALL_SECONDS = 30
+# F7 attempts 4/5: at most 146.140965 s from delete to observed absence.
+# Allow 153.859035 s margin; the whole cleanup remains bounded by 600 s.
+DELETE_CALL_SECONDS = 300
 READ_ATTEMPTS = 3
 CLEANUP_SECONDS = 600
 CREATE_ABSENCE_ROUNDS = 3
@@ -184,7 +187,7 @@ class Compute:
         if parse_time(self.state['deadline']) <= dt.datetime.now(dt.timezone.utc):
             raise ComputeError('absolute deadline already passed')
 
-    async def _call(self, argv, *, guest=False, read_only=False, deadline=None, allow_empty=False, creation=False):
+    async def _call(self, argv, *, guest=False, read_only=False, deadline=None, allow_empty=False, creation=False, timeout=None):
         args = argv + ['--project=' + PROJECT, '--quiet', '--format=json', '--verbosity=error']
         if guest:
             args.append('--impersonate-service-account=' + GUEST_SERVICE_ACCOUNT)
@@ -198,7 +201,7 @@ class Compute:
             if remaining <= 0:
                 raise ComputeError('MCP call deadline exhausted')
             try:
-                response = await asyncio.wait_for(self.execute(args), timeout=min(MCP_CALL_SECONDS, remaining))
+                response = await asyncio.wait_for(self.execute(args), timeout=min(MCP_CALL_SECONDS if timeout is None else timeout, remaining))
             except (TimeoutError, subprocess.TimeoutExpired) as exc:
                 if not read_only or attempt + 1 == READ_ATTEMPTS:
                     raise ComputeError('MCP call timed out; outcome may be unknown') from exc
@@ -250,7 +253,8 @@ class Compute:
         error = None
         try:
             flags = ['--no-graceful-shutdown'] if kind == 'instance' else []
-            await self._call(prefix + ['delete', name, location] + flags, allow_empty=True)
+            await self._call(prefix + ['delete', name, location] + flags,
+                             allow_empty=True, timeout=DELETE_CALL_SECONDS)
         except ComputeError as exc:
             # MCP may combine JSON with stderr even when deletion took effect.
             # Preserve uncertainty; exact scoped absence, not this reply, proves cleanup.
