@@ -101,7 +101,7 @@ impl ReplayConfig {
         }
         ensure(
             self.execution.mode == ExecutionMode::ClosedLoop
-                && self.execution.client_shards == 1
+                && matches!(self.execution.client_shards, None | Some(1))
                 && self.execution.offered_ops_per_second.is_none(),
             "replay requires closed_loop, client_shards=1, no offered rate",
         )?;
@@ -1353,6 +1353,7 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         "failed"
     };
     let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:info.configuration.clone(),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
+        execution:serde_json::json!({"effective_client_shards":1}),
         phase_counts:serde_json::json!({"scope":SCOPE,"profile":metrics,"preload_ns":preload_ns,"counts":m.counts,"error":result.as_ref().err().map(ToString::to_string),"resources":resources,"sustained_30s_qualified":result.is_ok() && unresolved_workers==0 && elapsed.as_secs_f64()>=30.0,"run_status":run_status,"unknown_outcomes":unknown_outcomes,"unresolved_workers":unresolved_workers,"shutdown_contract":"join completed callers; after deadline plus grace detach only unresolved calls, under external process supervision; no cancellation or rollback"}),
         distributions:reporter.distribution_summaries(),limitations:vec![SCOPE.into(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
     reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":SCOPE,"config":config,"trace_manifest":trace.manifest,"profile":metrics}))?;

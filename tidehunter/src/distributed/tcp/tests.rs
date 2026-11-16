@@ -183,6 +183,22 @@ pub(super) fn config(root: &Path) -> NodeConfig {
 }
 
 #[test]
+fn read_workers_default_to_parallelism_and_validate_bounds() {
+    let mut serialized = serde_json::to_value(config(Path::new("/unused"))).unwrap();
+    serialized.as_object_mut().unwrap().remove("read_workers");
+    let mut config: NodeConfig = serde_json::from_value(serialized).unwrap();
+    assert_eq!(config.read_workers, crate::parallelism::available());
+    for workers in [1, 1024] {
+        config.read_workers = workers;
+        config.validate().unwrap();
+    }
+    for workers in [0, 1025] {
+        config.read_workers = workers;
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
 fn static_node_validation_opens_no_runtime_resources() {
     let temp = tempdir::TempDir::new("static-node-config").unwrap();
     let mut config = config(&temp.path().join("absent-node-root"));

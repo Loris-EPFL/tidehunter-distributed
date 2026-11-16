@@ -59,6 +59,25 @@ def deadline():
 
 
 class SelectedBackendRuntimeTests(unittest.TestCase):
+    def test_controller_cpu_quotas_match_machine_parallelism(self):
+        import cloud_package
+        import manual_campaign
+        manifest = dict(revision='b'*40, source_sha256='a'*64,
+                        binary_sha256='c'*64, binary_blake2b512='d'*128,
+                        build_profile='focused', features=cloud_package.FOCUSED_FEATURES,
+                        files={'source/experiments/kv-comparison/nvme_campaign_owner.py': {}})
+        for cpus in (16, 32):
+            config = dict(package_root='/package', package={'source_revision': 'b'*40},
+                          source_sha256='a'*64, spec=manual_campaign.REVIEWED_SPECS['nvmeof_f7_highmem32'],
+                          fleet=fleet()[:2], run_id='bench-'+'1'*16,
+                          machine_type=f'z4m-highmem-{cpus}', bucket='bucket',
+                          project_number='1', deadline_utc=deadline())
+            with self.subTest(cpus=cpus), \
+                    patch.object(Path, 'read_text', return_value=json.dumps(manifest)):
+                controller = runtime._controller_config(config)
+            self.assertEqual(controller['fleet']['client_cpus'], cpus)
+            self.assertEqual(controller['fleet']['server_cpus'], cpus)
+
     def test_focused_package_profile_is_selection_specific(self):
         for selection, expected, rejected in (
                 ('valkey_rdma_reads', 'focused_valkey', 'focused'),

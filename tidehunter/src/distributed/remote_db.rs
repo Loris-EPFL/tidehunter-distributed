@@ -438,7 +438,7 @@ pub struct RemoteDatabaseConfig {
 }
 
 fn default_read_lanes() -> usize {
-    2
+    crate::parallelism::available()
 }
 fn default_max_pending_reads() -> usize {
     256
@@ -645,7 +645,7 @@ impl RemoteDatabaseConfig {
                 .read_cache_bytes
                 .checked_add(self.max_pending_read_bytes)
                 .is_none_or(|bytes| bytes > self.read_memory_allowance_bytes)
-            || !(1..=8).contains(&self.read_lanes)
+            || !(1..=1024).contains(&self.read_lanes)
             || self.max_pending_reads == 0
             || self.write_profile_limit > 65_536
             || !(ReadService::MIN_FLIGHT_BYTES..=256 * 1024 * 1024)
@@ -5135,37 +5135,39 @@ fn elapsed(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
-/// At most eight independent endpoint operations at once. Scoped ownership
-/// joins every started operation on errors/panics before any caller lock drops.
+/// Bound independent endpoint operations by the available CPU parallelism.
+/// Scoped ownership joins every started operation on errors/panics.
 fn endpoint_map<T: Send, R: Send>(
     items: &mut [T],
     operation: impl Fn(usize, &mut T) -> Result<R, LocalDbError> + Sync,
 ) -> Result<Vec<R>, LocalDbError> {
     let mut output = Vec::with_capacity(items.len());
-    for (wave, chunk) in items.chunks_mut(8).enumerate() {
+    let parallelism = crate::parallelism::available();
+    for (wave, chunk) in items.chunks_mut(parallelism).enumerate() {
         let results = thread::scope(|scope| {
             let operation = &operation;
-            let mut handles: [Option<thread::ScopedJoinHandle<'_, Result<R, LocalDbError>>>; 8] =
-                std::array::from_fn(|_| None);
-            let mut results = std::array::from_fn::<_, 8, _>(|_| None);
+            let mut handles = Vec::with_capacity(chunk.len());
+            let mut results = Vec::with_capacity(chunk.len());
             for (slot, item) in chunk.iter_mut().enumerate() {
                 match thread::Builder::new()
-                    .spawn_scoped(scope, move || operation(wave * 8 + slot, item))
+                    .spawn_scoped(scope, move || operation(wave * parallelism + slot, item))
                 {
-                    Ok(handle) => handles[slot] = Some(handle),
+                    Ok(handle) => {
+                        handles.push(handle);
+                        results.push(None);
+                    }
                     Err(error) => {
-                        results[slot] = Some(Err(LocalDbError::component(error)));
+                        results.push(Some(Err(LocalDbError::component(error))));
                         break;
                     }
                 }
             }
             for (slot, handle) in handles.into_iter().enumerate() {
-                if let Some(handle) = handle {
-                    results[slot] =
-                        Some(handle.join().unwrap_or_else(|_| {
-                            Err(LocalDbError::new("endpoint worker panicked"))
-                        }));
-                }
+                results[slot] = Some(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(LocalDbError::new("endpoint worker panicked"))),
+                );
             }
             results
         });

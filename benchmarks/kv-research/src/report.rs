@@ -197,6 +197,7 @@ pub struct RunSummary {
     pub started_unix_seconds: f64,
     pub finished_unix_seconds: f64,
     pub backend: BackendInfo,
+    pub execution: serde_json::Value,
     pub phase_counts: serde_json::Value,
     pub distributions: serde_json::Value,
     pub limitations: Vec<String>,

@@ -127,7 +127,6 @@ fn entry() -> BackendResult<()> {
         let output = output.ok_or("--output is required")?;
         install_replay_panic_hook(&output);
         return tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
             .enable_all()
             .build()?
             .block_on(kv_research::mainnet_replay::run(config, &output));
@@ -150,7 +149,6 @@ fn entry() -> BackendResult<()> {
     }
     let output = output.ok_or("--output is required")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
         .enable_all()
         .build()?;
     runtime.block_on(async move {

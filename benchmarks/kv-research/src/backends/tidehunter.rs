@@ -217,7 +217,10 @@ struct ExternalPreparationInput {
     #[serde(default = "default_coordinator_read_memory_allowance_bytes")]
     coordinator_read_memory_allowance_bytes: usize,
     #[serde(default)]
+    read_lanes: Option<usize>,
+    #[serde(default)]
     pin_read_lanes: bool,
+    #[serde(default = "tidehunter::parallelism::available")]
     owner_read_workers: usize,
     owner_wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     owner_read_memory_allowance_bytes: usize,
@@ -331,8 +334,17 @@ impl Drop for ExternalPreparationStaging {
 
 /// Generate external node launch files with the exact engine harness schema.
 // Keep emitted owner budgets beside their admission checks to prevent drift.
-#[allow(clippy::too_many_lines)]
 pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<()> {
+    prepare_external_case_with_parallelism(input, output, tidehunter::parallelism::available())
+}
+
+// Inject only the default lane count so preparation tests do not depend on the host CPU quota.
+#[allow(clippy::too_many_lines)]
+fn prepare_external_case_with_parallelism(
+    input: &Path,
+    output: &Path,
+    parallelism: usize,
+) -> BackendResult<()> {
     let input: ExternalPreparationInput = serde_json::from_slice(&fs::read(input)?)?;
     if input.replay_node_db_id.is_some_and(|id| id > 2) {
         return Err("replay_node_db_id must be 0, 1 or 2".into());
@@ -511,6 +523,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     remote.history_persistence = input.history_persistence;
     remote.preparation_workers = 8;
     remote.pin_read_lanes = input.pin_read_lanes;
+    remote.read_lanes = input.read_lanes.unwrap_or(parallelism);
     remote.read_cache_bytes = input.coordinator_cache_bytes;
     remote.read_memory_allowance_bytes = input.coordinator_read_memory_allowance_bytes;
     if let Some(live) = &input.live_nvmeof {
@@ -1052,7 +1065,7 @@ async fn open_with_shape(
                     .map(|partition| {
                         serde_json::json!({
                             "partition": partition,
-                            "read_workers": 2,
+                            "read_workers": tidehunter::parallelism::available(),
                             "wal_member_read": "async",
                             "read_resident_first": options.owner_read_resident_first,
                             "read_memory_allowance_bytes": 512 * 1024 * 1024,
@@ -1072,7 +1085,7 @@ async fn open_with_shape(
                 128 * 1024 * 1024,
                 None,
                 transport.clone(),
-                2,
+                tidehunter::parallelism::available(),
                 tidehunter::distributed::storage::WalMemberReadPolicy::Async,
                 512 * 1024 * 1024,
                 PollingPolicy::Adaptive,
@@ -2567,7 +2580,7 @@ mod tests {
                 "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
                 "transport": {"kind": "tcp"}, "max_batches_per_partition": 16384,
                 "max_admitted_batches": 16384, "max_index_bytes": 536870912,
-                "coordinator_cache_bytes": 0, "owner_read_workers": 4,
+                "coordinator_cache_bytes": 0,
                 "owner_wal_member_read": "async", "owner_read_memory_allowance_bytes": 268435456,
                 "polling": "adaptive"
             });
@@ -2585,6 +2598,10 @@ mod tests {
             let launch: serde_yaml::Value =
                 serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap())
                     .unwrap();
+            assert_eq!(
+                launch["node"]["read_workers"].as_u64(),
+                Some(tidehunter::parallelism::available() as u64)
+            );
             assert_eq!(
                 launch["history_persistence"].as_str(),
                 Some(mode.unwrap_or("on_disk"))
@@ -2926,11 +2943,12 @@ mod tests {
             });
             write_input(&config);
             let output = root.join("live");
-            prepare_external_case_file(&input, &output).unwrap();
+            prepare_external_case_with_parallelism(&input, &output, 16).unwrap();
             let remote: serde_json::Value =
                 serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
             assert_eq!(remote["live_nvme"]["write_mode"], "reserved");
             assert_eq!(remote["pin_read_lanes"], false);
+            assert_eq!(remote["read_lanes"], 16);
             assert_eq!(remote["live_nvme"]["inline_reads"], true);
             assert_eq!(remote["live_nvme"]["export_mode"], "on_demand");
             assert_eq!(remote["live_nvme"]["lease_ahead"], true);
@@ -3029,8 +3047,9 @@ mod tests {
                 serde_json::json!(["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"]);
             config["live_nvmeof"]["export_mode"] = serde_json::json!("on_demand");
             config["live_nvmeof"]["queue_geometry"] =
-                serde_json::json!({"io_queues": 2, "queue_size": 32, "poll_queues": 0});
+                serde_json::json!({"io_queues": 4, "queue_size": 32, "poll_queues": 0});
             config["pin_read_lanes"] = serde_json::json!(true);
+            config["read_lanes"] = serde_json::json!(4);
             for (mode, tier) in [
                 ("reserved", "native"),
                 ("leased", "native"),
@@ -3042,12 +3061,13 @@ mod tests {
                     config["durability_tier"] = serde_json::json!(tier);
                     write_input(&config);
                     let output = root.join(format!("live-{mode}-{tier}-{inline_reads}"));
-                    prepare_external_case_file(&input, &output).unwrap();
+                    prepare_external_case_with_parallelism(&input, &output, 16).unwrap();
                     let remote: serde_json::Value =
                         serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap())
                             .unwrap();
                     assert_eq!(remote["live_nvme"]["write_mode"], mode);
                     assert_eq!(remote["pin_read_lanes"], true);
+                    assert_eq!(remote["read_lanes"], 4);
                     assert_eq!(remote["live_nvme"]["inline_reads"], inline_reads);
                     assert_eq!(
                         remote["live_nvme"]["queue_geometry"],
@@ -3055,7 +3075,7 @@ mod tests {
                     );
                     let client: tidehunter::distributed::tcp::LiveClientConfig =
                         serde_json::from_value(remote["live_nvme"].clone()).unwrap();
-                    assert_eq!(client.queue_geometry.io_queues, 2);
+                    assert_eq!(client.queue_geometry.io_queues, 4);
                     assert_eq!(client.queue_geometry.queue_size, 32);
                     assert_eq!(client.queue_geometry.poll_queues, 0);
                     assert_eq!(

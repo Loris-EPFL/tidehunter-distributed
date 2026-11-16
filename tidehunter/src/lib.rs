@@ -29,6 +29,7 @@ mod lock;
 pub mod lookup;
 mod math;
 pub mod metrics;
+pub mod parallelism;
 mod primitives;
 #[cfg(all(target_os = "linux", feature = "test-utils"))]
 pub mod read_probe;

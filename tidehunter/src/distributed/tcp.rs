@@ -212,8 +212,8 @@ impl NodeConfig {
                 "live NVMe-oF target requires experimental-nvmeof on Linux",
             ));
         }
-        if !(1..=8).contains(&self.read_workers) {
-            return Err(TcpError::new("read_workers must be in 1..=8"));
+        if !(1..=1024).contains(&self.read_workers) {
+            return Err(TcpError::new("read_workers must be in 1..=1024"));
         }
         if self.read_resident_first
             && self.wal_member_read != super::storage::WalMemberReadPolicy::Async
@@ -231,7 +231,7 @@ impl NodeConfig {
 }
 
 fn default_read_workers() -> usize {
-    2
+    crate::parallelism::available()
 }
 fn default_async_read_policy() -> super::storage::WalMemberReadPolicy {
     super::storage::WalMemberReadPolicy::Async
