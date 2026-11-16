@@ -7,8 +7,7 @@
 #[allow(clippy::wildcard_imports)]
 // Private implementation shares its parent's internal types.
 use super::*;
-use parking_lot::Condvar;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// One authority thread writes these counters. Relaxed atomics let metric
 /// visitors sample them without a new lock; they publish no write authority.
@@ -100,10 +99,14 @@ struct WriteBudget {
     peak_requests: usize,
     peak_bytes: usize,
     closed: bool,
+    waiters: VecDeque<Arc<AdmissionWaiter>>,
+    live_waiters: usize,
 }
 struct Admission {
     budget: Mutex<WriteBudget>,
-    changed: Condvar,
+    // Cold benchmark-only quiescence wait, never used by put admission.
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    drained: parking_lot::Condvar,
     max_requests: usize,
     max_bytes: usize,
     first_failure: Arc<std::sync::OnceLock<String>>,
@@ -116,22 +119,202 @@ struct WriteCredit {
 }
 impl Drop for WriteCredit {
     fn drop(&mut self) {
-        let started = self.admission.timeline.block_started();
+        self.admission.release(self.bytes);
+    }
+}
+
+const WAITER_QUEUED: u8 = 0;
+const WAITER_GRANTED: u8 = 1;
+const WAITER_CLOSED: u8 = 2;
+
+struct AdmissionWaiter {
+    bytes: usize,
+    thread: thread::Thread,
+    state: AtomicU8,
+}
+
+/// One node per live blocked call. There is no independent producer of nodes:
+/// queue length is bounded by live blocked callers, not by admitted batch count.
+/// This guard also returns a grant if the blocked call unwinds before claiming it.
+struct WaitingReservation<'a> {
+    admission: &'a Admission,
+    waiter: Arc<AdmissionWaiter>,
+    claimed: bool,
+}
+
+impl Drop for WaitingReservation<'_> {
+    fn drop(&mut self) {
+        if self.claimed {
+            return;
+        }
         let mut budget = self.admission.budget.lock();
-        self.admission.timeline.block_finished(
+        if let Some(position) = budget
+            .waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(waiter, &self.waiter))
+        {
+            budget.waiters.remove(position);
+        } else if self.waiter.state.load(Ordering::Relaxed) == WAITER_GRANTED {
+            // The budget mutex orders grant ownership; cancellation must
+            // return both dimensions before handing them to another caller.
+            budget.requests -= 1;
+            budget.bytes -= self.waiter.bytes;
+        }
+        budget.live_waiters -= 1;
+        let granted = self.admission.grant_waiters(&mut budget);
+        drop(budget);
+        wake_granted(granted);
+    }
+}
+
+fn wake_granted(granted: SmallVec<[Arc<AdmissionWaiter>; 4]>) {
+    for waiter in granted {
+        waiter.thread.unpark();
+    }
+}
+
+impl Admission {
+    fn fits(&self, budget: &WriteBudget, bytes: usize) -> bool {
+        budget.requests < self.max_requests && bytes <= self.max_bytes - budget.bytes
+    }
+
+    fn charge(budget: &mut WriteBudget, bytes: usize) {
+        budget.requests += 1;
+        budget.bytes += bytes;
+        budget.peak_requests = budget.peak_requests.max(budget.requests);
+        budget.peak_bytes = budget.peak_bytes.max(budget.bytes);
+    }
+
+    fn grant_waiters(&self, budget: &mut WriteBudget) -> SmallVec<[Arc<AdmissionWaiter>; 4]> {
+        let mut granted = SmallVec::new();
+        // Each grant consumes a request slot, so at most max_requests can fit.
+        for _ in 0..self.max_requests {
+            if budget.closed
+                || budget
+                    .waiters
+                    .front()
+                    .is_none_or(|waiter| !self.fits(budget, waiter.bytes))
+            {
+                break;
+            }
+            let waiter = budget.waiters.pop_front().unwrap();
+            Self::charge(budget, waiter.bytes);
+            // Release publishes the exact reservation before unpark. The caller
+            // checks with Acquire, including when unpark precedes its first park.
+            waiter.state.store(WAITER_GRANTED, Ordering::Release);
+            granted.push(waiter);
+        }
+        debug_assert!(budget.waiters.len() <= budget.live_waiters);
+        #[cfg(all(target_os = "linux", feature = "test-utils"))]
+        if budget.requests == 0 {
+            self.drained.notify_all();
+        }
+        granted
+    }
+
+    fn enqueue<'a>(&'a self, budget: &mut WriteBudget, bytes: usize) -> WaitingReservation<'a> {
+        let waiter = Arc::new(AdmissionWaiter {
+            bytes,
+            thread: thread::current(),
+            state: AtomicU8::new(WAITER_QUEUED),
+        });
+        budget.live_waiters += 1;
+        budget.waiters.push_back(waiter.clone());
+        debug_assert!(budget.waiters.len() <= budget.live_waiters);
+        WaitingReservation {
+            admission: self,
+            waiter,
+            claimed: false,
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+        healthy: impl Fn() -> Result<(), LocalDbError>,
+    ) -> Result<WriteCredit, LocalDbError> {
+        if bytes > self.max_bytes {
+            return Err(LocalDbError::new("write exceeds admission byte budget"));
+        }
+        let mut budget = self.budget.lock();
+        healthy()?;
+        if budget.closed {
+            return Err(self.closed_error());
+        }
+        if budget.waiters.is_empty() && self.fits(&budget, bytes) {
+            // No allocation on uncontended admission. New arrivals never bypass
+            // a queued larger reservation even if their own bytes would fit.
+            Self::charge(&mut budget, bytes);
+            return Ok(WriteCredit {
+                admission: self.clone(),
+                bytes,
+            });
+        }
+        let mut waiting = self.enqueue(&mut budget, bytes);
+        drop(budget);
+        loop {
+            match waiting.waiter.state.load(Ordering::Acquire) {
+                WAITER_GRANTED => {
+                    healthy()?;
+                    let mut budget = self.budget.lock();
+                    if budget.closed {
+                        return Err(self.closed_error());
+                    }
+                    budget.live_waiters -= 1;
+                    debug_assert!(budget.waiters.len() <= budget.live_waiters);
+                    waiting.claimed = true;
+                    drop(budget);
+                    return Ok(WriteCredit {
+                        admission: self.clone(),
+                        bytes,
+                    });
+                }
+                WAITER_CLOSED => return Err(self.closed_error()),
+                _ => thread::park(),
+            }
+        }
+    }
+
+    fn closed_error(&self) -> LocalDbError {
+        LocalDbError::new(failure_context(
+            &self.first_failure,
+            "write authority closed",
+        ))
+    }
+
+    fn release(&self, bytes: usize) {
+        let started = self.timeline.block_started();
+        let mut budget = self.budget.lock();
+        self.timeline.block_finished(
             super::super::write_timeline::WriteBlockStage::CreditReleaseLock,
             started,
             budget.requests,
         );
         budget.requests -= 1;
-        budget.bytes -= self.bytes;
-        let started = self.admission.timeline.block_started();
-        self.admission.changed.notify_all();
-        self.admission.timeline.block_finished(
+        budget.bytes -= bytes;
+        let granted = self.grant_waiters(&mut budget);
+        drop(budget);
+        let started = self.timeline.block_started();
+        wake_granted(granted);
+        self.timeline.block_finished(
             super::super::write_timeline::WriteBlockStage::CreditNotify,
             started,
-            budget.requests,
+            0,
         );
+    }
+
+    fn close(&self) {
+        let mut budget = self.budget.lock();
+        budget.closed = true;
+        #[cfg(all(target_os = "linux", feature = "test-utils"))]
+        self.drained.notify_all();
+        let waiters = std::mem::take(&mut budget.waiters);
+        drop(budget);
+        for waiter in waiters {
+            // Release/Acquire also covers shutdown before the caller parks.
+            waiter.state.store(WAITER_CLOSED, Ordering::Release);
+            waiter.thread.unpark();
+        }
     }
 }
 
@@ -605,7 +788,8 @@ impl ConcurrentRemoteDatabase {
         db.config.pipelined_writes = true;
         let admission = Arc::new(Admission {
             budget: Mutex::new(WriteBudget::default()),
-            changed: Condvar::new(),
+            #[cfg(all(target_os = "linux", feature = "test-utils"))]
+            drained: parking_lot::Condvar::new(),
             max_requests: db.config.max_pending_batches,
             max_bytes: db.config.max_pending_bytes,
             first_failure: db.first_failure.clone(),
@@ -674,11 +858,7 @@ impl ConcurrentRemoteDatabase {
                         db.reads.poison();
                         db.healthy = false;
                     }
-                    {
-                        let mut budget = admission.budget.lock();
-                        budget.closed = true;
-                        admission.changed.notify_all();
-                    }
+                    admission.close();
                     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     let shutdown = if result.is_ok() && live_final_requested.load(Ordering::Acquire)
                     {
@@ -710,8 +890,7 @@ impl ConcurrentRemoteDatabase {
     pub(super) fn poison(&self) {
         self.failure.store(true, Ordering::Release);
         self.reads.poison();
-        let _budget = self.admission.budget.lock();
-        self.admission.changed.notify_all();
+        self.admission.close();
         let _ = self.wake.try_send(());
     }
 
@@ -960,33 +1139,7 @@ impl ConcurrentRemoteDatabase {
     }
 
     fn reserve(&self, bytes: usize) -> Result<WriteCredit, LocalDbError> {
-        if bytes > self.admission.max_bytes {
-            return Err(LocalDbError::new("write exceeds admission byte budget"));
-        }
-        let mut budget = self.admission.budget.lock();
-        loop {
-            self.ensure_healthy()?;
-            if budget.closed {
-                return Err(LocalDbError::new(failure_context(
-                    &self.first_failure,
-                    "write authority closed",
-                )));
-            }
-            if budget.requests < self.admission.max_requests
-                && bytes <= self.admission.max_bytes - budget.bytes
-            {
-                break;
-            }
-            self.admission.changed.wait(&mut budget);
-        }
-        budget.requests += 1;
-        budget.bytes += bytes;
-        budget.peak_requests = budget.peak_requests.max(budget.requests);
-        budget.peak_bytes = budget.peak_bytes.max(budget.bytes);
-        Ok(WriteCredit {
-            admission: self.admission.clone(),
-            bytes,
-        })
+        self.admission.reserve(bytes, || self.ensure_healthy())
     }
 
     /// # Errors
@@ -1171,7 +1324,7 @@ impl ConcurrentRemoteDatabase {
                     "writes did not drain before mapped-WAL eviction",
                 ));
             }
-            self.admission.changed.wait_for(&mut budget, deadline - now);
+            self.admission.drained.wait_for(&mut budget, deadline - now);
         }
         drop(budget);
         if self.config.read_cache_bytes != 0 {
