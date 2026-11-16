@@ -384,6 +384,10 @@ pub(crate) enum LivePausePoint {
     PositionAfterRoot,
     LeaseWaitingForPersistence,
     PrepareBeforePublish,
+    ColdReadBeforeSync,
+    ColdReadAfterSync,
+    ColdReadBeforePin,
+    ColdReadAfterPin,
 }
 
 #[cfg(all(test, feature = "experimental-nvmeof"))]
@@ -500,6 +504,7 @@ pub(crate) struct LiveTestDiagnostics {
     exports: Vec<LiveTestExport>,
     dropped_exports: u64,
     pub adoption: LiveTestAdoption,
+    cold_read_syncs: u64,
 }
 
 #[cfg(all(test, feature = "experimental-nvmeof"))]
@@ -4597,6 +4602,157 @@ impl PartitionLog {
             _log: self.clone(),
         })
     }
+    /// Cold leased authority is scoped to this exact record. The captured inode
+    /// and charged descriptors outlive unlocked I/O; neither adoption's round
+    /// gate nor the durable-metadata gate participates in this read barrier.
+    #[cfg(feature = "experimental-nvmeof")]
+    fn resolve_leased_record(
+        self: &Arc<Self>,
+        reference: &ValueRecordReference,
+    ) -> Result<Option<super::nvmeof::live_storage::LiveRecordLease>, StorageError> {
+        let address = reference.batch_address;
+        let captured = {
+            let state = self.state.lock();
+            self.check_cold_read_state(&state, reference)?;
+            let Some(open) = Self::record_extent(&state, address) else {
+                return Ok(None);
+            };
+            (
+                open.extent.clone(),
+                Arc::clone(&open.allocation.file),
+                state.wal_root.as_ref().map_or(0, |root| root.synced_end),
+            )
+        };
+        let (extent, file, synced_end) = captured;
+        // Do not use load_authority here: its opportunistic self-adoption can
+        // wait for a predecessor close or an adoption round unrelated to this
+        // exact batch, including a frame in the pre-leased successor.
+        let registered = match self.references.lookup(address)? {
+            Some(registered) => registered,
+            None => self.member_authority_from_file(address, &file)?,
+        };
+        registered.validate_reference(reference)?;
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::ColdReadBeforeSync);
+        if !self.serve_unsynced.load(Ordering::Acquire)
+            && registered.group_end() > self.readable_frontier()
+            && address.offset + u64::from(address.len) > synced_end
+        {
+            // The lease made the inode and its name durable before export.
+            // fdatasync covers this checked batch independently of the owner's
+            // receipt prefix. Never install this sparse proof in any frontier.
+            #[cfg(test)]
+            let result = if self.fail_persist.swap(false, Ordering::AcqRel) {
+                Err(io::Error::other("injected cold read persistence failure"))
+            } else {
+                file.sync_data()
+            };
+            #[cfg(not(test))]
+            let result = file.sync_data();
+            if let Err(error) = result {
+                self.poison_writer();
+                return Err(StorageError::Unknown(WalError::Io(error)));
+            }
+            #[cfg(test)]
+            {
+                self.state.lock().live_test_diagnostics.cold_read_syncs += 1;
+            }
+        }
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::ColdReadAfterSync);
+        {
+            let state = self.state.lock();
+            if !self.check_cold_read_extent(&state, reference, &extent)? {
+                return Ok(None);
+            }
+        }
+        let plan = RecordReadPlan {
+            member: crate::wal::WalMemberReadPlan {
+                file,
+                offset: address.offset % self.config().wal_file_bytes
+                    + 8
+                    + u64::from(reference.descriptor.offset),
+                len: reference.descriptor.len as usize,
+            },
+            device: self.device,
+            _authority: registered,
+            _log: self.clone(),
+        };
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::ColdReadBeforePin);
+        let lease = {
+            let _admission = self.read_admission()?;
+            self.live_lease(plan, address.offset)?
+        };
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::ColdReadAfterPin);
+        // Do not take state while holding read_admission: retirement takes them
+        // in the reverse order. The installed live pin now excludes retirement.
+        let state = self.state.lock();
+        if !self.check_cold_read_extent(&state, reference, &extent)? {
+            return Ok(None);
+        }
+        Ok(Some(lease))
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn record_extent(state: &State, address: PhysicalValueAddress) -> Option<&OpenLiveExtent> {
+        let end = address.offset.checked_add(u64::from(address.len))?;
+        state
+            .open_live_extent
+            .iter()
+            .chain(state.next_live_extent.iter())
+            .find(|open| address.offset >= open.extent.start && end <= open.extent.end)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn check_cold_read_state(
+        &self,
+        state: &State,
+        reference: &ValueRecordReference,
+    ) -> Result<(), StorageError> {
+        if state.poison.is_some()
+            || state.references.background_failed()
+            || self.references.failed()
+        {
+            return Err(StorageError::Poisoned);
+        }
+        if state.sealing {
+            return Err(StorageError::Invalid("live stream is sealing"));
+        }
+        if reference.batch_version.epoch != self.config().inventory.epoch {
+            return Err(StorageError::Fenced);
+        }
+        if reference.batch_address.partition != self.config().partition
+            || reference.batch_address.segment_generation
+                != self.config().inventory.segment_generation
+        {
+            return Err(StorageError::Invalid("foreign record reference"));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn check_cold_read_extent(
+        &self,
+        state: &State,
+        reference: &ValueRecordReference,
+        extent: &super::nvmeof::live_storage::LiveWriteExtent,
+    ) -> Result<bool, StorageError> {
+        self.check_cold_read_state(state, reference)?;
+        if state.sealed {
+            return Err(StorageError::Sealed);
+        }
+        match Self::record_extent(state, reference.batch_address) {
+            Some(open) if open.extent == *extent => Ok(true),
+            Some(_) => Err(StorageError::Invalid("live record extent changed")),
+            // Healthy close is the only non-lifecycle removal of an extent.
+            // Its batches are now adopted. Discard this scoped proof/pin and
+            // let the normal serving path obtain authoritative coverage; a
+            // successful close must not cause a spurious value-read failure.
+            None => Ok(false),
+        }
+    }
 
     /// Resolve a durable exact record reference to an owner-pinned file range.
     #[cfg(feature = "experimental-nvmeof")]
@@ -4604,6 +4760,11 @@ impl PartitionLog {
         self: &Arc<Self>,
         reference: &ValueRecordReference,
     ) -> Result<super::nvmeof::live_storage::LiveRecordLease, StorageError> {
+        if self.live_stream
+            && let Some(lease) = self.resolve_leased_record(reference)?
+        {
+            return Ok(lease);
+        }
         let registered = self.load_serving_record_authority(reference)?;
         let _admission = self.read_admission()?;
         let plan = self.plan_registered_record_read(reference, registered)?;

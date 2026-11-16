@@ -5648,6 +5648,40 @@ impl super::Client {
             self.live_leased.pending.is_some(),
         )
     }
+    /// Passive byte frontiers: CQ-complete, released, and synchronous-covered.
+    pub(crate) fn leased_test_completion_prefixes(&self) -> (u64, u64, Option<u64>) {
+        use crate::distributed::durability::DurabilityTier;
+        let released = self
+            .live_leased
+            .current
+            .as_ref()
+            .or(self.live_leased.closing.as_ref())
+            .map_or(0, |extent| extent.written_end);
+        let mut completed = released;
+        for flight in self
+            .live_leased
+            .flights
+            .iter()
+            .take_while(|flight| flight.completed)
+        {
+            completed = flight.end;
+        }
+        let durable = self.live_config.as_ref().and_then(|config| {
+            (config.leased_durability == Some(DurabilityTier::Synchronous)).then(|| {
+                self.live_leased
+                    .flights
+                    .iter()
+                    .take_while(|flight| {
+                        flight.completed
+                            && (flight.durable_at_completion
+                                || flight.id <= self.live_leased.flushed_through_seq)
+                    })
+                    .last()
+                    .map_or(released, |flight| flight.end)
+            })
+        });
+        (completed, released, durable)
+    }
     pub(crate) fn leased_test_ahead_state(&self) -> (bool, bool) {
         (
             self.live_leased.closing.is_some(),

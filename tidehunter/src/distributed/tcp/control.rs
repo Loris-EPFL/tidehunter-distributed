@@ -727,7 +727,8 @@ pub(super) fn is_stream_request(request: &Request) -> bool {
         | Request::CompleteLiveGroup { .. }
         | Request::LeaseLiveExtent { .. }
         | Request::PreleaseLiveExtent { .. }
-        | Request::AdoptLiveExtent { .. } => true,
+        | Request::AdoptLiveExtent { .. }
+        | Request::ResolveLiveRecords { .. } => true,
         _ => false,
     }
 }
@@ -1061,35 +1062,41 @@ fn run(shared: &Shared) {
             request => request,
         };
 
-        // Position validates the owner's completed-write frontier itself (or
-        // the leased coordinator's fixed acknowledged cut). It performs its own
-        // data barrier. Lifecycle controls still drain the ordered flush queue.
-        let (barrier_ok, barrier_wait_ns) =
-            if matches!(&request, Request::CheckpointPosition { .. }) {
-                (true, 0)
-            } else {
-                let (barrier_done, barrier_result) = mpsc::sync_channel(0);
-                let barrier_started = measured.then(Instant::now);
-                let barrier_sent = {
-                    let queue = shared.queue.lock();
-                    !queue.flush_failed
-                        && shared
-                            .flush
-                            .send(FlushCommand::Barrier(barrier_done))
-                            .is_ok()
-                };
-                let (barrier_ok, barrier_wait_ns) = if barrier_sent {
-                    let result = barrier_result.recv();
-                    let wait = barrier_started.map_or(0, elapsed_ns);
-                    if measured {
-                        profile.control_queue_ns = profile.control_queue_ns.saturating_add(wait);
-                    }
-                    (result.is_ok(), wait)
-                } else {
-                    (false, 0)
-                };
-                (barrier_ok, barrier_wait_ns)
+        // Position proofs and cold record grants establish their own covering
+        // data barriers. A grant must not join the flusher: that barrier may
+        // self-adopt an unrelated predecessor or wait for durable metadata.
+        // Lifecycle controls still drain the ordered flush queue.
+        let read_owned_barrier = match &request {
+            Request::CheckpointPosition { .. } => true,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::ResolveLiveRecords { .. } => true,
+            _ => false,
+        };
+        let (barrier_ok, barrier_wait_ns) = if read_owned_barrier {
+            (true, 0)
+        } else {
+            let (barrier_done, barrier_result) = mpsc::sync_channel(0);
+            let barrier_started = measured.then(Instant::now);
+            let barrier_sent = {
+                let queue = shared.queue.lock();
+                !queue.flush_failed
+                    && shared
+                        .flush
+                        .send(FlushCommand::Barrier(barrier_done))
+                        .is_ok()
             };
+            let (barrier_ok, barrier_wait_ns) = if barrier_sent {
+                let result = barrier_result.recv();
+                let wait = barrier_started.map_or(0, elapsed_ns);
+                if measured {
+                    profile.control_queue_ns = profile.control_queue_ns.saturating_add(wait);
+                }
+                (result.is_ok(), wait)
+            } else {
+                (false, 0)
+            };
+            (barrier_ok, barrier_wait_ns)
+        };
         if !barrier_ok {
             shared.context.poison_readers();
             {
