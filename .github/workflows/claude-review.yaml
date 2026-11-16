@@ -30,7 +30,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,6 +55,9 @@ jobs:
         uses: anthropics/claude-code-action@f3b070c88125d33dbae5653df5f143101d4ea9dc # v1.0.276
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The workflow token avoids the Claude app token exchange, which refuses any workflow
+          # that is not on the default branch; this repository keeps review workflows off main.
+          github_token: ${{ github.token }}
           allowed_bots: chatgpt-codex-connector
           prompt: |
             REPO: ${{ github.repository }}
