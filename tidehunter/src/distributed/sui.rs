@@ -696,12 +696,39 @@ impl Db {
         shape: KeyShape,
         config: RemoteDatabaseConfig,
     ) -> Result<Arc<Self>> {
+        Self::open_remote_inner(path, shape, config, |_: &mut RemoteDatabase| Ok(()))
+    }
+    /// Ordinary-file live I/O fixture only; never a hardware qualification route.
+    #[cfg(all(
+        feature = "test-utils",
+        feature = "experimental-nvmeof",
+        target_os = "linux"
+    ))]
+    pub fn open_remote_with_local_live_fixture(
+        path: &Path,
+        shape: KeyShape,
+        config: RemoteDatabaseConfig,
+        buffered: bool,
+    ) -> Result<Arc<Self>> {
+        Self::open_remote_inner(path, shape, config, |db| {
+            db.enable_local_live_fixture(buffered)
+        })
+    }
+    fn open_remote_inner(
+        path: &Path,
+        shape: KeyShape,
+        config: RemoteDatabaseConfig,
+        configure: impl FnOnce(
+            &mut RemoteDatabase,
+        ) -> std::result::Result<(), super::local_db::LocalDbError>,
+    ) -> Result<Arc<Self>> {
         let timeout = config.timeout;
         let batch_limits = config.storage.batch_limits;
         let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
         let capture_id =
             kv_capture::open(path, &shape, Some(&config.storage.database)).map_err(error)?;
         let mut db = RemoteDatabase::open(path, &shape, config, metrics).map_err(error)?;
+        configure(&mut db).map_err(error)?;
         db.configure_sui_read_cache();
         let epoch = db.epoch();
         let profile = db.read_profile_monitor();

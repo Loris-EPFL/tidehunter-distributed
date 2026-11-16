@@ -5,6 +5,7 @@ mod live_qualification;
 mod live_write_profile;
 #[cfg(all(feature = "nvmeof", target_os = "linux"))]
 mod nvmeof_campaign;
+pub mod replay;
 #[allow(clippy::too_many_lines)]
 // Its TLS setup is inherited and outside timed calls; do not restyle the shared engine helper.
 #[allow(clippy::assigning_clones)]
@@ -116,6 +117,11 @@ struct Options {
     key_count: u64,
     #[serde(default = "default_retained_batches")]
     max_batches_per_partition: usize,
+    /// Explicit complete-batch admission for table-aware checkpoint replay.
+    #[serde(default)]
+    batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
+    #[serde(default)]
+    database: Option<[u8; 16]>,
     #[serde(default)]
     owner_wal_geometry: OwnerWalGeometry,
     #[serde(default)]
@@ -186,6 +192,14 @@ struct ExternalPreparationInput {
     guest_root: PathBuf,
     addresses: Vec<String>,
     transport: Transport,
+    /// Independent owner identity and complete-batch bounds; absent retains synthetic defaults.
+    #[serde(default)]
+    database: Option<[u8; 16]>,
+    #[serde(default)]
+    batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
+    /// Pinned node DB table declarations, not the synthetic root keyspace.
+    #[serde(default)]
+    replay_node_db_id: Option<u16>,
     #[serde(default)]
     owner_transports: Option<Vec<Transport>>,
     #[serde(default)]
@@ -320,6 +334,21 @@ impl Drop for ExternalPreparationStaging {
 #[allow(clippy::too_many_lines)]
 pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<()> {
     let input: ExternalPreparationInput = serde_json::from_slice(&fs::read(input)?)?;
+    if input.replay_node_db_id.is_some_and(|id| id > 2) {
+        return Err("replay_node_db_id must be 0, 1 or 2".into());
+    }
+    if input.replay_node_db_id.is_some()
+        && (input.database.is_none() || input.batch_limits.is_none())
+    {
+        return Err("replay owner preparation requires explicit database and batch_limits".into());
+    }
+    let batch_limits = input
+        .batch_limits
+        .unwrap_or(tidehunter::distributed::codec::BatchLimits {
+            max_operations: 32,
+            max_encoded_bytes: RESEARCH_BATCH_BYTES,
+        });
+    batch_limits.validate()?;
     if !input.guest_root.is_absolute()
         || !matches!(input.addresses.len(), 1 | 2 | 4 | 5 | 16)
         || input.max_batches_per_partition == 0
@@ -405,12 +434,9 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     let owner_transports =
         select_owner_transports(&input.transport, input.owner_transports, addresses.len())?;
     let storage = LocalInventoryConfig {
-        database: [0x4b; 16],
+        database: input.database.unwrap_or([0x4b; 16]),
         partitions: (0..u32::try_from(addresses.len())?).collect(),
-        batch_limits: tidehunter::distributed::codec::BatchLimits {
-            max_operations: 32,
-            max_encoded_bytes: RESEARCH_BATCH_BYTES,
-        },
+        batch_limits,
         group_limits: tidehunter::distributed::group::GroupLimits {
             max_batches: 32,
             max_encoded_bytes: RESEARCH_FRAGMENT_BYTES - 8,
@@ -445,7 +471,10 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         fs::set_permissions(&staging.0, fs::Permissions::from_mode(0o700))?;
     }
     let prepared = staging.0.join("case");
-    let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
+    let shape = input.replay_node_db_id.map_or_else(
+        || KeyShape::new_single(32, 16, KeyType::uniform(64)),
+        |db| replay::shape(&crate::mainnet_trace::tables(), db),
+    );
     tcp_cluster::prepare_external_case_with_durability(
         &prepared,
         &input.guest_root,
@@ -693,6 +722,9 @@ pub struct TidehunterBackend {
 fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
     let options = Options::deserialize(value)?;
     let name = backend_name(&options.transport);
+    if let Some(limits) = options.batch_limits {
+        limits.validate()?;
+    }
     if let Some(limits) = options.replay_limits {
         limits
             .validate()
@@ -963,6 +995,21 @@ async fn open_for(
     value: &serde_json::Value,
     registry: &prometheus::Registry,
 ) -> BackendResult<TidehunterBackend> {
+    open_with_shape(
+        value,
+        registry,
+        KeyShape::new_single(32, 16, KeyType::uniform(64)),
+    )
+    .await
+}
+
+#[allow(clippy::unused_async)]
+#[allow(clippy::too_many_lines)]
+async fn open_with_shape(
+    value: &serde_json::Value,
+    registry: &prometheus::Registry,
+    shape: KeyShape,
+) -> BackendResult<TidehunterBackend> {
     let options = parse_options(value)?;
     let transport = options.transport;
     let evidence_path = options
@@ -970,9 +1017,6 @@ async fn open_for(
         .unwrap_or_else(|| options.path.join("evidence"));
     fs::create_dir_all(&options.path)?;
     fs::create_dir_all(&evidence_path)?;
-    // Match the native control and established adapter benchmark's bounded
-    // 16 x 64-cell geometry; dataset key_count is not cell capacity.
-    let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
     let owner_read_configuration;
     let (cluster, mut remote_config) =
         if let Some(config) = options.external_remote_config {
@@ -985,12 +1029,14 @@ async fn open_for(
             fs::create_dir_all(options.path.join("owners"))?;
             let partitions: Vec<u32> = (0..u32::try_from(options.owners)?).collect();
             let storage = LocalInventoryConfig {
-                database: [0x4b; 16],
+                database: options.database.unwrap_or([0x4b; 16]),
                 partitions,
-                batch_limits: tidehunter::distributed::codec::BatchLimits {
-                    max_operations: 32,
-                    max_encoded_bytes: RESEARCH_BATCH_BYTES,
-                },
+                batch_limits: options.batch_limits.unwrap_or(
+                    tidehunter::distributed::codec::BatchLimits {
+                        max_operations: 32,
+                        max_encoded_bytes: RESEARCH_BATCH_BYTES,
+                    },
+                ),
                 group_limits: tidehunter::distributed::group::GroupLimits {
                     max_batches: 32,
                     max_encoded_bytes: RESEARCH_FRAGMENT_BYTES - 8,
@@ -1262,6 +1308,11 @@ async fn open_for(
         "recovery_outcome": "an operation with a lost acknowledgement can be present after recovery: unknown outcome, not exactly-once",
     }));
     fs::create_dir_all(&coordinator_path)?;
+    let keyspace = shape
+        .iter_ks()
+        .next()
+        .ok_or("empty distributed key shape")?
+        .id();
     let db = sui::Db::open_remote(&coordinator_path, shape, remote_config).map_err(native_error)?;
     #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     for reader in &options.nvmeof_readers {
@@ -1341,7 +1392,6 @@ async fn open_for(
         effective_configuration["live_write"] = evidence.clone();
         effective_configuration["durability"]["live_write"] = evidence;
     }
-    let keyspace = db.ks("root");
     let operational_read_io = db.operational_read_io_monitor();
     Ok(TidehunterBackend {
         db: Some(db),
@@ -3238,3 +3288,7 @@ mod tests {
         assert!(validate_options(&options).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "tidehunter/replay_preparation_tests.rs"]
+mod replay_preparation_tests;

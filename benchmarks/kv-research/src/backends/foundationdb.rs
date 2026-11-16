@@ -23,6 +23,8 @@ use tidehunter::minibytes::Bytes;
 
 use crate::backend::{BackendInfo, BackendResult, BatchAtomicity, KvBackend};
 
+pub mod replay;
+
 static API_BOOTED: AtomicBool = AtomicBool::new(false);
 const FDB_MAX_KEY_BYTES: usize = 10_000;
 

@@ -95,6 +95,9 @@ pub struct Row {
     pub table: u16,
     pub tx: u32,
     pub key: Bytes,
+    /// Cold backend encoding; logical identity and byte accounting always use `key`.
+    pub backend_key: Bytes,
+    pub backend_owner: usize,
     pub value: Bytes,
 }
 #[derive(Clone, Debug)]
@@ -239,6 +242,8 @@ fn decode(bytes: Bytes, preload: bool, tables: &[Table]) -> BackendResult<Vec<Re
                     table,
                     tx,
                     key: bytes.slice(key_start..value_start),
+                    backend_key: bytes.slice(key_start..value_start),
+                    backend_owner: 0,
                     value: bytes.slice(value_start..end),
                 };
                 if read {

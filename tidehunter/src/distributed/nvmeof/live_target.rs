@@ -265,7 +265,7 @@ fn check_configfs() -> io::Result<()> {
 
 impl LiveTargetManager {
     /// Journal-only fixture: ordinary files do not prove kernel target I/O drain.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn open_fixture(config: LiveTargetConfig, configfs: PathBuf) -> io::Result<Self> {
         Self::open_inner(config, configfs, true, None)
     }

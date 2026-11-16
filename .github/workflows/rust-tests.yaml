@@ -181,41 +181,92 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  nvme-tcp-module-probe:
-    name: Kernel NVMe/TCP module probe (non-gating)
+  nvme-tcp-loopback:
+    name: Kernel NVMe/TCP four-owner proof (non-gating)
     runs-on: ubuntu-24.04
     continue-on-error: true
-    # Only inspect/load three kernel modules; no target, device or workload setup.
-    timeout-minutes: 2
+    # Cold native build plus the existing 600 s proof and bounded cleanup.
+    timeout-minutes: 40
+    env:
+      KERNEL_TCP_STATE: /var/lib/tidehunter-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - name: Report kernel and module availability
-        # Module load attempts need seconds, not an unbounded privileged command.
-        timeout-minutes: 1
-        shell: bash
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tidehunter_repo_ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+        with:
+          toolchain: "1.90"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.90-deps-${{ hashFiles('Cargo.lock') }}
+      - name: Prepare native and kernel TCP prerequisites
+        timeout-minutes: 15
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          bash .github/scripts/setup.sh core
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y \
+            --no-install-recommends nvme-cli python3-yaml python3-boto3
+          for module in nvmet nvmet-tcp nvme-tcp; do
+            timeout 10s sudo -n modprobe "$module"
+          done
+          mountpoint -q /sys/kernel/config || sudo mount -t configfs none /sys/kernel/config
+          sudo install -d -m 0700 "$KERNEL_TCP_STATE" "$KERNEL_TCP_STATE/libs"
+      - name: Build TCP multi-owner proof binary
+        timeout-minutes: 10
+        run: cargo +1.90 build --locked --offline -p kv-research --bin kv-research --features nvmeof
+      - name: Run existing kernel TCP admission and second-open proof
+        timeout-minutes: 13
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kernel-nvme-tcp"
+          df -B1 /var/lib /mnt "$GITHUB_WORKSPACE" | tee "$RUNNER_TEMP/kernel-nvme-tcp/disk-before.txt"
+          # TERM becomes an exception inside the maintained proof, so its finally
+          # block drains/stops exact-owned controllers, targets, namespaces and units.
+          timeout --signal=TERM --kill-after=120s 600s \
+            sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py run \
+              --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
+            2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/run.log"
+      - name: Verify exact-owned cleanup and export proof even on failure
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/kernel-nvme-tcp"
+          sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py cleanup \
+            --state "$KERNEL_TCP_STATE" > "$RUNNER_TEMP/kernel-nvme-tcp/cleanup.log" 2>&1
+          cleanup_status=$?
+          # Keep configs, limits, status and raw diagnostics, never owner DB/WAL files.
+          sudo -n find "$KERNEL_TCP_STATE" -type f \
+            \( -name '*.json' -o -name '*.log' -o -name '*.txt' -o -name '*.yaml' -o -name '*.prom' \) \
+            -exec cp --parents '{}' "$RUNNER_TEMP/kernel-nvme-tcp" \;
+          sudo -n chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/kernel-nvme-tcp"
           {
-            echo "### Kernel NVMe/TCP module probe (non-gating)"
-            echo
-            echo "Kernel: $(uname -r)"
-            echo
-            echo '```text'
-            for module in nvmet nvmet-tcp nvme-tcp; do
-              if timeout 10s sudo -n modprobe "$module"; then
-                echo "$module: modprobe succeeded"
-              else
-                echo "$module: modprobe failed (exit $?)"
-              fi
-              if [ -d "/sys/module/${module//-/_}" ]; then
-                echo "$module: present in /sys/module"
-              else
-                echo "$module: not present in /sys/module"
-              fi
-            done
-            echo '```'
-            echo
-            echo "Module availability only; no loopback, NVMe/RDMA or performance validation."
-          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "### Kernel NVMe/TCP four-owner proof (non-gating)"
+            echo "Kernel: $(uname -r); cleanup verifier exit: $cleanup_status"
+            echo "Four colocated owners; leased FUA writes, buffered kernel reads, TCP/TLS control."
+            echo "No RDMA, independent SSD, HA or performance qualification."
+            if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/proof/proof.json" ]; then
+              echo '```json'
+              cat "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/proof/proof.json"
+              echo '```'
+            else
+              echo "FAIL: proof did not produce its final receipt; inspect run/cleanup logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$cleanup_status"
+      - name: Retain kernel TCP proof and failure diagnostics
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-nvme-tcp-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kernel-nvme-tcp/
+          if-no-files-found: warn
+          retention-days: 7
 
   test:
     name: ${{ matrix.name }}
@@ -309,6 +360,24 @@ jobs:
         run: |
           cargo +1.90 test --locked --offline -p tidehunter --features experimental-nvmeof,test-utils
           cargo +1.90 test --locked --offline -p kv-research --features nvmeof,test-utils
+      - name: Gate distributed mainnet replay and public CLI
+        if: matrix.profile == 'fabric'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/distributed-mainnet"
+          python3 -B .github/scripts/distributed_mainnet_ci.py \
+            2>&1 | tee "$RUNNER_TEMP/distributed-mainnet/run.log"
+
+      - name: Retain distributed replay failures
+        if: always() && matrix.profile == 'fabric'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distributed-mainnet-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/distributed-mainnet/
+          if-no-files-found: warn
+          retention-days: 7
+
 
       - name: Run comparison and deployment harnesses
         if: matrix.profile == 'harness'

@@ -8,11 +8,19 @@ use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use std::time::Instant;
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(all(
+    any(test, feature = "test-utils"),
+    feature = "experimental-nvmeof",
+    target_os = "linux"
+))]
 static BENCH_LOCAL_BUFFERED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(all(
+    any(test, feature = "test-utils"),
+    feature = "experimental-nvmeof",
+    target_os = "linux"
+))]
 fn bench_open_local_file(
     path: &std::path::Path,
     bytes: u64,
@@ -852,8 +860,29 @@ impl super::Client {
                         .ok_or_else(|| super::TcpError::new("live NVMe is not configured"))?
                         .host_nqn;
                     let setup_timing = timed(LiveTimingStage::NamespaceSetup);
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-utils"))]
                     if self.live_write_local_fixture {
+                        if self
+                            .live_config
+                            .as_ref()
+                            .is_some_and(|c| c.export_mode == super::LiveExportMode::OnDemand)
+                        {
+                            pool.cache_local_namespace(
+                                &target,
+                                host_nqn,
+                                host_id,
+                                LiveNamespaceAccess::ReadWrite,
+                                &reserved.reservation.segment.path,
+                            )
+                        } else {
+                            pool.cache_local_shared_namespace(
+                                &target,
+                                host_nqn,
+                                host_id,
+                                &reserved.reservation.segment.path,
+                            )
+                        }
+                        .map_err(super::TcpError::component)?;
                         let namespace = bench_open_local_file(
                             &reserved.reservation.segment.path,
                             binding.bytes,
@@ -872,12 +901,13 @@ impl super::Client {
                             .map_err(super::TcpError::component)?,
                             _lease: None,
                             failed_accounting: None,
+                            #[cfg(test)]
                             drain_pause: None,
                         });
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-utils"))]
                     let needs_controller = !self.live_write_local_fixture;
-                    #[cfg(not(test))]
+                    #[cfg(not(any(test, feature = "test-utils")))]
                     let needs_controller = true;
                     if needs_controller {
                         let (lease, acquisition) = pool
@@ -1909,8 +1939,27 @@ impl super::Client {
             spdk: binding.spdk.clone(),
             geometry: config.queue_geometry,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if self.live_write_local_fixture {
+            if let Some(pool) = &self.live_pool {
+                if config.export_mode == super::LiveExportMode::OnDemand {
+                    pool.cache_local_namespace(
+                        &target,
+                        &config.host_nqn,
+                        config.host_id,
+                        LiveNamespaceAccess::ReadWrite,
+                        &leased.extent.segment.path,
+                    )
+                } else {
+                    pool.cache_local_shared_namespace(
+                        &target,
+                        &config.host_nqn,
+                        config.host_id,
+                        &leased.extent.segment.path,
+                    )
+                }
+                .map_err(super::TcpError::component)?;
+            }
             let namespace = bench_open_local_file(
                 &leased.extent.segment.path,
                 binding.bytes,
@@ -1930,6 +1979,7 @@ impl super::Client {
                 io,
                 _lease: None,
                 failed_accounting: None,
+                #[cfg(test)]
                 drain_pause: None,
             });
             self.register_leased_worker_wake();
@@ -5574,13 +5624,20 @@ pub(crate) mod leased_tests {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(all(
+    any(test, feature = "test-utils"),
+    feature = "experimental-nvmeof",
+    target_os = "linux"
+))]
 impl super::Client {
     pub(crate) fn bench_local_live_fixture(&mut self, buffered: bool) {
         self.live_write_local_fixture = true;
-        // Relaxed: test-only selection precedes queue setup in the serial benchmark.
+        // Relaxed: fixture selection precedes queue creation in serial tests.
         BENCH_LOCAL_BUFFERED.store(buffered, std::sync::atomic::Ordering::Relaxed);
     }
+}
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+impl super::Client {
     pub(crate) fn leased_test_frontier(&self) -> (u64, bool, bool) {
         (
             self.live_leased
