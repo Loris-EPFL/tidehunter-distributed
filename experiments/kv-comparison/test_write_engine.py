@@ -112,6 +112,16 @@ class WriteEngineTests(unittest.TestCase):
             self.assertTrue(cloud_package.allowed(name))
             self.assertTrue((Path(__file__).resolve().parents[2] / name).is_file())
 
+    def test_case_namespace_is_never_added_to_replay_configs(self):
+        # The typed replay config denies unknown fields; a namespace would fail admission.
+        for job in campaign.make_focused_matrix(SELECTION):
+            config = {}
+            controller.apply_case_namespace(config, job, "bench-0000000000000000")
+            if job["case_kind"] == "mainnet_replay":
+                self.assertNotIn("key_namespace_hex", config)
+            else:
+                self.assertEqual(len(config["key_namespace_hex"]), 32)
+
     def test_replay_owner_preparation_uses_pinned_domain(self):
         job = next(j for j in campaign.make_focused_matrix(SELECTION) if j["case_kind"] == "mainnet_replay")
         with tempfile.TemporaryDirectory() as tmp:
