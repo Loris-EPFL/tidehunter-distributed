@@ -28,6 +28,8 @@ class WriteEngineRegistryTests(unittest.TestCase):
             selected = {**copy.deepcopy(spec), "arms": arms}
             self.assertEqual(len(manual._reviewed_jobs(selected)), 9)
             self.assertTrue(all(job["arm"] == arms[0] for job in manual._reviewed_jobs(selected)))
+            # The terminal completion check expects the selected arm's cases, not job_count (18).
+            self.assertEqual(manual.expected_case_count({**selected, "mode": "focused"}), 9)
         with self.assertRaises(ValueError):
             manual._reviewed_jobs({**spec, "arms": ["raw"]})
         with self.assertRaises(ValueError):

@@ -392,6 +392,14 @@ def _reviewed_jobs(spec):
     return jobs
 
 
+def expected_case_count(spec):
+    """Cases the coordinator is asked to run: the reviewed jobs after arm selection,
+    not the selection's full job_count."""
+    if spec.get('mode') == 'focused':
+        return len(_reviewed_jobs(spec))
+    return len(workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'}))
+
+
 def _check_config(config, spec, surcharge_cents):
     if (config.get('project_id') != 'mysten-research'
             or config.get('bucket') != 'mysten-research-bench-artifacts'
@@ -1244,9 +1252,7 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
             # output of verification subprocesses (for example `verified: true` blocks).
             result = json.loads(terminal['stdout'].strip().splitlines()[-1])
             kv = result.get('kv', {})
-            expected_cases = (spec['job_count'] if spec.get('mode') == 'focused' else
-                              len(workflow_input.cloud_campaign.make_matrix(
-                                  {k: v for k, v in spec.items() if k != 'suite'})))
+            expected_cases = expected_case_count(spec)
             if kv.get('complete') is not True or kv.get('planned_cases') != expected_cases or kv.get('completed_cases') != expected_cases:
                 raise RuntimeError('coordinator did not complete the reviewed combined suite')
             profiles = spec.get('valkey_reproduction_profiles', [])
