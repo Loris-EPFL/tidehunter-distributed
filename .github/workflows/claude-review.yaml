@@ -1,0 +1,97 @@
+name: Claude review
+
+# Independent reviewer next to the native Codex review. Each reviews the whole diff, so either
+# catches what the other misses; Claude also answers Codex's findings.
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, synchronize]
+    paths:
+      - 'tidehunter/src/**'
+      - 'benchmarks/**'
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.draft == false &&
+      (github.event_name == 'pull_request' ||
+       github.event.review.user.login == 'chatgpt-codex-connector[bot]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Bound the Codex exchange per commit
+        id: bound
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # At most two Claude replies to Codex reviews per head commit; the first review is not counted.
+          replies=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq "[.[] | select(.body | contains(\"<!-- claude-codex-reply:$HEAD -->\"))] | length")
+          if [ "$GITHUB_EVENT_NAME" = pull_request_review ] && [ "$replies" -ge 2 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.bound.outputs.run == 'true'
+        uses: anthropics/claude-code-action@f3b070c88125d33dbae5653df5f143101d4ea9dc # v1.0.276
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_bots: chatgpt-codex-connector
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            HEAD SHA: ${{ github.event.pull_request.head.sha }}
+            EVENT: ${{ github.event_name }}
+
+            You are an independent reviewer. Codex (chatgpt-codex-connector[bot]) also reviews this PR;
+            do not rely on it: review the whole diff yourself for every concrete defect (correctness,
+            error handling, tests, API misuse, security). Only skip posting a finding that Codex
+            already posted; reply in its thread instead.
+            Read AGENTS.md and .github/AGENTS.md first. Review the diff (`gh pr diff`) with extra care for:
+            - crash consistency of every WAL, memtable flush, checkpoint and recovery change:
+              the on-disk state must stay recoverable after a crash at any point;
+            - memory ordering, lock order, lost wakeups, slot or buffer reuse, and data races;
+            - `unsafe` blocks without a SAFETY comment that states the invariant;
+            - loops and queues without a fixed upper bound;
+            - `unwrap`/`expect` on paths that can fail in production;
+            - sleeps, retries or looser assertions added to make tests pass;
+            - performance on the hot read/write path: allocation, copies, extra thread hops.
+
+            Read existing review comments first (`gh pr view --comments` and
+            `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments`).
+            For each finding by Codex, reply in its thread: agree (with any detail it missed) or
+            disagree (with file:line evidence). Mark a finding Blocking only with a concrete failure.
+            If a focused second look by Codex would settle a disagreement or a risk it did not cover,
+            request it once in a top-level comment of exactly the form
+            "@codex review for <one specific risk, with file:line>". Codex answers mentions only with a
+            code review, never a conversational reply, so phrase it as a review focus. Do not mention
+            Codex in any other comment.
+
+            Use mcp__github_inline_comment__create_inline_comment (confirmed: true) for code issues.
+            Post one top-level summary with `gh pr comment`: Blocking / Should fix / Nit, or
+            "No findings". If EVENT is pull_request_review, the summary must end with the line
+            <!-- claude-codex-reply:${{ github.event.pull_request.head.sha }} -->
+            Never approve, request changes, push, or edit files.
+          claude_args: |
+            --max-turns 40
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Read,Grep,Glob"

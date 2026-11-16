@@ -436,6 +436,166 @@ fn wait_for_device<T>(
         }
     }
 }
+
+/// Takes `LOCK_EX` on a namespace disk. A udev worker probing the disk holds
+/// `LOCK_SH` until its rules finish, and systemd expects the exclusive locker
+/// to wait for it. `flock` has no timeout, so a contended lock waits on a helper
+/// thread. A result after the deadline is dropped, which releases the lock; the
+/// helper then lives until the holder releases (udev bounds its own events).
+fn lock_disk(disk: File, path: &Path, controller: &str, deadline: Instant) -> io::Result<File> {
+    match disk.try_lock() {
+        Ok(()) => return Ok(disk),
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(with_context("lock namespace device", path, error));
+        }
+    }
+    let (tx, rx) = mpsc::sync_channel(0);
+    std::thread::Builder::new()
+        .name("live-nvme-disk-lock".into())
+        .spawn(move || {
+            let result = disk.lock().map(|()| disk);
+            // Fails only after the caller's deadline; dropping the result unlocks.
+            drop(tx.send(result));
+        })?;
+    match rx.recv_timeout(remaining(deadline)?) {
+        Ok(result) => result.map_err(|error| with_context("lock namespace device", path, error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "lock namespace device {} (controller {controller}): another holder kept the disk lock until the deadline",
+                path.display()
+            ),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(invalid("namespace disk lock worker failed"))
+        }
+    }
+}
+
+/// Visible namespace disks of the controller at `ctrl` (canonical sysfs path):
+/// its own disks and the native multipath heads that link to it. Entries that
+/// disappear during the scan are skipped.
+fn owned_visible_disks(
+    block_root: &Path,
+    ctrl: &Path,
+    controller: &str,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut disks = Vec::new();
+    for entry in std::fs::read_dir(block_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !namespace_name(name) {
+            continue;
+        }
+        let p = entry.path();
+        let parent_path = p.join("device");
+        let parent = match std::fs::canonicalize(&parent_path) {
+            Ok(parent) => parent,
+            Err(error) if vanished(&error) => continue,
+            Err(error) => {
+                return Err(with_context(
+                    "resolve namespace parent",
+                    &parent_path,
+                    error,
+                ));
+            }
+        };
+        let owned = if parent == ctrl {
+            true
+        } else {
+            let linked = parent.join(controller);
+            match std::fs::canonicalize(&linked) {
+                Ok(path) => path == ctrl,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(with_context("resolve namespace controller", &linked, error));
+                }
+            }
+        };
+        if !owned {
+            continue;
+        }
+        let visible = match namespace_visible(&p) {
+            Ok(visible) => visible,
+            Err(error) if vanished(&error) => continue,
+            Err(error) => return Err(with_context("read namespace visibility", &p, error)),
+        };
+        if visible {
+            disks.push((name.to_owned(), p));
+        }
+    }
+    Ok(disks)
+}
+
+/// Takes BSD `LOCK_EX` on every visible namespace disk of a controller before
+/// it is deleted. systemd-udevd watches NVMe disks: after any close of a
+/// descriptor opened for writing it runs `BLKRRPART` under `LOCK_EX|LOCK_NB`,
+/// and its workers probe under `LOCK_SH|LOCK_NB`
+/// (<https://systemd.io/BLOCK_DEVICE_LOCKING>). A partition scan whose reads
+/// follow the removal of the last path fails with kernel I/O errors. Holding
+/// the lock makes udev skip later rescans, and waiting for it lets a rescan
+/// already running finish first. Descriptors are read-only, so their close
+/// never triggers a rescan. A node that vanished, or that now names another
+/// device, belongs to a disk already deleted. Locks are taken in device-number
+/// order, so two teardowns sharing a multipath head cannot wait on each other.
+fn lock_controller_disks(
+    block_root: &Path,
+    dev_root: &Path,
+    ctrl: &Path,
+    controller: &str,
+    deadline: Instant,
+) -> io::Result<Vec<File>> {
+    let mut opened = Vec::new();
+    for (name, sysfs) in owned_visible_disks(block_root, ctrl, controller)? {
+        let Some(dev) = scan_attribute(&sysfs.join("dev"))? else {
+            continue;
+        };
+        let path = dev_root.join(name);
+        let disk = match File::open(&path) {
+            Ok(disk) => disk,
+            // ENXIO: the disk is no longer live, so nothing can scan it.
+            Err(error) if vanished(&error) || error.raw_os_error() == Some(libc::ENXIO) => {
+                continue;
+            }
+            Err(error) => {
+                return Err(with_context(
+                    "open namespace device for teardown",
+                    &path,
+                    error,
+                ));
+            }
+        };
+        let rdev = disk.metadata()?.rdev();
+        if format!("{}:{}", libc::major(rdev), libc::minor(rdev)) == dev {
+            opened.push((rdev, path, disk));
+        }
+    }
+    opened.sort_unstable_by_key(|(rdev, ..)| *rdev);
+    opened
+        .into_iter()
+        .map(|(_, path, disk)| lock_disk(disk, &path, controller, deadline))
+        .collect()
+}
+
+/// Teardown order: lock the namespace disks, delete, and release the locks only
+/// once deletion is confirmed. Locks are taken only before a delete is issued;
+/// if locking fails no delete is issued, so the caller keeps its intent. An
+/// unconfirmed deletion keeps the locks for the next attempt.
+fn retire_locked(
+    locks: &mut Vec<File>,
+    delete_not_issued: bool,
+    lock: impl FnOnce() -> io::Result<Vec<File>>,
+    retire: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if delete_not_issued && locks.is_empty() {
+        *locks = lock()?;
+    }
+    retire()?;
+    locks.clear();
+    Ok(())
+}
 fn namespace_visible(path: &Path) -> io::Result<bool> {
     match attr(&path.join("hidden"))?.as_str() {
         "0" => Ok(true),
@@ -609,6 +769,7 @@ impl LiveConnectionRegistry {
                     deletion: DeletionState::NotStarted,
                     registry: self.clone(),
                     intent_path: entry.path(),
+                    teardown_locks: Vec::new(),
                 };
                 owned.verify()?;
                 // A previous process may have issued the delete before dying.
@@ -618,7 +779,7 @@ impl LiveConnectionRegistry {
                 if matches!(state.as_str(), "deleting" | "deleting (no IO)" | "dead") {
                     owned.deletion = DeletionState::Initiated;
                 }
-                owned.delete_owned(deadline)?;
+                owned.retire(deadline)?;
             }
             self.remove_intent(&entry.path())?;
         }
@@ -725,6 +886,9 @@ pub struct LiveController {
     deletion: DeletionState,
     registry: LiveConnectionRegistry,
     intent_path: PathBuf,
+    /// Teardown `LOCK_EX` descriptors on this controller's namespace disks,
+    /// held from just before the delete until deletion is confirmed.
+    teardown_locks: Vec<File>,
 }
 
 pub(crate) struct LiveNamespaceResolver {
@@ -863,6 +1027,7 @@ impl LiveController {
             deletion: DeletionState::NotStarted,
             registry,
             intent_path,
+            teardown_locks: Vec::new(),
         };
         if let Err(error) = controller.verify() {
             // An identity mismatch cannot authorize deletion of this object.
@@ -933,53 +1098,8 @@ impl LiveNamespaceResolver {
             self.verify()?;
             let ctrl = std::fs::canonicalize(self.pinned())?;
             let mut candidates = Vec::new();
-            for entry in std::fs::read_dir("/sys/class/block")? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if !namespace_name(name) {
-                    continue;
-                }
-                let p = entry.path();
-                let parent_path = p.join("device");
-                let parent = match std::fs::canonicalize(&parent_path) {
-                    Ok(parent) => parent,
-                    Err(error) if vanished(&error) => continue,
-                    Err(error) => {
-                        return Err(with_context(
-                            "resolve namespace parent",
-                            &parent_path,
-                            error,
-                        ));
-                    }
-                };
-                let owned = if parent == ctrl {
-                    true
-                } else {
-                    let linked = parent.join(&self.name);
-                    match std::fs::canonicalize(&linked) {
-                        Ok(path) => path == ctrl,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                        Err(error) => {
-                            return Err(with_context(
-                                "resolve namespace controller",
-                                &linked,
-                                error,
-                            ));
-                        }
-                    }
-                };
-                if !owned {
-                    continue;
-                }
-                let hidden = match namespace_visible(&p) {
-                    Ok(hidden) => hidden,
-                    Err(error) if vanished(&error) => continue,
-                    Err(error) => return Err(with_context("read namespace visibility", &p, error)),
-                };
-                if !hidden {
-                    continue;
-                }
+            for (name, p) in owned_visible_disks(Path::new("/sys/class/block"), &ctrl, &self.name)?
+            {
                 let Some(nsid) = scan_attribute(&p.join("nsid"))? else {
                     continue;
                 };
@@ -1061,6 +1181,28 @@ impl LiveNamespaceResolver {
             }
             std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(20)));
         }
+    }
+    /// Locks every visible namespace disk of this controller for teardown. A
+    /// controller already gone has no paths left whose removal a scan could race.
+    fn lock_owned_disks(&self, deadline: Instant) -> io::Result<Vec<File>> {
+        let controller = Path::new("/sys/class/nvme").join(&self.name);
+        if original_removed(&controller, self.device, self.inode)? {
+            return Ok(Vec::new());
+        }
+        let ctrl = match std::fs::canonicalize(self.pinned()) {
+            Ok(path) => path,
+            Err(error) if vanished(&error) => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(with_context("resolve owned controller", &controller, error));
+            }
+        };
+        lock_controller_disks(
+            Path::new("/sys/class/block"),
+            Path::new("/dev"),
+            &ctrl,
+            &self.name,
+            deadline,
+        )
     }
 }
 impl LiveController {
@@ -1180,8 +1322,22 @@ impl LiveController {
         self.deletion = state;
         result
     }
+    /// Locks the namespace disks (see `lock_controller_disks`) before issuing
+    /// the delete, and releases them once the controller is gone.
+    fn retire(&mut self, deadline: Instant) -> io::Result<()> {
+        let resolver = self.resolver.clone();
+        let mut locks = std::mem::take(&mut self.teardown_locks);
+        let result = retire_locked(
+            &mut locks,
+            self.deletion == DeletionState::NotStarted,
+            || resolver.lock_owned_disks(deadline),
+            || self.delete_owned(deadline),
+        );
+        self.teardown_locks = locks;
+        result
+    }
     fn disconnect_inner(&mut self, deadline: Instant) -> io::Result<()> {
-        self.delete_owned(deadline)?;
+        self.retire(deadline)?;
         self.registry.remove_intent(&self.intent_path)
     }
 }
@@ -1210,6 +1366,7 @@ impl LiveController {
             deletion: DeletionState::Gone,
             registry: registry.clone(),
             intent_path: sysfs_stand_in.join("no-intent"),
+            teardown_locks: Vec::new(),
         })
     }
 }
@@ -1991,5 +2148,200 @@ mod tests {
         assert!(valid_nqn("nqn.2026-01.test:host"));
         assert!(!valid_nqn("nqn.2026-01.test:host,duplicate_connect"));
         assert!(!valid_nqn("nqn.2026-01.test:host=other"));
+    }
+
+    fn would_block(file: &File) -> bool {
+        matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+            && matches!(
+                file.try_lock_shared(),
+                Err(std::fs::TryLockError::WouldBlock)
+            )
+    }
+
+    fn unlocked(path: &Path) -> bool {
+        File::open(path).unwrap().try_lock().is_ok()
+    }
+
+    /// Fake sysfs and /dev for controller `nvme9`: a plain disk `nvme9n1`, a
+    /// multipath head `nvme9n2` linking to it, a hidden path disk, a disk of
+    /// `nvme8`, a node `nvme9n3` now naming another device, and a visible disk
+    /// `nvme9n4` whose node vanished. Returns `(block, dev, ctrl)`.
+    fn fake_controller_disks(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let (block, dev) = (root.join("block"), root.join("dev"));
+        for dir in ["ctrl/nvme9", "ctrl/nvme8", "subsys", "block", "dev"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let ctrl = std::fs::canonicalize(root.join("ctrl/nvme9")).unwrap();
+        std::os::unix::fs::symlink(&ctrl, root.join("subsys/nvme9")).unwrap();
+        for (name, parent, hidden, number, node) in [
+            ("nvme9n1", "ctrl/nvme9", "0", "0:0", true),
+            ("nvme9n2", "subsys", "0", "0:0", true),
+            ("nvme9c9n1", "ctrl/nvme9", "1", "0:0", true),
+            ("nvme8n1", "ctrl/nvme8", "0", "0:0", true),
+            ("nvme9n3", "ctrl/nvme9", "0", "7:3", true),
+            ("nvme9n4", "ctrl/nvme9", "0", "0:0", false),
+        ] {
+            let disk = block.join(name);
+            std::fs::create_dir(&disk).unwrap();
+            std::os::unix::fs::symlink(root.join(parent), disk.join("device")).unwrap();
+            std::fs::write(disk.join("hidden"), hidden).unwrap();
+            // Regular files stand in for nodes: their device number is 0:0.
+            std::fs::write(disk.join("dev"), number).unwrap();
+            if node {
+                File::create(dev.join(name)).unwrap();
+            }
+        }
+        (block, dev, ctrl)
+    }
+
+    #[test]
+    fn reconcile_teardown_locks_every_visible_disk_without_resolve_history() {
+        let temp = tempdir::TempDir::new("teardown-disks").unwrap();
+        let (block, dev, ctrl) = fake_controller_disks(temp.path());
+        let mut names: Vec<String> = owned_visible_disks(&block, &ctrl, "nvme9")
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["nvme9n1", "nvme9n2", "nvme9n3", "nvme9n4"]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let locks = lock_controller_disks(&block, &dev, &ctrl, "nvme9", deadline).unwrap();
+        assert_eq!(locks.len(), 2);
+        // udevd's close-after-write reread takes LOCK_EX|LOCK_NB and its
+        // workers LOCK_SH|LOCK_NB: both must skip the controller's disks.
+        assert!(would_block(&File::open(dev.join("nvme9n1")).unwrap()));
+        assert!(would_block(&File::open(dev.join("nvme9n2")).unwrap()));
+        for other in ["nvme9c9n1", "nvme8n1", "nvme9n3"] {
+            assert!(unlocked(&dev.join(other)), "{other} must not be locked");
+        }
+        drop(locks);
+        assert!(unlocked(&dev.join("nvme9n1")));
+    }
+
+    #[test]
+    fn disk_lock_is_taken_only_at_teardown_and_released_after_deletion() {
+        let temp = tempdir::TempDir::new("teardown-order").unwrap();
+        let (block, dev, ctrl) = fake_controller_disks(temp.path());
+        let disk = dev.join("nvme9n1");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // Normal use: namespace I/O opens and closes the disk read-write, and
+        // udev may process it; nothing holds the lock.
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&disk)
+                .unwrap(),
+        );
+        let udev = File::open(&disk).unwrap();
+        udev.try_lock().unwrap();
+        udev.unlock().unwrap();
+        let mut locks = Vec::new();
+        let error = retire_locked(
+            &mut locks,
+            true,
+            || lock_controller_disks(&block, &dev, &ctrl, "nvme9", deadline),
+            || {
+                assert!(would_block(&udev), "delete issued without the lock");
+                Err(io::Error::other("deletion uncertain"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "deletion uncertain");
+        assert!(would_block(&udev), "unconfirmed deletion released the lock");
+        // A later attempt after the store keeps the same locks until confirmation.
+        retire_locked(
+            &mut locks,
+            false,
+            || panic!("teardown relocked after the delete was issued"),
+            || {
+                assert!(would_block(&udev));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(locks.is_empty());
+        udev.try_lock().unwrap();
+    }
+
+    #[test]
+    fn teardown_lock_timeout_issues_no_delete() {
+        let temp = tempdir::TempDir::new("teardown-timeout").unwrap();
+        let (block, dev, ctrl) = fake_controller_disks(temp.path());
+        let probe = File::open(dev.join("nvme9n1")).unwrap();
+        probe.lock_shared().unwrap();
+        let mut locks = Vec::new();
+        let mut deleted = false;
+        let error = retire_locked(
+            &mut locks,
+            true,
+            || {
+                lock_controller_disks(
+                    &block,
+                    &dev,
+                    &ctrl,
+                    "nvme9",
+                    Instant::now() + Duration::from_millis(50),
+                )
+            },
+            || {
+                deleted = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!deleted, "delete issued without the lock");
+        assert!(locks.is_empty());
+        // Locks already taken in the failed attempt are released.
+        assert!(unlocked(&dev.join("nvme9n2")));
+    }
+
+    #[test]
+    fn disk_lock_waits_for_udev_probe_and_never_outlives_its_deadline() {
+        let temp = tempdir::TempDir::new("disk-lock-wait").unwrap();
+        let disk = temp.path().join("nvme9n1");
+        File::create(&disk).unwrap();
+        let probe = File::open(&disk).unwrap();
+        probe.lock_shared().unwrap();
+        let error = lock_disk(
+            File::open(&disk).unwrap(),
+            &disk,
+            "nvme9",
+            Instant::now() + Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{} (controller nvme9)", disk.display()))
+        );
+        let waiter = {
+            let disk = disk.clone();
+            std::thread::spawn(move || {
+                lock_disk(
+                    File::open(&disk).unwrap(),
+                    &disk,
+                    "nvme9",
+                    Instant::now() + Duration::from_secs(10),
+                )
+            })
+        };
+        // Ending the probe lets the waiter in; the timed-out helper also wakes,
+        // and must drop its late lock instead of keeping it.
+        drop(probe);
+        let held = waiter.join().unwrap().unwrap();
+        assert!(would_block(&File::open(&disk).unwrap()));
+        drop(held);
+        // The late helper may still take the lock briefly; it must let it go.
+        lock_disk(
+            File::open(&disk).unwrap(),
+            &disk,
+            "nvme9",
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
     }
 }

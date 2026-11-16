@@ -12,6 +12,19 @@ pub(in crate::distributed::tcp) mod multiplexed;
 mod wal_replay;
 
 #[test]
+fn default_owner_limits_admit_an_automatic_coordinator_and_its_reopen() {
+    use crate::distributed::remote_db::RemoteDatabaseConfig;
+    let limits = TcpLimits::default();
+    limits.validate().unwrap();
+    // A coordinator that omits `read_lanes` sizes its lanes from the host up to the cap;
+    // default owner limits must admit two such session sets.
+    assert!(
+        limits.max_connections
+            >= RemoteDatabaseConfig::generated_owner_connection_limit(None).unwrap()
+    );
+}
+
+#[test]
 fn production_wire_variant_tags_do_not_depend_on_features() {
     fn tag(value: &impl Serialize) -> u32 {
         let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(value).unwrap();
