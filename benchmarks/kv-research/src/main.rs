@@ -110,7 +110,29 @@ fn entry() -> BackendResult<()> {
         }
     }
     let config_path = config_path.ok_or("--config is required")?;
-    let mut config: RunConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path)?)?;
+    if raw["workload"]["kind"] == "sui_mainnet_replay" {
+        let config: kv_research::mainnet_replay::ReplayConfig = serde_json::from_value(raw)?;
+        if validate_only {
+            let (_, _, admission) = config.admit()?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "admitted_config": config, "scope": kv_research::mainnet_trace::SCOPE,
+                    "workload_admission": admission,
+                }))?
+            );
+            return Ok(());
+        }
+        let output = output.ok_or("--output is required")?;
+        install_replay_panic_hook(&output);
+        return tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(kv_research::mainnet_replay::run(config, &output));
+    }
+    let mut config: RunConfig = serde_json::from_value(raw)?;
     if config.backend.kind == "native" {
         backends::native::normalize_options(&mut config.backend.options)?;
     }
@@ -220,4 +242,60 @@ fn entry() -> BackendResult<()> {
             _ => Err("backend admission and dispatch disagree".into()),
         }
     })
+}
+
+/// Replay owns this process. A background engine panic is fatal, not a healthy
+/// foreground result. Preserve the ordinary panic diagnostic and fail closed.
+fn install_replay_panic_hook(output: &Path) {
+    use std::io::Write;
+    let previous = std::panic::take_hook();
+    let error_output = output.join("panic.txt");
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        if let Ok(mut file) = std::fs::File::create(&error_output) {
+            let _ = writeln!(file, "{info}");
+            let _ = file.sync_all();
+        }
+        std::process::abort();
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn replay_panic_hook_aborts_on_a_background_panic() {
+        const CHILD: &str = "KV_RESEARCH_REPLAY_PANIC_TEST";
+        if let Some(output) = std::env::var_os(CHILD) {
+            install_replay_panic_hook(Path::new(&output));
+            let thread = std::thread::spawn(|| panic!("replay background health regression"));
+            let _ = thread.join();
+            panic!("panic hook did not abort");
+        }
+        let output =
+            std::env::temp_dir().join(format!("mainnet-panic-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&output).unwrap();
+        // Avoid producing a core dump for this deliberately aborting child.
+        let child = std::process::Command::new("bash")
+            .args(["-c", "ulimit -c 0; exec \"$@\"", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::replay_panic_hook_aborts_on_a_background_panic",
+                "--nocapture",
+            ])
+            .env(CHILD, &output)
+            .output()
+            .unwrap();
+        assert_eq!(child.status.signal(), Some(libc::SIGABRT));
+        assert!(
+            String::from_utf8_lossy(&child.stderr).contains("replay background health regression")
+        );
+        let error = std::fs::read_to_string(output.join("panic.txt")).unwrap();
+        assert!(error.contains("replay background health regression"));
+        assert!(error.contains("src/main.rs:"));
+        std::fs::remove_dir_all(output).unwrap();
+    }
 }

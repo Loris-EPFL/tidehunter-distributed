@@ -1,4 +1,5 @@
 mod group_barrier;
+pub mod replay;
 
 #[cfg(test)]
 mod shard_tests;
@@ -421,6 +422,18 @@ impl NativeBackend {
 impl KvBackend for NativeBackend {
     fn info(&self) -> BackendInfo {
         self.info()
+    }
+    fn check_background_health(&self) -> Option<BackendResult<()>> {
+        for (index, shard) in self.shards.iter().enumerate() {
+            if let Err(error) = shard.db.check_background_health() {
+                return Some(Err(format!(
+                    "native shard {index} ({}): {error:?}",
+                    shard.path.display()
+                )
+                .into()));
+            }
+        }
+        Some(Ok(()))
     }
 
     #[cfg(all(target_os = "linux", feature = "test-utils"))]

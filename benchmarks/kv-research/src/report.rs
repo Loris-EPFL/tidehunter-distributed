@@ -14,8 +14,8 @@ use crate::backend::{BackendInfo, BackendResult};
 use crate::duration_ns;
 /// Raw sample queue: owner is the single `kv-research-sample-writer` thread; producers are the
 /// scheduling task (completions, rejections) and snapshot flush requests.
-/// Capacity: 4096 messages (about 0.5 MiB of `Sample`). Up to 65536 admitted requests can
-/// drain one row each, so the queue can fill before all completions are recorded.
+/// Capacity: 4096 messages (about 0.5 MiB of generic samples; replay adds a fixed identity).
+/// Up to 65536 admitted requests can drain one row each, so the queue can fill before recording ends.
 /// Full-queue policy: old single streams wait and count the stall. Interference rows use
 /// `try_send`; saturation fails the case and marks raw samples incomplete. Admission never
 /// waits for telemetry in interference. Flush requests use `try_send` and are skipped when full.
@@ -202,9 +202,23 @@ pub struct RunSummary {
     pub limitations: Vec<String>,
 }
 
+/// Replay-only identity, attached to a real get or the parent atomic batch call.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReplayIdentity {
+    pub source_checkpoint: u64,
+    pub source_tx: Option<u32>,
+    pub repetition: u64,
+    pub db: u16,
+    pub table: Option<u16>,
+    pub batch_phase: Option<u16>,
+    pub parent_batch: Option<u64>,
+    pub members: u64,
+}
+
 /// Raw rows and flush requests share one bounded queue so the writer needs no timer.
 enum WriterMessage {
     Row(Sample),
+    ReplayRow(Sample, ReplayIdentity),
     Flush,
 }
 
@@ -309,12 +323,13 @@ impl Reporter {
             mpsc::channel::<WriterMessage>(RAW_SAMPLE_QUEUE_CAPACITY);
         let sample_writer = thread::Builder::new().name("kv-research-sample-writer".to_owned()).spawn(move || {
             let mut samples = BufWriter::new(samples_file);
-            writeln!(samples, "phase,operation,outcome,scheduled_ns,dispatched_ns,dispatch_observed,completed_ns,api_ns,response_ns,scheduling_ns,logical_keys,bytes,error_kind,caller_sample_id,released_ns,stream")?;
+            writeln!(samples, "phase,operation,outcome,scheduled_ns,dispatched_ns,dispatch_observed,completed_ns,api_ns,response_ns,scheduling_ns,logical_keys,bytes,error_kind,caller_sample_id,released_ns,stream,source_checkpoint,source_tx,repetition,db,table,batch_phase,parent_batch,members")?;
             let mut next_flush = Instant::now() + Duration::from_secs(1);
             // This dedicated OS thread owns the receiver; blocking here never touches a runtime thread.
             while let Some(message) = sample_receiver.blocking_recv() {
                 match message {
                     WriterMessage::Row(sample) => write_sample_row(&mut samples, &sample)?,
+                    WriterMessage::ReplayRow(sample, identity) => write_replay_sample_row(&mut samples, &sample, Some(&identity))?,
                     WriterMessage::Flush => samples.flush()?,
                 }
                 if Instant::now() >= next_flush {
@@ -624,6 +639,22 @@ impl Reporter {
     }
 
     pub async fn record(&mut self, sample: Sample) -> BackendResult<()> {
+        self.record_with_identity(sample, None).await
+    }
+
+    pub async fn record_replay(
+        &mut self,
+        sample: Sample,
+        identity: ReplayIdentity,
+    ) -> BackendResult<()> {
+        self.record_with_identity(sample, Some(identity)).await
+    }
+
+    async fn record_with_identity(
+        &mut self,
+        sample: Sample,
+        identity: Option<ReplayIdentity>,
+    ) -> BackendResult<()> {
         let labels = [
             self.backend_label.as_str(),
             sample.operation,
@@ -708,20 +739,33 @@ impl Reporter {
                 .or_default()
                 .observe(oracle_ns);
         }
-        self.write_sample(sample).await
+        self.write_sample_with_identity(sample, identity).await
     }
 
     async fn write_sample(&mut self, sample: Sample) -> BackendResult<()> {
+        self.write_sample_with_identity(sample, None).await
+    }
+
+    async fn write_sample_with_identity(
+        &mut self,
+        sample: Sample,
+        identity: Option<ReplayIdentity>,
+    ) -> BackendResult<()> {
         let sender = self.samples.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "sample writer already stopped",
             )
         })?;
+        let interference = sample.stream.is_some();
+        let message = match identity {
+            Some(identity) => WriterMessage::ReplayRow(sample, identity),
+            None => WriterMessage::Row(sample),
+        };
         // The arrival clock must not wait for telemetry. A full writer queue invalidates
         // interference instead of delaying admission or losing a row without an error.
-        if sample.stream.is_some() {
-            return match sender.try_send(WriterMessage::Row(sample)) {
+        if interference {
+            return match sender.try_send(message) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     self.sample_submit_errors = self.sample_submit_errors.saturating_add(1);
@@ -732,7 +776,7 @@ impl Reporter {
                 }
             };
         }
-        let admission = send_bounded(sender, WriterMessage::Row(sample)).await;
+        let admission = send_bounded(sender, message).await;
         if let Some(stalled_ns) = admission.stalled_ns {
             self.sample_backpressure_events = self.sample_backpressure_events.saturating_add(1);
             self.sample_backpressure_ns = self.sample_backpressure_ns.saturating_add(stalled_ns);
@@ -923,7 +967,15 @@ impl Reporter {
     }
 }
 fn write_sample_row<W: Write>(samples: &mut W, sample: &Sample) -> std::io::Result<()> {
-    writeln!(
+    write_replay_sample_row(samples, sample, None)
+}
+
+fn write_replay_sample_row<W: Write>(
+    samples: &mut W,
+    sample: &Sample,
+    identity: Option<&ReplayIdentity>,
+) -> std::io::Result<()> {
+    write!(
         samples,
         "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv(sample.phase),
@@ -944,7 +996,28 @@ fn write_sample_row<W: Write>(samples: &mut W, sample: &Sample) -> std::io::Resu
             .map_or_else(String::new, |id| id.to_string()),
         sample.released_ns,
         sample.stream.map_or("", Stream::as_str)
-    )
+    )?;
+    if let Some(identity) = identity {
+        write!(samples, ",{},", identity.source_checkpoint)?;
+        if let Some(tx) = identity.source_tx {
+            write!(samples, "{tx}")?;
+        }
+        write!(samples, ",{},{}", identity.repetition, identity.db)?;
+        for value in [
+            identity.table.map(u64::from),
+            identity.batch_phase.map(u64::from),
+            identity.parent_batch,
+            Some(identity.members),
+        ] {
+            write!(samples, ",")?;
+            if let Some(value) = value {
+                write!(samples, "{value}")?;
+            }
+        }
+        writeln!(samples)
+    } else {
+        writeln!(samples, ",,,,,,,,")
+    }
 }
 
 fn csv(value: &str) -> Cow<'_, str> {
@@ -1254,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_row_ends_with_worker_release_clock() {
+    fn sample_row_keeps_release_clock_and_empty_replay_identity() {
         let WriterMessage::Row(sample) = row("success") else {
             unreachable!("row builds a sample message");
         };
@@ -1262,7 +1335,7 @@ mod tests {
         write_sample_row(&mut line, &sample).unwrap();
         assert_eq!(
             String::from_utf8(line).unwrap(),
-            "measurement,read,success,0,1,true,5,4,5,1,1,0,,,9,\n"
+            "measurement,read,success,0,1,true,5,4,5,1,1,0,,,9,,,,,,,,,\n"
         );
     }
 }
