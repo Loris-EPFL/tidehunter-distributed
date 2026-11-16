@@ -154,20 +154,15 @@ def pair_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_sh
 
 def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256,
                          preparation_sha256, *, members, rdma_device, machine_type,
-                         live_transports=(), live_spdk=False, qualification_profile='full', selection=None, suite_spec=None, sui_extra_libraries=(), sui_needed_libraries=()):
+                         live_transports=(), live_spdk=False, qualification_profile='full', selection=None):
     """Prepare and qualify the admitted fleet before starting its ordinary worker."""
     gcp_runtime._sha(preparation_sha256)
     if qualification_profile not in ('full', 'focused'):
         raise ValueError('unknown qualification profile')
     if not isinstance(members, (list, tuple)) or len(members) - 1 not in gcp_runtime.owner_host_counts():
         raise ValueError('fleet must have one or five owner hosts')
-    if suite_spec is not None:
-        import manual_sui
-    if suite_spec is not None and not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(suite_spec)):
-        raise ValueError('unreviewed Sui qualification specification')
     if qualification_profile == 'focused' and (live_transports or live_spdk):
-        if (not (gcp_runtime.live_mode({'mode': 'focused', 'selection': selection})
-                 or (suite_spec is not None and manual_sui.focused_qualification(suite_spec)))
+        if (not gcp_runtime.live_mode({'mode': 'focused', 'selection': selection})
                 or list(live_transports) != ['rdma'] or live_spdk
                 or (len(members) != 2 and selection not in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'))):
             raise ValueError('focused qualification forbids unreviewed live and Valkey probes')
@@ -192,10 +187,6 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
                         peer_instance_id=normalized[1]['id'], machine_type=machine_type,
                         live_transports=live_transports, live_spdk=live_spdk)
     extra = {'qualification_profile': 'focused', 'selection': selection} if qualification_profile == 'focused' else {}
-    if suite_spec is not None:
-        extra['suite_spec'] = suite_spec
-        extra['sui_extra_libraries'] = list(sui_extra_libraries)
-        extra['sui_needed_libraries'] = list(sui_needed_libraries)
     return _script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256, 'fleet',
                    preparation_sha256=preparation_sha256, members=normalized,
                    rdma_device=rdma_device, machine_type=machine_type,
@@ -372,15 +363,9 @@ def _pair(package, cfg, deadline, store, own, identity):
     profile = cfg.get('qualification_profile', 'full')
     if profile not in ('full', 'focused'):
         raise ValueError('unknown qualification profile')
-    suite_spec = cfg.get('suite_spec')
-    if suite_spec is not None:
-        import manual_sui
-    if suite_spec is not None and not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(suite_spec)):
-        raise ValueError('unreviewed Sui qualification specification')
     if profile == 'focused' and (cfg.get('live_transports') or cfg.get('live_spdk')
                                  or cfg.get('valkey_qualification')):
-        if (not (gcp_runtime.live_mode({'mode': 'focused', 'selection': cfg.get('selection')})
-                 or (suite_spec is not None and manual_sui.focused_qualification(suite_spec)))
+        if (not gcp_runtime.live_mode({'mode': 'focused', 'selection': cfg.get('selection')})
                 or cfg.get('live_transports') != ['rdma'] or cfg.get('live_spdk')
                 or cfg.get('valkey_qualification')):
             raise ValueError('focused qualification forbids unreviewed live and Valkey probes')
@@ -420,9 +405,7 @@ def _pair(package, cfg, deadline, store, own, identity):
         if profile == 'focused':
             result = gcp_image_qualify.guest(package, cfg['peer_ip'], cfg['peer_instance'],
                                              cfg['rdma_device'], cfg['manifest_sha256'],
-                                             qualification_profile='focused',
-                                             **({'sui_needed_libraries': cfg['sui_needed_libraries']}
-                                                if cfg.get('sui_needed_libraries') else {}))
+                                             qualification_profile='focused')
         else:
             result = gcp_image_qualify.guest(package, cfg['peer_ip'], cfg['peer_instance'],
                                              cfg['rdma_device'], cfg['manifest_sha256'])

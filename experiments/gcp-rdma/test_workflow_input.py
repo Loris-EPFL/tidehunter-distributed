@@ -165,41 +165,6 @@ class WorkflowInputTest(unittest.TestCase):
             with self.subTest(backends=backends), self.assertRaises(ValueError):
                 workflow_input.specification('kv', backends, mode)
 
-    def test_sui_requires_reviewed_generation_bound_fixture(self):
-        with self.assertRaises(ValueError):
-            workflow_input.specification('sui', 'native,tidehunter_tcp', 'standard')
-        fixture = {'key': 'fixtures/checkpoint.tar.gz', 'generation': '123', 'sha256': workflow_input.FIXTURE_SHA}
-        self.assertEqual(workflow_input.specification('both', 'native,tidehunter_tcp', 'standard', fixture)['sui_fixture'], fixture)
-        with self.assertRaises(ValueError):
-            workflow_input.specification('sui', 'native', 'standard', fixture | {'generation': 'latest'})
-        for transport in ('efa', 'fabric-tcp', 'fabric-tcp-native'):
-            with self.subTest(transport=transport), self.assertRaises(ValueError):
-                workflow_input.specification('sui', 'native', 'standard', fixture, transport)
-        spec = workflow_input.specification('both', 'native,tidehunter_tcp,tidehunter_nvme_tcp,tidehunter_nvme_rdma', 'nvmeof-focused', fixture, 'tcp,tidehunter_verbs')
-        self.assertEqual(spec['sui_transports'], ['tcp', 'tidehunter_verbs'])
-        self.assertIn('tidehunter_nvme_rdma', spec['backends'])
-
-    def test_fixture_bytes_are_verified_after_generation_qualified_download(self):
-        import json
-        import gcp_api
-        class Store:
-            def download(self, key, path, **kwargs):
-                self.call = (key, kwargs)
-                Path(path).write_bytes(b'wrong fixture')
-        store = Store()
-        class Api:
-            def __init__(self, project):
-                self.project = project
-            def objects(self, bucket):
-                return store
-        with tempfile.TemporaryDirectory() as directory, patch.object(gcp_api, 'GoogleApi', Api):
-            root = Path(directory)
-            (root / 'config.json').write_text(json.dumps({'project_id': 'p', 'bucket': 'b'}))
-            (root / 'spec.json').write_text(json.dumps({'sui_fixture': {'key': 'fixture', 'generation': '7', 'sha256': workflow_input.FIXTURE_SHA}}))
-            with self.assertRaises(ValueError):
-                workflow_input.download_fixture(root / 'config.json', root / 'spec.json', root / 'fixture')
-            self.assertFalse((root / 'fixture').exists())
-            self.assertEqual(store.call[1]['generation'], '7')
 
 
 if __name__ == '__main__':

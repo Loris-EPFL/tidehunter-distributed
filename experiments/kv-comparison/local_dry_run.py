@@ -407,32 +407,20 @@ class LocalMode:
 
     def start_owner(self, index, request, case, timeout):
         import yaml
-        if index not in range(5) or case != request["case_id"]:
+        if index not in range(self.config.get("jobs", [{}])[0].get("owner_count", 5)) or case != request["case_id"]:
             raise ValueError("invalid local owner identity")
         expected_key = f"{self.config['prefix']}/deploy/cells/{case}/storage-{index}.tar.gz"
         if request["key"] != expected_key:
             raise ValueError("capsule object identity differs")
-        guest = self.fixture / f"guest-{index}" / "cells" / case
+        guest = self.fixture / "cells" / case / f"node-{index}"
         guest.parent.mkdir(parents=True, exist_ok=True)
-        archive = guest.parent / (case + ".tar.gz")
+        archive = guest.parent / f"capsule-{index}.tar.gz"
         self.cloud.download_object(self.controller.clients, self.config, expected_key, archive)
         if self.cloud.digest(archive) != request["sha256"]:
             raise ValueError("capsule checksum differs")
         self.cloud.safe_extract_capsule(archive, guest, request["files"])
         archive.unlink()
-        shared = self.fixture / "cells" / case
-        with self.unit_lock:
-            for member in request["files"]:
-                source = self.cloud.guarded(guest / member, guest, must_exist=True)
-                target = self.cloud.guarded(shared / member, shared)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists():
-                    if not member.startswith("tls/") or target.read_bytes() != source.read_bytes():
-                        raise ValueError("local capsule overlaps a different file")
-                else:
-                    shutil.copyfile(source, target)
-                    target.chmod(0o600)
-        launch_path = shared / f"node-{index}" / "launch.yaml"
+        launch_path = guest / "launch.yaml"
         launch = yaml.safe_load(launch_path.read_text())
         self.cloud.validate_launch(self.config, launch, case, index)
         live = launch.get("node", {}).get("live_target")
@@ -490,7 +478,7 @@ class LocalMode:
 
     def stop_owner(self, index, request, case):
         import yaml
-        if case != request["case_id"] or index not in range(5):
+        if case != request["case_id"] or index not in range(self.config.get("jobs", [{}])[0].get("owner_count", 5)):
             raise ValueError("invalid local owner identity")
         root = self.fixture / "cells" / case
         launch_path = root / f"node-{index}" / "launch.yaml"

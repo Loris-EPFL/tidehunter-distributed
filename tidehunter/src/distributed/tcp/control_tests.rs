@@ -1655,6 +1655,61 @@ mod live_fencing {
     }
 
     #[test]
+    fn readonly_export_connection_pin_survives_record_release_and_idle_history_eviction() {
+        let temp = tempdir::TempDir::new("pinned-history-export").unwrap();
+        let (config, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        let count = 2 * (super::super::inventory::MAX_IDLE_HISTORY_EXPORTS + 2);
+        let end = leased_history(&node, &config, count);
+        let first = history_page(&node, &config, 0, end, 0);
+        let entry = &first.entries[0];
+        let Response::NvmeofEpochPinned(token) = extent_exchange(
+            &node,
+            Request::AcquireLiveExportPin {
+                epoch: 2,
+                segment: entry.segment.clone(),
+                binding: entry.binding.clone(),
+            },
+        ) else {
+            panic!("expected export pin")
+        };
+        let file = LiveFileIdentity {
+            path: entry.segment.path.clone(),
+            device: entry.segment.device,
+            inode: entry.segment.inode,
+            bytes: entry.segment.bytes,
+            block_size: entry.segment.block_size,
+        };
+        let mut next = first.next;
+        release_history_page(&node, &first);
+        for sequence in 1..count {
+            let page = history_page(&node, &config, next.unwrap() as u64, end, sequence as u64);
+            next = page.next;
+            release_history_page(&node, &page);
+        }
+        assert_eq!(node.inventory.lock().live_export_pins.len(), 1);
+        assert_eq!(
+            node.inventory
+                .lock()
+                .live_target
+                .as_ref()
+                .unwrap()
+                .binding_for_file(&file),
+            Some(entry.binding.clone()),
+        );
+        assert!(matches!(
+            extent_exchange(&node, Request::ReleaseLiveExportPin { epoch: 2, token }),
+            Response::NvmeofEpochReleased,
+        ));
+        assert!(node.inventory.lock().live_export_pins.is_empty());
+        fence(&node, 3).unwrap();
+        shutdown(&node, 3);
+    }
+
+    #[test]
     fn retained_history_stays_readonly_and_lifecycle_revocation_allows_retirement() {
         for lifecycle in ["seal", "retire", "final"] {
             let temp = tempdir::TempDir::new("retained-history-lifecycle").unwrap();
@@ -2683,7 +2738,7 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 25);
-    preface[4..6].copy_from_slice(&24u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 26);
+    preface[4..6].copy_from_slice(&25u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }

@@ -4,6 +4,8 @@ use super::live_connect::{
     LiveConnectTarget, LiveConnectionRegistry, LiveController, LiveNamespaceResolver,
 };
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
+use crate::distributed::tcp::checkpoint::RetirementResult;
+use crate::distributed::tcp::{LiveExportPin, LiveExportPinControl, LiveExportPinRequest};
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -22,13 +24,24 @@ fn timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "live controller pool deadline")
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 struct Identity {
     target: LiveConnectTarget,
     host_nqn: String,
     host_id: [u8; 16],
     access: LiveNamespaceAccess,
+    // Retirement routing only, not part of the controller's transport identity.
+    file: Option<(u32, u64, u64)>,
 }
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.host_nqn == other.host_nqn
+            && self.host_id == other.host_id
+            && self.access == other.access
+    }
+}
+impl Eq for Identity {}
 
 /// The lease is cheap to share. Namespace handles opened through this object
 /// retain an independent shutdown pin until their file descriptor is dropped.
@@ -126,23 +139,30 @@ fn idle(lease: &Arc<LiveControllerLease>) -> bool {
 #[allow(clippy::large_enum_variant)]
 enum Entry {
     Pending(Identity),
-    Quarantined,
+    Quarantined {
+        _export_pin: Option<LiveExportPin>,
+    },
     /// An idle controller whose deletion runs outside the pool lock. The entry
     /// still counts against capacity; waiters block until it is removed or, on
     /// a failed delete, restored as an unusable `Ready` entry.
     Closing {
         identity: Identity,
         lease: Arc<LiveControllerLease>,
+        export_pin: Option<LiveExportPin>,
     },
     Ready {
         identity: Identity,
         lease: Arc<LiveControllerLease>,
         controller: LiveController,
         usable: bool,
+        export_pin: Option<LiveExportPin>,
     },
 }
 struct State {
     entries: HashMap<String, Entry>,
+    // One cold metadata connection per configured owner, independent of entry
+    // count. Entry creation/eviction never borrows a caller's Client lock.
+    owners: HashMap<(String, [u8; 32], u32), Arc<LiveExportPinControl>>,
     closing: bool,
 }
 pub struct LiveControllerPool {
@@ -151,6 +171,8 @@ pub struct LiveControllerPool {
     max_pending: usize,
     state: Mutex<State>,
     changed: Condvar,
+    #[cfg(test)]
+    local_targets: Mutex<HashMap<String, std::path::PathBuf>>,
 }
 impl LiveControllerPool {
     /// Local-file pool fixture. It does not create or qualify a kernel controller.
@@ -224,6 +246,7 @@ impl LiveControllerPool {
             host_nqn: host_nqn.to_owned(),
             host_id,
             access: LiveNamespaceAccess::ReadWrite,
+            file: None,
         };
         identity.target.nsid = 0;
         identity.target.uuid = [0; 16];
@@ -238,6 +261,7 @@ impl LiveControllerPool {
                     lease,
                     controller,
                     usable: true,
+                    export_pin: None,
                 },
             );
         Ok(())
@@ -280,11 +304,190 @@ impl LiveControllerPool {
             max_pending,
             state: Mutex::new(State {
                 entries: HashMap::new(),
+                owners: HashMap::new(),
                 closing: false,
             }),
             changed: Condvar::new(),
+            #[cfg(test)]
+            local_targets: Mutex::new(HashMap::new()),
         })
     }
+
+    /// Poison cleanup on a bounded setup/lane worker, never an I/O reactor.
+    /// One capacity-bounded snapshot; active and pending entries are left for
+    /// their owners to drain. Every uncertain outcome keeps its connection pin.
+    pub(crate) fn drain_idle(&self, deadline: Instant) -> io::Result<()> {
+        let keys: Vec<_> = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| invalid("controller pool poisoned"))?;
+            state.closing = true;
+            state
+                .entries
+                .iter()
+                .filter_map(|(key, entry)| match entry {
+                    Entry::Ready {
+                        lease,
+                        usable: true,
+                        ..
+                    } if idle(lease) => Some(key.clone()),
+                    _ => None,
+                })
+                .take(self.capacity)
+                .collect()
+        };
+        let mut first_error = None;
+        for key in keys {
+            if Instant::now() >= deadline {
+                return Err(first_error.unwrap_or_else(timeout));
+            }
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| invalid("controller pool poisoned"))?;
+            // Another lane may already have tried this snapshot's entry.
+            // Never retry its uncertain delete/release during poison cleanup.
+            if !matches!(state.entries.get(&key), Some(Entry::Ready { lease, usable: true, .. }) if idle(lease))
+            {
+                continue;
+            }
+            let controller = Self::begin_close(&mut state, &key)?;
+            let (state, result) =
+                self.finish_close(state, &key, controller, |c| c.disconnect(deadline))?;
+            drop(state);
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lose_next_pin_reply_for_test(
+        &self,
+        recipe: &Arc<crate::distributed::tcp::LivePinRecipe>,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .owners
+            .entry(recipe.key.clone())
+            .or_insert_with(|| Arc::new(LiveExportPinControl::new(recipe.clone())))
+            .lose_next_reply();
+    }
+    /// Disconnect only controllers for the exact retirement files. Busy/pending
+    /// entries refuse immediately; unrelated controllers stay cached.
+    pub(crate) fn evict_files(
+        &self,
+        partition: u32,
+        epoch: u64,
+        bytes: u64,
+        files: &[u64],
+        deadline: Instant,
+    ) -> io::Result<RetirementResult> {
+        let matches = |identity: &Identity| {
+            identity.file.is_some_and(|(owner, source, file)| {
+                owner == partition && source == epoch && files.contains(&(file * bytes))
+            })
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("controller pool poisoned"))?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(timeout());
+            }
+            // Check all matching users before disconnecting any idle sibling.
+            if state.entries.values().any(|entry| match entry {
+                Entry::Pending(identity) | Entry::Closing { identity, .. } => matches(identity),
+                Entry::Ready {
+                    identity, lease, ..
+                } => matches(identity) && !idle(lease),
+                Entry::Quarantined { .. } => false,
+            }) {
+                return Ok(RetirementResult::Busy);
+            }
+            let Some(key) = state.entries.iter().find_map(|(key, entry)| match entry {
+                Entry::Ready { identity, .. } if matches(identity) => Some(key.clone()),
+                _ => None,
+            }) else {
+                return Ok(RetirementResult::Completed);
+            };
+            let controller = Self::begin_close(&mut state, &key)?;
+            let (next, result) =
+                self.finish_close(state, &key, controller, |c| c.disconnect(deadline))?;
+            state = next;
+            result?;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_local_target(&self, nqn: &str, path: std::path::PathBuf) {
+        self.local_targets
+            .lock()
+            .unwrap()
+            .insert(nqn.to_owned(), path);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evict_for_test(
+        &self,
+        key: &str,
+        before_disconnect: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let controller = Self::begin_close(&mut state, key)?;
+        let (_state, result) = self.finish_close(state, key, controller, |controller| {
+            before_disconnect()?;
+            controller.disconnect(Instant::now() + Duration::from_secs(5))
+        })?;
+        result
+    }
+
+    fn connect(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        access: LiveNamespaceAccess,
+        deadline: Instant,
+    ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
+        #[cfg(test)]
+        if let Some(path) = self
+            .local_targets
+            .lock()
+            .map_err(|_| invalid("local target map poisoned"))?
+            .get(&target.nqn)
+        {
+            let parent = path
+                .parent()
+                .ok_or_else(|| invalid("local target has no parent"))?;
+            return Ok((
+                LiveController::deleted_for_test(&self.registry, parent, target)?,
+                LiveNamespaceBinding {
+                    namespace_path: path.clone(),
+                    transport: target.transport,
+                    nqn: target.nqn.clone(),
+                    uuid: target.uuid,
+                    nsid: target.nsid,
+                    bytes: target.bytes,
+                    block_size: target.block_size,
+                    access,
+                    spdk: None,
+                },
+            ));
+        }
+        self.registry
+            .connect(target, host_nqn, host_id, access, deadline)
+    }
+
     /// Must run on a bounded setup worker, never the reactor. Existing in-flight
     /// requests for this exact target wait for the one shared connection.
     pub fn get_or_connect(
@@ -313,7 +516,7 @@ impl LiveControllerPool {
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        self.acquire_inner(target, host_nqn, host_id, access, deadline, false)
+        self.acquire_inner(target, host_nqn, host_id, access, deadline, false, None)
     }
 
     pub fn acquire_shared(
@@ -328,9 +531,37 @@ impl LiveControllerPool {
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        self.acquire_inner(target, host_nqn, host_id, access, deadline, true)
+        self.acquire_inner(target, host_nqn, host_id, access, deadline, true, None)
     }
 
+    /// A non-permanent export must be pinned before creating its controller.
+    /// Hits share the entry's existing token, including across reader/writer
+    /// sessions. Permanent exports keep the unpinned acquisition path.
+    pub(crate) fn acquire_pinned(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        access: LiveNamespaceAccess,
+        deadline: Instant,
+        request: LiveExportPinRequest<'_>,
+    ) -> io::Result<(
+        Arc<LiveControllerLease>,
+        LivePoolAcquisition,
+        LivePoolTimings,
+    )> {
+        self.acquire_inner(
+            target,
+            host_nqn,
+            host_id,
+            access,
+            deadline,
+            false,
+            Some(request),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn acquire_inner(
         &self,
         target: &LiveConnectTarget,
@@ -339,6 +570,7 @@ impl LiveControllerPool {
         access: LiveNamespaceAccess,
         deadline: Instant,
         shared: bool,
+        pin_request: Option<LiveExportPinRequest<'_>>,
     ) -> io::Result<(
         Arc<LiveControllerLease>,
         LivePoolAcquisition,
@@ -349,6 +581,13 @@ impl LiveControllerPool {
             host_nqn: host_nqn.to_owned(),
             host_id,
             access,
+            file: pin_request.as_ref().map(|request| {
+                (
+                    request.segment.partition,
+                    request.segment.epoch,
+                    request.segment.file_index,
+                )
+            }),
         };
         if shared {
             identity.target.nsid = 0;
@@ -401,14 +640,14 @@ impl LiveControllerPool {
                         return Err(timeout());
                     }
                 }
-                Some(Entry::Quarantined) => {
+                Some(Entry::Quarantined { .. }) => {
                     return Err(invalid("connection outcome remains quarantined"));
                 }
                 None => {
                     if state
                         .entries
                         .values()
-                        .filter(|e| matches!(e, Entry::Pending(_) | Entry::Quarantined))
+                        .filter(|e| matches!(e, Entry::Pending(_) | Entry::Quarantined { .. }))
                         .count()
                         >= self.max_pending
                     {
@@ -442,10 +681,41 @@ impl LiveControllerPool {
             }
         }
         drop(state);
+        let mut export_pin = if let Some(request) = &pin_request {
+            let control = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| invalid("controller pool poisoned"))?;
+                state
+                    .owners
+                    .entry(request.recipe.key.clone())
+                    .or_insert_with(|| Arc::new(LiveExportPinControl::new(request.recipe.clone())))
+                    .clone()
+            };
+            match control.acquire(request) {
+                Ok(pin) => Some(pin),
+                Err(error) => {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| invalid("controller pool poisoned"))?;
+                    if error.outcome_unknown {
+                        state
+                            .entries
+                            .insert(key.clone(), Entry::Quarantined { _export_pin: None });
+                    } else {
+                        state.entries.remove(&key);
+                    }
+                    self.changed.notify_all();
+                    return Err(error.error);
+                }
+            }
+        } else {
+            None
+        };
         let started = Instant::now();
-        let result = self
-            .registry
-            .connect(target, host_nqn, host_id, access, deadline);
+        let result = self.connect(target, host_nqn, host_id, access, deadline);
         let connect_time = started.elapsed();
         let mut state = self
             .state
@@ -460,7 +730,11 @@ impl LiveControllerPool {
                     resolver: controller.resolver(),
                     namespaces: Mutex::new(HashMap::new()),
                     #[cfg(test)]
-                    local_fixture: false,
+                    local_fixture: self
+                        .local_targets
+                        .lock()
+                        .map_err(|_| invalid("local target map poisoned"))?
+                        .contains_key(&target.nqn),
                 });
                 state.entries.insert(
                     key,
@@ -469,6 +743,7 @@ impl LiveControllerPool {
                         lease: lease.clone(),
                         controller,
                         usable: true,
+                        export_pin,
                     },
                 );
                 self.changed.notify_all();
@@ -480,9 +755,39 @@ impl LiveControllerPool {
                 // or a late worker, not just timeouts. An unreadable registry
                 // is also unknown; release capacity only on confirmed absence.
                 if !matches!(self.registry.has_intent(&target.nqn, host_nqn), Ok(false)) {
-                    state.entries.insert(key, Entry::Quarantined);
+                    state.entries.insert(
+                        key,
+                        Entry::Quarantined {
+                            _export_pin: export_pin,
+                        },
+                    );
                 } else {
-                    state.entries.remove(&key);
+                    drop(state);
+                    // No kernel intent exists: the failed connect left no
+                    // controller. Keep a failed release quarantined and bounded.
+                    if let Some(pin) = &mut export_pin
+                        && let Err(release) = pin.release()
+                    {
+                        self.state
+                            .lock()
+                            .map_err(|_| invalid("controller pool poisoned"))?
+                            .entries
+                            .insert(
+                                key,
+                                Entry::Quarantined {
+                                    _export_pin: export_pin,
+                                },
+                            );
+                        self.changed.notify_all();
+                        return Err(release);
+                    }
+                    self.state
+                        .lock()
+                        .map_err(|_| invalid("controller pool poisoned"))?
+                        .entries
+                        .remove(&key);
+                    self.changed.notify_all();
+                    return Err(error);
                 }
                 self.changed.notify_all();
                 Err(error)
@@ -497,6 +802,7 @@ impl LiveControllerPool {
                 identity,
                 lease,
                 controller,
+                export_pin,
                 ..
             }) => {
                 lease
@@ -504,9 +810,14 @@ impl LiveControllerPool {
                     .lock()
                     .map_err(|_| invalid("namespace map poisoned"))?
                     .clear();
-                state
-                    .entries
-                    .insert(key.to_owned(), Entry::Closing { identity, lease });
+                state.entries.insert(
+                    key.to_owned(),
+                    Entry::Closing {
+                        identity,
+                        lease,
+                        export_pin,
+                    },
+                );
                 Ok(controller)
             }
             Some(other) => {
@@ -528,14 +839,49 @@ impl LiveControllerPool {
         delete: impl FnOnce(&mut LiveController) -> io::Result<()>,
     ) -> io::Result<(MutexGuard<'a, State>, io::Result<()>)> {
         drop(state);
-        let result = delete(&mut controller);
+        let mut result = delete(&mut controller);
+        if result.is_ok() {
+            let mut export_pin = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| invalid("controller pool poisoned"))?;
+                match state.entries.get_mut(key) {
+                    Some(Entry::Closing { export_pin, .. }) => export_pin.take(),
+                    _ => return Err(invalid("closing controller disappeared")),
+                }
+            };
+            // The controller is confirmed gone before the owner can reap its
+            // export. Both operations run outside the pool's accounting lock.
+            if let Some(pin) = &mut export_pin {
+                result = pin.release();
+            }
+            if result.is_err() {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| invalid("controller pool poisoned"))?;
+                if let Some(Entry::Closing {
+                    export_pin: retained,
+                    ..
+                }) = state.entries.get_mut(key)
+                {
+                    *retained = export_pin;
+                }
+            }
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| invalid("controller pool poisoned"))?;
         if result.is_ok() {
             state.entries.remove(key);
-        } else if let Some(Entry::Closing { identity, lease }) = state.entries.remove(key) {
+        } else if let Some(Entry::Closing {
+            identity,
+            lease,
+            export_pin,
+        }) = state.entries.remove(key)
+        {
             state.entries.insert(
                 key.to_owned(),
                 Entry::Ready {
@@ -543,6 +889,7 @@ impl LiveControllerPool {
                     lease,
                     controller,
                     usable: false,
+                    export_pin,
                 },
             );
         }
@@ -559,7 +906,7 @@ impl LiveControllerPool {
             .map_err(|_| invalid("controller pool poisoned"))?;
         for entry in state.entries.values() {
             match entry {
-                Entry::Pending(_) | Entry::Quarantined | Entry::Closing { .. } => {
+                Entry::Pending(_) | Entry::Quarantined { .. } | Entry::Closing { .. } => {
                     return Err(full());
                 }
                 Entry::Ready { lease, .. } if !idle(lease) => {
@@ -586,6 +933,11 @@ impl LiveControllerPool {
 
 impl Drop for LiveControllerPool {
     fn drop(&mut self) {
+        // Pool destruction is blocking, like explicit shutdown. Do not release
+        // a pin after an uncertain delete; the next epoch fence reclaims it.
+        if let Err(error) = self.shutdown(Instant::now() + Duration::from_secs(30)) {
+            eprintln!("live controller pool cleanup failed; pins retained until fence: {error}");
+        }
         let Ok(state) = self.state.get_mut() else {
             std::process::abort()
         };
@@ -594,7 +946,7 @@ impl Drop for LiveControllerPool {
         if state.entries.values().any(|entry| match entry {
             Entry::Pending(_) => true,
             // Nothing can open I/O on a controller whose delete was started.
-            Entry::Quarantined | Entry::Closing { .. } => false,
+            Entry::Quarantined { .. } | Entry::Closing { .. } => false,
             Entry::Ready { lease, .. } => !idle(lease),
         }) {
             std::process::abort();
@@ -707,6 +1059,7 @@ mod tests {
             host_nqn: "nqn.2026-01.test:host".into(),
             host_id: [2; 16],
             access: LiveNamespaceAccess::ReadWrite,
+            file: None,
         };
         pool.state
             .lock()
@@ -740,7 +1093,7 @@ mod tests {
             .lock()
             .unwrap()
             .entries
-            .insert(target.nqn.clone(), Entry::Quarantined);
+            .insert(target.nqn.clone(), Entry::Quarantined { _export_pin: None });
         assert!(
             matches!(pool.get_or_connect(&other, "nqn.2026-01.test:host", [2;16], LiveNamespaceAccess::ReadWrite, deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
         );
@@ -761,7 +1114,7 @@ mod tests {
         );
         assert!(matches!(
             pool.state.lock().unwrap().entries.get(&target.nqn),
-            Some(Entry::Quarantined)
+            Some(Entry::Quarantined { .. })
         ));
         assert!(matches!(pool.shutdown(deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
         std::fs::remove_file(journal).unwrap();
@@ -845,6 +1198,7 @@ mod tests {
             host_nqn: "nqn.2026-01.test:host".into(),
             host_id: [2; 16],
             access: LiveNamespaceAccess::ReadWrite,
+            file: None,
         };
         pool.state.lock().unwrap().entries.insert(
             nqn.into(),
@@ -853,6 +1207,7 @@ mod tests {
                 lease,
                 controller: LiveController::deleted_for_test(&pool.registry, dir, &target).unwrap(),
                 usable: true,
+                export_pin: None,
             },
         );
         target
@@ -897,6 +1252,13 @@ mod tests {
         assert!(matches!(
             pool.get_or_connect(&target, "nqn.2026-01.test:host", [2; 16], LiveNamespaceAccess::ReadWrite, deadline),
             Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
+
+        // Poison cleanup must not retry another lane's uncertain delete.
+        pool.drain_idle(deadline).unwrap();
+        assert!(matches!(
+            pool.state.lock().unwrap().entries.get(&key),
+            Some(Entry::Ready { usable: false, .. })
         ));
 
         // Retry through shutdown deletes it and removes the entry.

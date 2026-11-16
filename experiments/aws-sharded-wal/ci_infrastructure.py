@@ -58,11 +58,9 @@ def compact_policy(statements):
 def baseline_commands(account, region):
     common = ['uvx', 'iam-policy-autopilot==0.3.0', 'generate-policies']
     groups = {
-        'launcher': ['ci_campaign.py', 'ci_budget.py', 'ci_watchdog.py'],
-        'controller': ['atomic_start.py', 'sui_checkpoint.py', 'guest.py', 'checkpoint_kv.py'],
-        # The storage guest only retrieves its immutable bootstrap and emits proof;
-        # its policy is narrowed further below despite the shared dispatcher source.
-        'storage': ['atomic_start.py'],
+        'launcher': ['ci_campaign.py', 'ci_budget.py', 'ci_watchdog.py', '../kv-comparison/ci_campaign.py'],
+        'controller': ['../kv-comparison/cloud_controller.py', '../kv-comparison/cloud_bootstrap.py'],
+        'storage': ['../kv-comparison/cloud_bootstrap.py'],
         'watchdog': ['ci_watchdog.py'],
     }
     return {name: common + [str((HERE / path).resolve()) for path in paths]
@@ -88,8 +86,6 @@ def scoped_policy(actions, role, *, account, region, bucket, stack, regions, ins
         owned['StringEquals']['ec2:ResourceTag/RunId'] = '${aws:PrincipalTag/RunId}'
     for action in sorted(actions):
         service, method = action.split(':', 1)
-        if role == 'input' and action not in ('s3:GetObject', 'sts:GetCallerIdentity'):
-            continue
         # The deployed bucket uses SSE-S3 and no Object Lambda, ACL or Object
         # Lock APIs. Autopilot includes these conditional API variants; retain
         # the raw baseline for review, but do not grant inapplicable variants.
@@ -110,8 +106,6 @@ def scoped_policy(actions, role, *, account, region, bucket, stack, regions, ins
                     condition = {'StringLike': {'s3:prefix': ['${aws:PrincipalTag/RunId}', '${aws:PrincipalTag/RunId}/*']}}
             else:
                 resource = node_prefix if role in ('controller', 'storage') else f'arn:aws:s3:::{bucket}/*'
-                if role == 'input':
-                    resource = f'arn:aws:s3:::{bucket}/fixtures/sui-genesis-1775/fixture.tar.gz'
                 if role == 'watchdog':
                     resource = f'arn:aws:s3:::{bucket}/ci/watchdog/*'
                 if role == 'storage' and method not in ('GetObject', 'PutObject', 'AbortMultipartUpload', 'ListMultipartUploadParts'):
@@ -235,7 +229,7 @@ def template(args, policies):
             {'Id': 'expire-old-ledger-versions', 'Status': 'Enabled', 'Prefix': 'ci-control/budget/', 'NoncurrentVersionExpiration': {'NoncurrentDays': 30}},
             {'Id': 'expire-old-report-versions', 'Status': 'Enabled', 'Prefix': 'ci-control/reports/', 'NoncurrentVersionExpiration': {'NoncurrentDays': 30}},
             {'Id': 'expire-watchdog-receipts', 'Status': 'Enabled', 'Prefix': 'ci/watchdog/', 'ExpirationInDays': 30, 'NoncurrentVersionExpiration': {'NoncurrentDays': 7}},
-        ]}, 'Tags': tags}, 'Private retained fixture, exact run evidence and never-expiring active cost ledger.', ['Retain fixtures and current ledger; only temporary run evidence expires.'])
+        ]}, 'Tags': tags}, 'Exact run evidence and never-expiring active cost ledger.', ['Retain current ledger; only temporary run evidence expires.'])
     resources['Results'].update(DeletionPolicy='Retain', UpdateReplacePolicy='Retain')
     add('ResultsTls', 'AWS::S3::BucketPolicy', {'Bucket': {'Ref': 'Results'}, 'PolicyDocument': {
         'Version': '2012-10-17', 'Statement': [{'Effect': 'Deny', 'Principal': '*', 'Action': 's3:*',
@@ -270,13 +264,13 @@ def template(args, policies):
         'ManagedPolicyName': stack + '-guest-boundary', 'PolicyDocument': boundary},
         'Fixed upper bound for temporary guest roles; run identity comes from trusted role tags.',
         ['Guest roles cannot alter this boundary; run inputs and partition writes are narrowed by their inline policy.'])
-    for role in ('launcher', 'input', 'watchdog'):
+    for role in ('launcher', 'watchdog'):
         logical = role.title() + 'Role'
-        if role in ('launcher', 'input'):
+        if role == 'launcher':
             trust = {'Version': '2012-10-17', 'Statement': [{'Effect': 'Allow', 'Principal': {'Federated': {'Ref': 'GitHubOidc'}},
                 'Action': 'sts:AssumeRoleWithWebIdentity', 'Condition': {'StringEquals': {
                     'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-                    'token.actions.githubusercontent.com:sub': args.oidc_subject + ('-inputs' if role == 'input' else '')}}}]}
+                    'token.actions.githubusercontent.com:sub': args.oidc_subject}}}]}
         else:
             trust = {'Version': '2012-10-17', 'Statement': [{'Effect': 'Allow',
                 'Principal': {'Service': 'lambda.amazonaws.com'}, 'Action': 'sts:AssumeRole'}]}
@@ -321,7 +315,6 @@ def template(args, policies):
         'Resources': resources,
         'Outputs': {name: {'Value': value, 'Description': description} for name, value, description in [
             ('RoleArn', {'Fn::GetAtt': ['LauncherRole', 'Arn']}, 'AWS_BENCH_ROLE_ARN'),
-            ('InputRoleArn', {'Fn::GetAtt': ['InputRole', 'Arn']}, 'AWS_BENCH_INPUT_ROLE_ARN'),
             ('Bucket', {'Ref': 'Results'}, 'AWS_BENCH_BUCKET'), ('BucketRegion', {'Ref': 'AWS::Region'}, 'AWS_BENCH_BUCKET_REGION'),
             ('GuestBoundaryArn', {'Ref': 'GuestBoundary'}, 'AWS_BENCH_GUEST_BOUNDARY_ARN'),
             ('WatchdogFunction', {'Ref': 'Watchdog'}, 'AWS_BENCH_WATCHDOG_FUNCTION'), ('WatchdogRule', {'Ref': 'ExpiryRule'}, 'AWS_BENCH_WATCHDOG_RULE'),
@@ -336,7 +329,7 @@ def main():
     parser.add_argument('--stack', default='tidehunter-aws-benchmarks')
     parser.add_argument('--bucket', required=True)
     parser.add_argument('--oidc-subject', default=SUBJECT)
-    parser.add_argument('--config', type=Path, default=HERE / 'ci-config.json')
+    parser.add_argument('--config', type=Path, default=HERE.parent / 'kv-comparison/ci-config.json')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--profile', help='Optional admin profile for read-only managed-policy discovery; never used by CI')
     args = parser.parse_args()
@@ -389,10 +382,6 @@ def main():
         policies[role] = scoped_policy(actions, role, account=args.account, region=args.region, bucket=args.bucket,
                                       stack=args.stack, regions=config['regions'], instance_types=config['instance_types'])
         save(args.output / (role + '.scoped.json'), policies[role])
-    policies['input'] = scoped_policy(policy_actions(json.loads((args.output / 'storage.baseline.json').read_text())),
-        'input', account=args.account, region=args.region, bucket=args.bucket, stack=args.stack,
-        regions=config['regions'], instance_types=config['instance_types'])
-    save(args.output / 'input.scoped.json', policies['input'])
     rendered = template(args, policies)
     payload = json.dumps(rendered, separators=(',', ':')) + '\n'
     if len(payload.encode()) > 51200:

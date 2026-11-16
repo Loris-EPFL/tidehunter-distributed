@@ -1575,10 +1575,10 @@ class CapsuleAndExportTests(unittest.TestCase):
         root = Path(config["fleet"]["data_root"]) / "cells" / case
         launch = {"ready_file": str(root / "node-0/ready"), "stop_file": str(root / "node-0/stop"),
             "node": {"root": str(root / "node-0/storage")}, "listen": "10.0.0.2:9400",
-            "tls": {"transport": {"kind": "tcp"}, "ca": str(root / "tls/ca.der"),
-                    "cert": str(root / "tls/tidehunter-node-0.der"), "key": str(root / "tls/tidehunter-node-0.pk8")}}
+            "tls": {"transport": {"kind": "tcp"}, "ca": str(root / "node-0/tls/ca.der"),
+                    "cert": str(root / "node-0/tls/tidehunter-node-0.der"), "key": str(root / "node-0/tls/tidehunter-node-0.pk8")}}
         controller.validate_launch(config, launch, case, 0)
-        for mutation in (lambda x: x["tls"].update(key=str(root / "tls/ca.key")),
+        for mutation in (lambda x: x["tls"].update(key=str(root / "node-0/tls/ca.key")),
                          lambda x: x["node"].update(root="/mnt/foreign/storage")):
             broken = copy.deepcopy(launch)
             mutation(broken)
@@ -1607,8 +1607,8 @@ class CapsuleAndExportTests(unittest.TestCase):
                      "live_target": controller.live_target_for_owner(config, case, 0, "tcp",
                          "nqn.2014-08.org.nvmexpress:uuid:12345678-1234-4234-8234-123456789abc")},
             "listen": "10.0.0.2:9400",
-            "tls": {"transport": {"kind": "tcp"}, "ca": str(root / "tls/ca.der"),
-                    "cert": str(root / "tls/tidehunter-node-0.der"), "key": str(root / "tls/tidehunter-node-0.pk8")}}
+            "tls": {"transport": {"kind": "tcp"}, "ca": str(root / "node-0/tls/ca.der"),
+                    "cert": str(root / "node-0/tls/tidehunter-node-0.der"), "key": str(root / "node-0/tls/tidehunter-node-0.pk8")}}
         controller.validate_launch(config, launch, case, 0)
         for field, value in (("state_dir", "/tmp/foreign"), ("address", "10.0.0.3"),
                              ("host_nqn", "nqn.foreign"), ("port_id", 999)):

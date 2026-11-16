@@ -221,15 +221,6 @@ class ConfigTests(unittest.TestCase):
                 with self.subTest(repeats=repeats, replacement=replacement), self.assertRaises(ValueError):
                     self.config(matrix=spec | {'repeats': repeats} | replacement)
 
-    def test_real_sui_loader_still_refuses_three_hour_config(self):
-        old = ci.core.read_json(ci.OLD / 'ci-config.json')
-        old['ttl_seconds'] = 10800
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / 'cfg.json'
-            ci.core.dump(path, old)
-            with self.assertRaises(ValueError):
-                ci.core.load_config(path, ENV)
-
     def test_prepared_source_failure_precedes_any_aws_client(self):
         with patch.object(ci.ci_prepare, 'admit_inputs', side_effect=ValueError('stale source')), \
                 patch.object(ci.core, 'AWS') as aws:

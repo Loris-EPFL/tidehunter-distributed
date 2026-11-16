@@ -1,14 +1,10 @@
-"""Bounded checkpoint cells and fail-closed EFA hardware activity evidence."""
+"""Shared transport identities and fail-closed EFA hardware activity evidence."""
 from pathlib import Path
-import json
 import re
 import time
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-FABRIC_LOCAL_PREFIX = b'TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS'
+
 
 # Application transport names are not necessarily libfabric fabric names:
 # efa-native uses the direct adapter without the software TLS stream.
@@ -31,171 +27,27 @@ def fabric_name(transport):
     return 'efa-direct' if transport in DIRECT_TRANSPORTS else 'efa'
 
 
-def parse_fabric_local_diagnostics(stream, *, max_bytes=128 * 1024**2, max_records=4096):
-    """Parse finalized local provider windows, never infer wire or latency facts."""
-    records, windows, consumed = [], set(), 0
-    counters = ('data_posts', 'credit_posts', 'piggyback_advances')
-    reasons = {'profile-reset', 'profile-disable', 'session-abort', 'session-drop'}
-    def unique_pairs(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError('duplicate fabric local diagnostic JSON key')
-            result[key] = value
-        return result
-    while True:
-        line = stream.readline(65537)
-        if not line:
-            break
-        consumed += len(line)
-        if consumed > max_bytes or len(line) > 65536:
-            raise ValueError('fabric local diagnostic log exceeds bounded scan/line size')
-        if not line.startswith(FABRIC_LOCAL_PREFIX):
-            continue
-        if not line.endswith(b'\n') or len(records) >= max_records:
-            raise ValueError('truncated or excessive fabric local diagnostic records')
-        try:
-            record = json.loads(line[len(FABRIC_LOCAL_PREFIX):].decode(), object_pairs_hook=unique_pairs)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError('malformed fabric local diagnostic JSON') from error
-        if (not isinstance(record, dict)
-                or set(record) != {'schema', 'reason', 'window', *counters, 'peer'}
-                or type(record['schema']) is not int or record['schema'] != 1
-                or not isinstance(record['reason'], str) or record['reason'] not in reasons
-                or any(type(record[key]) is not int or not 0 <= record[key] <= 2**64 - 1
-                       for key in ('window', *counters))
-                or record['window'] == 0 or record['window'] in windows
-                or record['piggyback_advances'] > record['data_posts']
-                or not any(record[key] for key in counters)
-                or (record['peer'] is not None and (not isinstance(record['peer'], str)
-                    or not 1 <= len(record['peer']) <= 256
-                    or any(ord(char) < 32 for char in record['peer'])))):
-            raise ValueError('fabric local diagnostic schema/window/counter identity differs')
-        windows.add(record['window'])
-        records.append(record)
-    return dict(available=bool(records), records=records, record_count=len(records),
-                totals={key: sum(record[key] for record in records) for key in counters} if records else None,
-                scope='finalized local endpoint profile-window deltas; may include control messages; not packets per RPC, pure wire, RTT or latency',
-                completeness='only emitted finalized windows; SIGTERM may bypass abort/drop')
-
-
-def fabric_local_log(path, *, required=False, forbidden=False):
-    path = Path(path)
-    with path.open('rb') as stream:
-        result = parse_fabric_local_diagnostics(stream)
-    return validate_fabric_local_population(result, str(path), required, forbidden)
-
-
-def validate_fabric_local_population(result, source, required=False, forbidden=False):
-    if required and not result['available']:
-        raise ValueError('required finalized diagnostic EFA-direct window missing: ' + source)
-    if forbidden and result['available']:
-        raise ValueError('clean or non-direct population contains local fabric diagnostics: ' + source)
-    return result | dict(source=source, required=required,
-        unavailable_reason=None if result['available'] else
-        'no emitted nonzero finalized direct window; SIGTERM may bypass abort/drop')
-
-
-def fabric_local_archive_log(archive, name, *, required=False, forbidden=False):
-    members = [member for member in archive.getmembers() if member.name == name]
-    if len(members) != 1 or not members[0].isfile() or members[0].size > 128 * 1024**2:
-        raise ValueError('missing, duplicate, nonregular or oversized diagnostic stderr: ' + name)
-    with archive.extractfile(members[0]) as stream:
-        result = parse_fabric_local_diagnostics(stream)
-    return validate_fabric_local_population(result, name, required, forbidden)
+def fabric_preflight(output, transport='efa'):
+    import os
+    import resource
+    import shutil
+    import subprocess
+    if transport not in HARDWARE_TRANSPORTS:
+        raise ValueError('hardware fabric preflight requires an EFA transport')
+    resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    os.environ.update(FI_EFA_USE_DEVICE_RDMA='1', FI_EFA_ENABLE_SHM_TRANSFER='0')
+    executable = shutil.which('fi_info') or '/opt/amazon/efa/bin/fi_info'
+    result = subprocess.run([executable, '-p', 'efa', '-f', fabric_name(transport), '-t', 'FI_EP_RDM'],
+                            capture_output=True, timeout=30)
+    (output / 'efa-provider.txt').write_bytes(result.stdout + result.stderr)
+    if result.returncode:
+        raise RuntimeError(f'{transport} requires an available hardware EFA RDM fabric; no transport fallback')
+    validate_provider(result.stdout.decode(), transport)
 
 
 
-def matrix_plan(cfg):
-    if {'shard_cache_mib', 'shard_cache_mib_by_repetition'} & cfg.keys():
-        raise ValueError('owner cache configuration is obsolete')
-    if 'resident_reads' in (cfg.get('kv_suite') or {}):
-        raise ValueError('registered value reads are obsolete')
-    transports = cfg.get('transports')
-    repetitions = cfg.get('repetitions')
-    if ('transport' in cfg or not isinstance(transports, list) or not transports
-            or any(value not in TRANSPORTS for value in transports)
-            or len(set(transports)) != len(transports)
-            or type(repetitions) is not int or not 1 <= repetitions <= 4):
-        raise ValueError('require distinct TCP/EFA transports and repetitions 1..4; singular transport is obsolete')
-    limits = cfg.get('read_profile_limits')
-    if ('read_profile_limit' in cfg or not isinstance(limits, list)
-            or len(limits) != repetitions
-            or any(type(limit) is not int or not 0 <= limit <= 65536 for limit in limits)):
-        raise ValueError('require read_profile_limits with one integer 0..65536 per repetition; singular limit is obsolete')
-    # Historical retained campaigns predate write sampling; omission disables it.
-    write_limits = cfg.get('write_profile_limits', [0] * repetitions)
-    if ('write_profile_limit' in cfg or not isinstance(write_limits, list)
-            or len(write_limits) != repetitions
-            or any(type(limit) is not int or not 0 <= limit <= 65536 for limit in write_limits)):
-        raise ValueError('require write_profile_limits with one integer 0..65536 per repetition')
-    native_limits = cfg.get('native_write_profile_limits', [0] * repetitions)
-    if ('native_write_profile_limit' in cfg or not isinstance(native_limits, list)
-            or len(native_limits) != repetitions
-            or any(type(limit) is not int or not 0 <= limit <= 65536 for limit in native_limits)):
-        raise ValueError('require native_write_profile_limits with one integer 0..65536 per repetition')
-    cache_budgets = {}
-    for name, default in (('coordinator_cache_mib', 8),):
-        budgets = cfg.get(name + '_by_repetition', [cfg.get(name, default)] * repetitions)
-        if (not isinstance(budgets, list) or len(budgets) != repetitions
-                or any(type(value) is not int or not 0 <= value <= 128 for value in budgets)):
-            raise ValueError('cache schedules require one integer 0..128 MiB per repetition')
-        cache_budgets[name] = budgets
-    cells = [dict(cell_id=f'r{repeat + 1:02d}-{transport}', repetition=repeat + 1,
-                  transport=transport, ordinal=ordinal, read_profile_limit=limits[repeat],
-                  write_profile_limit=write_limits[repeat], native_write_profile_limit=native_limits[repeat],
-                  **{name: budgets[repeat] for name, budgets in cache_budgets.items()})
-             for ordinal, (repeat, transport) in enumerate(
-                 ( (repeat, transport) for repeat in range(repetitions)
-                   for transport in (transports if repeat % 2 == 0 else transports[::-1]) ))]
-    return cells
-
-def historical_matrix_plan(cfg):
-    """Decode the retired owner-cache/grant schema of frozen campaigns only."""
-    from resident_config import resident_read_config
-
-    clean = {key: value for key, value in cfg.items()
-             if key not in ('shard_cache_mib', 'shard_cache_mib_by_repetition')}
-    clean['kv_suite'] = {key: value for key, value in (cfg.get('kv_suite') or {}).items()
-                         if key != 'resident_reads'}
-    cells = matrix_plan(clean)
-    repetitions = cfg['repetitions']
-    budgets = cfg.get('shard_cache_mib_by_repetition', [cfg.get('shard_cache_mib', 0)] * repetitions)
-    if (not isinstance(budgets, list) or len(budgets) != repetitions
-            or any(type(value) is not int or not 0 <= value <= 128 for value in budgets)):
-        raise ValueError('historical owner cache schedule is invalid')
-    resident = resident_read_config((cfg.get('kv_suite') or {}).get('resident_reads'))
-    for cell in cells:
-        cell['shard_cache_mib'] = budgets[cell['repetition'] - 1]
-    if (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
-        limits = cfg['read_profile_limits']
-        if (repetitions != 3 or limits[:2] != [0, 0] or limits[2] == 0
-                or cfg.get('write_profile_limits', [0] * repetitions) != limits
-                or cfg.get('native_write_profile_limits', [0] * repetitions) != limits
-                or [cell['coordinator_cache_mib'] for cell in cells if cell['transport'] == cfg['transports'][0]] != [0, 8, 0]
-                or budgets != [8, 8, 8] or not resident['destination_slots'] or not resident['require_device_read']):
-            raise ValueError('historical hardware matrix policy differs')
-        focused = []
-        for cell in cells:
-            if cell['repetition'] == 3 and cell['transport'] != 'efa-native':
-                continue
-            focused.append(cell)
-            if cell['transport'] == 'efa-native':
-                focused.append(cell | dict(cell_id=cell['cell_id'] + '-rma', resident_reads=dict(resident)))
-        for ordinal, cell in enumerate(focused):
-            cell['ordinal'] = ordinal
-        return focused
-    if resident['destination_slots']:
-        for cell in cells:
-            if cell['transport'] == 'efa-native':
-                cell['resident_reads'] = dict(resident)
-    return cells
 
 
-def check_cell(cell_id, transport):
-    if (transport not in TRANSPORTS or not isinstance(cell_id, str)
-            or not re.fullmatch(r'r0[1-4]-' + transport + (r'(?:-rma)?' if transport == 'efa-native' else ''), cell_id)):
-        raise ValueError('invalid checkpoint cell identity')
 
 
 def validate_provider(text, transport=None):
@@ -271,95 +123,3 @@ def efa_proof(before, after, identity):
                 scope='host-wide EFA hardware activity during this cell; not pure-wire timing or process attribution')
 
 
-def validate_efa_proof(proof, identity):
-    if proof != efa_proof(proof['before'], proof['after'], identity):
-        raise ValueError('EFA proof totals/identity differ from raw snapshots')
-
-
-def validate_matrix(cfg, cells):
-    return _validate_matrix(cfg, cells, matrix_plan(cfg), historical=False)
-
-
-def validate_historical_matrix(cfg, cells):
-    """Validate retained historical reports without admitting old runtime controls."""
-    return _validate_matrix(cfg, cells, historical_matrix_plan(cfg), historical=True)
-
-
-def _validate_matrix(cfg, cells, plan, *, historical):
-    if len(cells) != len(plan):
-        raise ValueError('matrix misses requested cells')
-    hashes, namespace_ids = set(), set()
-    namespaces = None
-    for planned, cell in zip(plan, cells):
-        if not historical and {'resident_reads', 'shard_cache_mib'} & cell.keys():
-            raise ValueError('matrix cell contains obsolete owner-cache or registered-read policy')
-        if (type(cell.get('read_profile_limit')) is not int
-                or type(cell.get('write_profile_limit', 0)) is not int
-                or type(cell.get('native_write_profile_limit', 0)) is not int
-                or type(cell.get('coordinator_cache_mib')) is not int):
-            raise ValueError('matrix cell profile limits and cache budgets must be integers')
-        if historical and (type(cell.get('shard_cache_mib')) is not int
-                           or cell.get('resident_reads') != planned.get('resident_reads')):
-            raise ValueError('historical matrix owner-cache or registered-read policy differs')
-        if any(cell.get(key, 0 if key in ('write_profile_limit', 'native_write_profile_limit') else None) != value
-               for key, value in planned.items()) or cell.get('complete') is not True:
-            raise ValueError('matrix cell missing, reordered, mismatched or incomplete')
-        if cell.get('build_manifest_sha256') != cfg['build_manifest_sha256'] or cell.get('binaries') != cfg['binaries']:
-            raise ValueError('matrix cell source differs')
-        for key in ('fixture_bundle', 'verification_bundle', 'source_archive_sha256', 'source_manifest_sha256'):
-            if cell.get(key) != cfg[key]:
-                raise ValueError('matrix immutable input differs: ' + key)
-        for key in ('replay_evidence_sha256', 'resources_sha256'):
-            if not re.fullmatch(r'[0-9a-f]{64}', cell.get(key, '')):
-                raise ValueError('matrix misses paired replay/resource evidence')
-        identities = cell.get('namespace_ids', {})
-        if not identities or (namespaces is not None and set(identities) != namespaces):
-            raise ValueError('matrix namespace/schema coverage differs')
-        namespaces = set(identities)
-        for identity in identities.values():
-            if (not isinstance(identity, list) or len(identity) != 16
-                    or any(type(value) is not int or not 0 <= value <= 255 for value in identity)
-                    or tuple(identity) in namespace_ids):
-                raise ValueError('matrix reuses namespace database identity')
-            namespace_ids.add(tuple(identity))
-        digest = cell.get('config_sha256', '')
-        if not re.fullmatch(r'[0-9a-f]{64}', digest) or digest in hashes:
-            raise ValueError('matrix reuses an old namespace/config identity')
-        hashes.add(digest)
-        expected_hosts = {cfg['coordinator_instance_id'], *(node['instance_id'] for node in cfg['nodes'])}
-        if set(cell.get('node_archives', {})) != {node['instance_id'] for node in cfg['nodes']}:
-            raise ValueError('matrix misses node archives')
-        for instance_id, receipt in cell['node_archives'].items():
-            partition = next(node['partition'] for node in cfg['nodes'] if node['instance_id'] == instance_id)
-            key = f"{cfg['s3_prefix']}/results/cells/{cell['cell_id']}/storage/{partition}/final/evidence.tar.gz"
-            if receipt.get('key') != key or receipt.get('bucket') != cfg['bucket'] or not re.fullmatch(r'[0-9a-f]{64}', receipt.get('sha256', '')):
-                raise ValueError('matrix node archive belongs to another cell')
-        proofs = cell.get('efa', {})
-        if set(proofs) != (expected_hosts if cell['transport'] in HARDWARE_TRANSPORTS else set()):
-            raise ValueError('matrix EFA proof misses a host or contaminates TCP control')
-        for instance_id, proof in proofs.items():
-            identity = dict(run_id=cfg['run_id'], cell_id=cell['cell_id'], instance_id=instance_id,
-                            config_sha256=digest, build_manifest_sha256=cfg['build_manifest_sha256'])
-            validate_efa_proof(proof, identity)
-
-
-def validate_placement(cfg, instances, groups):
-    expected = {cfg['coordinator_instance_id'], *(node['instance_id'] for node in cfg['nodes'])}
-    if len(instances) != 6 or {instance['InstanceId'] for instance in instances} != expected:
-        raise ValueError('placement evidence misses an exact fleet host')
-    if (len(groups) != 1 or groups[0].get('GroupName') != cfg['placement_group']
-            or groups[0].get('Strategy') != 'cluster' or groups[0].get('State') != 'available'
-            or not groups[0].get('GroupId')):
-        raise ValueError('owned named placement group is not an available cluster')
-    for instance in instances:
-        placement = instance.get('Placement', {})
-        if (placement.get('AvailabilityZone') != cfg['availability_zone']
-                or placement.get('GroupName') != cfg['placement_group']
-                or placement.get('GroupId') != groups[0]['GroupId']
-                or instance.get('InstanceType') != cfg['instance_type']):
-            raise ValueError('fleet hardware/zone/cluster placement differs')
-        if any(transport in HARDWARE_TRANSPORTS for transport in cfg['transports']) and not any(
-                nic.get('InterfaceType') == 'efa' and nic.get('Status') == 'in-use'
-                and nic.get('Attachment', {}).get('Status') == 'attached'
-                for nic in instance.get('NetworkInterfaces', [])):
-            raise ValueError('EFA matrix host lacks an attached EFA interface')

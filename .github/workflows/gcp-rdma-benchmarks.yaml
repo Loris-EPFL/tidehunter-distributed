@@ -12,20 +12,10 @@ on:
         options: [authenticate, preflight, launch]
         default: preflight
         required: true
-      suite:
-        type: choice
-        options: [kv, sui, both]
-        default: kv
-        required: true
       backends:
         description: 'Comma-separated IDs: native,tidehunter_tcp,tidehunter_verbs,tidehunter_verbs_native,tidehunter_nvme_tcp,tidehunter_nvme_rdma,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks'
         type: string
         default: 'native,tidehunter_tcp,tidehunter_verbs_native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks'
-        required: true
-      sui_transports:
-        description: 'Sui transports: tcp,tidehunter_verbs,tidehunter_verbs_native'
-        type: string
-        default: 'tcp'
         required: true
       mode:
         description: 'NVMe arms require nvmeof-focused. For portable RDMA compare native,tidehunter_tcp,tidehunter_verbs_native,tidehunter_nvme_rdma; NVMe/TCP optional.'
@@ -111,13 +101,9 @@ jobs:
       GCP_BENCH_ENABLED: ${{ vars.GCP_BENCH_ENABLED }}
       GCP_BENCH_IMAGE: ${{ vars.GCP_BENCH_IMAGE }}
       GCP_BENCH_IMAGE_QUALIFICATION: ${{ vars.GCP_BENCH_IMAGE_QUALIFICATION }}
-      SUI_TRANSPORTS: ${{ inputs.sui_transports || 'tcp' }}
       OPERATION: ${{ inputs.operation || 'launch' }}
-      SUITE: ${{ inputs.suite || 'kv' }}
       BACKENDS: ${{ inputs.backends || 'native,tidehunter_tcp,tidehunter_verbs_native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks' }}
       MATRIX_MODE: ${{ inputs.mode || 'standard' }}
-      FIXTURE_KEY: ${{ vars.GCP_BENCH_FIXTURE_KEY }}
-      FIXTURE_GENERATION: ${{ vars.GCP_BENCH_FIXTURE_GENERATION }}
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
     steps:
@@ -145,17 +131,9 @@ jobs:
       - name: Select and validate suite
         if: steps.gate.outputs.enabled == 'true'
         run: |
-          python3 engine/experiments/gcp-rdma/workflow_input.py spec --suite "$SUITE" --backends "$BACKENDS" --mode "$MATRIX_MODE" \
-            --sui-transports "$SUI_TRANSPORTS" --fixture-key "$FIXTURE_KEY" --fixture-generation "$FIXTURE_GENERATION" --output "$RUNNER_TEMP/gcp-results/spec.json"
+          python3 engine/experiments/gcp-rdma/workflow_input.py spec --suite kv --backends "$BACKENDS" --mode "$MATRIX_MODE" \
+            --output "$RUNNER_TEMP/gcp-results/spec.json"
           python3 engine/experiments/gcp-rdma/workflow_input.py policy --config "$RUNNER_TEMP/gcp-results/config.json" --budget engine/experiments/gcp-rdma/budget.json
-      - name: Checkout reviewed Sui source
-        if: steps.gate.outputs.enabled == 'true' && (env.SUITE == 'sui' || env.SUITE == 'both')
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Loris-EPFL/sui-tidehunter-distributed
-          ref: ef6701911cc07d9102f55e52f5a0632e5ddb0a86
-          path: sui
-          persist-credentials: false
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         if: steps.gate.outputs.enabled == 'true'
         with:
@@ -163,9 +141,6 @@ jobs:
           service_account: ${{ vars.GCP_BENCH_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
         if: steps.gate.outputs.enabled == 'true'
-      - name: Retrieve generation-bound real fixture
-        if: steps.gate.outputs.enabled == 'true' && (env.SUITE == 'sui' || env.SUITE == 'both')
-        run: python3 engine/experiments/gcp-rdma/workflow_input.py fixture --config engine/experiments/gcp-rdma/config.json --spec "$RUNNER_TEMP/gcp-results/spec.json" --output "$RUNNER_TEMP/gcp-fixture.tar.gz"
       - name: Prepare pinned build dependencies
         if: steps.gate.outputs.enabled == 'true'
         timeout-minutes: 40
@@ -182,13 +157,6 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         timeout-minutes: 150
         run: python3 engine/experiments/gcp-rdma/prepare.py --engine "$GITHUB_WORKSPACE/engine" --revision "$GITHUB_SHA" --output "$RUNNER_TEMP/gcp-inputs" --build-container tidehunter-gcp-build --spec "$RUNNER_TEMP/gcp-results/spec.json" --deadline 8700
-      - name: Build and audit exact Sui release against real checkpoint
-        if: steps.gate.outputs.enabled == 'true' && (env.SUITE == 'sui' || env.SUITE == 'both')
-        timeout-minutes: 150
-        env:
-          PKG_CONFIG_PATH: ${{ runner.temp }}/gcp-inputs/fabric/lib/pkgconfig
-          LD_LIBRARY_PATH: ${{ runner.temp }}/gcp-inputs/fabric/lib
-        run: python3 engine/experiments/gcp-rdma/prepare.py --output "$RUNNER_TEMP/gcp-inputs" --sui "$GITHUB_WORKSPACE/sui" --revision ef6701911cc07d9102f55e52f5a0632e5ddb0a86 --fixture "$RUNNER_TEMP/gcp-fixture.tar.gz" --target "$RUNNER_TEMP/gcp-sui-target" --deadline 8700
       - name: Seal qualified inputs for separate campaign job
         id: transfer
         if: steps.gate.outputs.enabled == 'true'
@@ -197,9 +165,6 @@ jobs:
           cp "$RUNNER_TEMP/gcp-results/spec.json" "$RUNNER_TEMP/gcp-inputs/spec.json"
           cp "$RUNNER_TEMP/gcp-results/config.json" "$RUNNER_TEMP/gcp-inputs/config.json"
           files=(package qualification package-receipt.json spec.json config.json)
-          if [ "$SUITE" = sui ] || [ "$SUITE" = both ]; then
-            files+=(sui/sui-package.tar.gz sui/verification.tar.gz)
-          fi
           tar -C "$RUNNER_TEMP/gcp-inputs" -czf "$RUNNER_TEMP/gcp-qualified.tar.gz" "${files[@]}"
           echo "sha256=$(sha256sum "$RUNNER_TEMP/gcp-qualified.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Transfer qualified current-source inputs
@@ -226,9 +191,6 @@ jobs:
             ${{ runner.temp }}/gcp-inputs/build/build.json
             ${{ runner.temp }}/gcp-inputs/build/build.log
             ${{ runner.temp }}/gcp-inputs/qualification/
-            ${{ runner.temp }}/gcp-inputs/sui/build/build-receipt.json
-            ${{ runner.temp }}/gcp-inputs/sui/build/build-manifest.json
-            ${{ runner.temp }}/gcp-inputs/sui/verification/
           if-no-files-found: warn
           retention-days: 30
 

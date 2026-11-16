@@ -509,7 +509,7 @@ pub struct LiveConnectionRegistry {
 impl LiveConnectionRegistry {
     /// Takes exclusive ownership of a private persistent directory and retires
     /// recorded controllers before returning. Host identities must be unique to
-    /// this registry; target fencing/draining must precede recovery.
+    /// this registry; authority open reconciles here before fencing the targets.
     pub fn open(directory: &Path) -> io::Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)

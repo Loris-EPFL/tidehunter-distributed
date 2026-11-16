@@ -8,7 +8,7 @@ from pathlib import Path
 import ci_prepare
 from ci_budget import load_budget
 
-SUITES = ('sui-transport', 'kv-comparison')
+SUITES = ('kv-comparison',)
 CONFIG = Path(__file__).with_name('suite.json')
 
 
@@ -27,8 +27,6 @@ def selection(path=CONFIG, override='configured', event=None):
 def settings(env, path=CONFIG):
     ci_prepare.trusted_environment(env)
     suite = selection(path, env.get('AWS_BENCH_SUITE', 'configured'), env.get('GITHUB_EVENT_NAME'))
-    if suite == 'sui-transport':
-        return ci_prepare.settings(env) | {'suite': suite}
     if env.get('AWS_BENCH_ENABLED') != 'true':
         return {'enabled': False, 'suite': suite, 'reason': 'AWS benchmarks are disarmed'}
     required = ('AWS_BENCH_ROLE_ARN', 'AWS_BENCH_BUCKET', 'AWS_BENCH_BUCKET_REGION',

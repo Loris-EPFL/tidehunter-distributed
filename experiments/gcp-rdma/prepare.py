@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Build and qualify a sealed engine checkout without cloud credentials."""
 import argparse
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -9,8 +8,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
 import time
 import uuid
 
@@ -30,8 +27,6 @@ def checkout(repo, revision, allow_dirty=False):
         raise ValueError(f'checkout {repo} must be clean and at the requested commit')
 
 def admit_selected_features(spec, manifest):
-    if spec.get('suite') == 'sui':
-        return
     profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
     if spec.get('mode') == 'focused':
         features = (cloud_package.FOCUSED_VALKEY_FEATURES if profile == 'focused_valkey'
@@ -146,8 +141,7 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
         except ValueError as exc:
             raise ValueError('manual dirty preparation requires the exact reviewed manual spec') from exc
     spec = json.loads(Path(spec_path).read_text()) if spec_path is not None else {}
-    import manual_sui
-    focused = manual_sui.focused_qualification(spec)
+    focused = spec.get('mode') == 'focused'
     focused_valkey = spec.get('selection') == 'valkey_rdma_reads'
     focused = focused or focused_valkey
     admission_options = spec.get('selection') == 'nvmeof_f9_tools'
@@ -180,7 +174,7 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     spec = None
     if spec_path is not None:
         spec = json.loads(Path(spec_path).read_text())
-        if spec.get('suite') != 'sui' and ('valkey_rdma' in spec['backends'] or
+        if ('valkey_rdma' in spec['backends'] or
                 ('valkey_tcp' in spec['backends'] and spec.get('diagnostics', {}).get('valkey_profile_limit', 0))):
             if focused_valkey:
                 valkey_source = engine.parent / 'checkpoint-work/gcp-manual-qualified-b35a62e24b47faaf/valkey-source'
@@ -286,121 +280,6 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     cloud_package.dump(output / 'package-receipt.json', receipt)
     return receipt
 
-def admit_sui_archives(bundle, verification):
-    import gcp_sui
-
-    def nested(parent, name, target):
-        with tarfile.open(parent, 'r:gz') as archive:
-            member = archive.getmember(name)
-            if not member.isfile():
-                raise ValueError('nested Sui archive is not a regular file')
-            with archive.extractfile(member) as source, target.open('xb') as destination:
-                shutil.copyfileobj(source, destination)
-        gcp_sui.inspect_archive(target)
-
-    gcp_sui.inspect_archive(bundle)
-    gcp_sui.inspect_archive(verification)
-    with tempfile.TemporaryDirectory(prefix='gcp-sui-admission-') as temporary:
-        root = Path(temporary)
-        nested(bundle, 'build-bundle.tar.gz', root / 'build.tar.gz')
-        nested(root / 'build.tar.gz', 'sources.tar.gz', root / 'sources.tar.gz')
-        gcp_sui.extract(verification, root / 'verification')
-        for contract in ('harness', 'original_default'):
-            checked = gcp_sui.verification_for_contract(root / 'verification', contract)
-            gcp_sui.inspect_archive(checked / 'evidence.tar.gz')
-        identities = []
-        with tarfile.open(root / 'build.tar.gz', 'r:gz') as archive:
-            member = archive.getmember('build-manifest.json')
-            if not member.isfile() or member.size > 1024 * 1024:
-                raise ValueError('invalid Sui build manifest')
-            manifest = json.loads(archive.extractfile(member).read())
-            binaries = manifest.get('binaries')
-            expected = {'sui-node-native', 'sui-node-remote', 'rocksdb-audit', 'storage-node', 'transport-floor', 'state-audit'}
-            if not isinstance(binaries, dict) or set(binaries) != expected:
-                raise ValueError('sealed Sui executable inventory differs')
-            for name, digest in sorted(binaries.items()):
-                member = archive.getmember('binaries/' + name)
-                if not member.isfile():
-                    raise ValueError('Sui executable must be a regular file')
-                target = root / name
-                with archive.extractfile(member) as source, target.open('xb') as destination:
-                    shutil.copyfileobj(source, destination)
-                if ci_prepare.sha(target) != digest:
-                    raise ValueError('sealed Sui executable SHA differs')
-                identities.append(cloud_package.elf_identity(target))
-                target.unlink()
-        return cloud_package.abi_requirements(identities)
-
-
-
-def prepare_sui(output, sui, revision, fixture, target, deadline_seconds, nvmeof=False):
-    output = Path(output).resolve(strict=True)
-    sui = Path(sui).resolve(strict=True)
-    checkout(ROOT, json.loads((output / 'package-receipt.json').read_text())['source_revision'])
-    checkout(sui, revision)
-    if revision != 'ef6701911cc07d9102f55e52f5a0632e5ddb0a86':
-        raise ValueError('Sui revision must be the reviewed checkpoint metrics commit')
-    if not 1800 <= deadline_seconds <= 21600:
-        raise ValueError('Sui preparation deadline must be 1800..21600 seconds')
-    spec = importlib.util.spec_from_file_location('checkpoint_ci', ROOT / 'experiments/aws-sharded-wal/ci_prepare.py')
-    ci = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ci)
-    work = output / 'sui'
-    work.mkdir(mode=0o700)
-    import gcp_sui
-    gcp_sui.inspect_archive(fixture)
-    admitted_fixture = ci.unpack_fixture(Path(fixture), work / 'fixture-input')
-    transport = ci.local_replay_transport()
-    transport_config = work / 'transport.json'
-    ci.write_local_replay_transport(transport_config)
-    build = work / 'build'
-    replay = work / 'replay'
-    deadline = time.monotonic() + deadline_seconds
-    script = ROOT / 'experiments/sui-checkpoint/build.py'
-    commands = [
-        [sys.executable, script, 'prepare', '--sui', sui, '--engine', ROOT, '--output', build, '--fabric', '--jobs', '2'],
-        [sys.executable, script, 'build', '--output', build, '--target', Path(target), '--deadline', str(deadline_seconds)],
-        [sys.executable, ROOT / 'experiments/sui-checkpoint/run.py', '--build', build, '--fixture', admitted_fixture,
-         '--output', replay, '--deadline', '900', '--transport-config', transport_config],
-        [sys.executable, ROOT / 'experiments/sui-checkpoint/run.py', '--build', build, '--fixture', admitted_fixture,
-         '--output', work / 'replay-original-default', '--deadline', '900', '--transport-config', transport_config,
-         '--contract', 'original_default'],
-    ]
-    if nvmeof:
-        commands[0].append('--nvmeof')
-    for command in commands:
-        ci_prepare.bounded(command, deadline)
-    verification = ci.verification_bundle(replay, work / 'verification', transport)
-    original_verification = ci.verification_bundle(
-        work / 'replay-original-default', work / 'verification-original-default', transport)
-    for contract in ('harness', 'original_default'):
-        gcp_sui.verification_for_contract(work, contract)
-    static_gate = [sys.executable,
-        build / 'sources/tidehunter-sharded-wal/experiments/sui-checkpoint/validate_deployment.py',
-        '--build', build, '--verification-root', work, '--output', work / 'config-admission']
-    if nvmeof:
-        static_gate.append('--nvmeof')
-    ci_prepare.bounded(static_gate, deadline)
-    source = json.loads((build / 'source-manifest.json').read_text())
-    if source['sui']['revision'] != revision or source['tidehunter-sharded-wal']['revision'] != json.loads((output / 'package-receipt.json').read_text())['source_revision']:
-        raise ValueError('Sui build source revisions differ from admitted checkouts')
-    checkout(sui, revision)
-    bundle = work / 'sui-package.tar.gz'
-    with tarfile.open(bundle, 'x:gz') as archive:
-        archive.add(build / 'build-bundle.tar.gz', arcname='build-bundle.tar.gz')
-        archive.add(build / 'build-receipt.json', arcname='build-receipt.json')
-    verification_archive = work / 'verification.tar.gz'
-    with tarfile.open(verification_archive, 'x:gz') as archive:
-        archive.add(verification, arcname='verification')
-        archive.add(original_verification, arcname='verification-original-default')
-    sui_abi = admit_sui_archives(bundle, verification_archive)
-    receipt = json.loads((output / 'package-receipt.json').read_text())
-    receipt.update(sui_archive_path=str(bundle.resolve()), sui_sha256=ci_prepare.sha(bundle), sui_revision=revision,
-                   verification_archive_path=str(verification_archive.resolve()),
-                   verification_sha256=ci_prepare.sha(verification_archive), sui_abi=sui_abi)
-    cloud_package.dump(output / 'package-receipt.json', receipt)
-    return receipt
-
 def admit_transfer(output, revision):
     output = Path(output).resolve(strict=True)
     checkout(ROOT, revision)
@@ -427,19 +306,6 @@ def admit_transfer(output, revision):
                             json.loads((package / 'manifest.json').read_text()))
     ci_prepare.admit_qualification(output / 'qualification', proof)
     receipt['archive_path'] = str((package / 'bundle.tar.gz').resolve())
-    if receipt.get('sui_sha256'):
-        if receipt.get('sui_revision') != 'ef6701911cc07d9102f55e52f5a0632e5ddb0a86':
-            raise ValueError('transferred Sui revision is not reviewed')
-        for path_key, sha_key, filename in (
-                ('sui_archive_path', 'sui_sha256', 'sui-package.tar.gz'),
-                ('verification_archive_path', 'verification_sha256', 'verification.tar.gz')):
-            path = output / 'sui' / filename
-            if ci_prepare.sha(path) != receipt.get(sha_key):
-                raise ValueError('transferred Sui archive digest differs')
-            receipt[path_key] = str(path.resolve())
-        sui_abi = admit_sui_archives(Path(receipt['sui_archive_path']), Path(receipt['verification_archive_path']))
-        if receipt.get('sui_abi') != sui_abi:
-            raise ValueError('transferred Sui ABI requirements differ from sealed executables')
     cloud_package.dump(receipt_path, receipt)
     return receipt
 
@@ -455,24 +321,16 @@ def main():
     parser.add_argument('--spec', type=Path)
     parser.add_argument('--spdk-prefix', type=Path, help='locally built and qualified SPDK target prefix')
     parser.add_argument('--nvmet-fix-prefix', type=Path, help='statically admitted nvmet kernel fix prefix')
-    parser.add_argument('--sui', type=Path)
-    parser.add_argument('--sui-nvmeof', action='store_true')
-    parser.add_argument('--fixture', type=Path)
-    parser.add_argument('--target', type=Path)
     parser.add_argument('--admit-transfer', action='store_true')
     parser.add_argument('--manual-allow-dirty', action='store_true',
                         help='allow a frozen dirty checkout only for the reviewed manual KV campaign')
     args = parser.parse_args()
-    if args.manual_allow_dirty and (args.admit_transfer or args.sui):
+    if args.manual_allow_dirty and args.admit_transfer:
         parser.error('--manual-allow-dirty is only for manual KV preparation')
-    if args.nvmet_fix_prefix and (args.admit_transfer or args.sui):
+    if args.nvmet_fix_prefix and args.admit_transfer:
         parser.error('--nvmet-fix-prefix is only for KV package preparation')
     if args.admit_transfer:
         result = admit_transfer(args.output, args.revision)
-    elif args.sui:
-        if not args.fixture or not args.target:
-            parser.error('--sui requires --fixture and --target')
-        result = prepare_sui(args.output, args.sui, args.revision, args.fixture, args.target, args.deadline, nvmeof=args.sui_nvmeof)
     else:
         if bool(args.fabric_prefix) == bool(args.build_container):
             parser.error('KV preparation requires exactly one of --fabric-prefix and --build-container')

@@ -132,6 +132,14 @@ impl PrefixDigest {
     }
 }
 
+/// A busy controller defers maintenance, but is a refusal for a direct caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetirementResult {
+    Completed,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    Busy,
+}
+
 impl Client {
     pub(crate) fn checkpoint_deadline(&self) -> Instant {
         Instant::now() + self.timeout.max(LIFECYCLE_TIMEOUT)
@@ -369,23 +377,10 @@ impl Client {
         prefix: usize,
         files: Vec<u64>,
     ) -> Result<(), TcpError> {
-        if files.len() > 256
-            || epoch >= authority_epoch
-            || files.windows(2).any(|pair| pair[0] >= pair[1])
-            || files
-                .iter()
-                .any(|offset| offset % self.expected.wal_file_bytes != 0)
-        {
-            return Err(TcpError::new("invalid retained WAL retirement decision"));
-        }
-        match self.request(Request::RetireFiles {
-            authority_epoch,
-            epoch,
-            prefix,
-            files,
-        })? {
-            Response::Retired => Ok(()),
-            response => self.wrong_variant("RetireFiles", &response, "Retired"),
+        match self.retire_files_if_idle(authority_epoch, epoch, Some(prefix), files)? {
+            RetirementResult::Completed => Ok(()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            RetirementResult::Busy => Err(TcpError::new("retirement controller is in use")),
         }
     }
 
@@ -395,6 +390,20 @@ impl Client {
         epoch: u64,
         files: Vec<u64>,
     ) -> Result<(), TcpError> {
+        match self.retire_files_if_idle(authority_epoch, epoch, None, files)? {
+            RetirementResult::Completed => Ok(()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            RetirementResult::Busy => Err(TcpError::new("retirement controller is in use")),
+        }
+    }
+
+    pub(crate) fn retire_files_if_idle(
+        &mut self,
+        authority_epoch: u64,
+        epoch: u64,
+        prefix: Option<usize>,
+        files: Vec<u64>,
+    ) -> Result<RetirementResult, TcpError> {
         if files.len() > 256
             || epoch >= authority_epoch
             || files.windows(2).any(|pair| pair[0] >= pair[1])
@@ -404,13 +413,37 @@ impl Client {
         {
             return Err(TcpError::new("invalid retained WAL retirement decision"));
         }
-        match self.request(Request::RetireWalFiles {
-            authority_epoch,
-            epoch,
-            files,
-        })? {
-            Response::Retired => Ok(()),
-            response => self.wrong_variant("RetireWalFiles", &response, "Retired"),
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Some(pool) = &self.live_pool
+            && pool
+                .evict_files(
+                    self.expected.partition,
+                    epoch,
+                    self.expected.wal_file_bytes,
+                    &files,
+                    Instant::now() + self.timeout,
+                )
+                .map_err(TcpError::component)?
+                == RetirementResult::Busy
+        {
+            return Ok(RetirementResult::Busy);
+        }
+        let request = match prefix {
+            Some(prefix) => Request::RetireFiles {
+                authority_epoch,
+                epoch,
+                prefix,
+                files,
+            },
+            None => Request::RetireWalFiles {
+                authority_epoch,
+                epoch,
+                files,
+            },
+        };
+        match self.request(request)? {
+            Response::Retired => Ok(RetirementResult::Completed),
+            response => self.wrong_variant("RetireFiles", &response, "Retired"),
         }
     }
 }

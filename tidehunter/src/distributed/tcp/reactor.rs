@@ -3693,6 +3693,10 @@ fn request_kind_code(request: &Request) -> u64 {
         Request::PreleaseLiveExtent { .. } => 36,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         Request::ReplayLiveWal { .. } => 37,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::AcquireLiveExportPin { .. } => 42,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        Request::ReleaseLiveExportPin { .. } => 43,
         #[cfg(all(target_os = "linux", feature = "test-utils"))]
         Request::ReadEvidence { .. } => 38,
         #[cfg(all(target_os = "linux", feature = "test-utils"))]

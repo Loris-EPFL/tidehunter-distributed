@@ -120,6 +120,7 @@ def admit_inputs(inputs, output):
     admission = dict(bindings=bindings, inputs={'runner_bundle': dict(path=str((inputs / 'bundle.tar.gz').resolve()),
         sha256=ready['bundle_sha256'], bytes=(inputs / 'bundle.tar.gz').stat().st_size)},
         bootstrap_sha256=core.sha(HERE / 'cloud_bootstrap.py'),
+        # Stable journal field: this hashes cloud_controller.py.
         atomic_start_sha256=core.sha(HERE / 'cloud_controller.py'), qualification=ready)
     Path(output).mkdir(parents=True, exist_ok=True)
     core.dump(Path(output) / 'input-admission.json', admission)

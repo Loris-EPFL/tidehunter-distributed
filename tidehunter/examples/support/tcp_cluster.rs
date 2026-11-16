@@ -122,7 +122,7 @@ pub fn prepare_external_case_with_durability(
             addresses.len(),
         )?)
     };
-    let rebase = |path: &Path| guest_root.join("tls").join(path.file_name().unwrap());
+    let rebase = |root: &Path, path: &Path| root.join("tls").join(path.file_name().unwrap());
     let mut endpoints = Vec::new();
     for (i, ((&partition, &address), owner_transport)) in storage
         .partitions
@@ -136,10 +136,22 @@ pub fn prepare_external_case_with_durability(
         let node_root = guest_root.join(format!("node-{partition}"));
         let (ca, cert, key, server_name) = if let Some(certs) = certs.as_ref() {
             let identity = &certs.nodes[i];
+            // The prepared tree is also executable in place. Keep each owner's
+            // complete identity with its launch file, never in a shared TLS bind.
+            fs::create_dir(local_node.join("tls"))?;
+            fs::copy(&certs.ca, rebase(&local_node, &certs.ca))?;
+            fs::rename(
+                &identity.certificate,
+                rebase(&local_node, &identity.certificate),
+            )?;
+            fs::rename(
+                &identity.private_key,
+                rebase(&local_node, &identity.private_key),
+            )?;
             (
-                rebase(&certs.ca),
-                rebase(&identity.certificate),
-                rebase(&identity.private_key),
+                rebase(&node_root, &certs.ca),
+                rebase(&node_root, &identity.certificate),
+                rebase(&node_root, &identity.private_key),
                 identity.server_name.clone(),
             )
         } else {
@@ -212,9 +224,9 @@ pub fn prepare_external_case_with_durability(
     let client_tls = if let Some(certs) = certs.as_ref() {
         TlsFiles {
             transport,
-            ca: rebase(&certs.ca),
-            cert: rebase(&certs.authority.certificate),
-            key: rebase(&certs.authority.private_key),
+            ca: rebase(guest_root, &certs.ca),
+            cert: rebase(guest_root, &certs.authority.certificate),
+            key: rebase(guest_root, &certs.authority.private_key),
             server_name: "unused-client-template".into(),
         }
     } else {

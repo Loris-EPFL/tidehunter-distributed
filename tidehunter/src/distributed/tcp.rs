@@ -36,6 +36,8 @@ pub(crate) use live_client::leased_tests;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) use live_client::{LeasedSubmit, LiveGroupBudget};
 pub use live_client::{LeasedSync, LiveClientConfig, LiveInitiatorIdentity, LiveWriteMode};
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+pub(crate) mod export_pin_tests;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_control;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -47,6 +49,10 @@ pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProf
 pub use live_control::{
     AdoptProfile, LeaseProfile, LiveAdopted, LiveCompletion, LiveLeased, LiveRecordLocation,
     LiveRecordLocations, LiveRecoveryEntry, LiveRecoveryPage, LiveReserveResponse, LiveReserved,
+};
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(crate) use live_control::{
+    LiveExportPin, LiveExportPinControl, LiveExportPinRequest, LivePinRecipe,
 };
 use payload::WireBytes;
 #[cfg(test)]
@@ -94,7 +100,8 @@ pub use inventory::SealedOwnerExport;
 /// 23 adds OpenLiveExports for permanent live export.
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
 /// 25 gives production requests and replies feature-stable tags before NVMe-oF and test-only variants.
-const PROTOCOL: u32 = 25;
+/// 26 adds controller-lifetime pins for non-permanent live exports.
+const PROTOCOL: u32 = 26;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -697,6 +704,17 @@ enum Request {
         limit: usize,
         require_end: u64,
     },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    AcquireLiveExportPin {
+        epoch: u64,
+        segment: super::nvmeof::live_storage::LiveWalSegment,
+        binding: super::nvmeof::live_target::LiveTargetBinding,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    ReleaseLiveExportPin {
+        epoch: u64,
+        token: [u8; 16],
+    },
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     ReadEvidence {
         epoch: u64,
@@ -752,6 +770,8 @@ impl Request {
             | Self::RegisterNvmeofEpochPin { .. }
             | Self::ReleaseNvmeofEpochPin { .. }
             | Self::ReleaseLiveEpochPin { .. }
+            | Self::AcquireLiveExportPin { .. }
+            | Self::ReleaseLiveExportPin { .. }
             | Self::ReserveLiveGroup { .. }
             | Self::CompleteLiveGroup { .. }
             | Self::ResolveLiveRecords { .. }
@@ -1582,6 +1602,8 @@ pub struct Client {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_config: Option<LiveClientConfig>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_pin_recipe: Arc<LivePinRecipe>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_exports: Option<(u64, live_control::LiveExportInfo, u64)>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
@@ -1743,6 +1765,15 @@ impl Client {
         shape: &KeyShape,
         query_status: bool,
     ) -> Result<Self, TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let live_pin_recipe = Arc::new(LivePinRecipe::new(
+            endpoint,
+            tls,
+            &client_config,
+            timeout,
+            &expected,
+            shape,
+        ));
         expected.validate().map_err(TcpError::component)?;
         tls.transport.validate()?;
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
@@ -1845,6 +1876,8 @@ impl Client {
             polling: PollingPolicy::Adaptive,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_config: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_pin_recipe,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_exports: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
