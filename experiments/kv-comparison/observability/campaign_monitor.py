@@ -43,7 +43,8 @@ MAX_JSON = 16 * 1024**2
 SCRAPE_SECONDS = 1
 QUERY_PAGE_SECONDS = 300
 # Case kinds that run no KV client, so no exporter ever sees a final result snapshot for them.
-STANDALONE_CASE_KINDS = ('fio_floor', 'net_floor', 'ssd_floor', 'ssd_write_floor')
+STANDALONE_CASE_KINDS = ('fio_floor', 'net_floor', 'ssd_floor', 'ssd_write_floor',
+                         'nvmeof_write_ceiling', 'admission_options')
 LEGACY_QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_observer_data_available', 'up',
                  'kv_case_success_calls_per_second', 'kv_case_api_quantile_seconds', 'kv_case_read_path_calls',
                  'kv_case_resource_interval_available', 'kv_case_resource_interval_elapsed_seconds',

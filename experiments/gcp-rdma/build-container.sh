@@ -13,6 +13,7 @@ output=$2
 build_timeout=$3
 with_valkey=$4
 focused=${5:-0}
+admission_options=${6:-0}
 export HOME="$output/container-home"
 export CARGO_HOME="$HOME/cargo" RUSTUP_HOME="$HOME/rustup"
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -21,6 +22,9 @@ export TIDEHUNTER_LIBFABRIC_PREFIX="$output/fabric"
 mkdir -p "$HOME"
 bash "$engine/.github/scripts/setup.sh" fabric
 args=()
+if [[ $admission_options == 1 ]]; then
+    args+=(--admission-options)
+fi
 if [[ $with_valkey == 1 ]]; then
     if [[ $focused != 2 ]]; then
         python3 "$engine/experiments/kv-comparison/prepare_valkey_rdma.py" --output "$output/valkey-source" --cq-diagnostics

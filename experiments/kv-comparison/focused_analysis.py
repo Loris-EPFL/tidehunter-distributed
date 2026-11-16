@@ -1373,6 +1373,8 @@ def generate(export, report, output, baseline_root=None):
     by_kind = defaultdict(list)
     for c in cases:
         by_kind[c['job'].get('case_kind')].append(c)
+    import fleet_tools
+    tables.update(fleet_tools.analysis_rows(cases))
     for c in by_kind['media_read']:
         j = c['job']; e = c.get('focused_evidence', {}).get('media_evidence', {}); v, reasons = verdict(c)
         row = {**base(c), **metrics(c), 'expected': j.get('media', {}).get('expected'), 'history': j.get('media', {}).get('history'), 'verdict': v, 'reason_codes': reasons, 'read_ops_per_success': e.get('read_ops_per_success')}
@@ -1521,6 +1523,8 @@ def generate(export, report, output, baseline_root=None):
                 for reason in why: reasons[reason] += 1
         tables['coverage'].append({'case_kind': kind, 'route': r, 'case_ids': sorted(c['case_id'] for c in rows), 'planned': len(rows), 'completed': sum(c.get('status') == 'completed' for c in rows), 'failed': sum(c.get('status') == 'failed' for c in rows), 'not_run': sum(c.get('status') == 'not_run' for c in rows), 'unqualified': unqualified, 'reason_counts': dict(sorted(reasons.items()))})
     names = ['media_read', 'cold_resident', 'cold_targets', 'cold_target_spread', 'warm_history', 'interference', 'sealed_knee', 'knee_growth', 'knee_spread', 'fio_floor', 'block_trace', 'anchors', 'coverage', 'failed_cases', 'hybrid_versus_owner']
+    if any(by_kind[kind] for kind in fleet_tools.KINDS):
+        names.extend(fleet_tools.KINDS)
     if by_kind['net_floor'] or by_kind['ssd_floor']:
         names.extend(('net_floor', 'ssd_floor'))
     if by_kind['ssd_write_floor']:

@@ -66,6 +66,52 @@ class CheckoutAdmissionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'commas'):
                 prepare.container_build(Path('/engine'), Path('/out,put'), 'builder', 10, 9000, False)
 
+    def test_tools_spec_enables_container_admission_build(self):
+        import manual_campaign
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / 'spec.json'
+            spec.write_text(json.dumps(manual_campaign.REVIEWED_SPECS['nvmeof_f9_tools']))
+            with patch.object(prepare, 'checkout'), \
+                 patch.object(prepare.cloud_package, 'inventory', return_value={}), \
+                 patch.object(prepare.cloud_package, 'snapshot', return_value={'sha256': {}}), \
+                 patch.object(prepare, 'container_build', side_effect=RuntimeError('captured')) as build:
+                with self.assertRaisesRegex(ValueError, 'requires --build-container'):
+                    prepare.prepare(prepare.ROOT, Path(directory) / 'host', 'a' * 40, None, 1800, spec)
+                with self.assertRaisesRegex(RuntimeError, 'captured'):
+                    prepare.prepare(prepare.ROOT, Path(directory) / 'out', 'a' * 40, None, 1800,
+                                    spec, build_container='builder')
+                self.assertEqual(build.call_args.kwargs, {'focused': True, 'admission_options': True})
+
+    def test_admission_flag_reaches_container_packager(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            setup = root / '.github/scripts/setup.sh'
+            setup.parent.mkdir(parents=True)
+            setup.write_text(':\n')
+            output = root / 'output'
+            fake_bin = output / 'container-home/cargo/bin'
+            fake_bin.mkdir(parents=True)
+            python = fake_bin / 'python3'
+            python.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$CAPTURE"\n')
+            python.chmod(0o755)
+            capture = root / 'argv'
+            env = {**os.environ, 'TIDEHUNTER_GCP_BUILD_CHILD': '1', 'CAPTURE': str(capture)}
+            script = prepare.ROOT / 'experiments/gcp-rdma/build-container.sh'
+            subprocess.run(['bash', str(script), str(root), str(output), '600', '0', '1', '1'],
+                           env=env, check=True, timeout=10, capture_output=True)
+            argv = capture.read_text().splitlines()
+            self.assertIn('--focused', argv)
+            self.assertIn('--admission-options', argv)
+            self.assertEqual(argv[:2], [str(root / 'experiments/kv-comparison/cloud_package.py'), 'build'])
+            with patch.object(prepare.cloud_package, 'command', return_value='sha256:' + 'a' * 64), \
+                 patch.object(prepare.cloud_package, 'dump'), \
+                 patch.object(prepare.ci_prepare, 'bounded') as bounded, \
+                 patch.object(prepare, 'remove_build_container'):
+                prepare.container_build(root, output, 'builder', 600, 9000, False,
+                                        focused=True, admission_options=True)
+            self.assertEqual(bounded.call_args.args[0][-2:], ['1', '1'])
+
     def test_rocky_abi_rejects_newer_runtime_symbols(self):
         abi = {'version_requirements': {'GLIBC': ['2.34'], 'GLIBCXX': ['3.4.29']}}
         prepare.admit_rocky9_abi(abi)

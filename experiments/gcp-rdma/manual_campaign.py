@@ -121,6 +121,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
     'valkey_rdma_reads': 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2',
+    'nvmeof_f9_tools': '2bfaafed8b3e7830a4a8b4b634a6762607d66499327284afe030920855665b5f',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -185,6 +186,12 @@ REVIEWED_SPECS['valkey_rdma_reads'] = {
 REVIEWED_SPECS['nvmeof_f6']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f6b']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f8']['machine_type'] = 'z4m-highmem-16'
+REVIEWED_SPECS['nvmeof_f9_tools'] = {
+    **copy.deepcopy(REVIEWED_SPECS['nvmeof_f8']),
+    'selection': 'nvmeof_f9_tools', 'job_count': 38, 'max_cases': 38, 'repeats': 1,
+    'matrix_sha256': FOCUSED_MATRIX_SHA256['nvmeof_f9_tools'],
+    'backends': ['native', 'tidehunter_nvme_rdma'], 'owner_hosts': 1,
+}
 REVIEWED_SPECS['nvmeof_f7_highmem32'].update(
     machine_type='z4m-highmem-32', backends=['tidehunter_nvme_rdma'])
 
@@ -440,6 +447,9 @@ def _admit_package(package_dir, revision, spec):
             or proof.get('binary_blake2b512') != verified['binary_blake2b512']):
         raise ValueError('qualification does not bind the sealed executable')
     manifest = json.loads((root / 'manifest.json').read_text())
+    if (spec.get('selection') == 'nvmeof_f9_tools'
+            and 'runtime/bin/admission-options' not in manifest.get('files', {})):
+        raise ValueError('F9 tools require sealed runtime/bin/admission-options')
     if focused and expected_profile != 'focused_valkey' and (
             'valkey-rdma' in manifest.get('features', [])
             or any(name.startswith('runtime/bin/valkey-') or name == 'runtime/valkey-rdma.json'

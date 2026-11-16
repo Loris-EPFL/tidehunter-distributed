@@ -94,7 +94,7 @@ def remove_build_container(name, owner):
         raise RuntimeError(f'build container cleanup failed: {removed.stderr}')
 
 
-def container_build(engine, output, image_name, timeout, deadline, with_valkey, *, focused=False, focused_valkey=False):
+def container_build(engine, output, image_name, timeout, deadline, with_valkey, *, focused=False, focused_valkey=False, admission_options=False):
     image = cloud_package.command(['docker', 'image', 'inspect', '--format', '{{.Id}}', image_name])
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
         raise ValueError('Docker did not resolve the build image to an immutable image ID')
@@ -117,8 +117,10 @@ def container_build(engine, output, image_name, timeout, deadline, with_valkey, 
             '--env', 'TIDEHUNTER_GCP_BUILD_CHILD=0',
             image, 'bash', str(engine / 'experiments/gcp-rdma/build-container.sh'),
             str(engine), str(output), str(timeout), '1' if with_valkey else '0']
-    if focused or focused_valkey:
-        argv.append('2' if focused_valkey else '1')
+    if focused or focused_valkey or admission_options:
+        argv.append('2' if focused_valkey else ('1' if focused else '0'))
+    if admission_options:
+        argv.append('1')
     try:
         ci_prepare.bounded(argv, deadline - 1200)
     finally:
@@ -148,6 +150,10 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     focused = manual_sui.focused_qualification(spec)
     focused_valkey = spec.get('selection') == 'valkey_rdma_reads'
     focused = focused or focused_valkey
+    admission_options = spec.get('selection') == 'nvmeof_f9_tools'
+    if admission_options and not build_container:
+        raise ValueError('F9 admission-options requires --build-container for guest-compatible glibc')
+    build_args = {'admission_options': True} if admission_options else {}
     profile_args = {'focused_valkey': True} if focused_valkey else ({'focused': True} if focused else {})
     if focused:
         import manual_campaign
@@ -200,10 +206,10 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
         raise TimeoutError('no build and qualification reserve remains')
     if build_container:
         container_build(engine, output, build_container, remaining, deadline, valkey_source is not None,
-                        **profile_args)
+                        **profile_args, **build_args)
     else:
         cloud_package.build(snapshot, build, fdb, fabric, timeout=remaining, valkey_source=valkey_source,
-                            **profile_args)
+                            **profile_args, **build_args)
     if build_container:
         built = json.loads((build / 'build.json').read_text())
         admit_rocky9_abi(cloud_package.abi_requirements(
@@ -213,7 +219,8 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
               built['valkey_rdma']['benchmark_elf']] if valkey_source else []) +
             ([cloud_package.elf_identity(Path(spdk_prefix) / name, provider='gcp')
               for name in spdk['files'] if name == 'bin/nvmf_tgt' or name.startswith('lib/')]
-             if spdk_prefix is not None else [])))
+             if spdk_prefix is not None else []) +
+            ([built['admission_options']['binary']] if admission_options else [])))
     package = output / 'package'
     cloud_package.stage(engine, snapshot, build, fdb, package,
                         valkey_source=valkey_source, spdk_prefix=spdk_prefix, nvmet_fix_prefix=nvmet_fix_prefix,
