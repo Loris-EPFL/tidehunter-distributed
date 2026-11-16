@@ -1,14 +1,17 @@
 """Logical-owner identities remain distinct when physical hosts are shared."""
 import copy
+import csv
 import json
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import cloud_campaign as campaign
 import cloud_controller as controller
+import campaign as run_campaign
 
 
 class MultiOwnerTests(unittest.TestCase):
@@ -17,10 +20,10 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 30)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 30)
+        self.assertEqual(len(self.jobs), 24)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 24)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
-                         {('colocated', 4), ('colocated', 16), ('separate', 2), ('separate', 5)})
+                         {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:
             campaign.validate_focused_job(job)
             self.assertTrue(job['thread_cpu_sampling'])
@@ -29,6 +32,19 @@ class MultiOwnerTests(unittest.TestCase):
             self.assertEqual(campaign.job_owner_hosts(job),
                              1 if job['owner_topology'] == 'colocated' else job['owner_count'])
 
+    def test_write_ceiling_and_historical_sync_controls_survive_margin(self):
+        jobs = [job for job in self.jobs if job["selection"] == "nvmeof_m3_t2_5"]
+        puts = [job for job in jobs if job["mix"]["put"] == 100]
+        self.assertEqual({(job["concurrency"], job["value_size"], job["repeat"]) for job in puts},
+                         {(16, 1024, 0), (16, 65536, 0), (64, 65536, 0), (256, 1024, 0)})
+        mixed, = [job for job in jobs if job["mix"]["read"] == 50]
+        self.assertEqual((mixed["concurrency"], mixed["value_size"]), (16, 1024))
+        self.assertTrue(all(job["durability_tier"] == "synchronous" for job in puts))
+        self.assertTrue(all(job["repeat"] == 0 for job in jobs))
+        t1 = [job for job in self.jobs if job["selection"] == "nvmeof_m3_t1"]
+        self.assertEqual(len(t1), 8)
+        self.assertTrue(all(job["owner_count"] == 16 for job in t1))
+
     def test_unreviewed_owner_count_fails_closed(self):
         job = copy.deepcopy(self.jobs[0])
         job['owner_count'] = 2
@@ -36,11 +52,127 @@ class MultiOwnerTests(unittest.TestCase):
             campaign.active_owner_count(job)
 
     def test_physical_fleet_selects_only_its_topology(self):
-        for hosts, expected, selection in ((1, 11, "nvmeof_m3_t1"), (2, 8, "nvmeof_m3_t2_2"), (5, 11, "nvmeof_m3_t2_5")):
+        for hosts, expected, selection in ((1, 8, "nvmeof_m3_t1"), (2, 8, "nvmeof_m3_t2_2"), (5, 8, "nvmeof_m3_t2_5")):
             jobs = controller.controller_matrix({'mode': 'focused',
                 'selection': selection, 'owner_hosts': hosts})
             self.assertEqual(len(jobs), expected)
             self.assertTrue(all(campaign.job_owner_hosts(job) == hosts for job in jobs))
+
+    def test_read_diagnostics_and_cache_controls(self):
+        for selection, owners in (("nvmeof_m3_t1", 16), ("nvmeof_m3_t2_2", 2), ("nvmeof_m3_t2_5", 5)):
+            jobs = [job for job in self.jobs if job["selection"] == selection]
+            reads = [job for job in jobs if job["mix"]["read"] == 100]
+            self.assertTrue(all(job["thread_cpu_sampling"] for job in reads))
+            profiles = [job for job in reads if job.get("diagnostics", {}).get("read_profile_limit")]
+            self.assertEqual({job["value_size"] for job in profiles}, {1024, 65536})
+            self.assertTrue(all(job["diagnostics"] == {"read_profile_limit": 1024} for job in profiles))
+            timelines = [job for job in jobs if job.get("diagnostics", {}).get("write_timeline_limit")]
+            self.assertEqual(len(timelines), 1)
+            self.assertEqual((timelines[0]["mix"]["put"], timelines[0]["value_size"],
+                              timelines[0]["durability_tier"]), (100, 1024, "synchronous"))
+            self.assertEqual(timelines[0]["diagnostics"], {"write_timeline_limit": 1024})
+            cached, = [job for job in reads if job["coordinator_cache_bytes"]]
+            self.assertEqual((cached["owner_count"], cached["concurrency"], cached["value_size"]),
+                             (owners, 64, 1024))
+            self.assertTrue(cached["warmup_key_sweep"])
+            self.assertGreaterEqual(cached["coordinator_cache_bytes"], 2 * cached["keys"] * cached["value_size"])
+            off, = [job for job in reads if not job["coordinator_cache_bytes"]
+                    and (job["owner_count"], job["concurrency"], job["value_size"]) == (owners, 64, 1024)]
+            excluded = {"case_id", "coordinator_cache_bytes"}
+            self.assertEqual({k: v for k, v in cached.items() if k not in excluded},
+                             {k: v for k, v in off.items() if k not in excluded})
+
+    def test_read_sampler_includes_coordinator_and_each_logical_owner(self):
+        for job in self.jobs:
+            if job["mix"]["read"] != 100:
+                continue
+            count = campaign.active_owner_count(job)
+            config = {"spec": {"selection": job["selection"]},
+                      "fleet": {"nodes": [{}] * campaign.job_owner_hosts(job)}}
+            instance = SimpleNamespace(config=config, request=lambda index, *args, **kwargs: index)
+            for action in ("thread_cpu_start", "thread_cpu_stop"):
+                with self.subTest(case=job["case_id"], action=action):
+                    self.assertEqual(controller.Controller.all_hosts(
+                        instance, {"action": action, "case_id": job["case_id"]},
+                        case=job["case_id"], owner_count=count), list(range(-1, count)))
+
+    def test_measurement_windows_and_admission_cap(self):
+        for job in self.jobs:
+            sizing = job["measurement_sizing"]
+            self.assertIn(sizing["measurement_seconds"], (5, 10))
+            if sizing["rate_calls_per_second"] >= 90000:
+                self.assertEqual(sizing["measurement_seconds"], 5)
+            elif job["mix"]["read"] != 50:
+                self.assertEqual(sizing["measurement_seconds"], 10)
+            self.assertGreaterEqual(job["warmup_operations"] / sizing["rate_calls_per_second"], 2)
+            if job["mix"]["put"]:
+                self.assertLessEqual(4096 + job["warmup_operations"] + job["measurement_operations"], 1_000_000)
+        for selection in campaign.M3_SELECTIONS:
+            self.assertLessEqual(sum(job["measurement_sizing"]["expected_archive_bytes"]
+                                     for job in self.jobs if job["selection"] == selection), 3_000_000_000)
+
+    def test_cache_pair_has_explicit_hit_window_and_remote_deadline_rates(self):
+        pairs = [job for job in self.jobs
+                 if job["measurement_sizing"].get("minimum_phase_seconds")]
+        self.assertEqual(len(pairs), 6)
+        for job in pairs:
+            sizing = job["measurement_sizing"]
+            self.assertEqual((job["measurement_operations"], job["warmup_operations"]),
+                             (2_500_000, 1_000_000))
+            self.assertEqual(sizing["window_planning_rate_calls_per_second"], 500_000)
+            self.assertEqual(sizing["minimum_phase_seconds"], {"warmup": 2, "measurement": 5})
+            self.assertEqual(sizing["case_deadline_seconds"], 315)
+            self.assertEqual(sizing["rate_calls_per_second"], 143199.73694040513)
+            self.assertIn("not a hardware bound", sizing["window_planning_assumption"])
+        with self.assertRaisesRegex(ValueError, "pure read"):
+            campaign._m3_measurement_sizing("put", 1024, 64, read_window_rate=500_000)
+
+    def test_duration_qualification_uses_complete_raw_phase_timestamps(self):
+        job = copy.deepcopy(next(job for job in self.jobs if job["coordinator_cache_bytes"]))
+        job.update(warmup_operations=2, measurement_operations=2)
+        config = {"qualification_only": False, "dataset": {"keys": 4096},
+                  "phases": {"preload": False, "warmup_operations": 2,
+                             "measurement_operations": 2, "aging_operations": 0}}
+        for warmup, measurement, outcome, omit in (
+                (2_000_000_000, 5_000_000_000, "success", False),
+                (1_999_999_999, 5_000_000_000, "success", False),
+                (2_000_000_000, 4_999_999_999, "success", False),
+                (2_000_000_000, 5_000_000_000, "error", False),
+                (2_000_000_000, 5_000_000_000, "success", True)):
+            rows = []
+            for phase, start, elapsed in (("warmup", 0, warmup), ("measurement", 3_000_000_000, measurement)):
+                for index in range(2):
+                    scheduled = start if index == 0 else start + elapsed - 1
+                    completed = start + 1 if index == 0 else start + elapsed
+                    rows.append({"phase": phase, "operation": "read",
+                                 "outcome": outcome if phase == "measurement" and index else "success",
+                                 "scheduled_ns": scheduled, "dispatched_ns": scheduled,
+                                 "dispatch_observed": "true", "completed_ns": completed,
+                                 "api_ns": completed - scheduled, "response_ns": completed - scheduled,
+                                 "scheduling_ns": 0, "logical_keys": 1, "bytes": 1024,
+                                 "error_kind": "timeout" if outcome == "error" else ""})
+            if omit:
+                rows.pop()
+            with self.subTest(warmup=warmup, measurement=measurement, outcome=outcome, omit=omit), \
+                    tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                with (root / "samples.csv").open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+                    writer.writeheader()
+                    writer.writerows(rows)
+                windows = {}
+                counts = run_campaign.verify_timing_result(root, config, allow_partial=True, phase_windows=windows)
+                self.assertEqual(sum(counts.values()), len(rows))
+                self.assertEqual(windows["warmup"]["elapsed_ns"], warmup)
+                self.assertEqual(windows["measurement"]["unsuccessful_rows"], outcome == "error")
+                qualification = campaign.qualify_m3_phase_windows(job, windows)
+                self.assertEqual(qualification["qualified"],
+                                 warmup >= 2_000_000_000 and measurement >= 5_000_000_000
+                                 and outcome == "success" and not omit)
+                self.assertEqual(qualification["observed"], windows)
+                if not qualification["qualified"]:
+                    self.assertTrue(qualification["reasons"])
+        self.assertFalse(campaign.qualify_m3_phase_windows(job, {})["qualified"])
 
     def test_repeated_hosts_keep_logical_indices(self):
         config = {'fleet': {'nodes': [{'index': 0, 'address': '10.0.0.1'}]}}
@@ -69,41 +201,88 @@ class MultiOwnerTests(unittest.TestCase):
         self.assertIn('cannot observe unit', missing['missing'][0]['reason'])
 
     def test_short_admission_connects_writes_and_reads_each_slot(self):
-        job = next(j for j in self.jobs if j['owner_count'] == 4 and j['owner_topology'] == 'colocated')
-        identities = {str(i): {'host_nqn': 'owner-' + str(i), 'host_id': [i + 1] * 16} for i in range(4)}
-        options = {'external_remote_config': {'storage': {'partitions': list(range(4))},
-            'endpoints': [{'partition': i, 'address': '10.0.0.1:' + str(9400 + i)} for i in range(4)],
+        job = next(j for j in self.jobs if j['owner_count'] == 16 and j['owner_topology'] == 'colocated')
+        identities = {str(i): {'host_nqn': 'owner-' + str(i), 'host_id': [i + 1] * 16} for i in range(16)}
+        options = {'owners': 16, 'external_remote_config': {'storage': {'partitions': list(range(16))},
+            'endpoints': [{'partition': i, 'address': '10.0.0.1:' + str(9400 + i)} for i in range(16)],
             'live_nvme': {'owner_identities': identities}}, 'external_owner_read_config': [
-                {'partition': i} for i in range(4)], 'external_owner_durability_receipts': ['receipt-' + str(i) for i in range(4)]}
+                {'partition': i} for i in range(16)], 'external_owner_durability_receipts': ['receipt-' + str(i) for i in range(16)]}
         instance = SimpleNamespace(config={'binary': '/binary', 'source_revision': 'a' * 40,
-            'fleet': {'nodes': [{'index': 0}]}}, remaining=lambda: 3600)
+            'repository_root': '/repo', 'fleet': {'nodes': [{'index': 0}]}},
+            remaining=lambda: 3600, clock=time.monotonic)
+        instance.run_logical_owner_admission = lambda *args: controller.Controller.run_logical_owner_admission(instance, *args)
         configs = []
+        missing = None
+        completed_writes = 256
         def run(argv, **kwargs):
             config = json.loads(Path(argv[2]).read_text())
             configs.append(config)
-            owner = config['backend']['options']['external_remote_config']['storage']['partitions'][0]
+            selected = config['backend']['options']
+            # Status compares the server's complete immutable partition inventory.
+            self.assertEqual(selected['external_remote_config'], {
+                **options['external_remote_config'], 'read_cache_bytes': 0})
+            self.assertEqual(selected['external_owner_durability_receipts'],
+                             options['external_owner_durability_receipts'])
+            self.assertEqual(selected['external_owner_read_config'], options['external_owner_read_config'])
+            Path(selected['path']).mkdir()
             output = Path(argv[-1])
             output.mkdir()
             (output / 'summary.json').write_text(json.dumps({'status': 'completed'}))
-            (output / 'samples.csv').write_text('operation,outcome\nread,ok\n')
+            (output / 'samples.csv').write_text('phase,operation,outcome\n'
+                + 'preload,put,success\n' * 256 + 'measurement,read,success\n' * 256)
+            routes = [{'host_nqn': identity['host_nqn'], 'writer': writer,
+                       'transport': 'rdma', 'address': '10.0.0.1', 'service': 4420 + 2 * i,
+                       'namespace_identity': {'nqn': 'target-' + str(i)}}
+                      for i, identity in enumerate(identities.values()) if i != missing
+                      for writer in (None, {'epoch': 1, 'file_index': 0})]
             (output / 'measurement-read-evidence.json').write_text(json.dumps({'end': {'live_nvmeof': {
-                'completed_read_ops': 1, 'completed_write_ops': 1, 'errors': 0, 'payload_rpc_requests': 0,
-                'routes': [{'host_nqn': identities[str(owner)]['host_nqn']}]}}}))
-        with tempfile.TemporaryDirectory() as tmp, patch.object(controller, 'command', side_effect=run), patch.object(controller, 'environment', return_value={}):
-            controller.Controller.admit_logical_owners(instance, job, Path(tmp), options)
-            proofs = json.loads((Path(tmp) / 'owner-admission.json').read_text())
-        self.assertEqual(len(proofs['owners']), 4)
-        configs.sort(key=lambda config: config["backend"]["options"]["external_remote_config"]["storage"]["partitions"][0])
-        for index, config in enumerate(configs):
-            self.assertFalse(config['qualification_only'])
-            self.assertTrue(config['phases']['preload'])
-            self.assertEqual(config['phases']['measurement_operations'], 1)
-            self.assertNotIn('measurement_gate', config)
-            selected = config['backend']['options']
-            self.assertEqual(selected['owners'], 1)
-            self.assertEqual(selected['coordinator_read_cache_bytes'], 0)
-            self.assertEqual(selected['external_remote_config']['storage']['partitions'], [index])
-        self.assertEqual(options['external_remote_config']['storage']['partitions'], list(range(4)))
+                'completed_read_ops': 256, 'completed_write_ops': completed_writes, 'errors': 0,
+                'payload_rpc_requests': 0, 'routes': routes}}}))
+        helper = SimpleNamespace(controller_snapshot=lambda: {}, controller_matches=lambda *args: True)
+        spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(controller, 'command', side_effect=run), patch.object(
+                controller, 'environment', return_value={}), patch(
+                'importlib.util.spec_from_file_location', return_value=spec), patch(
+                'importlib.util.module_from_spec', return_value=helper):
+            root = Path(tmp) / 'success'
+            root.mkdir()
+            controller.Controller.admit_logical_owners(instance, job, root, options)
+            proofs = json.loads((root / 'owner-admission.json').read_text())
+            self.assertEqual(len(configs), 1)
+            self.assertEqual(len(proofs['owners']), 16)
+            self.assertTrue(proofs['coordinator_exited'])
+            self.assertTrue(proofs['coordinator_database_removed'])
+            self.assertEqual(proofs['remaining_controllers'], [])
+            self.assertFalse((root / 'owner-admission/database').exists())
+            # Grouped transport writes are not the API preload-put population.
+            completed_writes = 16
+            grouped = Path(tmp) / 'grouped-writes'
+            grouped.mkdir()
+            controller.Controller.admit_logical_owners(instance, job, grouped, options)
+            self.assertTrue(json.loads((grouped / 'owner-admission.json').read_text())['coordinator_exited'])
+            completed_writes = 256
+            for missing in range(16):
+                failed = Path(tmp) / f'missing-{missing}'
+                failed.mkdir()
+                with self.assertRaisesRegex(controller.SafetyError, 'write/read admission failed'):
+                    controller.Controller.admit_logical_owners(instance, job, failed, options)
+            missing = None
+            helper.controller_snapshot = lambda: {'nvme1': {}}
+            failed = Path(tmp) / 'controller-left'
+            failed.mkdir()
+            with self.assertRaisesRegex(controller.SafetyError, 'left live controllers'):
+                controller.Controller.admit_logical_owners(instance, job, failed, options)
+            self.assertTrue((failed / 'owner-admission/database').exists())
+        config = configs[0]
+        self.assertFalse(config['qualification_only'])
+        self.assertTrue(config['phases']['preload'])
+        self.assertEqual(config['phases']['measurement_operations'], 256)
+        self.assertTrue(config['phases']['measurement_key_sweep'])
+        self.assertEqual(config['execution']['concurrency'], 16)
+        self.assertNotIn('measurement_gate', config)
+        self.assertEqual(config['backend']['options']['owners'], 16)
+        self.assertEqual(config['backend']['options']['coordinator_read_cache_bytes'], 0)
+        self.assertEqual(options['external_remote_config']['storage']['partitions'], list(range(16)))
 
     def test_real_unit_names_and_shared_host_caps(self):
         config = {'prefix': 'bench-' + '0' * 16, 'repository_root': '/source',

@@ -12,7 +12,7 @@ import gcp_runtime as runtime
 
 class MultiOwnerLauncherTests(unittest.TestCase):
     def test_reviewed_subsets_bind_every_case(self):
-        for hosts, count in ((1, 11), (2, 8), (5, 11)):
+        for hosts, count in ((1, 8), (2, 8), (5, 8)):
             spec = manual.m3_spec(hosts)
             jobs = manual._reviewed_jobs(spec)
             self.assertEqual(len(jobs), count)
@@ -44,7 +44,8 @@ class MultiOwnerLauncherTests(unittest.TestCase):
                              + campaign.M3_OWNER_ADMISSION_MARGIN_SECONDS)
                 worst_seconds = (sum(deadlines) + len(jobs) * admission + bootstrap.M3_PAIR_SECONDS
                                  + manual.PAIR_CLEANUP_SECONDS
-                                 + manual.EXPORT_RESERVE_SECONDS + manual.PREPARATION_SECONDS)
+                                 + manual.EXPORT_RESERVE_SECONDS + manual.PREPARATION_SECONDS
+                                 + 720)  # launcher cleanup (600s) plus terminal receipt slack (120s)
                 self.assertLessEqual(worst_seconds, 0.85 * manual.reservation_seconds(spec))
                 duration, compute_cents, _ = manual.reservation_quote(spec, spec["machine_type"])
                 self.assertEqual(duration, 7200)
