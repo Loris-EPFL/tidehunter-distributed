@@ -94,7 +94,16 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(refresh['with']['unset-current-credentials'], 'true')
         self.assertEqual(steps[credentials]['with']['role-duration-seconds'], '14400')
         local = yaml.load((ROOT / '.github/workflows/kv-comparison.yaml').read_text(), Loader=yaml.BaseLoader)
-        self.assertNotIn('push', local['on'])
+        # Correctness pushes must never overlap the paid fleet's push branch.
+        self.assertEqual(local['on']['push']['branches'],
+                         ['feat/two-vm-remote-read-write', 'p8-ci'])
+        self.assertNotIn('bench/aws-efa', local['on']['push']['branches'])
+        self.assertEqual(local['permissions'], {'contents': 'read'})
+        for local_job in local['jobs'].values():
+            self.assertEqual(local_job.get('permissions', local['permissions']),
+                             {'contents': 'read'})
+            self.assertFalse(any('configure-aws-credentials' in step.get('uses', '')
+                                 for step in local_job['steps']))
 
 
 if __name__ == '__main__':

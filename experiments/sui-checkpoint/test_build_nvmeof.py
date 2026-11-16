@@ -1,6 +1,8 @@
+import os
 import shutil
 import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,19 +11,38 @@ from unittest.mock import patch
 import build
 
 
+# Captured feature sections from the Sui typed-store and sui-node manifests.
+# Staging must work on a clean checkout without a developer's sibling Sui tree.
+SUI_FEATURE_MANIFESTS = {
+    'crates/typed-store/Cargo.toml': '''[features]
+testing = []
+distributed-tidehunter-bulk = []
+distributed-tidehunter-durability = ["testing"]
+distributed-tidehunter-session = ["testing"]
+sharded-wal = ["tidehunter", "distributed-tidehunter-bulk"]
+sharded-wal-fabric = ["sharded-wal", "tidehunter/experimental-fabric"]
+''',
+    'crates/sui-node/Cargo.toml': '''[features]
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator"]
+testing = []
+distributed-tidehunter-session = ["typed-store/distributed-tidehunter-session"]
+sharded-wal = ["typed-store/sharded-wal", "distributed-tidehunter-session"]
+sharded-wal-fabric = ["sharded-wal", "typed-store/sharded-wal-fabric"]
+''',
+}
+
+
 class NvmeStagingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.sources = Path(self.tmp.name) / 'sources'
-        checkout = Path('/home/hybr1d/Desktop/PDM/TideHunter/sui')
-        self.paths = ['crates/typed-store/Cargo.toml', 'crates/sui-node/Cargo.toml']
-        if not all((checkout / name).is_file() for name in self.paths):
-            self.skipTest('real Sui manifests unavailable')
-        for name in self.paths:
+        self.paths = list(SUI_FEATURE_MANIFESTS)
+        for name, manifest in SUI_FEATURE_MANIFESTS.items():
             target = self.sources / 'sui' / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(checkout / name, target)
+            target.write_text(manifest)
         engine = self.sources / 'tidehunter-sharded-wal/tidehunter/Cargo.toml'
         engine.parent.mkdir(parents=True)
         engine.write_text('[features]\nexperimental-nvmeof = []\n')
@@ -84,3 +105,21 @@ class NvmeStagingTests(unittest.TestCase):
             plan = json.loads((output/'plan.json').read_text())
             self.assertEqual(plan['nvmeof'], nvmeof)
             self.assertEqual(plan['remote_features'], ['sui-node/sharded-wal-' + ('nvmeof' if nvmeof else 'fabric')])
+
+
+@unittest.skipUnless(os.environ.get('SUI_CHECKOUT'),
+                     'set SUI_CHECKOUT to check upstream Sui feature drift')
+class SuiFeatureDriftTests(unittest.TestCase):
+    def test_real_sui_features_match_captured_contract(self):
+        checkout = Path(os.environ['SUI_CHECKOUT'])
+        for relative, manifest in SUI_FEATURE_MANIFESTS.items():
+            with self.subTest(manifest=relative):
+                expected = tomllib.loads(manifest)['features']
+                text = (checkout / relative).read_text()
+                actual = tomllib.loads(text)['features']
+                # Staging requires this exact line, not only equivalent TOML.
+                anchor = next(line for line in manifest.splitlines()
+                              if line.startswith('sharded-wal-fabric = '))
+                self.assertEqual(text.splitlines().count(anchor), 1)
+                for name in ('sharded-wal', 'sharded-wal-fabric'):
+                    self.assertEqual(actual[name], expected[name])
