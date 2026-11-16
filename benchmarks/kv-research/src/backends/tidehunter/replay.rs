@@ -5,7 +5,7 @@ use crate::backends::native::replay::table_mutexes;
 use crate::backends::replay::ReplayBackend;
 use crate::mainnet_trace::{Row, Table, Trace};
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tidehunter::distributed::codec::{BatchLimits, CompleteBatch, Mutation};
 use tidehunter::distributed::types::{BatchId, BatchVersion};
 use tidehunter::key_shape::{
@@ -25,11 +25,13 @@ struct NodeOptions {
     options: serde_json::Value,
 }
 
-fn options(value: &serde_json::Value) -> BackendResult<Vec<(serde_json::Value, Options)>> {
-    let mut parsed = ReplayOptions::deserialize(value)?.databases;
-    parsed.sort_by_key(|node| node.db_id);
-    if parsed.iter().map(|node| node.db_id).collect::<Vec<_>>() != [0, 1, 2] {
-        return Err("distributed replay requires exactly node DBs 0, 1 and 2".into());
+fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Value, Options)>> {
+    let parsed = ReplayOptions::deserialize(value)?.databases;
+    if parsed.is_empty()
+        || parsed.iter().any(|node| node.db_id > 2)
+        || !parsed.windows(2).all(|pair| pair[0].db_id < pair[1].db_id)
+    {
+        return Err("distributed replay requires strictly increasing node DB ids in 0..=2".into());
     }
     let mut identities = BTreeSet::new();
     let mut paths = Vec::<std::path::PathBuf>::new();
@@ -82,10 +84,10 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(serde_json::Value, O
             );
         }
         batch_limits(&opts)?.validate()?;
-        result.push((node.options, opts));
+        result.push((node.db_id, node.options, opts));
     }
-    let first = &result[0].1;
-    for (_, other) in &result[1..] {
+    let first = &result[0].2;
+    for (_, _, other) in &result[1..] {
         if !first.transport.same_protocol(&other.transport)
             || first.durability_tier != other.durability_tier
             || first
@@ -152,22 +154,29 @@ pub(super) fn shape(tables: &[Table], db: u16) -> KeyShape {
 }
 
 pub struct TidehunterReplayBackend {
-    databases: Vec<TidehunterBackend>,
-    tables: Vec<(u16, KeySpace)>,
+    databases: BTreeMap<u16, TidehunterBackend>,
+    tables: Vec<Option<(u16, KeySpace)>>,
 }
 impl TidehunterReplayBackend {
     pub fn validate(value: &serde_json::Value, trace: &Trace) -> BackendResult<()> {
-        for (id, (_, opts)) in options(value)?.iter().enumerate() {
-            let shape = shape(&trace.tables, id as u16);
+        let parsed = options(value)?;
+        let expected: BTreeSet<_> = trace.batches.iter().map(|batch| batch.db).collect();
+        if parsed.iter().map(|(id, _, _)| *id).collect::<BTreeSet<_>>() != expected {
+            return Err(
+                "distributed replay databases must match workload.node_databases exactly".into(),
+            );
+        }
+        for (id, _, opts) in &parsed {
+            let shape = shape(&trace.tables, *id);
             let limits = batch_limits(opts)?;
             // Use the actual codec on the immutable source rows before opening owners.
             // Expanded keys have identical lengths. Never split the 519-member output batch.
             for entries in trace
                 .batches
                 .iter()
-                .filter(|b| usize::from(b.db) == id)
+                .filter(|b| b.db == *id)
                 .map(|b| b.entries.as_slice())
-                .chain(trace.preload.chunks(256).filter(|_| id == 0))
+                .chain(trace.preload.chunks(256).filter(|_| *id == 0))
             {
                 let mutations = entries
                     .iter()
@@ -202,7 +211,7 @@ impl TidehunterReplayBackend {
     pub fn geometry(value: &serde_json::Value) -> BackendResult<serde_json::Value> {
         let opts = options(value)?;
         let mut wal = 0;
-        for (_, node) in &opts {
+        for (_, _, node) in &opts {
             let bytes = node
                 .external_remote_config
                 .as_ref()
@@ -216,15 +225,15 @@ impl TidehunterReplayBackend {
             );
         }
         Ok(serde_json::json!({
-            "wal_file_size":wal, "admission_path":opts[0].1.path,
-            "databases":value["databases"], "node_databases":3,
+            "wal_file_size":wal, "admission_path":opts[0].2.path,
+            "databases":value["databases"], "node_databases":opts.len(),
             "owner_disk_admission":"local owner roots share their per-DB coordinator filesystem; external owner capacity is not observable here",
             "atomicity":"complete batch within one node DB; no cross-DB atomicity",
             "scope":crate::mainnet_trace::SCOPE
         }))
     }
     pub fn validate_disk_paths(value: &serde_json::Value, reservation: u64) -> BackendResult<()> {
-        for (_, node) in options(value)? {
+        for (_, _, node) in options(value)? {
             let path = resolve_path(&node.path)?;
             let mut ancestor = path.as_path();
             while !ancestor.exists() {
@@ -255,13 +264,14 @@ impl TidehunterReplayBackend {
     }
     pub async fn open(value: &serde_json::Value, trace: &Trace) -> BackendResult<Self> {
         Self::validate(value, trace)?;
-        let mut databases = Vec::with_capacity(3);
-        for (id, (value, _)) in options(value)?.into_iter().enumerate() {
-            databases.push(
+        let mut databases = BTreeMap::new();
+        for (id, value, _) in options(value)? {
+            databases.insert(
+                id,
                 open_with_shape(
                     &value,
                     &prometheus::Registry::new(),
-                    shape(&trace.tables, id as u16),
+                    shape(&trace.tables, id),
                 )
                 .await?,
             );
@@ -270,29 +280,40 @@ impl TidehunterReplayBackend {
             .tables
             .iter()
             .map(|t| {
-                Ok((
-                    t.db_id,
-                    databases[usize::from(t.db_id)]
-                        .db
-                        .as_ref()
-                        .ok_or("replay DB closed")?
-                        .try_ks(&t.node_name)
-                        .ok_or("replay table not declared")?,
-                ))
+                databases
+                    .get(&t.db_id)
+                    .map(|backend| {
+                        Ok((
+                            t.db_id,
+                            backend
+                                .db
+                                .as_ref()
+                                .ok_or("replay DB closed")?
+                                .try_ks(&t.node_name)
+                                .ok_or("replay table not declared")?,
+                        ))
+                    })
+                    .transpose()
             })
             .collect::<BackendResult<_>>()?;
         Ok(Self { databases, tables })
     }
     pub fn info(&self) -> BackendInfo {
-        let mut info = self.databases[0].info();
+        let first = self
+            .databases
+            .first_key_value()
+            .expect("validated node DBs")
+            .1;
+        let mut info = first.info();
         if let Some(ack) =
-            self.databases[0].effective_configuration["live_write"]["acknowledgement_contract"]
-                .as_str()
+            first.effective_configuration["live_write"]["acknowledgement_contract"].as_str()
         {
             info.acknowledgement = ack.to_owned();
         }
-        info.topology = serde_json::json!({"node_databases":3, "databases": self.databases.iter().enumerate().map(|(id, b)| serde_json::json!({"db_id":id,"topology":b.info().topology})).collect::<Vec<_>>()});
-        info.configuration = serde_json::json!({"databases":self.databases.iter().enumerate().map(|(id,b)| serde_json::json!({"db_id":id,"configuration":b.effective_configuration})).collect::<Vec<_>>(), "atomicity":"one complete batch per node DB; no cross-DB atomicity"});
+        info.topology = serde_json::json!({"node_databases":self.databases.len(), "databases": self.databases.iter().map(|(id, b)| serde_json::json!({"db_id":id,"topology":b.info().topology})).collect::<Vec<_>>()});
+        if self.databases.len() != 1 {
+            info.configuration = serde_json::json!({"databases":self.databases.iter().map(|(id,b)| serde_json::json!({"db_id":id,"configuration":b.effective_configuration})).collect::<Vec<_>>(), "atomicity":"one complete batch per node DB; no cross-DB atomicity"});
+        }
         info
     }
 }
@@ -301,8 +322,9 @@ impl ReplayBackend for TidehunterReplayBackend {
         let &(db, ks) = self
             .tables
             .get(usize::from(table))
+            .and_then(Option::as_ref)
             .ok_or("unknown replay table")?;
-        self.databases[usize::from(db)]
+        self.databases[&db]
             .db
             .as_ref()
             .ok_or("replay DB closed")?
@@ -312,7 +334,7 @@ impl ReplayBackend for TidehunterReplayBackend {
     fn commit(&self, db: u16, entries: &[Row]) -> BackendResult<()> {
         let database = self
             .databases
-            .get(usize::from(db))
+            .get(&db)
             .ok_or("unknown replay DB")?
             .db
             .as_ref()
@@ -321,6 +343,7 @@ impl ReplayBackend for TidehunterReplayBackend {
             let &(row_db, _) = self
                 .tables
                 .get(usize::from(row.table))
+                .and_then(Option::as_ref)
                 .ok_or("unknown replay table")?;
             if row_db != db {
                 return Err("cross-DB replay batch".into());
@@ -329,7 +352,9 @@ impl ReplayBackend for TidehunterReplayBackend {
         let mut batch = database.write_batch();
         for row in entries {
             batch.write(
-                self.tables[usize::from(row.table)].1,
+                self.tables[usize::from(row.table)]
+                    .ok_or("unknown replay table")?
+                    .1,
                 row.key.clone(),
                 row.value.clone(),
             );
@@ -342,8 +367,29 @@ impl ReplayBackend for TidehunterReplayBackend {
         // writes acknowledge their configured device completion before owner adoption.
         batch.commit().map_err(native_error)
     }
+    fn physical_counts(&self) -> serde_json::Value {
+        use crate::backend::KvBackend;
+        let observations = self
+            .databases
+            .iter()
+            .map(|(id, backend)| {
+                let observation = backend.read_observation().unwrap_or_else(
+                    |error| serde_json::json!({"available":false,"error":error.to_string()}),
+                );
+                (*id, observation)
+            })
+            .collect::<BTreeMap<_, _>>();
+        if observations.len() == 1 {
+            observations
+                .into_values()
+                .next()
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::json!({"databases": observations})
+        }
+    }
     fn check_background_health(&self) -> BackendResult<()> {
-        for (id, backend) in self.databases.iter().enumerate() {
+        for (id, backend) in &self.databases {
             // A poisoned authority/publication/read worker fails even on cache hits.
             backend
                 .db

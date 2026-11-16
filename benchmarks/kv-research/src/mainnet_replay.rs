@@ -10,7 +10,7 @@ use crate::config::{
     MeasurementGateConfig,
 };
 use crate::duration_ns;
-use crate::mainnet_trace::{Batch, Read, Row, SCOPE, Trace, expanded_keys};
+use crate::mainnet_trace::{Batch, Read, Row, Trace, expanded_keys};
 use crate::report::{ReplayIdentity, Reporter, RunSummary, Sample};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -37,6 +37,8 @@ pub struct ReplayWorkload {
     pub manifest_sha256: String,
     pub repetitions: u64,
     pub minimum_measurement_seconds: f64,
+    #[serde(default)]
+    pub node_databases: Option<Vec<u8>>,
 }
 /// Replay has no synthetic dataset, seed, mix, phases or key namespace.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -151,7 +153,10 @@ impl ReplayConfig {
                 "replay gates require distinct markers",
             )?;
         }
-        let trace = Trace::load(&self.workload.manifest_path, &self.workload.manifest_sha256)?;
+        let mut trace = Trace::load(&self.workload.manifest_path, &self.workload.manifest_sha256)?;
+        if let Some(selected) = &self.workload.node_databases {
+            trace.select_node_databases(selected)?;
+        }
         if self.backend.kind == "tidehunter_tcp" {
             TidehunterReplayBackend::validate(&self.backend.options, &trace)?;
         }
@@ -292,9 +297,11 @@ pub fn prepare(trace: &Trace, repetitions: u64) -> BackendResult<Vec<Prepared>> 
                         .iter()
                         .map(|read| {
                             read.producer.and_then(|_| {
-                                trace.batches[7]
-                                    .entries
+                                trace
+                                    .batches
                                     .iter()
+                                    .filter(|batch| batch.phase == 7)
+                                    .flat_map(|batch| &batch.entries)
                                     .find(|r| r.table == read.row.table && r.key == read.row.key)
                                     .map(|r| r.value.clone())
                             })
@@ -820,8 +827,8 @@ fn identity(
             None,
             prepared.batches[phase].db,
             None,
-            Some(u16::try_from(phase)?),
-            Some(repetition as u64 * 9 + phase as u64),
+            Some(prepared.batches[phase].phase),
+            Some(repetition as u64 * 9 + u64::from(prepared.batches[phase].phase)),
         ),
         Operation::Preload => return Err("preload has no measurement identity".into()),
     };
@@ -878,7 +885,7 @@ async fn checkpoint(
     measurements: &mut Measurements,
 ) -> BackendResult<()> {
     for phase in 0..9 {
-        if phase == 5 {
+        if phase == 5 && trace.reads.iter().any(|reads| !reads.is_empty()) {
             measurements.completed.fill(false);
             measurements.ready_at.fill(None);
             measurements.read_index.fill(0);
@@ -971,7 +978,20 @@ async fn checkpoint(
                 }
             }
         }
-        pool.dispatch(0, rep, Operation::Commit(phase), Instant::now(), deadline)?;
+        let Some(batch_index) = prepared
+            .batches
+            .iter()
+            .position(|batch| usize::from(batch.phase) == phase)
+        else {
+            continue;
+        };
+        pool.dispatch(
+            0,
+            rep,
+            Operation::Commit(batch_index),
+            Instant::now(),
+            deadline,
+        )?;
         let completion = pool.receive(deadline).await?;
         observe_completion(
             trace,
@@ -1137,7 +1157,7 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         .flatten()
         .filter(|r| r.producer.is_none())
         .count() as u64
-        + 9;
+        + trace.batches.len() as u64;
     let source: std::collections::BTreeSet<_> = trace
         .preload
         .iter()
@@ -1178,9 +1198,12 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
 }
 
 pub async fn run(config: ReplayConfig, output: &Path) -> BackendResult<()> {
+    // Hash the executable before starting the bounded replay, never after a timed-out call.
+    let binary = crate::runner::binary_identity();
     let started_unix = now_unix();
     let started = Instant::now();
     let (trace, mut prepared, mut resources) = config.admit()?;
+    resources["binary"] = binary;
     let (backend, info) = open_backend(&config, &trace).await?;
     resources["prepared_placement"] = backend.prepare_case(&mut prepared)?;
     let prepared = Arc::new(prepared);
@@ -1337,8 +1360,22 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
             .map(|r| r.backend_key.len() as u64)
             .sum::<u64>()
     );
+    if config.backend.kind == "tidehunter_tcp"
+        && config.workload.node_databases.as_deref() == Some(&[0])
+    {
+        let evidence = crate::runner::measurement_read_evidence(
+            &physical_before,
+            &physical_after,
+            window_start.is_some(),
+            result.is_ok(),
+        );
+        std::fs::write(
+            output.join("measurement-read-evidence.json"),
+            serde_json::to_vec(&evidence)?,
+        )?;
+    }
     metrics["topology"] = info.topology.clone();
-    metrics["case_identity"] = serde_json::json!({"scope":SCOPE,"fixture_sha256":config.workload.manifest_sha256,"source":trace.manifest["source"],"repeat_domain":std::str::from_utf8(crate::mainnet_trace::DOMAIN)?,"repeat_version":1,"repetitions":prepared.len(),"N":config.execution.concurrency,"W":1,"table_mapping":trace.tables,"device_counters":"unmeasured"});
+    metrics["case_identity"] = serde_json::json!({"scope":trace.scope(),"fixture_sha256":config.workload.manifest_sha256,"source":trace.manifest["source"],"repeat_domain":std::str::from_utf8(crate::mainnet_trace::DOMAIN)?,"repeat_version":1,"repetitions":prepared.len(),"N":config.execution.concurrency,"W":1,"table_mapping":trace.tables,"device_counters":"unmeasured"});
     let unknown_outcomes = m
         .calls
         .iter()
@@ -1352,11 +1389,11 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     } else {
         "failed"
     };
-    let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:info.configuration.clone(),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
+    let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:info.configuration.get("durability").unwrap_or(&info.configuration).clone(),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
         execution:serde_json::json!({"effective_client_shards":1}),
-        phase_counts:serde_json::json!({"scope":SCOPE,"profile":metrics,"preload_ns":preload_ns,"counts":m.counts,"error":result.as_ref().err().map(ToString::to_string),"resources":resources,"sustained_30s_qualified":result.is_ok() && unresolved_workers==0 && elapsed.as_secs_f64()>=30.0,"run_status":run_status,"unknown_outcomes":unknown_outcomes,"unresolved_workers":unresolved_workers,"shutdown_contract":"join completed callers; after deadline plus grace detach only unresolved calls, under external process supervision; no cancellation or rollback"}),
-        distributions:reporter.distribution_summaries(),limitations:vec![SCOPE.into(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
-    reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":SCOPE,"config":config,"trace_manifest":trace.manifest,"profile":metrics}))?;
+        phase_counts:serde_json::json!({"scope":trace.scope(),"profile":metrics,"preload_ns":preload_ns,"counts":m.counts,"error":result.as_ref().err().map(ToString::to_string),"resources":resources,"sustained_30s_qualified":result.is_ok() && unresolved_workers==0 && elapsed.as_secs_f64()>=30.0,"run_status":run_status,"unknown_outcomes":unknown_outcomes,"unresolved_workers":unresolved_workers,"shutdown_contract":"join completed callers; after deadline plus grace detach only unresolved calls, under external process supervision; no cancellation or rollback"}),
+        distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
+    reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":trace.scope(),"config":config,"binary":resources["binary"],"trace_manifest":trace.manifest,"profile":metrics}))?;
     result
 }
 async fn open_backend(
@@ -1499,8 +1536,13 @@ fn profile(
             t.2.push(s.api_ns);
         }
         if let Some(phase) = id.batch_phase {
-            let batch =
-                &prepared[usize::try_from(id.repetition).unwrap_or(0)].batches[usize::from(phase)];
+            let Some(batch) = prepared[usize::try_from(id.repetition).unwrap_or(0)]
+                .batches
+                .iter()
+                .find(|batch| batch.phase == phase)
+            else {
+                continue;
+            };
             let mut seen = [false; 17];
             for row in &batch.entries {
                 let t = tables
@@ -1523,7 +1565,7 @@ fn profile(
         .iter()
         .filter(|(s, _)| s.outcome == "success")
         .count();
-    serde_json::json!({"scope":SCOPE,"measurement_elapsed_seconds":seconds,"api_calls_per_second":success as f64/seconds,"offered_calls":m.calls.len(),"successful_calls":success,"rejected_calls":0,
+    serde_json::json!({"scope":trace.scope(),"measurement_elapsed_seconds":seconds,"api_calls_per_second":success as f64/seconds,"offered_calls":m.calls.len(),"successful_calls":success,"rejected_calls":0,
         "offered_calls_per_second":m.calls.len() as f64/seconds,"rejected_calls_per_second":0.0,
         "timed_out_calls_per_second":m.calls.iter().filter(|(s,_)|matches!(s.outcome,"timeout"|"unknown_mutation")).count() as f64/seconds,
         "timed_out_calls":m.calls.iter().filter(|(s,_)|matches!(s.outcome,"timeout"|"unknown_mutation")).count(),"logical_ops_per_second":(m.counts.store_gets+m.counts.put_members) as f64/seconds,

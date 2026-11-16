@@ -86,8 +86,13 @@ fn fixture(
         stop: Arc::new(AtomicBool::new(false)),
         servers: Vec::new(),
     };
-    let mut databases = Vec::new();
-    for id in 0..3 {
+    let mut databases = BTreeMap::new();
+    for id in trace
+        .batches
+        .iter()
+        .map(|batch| batch.db)
+        .collect::<BTreeSet<_>>()
+    {
         let base = root.join(format!("db-{id}"));
         std::fs::create_dir_all(&base).unwrap();
         let shape = shape(&trace.tables, id);
@@ -216,7 +221,7 @@ fn fixture(
             .find(|table| table.db_id == id)
             .unwrap()
             .node_name);
-        databases.push(TidehunterBackend {
+        databases.insert(id, TidehunterBackend {
             db:Some(db),keyspace,cluster:std::sync::Mutex::new(None),
             endpoints:config.endpoints.iter().map(|e|(e.partition,e.address.clone())).collect(),owners:1,
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
@@ -230,14 +235,9 @@ fn fixture(
         .tables
         .iter()
         .map(|t| {
-            (
-                t.db_id,
-                databases[usize::from(t.db_id)]
-                    .db
-                    .as_ref()
-                    .unwrap()
-                    .ks(&t.node_name),
-            )
+            databases
+                .get(&t.db_id)
+                .map(|backend| (t.db_id, backend.db.as_ref().unwrap().ks(&t.node_name)))
         })
         .collect();
     (
@@ -338,7 +338,7 @@ async fn replay(route: Option<&str>, callers: usize) -> BTreeMap<(u16, Bytes), B
     if route.is_some() {
         let stats: Vec<_> = backend
             .databases
-            .iter()
+            .values()
             .map(|b| b.db.as_ref().unwrap().live_nvmeof_stats().unwrap())
             .collect();
         let evidence = serde_json::to_value(stats).unwrap();
@@ -385,7 +385,7 @@ async fn poisoned_owner_lifecycle_fails_replay_health_boundary() {
     let clone = Arc::clone(&backend);
     assert!(
         std::thread::spawn(move || {
-            let _guard = clone.databases[0].cluster.lock().unwrap();
+            let _guard = clone.databases[&0].cluster.lock().unwrap();
             panic!("poison replay lifecycle");
         })
         .join()
@@ -463,6 +463,42 @@ async fn unknown_owner_append_fails_replay_and_poisoned_authority_health() {
     );
     let health = backend.check_background_health().unwrap_err();
     assert!(health.to_string().contains("requires recovery"), "{health}");
+    drop(backend);
+    drop(owners);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn perpetual_only_replay_uses_exact_database_population() {
+    let root = root();
+    let mut trace = trace();
+    trace.select_node_databases(&[0]).unwrap();
+    let mut options = local_options(&root);
+    options["databases"].as_array_mut().unwrap().truncate(1);
+    TidehunterReplayBackend::validate(&options, &trace).unwrap();
+    let extra = local_options(&root);
+    assert!(TidehunterReplayBackend::validate(&extra, &trace).is_err());
+    let (backend, owners) = fixture(&root, &trace, None);
+    let counts = execute(
+        backend.clone(),
+        &trace,
+        Arc::new(prepare(&trace, 2).unwrap()),
+        4,
+        Instant::now() + Duration::from_secs(30),
+        30000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            counts.store_gets,
+            counts.overlay_demands,
+            counts.put_members,
+            counts.write_calls
+        ),
+        (1014, 232, 1308, 6)
+    );
+    assert_eq!(backend.info().topology["node_databases"], 1);
     drop(backend);
     drop(owners);
     std::fs::remove_dir_all(root).unwrap();

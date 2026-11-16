@@ -44,7 +44,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
-M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put")
+M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put", "nvmeof_p9_write_engine")
 M3_OWNER_ADMISSION_TIMEOUT_SECONDS = 95
 M3_OWNER_ADMISSION_MARGIN_SECONDS = 5
 NVMEOF_PATH_SELECTIONS += M3_SELECTIONS
@@ -157,6 +157,34 @@ def owner_receipt_is_fresh(previous, receipt):
             and receipt["durability"] == previous["durability"]
             and [receipt[name] for name in process] != [previous[name] for name in process]
             and receipt["started_unix_ns"] > previous["started_unix_ns"])
+
+
+def runtime_options(config):
+    options = config["backend"]["options"]
+    if config.get("workload", {}).get("kind") == "sui_mainnet_replay":
+        databases = options.get("databases")
+        if not isinstance(databases, list) or len(databases) != 1 or databases[0].get("db_id") != 0:
+            raise ValueError("cloud replay requires exactly the perpetual node database")
+        return databases[0]["options"]
+    return options
+
+
+def admit_replay_summary(config, summary):
+    if config.get("workload", {}).get("kind") != "sui_mainnet_replay":
+        return
+    phase = summary["phase_counts"]
+    if phase.get("scope") != "archive-derivable node KV subset, node databases: perpetual":
+        raise ValueError("replay scope differs from the perpetual case")
+    if summary["status"] != "completed":
+        return
+    repetitions = config["workload"]["repetitions"]
+    expected = {"checkpoints": repetitions, "store_gets": 507 * repetitions,
+                "overlay_demands": 116 * repetitions, "put_members": 654 * repetitions,
+                "write_calls": 3 * repetitions, "transactions": 45 * repetitions}
+    if (phase.get("counts") != expected or phase.get("unknown_outcomes") != 0
+            or phase.get("unresolved_workers") != 0
+            or phase.get("profile", {}).get("functional_qualification") is not True):
+        raise ValueError("replay did not complete its exact filtered population")
 
 
 def admit_durability_tier(job, options, manifest_path):
@@ -749,6 +777,7 @@ FOCUSED_COUNTS["nvmeof_f6b"] = 58
 FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
 FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
+FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 32
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -804,6 +833,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_m3_t2_2": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_m3_t2_5": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_p9_small_put": {"G34W": 7},
+    "nvmeof_p9_write_engine": {"G35W": 24, "G35R": 4, "G35S": 4},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -817,7 +847,7 @@ _FOCUSED_GROUP_COUNTS = {
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
-        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5)))[selection]
+        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 5)))[selection]
     return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
 
 
@@ -2078,10 +2108,43 @@ def _nvmeof_p9_small_put():
     return result
 
 
+def _nvmeof_p9_write_engine():
+    """Matched file/prewritten arms: twelve puts, two reads and two perpetual replays."""
+    result = []
+    puts = [job for job in _nvmeof_p9_small_put() if job["repeat"] == 0]
+    reads = [job for job in _nvmeof_m3_owners()
+             if job["selection"] == "nvmeof_m3_t2_5" and job["case_kind"] == "live_read"
+             and job["value_size"] == 1024 and job["concurrency"] in (16, 64)]
+    for arm, prewrite in (("file", False), ("prewritten", True)):
+        common = dict(arm=arm, owner_wal_prewrite=prewrite,
+                      owner_count=5, owner_topology="separate", coordinator_cache_bytes=0,
+                      thread_cpu_sampling=True)
+        for source in puts:
+            for tier in ("synchronous", "native"):
+                clean = {key: value for key, value in source.items() if key != "diagnostics"}
+                _clone_job(result, "nvmeof_p9_write_engine", clean, "G35W",
+                           durability_tier=tier, **common)
+        for source in reads:
+            clean = {key: value for key, value in source.items() if key != "diagnostics"}
+            _clone_job(result, "nvmeof_p9_write_engine", clean, "G35R", **common)
+        for tier in ("synchronous", "native"):
+            source = {key: value for key, value in puts[0].items() if key != "diagnostics"}
+            _clone_job(result, "nvmeof_p9_write_engine", source, "G35S",
+                       case_kind="mainnet_replay", concurrency=16, durability_tier=tier,
+                       replay_node_db_id=0, repetitions=4096, minimum_measurement_seconds=15,
+                       mix=mix(read=50, put=50),
+                       measurement_operations=4096 * (507 + 3), warmup_operations=0,
+                       measurement_sizing={"case_deadline_seconds": 600,
+                                           "expected_case_seconds": 120,
+                                           "expected_archive_bytes": 600 * 1024**2},
+                       **common)
+    return result
+
+
 
 @functools.cache
 def _m3_cases():
-    return {job["case_id"]: job for job in _nvmeof_m3_owners() + _nvmeof_p9_small_put()}
+    return {job["case_id"]: job for job in _nvmeof_m3_owners() + _nvmeof_p9_small_put() + _nvmeof_p9_write_engine()}
 
 
 def _nvmeof_m3_owners():
@@ -2768,6 +2831,33 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
     case_root = Path(case_root)
     if not case_root.is_absolute():
         raise ValueError("absolute case root required")
+    if job.get("case_kind") == "mainnet_replay":
+        fixture = Path(__file__).resolve().parents[1] / "sui-mainnet/fixture/manifest.json"
+        node_options = copy.deepcopy(options)
+        tier = durability_tier(job)
+        if node_options.get("durability_tier", tier) != tier:
+            raise ValueError("replay durability_tier differs from the planned case")
+        node_options["durability_tier"] = tier
+        node_options["transport"] = copy.deepcopy(TRANSPORTS["tidehunter_verbs_native"])
+        return {
+            "schema_version": 1, "case_id": job["case_id"], "source_revision": source_revision,
+            "backend": {"kind": "tidehunter_tcp", "options": {
+                "databases": [{"db_id": 0, "options": node_options}]}},
+            "workload": {"kind": "sui_mainnet_replay", "manifest_path": str(fixture),
+                         "manifest_sha256": hashlib.sha256(fixture.read_bytes()).hexdigest(),
+                         "node_databases": [0], "repetitions": 4096,
+                         "minimum_measurement_seconds": 15},
+            "execution": {"mode": "closed_loop", "concurrency": 16, "client_shards": 1,
+                          "queue_capacity": 128, "request_timeout_ms": 10000,
+                          "offered_ops_per_second": None},
+            "measurement_gate": {"ready_file": str(case_root / "measurement.ready"),
+                                 "release_file": str(case_root / "measurement.release"), "timeout_seconds": 240},
+            "measurement_completion_gate": {"ready_file": str(case_root / "measurement.complete"),
+                                            "release_file": str(case_root / "measurement.observed"), "timeout_seconds": 240},
+            "limits": {"max_keys": 8_000_000, "max_bytes": 16 * 1024**3,
+                       "max_operations": 8_000_000, "deadline_seconds": max(600, deadline_seconds),
+                       "shutdown_grace_seconds": 20},
+        }
     maximum = job["keys"] + job["warmup_operations"] + job["measurement_operations"] + 4096
     options = dict(options)
     contract = ack_contract.selected(job["backend"], job.get("ack_contract", "synced"))
@@ -4113,7 +4203,9 @@ def summarize_case(directory, *, local_mode=False):
                                 ("native_shards", "native_shards")):
             if planned in job and options.get(option) != job[planned]:
                 raise ValueError(f"native {option} differs from the planned case")
-    admit_durability_tier(job, normalized["backend"]["options"], result / "manifest.json")
+    admit_durability_tier(job, runtime_options(normalized), result / "manifest.json")
+    if job.get("case_kind") == "mainnet_replay":
+        admit_replay_summary(normalized, json.loads((result / "summary.json").read_text()))
     if job["backend"] in NVME_BACKENDS and job.get("nvmeof_route") == "live":
         manifest_path = result / "manifest.json"
         backend_info = json.loads(manifest_path.read_text()).get("backend_info", {}) if manifest_path.is_file() else {}
@@ -4129,7 +4221,7 @@ def summarize_case(directory, *, local_mode=False):
             if hashlib.sha256(artifact.read_bytes()).hexdigest() != binding.get("sha256"):
                 raise ValueError("live NVMe expectation differs from its integrity binding")
             expected = json.loads(artifact.read_text())
-            live = config["backend"]["options"].get("external_remote_config", {}).get("live_nvme")
+            live = runtime_options(config).get("external_remote_config", {}).get("live_nvme")
             if not isinstance(live, dict) or any(expected.get(k) != live.get(k) for k in ("host_id", "host_nqn")):
                 raise ValueError("live NVMe identity differs from executed configuration")
         qualification = qualify_live_nvme_route(read_interval["observed"] if read_interval else None, job, expected, backend_info)

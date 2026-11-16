@@ -84,10 +84,32 @@ def verify_run_identity(result_dir, receipt, normalized_config, fdb_identity=Non
         receipt["loaded_native_library"] = loaded
 
 
-def verify_timing_result(result_dir, config, *, allow_partial=False, phase_windows=None):
-    counts = dict.fromkeys(("preload", "warmup", "aging", "measurement"), 0)
+def planned_timing_rows(config):
+    if config.get("workload", {}).get("kind") == "sui_mainnet_replay":
+        manifest = json.loads(Path(config["workload"]["manifest_path"]).read_text())
+        selected = config["workload"].get("node_databases")
+        batches = [batch for batch in manifest["batches"]
+                   if selected is None or batch["db_id"] in selected]
+        # The v1 trace declares all store reads in the perpetual objects table.
+        reads = manifest["store_reads"] if selected is None or 0 in selected else 0
+        return {"preload": 0, "warmup": 0, "aging": 0,
+                "measurement": (reads + len(batches)) * config["workload"]["repetitions"]}
+    expected = {
+        "preload": config["dataset"]["keys"] if config["phases"]["preload"] else 0,
+        "warmup": config["phases"]["warmup_operations"],
+        "aging": config["phases"]["aging_operations"],
+        "measurement": config["phases"]["measurement_operations"],
+    }
     if config["phases"].get("verify_existing_dataset", False):
-        counts["verify_existing_dataset"] = 0
+        expected["verify_existing_dataset"] = config["dataset"]["keys"]
+    if config.get("qualification_only", False):
+        expected = dict.fromkeys(expected, 0)
+    return expected
+
+
+def verify_timing_result(result_dir, config, *, allow_partial=False, phase_windows=None):
+    expected = planned_timing_rows(config)
+    counts = dict.fromkeys(expected, 0)
     for row in analyze.read_samples(result_dir / "samples.csv", measurement_only=False):
         if row["phase"] not in counts:
             raise ValueError("unrecognized raw timing phase")
@@ -103,16 +125,6 @@ def verify_timing_result(result_dir, config, *, allow_partial=False, phase_windo
             window["elapsed_ns"] = window["end_ns"] - window["start_ns"]
             window["rows"] += 1
             window["unsuccessful_rows"] += row["outcome"] != "success"
-    expected = {
-        "preload": config["dataset"]["keys"] if config["phases"]["preload"] else 0,
-        "warmup": config["phases"]["warmup_operations"],
-        "aging": config["phases"]["aging_operations"],
-        "measurement": config["phases"]["measurement_operations"],
-    }
-    if "verify_existing_dataset" in counts:
-        expected["verify_existing_dataset"] = config["dataset"]["keys"]
-    if config["qualification_only"]:
-        expected = dict.fromkeys(expected, 0)
     if any(counts[name] > expected[name] for name in counts) or (not allow_partial and counts != expected):
         raise ValueError(f"raw timing rows differ from admitted phase bounds: expected={expected}, observed={counts}")
     return counts

@@ -122,6 +122,51 @@ pub struct Trace {
     pub batches: Vec<Batch>,
     pub reads: Vec<Vec<Read>>,
     pub dependencies: Vec<Vec<usize>>,
+    selected_databases: Option<Vec<u8>>,
+}
+impl Trace {
+    pub fn select_node_databases(&mut self, selected: &[u8]) -> BackendResult<()> {
+        let declared = self.manifest["node_databases"]
+            .as_array()
+            .ok_or("missing node database declarations")?;
+        require(
+            !selected.is_empty()
+                && selected.windows(2).all(|pair| pair[0] < pair[1])
+                && selected
+                    .iter()
+                    .all(|id| declared.iter().any(|node| node["id"] == *id)),
+            "node_databases must be a non-empty strictly increasing subset of manifest ids",
+        )?;
+        let tables = &self.tables;
+        let includes = |row: &Row| selected.contains(&(tables[usize::from(row.table)].db_id as u8));
+        self.preload.retain(includes);
+        self.batches
+            .retain(|batch| selected.contains(&(batch.db as u8)));
+        for reads in &mut self.reads {
+            reads.retain(|read| includes(&read.row));
+        }
+        for (dependencies, reads) in self.dependencies.iter_mut().zip(&self.reads) {
+            dependencies
+                .retain(|producer| reads.iter().any(|read| read.producer == Some(*producer)));
+        }
+        self.selected_databases = Some(selected.to_vec());
+        Ok(())
+    }
+
+    pub fn scope(&self) -> String {
+        let Some(selected) = &self.selected_databases else {
+            return SCOPE.to_owned();
+        };
+        let ids: BTreeSet<_> = selected.iter().copied().map(u64::from).collect();
+        let names = self.manifest["node_databases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|node| node["id"].as_u64().is_some_and(|id| ids.contains(&id)))
+            .filter_map(|node| node["name"].as_str())
+            .collect::<Vec<_>>();
+        format!("{SCOPE}, node databases: {}", names.join(","))
+    }
 }
 #[derive(Debug)]
 enum Record {
@@ -535,6 +580,7 @@ impl Trace {
             batches,
             reads,
             dependencies,
+            selected_databases: None,
         })
     }
     fn check_manifest(&self, m: &serde_json::Value) -> BackendResult<()> {

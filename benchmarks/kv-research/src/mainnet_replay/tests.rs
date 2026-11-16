@@ -1,4 +1,5 @@
 use super::*;
+use crate::mainnet_trace::SCOPE;
 use tidehunter::minibytes::Bytes;
 fn trace() -> Trace {
     Trace::load(
@@ -37,6 +38,7 @@ fn config(root: &Path) -> ReplayConfig {
                 .into(),
             repetitions: 2,
             minimum_measurement_seconds: 0.0,
+            node_databases: None,
         },
         execution: ExecutionConfig {
             mode: ExecutionMode::ClosedLoop,
@@ -531,4 +533,112 @@ async fn unknown_partial_commit_stops_without_retry_or_final_get_recovery() {
     assert!(native.get(16, &2_u32.to_be_bytes()).unwrap().is_none());
     drop(native);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn perpetual_subset_has_exact_counts_and_real_native_contents() {
+    let root = temp("perpetual");
+    let mut config = config(&root);
+    config.workload.node_databases = Some(vec![0]);
+    let selected = config.validate().unwrap();
+    assert_eq!(
+        selected.scope(),
+        "archive-derivable node KV subset, node databases: perpetual"
+    );
+    assert_eq!(selected.batches.len(), 3);
+    assert_eq!(
+        selected
+            .batches
+            .iter()
+            .map(|b| b.entries.len())
+            .sum::<usize>(),
+        654
+    );
+    assert_eq!(
+        selected
+            .reads
+            .iter()
+            .flatten()
+            .filter(|r| r.producer.is_none())
+            .count(),
+        507
+    );
+    assert_eq!(
+        selected
+            .reads
+            .iter()
+            .flatten()
+            .filter(|r| r.producer.is_some())
+            .count(),
+        116
+    );
+    let prepared = prepare(&selected, 2).unwrap();
+    let backend =
+        Arc::new(NativeReplayBackend::open(&config.backend.options, &selected.tables).unwrap());
+    let counts = execute(
+        backend.clone(),
+        &selected,
+        Arc::new(prepared),
+        4,
+        Instant::now() + Duration::from_secs(30),
+        30000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.checkpoints, 2);
+    assert_eq!(counts.write_calls, 6);
+    assert_eq!(counts.put_members, 1308);
+    assert_eq!(counts.store_gets, 1014);
+    assert_eq!(counts.overlay_demands, 232);
+    drop(backend);
+    for ids in [vec![], vec![0, 0], vec![1, 0], vec![3]] {
+        config.workload.node_databases = Some(ids);
+        assert!(config.validate().is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn all_node_database_subsets_preserve_source_phases() {
+    let source = trace();
+    for ids in [
+        vec![0],
+        vec![1],
+        vec![2],
+        vec![0, 1],
+        vec![0, 2],
+        vec![1, 2],
+        vec![0, 1, 2],
+    ] {
+        let mut selected = trace();
+        selected.select_node_databases(&ids).unwrap();
+        let expected = source
+            .batches
+            .iter()
+            .filter(|batch| ids.contains(&(batch.db as u8)))
+            .map(|batch| batch.phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected
+                .batches
+                .iter()
+                .map(|batch| batch.phase)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            selected.preload.len(),
+            if ids.contains(&0) { 376 } else { 0 }
+        );
+        assert_eq!(
+            selected.reads.iter().flatten().count(),
+            if ids.contains(&0) { 623 } else { 0 }
+        );
+        assert!(
+            selected
+                .scope()
+                .starts_with("archive-derivable node KV subset, node databases: ")
+        );
+        prepare(&selected, 2).unwrap();
+    }
 }
