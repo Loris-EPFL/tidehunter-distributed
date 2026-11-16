@@ -61,6 +61,11 @@ fn distributed_mainnet_cli_uses_three_real_owner_databases() {
     assert_eq!(summary["phase_counts"]["unknown_outcomes"], 0);
     assert_eq!(summary["phase_counts"]["unresolved_workers"], 0);
     assert_eq!(summary["phase_counts"]["sustained_30s_qualified"], false);
+    // The campaign admits a Tidehunter case only with the owner-confirmed tier in this field.
+    let tier =
+        &summary["backend"]["configuration"]["databases"][0]["configuration"]["durability_tier"];
+    assert!(tier.is_string());
+    assert_eq!(&summary["durability"]["confirmed_by_backend_receipt"], tier);
     let samples = std::fs::read_to_string(root.join("result/samples.csv")).unwrap();
     assert_eq!(samples.lines().count(), 1033);
     for id in 0..3 {

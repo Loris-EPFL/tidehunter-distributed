@@ -87,6 +87,8 @@ class ReplayCITests(unittest.TestCase):
     def test_prewrite_pass_is_non_gating_but_cleanup_is_required(self):
         import argparse
         import local_multiowner_check
+        import local_dry_run_targets
+        original_root = local_dry_run_targets.ROOT
         for clean in (True, False):
             with self.subTest(clean=clean), tempfile.TemporaryDirectory() as temporary:
                 state = Path(temporary)
@@ -95,6 +97,7 @@ class ReplayCITests(unittest.TestCase):
                 args = argparse.Namespace(state=state, binary=binary)
                 calls = []
                 def proof():
+                    self.assertEqual(local_dry_run_targets.ROOT, [])
                     prewrite = "--wal-prewrite" in sys.argv
                     calls.append(prewrite)
                     output = Path(sys.argv[sys.argv.index("--output") + 1])
@@ -109,6 +112,7 @@ class ReplayCITests(unittest.TestCase):
                         patch.object(sys, "argv", ["test"]), \
                         patch.object(local_multiowner_check, "main", side_effect=proof):
                     self.assertEqual(kernel.run(args), 0)
+                    self.assertIs(local_dry_run_targets.ROOT, original_root)
                     self.assertEqual(calls, [False, True])
                     self.assertFalse(json.loads((state / "prewrite-result.json").read_text())["passed"])
                     if clean:

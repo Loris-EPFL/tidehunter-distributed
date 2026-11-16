@@ -128,36 +128,47 @@ fn fixture(
                 "inline_reads":true,"lease_ahead":true,"polled_writes":false
             })).unwrap());
         }
-        let node = StorageNode::open(
-            NodeConfig {
-                root: base.join("owner"),
-                partition: tidehunter::distributed::storage::PartitionConfig {
-                    inventory: tidehunter::distributed::storage::StaticInventory {
-                        database: config.storage.database,
-                        epoch: 1,
-                        segment_generation: 1,
-                        partitions: config.storage.partitions.clone(),
-                    },
-                    partition: 0,
-                    batch_limits: config.storage.batch_limits,
-                    group_limits: config.storage.group_limits,
-                    fragment_bytes: config.storage.fragment_bytes,
-                    wal_file_bytes: config.storage.wal_file_bytes,
-                    max_batches: config.storage.max_batches_per_partition,
-                    max_reference_metadata_bytes: config.storage.max_reference_metadata_bytes,
+        let node_config = NodeConfig {
+            root: base.join("owner"),
+            partition: tidehunter::distributed::storage::PartitionConfig {
+                inventory: tidehunter::distributed::storage::StaticInventory {
+                    database: config.storage.database,
+                    epoch: 1,
+                    segment_generation: 1,
+                    partitions: config.storage.partitions.clone(),
                 },
-                shape_yaml: serde_yaml::to_string(&shape).unwrap(),
-                max_epochs: 4,
-                read_workers: Some(2),
-                wal_member_read: Default::default(),
-                wal_prewrite: false,
-                read_resident_first: false,
-                read_memory_allowance_bytes: 134217728,
-                read_max_inflight_requests: 64,
-                read_max_inflight_bytes: 16777216,
-                read_max_device_reads: 64,
-                live_target: None,
+                partition: 0,
+                batch_limits: config.storage.batch_limits,
+                group_limits: config.storage.group_limits,
+                fragment_bytes: config.storage.fragment_bytes,
+                wal_file_bytes: config.storage.wal_file_bytes,
+                max_batches: config.storage.max_batches_per_partition,
+                max_reference_metadata_bytes: config.storage.max_reference_metadata_bytes,
             },
+            shape_yaml: serde_yaml::to_string(&shape).unwrap(),
+            max_epochs: 4,
+            read_workers: Some(2),
+            wal_member_read: Default::default(),
+            wal_prewrite: false,
+            read_resident_first: false,
+            read_memory_allowance_bytes: 134217728,
+            read_max_inflight_requests: 64,
+            read_max_inflight_bytes: 16777216,
+            read_max_device_reads: 64,
+            live_target: None,
+        };
+        let owner_read = super::super::ExternalOwnerReadConfig {
+            partition: node_config.partition.partition,
+            read_workers: node_config.read_workers,
+            wal_member_read: node_config.wal_member_read,
+            read_resident_first: node_config.read_resident_first,
+            read_memory_allowance_bytes: node_config.read_memory_allowance_bytes,
+            read_max_inflight_requests: node_config.read_max_inflight_requests,
+            read_max_inflight_bytes: node_config.read_max_inflight_bytes,
+            read_max_device_reads: node_config.read_max_device_reads,
+        };
+        let node = StorageNode::open(
+            node_config,
             Metrics::new_in_enabled(&prometheus::Registry::new(), false),
         )
         .unwrap();
@@ -225,7 +236,7 @@ fn fixture(
             db:Some(db),keyspace,cluster:std::sync::Mutex::new(None),
             endpoints:config.endpoints.iter().map(|e|(e.partition,e.address.clone())).collect(),owners:1,
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
-            effective_configuration:serde_json::json!({"fixture_route":live.unwrap_or("owner_rpc")}),operational_read_io:None,
+            effective_configuration:serde_json::json!({"fixture_route":live.unwrap_or("owner_rpc"),"remote":config,"owner_read":owner_read}),operational_read_io:None,
             read_evidence_written:false,coordinator_interval_baseline:std::sync::Mutex::new(None),
             #[cfg(all(feature="nvmeof",target_os="linux"))]
             live_write_profile:std::sync::Mutex::new(None),
@@ -361,8 +372,55 @@ async fn replay(route: Option<&str>, callers: usize) -> BTreeMap<(u16, Bytes), B
             "{evidence}"
         );
     }
+    let metadata_bound = if route.is_some() {
+        let options = serde_json::json!({"databases":backend.databases.iter().map(|(id, backend)| {
+            backend.db.as_ref().unwrap().flush().unwrap();
+            serde_json::json!({"db_id":id,"options":{
+                "transport":{"kind":"tcp-trusted"},"path":root.join(format!("db-{id}")),
+                "owners":1,"external_remote_config":backend.effective_configuration["remote"],
+                "external_owner_read_config":[backend.effective_configuration["owner_read"]],
+                "owner_read_resident_first":false
+            }})
+        }).collect::<Vec<_>>()});
+        Some(TidehunterReplayBackend::coordinator_reservation(&options, &trace, 2).unwrap())
+    } else {
+        None
+    };
     drop(backend);
     drop(owners);
+    if let Some(bound) = metadata_bound {
+        let mut actual = 0_u64;
+        for db in trace
+            .batches
+            .iter()
+            .map(|batch| batch.db)
+            .collect::<BTreeSet<_>>()
+        {
+            let output = std::process::Command::new("du")
+                .args(["-s", "-B1"])
+                .arg(root.join(format!("db-{db}/coordinator")))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            actual += std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+        }
+        let predicted = bound["reservation_bytes"].as_u64().unwrap();
+        assert!(actual <= predicted, "actual={actual}; bound={bound}");
+        eprintln!(
+            "local-file-replay-disk-bound route={route:?} repetitions=2 callers={callers} actual_bytes={actual} predicted_bytes={predicted} measured_to_bound_ratio={}",
+            actual as f64 / predicted as f64
+        );
+    }
     std::fs::remove_dir_all(root).unwrap();
     expected
 }

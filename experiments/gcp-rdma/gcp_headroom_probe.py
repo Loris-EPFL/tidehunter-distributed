@@ -179,13 +179,21 @@ def retire_controllers(expected, hostnqn, timeout=180):
     return len(selected)
 
 
+def targets_per_owner(owners):
+    """Coordinator-wide headroom: spread MAX_CONTROLLERS over the owners so the
+    MIN_CONTROLLERS threshold is reachable for every reviewed owner count."""
+    if owners not in OWNER_HOST_COUNTS:
+        raise ValueError('unreviewed owner count')
+    return MAX_CONTROLLERS // owners
+
+
 def probe(run_id, addresses, device, seconds=120):
     if len(addresses) not in OWNER_HOST_COUNTS or not re.fullmatch(r'[A-Za-z0-9_]+', device):
-        raise ValueError('one or five owners and a valid RDMA device are required')
+        raise ValueError('a reviewed owner count and a valid RDMA device are required')
     addresses = [str(ipaddress.IPv4Address(x)) for x in addresses]
     hostnqn, _ = identities(run_id, 1)
     hostid = str(uuid.uuid5(uuid.NAMESPACE_URL, hostnqn))
-    count = MAX_CONTROLLERS if len(addresses) == 1 else COUNT_PER_OWNER
+    count = targets_per_owner(len(addresses))
     expected = [(name, address) for owner, address in enumerate(addresses, 1)
                 for name in identities(run_id, owner, count)[1]]
     before = manage.controller_snapshot()
@@ -257,14 +265,18 @@ def main():
     parser.add_argument('--address')
     parser.add_argument('--addresses')
     parser.add_argument('--device')
-    parser.add_argument('--count', type=int, default=COUNT_PER_OWNER)
+    parser.add_argument('--owners', type=int, help='owner host count (create/cleanup)')
     args = parser.parse_args()
     root = Path('/mnt/tidehunter-kv-comparison') / args.run_id / 'headroom-probe'
     configfs = Path('/sys/kernel/config/nvmet')
+    if args.action in ('create', 'cleanup'):
+        if args.owners is None:
+            parser.error('--owners is required for create and cleanup')
+        count = targets_per_owner(args.owners)
     if args.action == 'create':
-        result = create_targets(root, configfs, args.run_id, args.owner, args.address, args.count)
+        result = create_targets(root, configfs, args.run_id, args.owner, args.address, count)
     elif args.action == 'cleanup':
-        result = cleanup_targets(root, configfs, args.run_id, args.owner, args.count)
+        result = cleanup_targets(root, configfs, args.run_id, args.owner, count)
     else:
         result = probe(args.run_id, args.addresses.split(','), args.device)
     print(json.dumps(result, sort_keys=True), flush=True)

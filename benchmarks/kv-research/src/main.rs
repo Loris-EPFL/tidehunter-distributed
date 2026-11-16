@@ -114,12 +114,13 @@ fn entry() -> BackendResult<()> {
     if raw["workload"]["kind"] == "sui_mainnet_replay" {
         let config: kv_research::mainnet_replay::ReplayConfig = serde_json::from_value(raw)?;
         if validate_only {
-            let (_, _, admission) = config.admit()?;
+            let (_, _, admission) = config.admit_configuration()?;
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "admitted_config": config, "scope": kv_research::mainnet_trace::SCOPE,
                     "workload_admission": admission,
+                    "host_resources": admission["host_resources"],
                 }))?
             );
             return Ok(());

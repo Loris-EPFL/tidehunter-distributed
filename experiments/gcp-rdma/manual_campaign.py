@@ -392,6 +392,14 @@ def _reviewed_jobs(spec):
     return jobs
 
 
+def expected_case_count(spec):
+    """Cases the coordinator is asked to run: the reviewed jobs after arm selection,
+    not the selection's full job_count."""
+    if spec.get('mode') == 'focused':
+        return len(_reviewed_jobs(spec))
+    return len(workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'}))
+
+
 def _check_config(config, spec, surcharge_cents):
     if (config.get('project_id') != 'mysten-research'
             or config.get('bucket') != 'mysten-research-bench-artifacts'
@@ -1131,7 +1139,8 @@ async def _headroom(mailbox, fleet, state, package_root, rdma_device, output):
     probe_submitted = False
     try:
         created = await _joined_waiters(
-            request(index, 'create', ['--owner', str(index), '--address', fleet[index]['rdma_ip']])
+            request(index, 'create', ['--owner', str(index), '--address', fleet[index]['rdma_ip'],
+                                      '--owners', str(len(fleet) - 1)])
             for index in range(1, len(fleet)))
         if any(item['exit_code'] != 0 for item in created):
             raise RuntimeError('headroom target creation failed; see mailbox receipts')
@@ -1151,7 +1160,7 @@ async def _headroom(mailbox, fleet, state, package_root, rdma_device, output):
     try:
         if cleanup_timeout < 1:
             raise TimeoutError('headroom teardown deadline exhausted')
-        cleaned = await _joined_waiters(request(index, 'cleanup', ['--owner', str(index)])
+        cleaned = await _joined_waiters(request(index, 'cleanup', ['--owner', str(index), '--owners', str(len(fleet) - 1)])
                                         for index in range(1, len(fleet)))
         if probe_submitted and time.time() > result['teardown_started_unix'] + 180:
             raise TimeoutError('headroom teardown exceeded 180 seconds')
@@ -1243,9 +1252,7 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
             # output of verification subprocesses (for example `verified: true` blocks).
             result = json.loads(terminal['stdout'].strip().splitlines()[-1])
             kv = result.get('kv', {})
-            expected_cases = (spec['job_count'] if spec.get('mode') == 'focused' else
-                              len(workflow_input.cloud_campaign.make_matrix(
-                                  {k: v for k, v in spec.items() if k != 'suite'})))
+            expected_cases = expected_case_count(spec)
             if kv.get('complete') is not True or kv.get('planned_cases') != expected_cases or kv.get('completed_cases') != expected_cases:
                 raise RuntimeError('coordinator did not complete the reviewed combined suite')
             profiles = spec.get('valkey_reproduction_profiles', [])

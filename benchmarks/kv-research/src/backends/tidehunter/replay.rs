@@ -208,6 +208,13 @@ impl TidehunterReplayBackend {
         }
         Ok(())
     }
+    pub(crate) fn coordinator_reservation(
+        value: &serde_json::Value,
+        trace: &Trace,
+        repetitions: u64,
+    ) -> BackendResult<serde_json::Value> {
+        resources::reservation(value, trace, repetitions)
+    }
     pub fn geometry(value: &serde_json::Value) -> BackendResult<serde_json::Value> {
         let opts = options(value)?;
         let mut wal = 0;
@@ -313,6 +320,16 @@ impl TidehunterReplayBackend {
         info.topology = serde_json::json!({"node_databases":self.databases.len(), "databases": self.databases.iter().map(|(id, b)| serde_json::json!({"db_id":id,"topology":b.info().topology})).collect::<Vec<_>>()});
         if self.databases.len() != 1 {
             info.configuration = serde_json::json!({"databases":self.databases.iter().map(|(id,b)| serde_json::json!({"db_id":id,"configuration":b.effective_configuration})).collect::<Vec<_>>(), "atomicity":"one complete batch per node DB; no cross-DB atomicity"});
+            // Each node DB confirmed its tier from its own owner receipts; a common tier is
+            // published only when every node DB confirmed the same one.
+            let tier = &first.effective_configuration["durability_tier"];
+            if self
+                .databases
+                .values()
+                .all(|b| b.effective_configuration["durability_tier"] == *tier)
+            {
+                info.configuration["durability_tier"] = tier.clone();
+            }
         }
         info
     }
@@ -408,5 +425,6 @@ impl ReplayBackend for TidehunterReplayBackend {
     }
 }
 
+mod resources;
 #[cfg(test)]
 mod tests;
