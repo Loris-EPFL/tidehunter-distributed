@@ -11,6 +11,51 @@ import nvme_campaign_native
 
 
 class CompactReadLifecycleTests(unittest.TestCase):
+    def test_shared_preparation_sizes_exact_group_for_largest_reader(self):
+        for second_lanes, expected_lanes, expected_limit in ((4, 4, 12), (None, 64, 132)):
+            with self.subTest(lanes=second_lanes), tempfile.TemporaryDirectory() as tmp:
+                first = {'case_id': 'first', 'backend': 'tidehunter_tcp',
+                         'sealed_dataset': {'source_id': 'source'},
+                         'durability_tier': 'synchronous', 'read_lanes': 1}
+                second = dict(first, case_id='second', backend='tidehunter_nvme_rdma')
+                if second_lanes is None:
+                    second.pop('read_lanes')
+                else:
+                    second['read_lanes'] = second_lanes
+                excluded = [
+                    dict(first, case_id='other-source', read_lanes=126,
+                         sealed_dataset={'source_id': 'other'}),
+                    dict(first, case_id='other-transport', read_lanes=126,
+                         backend='tidehunter_verbs_native'),
+                    dict(first, case_id='other-tier', read_lanes=126, durability_tier='native'),
+                    dict(first, case_id='other-polling', read_lanes=126, owner_polling='busy'),
+                    dict(first, case_id='other-route', read_lanes=126,
+                         backend='tidehunter_nvme_rdma', case_kind='hybrid_put',
+                         nvmeof_route='sealed_read'),
+                ]
+                runtime = controller.Controller.__new__(controller.Controller)
+                runtime.root = Path(tmp)
+                runtime.config = {'spec': {}}
+                runtime.shared_tide = None
+                runtime.active_nvme = None
+                runtime.prepare_tide = MagicMock(side_effect=RuntimeError('preparation captured'))
+                with patch.object(controller, 'controller_matrix',
+                                  return_value=[first, second, *excluded]), \
+                        self.assertRaisesRegex(RuntimeError, 'preparation captured'):
+                    runtime.prepared_tide_options(first, Path(tmp) / 'case')
+                prepared_job, block = runtime.prepare_tide.call_args.args
+                self.assertEqual(prepared_job['read_lanes'], expected_lanes)
+                # The Rust preparer uses this resolved lane budget in 2*(L+2).
+                self.assertEqual(2 * (prepared_job['read_lanes'] + 2), expected_limit)
+                evidence = json.loads((block / 'preparation-sizing.json').read_text())
+                self.assertEqual(evidence, {'read_lanes': expected_lanes,
+                                            'job_ids': ['first', 'second']})
+                self.assertEqual(first['read_lanes'], 1)
+                if second_lanes is None:
+                    self.assertNotIn('read_lanes', second)
+                else:
+                    self.assertEqual(second['read_lanes'], second_lanes)
+
     def test_live_anchor_preparation_receipt_and_emitted_transport_match(self):
         from test_cloud_controller import config_fixture
         for selection in ("nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "valkey_rdma_reads"):

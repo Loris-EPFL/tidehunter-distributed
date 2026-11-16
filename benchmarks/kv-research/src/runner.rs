@@ -962,7 +962,7 @@ fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_js
     })
 }
 
-fn measurement_read_evidence(
+pub(crate) fn measurement_read_evidence(
     start: &serde_json::Value,
     end: &serde_json::Value,
     attempted: bool,
@@ -3663,7 +3663,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 // One reusable 64 KiB setup buffer fits the non-recursive 2 MiB worker stack; avoid a heap copy.
 #[allow(clippy::large_stack_arrays)]
-fn binary_identity() -> serde_json::Value {
+pub(crate) fn binary_identity() -> serde_json::Value {
     let result = std::env::current_exe()
         .and_then(|path| std::fs::File::open(&path).map(|file| (path, file)));
     match result {

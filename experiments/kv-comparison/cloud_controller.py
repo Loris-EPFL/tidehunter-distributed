@@ -150,6 +150,11 @@ def controller_matrix(spec):
         jobs = cloud_campaign.make_focused_matrix(spec["selection"])
         if spec["selection"] in cloud_campaign.M3_SELECTIONS and "owner_hosts" in spec:
             jobs = [job for job in jobs if cloud_campaign.job_owner_hosts(job) == spec["owner_hosts"]]
+        if spec["selection"] == "nvmeof_p9_write_engine":
+            arms = spec.get("arms", ["file"])
+            if arms not in (["file"], ["prewritten"]):
+                raise SafetyError("write-engine fleets require exactly one file or prewritten arm")
+            jobs = [job for job in jobs if job["arm"] in arms]
         return jobs
     return cloud_campaign.make_matrix(spec)
 
@@ -1733,6 +1738,9 @@ def require_zero_owner_history_waits(directory, owner_count):
 def planned_write_batches_per_partition(job):
     """Reserve a per-owner write-batch ceiling, with fixed history slack."""
     owners = job["owner_count"]
+    if job.get("case_kind") == "mainnet_replay":
+        writes = job["repetitions"] * (3 + 2)  # Three commits and two preload chunks per repetition.
+        return (writes + owners - 1) // owners + 4096
     writes = job["keys"]  # At most one preload batch per key.
     if any(job["mix"].get(kind, 0) for kind in ("put", "delete", "put_batch")):
         # Mixed phases reserve the all-write ceiling, not an expected fraction.
@@ -1857,6 +1865,16 @@ def live_target_for_owner(config, case, index, transport, host_nqn, target="kern
     return result
 
 
+def bind_owner_wal_prewrite(job, launch):
+    if "owner_wal_prewrite" in job:
+        if type(job["owner_wal_prewrite"]) is not bool:
+            raise SafetyError("owner_wal_prewrite must be boolean")
+        if job["owner_wal_prewrite"]:
+            launch["node"]["wal_prewrite"] = True
+        else:
+            launch["node"].pop("wal_prewrite", None)
+
+
 def validate_launch(config, launch, case, index, polling=None):
     root = Path(config["fleet"]["data_root"]) / "cells" / case
     node = root / f"node-{index}"
@@ -1870,6 +1888,14 @@ def validate_launch(config, launch, case, index, polling=None):
     if launch.get("node", {}).get("root") != str(node / "storage"):
         raise SafetyError("typed database root escapes exact case/node")
     guarded(node / "storage", root)
+    job = case_owner_job(config, case)
+    if "owner_wal_prewrite" in job:
+        expected_prewrite = job["owner_wal_prewrite"]
+        actual_prewrite = launch.get("node", {}).get("wal_prewrite", False)
+        if (type(expected_prewrite) is not bool or type(actual_prewrite) is not bool
+                or actual_prewrite != expected_prewrite
+                or not expected_prewrite and "wal_prewrite" in launch.get("node", {})):
+            raise SafetyError("owner wal_prewrite differs from the exact reviewed case")
     live_target = launch.get("node", {}).get("live_target")
     if live_target is not None:
         if not isinstance(live_target, dict):
@@ -3641,6 +3667,10 @@ class Controller:
             prep["owner_wal_file_bytes"] = job["owner_wal_file_bytes"]
         tier = cloud_campaign.durability_tier(job)
         prep["durability_tier"] = tier
+        if job.get("case_kind") == "mainnet_replay":
+            prep.update(replay_node_db_id=0,
+                        database=list(hashlib.blake2b(case.encode(), digest_size=16).digest()),
+                        batch_limits={"max_operations": 519, "max_encoded_bytes": 500000})
         receipts, nonces = {}, {}
         if job.get("nvmeof_route") == "live":
             live_transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}.get(job["backend"])
@@ -3738,6 +3768,7 @@ class Controller:
                     raise SafetyError("prepared live target is missing or differs from selected transport")
             elif launch.get("node", {}).get("live_target") is not None:
                 raise SafetyError("unexpected live target in non-live campaign case")
+            bind_owner_wal_prewrite(job, launch)
             launch["launch_nonce"] = nonces[index] = secrets.token_hex(16)
             launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
             files = {"launch.yaml": launch_path}
@@ -3787,7 +3818,7 @@ class Controller:
                 "durability_tier": tier,
                 "external_owner_durability_receipts": receipt_paths,
                 "external_owner_read_config": json.loads((prepared / "external_owner_read_config.json").read_text())}
-        if job.get("selection") in cloud_campaign.M3_SELECTIONS:
+        if job.get("selection") in cloud_campaign.M3_SELECTIONS and job.get("case_kind") != "mainnet_replay":
             self.admit_logical_owners(job, directory, options)
         return options
 
@@ -3996,16 +4027,22 @@ class Controller:
         return mirrors
 
     def prepared_tide_options(self, job, directory, spans=None):
-        source = job["sealed_dataset"]["source_id"]
-        focused_hybrid = (job.get("case_kind") is not None and job["backend"] in cloud_campaign.NVME_BACKENDS
-                          and job.get("nvmeof_route") == "sealed_read")
-        transport = ("tidehunter_verbs_native" if focused_hybrid else
-                     "tcp" if job["backend"] == "tidehunter_tcp" or job["backend"] in cloud_campaign.NVME_BACKENDS
-                     else job["backend"])
-        polling = job.get("owner_polling", "adaptive")
+        def shared_identity(candidate):
+            source = candidate["sealed_dataset"]["source_id"]
+            focused_hybrid = (candidate.get("case_kind") is not None
+                              and candidate["backend"] in cloud_campaign.NVME_BACKENDS
+                              and candidate.get("nvmeof_route") == "sealed_read")
+            transport = ("tidehunter_verbs_native" if focused_hybrid else
+                         "tcp" if candidate["backend"] == "tidehunter_tcp"
+                         or candidate["backend"] in cloud_campaign.NVME_BACKENDS
+                         else candidate["backend"])
+            return (source, transport, cloud_campaign.durability_tier(candidate),
+                    candidate.get("owner_polling", "adaptive"))
+
+        identity = shared_identity(job)
+        transport, polling = identity[1], identity[3]
         if polling not in ("adaptive", "busy"):
             raise ValueError("owner_polling must be adaptive or busy")
-        identity = (source, transport, cloud_campaign.durability_tier(job), polling)
         if self.shared_tide is not None and self.shared_tide["identity"] != identity:
             if self.active_nvme is not None:
                 raise SafetyError("cannot replace a dataset with outstanding NVMe namespaces")
@@ -4017,7 +4054,23 @@ class Controller:
                 name += "-" + polling + "-" + job["case_id"]
             block = guarded(self.root / "datasets" / name, self.root)
             block.mkdir(parents=True, exist_ok=False)
-            options = record_phase_span(spans, "backend_deploy", self.prepare_tide, job, block)
+            group = [job] + [
+                candidate for candidate in controller_matrix(self.config["spec"])
+                if "sealed_dataset" in candidate
+                and shared_identity(candidate) == identity
+                and candidate["case_id"] != job["case_id"]
+            ]
+            # Match RemoteDatabaseConfig::MAX_AUTO_READ_LANES. Missing/None
+            # stays automatic on each reader, but owners reserve for its cap.
+            read_lanes = max(64 if candidate.get("read_lanes") is None
+                             else candidate["read_lanes"] for candidate in group)
+            dump(block / "preparation-sizing.json", {
+                "read_lanes": read_lanes,
+                "job_ids": [candidate["case_id"] for candidate in group],
+            })
+            preparation_job = dict(job, read_lanes=read_lanes)
+            options = record_phase_span(
+                spans, "backend_deploy", self.prepare_tide, preparation_job, block)
             prep_config = cloud_campaign.make_run_config(job, block, options, self.config["source_revision"],
                                                         min(600, int(self.remaining())))
             if job.get("case_kind") == "hybrid_put":
@@ -4070,7 +4123,10 @@ class Controller:
                                 "options": options, "prepared": prepared, "ready": ready, "mirror_roots": mirrors}
         options = copy.deepcopy(self.shared_tide["options"])
         options["evidence"] = str(directory / "read-evidence")
-        options["external_remote_config"]["read_lanes"] = job["read_lanes"]
+        if "read_lanes" in job:
+            options["external_remote_config"]["read_lanes"] = job["read_lanes"]
+        else:
+            options["external_remote_config"].pop("read_lanes", None)
         if "live_pin_read_lanes" in job:
             options["external_remote_config"]["pin_read_lanes"] = job["live_pin_read_lanes"]
         else:
@@ -5138,19 +5194,14 @@ class Controller:
                         or manifest.get("raw_samples_complete") is not True):
                     raise ValueError("terminal manifest/summary schema, backend, status or raw writer completeness differs")
                 analyze.admit_ack_contract(backend, summary["backend"], job.get("ack_contract", "synced"))
+                cloud_campaign.admit_replay_summary(admitted, summary)
                 phase_windows = ({} if job.get("measurement_sizing", {}).get("minimum_phase_seconds") else None)
                 observed_counts = campaign.verify_timing_result(
                     directory / "result", admitted, allow_partial=True, phase_windows=phase_windows)
                 if phase_windows is not None:
                     receipt["timing_windows_by_phase"] = phase_windows
                 receipt["validated_timing_rows_by_phase"] = observed_counts
-                receipt["planned_timing_rows_by_phase"] = {
-                    "preload": admitted["dataset"]["keys"] if admitted["phases"]["preload"] else 0,
-                    "warmup": admitted["phases"]["warmup_operations"],
-                    "aging": admitted["phases"]["aging_operations"],
-                    "measurement": admitted["phases"]["measurement_operations"]}
-                if admitted["phases"].get("verify_existing_dataset", False):
-                    receipt["planned_timing_rows_by_phase"]["verify_existing_dataset"] = admitted["dataset"]["keys"]
+                receipt["planned_timing_rows_by_phase"] = campaign.planned_timing_rows(admitted)
                 if job.get("case_kind") == "interference":
                     artifact = directory / "result" / "interference_result.json"
                     data = json.loads(artifact.read_text())
