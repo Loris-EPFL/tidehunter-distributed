@@ -1518,7 +1518,7 @@ impl RemoteDatabase {
     /// Open with a hook over the read-lane clients and a read-only config clone
     /// before `ReadService::from_clients`. The write route, worker clients and
     /// manifest identity use the unmodified `config`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(in crate::distributed::remote_db) fn open_with_read_hook(
         path: &Path,
         shape: &KeyShape,
@@ -3706,13 +3706,13 @@ struct ClientWorker {
     thread: Mutex<Option<JoinHandle<()>>>,
     queue: Arc<OwnerQueue>,
     accounting: Arc<WorkerAccounting>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     failure: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     partition: u32,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     test_completion: Option<Arc<write_core::test_completion::TestCompletion>>,
 }
 struct WorkerDiagnostics {
@@ -3754,7 +3754,7 @@ impl ClientWorker {
         signal_worker_wake(&self.worker_wake)?;
         Ok(())
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     fn enqueue_batch(&self, batch: CompleteBatch) -> Result<(), LocalDbError> {
         if self.failure.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LocalDbError::unknown(
@@ -3784,7 +3784,7 @@ impl ClientWorker {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     fn enqueue(
         &self,
         epoch: u64,
