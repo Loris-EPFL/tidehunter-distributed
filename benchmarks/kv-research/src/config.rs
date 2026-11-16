@@ -97,6 +97,15 @@ pub enum ExecutionMode {
 pub struct ExecutionConfig {
     pub mode: ExecutionMode,
     pub concurrency: usize,
+    /// Independent scheduling threads. Seeds are stable for a fixed (seed, shard count);
+    /// changing the count changes the random stream, not the configured key distribution.
+    /// The fixed caller/queue budgets split by quotient/remainder. Each client owns
+    /// global arrival indexes shard + n*K; open-loop due times use the global rate.
+    /// Keys remain globally distributed, with the existing per-key atomic oracle.
+    /// Phase gates enclose all clients; rates use min scheduled through max completed,
+    /// never a sum or mean of client windows. Interference requires one client.
+    #[serde(default = "default_client_shards")]
+    pub client_shards: usize,
     /// Maximum admitted in-flight requests. Arrivals beyond this bound are recorded rejected.
     pub queue_capacity: usize,
     /// Per-request timeout; global phase deadline always takes precedence.
@@ -104,6 +113,10 @@ pub struct ExecutionConfig {
     /// Independent arrival rate for open-loop only; operations per second.
     #[serde(default)]
     pub offered_ops_per_second: Option<f64>,
+}
+
+fn default_client_shards() -> usize {
+    1
 }
 
 /// Explicit dual-stream settings. No campaign value is a harness default.
@@ -566,6 +579,14 @@ impl RunConfig {
                 "execution concurrency and queue capacity must be bounded, nonzero, and queue_capacity >= concurrency",
             );
         }
+        if self.execution.client_shards == 0
+            || self.execution.client_shards > self.execution.concurrency
+        {
+            return invalid("execution.client_shards must be between 1 and concurrency");
+        }
+        if self.execution.client_shards > 1 && self.execution.mode == ExecutionMode::Interference {
+            return invalid("interference mode requires execution.client_shards=1");
+        }
         if self.execution.mode == ExecutionMode::Interference {
             let Some(interference) = &self.interference else {
                 return invalid("interference mode requires explicit interference settings");
@@ -679,6 +700,41 @@ impl RunConfig {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_shards_default_to_one_and_are_bounded_by_callers() {
+        let valid = config();
+        let mut value = serde_json::to_value(&valid).unwrap();
+        value["execution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("client_shards");
+        let decoded: RunConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.execution.client_shards, 1);
+        decoded.validate().unwrap();
+        for clients in [0, 3] {
+            let mut invalid = valid.clone();
+            invalid.execution.client_shards = clients;
+            assert!(
+                invalid
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("client_shards")
+            );
+        }
+        let mut sharded = valid;
+        sharded.execution.client_shards = 2;
+        sharded.validate().unwrap();
+        sharded.execution.mode = ExecutionMode::Interference;
+        assert!(
+            sharded
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("client_shards=1")
+        );
+    }
+
     use super::*;
 
     fn config() -> RunConfig {
@@ -710,6 +766,7 @@ mod tests {
             execution: ExecutionConfig {
                 mode: ExecutionMode::ClosedLoop,
                 concurrency: 2,
+                client_shards: 1,
                 queue_capacity: 4,
                 request_timeout_ms: 1000,
                 offered_ops_per_second: None,

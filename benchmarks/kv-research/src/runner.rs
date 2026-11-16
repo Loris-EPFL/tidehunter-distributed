@@ -89,17 +89,7 @@ pub async fn run<B: KvBackend>(
         }
     }
 
-    // The scheduler feeds every worker and keeps this counter across all workload phases.
-    let next_put_index = Arc::new(AtomicU64::new(0));
-    let mut generator = WorkloadGenerator::new(
-        config.seed ^ 0x6b76_7265_7365_6172,
-        config.dataset.keys,
-        config.workload.mix.clone(),
-        config.workload.batch_size,
-        config.workload.distribution.clone(),
-        config.workload.put_key_policy,
-        next_put_index,
-    );
+    let mut generators = client_generators(&config);
     // Presence checks need a baseline dataset; without one every key may legitimately be absent.
     let oracle = Arc::new(KeyOracle::new(
         !config.qualification_only
@@ -149,7 +139,7 @@ pub async fn run<B: KvBackend>(
             &backend,
             &config,
             &namespace,
-            &mut generator,
+            &mut generators,
             phase,
             count,
             started,
@@ -281,7 +271,7 @@ pub async fn run<B: KvBackend>(
                     &backend,
                     &config,
                     &namespace,
-                    &mut generator,
+                    &mut generators[0],
                     started,
                     deadline,
                     &oracle,
@@ -301,7 +291,7 @@ pub async fn run<B: KvBackend>(
                     &backend,
                     &config,
                     &namespace,
-                    &mut generator,
+                    &mut generators,
                     "measurement",
                     config.phases.measurement_operations,
                     started,
@@ -621,6 +611,7 @@ pub async fn run<B: KvBackend>(
             "timeouts_or_unknown_mutations": totals.3, "errors_or_wrong_values": totals.4,
             "logical_keys_completed_terminal": totals.5, "logical_keys_offered": totals.7, "logical_keys_rejected": totals.8,
             "outstanding_at_finalization": totals.0.saturating_sub(totals.1).saturating_sub(totals.2),
+            "realized_mix": reporter.realized_mix(),
         }),
         distributions: reporter.distribution_summaries(),
         limitations: vec![
@@ -1620,6 +1611,7 @@ struct WorkerPool {
     workers: Vec<JoinHandle<()>>,
     pending: std::collections::HashMap<u64, PendingOperation>,
     next_id: u64,
+    id_stride: u64,
     origin: Instant,
     value_size: usize,
     stream: Option<Stream>,
@@ -1713,6 +1705,7 @@ impl WorkerPool {
             workers,
             pending: std::collections::HashMap::default(),
             next_id: 0,
+            id_stride: 1,
             origin,
             value_size: config.dataset.value_size,
             stream: None,
@@ -1729,7 +1722,7 @@ impl WorkerPool {
         caller_sample_id: Option<u64>,
     ) -> Result<(), WorkItem> {
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        self.next_id = self.next_id.saturating_add(self.id_stride);
         let dispatch_timestamp = Arc::new(AtomicU64::new(0));
         let operation = work.operation;
         let logical_keys = work.keys.len() as u64;
@@ -1886,6 +1879,14 @@ impl WorkerPool {
         } else {
             self.workers.clear();
         }
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // Startup can fail after worker creation but before any request is sent.
+        // Those idle threads must be joined, including a failed client-thread spawn.
+        self.shutdown(self.pending.is_empty());
     }
 }
 
@@ -2510,19 +2511,47 @@ fn export_write_wait_metrics(
     Ok(true)
 }
 
-// Keep phase state, independent clocks and reporter borrowing explicit at this private boundary.
-#[allow(clippy::too_many_arguments)]
-// Keep open/closed-loop admission beside their common completion/drain accounting.
-#[allow(clippy::too_many_lines)]
-// Phase counts are admitted below 100 million, exactly representable in f64.
-#[allow(clippy::cast_precision_loss)]
-// Match makes the received-event and disconnected-channel paths explicit in select branches.
-#[allow(clippy::single_match_else)]
+fn client_generators(config: &RunConfig) -> Vec<WorkloadGenerator> {
+    // Reserve new-key IDs across every client and phase. This atomic allocates IDs
+    // only; oracle tracking is separate. K=1 retains the original seed and stream.
+    let next_put_index = Arc::new(AtomicU64::new(0));
+    (0..config.execution.client_shards)
+        .map(|shard| {
+            WorkloadGenerator::new(
+                (config.seed ^ 0x6b76_7265_7365_6172)
+                    .wrapping_add((shard as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                config.dataset.keys,
+                config.workload.mix.clone(),
+                config.workload.batch_size,
+                config.workload.distribution.clone(),
+                config.workload.put_key_policy,
+                Arc::clone(&next_put_index),
+            )
+        })
+        .collect()
+}
+
+/// Divide a fixed budget without rounding up the aggregate or dropping a remainder.
+fn client_budget(total: usize, clients: usize, shard: usize) -> usize {
+    total / clients + usize::from(shard < total % clients)
+}
+
+struct ClientSchedule {
+    epoch: Instant,
+    shard: u64,
+    clients: u64,
+    sweep_cursor: Option<Arc<AtomicU64>>,
+}
+
+/// Each client owns its generator, worker pool and report accumulators. Ready/start
+/// handshakes happen once per phase, never per operation. All clients drain and join
+/// before the caller can pass a phase, telemetry or measurement-completion boundary.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_phase<B: KvBackend>(
     backend: &Arc<B>,
     config: &RunConfig,
     namespace: &[u8; 16],
-    generator: &mut WorkloadGenerator,
+    generators: &mut Vec<WorkloadGenerator>,
     phase: &'static str,
     count: u64,
     origin: Instant,
@@ -2530,9 +2559,167 @@ async fn run_phase<B: KvBackend>(
     oracle: &Arc<KeyOracle>,
     reporter: &mut Reporter,
 ) -> BackendResult<()> {
-    let mut pool = WorkerPool::new(backend, config, namespace, origin, oracle)?;
-    let phase_start = Instant::now();
-    let mut scheduled_index = 0_u64;
+    let clients = config.execution.client_shards;
+    if clients == 1 {
+        let mut pool = WorkerPool::new(backend, config, namespace, origin, oracle)?;
+        let schedule = ClientSchedule {
+            epoch: Instant::now(),
+            shard: 0,
+            clients: 1,
+            sweep_cursor: None,
+        };
+        return run_client_phase(
+            config,
+            &mut generators[0],
+            phase,
+            count,
+            origin,
+            deadline,
+            reporter,
+            &mut pool,
+            &schedule,
+        )
+        .await;
+    }
+    let handle = tokio::runtime::Handle::current();
+    // Owner: parent phase task. Capacity K: one readiness message per client, no
+    // per-operation messages. Senders wait; all are dropped after phase startup.
+    let (ready_tx, mut ready_rx) = mpsc::channel(clients);
+    let sweep_cursor = Arc::new(AtomicU64::new(0));
+    let mut threads = Vec::with_capacity(clients);
+    let mut first_error = None;
+    for (shard, mut generator) in std::mem::take(generators).into_iter().enumerate() {
+        let mut client_config = config.clone();
+        client_config.execution.concurrency =
+            client_budget(config.execution.concurrency, clients, shard);
+        client_config.execution.queue_capacity =
+            client_budget(config.execution.queue_capacity, clients, shard);
+        client_config.diagnostics.write_profile_limit =
+            client_budget(config.diagnostics.write_profile_limit, clients, shard);
+        client_config.diagnostics.write_timeline_limit =
+            client_budget(config.diagnostics.write_timeline_limit, clients, shard);
+        let mut client_reporter = reporter.fork_client();
+        let mut pool = match WorkerPool::new(backend, &client_config, namespace, origin, oracle) {
+            Ok(pool) => pool,
+            Err(error) => {
+                first_error = Some(error);
+                break;
+            }
+        };
+        pool.next_id = shard as u64;
+        pool.id_stride = clients as u64;
+        // Each start channel holds exactly one phase epoch, then closes. Waiting
+        // here occurs only on the dedicated client thread, never an executor thread.
+        let (start_tx, start_rx) = std_mpsc::sync_channel(1);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let ready = ready_tx.clone();
+        let handle = handle.clone();
+        let sweep_cursor = Arc::clone(&sweep_cursor);
+        let spawned = thread::Builder::new()
+            .name(format!("kv-research-client-{shard}"))
+            .spawn(move || {
+                let result = if ready.blocking_send(()).is_err() {
+                    pool.shutdown(true);
+                    Err(invalid("client phase readiness channel closed"))
+                } else if let Ok(epoch) = start_rx.recv() {
+                    let schedule = ClientSchedule {
+                        epoch,
+                        shard: shard as u64,
+                        clients: clients as u64,
+                        sweep_cursor: Some(sweep_cursor),
+                    };
+                    handle.block_on(run_client_phase(
+                        &client_config,
+                        &mut generator,
+                        phase,
+                        count,
+                        origin,
+                        deadline,
+                        &mut client_reporter,
+                        &mut pool,
+                        &schedule,
+                    ))
+                } else {
+                    pool.shutdown(true);
+                    Err(invalid("client phase startup cancelled"))
+                };
+                let _ = done_tx.send((generator, client_reporter, result));
+            });
+        match spawned {
+            Ok(thread) => threads.push((thread, start_tx, done_rx)),
+            Err(error) => {
+                first_error = Some(error.into());
+                break;
+            }
+        }
+    }
+    drop(ready_tx);
+    if first_error.is_none() {
+        for _ in 0..clients {
+            if ready_rx.recv().await.is_none() {
+                first_error = Some(invalid("client failed before phase startup"));
+                break;
+            }
+        }
+    }
+    let epoch = Instant::now();
+    for (_, start, _) in &threads {
+        if first_error.is_none() && start.send(epoch).is_err() {
+            first_error = Some(invalid("client stopped before phase startup"));
+        }
+    }
+    // Dropping every remaining start sender releases clients even on partial startup.
+    for (thread, start, mut done) in threads {
+        drop(start);
+        let result = loop {
+            tokio::select! {
+                result = &mut done => break result,
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Err(error) = reporter.snapshot() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        };
+        if thread.join().is_err() {
+            first_error.get_or_insert_with(|| invalid("client scheduling thread panicked"));
+        }
+        match result {
+            Ok((generator, client_reporter, result)) => {
+                generators.push(generator);
+                reporter.merge_client(client_reporter);
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| invalid("client result channel closed"));
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+// Keep phase state and reporter borrowing explicit at this private boundary.
+#[allow(clippy::too_many_arguments)]
+// Keep open/closed-loop admission beside their common completion/drain accounting.
+#[allow(clippy::too_many_lines)]
+// Phase counts are admitted below 100 million, exactly representable in f64.
+#[allow(clippy::cast_precision_loss)]
+// Match makes the received-event and disconnected-channel paths explicit in select branches.
+#[allow(clippy::single_match_else)]
+async fn run_client_phase(
+    config: &RunConfig,
+    generator: &mut WorkloadGenerator,
+    phase: &'static str,
+    count: u64,
+    origin: Instant,
+    deadline: Instant,
+    reporter: &mut Reporter,
+    pool: &mut WorkerPool,
+    schedule: &ClientSchedule,
+) -> BackendResult<()> {
+    let mut scheduled_index = schedule.shard;
     let mut phase_expired = false;
     let mut next_snapshot = Instant::now() + Duration::from_secs(1);
     let mut profiled_selected = 0usize;
@@ -2573,7 +2760,7 @@ async fn run_phase<B: KvBackend>(
                     continue;
                 }
                 let work = if sweep_keys {
-                    generator.next_sweep_item(&mut sweep_cursor)?
+                    client_sweep_item(generator, &mut sweep_cursor, schedule)?
                 } else {
                     generator.next_item()?
                 };
@@ -2619,7 +2806,7 @@ async fn run_phase<B: KvBackend>(
                             .await?
                     }
                 }
-                scheduled_index += 1;
+                scheduled_index += schedule.clients;
             }
         }
         ExecutionMode::OpenLoop => {
@@ -2632,7 +2819,7 @@ async fn run_phase<B: KvBackend>(
                     phase_expired = true;
                     break;
                 }
-                let due = phase_start + Duration::from_secs_f64(scheduled_index as f64 / rate);
+                let due = schedule.epoch + Duration::from_secs_f64(scheduled_index as f64 / rate);
                 if due >= deadline {
                     phase_expired = true;
                     break;
@@ -2664,7 +2851,7 @@ async fn run_phase<B: KvBackend>(
                     }
                 }
                 let work = if sweep_keys {
-                    generator.next_sweep_item(&mut sweep_cursor)?
+                    client_sweep_item(generator, &mut sweep_cursor, schedule)?
                 } else {
                     generator.next_item()?
                 };
@@ -2714,7 +2901,7 @@ async fn run_phase<B: KvBackend>(
                     reporter.snapshot()?;
                     next_snapshot = Instant::now() + Duration::from_secs(1);
                 }
-                scheduled_index += 1;
+                scheduled_index += schedule.clients;
             }
         }
     }
@@ -2750,6 +2937,18 @@ async fn run_phase<B: KvBackend>(
         ));
     }
     Ok(())
+}
+
+fn client_sweep_item(
+    generator: &mut WorkloadGenerator,
+    cursor: &mut u64,
+    schedule: &ClientSchedule,
+) -> BackendResult<WorkItem> {
+    if let Some(cursor) = &schedule.sweep_cursor {
+        generator.next_shared_sweep_item(cursor)
+    } else {
+        generator.next_sweep_item(cursor)
+    }
 }
 
 fn rejected_sample(
@@ -3483,6 +3682,433 @@ fn invalid(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
 }
 #[cfg(test)]
 mod tests {
+    /// Auxiliary exact-oracle primitive cost, not a storage workload. The 90/10
+    /// read/put sequence exercises the same shared atomics as the native mixed run.
+    #[test]
+    #[ignore = "explicit local release-mode accounting measurement"]
+    fn client_oracle_atomic_cost() {
+        for clients in [1, 2, 4] {
+            for keys in [1, 4096] {
+                let oracle = KeyOracle::new(true, keys, true).unwrap();
+                let barrier = std::sync::Barrier::new(clients + 1);
+                let elapsed = std::thread::scope(|scope| {
+                    let mut threads = Vec::with_capacity(clients);
+                    for shard in 0..clients {
+                        let oracle = &oracle;
+                        let barrier = &barrier;
+                        threads.push(scope.spawn(move || {
+                            barrier.wait();
+                            for index in 0..1_000_000 / clients {
+                                let key = (index * clients + shard) as u64 % keys;
+                                if index % 10 == 0 {
+                                    let ticket = oracle.begin_put(key);
+                                    oracle.end_put(key, ticket, true);
+                                } else {
+                                    let before = oracle.snapshot(key);
+                                    std::hint::black_box(oracle.absence_allowed(key, before));
+                                }
+                            }
+                        }));
+                    }
+                    let started = Instant::now();
+                    barrier.wait();
+                    for thread in threads {
+                        thread.join().unwrap();
+                    }
+                    started.elapsed()
+                });
+                println!(
+                    "client_oracle_atomic_cost clients={clients} keys={keys} aggregate_ns_per_call={:.3}",
+                    elapsed.as_nanos() as f64 / 1_000_000.0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn client_shards_one_raw_operation_sequence_matches_original_generator() {
+        let directory = result_directory("client-one-sequence");
+        let output = directory.join("result");
+        let mut config = read_test_config();
+        config.execution.concurrency = 1;
+        config.execution.queue_capacity = 1;
+        config.dataset.keys = 31;
+        config.workload.mix = crate::config::OperationMix {
+            read: 7,
+            put: 3,
+            delete: 2,
+            missing_read: 1,
+            get_many: 2,
+            put_batch: 1,
+        };
+        config.phases.warmup_operations = 11;
+        config.phases.aging_operations = 7;
+        config.phases.measurement_operations = 127;
+        let mut original = WorkloadGenerator::new(
+            config.seed ^ 0x6b76_7265_7365_6172,
+            config.dataset.keys,
+            config.workload.mix.clone(),
+            config.workload.batch_size,
+            config.workload.distribution.clone(),
+            config.workload.put_key_policy,
+            Arc::new(AtomicU64::new(0)),
+        );
+        for _ in 0..18 {
+            original.next_item().unwrap();
+        }
+        let expected = (0..127)
+            .map(|_| {
+                let work = original.next_item().unwrap();
+                (work.operation.as_str(), work.keys.len())
+            })
+            .collect::<Vec<_>>();
+        run(
+            MemoryBackend::new(false, false),
+            config,
+            &output,
+            prometheus::Registry::new(),
+        )
+        .await
+        .unwrap();
+        let samples = std::fs::read_to_string(output.join("samples.csv")).unwrap();
+        let actual = samples
+            .lines()
+            .filter(|row| row.starts_with("measurement,"))
+            .map(|row| {
+                let fields = row.split(',').collect::<Vec<_>>();
+                assert_eq!(fields[2], "success");
+                (fields[1], fields[10].parse::<usize>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_shards_bound_overload_and_cancel_timed_out_calls() {
+        for overload in [false, true] {
+            let directory = result_directory("client-shards-bounds");
+            let mut config = read_test_config();
+            config.execution.concurrency = 7;
+            config.execution.queue_capacity = 11;
+            config.execution.client_shards = 3;
+            config.execution.request_timeout_ms = if overload { 1000 } else { 1 };
+            if overload {
+                config.execution.mode = ExecutionMode::OpenLoop;
+                config.execution.offered_ops_per_second = Some(1_000_000_000.0);
+            }
+            let active = Arc::new(AtomicUsize::new(0));
+            let backend = Arc::new(InterferenceBackend {
+                inner: Arc::new(MemoryBackend::new(false, false)),
+                read_delay: Duration::from_millis(20),
+                put_delay: Duration::ZERO,
+                active: Arc::clone(&active),
+            });
+            let oracle = Arc::new(KeyOracle::new(false, 0, false).unwrap());
+            let mut reporter = Reporter::create(
+                &directory.join("result"),
+                prometheus::Registry::new(),
+                "memory-test".into(),
+            )
+            .unwrap();
+            let origin = Instant::now();
+            let mut generators = client_generators(&config);
+            run_phase(
+                &backend,
+                &config,
+                &[0; 16],
+                &mut generators,
+                "measurement",
+                101,
+                origin,
+                origin + Duration::from_secs(5),
+                &oracle,
+                &mut reporter,
+            )
+            .await
+            .unwrap();
+            assert_eq!(generators.len(), 3);
+            assert_eq!(active.load(Ordering::Relaxed), 0);
+            let totals = reporter.totals();
+            assert_eq!(totals.0, 101);
+            assert_eq!(totals.1 + totals.2, 101);
+            if overload {
+                assert!(totals.2 >= 90);
+                assert_eq!(totals.3, 0);
+            } else {
+                assert_eq!(totals.2, 0);
+                assert_eq!(totals.3, 101);
+            }
+            let receiver = reporter.stall_sample_writer_for_test();
+            drop(receiver);
+            drop(reporter);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_shards_one_keeps_original_workload_sequence() {
+        let mut config = read_test_config();
+        config.dataset.keys = 31;
+        config.workload.mix = crate::config::OperationMix {
+            read: 7,
+            put: 3,
+            delete: 2,
+            missing_read: 1,
+            get_many: 2,
+            put_batch: 1,
+        };
+        let mut original = WorkloadGenerator::new(
+            config.seed ^ 0x6b76_7265_7365_6172,
+            config.dataset.keys,
+            config.workload.mix.clone(),
+            config.workload.batch_size,
+            config.workload.distribution.clone(),
+            config.workload.put_key_policy,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut clients = client_generators(&config);
+        assert_eq!(clients.len(), 1);
+        for _phase in 0..3 {
+            for _ in 0..257 {
+                let expected = original.next_item().unwrap();
+                let actual = clients[0].next_item().unwrap();
+                assert_eq!(actual.operation, expected.operation);
+                assert_eq!(actual.keys, expected.keys);
+            }
+        }
+    }
+
+    #[test]
+    fn client_shards_streams_are_deterministic_and_budgets_are_exact() {
+        let mut config = read_test_config();
+        config.execution.concurrency = 7;
+        config.execution.queue_capacity = 11;
+        config.execution.client_shards = 3;
+        config.workload.mix.put = 1;
+        let mut first = client_generators(&config);
+        let mut second = client_generators(&config);
+        for index in 0..101 {
+            let shard = index % config.execution.client_shards;
+            let left = first[shard].next_item().unwrap();
+            let right = second[shard].next_item().unwrap();
+            assert_eq!(left.operation, right.operation);
+            assert_eq!(left.keys, right.keys);
+        }
+        for concurrency in 1..32 {
+            for clients in 1..=concurrency {
+                for capacity in [concurrency, concurrency + 1, concurrency * 3 + 1] {
+                    assert_eq!(
+                        (0..clients)
+                            .map(|s| client_budget(concurrency, clients, s))
+                            .sum::<usize>(),
+                        concurrency
+                    );
+                    assert_eq!(
+                        (0..clients)
+                            .map(|s| client_budget(capacity, clients, s))
+                            .sum::<usize>(),
+                        capacity
+                    );
+                    for shard in 0..clients {
+                        assert!(client_budget(concurrency, clients, shard) > 0);
+                        assert!(
+                            client_budget(capacity, clients, shard)
+                                >= client_budget(concurrency, clients, shard)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_shards_preserve_sample_counts_and_oracle_results() {
+        for clients in [1, 3] {
+            for mixed in [false, true] {
+                let directory = result_directory("client-shards-counts");
+                let output = directory.join("result");
+                let mut config = read_test_config();
+                config.execution.concurrency = 7;
+                config.execution.queue_capacity = 11;
+                config.execution.client_shards = clients;
+                config.dataset.keys = 31;
+                config.phases.warmup_operations = 62;
+                config.phases.aging_operations = 19;
+                config.phases.measurement_operations = 127;
+                if mixed {
+                    config.workload.mix = crate::config::OperationMix {
+                        read: 7,
+                        put: 3,
+                        delete: 2,
+                        missing_read: 1,
+                        get_many: 2,
+                        put_batch: 1,
+                    };
+                }
+                run(
+                    MemoryBackend::new(false, false),
+                    config,
+                    &output,
+                    prometheus::Registry::new(),
+                )
+                .await
+                .unwrap();
+                let samples = std::fs::read_to_string(output.join("samples.csv")).unwrap();
+                for (phase, expected) in [("warmup", 62), ("aging", 19), ("measurement", 127)] {
+                    let rows = samples
+                        .lines()
+                        .filter(|row| row.starts_with(&format!("{phase},")))
+                        .collect::<Vec<_>>();
+                    assert_eq!(rows.len(), expected);
+                    for row in rows {
+                        let fields = row.split(',').collect::<Vec<_>>();
+                        assert_eq!(fields[2], "success");
+                        let number = |index: usize| fields[index].parse::<u64>().unwrap();
+                        assert_eq!(number(7), number(6) - number(4));
+                        assert_eq!(number(8), number(6) - number(3));
+                        assert_eq!(number(9), number(4) - number(3));
+                        assert!(number(14) >= number(6));
+                    }
+                }
+                let summary: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(output.join("summary.json")).unwrap())
+                        .unwrap();
+                let mix = summary["phase_counts"]["realized_mix"].as_object().unwrap();
+                let measurement_count: u64 = mix
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("measurement."))
+                    .map(|(_, value)| value["offered"].as_u64().unwrap())
+                    .sum();
+                let fraction: f64 = mix
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("measurement."))
+                    .map(|(_, value)| value["fraction"].as_f64().unwrap())
+                    .sum();
+                assert_eq!(measurement_count, 127);
+                assert!((fraction - 1.0).abs() < 1e-12);
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_shards_sweeps_find_the_same_lost_baseline_key() {
+        for clients in [1, 3] {
+            for missing in [false, true] {
+                let directory = result_directory("client-shards-sweep");
+                let output = directory.join("result");
+                let mut config = read_test_config();
+                config.execution.concurrency = 7;
+                config.execution.queue_capacity = 11;
+                config.execution.client_shards = clients;
+                config.dataset.keys = 31;
+                config.phases.warmup_operations = 62;
+                config.phases.warmup_key_sweep = true;
+                config.phases.measurement_operations = 31;
+                config.phases.measurement_key_sweep = true;
+                let backend = if missing {
+                    MemoryBackend::omitting_put(5)
+                } else {
+                    MemoryBackend::new(false, false)
+                };
+                let result = run(backend, config, &output, prometheus::Registry::new()).await;
+                assert_eq!(result.is_ok(), !missing);
+                let outcomes = measurement_outcomes(&output);
+                assert_eq!(outcomes.len(), 31);
+                assert_eq!(
+                    outcomes
+                        .iter()
+                        .filter(|value| value.as_str() == "wrong_value")
+                        .count(),
+                    usize::from(missing)
+                );
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_shards_open_loop_keeps_global_due_times() {
+        for clients in [1, 3] {
+            let directory = result_directory("client-shards-arrivals");
+            let output = directory.join("result");
+            let mut config = read_test_config();
+            config.execution.mode = ExecutionMode::OpenLoop;
+            config.execution.concurrency = 7;
+            config.execution.queue_capacity = 11;
+            config.execution.client_shards = clients;
+            config.execution.offered_ops_per_second = Some(200.0);
+            config.phases.measurement_operations = 17;
+            run(
+                MemoryBackend::new(false, false),
+                config,
+                &output,
+                prometheus::Registry::new(),
+            )
+            .await
+            .unwrap();
+            let samples = std::fs::read_to_string(output.join("samples.csv")).unwrap();
+            let mut arrivals = samples
+                .lines()
+                .filter(|row| row.starts_with("measurement,"))
+                .map(|row| {
+                    let fields = row.split(',').collect::<Vec<_>>();
+                    assert_eq!(fields[2], "success");
+                    fields[3].parse::<u64>().unwrap()
+                })
+                .collect::<Vec<_>>();
+            arrivals.sort_unstable();
+            assert_eq!(arrivals.len(), 17);
+            for (index, arrival) in arrivals.iter().enumerate() {
+                assert_eq!(
+                    *arrival - arrivals[0],
+                    duration_ns(Duration::from_secs_f64(index as f64 / 200.0))
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_shards_expired_deadline_joins_without_offering_work() {
+        let directory = result_directory("client-shards-deadline");
+        let mut config = read_test_config();
+        config.execution.concurrency = 7;
+        config.execution.queue_capacity = 11;
+        config.execution.client_shards = 3;
+        let backend = Arc::new(MemoryBackend::new(false, false));
+        let oracle = Arc::new(KeyOracle::new(false, 0, false).unwrap());
+        let mut reporter = Reporter::create(
+            &directory.join("result"),
+            prometheus::Registry::new(),
+            "memory-test".into(),
+        )
+        .unwrap();
+        let origin = Instant::now();
+        let mut generators = client_generators(&config);
+        let result = run_phase(
+            &backend,
+            &config,
+            &[0; 16],
+            &mut generators,
+            "measurement",
+            101,
+            origin,
+            origin,
+            &oracle,
+            &mut reporter,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(generators.len(), 3);
+        assert_eq!(reporter.totals().0, 0);
+        let receiver = reporter.stall_sample_writer_for_test();
+        drop(receiver);
+        drop(reporter);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     use super::*;
     use crate::backend::BackendInfo;
     use std::collections::HashMap;

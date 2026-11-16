@@ -148,6 +148,23 @@ impl WorkloadGenerator {
         }
         Ok(item)
     }
+    /// With K>1 clients, reservations follow thread interleaving: coverage and
+    /// uniqueness are exact, but per-operation key assignment is not deterministic.
+    /// K=1 uses next_sweep_item and retains its fully deterministic sequence.
+    ///
+    /// Reserve a disjoint part of one phase's sweep. Relaxed only allocates cursor
+    /// positions; it publishes no values or oracle state to other client loops.
+    pub(crate) fn next_shared_sweep_item(
+        &mut self,
+        cursor: &AtomicU64,
+    ) -> crate::backend::BackendResult<WorkItem> {
+        let mut item = self.next_item()?;
+        let first = cursor.fetch_add(item.keys.len() as u64, Ordering::Relaxed);
+        for (offset, key) in item.keys.iter_mut().enumerate() {
+            *key = (first + offset as u64) % self.key_count;
+        }
+        Ok(item)
+    }
 
     pub fn next_item(&mut self) -> crate::backend::BackendResult<WorkItem> {
         let choice = self.rng.gen_range(0..self.mix.total_weight());
@@ -201,6 +218,8 @@ impl WorkloadGenerator {
 
     fn next_put_key(&self) -> crate::backend::BackendResult<u64> {
         // Relaxed reserves unique ids only; it does not publish any other shared state.
+        // With K>1 clients, ID assignment follows thread interleaving; uniqueness
+        // and coverage remain exact. K=1 retains its fully deterministic sequence.
         let index = self
             .next_put_index
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
@@ -273,6 +292,37 @@ fn zipf_rejection_inversion(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_sweep_reserves_exact_coverage_across_clients_and_wraps() {
+        let cursor = AtomicU64::new(0);
+        let mut clients = (0..3)
+            .map(|shard| {
+                WorkloadGenerator::new(
+                    shard,
+                    17,
+                    OperationMix {
+                        read: 1,
+                        get_many: 1,
+                        ..OperationMix::default()
+                    },
+                    3,
+                    KeyDistribution::Uniform,
+                    PutKeyPolicy::Overwrite,
+                    Arc::new(AtomicU64::new(0)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut visited = Vec::new();
+        for index in 0..31 {
+            let item = clients[index % 3].next_shared_sweep_item(&cursor).unwrap();
+            visited.extend(item.keys);
+        }
+        assert_eq!(cursor.load(Ordering::Relaxed), visited.len() as u64);
+        for (index, key) in visited.into_iter().enumerate() {
+            assert_eq!(key, index as u64 % 17);
+        }
+    }
+
     use super::*;
 
     #[test]
