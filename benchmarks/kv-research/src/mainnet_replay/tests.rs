@@ -86,6 +86,87 @@ fn native_disk_reservation_covers_measured_growth_without_whole_wal_preallocatio
     assert!(native_disk_reservation((u64::MAX - fragments) / 2 + 1, fragment_size).is_err());
 }
 
+#[test]
+fn configuration_admission_reports_estimates_without_host_capacity() {
+    let root = temp("configuration-admission");
+    let cfg = config(&root);
+    let (_, prepared, resources) = cfg.admit_configuration().unwrap();
+    assert_eq!(prepared.len(), 2);
+    assert_eq!(
+        resources["host_resources"],
+        "not_checked; enforced at run time on the executing host"
+    );
+    assert!(
+        resources["estimated_disk_reservation_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        resources["estimated_memory_reservation_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(resources["native_index_geometry"].is_object());
+    assert!(resources.get("available_bytes").is_none());
+    assert!(resources.get("memory_available_bytes").is_none());
+    assert!(!root.join("db").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn configuration_admission_accepts_estimates_that_execution_rejects() {
+    let root = temp("oversized-admission");
+    let cfg = config(&root);
+    for kind in ["native", "tidehunter_tcp"] {
+        let mut cfg = cfg.clone();
+        if kind == "tidehunter_tcp" {
+            cfg.backend = BackendSpec {
+                kind: kind.into(),
+                options: serde_json::json!({"databases":(0..3).map(|id| serde_json::json!({
+                    "db_id":id,"options":{
+                        "transport":{"kind":"tcp-trusted"},"path":root.join(format!("db-{id}")),
+                        "database":vec![id+1;16],"owners":1,"owner_wal_geometry":"research",
+                        "batch_limits":{"max_operations":519,"max_encoded_bytes":500000}
+                    }
+                })).collect::<Vec<_>>()}),
+            };
+        }
+        for dimension in [
+            "estimated_disk_reservation_bytes",
+            "estimated_memory_reservation_bytes",
+        ] {
+            let oversized = |config: &ReplayConfig, trace: &Trace| {
+                let mut resources = resource_estimate(config, trace)?;
+                // Inject an impossible reservation; never allocate it or fill the filesystem.
+                resources[dimension] = u64::MAX.into();
+                if dimension == "estimated_memory_reservation_bytes" {
+                    resources["estimated_disk_reservation_bytes"] = 0.into();
+                }
+                Ok(resources)
+            };
+            let (_, _, resources) = cfg.admit_with(oversized, false).unwrap();
+            assert_eq!(resources[dimension], u64::MAX);
+            let error = cfg.admit_with(oversized, true).unwrap_err().to_string();
+            assert!(
+                error.contains(if dimension == "estimated_disk_reservation_bytes" {
+                    if kind == "native" {
+                        "insufficient native replay disk space"
+                    } else {
+                        "insufficient distributed replay disk space"
+                    }
+                } else {
+                    "insufficient memory"
+                }),
+                "{error}"
+            );
+        }
+    }
+    assert!(!root.join("db").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_native_two_repeats_same_final_contents_for_one_and_four_callers() {
     let trace = trace();

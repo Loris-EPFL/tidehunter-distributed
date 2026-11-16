@@ -208,6 +208,13 @@ impl TidehunterReplayBackend {
         }
         Ok(())
     }
+    pub(crate) fn coordinator_reservation(
+        value: &serde_json::Value,
+        trace: &Trace,
+        repetitions: u64,
+    ) -> BackendResult<serde_json::Value> {
+        resources::reservation(value, trace, repetitions)
+    }
     pub fn geometry(value: &serde_json::Value) -> BackendResult<serde_json::Value> {
         let opts = options(value)?;
         let mut wal = 0;
@@ -408,5 +415,6 @@ impl ReplayBackend for TidehunterReplayBackend {
     }
 }
 
+mod resources;
 #[cfg(test)]
 mod tests;

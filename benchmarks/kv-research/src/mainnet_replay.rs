@@ -197,9 +197,26 @@ impl ReplayConfig {
         Ok(trace)
     }
 
+    /// Admit execution, including disk and memory checks on the executing host.
     pub fn admit(&self) -> BackendResult<(Trace, Vec<Prepared>, serde_json::Value)> {
+        self.admit_with(resource_estimate, true)
+    }
+
+    /// Validate configuration and estimate resources without checking the validating host.
+    pub fn admit_configuration(&self) -> BackendResult<(Trace, Vec<Prepared>, serde_json::Value)> {
+        self.admit_with(resource_estimate, false)
+    }
+
+    fn admit_with(
+        &self,
+        resources: impl FnOnce(&Self, &Trace) -> BackendResult<serde_json::Value>,
+        enforce_host_resources: bool,
+    ) -> BackendResult<(Trace, Vec<Prepared>, serde_json::Value)> {
         let trace = self.validate()?;
-        let mut resources = resource_admission(self, &trace)?;
+        let mut resources = resources(self, &trace)?;
+        if enforce_host_resources {
+            check_host_resources(self, &mut resources)?;
+        }
         let mut prepared = prepare(&trace, self.workload.repetitions)?;
         if matches!(
             self.backend.kind.as_str(),
@@ -1076,7 +1093,7 @@ fn native_disk_reservation(payload: u64, fragment_size: u64) -> BackendResult<(u
     Ok((reserve, fragments))
 }
 
-fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<serde_json::Value> {
+fn resource_estimate(config: &ReplayConfig, trace: &Trace) -> BackendResult<serde_json::Value> {
     let geometry = if config.backend.kind == "native" {
         NativeReplayBackend::geometry(&config.backend.options)?
     } else if config.backend.kind == "tidehunter_tcp" {
@@ -1099,6 +1116,15 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         .and_then(|n| n.checked_mul(128))
         .ok_or("replay index bound overflow")?;
     let network_store = !matches!(config.backend.kind.as_str(), "native" | "tidehunter_tcp");
+    let coordinator = if config.backend.kind == "tidehunter_tcp" {
+        TidehunterReplayBackend::coordinator_reservation(
+            &config.backend.options,
+            trace,
+            config.workload.repetitions,
+        )?
+    } else {
+        serde_json::Value::Null
+    };
     let (reserve, wal) = if network_store {
         (0, 0)
     } else if config.backend.kind == "native" {
@@ -1107,47 +1133,15 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
             .ok_or("missing native fragment geometry")?;
         native_disk_reservation(payload, fragment_size)?
     } else {
-        // Distributed owners reserve whole WAL files; keep the conservative whole-file bound.
-        let wal = geometry["wal_file_size"]
-            .as_u64()
-            .ok_or("missing distributed WAL geometry")?
-            .checked_mul(6)
-            .ok_or("replay WAL reservation overflow")?;
-        let reserve = payload
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(index))
-            .and_then(|n| n.checked_add(wal))
-            .ok_or("replay disk reservation overflow")?;
-        TidehunterReplayBackend::validate_disk_paths(&config.backend.options, reserve)?;
-        (reserve, wal)
+        (
+            coordinator["reservation_bytes"]
+                .as_u64()
+                .ok_or("missing distributed coordinator disk reservation")?,
+            coordinator["local_owner_wal_reservation_bytes"]
+                .as_u64()
+                .ok_or("missing colocated owner WAL reservation")?,
+        )
     };
-    let mut path = PathBuf::from(
-        geometry["admission_path"]
-            .as_str()
-            .or_else(|| config.backend.options["path"].as_str())
-            .ok_or("replay admission path is required")?,
-    );
-    while !path.exists() {
-        if !path.pop() {
-            path = PathBuf::from(".");
-            break;
-        }
-    }
-    let output = std::process::Command::new("df")
-        .args(["-B1", "--output=avail", "--"])
-        .arg(path)
-        .output()?;
-    ensure(output.status.success(), "replay free-space check failed")?;
-    let available = String::from_utf8(output.stdout)?
-        .lines()
-        .last()
-        .ok_or("missing free-space result")?
-        .trim()
-        .parse::<u64>()?;
-    ensure(
-        reserve <= available,
-        "insufficient native replay disk space, including payload amplification and open WAL fragments",
-    )?;
     // Include immutable row views, retained raw samples, key-map nodes and key owners
     // at peak expansion. Values stay shared with the two input buffers.
     let demands = trace.reads.iter().map(Vec::len).sum::<usize>() as u64;
@@ -1175,6 +1169,59 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         .checked_mul(config.workload.repetitions)
         .and_then(|n| n.checked_add(index))
         .ok_or("replay memory bound overflow")?;
+    Ok(
+        serde_json::json!({"estimated_disk_reservation_bytes":reserve,
+        "estimated_memory_reservation_bytes":memory,
+        "admission_path":geometry["admission_path"].as_str()
+            .or_else(|| config.backend.options["path"].as_str())
+            .ok_or("replay admission path is required")?,
+        "host_resources":"not_checked; enforced at run time on the executing host",
+        "payload_key_value_bytes":payload,"index_reservation_bytes":index,"wal_fragment_reservation_bytes":wal,
+        "coordinator_disk_reservation":coordinator,
+        "disk_payload_amplification_factor":if config.backend.kind == "native" {2} else {0},
+        "reservation_model":if network_store {"client memory admission only; remote engine/disk budgets require the exact-owned lifecycle receipt"} else if config.backend.kind == "native" {"2x key/value payload for framing/index amplification + six open WAL fragments; empirical conservative native estimate, not physical I/O measurement; memory additionally reserves 128 bytes per row for indexes"} else {coordinator["model"].as_str().ok_or("missing coordinator disk reservation model")?}}),
+    )
+}
+
+fn check_host_resources(
+    config: &ReplayConfig,
+    resources: &mut serde_json::Value,
+) -> BackendResult<()> {
+    let reserve = resources["estimated_disk_reservation_bytes"]
+        .as_u64()
+        .ok_or("missing replay disk estimate")?;
+    let memory = resources["estimated_memory_reservation_bytes"]
+        .as_u64()
+        .ok_or("missing replay memory estimate")?;
+    if config.backend.kind == "tidehunter_tcp" {
+        TidehunterReplayBackend::validate_disk_paths(&config.backend.options, reserve)?;
+    }
+    let mut path = PathBuf::from(
+        resources["admission_path"]
+            .as_str()
+            .ok_or("replay admission path is required")?,
+    );
+    while !path.exists() {
+        if !path.pop() {
+            path = PathBuf::from(".");
+            break;
+        }
+    }
+    let output = std::process::Command::new("df")
+        .args(["-B1", "--output=avail", "--"])
+        .arg(path)
+        .output()?;
+    ensure(output.status.success(), "replay free-space check failed")?;
+    let available = String::from_utf8(output.stdout)?
+        .lines()
+        .last()
+        .ok_or("missing free-space result")?
+        .trim()
+        .parse::<u64>()?;
+    ensure(
+        reserve <= available,
+        "insufficient native replay disk space, including payload amplification and open WAL fragments",
+    )?;
     let meminfo = std::fs::read_to_string("/proc/meminfo")?;
     let memory_available = meminfo
         .lines()
@@ -1188,13 +1235,10 @@ fn resource_admission(config: &ReplayConfig, trace: &Trace) -> BackendResult<ser
         memory <= memory_available,
         "insufficient memory for bounded replay expansion and retained exact samples",
     )?;
-    Ok(
-        serde_json::json!({"estimated_disk_reservation_bytes":reserve,"available_bytes":available,
-        "estimated_memory_reservation_bytes":memory,"memory_available_bytes":memory_available,
-        "payload_key_value_bytes":payload,"index_reservation_bytes":index,"wal_fragment_reservation_bytes":wal,
-        "disk_payload_amplification_factor":2,
-        "reservation_model":if network_store {"client memory admission only; remote engine/disk budgets require the exact-owned lifecycle receipt"} else if config.backend.kind == "native" {"2x key/value payload for framing/index amplification + six open WAL fragments; empirical conservative native estimate, not physical I/O measurement; memory additionally reserves 128 bytes per row for indexes"} else {"2x key/value payload + 128 bytes per row + six whole WAL files, checked on every coordinator root; owner device capacity is not observable; memory additionally reserves 128 bytes per row for indexes"}}),
-    )
+    resources["available_bytes"] = available.into();
+    resources["memory_available_bytes"] = memory_available.into();
+    resources["host_resources"] = "checked on the executing host".into();
+    Ok(())
 }
 
 pub async fn run(config: ReplayConfig, output: &Path) -> BackendResult<()> {
