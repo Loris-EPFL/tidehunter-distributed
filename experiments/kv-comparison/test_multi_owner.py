@@ -246,6 +246,30 @@ class MultiOwnerTests(unittest.TestCase):
         self.assertEqual(len(missing['missing']), 16)
         self.assertIn('cannot observe unit', missing['missing'][0]['reason'])
 
+    def test_admission_does_not_inherit_case_workload(self):
+        job = self.jobs[0]
+        options = {'coordinator_read_cache_bytes': 999,
+                   'external_remote_config': {'read_cache_bytes': 999, 'read_lanes': 8,
+                                              'pin_read_lanes': True}}
+        original = campaign.make_run_config(job, Path('/case'), options, 'a' * 40)
+        expected = campaign.make_owner_admission_config(original, job['owner_count'])
+        mutated = copy.deepcopy(original)
+        mutated.update(seed=999, namespace='measured', qualification_only=True,
+                       diagnostics={'read_profile_limit': 512}, interference={'unexpected': True})
+        mutated['dataset'] = {'keys': 999, 'value_size': 65536, 'entropy': 0.1}
+        mutated['workload'] = {'distribution': {'zipf': {'exponent': 0.99}},
+                               'mix': campaign.mix(put=100), 'batch_size': 256, 'put_key_policy': 'new'}
+        mutated['execution'] = {'mode': 'open_loop', 'concurrency': 256}
+        mutated['phases'] = {'preload': False, 'verify_existing_dataset': True,
+            'evict_mapped_wal_before_measurement': True, 'warmup_key_sweep': True,
+            'measurement_key_sweep': False, 'measurement_operations': 999}
+        mutated['limits'] = {'deadline_seconds': 999}
+        self.assertEqual(campaign.make_owner_admission_config(mutated, job['owner_count']), expected)
+        self.assertEqual(original['backend']['options']['external_remote_config']['read_cache_bytes'], 999)
+        self.assertNotIn('measurement_gate', expected)
+        self.assertNotIn('measurement_completion_gate', expected)
+        self.assertNotIn('diagnostics', expected)
+
     def test_short_admission_connects_writes_and_reads_each_slot(self):
         job = next(j for j in self.jobs if j['owner_count'] == 16 and j['owner_topology'] == 'colocated')
         identities = {str(i): {'host_nqn': 'owner-' + str(i), 'host_id': [i + 1] * 16} for i in range(16)}
@@ -266,7 +290,8 @@ class MultiOwnerTests(unittest.TestCase):
             selected = config['backend']['options']
             # Status compares the server's complete immutable partition inventory.
             self.assertEqual(selected['external_remote_config'], {
-                **options['external_remote_config'], 'read_cache_bytes': 0})
+                **options['external_remote_config'], 'read_cache_bytes': 0,
+                'read_lanes': 1, 'pin_read_lanes': False})
             self.assertEqual(selected['external_owner_durability_receipts'],
                              options['external_owner_durability_receipts'])
             self.assertEqual(selected['external_owner_read_config'], options['external_owner_read_config'])

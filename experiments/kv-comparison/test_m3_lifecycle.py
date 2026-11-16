@@ -131,6 +131,85 @@ class CapsuleLayoutTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.environ.get('TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY'),
+                     'set TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY for real admission config validation')
+class AdmissionConfigTests(unittest.TestCase):
+    def test_every_m3_job_validates_with_real_binary(self):
+        binary = Path(os.environ['TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY']).resolve(strict=True)
+        class Validated(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for selection in campaign.M3_SELECTIONS:
+                for job in campaign.make_focused_matrix(selection):
+                    with self.subTest(selection=selection, case=job['case_id']):
+                        directory = root / job['case_id']
+                        directory.mkdir()
+                        prepared = directory / 'prepared'
+                        count = job['owner_count']
+                        cfg = config_fixture()
+                        cfg['spec'].update(mode='focused', selection=selection,
+                                           backends=['tidehunter_nvme_rdma'])
+                        live = cloud.live_nvme_preparation(cfg, job['case_id'], 'rdma')
+                        live.update(write_mode=job['live_write_mode'],
+                                    export_mode=job['live_export_mode'],
+                                    inline_reads=job['live_inline_reads'],
+                                    lease_ahead=job['live_lease_ahead'],
+                                    polled_writes=job['live_polled_writes'],
+                                    queue_geometry={'io_queues': job['live_io_queues'],
+                                        'queue_size': job['live_io_queue_size'],
+                                        'poll_queues': job['live_poll_queues']})
+                        prep = {'guest_root': str(prepared),
+                            'addresses': [host['address'] + ':' + str(9400 + i)
+                                for i, host in enumerate(cloud.logical_owner_hosts(cfg, job))],
+                            'transport': cloud.owner_control_settings(job)['owner_transport'],
+                            'durability_tier': campaign.durability_tier(job),
+                            'owner_wal_geometry': job['owner_wal_geometry'],
+                            'max_batches_per_partition': max(16384, cloud.planned_write_batches_per_partition(job)),
+                            'max_admitted_batches': 1000000, 'max_index_bytes': 512 * 1024**2,
+                            'coordinator_cache_bytes': job['coordinator_cache_bytes'],
+                            'owner_read_workers': 4, 'owner_wal_member_read': 'async',
+                            'owner_read_memory_allowance_bytes': 128 * 1024**2,
+                            'polling': job['owner_polling'], 'history_persistence': job['history_persistence'],
+                            'owner_read_resident_first': job.get('owner_read_resident_first', False),
+                            'live_nvmeof': live}
+                        (directory / 'prepare.json').write_text(json.dumps(prep))
+                        result = subprocess.run([str(binary), '--prepare-external-case',
+                            str(directory / 'prepare.json'), '--output', str(prepared)],
+                            capture_output=True, text=True, timeout=60)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        remote = json.loads((prepared / 'remote.json').read_text())
+                        remote['read_lanes'] = job['read_lanes']
+                        options = {'path': str(directory / 'database'), 'owners': count,
+                            'key_count': max(1048576, job['keys']),
+                            'max_batches_per_partition': prep['max_batches_per_partition'],
+                            'coordinator_read_cache_bytes': job['coordinator_cache_bytes'],
+                            'owner_read_resident_first': False, 'external_remote_config': remote,
+                            'durability_tier': prep['durability_tier'],
+                            'external_owner_read_config': json.loads(
+                                (prepared / 'external_owner_read_config.json').read_text()),
+                            'external_owner_durability_receipts': [
+                                str(prepared / f'node-{i}/ready.durability.json') for i in range(count)]}
+                        def validate(argv, **kwargs):
+                            result = subprocess.run([str(binary), '--config', str(argv[2]),
+                                '--validate-config'], capture_output=True, text=True, timeout=60)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            admitted = json.loads(result.stdout)['admitted_config']
+                            self.assertFalse(admitted['phases']['warmup_key_sweep'])
+                            self.assertTrue(admitted['phases']['measurement_key_sweep'])
+                            self.assertIsNone(admitted['measurement_gate'])
+                            self.assertIsNone(admitted['measurement_completion_gate'])
+                            print('M3 admission validated:', selection, job['case_id'], flush=True)
+                            raise Validated
+                        runtime = SimpleNamespace(config={'binary': str(binary),
+                            'source_revision': 'a' * 40}, clock=time.monotonic, remaining=lambda: 3600)
+                        runtime.run_logical_owner_admission = lambda *args: (
+                            cloud.Controller.run_logical_owner_admission(runtime, *args))
+                        with patch.object(cloud, 'command', side_effect=validate), patch.object(
+                                cloud, 'environment', return_value=dict(os.environ)), self.assertRaises(Validated):
+                            cloud.Controller.admit_logical_owners(runtime, job, directory, options)
+
+
+@unittest.skipUnless(os.environ.get('TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY'),
                      'set TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY to exercise real TCP owners')
 class AuthorityHandoffTests(unittest.TestCase):
     def test_admission_then_second_coordinator_open_with_live_owners(self):

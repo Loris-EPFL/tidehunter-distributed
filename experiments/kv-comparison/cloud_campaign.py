@@ -2686,6 +2686,32 @@ def validate_media_sample_count(media, samples, config):
         raise ValueError("media successful reads differ from raw samples")
 
 
+def make_owner_admission_config(config, owner_count):
+    """Keep prepared owner authority, but never inherit a measured workload."""
+    keys = 16 * owner_count
+    backend = copy.deepcopy(config["backend"])
+    options = backend["options"]
+    options["coordinator_read_cache_bytes"] = 0
+    options["external_remote_config"].update(read_cache_bytes=0, read_lanes=1,
+                                              pin_read_lanes=False)
+    return {"schema_version": 1, "backend": backend, "seed": 1775,
+        "namespace": "owner-admission",
+        "dataset": {"keys": keys, "value_size": 1024, "entropy": 1.0},
+        "workload": {"distribution": "uniform", "mix": mix(read=100),
+                     "batch_size": 32, "put_key_policy": "overwrite"},
+        "execution": {"mode": "closed_loop", "concurrency": owner_count,
+            "queue_capacity": owner_count, "request_timeout_ms": 10000,
+            "offered_ops_per_second": None},
+        "phases": {"preload": True, "verify_existing_dataset": False,
+            "evict_mapped_wal_before_measurement": False, "warmup_operations": 0,
+            "warmup_key_sweep": False, "measurement_key_sweep": True,
+            "aging_operations": 0, "measurement_operations": keys},
+        "qualification_only": False, "source_revision": config["source_revision"],
+        "limits": {"max_keys": keys, "max_bytes": keys * 1024,
+            "max_operations": 2 * keys, "deadline_seconds": M3_OWNER_ADMISSION_TIMEOUT_SECONDS,
+            "shutdown_grace_seconds": 20}}
+
+
 def make_run_config(job, case_root, options, source_revision, deadline_seconds=180):
     active_owner_count(job)
     if "case_kind" in job:

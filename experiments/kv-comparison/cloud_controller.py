@@ -3804,19 +3804,11 @@ class Controller:
         """Run a typed full-topology admission, shared with local TCP checks."""
         import importlib.util
         cell = directory / "owner-admission"
+        config = cloud_campaign.make_owner_admission_config(config, job["owner_count"])
         remote = config["backend"]["options"]["external_remote_config"]
-        remote["read_cache_bytes"] = 0
         identities = remote["live_nvme"]["owner_identities"]
         expected_nqns = {identities[str(index)]["host_nqn"] for index in range(job["owner_count"])}
         keys = 16 * job["owner_count"]
-        config.update(namespace="owner-admission", qualification_only=False)
-        config["dataset"].update(keys=keys, value_size=1024)
-        config["workload"].update(mix=cloud_campaign.mix(read=100))
-        config["execution"].update(concurrency=job["owner_count"], queue_capacity=job["owner_count"])
-        config["phases"].update(warmup_operations=0, measurement_operations=keys,
-                                measurement_key_sweep=True)
-        for key in ("measurement_gate", "measurement_completion_gate", "warmup_key_sweep", "diagnostics"):
-            config.pop(key, None)
         dump(cell / "config.json", config)
         began = self.clock()
         command([self.config["binary"], "--config", cell / "config.json", "--output", cell / "result"],
