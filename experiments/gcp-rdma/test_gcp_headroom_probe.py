@@ -126,6 +126,34 @@ class HeadroomTests(unittest.TestCase):
                 if ceiling < 225:
                     self.assertIn('ENOMEM', result['stderr'])
 
+    def test_every_reviewed_owner_count_can_reach_the_threshold(self):
+        for owners in probe.OWNER_HOST_COUNTS:
+            with self.subTest(owners=owners):
+                per_owner = probe.targets_per_owner(owners)
+                self.assertGreaterEqual(per_owner * owners, probe.MIN_CONTROLLERS)
+                self.assertLessEqual(per_owner * owners, probe.MAX_CONTROLLERS)
+                controllers = {}
+                def connect(argv, **kwargs):
+                    index = len(controllers)
+                    controllers['nvme' + str(index)] = {
+                        'nqn': argv[argv.index('-n') + 1], 'transport': 'rdma',
+                        'address': 'traddr=' + argv[argv.index('-a') + 1] + ',trsvcid=' + str(probe.SERVICE),
+                        'inode': index + 1}
+                def retire(expected, hostnqn):
+                    count = len(controllers)
+                    controllers.clear()
+                    return count
+                with patch.object(probe.manage, 'controller_snapshot', side_effect=lambda **_: dict(controllers)), \
+                     patch.object(probe.manage, 'verify_queue_geometry'), \
+                     patch.object(probe, 'retire_controllers', side_effect=retire), \
+                     patch.object(probe, 'resource_sample', side_effect=lambda device, count: {'controllers': count}), \
+                     patch.object(probe.subprocess, 'run', side_effect=connect):
+                    result = probe.probe(RUN, ['10.0.0.' + str(i) for i in range(1, owners + 1)], 'irdma0')
+                self.assertEqual(result['connected'], per_owner * owners)
+                self.assertTrue(result['admitted'])
+        with self.assertRaisesRegex(ValueError, 'unreviewed owner count'):
+            probe.targets_per_owner(3)
+
 
 class ProbeRetirementTests(unittest.TestCase):
     def fixture(self, root):

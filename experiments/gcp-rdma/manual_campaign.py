@@ -1131,7 +1131,8 @@ async def _headroom(mailbox, fleet, state, package_root, rdma_device, output):
     probe_submitted = False
     try:
         created = await _joined_waiters(
-            request(index, 'create', ['--owner', str(index), '--address', fleet[index]['rdma_ip']])
+            request(index, 'create', ['--owner', str(index), '--address', fleet[index]['rdma_ip'],
+                                      '--owners', str(len(fleet) - 1)])
             for index in range(1, len(fleet)))
         if any(item['exit_code'] != 0 for item in created):
             raise RuntimeError('headroom target creation failed; see mailbox receipts')
@@ -1151,7 +1152,7 @@ async def _headroom(mailbox, fleet, state, package_root, rdma_device, output):
     try:
         if cleanup_timeout < 1:
             raise TimeoutError('headroom teardown deadline exhausted')
-        cleaned = await _joined_waiters(request(index, 'cleanup', ['--owner', str(index)])
+        cleaned = await _joined_waiters(request(index, 'cleanup', ['--owner', str(index), '--owners', str(len(fleet) - 1)])
                                         for index in range(1, len(fleet)))
         if probe_submitted and time.time() > result['teardown_started_unix'] + 180:
             raise TimeoutError('headroom teardown exceeded 180 seconds')
