@@ -1241,6 +1241,10 @@ fn position_is_submitted_during_adoption_and_preserves_control_order() {
         client.submit_leased_adoption().unwrap();
         let (worker, failure) = worker(&fixture, client);
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Position persistence does not wait for adoption. Hold its own hook so
+        // the pending slot cannot disappear before the passing append replies.
+        let (position_entered, release_position) =
+            log.pause_live(LivePausePoint::PositionBeforeData);
         let guard = worker.client.lock();
         let (reply, proof) = mpsc::sync_channel(1);
         worker
@@ -1255,34 +1259,46 @@ fn position_is_submitted_during_adoption_and_preserves_control_order() {
             .unwrap();
         let later = worker.append(1, vec![fixture.batch(2)]).unwrap();
         drop(guard);
+        let position_submitted = position_entered.recv_timeout(Duration::from_secs(5));
         let passed = passing.recv_timeout(Duration::from_secs(5));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let submitted = loop {
-            if worker.client.lock().checkpoint_position_pending() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            thread::yield_now();
-        };
+        let submitted =
+            position_submitted.is_ok() && worker.client.lock().checkpoint_position_pending();
         let proof_pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
         let control_pending = matches!(control.try_recv(), Err(mpsc::TryRecvError::Empty));
         let later_pending = matches!(later.try_recv(), Err(mpsc::TryRecvError::Empty));
-        release.send(()).unwrap();
-        let passed = passed.unwrap().unwrap()[0];
-        assert!(submitted && proof_pending && control_pending && later_pending);
-        assert!(passed.appended().address().offset > through);
-        assert!(
-            proof
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .durable_end
-                >= through
-        );
+        let position_released = release_position.send(());
+        // Force the order that the old test raced: the proof completes while
+        // adoption still waits. Lifecycle control and the later append must not.
+        let completed = proof.recv_timeout(Duration::from_secs(5));
+        let control_waits_for_adoption =
+            matches!(control.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let later_waits_for_adoption = matches!(later.try_recv(), Err(mpsc::TryRecvError::Empty));
         let source = fixture.config.root.join("epoch_0000000000000001");
-        let captured_root = std::fs::read(source.join("partition-wal-root-v1")).unwrap();
+        let captured_root = std::fs::read(source.join("partition-wal-root-v1"));
+        let adoption_released = release.send(());
+        // Release both workers before any assertion can start teardown.
+        position_submitted.unwrap();
+        position_released.unwrap();
+        adoption_released.unwrap();
+        let passed = passed.unwrap().unwrap()[0];
+        assert!(submitted, "position must be submitted during adoption");
+        assert!(
+            proof_pending,
+            "position must wait at its own persistence hook"
+        );
+        assert!(control_pending, "control must wait for the position proof");
+        assert!(later_pending, "later append must wait behind control");
+        assert!(
+            control_waits_for_adoption,
+            "control must still wait for adoption after the position proof"
+        );
+        assert!(
+            later_waits_for_adoption,
+            "later append must still wait behind control after the position proof"
+        );
+        assert!(passed.appended().address().offset > through);
+        assert!(completed.unwrap().unwrap().durable_end >= through);
+        let captured_root = captured_root.unwrap();
         assert!(!control.recv_timeout(Duration::from_secs(5)).unwrap());
         let later = later.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()[0];
         assert!(later.appended().address().offset >= 128 * 1024);
