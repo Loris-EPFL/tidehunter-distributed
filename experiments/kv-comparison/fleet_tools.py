@@ -23,7 +23,7 @@ import owner_ftrace
 
 SELECTION = 'nvmeof_f9_tools'
 KINDS = ('nvmeof_write_ceiling', 'admission_options')
-TOOL_BUDGET_SECONDS = dict(zip(KINDS, (900, 1200)))
+TOOL_BUDGET_SECONDS = dict(zip(KINDS, (900, 1008)))
 REGION_BYTES = 2 * 1024**3
 LABEL = 'F9 z4m-highmem-16 admission models'
 ADMISSION_BATCHES = [1, 2, 22, 57]
@@ -44,7 +44,8 @@ def make_jobs():
     return _measurement_jobs(
         repetitions=1,
         cell_filter=lambda callers, owners, distribution, batch:
-        not (callers in (1, 4) and batch in (1, 57)))
+        not (callers in (1, 4) and batch in (1, 57))
+        and not (callers in (16, 64) and owners in (4, 16) and distribution == 'zipf099'))
 
 
 def _measurement_jobs(*, repetitions, cell_filter, options=ADMISSION_OPTIONS, selection=SELECTION):
@@ -73,8 +74,8 @@ def _measurement_jobs(*, repetitions, cell_filter, options=ADMISSION_OPTIONS, se
                 {'fio_write': dict(block_bytes=size, jobs=count, dsync=dsync, queue_depth=32,
                                    runtime_seconds=30, region_bytes=REGION_BYTES,
                                    target_buffered_io=1, transport='rdma')})
-    # Fixed F9 invocation: 800 timed seconds + 160 warmup seconds, leaving
-    # four minutes for trace/topology setup inside its twenty-minute cap.
+    # Fixed F9 invocation: 640 timed seconds + 128 warmup seconds, leaving
+    # four minutes for trace/topology setup inside its 1008-second cap.
     for callers, owners, distribution in itertools.product((1, 4, 16, 64, 256), (1, 4, 16), ('uniform', 'zipf099')):
         batches = [batch for batch in ADMISSION_BATCHES if cell_filter(callers, owners, distribution, batch)]
         if not batches:

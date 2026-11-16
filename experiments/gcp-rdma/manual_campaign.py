@@ -46,7 +46,7 @@ FLEET_SECONDS = 21600
 EXPORT_RESERVE_SECONDS = 900
 # Export reserve is inside the campaign; this margin leaves time after its
 # deadline for the terminal receipt and cleanup before VM expiry.
-CAMPAIGN_MARGIN_SECONDS = 120
+CAMPAIGN_MARGIN_SECONDS = 720  # 600 s bounded Compute cleanup + 120 s terminal receipt.
 CEILING_CENTS = 14500
 # Rounded-up compute for six six-hour guests at $3.287109973 per host-hour.
 # Iowa on-demand: https://cloud.google.com/products/compute/pricing/storage-optimized
@@ -121,7 +121,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
     'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
     'valkey_rdma_reads': 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2',
-    'nvmeof_f9_tools': '2bfaafed8b3e7830a4a8b4b634a6762607d66499327284afe030920855665b5f',
+    'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -188,7 +188,7 @@ REVIEWED_SPECS['nvmeof_f6b']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f8']['machine_type'] = 'z4m-highmem-16'
 REVIEWED_SPECS['nvmeof_f9_tools'] = {
     **copy.deepcopy(REVIEWED_SPECS['nvmeof_f8']),
-    'selection': 'nvmeof_f9_tools', 'job_count': 38, 'max_cases': 38, 'repeats': 1,
+    'selection': 'nvmeof_f9_tools', 'job_count': 34, 'max_cases': 34, 'repeats': 1,
     'matrix_sha256': FOCUSED_MATRIX_SHA256['nvmeof_f9_tools'],
     'backends': ['native', 'tidehunter_nvme_rdma'], 'owner_hosts': 1,
 }
