@@ -100,8 +100,10 @@ class SysfsInventoryTests(unittest.TestCase):
                     target = manage.os if operation == 'scandir' else Path
                     with patch.object(manage, 'SYS_NVME', root), \
                          patch.object(target, operation, side_effect=OSError(code, 'incomplete inventory')), \
-                         self.clock(), self.assertRaisesRegex(ValueError, 'did not stabilize.*identity remains unknown'):
+                         self.clock(), self.assertRaisesRegex(manage.InventoryTimeout,
+                                                              'controller inventory did not stabilize.*identity remains unknown') as failure:
                         manage.controller_snapshot(timeout=.05)
+                    self.assertIsInstance(failure.exception, ValueError)
 
     def test_deleting_one_of_two_controllers_resets_prior_matching_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,8 +173,10 @@ class SysfsInventoryTests(unittest.TestCase):
                     self.assertEqual(manage.namespace_candidates(None, {}, timeout=1), [path])
                     self.assertEqual(scan.call_count, 4)
                 with patch.object(manage, '_namespace_candidates_once', side_effect=OSError(code, 'changing')), \
-                     self.clock(), self.assertRaisesRegex(ValueError, 'did not stabilize.*identity remains unknown'):
+                     self.clock(), self.assertRaisesRegex(manage.InventoryTimeout,
+                                                          'did not stabilize.*identity remains unknown') as failure:
                     manage.namespace_candidates(None, {}, timeout=.05)
+                self.assertIsInstance(failure.exception, ValueError)
 
     def test_other_inventory_errors_are_not_retried(self):
         for code in (errno.EACCES, errno.EIO):
