@@ -70,9 +70,17 @@ pub enum PutKeyPolicy {
     New,
 }
 
+/// Required wire discriminant; old untagged workloads are deliberately rejected.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticKind {
+    Synthetic,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadConfig {
+    pub kind: SyntheticKind,
     pub distribution: KeyDistribution,
     pub mix: OperationMix,
     #[serde(default = "default_batch_size")]
@@ -755,6 +763,7 @@ mod tests {
                 entropy: 1.0,
             },
             workload: WorkloadConfig {
+                kind: SyntheticKind::Synthetic,
                 distribution: KeyDistribution::Uniform,
                 mix: OperationMix {
                     read: 1,

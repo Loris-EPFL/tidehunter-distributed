@@ -208,6 +208,12 @@ pub async fn run<B: KvBackend>(
             reporter.snapshot()?;
         }
         if fatal_reason.is_none()
+            && let Some(Err(error)) = backend.check_background_health()
+        {
+            failed = true;
+            fatal_reason = Some(format!("pre-measurement background health failed: {error}"));
+        }
+        if fatal_reason.is_none()
             && config.diagnostics.write_profile_limit > 0
             && let Err(error) = boundary_on_worker(&backend, move |backend| {
                 backend.arm_write_profile(config.diagnostics.write_profile_limit)
@@ -395,6 +401,14 @@ pub async fn run<B: KvBackend>(
         )
     };
 
+    if measurement_attempted && let Some(Err(error)) = backend.check_background_health() {
+        failed = true;
+        let reason = format!("measurement-end background health failed: {error}");
+        fatal_reason = Some(fatal_reason.map_or_else(
+            || reason.clone(),
+            |previous| format!("{previous}; {reason}"),
+        ));
+    }
     if measurement_attempted
         && let Some(gate) = &config.measurement_completion_gate
         && let Err(error) = wait_for_measurement_gate(gate, deadline).await
@@ -571,6 +585,14 @@ pub async fn run<B: KvBackend>(
             serde_json::Value::Null
         }
     };
+    if let Some(Err(error)) = backend.check_background_health() {
+        failed = true;
+        let reason = format!("final background health failed: {error}");
+        fatal_reason = Some(fatal_reason.map_or_else(
+            || reason.clone(),
+            |previous| format!("{previous}; {reason}"),
+        ));
+    }
     if let Err(error) = shutdown_on_worker(
         backend,
         deadline,
@@ -1570,7 +1592,7 @@ async fn check_many<F: Future<Output = BackendResult<Vec<Option<Bytes>>>>>(
     Ok(())
 }
 
-fn request_deadline(global: Instant, timeout_ms: u64) -> Instant {
+pub(crate) fn request_deadline(global: Instant, timeout_ms: u64) -> Instant {
     global.min(Instant::now() + Duration::from_millis(timeout_ms))
 }
 
@@ -1890,7 +1912,7 @@ impl Drop for WorkerPool {
     }
 }
 
-async fn wait_for_measurement_gate(
+pub(crate) async fn wait_for_measurement_gate(
     gate: &crate::config::MeasurementGateConfig,
     global_deadline: Instant,
 ) -> BackendResult<()> {
@@ -4548,6 +4570,8 @@ mod tests {
         observation_failure_at: Option<usize>,
         observation_calls: AtomicUsize,
         eviction_supported: bool,
+        health_failure_at: Option<usize>,
+        health_calls: AtomicUsize,
     }
 
     impl MemoryBackend {
@@ -4570,6 +4594,8 @@ mod tests {
                 write_snapshot_boundary_error: false,
                 observation_failure_at: None,
                 observation_calls: AtomicUsize::new(0),
+                health_failure_at: None,
+                health_calls: AtomicUsize::new(0),
             }
         }
 
@@ -4610,6 +4636,17 @@ mod tests {
                 // Stands in for the Tidehunter adapter in tests that select that backend kind.
                 configuration: serde_json::json!({"durability_tier": "native"}),
             }
+        }
+        fn check_background_health(&self) -> Option<BackendResult<()>> {
+            let failure_at = self.health_failure_at?;
+            let call = self.health_calls.fetch_add(1, Ordering::Relaxed);
+            Some(if call >= failure_at {
+                Err(invalid(
+                    "native flusher panic: background health regression",
+                ))
+            } else {
+                Ok(())
+            })
         }
         fn read_observation(&self) -> BackendResult<serde_json::Value> {
             let boundary = self.observation_calls.fetch_add(1, Ordering::Relaxed);
@@ -4990,6 +5027,37 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_health_failure_at_each_boundary_fails_and_preserves_reason() {
+        for boundary in 0..3 {
+            let directory = result_directory(&format!("background-health-{boundary}"));
+            let mut backend = MemoryBackend::new(false, false);
+            backend.health_failure_at = Some(boundary);
+            let result = run(
+                backend,
+                read_test_config(),
+                &directory,
+                prometheus::Registry::new(),
+            )
+            .await;
+            assert!(result.is_err());
+            let summary: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("summary.json")).unwrap())
+                    .unwrap();
+            assert_eq!(summary["status"], "failed");
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("manifest.json")).unwrap())
+                    .unwrap();
+            assert!(
+                manifest["run"]["qualification_failure"]
+                    .as_str()
+                    .unwrap()
+                    .contains("native flusher panic: background health regression")
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     struct ActiveCall(Arc<AtomicUsize>);

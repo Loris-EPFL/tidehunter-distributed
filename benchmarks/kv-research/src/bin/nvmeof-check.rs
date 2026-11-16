@@ -654,7 +654,7 @@ fn main() -> Result<()> {
         "namespace": "nvmeof-loopback-qualification",
         "key_namespace_hex": namespace_hex,
         "dataset": { "keys": keys, "value_size": value_size, "entropy": 1.0 },
-        "workload": { "distribution": "uniform", "batch_size": 32,
+        "workload": { "kind": "synthetic", "distribution": "uniform", "batch_size": 32,
             "mix": { "read": 1, "get_many": 1, "put": 0, "delete": 0,
                 "missing_read": 0, "put_batch": 0 } },
         "execution": { "mode": "closed_loop", "concurrency": 1,

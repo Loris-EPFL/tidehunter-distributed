@@ -12,7 +12,7 @@ def config():
     return {"schema_version": 1, "backend": {"kind": "native", "options": {"path": "/unused", "key_count": 100, "durability": "page_cache"}},
             "seed": 7, "key_namespace_hex": "01" * 16,
             "dataset": {"keys": 3, "value_size": 64, "entropy": 1.0},
-            "workload": {"distribution": "uniform", "mix": {"read": 100, "get_many": 0, "put": 0, "put_batch": 0, "delete": 0, "missing_read": 0}, "batch_size": 32},
+            "workload": {"kind": "synthetic", "distribution": "uniform", "mix": {"read": 100, "get_many": 0, "put": 0, "put_batch": 0, "delete": 0, "missing_read": 0}, "batch_size": 32},
             "execution": {"mode": "closed_loop", "concurrency": 1, "queue_capacity": 8, "request_timeout_ms": 1000},
             "phases": {"preload": False, "warmup_operations": 0, "aging_operations": 0, "measurement_operations": 4},
             "qualification_only": False, "measurement_gate": {"ready_file": "/case/ready", "release_file": "/case/release", "timeout_seconds": 10},
