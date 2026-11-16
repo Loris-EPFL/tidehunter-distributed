@@ -1,8 +1,10 @@
+use crate::background_health::BackgroundHealth;
 use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::container::LargeTableContainer;
 use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::control::RelocateFiles;
+use crate::db::{DbError, DbResult};
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
@@ -41,6 +43,7 @@ pub struct LargeTable {
     table: Vec<KsTable>,
     pub(crate) flusher: IndexFlusher,
     metrics: Arc<Metrics>,
+    background_health: Arc<BackgroundHealth>,
     pub(crate) fp: LargeTableFailPoints,
     /// Tracks the (ks, state) label pairs reported in the previous call to
     /// [`report_entries_state`]. Used to zero out stale combinations that no
@@ -215,6 +218,7 @@ impl LargeTable {
         flusher: IndexFlusher,
         metrics: Arc<Metrics>,
         loader: &L,
+        background_health: Arc<BackgroundHealth>,
     ) -> Self {
         assert_eq!(
             snapshot.data.len(),
@@ -344,6 +348,7 @@ impl LargeTable {
             table,
             flusher,
             metrics,
+            background_health,
             fp: Default::default(),
             reported_entry_state_keys: parking_lot::Mutex::new(HashSet::new()),
         }
@@ -921,7 +926,7 @@ impl LargeTable {
 
     /// Locks the row for a cell, waiting for any pending async flush to complete.
     ///
-    /// The returned cell is guaranteed to have pending_last_processed = None.
+    /// On success, the returned cell has pending_last_processed = None.
     ///
     /// This is not suitable for frequent user-facing operations as it blocks current thread
     /// via sleep while it waits for pending flush to finish.
@@ -929,11 +934,14 @@ impl LargeTable {
         &self,
         context: &KsContext,
         cell: &CellId,
-    ) -> MutexGuard<'_, Row> {
+    ) -> DbResult<MutexGuard<'_, Row>> {
         let mutex = context.ks_config.mutex_for_cell(cell);
         let ks_table = self.ks_rows(&context.ks_config);
 
         loop {
+            // A failed flusher cannot clear its pending marker. Keep the
+            // existing wait cadence, but never wait forever after failure.
+            self.background_health.check()?;
             let mut row = ks_table.lock(mutex, &context.large_table_contention);
 
             if let Some(entry) = row.try_entry_mut(cell)
@@ -941,11 +949,12 @@ impl LargeTable {
             {
                 // Async flush is in progress, wait for it to complete
                 drop(row);
+                self.fp.fp_waiting_for_flush();
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
 
-            return row;
+            return Ok(row);
         }
     }
 
@@ -1006,15 +1015,15 @@ impl LargeTable {
         Ok(Some(Arc::new(merged)))
     }
 
-    pub fn sync_flush_for_relocation<L: Loader>(
+    pub fn sync_flush_for_relocation<L: Loader<Error = DbError>>(
         &self,
         context: &KsContext,
         cell_id: &CellId,
         loader: &L,
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
-    ) -> Result<(), L::Error> {
-        let mut row = self.lock_cell_waiting_for_flush(context, cell_id);
+    ) -> DbResult<()> {
+        let mut row = self.lock_cell_waiting_for_flush(context, cell_id)?;
 
         let entry = match row.try_entry_mut(cell_id) {
             Some(entry) => entry,
@@ -1445,11 +1454,11 @@ impl LargeTable {
         context: &KsContext,
         from_cell: &CellId,
         to_cell: &CellId,
-    ) {
+    ) -> DbResult<()> {
         let mut current_cell = Some(from_cell.clone());
 
         while let Some(cell) = current_cell.as_ref() {
-            let mut row = self.lock_cell_waiting_for_flush(context, cell);
+            let mut row = self.lock_cell_waiting_for_flush(context, cell)?;
             row.remove_entry(cell);
 
             if cell == to_cell {
@@ -1464,6 +1473,7 @@ impl LargeTable {
                 break;
             }
         }
+        Ok(())
     }
 
     /// Clears every cell of a keyspace. Used by `Db::destroy_key_space`
@@ -1471,10 +1481,11 @@ impl LargeTable {
     /// (no user handle exists), so only internal machinery can touch it
     /// concurrently; any pending async flush per row is waited out before
     /// clearing, mirroring `drop_cells_in_range`.
-    pub(crate) fn drop_all_cells(&self, context: &KsContext) {
+    pub(crate) fn drop_all_cells(&self, context: &KsContext) -> DbResult<()> {
         let ks_table = self.ks_table(&context.ks_config);
         for mutex in ks_table.rows.mutexes() {
             loop {
+                self.background_health.check()?;
                 let mut row = mutex.lock();
                 if row
                     .entries
@@ -1482,6 +1493,7 @@ impl LargeTable {
                     .any(|entry| entry.pending_last_processed.is_some())
                 {
                     drop(row);
+                    self.fp.fp_waiting_for_flush();
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
@@ -1493,6 +1505,7 @@ impl LargeTable {
         // but a destroyed keyspace is never iterated again — release the
         // memory.
         ks_table.cell_index.write().clear();
+        Ok(())
     }
 
     pub fn report_entries_state(&self) {
@@ -2952,6 +2965,8 @@ pub(crate) struct LargeTableFailPointsInner {
     /// Hit by the flusher thread between the flush work and the visible
     /// completion (`update_flushed_index` / `update_relocated_index`).
     pub fp_flush_before_completion: crate::failpoints::FailPoint,
+    /// Hit after releasing a row whose pending flush has not completed.
+    pub fp_waiting_for_flush: crate::failpoints::FailPoint,
 }
 
 #[cfg(not(test))]
@@ -2963,6 +2978,7 @@ impl LargeTableFailPoints {
     pub fn fp_lookup_after_lock_drop(&self) {}
 
     pub fn fp_flush_before_completion(&self) {}
+    pub fn fp_waiting_for_flush(&self) {}
 }
 
 #[cfg(test)]
@@ -2983,6 +2999,10 @@ impl LargeTableFailPoints {
 
     pub fn fp_flush_before_completion(&self) {
         self.0.read().fp_flush_before_completion.fp();
+    }
+
+    pub fn fp_waiting_for_flush(&self) {
+        self.0.read().fp_waiting_for_flush.fp();
     }
 }
 
@@ -3021,6 +3041,7 @@ mod tests {
             IndexFlusher::new_unstarted_for_test(),
             Metrics::new(),
             wal.as_ref(),
+            Arc::default(),
         );
         let (mut row, cell) = l.row(l.ks_context(a), &[]);
         assert_eq!(row.entry_mut(&cell).0.context.name(), "a");
@@ -3732,6 +3753,7 @@ mod tests {
             IndexFlusher::new_unstarted_for_test(),
             Metrics::new(),
             wal.as_ref(),
+            Arc::default(),
         );
 
         let context = table.ks_context(ks_id);
@@ -3870,6 +3892,7 @@ mod tests {
             IndexFlusher::new_unstarted_for_test(),
             Arc::clone(&metrics),
             wal.as_ref(),
+            Arc::default(),
         );
 
         let entry_state = |state: &str| {

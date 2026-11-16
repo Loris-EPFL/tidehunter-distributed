@@ -154,7 +154,7 @@ pub(crate) fn replay_wal(
                 // cells exist as Unloaded entries from a CR snapshot loaded
                 // at replay start).
                 buffer.drop_cells_in_range(ks, &from_cell, &to_cell);
-                large_table.drop_cells_in_range(context, &from_cell, &to_cell);
+                large_table.drop_cells_in_range(context, &from_cell, &to_cell)?;
             }
             entry @ WalEntry::CompressedBatch(..) => {
                 // A compressed batch is one durable WAL frame — either it

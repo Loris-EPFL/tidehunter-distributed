@@ -124,6 +124,23 @@ impl Default for LatencyAccumulator {
 }
 
 impl LatencyAccumulator {
+    fn merge(&mut self, other: Self) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            self.min_ns = other.min_ns;
+            self.max_ns = other.max_ns;
+        } else {
+            self.min_ns = self.min_ns.min(other.min_ns);
+            self.max_ns = self.max_ns.max(other.max_ns);
+        }
+        self.count += other.count;
+        for (bin, count) in self.bins.iter_mut().zip(other.bins) {
+            *bin += count;
+        }
+    }
+
     fn observe(&mut self, value: u64) {
         if self.count == 0 {
             self.min_ns = value;
@@ -225,6 +242,7 @@ pub struct Reporter {
     output: PathBuf,
     samples: Option<mpsc::Sender<WriterMessage>>,
     sample_writer: Option<JoinHandle<std::io::Result<()>>>,
+    client_shard: bool,
     registry: Registry,
     pub backend_label: String,
     status: IntGauge,
@@ -243,6 +261,7 @@ pub struct Reporter {
     response_latency: HistogramVec,
     scheduling_delay: HistogramVec,
     offered_total: u64,
+    offered_operations: std::collections::BTreeMap<(&'static str, &'static str), u64>,
     completed_total: u64,
     rejected_total: u64,
     timeout_total: u64,
@@ -425,6 +444,7 @@ impl Reporter {
             output: output.to_owned(),
             samples: Some(sample_sender),
             sample_writer: Some(sample_writer),
+            client_shard: false,
             registry,
             backend_label,
             status,
@@ -443,6 +463,7 @@ impl Reporter {
             response_latency,
             scheduling_delay,
             offered_total: 0,
+            offered_operations: std::collections::BTreeMap::default(),
             completed_total: 0,
             rejected_total: 0,
             timeout_total: 0,
@@ -461,7 +482,82 @@ impl Reporter {
         })
     }
 
+    /// A client owns its counters and distributions. Only metric handles and the bounded
+    /// raw-row sender are shared; the original reporter owns snapshots and writer shutdown.
+    pub(crate) fn fork_client(&self) -> Self {
+        Self {
+            output: self.output.clone(),
+            samples: self.samples.clone(),
+            sample_writer: None,
+            client_shard: true,
+            registry: self.registry.clone(),
+            backend_label: self.backend_label.clone(),
+            status: self.status.clone(),
+            snapshot_timestamp: self.snapshot_timestamp.clone(),
+            current_phase: self.current_phase.clone(),
+            offered: self.offered.clone(),
+            completed: self.completed.clone(),
+            rejected: self.rejected.clone(),
+            timeout: self.timeout.clone(),
+            error: self.error.clone(),
+            keys_completed: self.keys_completed.clone(),
+            keys_offered: self.keys_offered.clone(),
+            keys_rejected: self.keys_rejected.clone(),
+            succeeded: self.succeeded.clone(),
+            api_latency: self.api_latency.clone(),
+            response_latency: self.response_latency.clone(),
+            scheduling_delay: self.scheduling_delay.clone(),
+            offered_total: 0,
+            offered_operations: std::collections::BTreeMap::default(),
+            completed_total: 0,
+            rejected_total: 0,
+            timeout_total: 0,
+            error_total: 0,
+            keys_completed_total: 0,
+            keys_offered_total: 0,
+            keys_rejected_total: 0,
+            succeeded_total: 0,
+            sample_backpressure_ns: 0,
+            sample_backpressure_events: 0,
+            sample_submit_errors: 0,
+            release_samples: 0,
+            release_oracle_ns_sum: 0,
+            release_oracle_ns_max: 0,
+            distributions: std::collections::BTreeMap::default(),
+        }
+    }
+
+    pub(crate) fn merge_client(&mut self, client: Self) {
+        self.offered_total += client.offered_total;
+        for (population, count) in client.offered_operations {
+            *self.offered_operations.entry(population).or_default() += count;
+        }
+        self.completed_total += client.completed_total;
+        self.rejected_total += client.rejected_total;
+        self.timeout_total += client.timeout_total;
+        self.error_total += client.error_total;
+        self.keys_completed_total += client.keys_completed_total;
+        self.keys_offered_total += client.keys_offered_total;
+        self.keys_rejected_total += client.keys_rejected_total;
+        self.succeeded_total += client.succeeded_total;
+        self.sample_backpressure_ns += client.sample_backpressure_ns;
+        self.sample_backpressure_events += client.sample_backpressure_events;
+        self.sample_submit_errors += client.sample_submit_errors;
+        self.release_samples += client.release_samples;
+        self.release_oracle_ns_sum += client.release_oracle_ns_sum;
+        self.release_oracle_ns_max = self.release_oracle_ns_max.max(client.release_oracle_ns_max);
+        for (population, values) in client.distributions {
+            self.distributions
+                .entry(population)
+                .or_default()
+                .merge(values);
+        }
+    }
+
     pub fn set_phase(&self, phase: &str) {
+        if self.client_shard {
+            return;
+        }
         self.current_phase.set(match phase {
             "qualification" => 1,
             "preload" => 2,
@@ -484,13 +580,17 @@ impl Reporter {
         receiver
     }
 
-    pub fn offered(&mut self, phase: &str, operation: &str, logical_keys: u64) {
+    pub fn offered(&mut self, phase: &'static str, operation: &'static str, logical_keys: u64) {
         let labels = [self.backend_label.as_str(), operation, "scheduled", phase];
         self.offered.with_label_values(&labels).inc();
         self.keys_offered
             .with_label_values(&labels)
             .inc_by(logical_keys);
         self.offered_total += 1;
+        *self
+            .offered_operations
+            .entry((phase, operation))
+            .or_default() += 1;
         self.keys_offered_total += logical_keys;
     }
 
@@ -650,6 +750,9 @@ impl Reporter {
     }
 
     pub fn snapshot(&mut self) -> BackendResult<()> {
+        if self.client_shard {
+            return Ok(());
+        }
         // A full queue means rows are flowing and the writer flushes by elapsed time.
         if let Some(sender) = &self.samples {
             let _ = sender.try_send(WriterMessage::Flush);
@@ -761,6 +864,30 @@ impl Reporter {
         Ok(())
     }
 
+    /// Actual offered mix includes rejected arrivals. Probabilities, not a realized
+    /// random sequence, are preserved when the number of independent clients changes.
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn realized_mix(&self) -> serde_json::Value {
+        let mut phases = std::collections::BTreeMap::new();
+        for ((phase, _), count) in &self.offered_operations {
+            *phases.entry(*phase).or_insert(0_u64) += count;
+        }
+        serde_json::Value::Object(
+            self.offered_operations
+                .iter()
+                .map(|((phase, operation), count)| {
+                    (
+                        format!("{phase}.{operation}"),
+                        serde_json::json!({
+                            "offered": count,
+                            "fraction": *count as f64 / phases[phase] as f64,
+                        }),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     #[must_use]
     pub fn totals(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
@@ -855,6 +982,135 @@ fn atomic_write(path: &Path, contents: &[u8]) -> BackendResult<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Auxiliary primitive-cost check, not a store-throughput benchmark. All five
+    /// successful-call counter updates and three labelled histogram observations
+    /// match offered()/record(); raw output and private accumulators are excluded.
+    #[test]
+    #[ignore = "explicit local release-mode accounting measurement"]
+    fn client_metric_handle_cost() {
+        for clients in [1, 2, 4] {
+            for shared in [false, true] {
+                let root = std::env::temp_dir().join(format!(
+                    "kv-client-metrics-{}-{}-{clients}-{shared}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let mut parents = (0..if shared { 1 } else { clients })
+                    .map(|index| {
+                        Reporter::create(
+                            &root.join(index.to_string()),
+                            Registry::new(),
+                            "test".into(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let clients = (0..clients)
+                    .map(|index| parents[if shared { 0 } else { index }].fork_client())
+                    .collect::<Vec<_>>();
+                let count = clients.len();
+                let barrier = std::sync::Barrier::new(count + 1);
+                let elapsed = std::thread::scope(|scope| {
+                    let mut threads = Vec::with_capacity(count);
+                    for mut client in clients {
+                        let barrier = &barrier;
+                        threads.push(scope.spawn(move || {
+                            barrier.wait();
+                            for _ in 0..200_000 / count {
+                                client.offered("measurement", "read", 1);
+                                let labels = ["test", "read", "success", "measurement"];
+                                client.completed.with_label_values(&labels).inc();
+                                client.succeeded.with_label_values(&labels).inc();
+                                client.keys_completed.with_label_values(&labels).inc();
+                                client
+                                    .response_latency
+                                    .with_label_values(&labels)
+                                    .observe(0.000_002);
+                                client
+                                    .api_latency
+                                    .with_label_values(&labels)
+                                    .observe(0.000_001);
+                                client
+                                    .scheduling_delay
+                                    .with_label_values(&labels)
+                                    .observe(0.000_001);
+                            }
+                        }));
+                    }
+                    let started = Instant::now();
+                    barrier.wait();
+                    for thread in threads {
+                        thread.join().unwrap();
+                    }
+                    started.elapsed()
+                });
+                println!(
+                    "client_metric_handle_cost clients={count} shared={shared} aggregate_ns_per_call={:.3}",
+                    elapsed.as_nanos() as f64 / 200_000.0
+                );
+                for parent in &mut parents {
+                    parent.samples.take();
+                    parent
+                        .sample_writer
+                        .take()
+                        .unwrap()
+                        .join()
+                        .unwrap()
+                        .unwrap();
+                }
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn client_reports_merge_counts_distributions_and_all_raw_rows_once() {
+        let path = std::env::temp_dir().join(format!(
+            "kv-research-client-report-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut parent = Reporter::create(&path, Registry::new(), "test".into()).unwrap();
+        for (index, latency) in [3, 255].into_iter().enumerate() {
+            let mut client = parent.fork_client();
+            let WriterMessage::Row(mut sample) = row("success") else {
+                unreachable!()
+            };
+            sample.api_ns = latency;
+            sample.response_ns = latency + 1;
+            client.offered("measurement", "read", 1);
+            client.record(sample).await.unwrap();
+            assert_eq!(parent.totals().0, index as u64);
+            parent.merge_client(client);
+        }
+        assert_eq!(parent.totals().0, 2);
+        assert_eq!(parent.totals().1, 2);
+        assert_eq!(parent.totals().6, 2);
+        let summary = parent.distribution_summaries();
+        assert_eq!(summary["measurement.read.api.success"]["count"], 2);
+        assert_eq!(summary["measurement.read.api.success"]["min_ns"], 3);
+        assert_eq!(summary["measurement.read.api.success"]["max_ns"], 255);
+        assert_eq!(parent.realized_mix()["measurement.read"]["offered"], 2);
+        assert_eq!(parent.realized_mix()["measurement.read"]["fraction"], 1.0);
+        let receiver = parent.stall_sample_writer_for_test();
+        assert_eq!(
+            std::fs::read_to_string(path.join("samples.csv.tmp"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        drop(receiver);
+        drop(parent);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     use super::*;
 
     #[test]

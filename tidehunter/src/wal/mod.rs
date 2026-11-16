@@ -8,6 +8,7 @@ mod syncer;
 pub(crate) mod tracker;
 pub(crate) mod tracking_mmap;
 
+use crate::background_health::BackgroundHealth;
 use crate::context::ReadType;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
 use crate::file_reader::FileReader;
@@ -50,6 +51,7 @@ pub struct Wal {
     layout: WalLayout,
     maps: Arc<ArcSwap<WalMaps>>,
     metrics: Arc<Metrics>,
+    background_health: Arc<BackgroundHealth>,
     #[cfg(feature = "experimental-distributed")]
     retained: bool,
 }
@@ -368,6 +370,15 @@ impl Wal {
         layout: WalLayout,
         metrics: Arc<Metrics>,
     ) -> io::Result<Arc<Self>> {
+        Self::open_with_background_health(base_path, layout, metrics, Arc::default())
+    }
+
+    pub(crate) fn open_with_background_health(
+        base_path: &Path,
+        layout: WalLayout,
+        metrics: Arc<Metrics>,
+        background_health: Arc<BackgroundHealth>,
+    ) -> io::Result<Arc<Self>> {
         layout.assert_layout();
         let files = WalFiles::new(base_path, &layout)?;
         let wal = Wal {
@@ -375,6 +386,7 @@ impl Wal {
             layout,
             maps: Default::default(),
             metrics,
+            background_health,
             #[cfg(feature = "experimental-distributed")]
             retained: false,
         };
@@ -397,6 +409,7 @@ impl Wal {
             layout,
             maps: Default::default(),
             metrics,
+            background_health: Arc::default(),
             retained: true,
         }))
     }
@@ -1155,7 +1168,11 @@ impl WalIterator {
 
         self.clear_fragment_from_position(position);
 
-        let syncer = WalSyncer::start(self.wal.metrics.clone(), self.wal.layout.kind.name());
+        let syncer = WalSyncer::start(
+            self.wal.metrics.clone(),
+            self.wal.layout.kind.name(),
+            self.wal.background_health.clone(),
+        );
         self.wal.maps.store(Arc::new(self.maps));
         let mapper = WalMapper::start(
             self.wal.maps.clone(),
@@ -1163,6 +1180,7 @@ impl WalIterator {
             self.wal.layout.clone(),
             syncer,
             self.wal.metrics.clone(),
+            self.wal.background_health.clone(),
         );
         // The writer doesn't use `self.map` directly — it looks up the
         // correct map via `get_writeable_map` against `self.wal.maps`,
@@ -1176,6 +1194,7 @@ impl WalIterator {
             mapper,
             LastProcessed::new(position),
             self.wal.metrics.clone(),
+            self.wal.background_health.clone(),
         );
         let allocator = WalAllocator::new(self.wal.layout.clone(), position);
         WalWriter {

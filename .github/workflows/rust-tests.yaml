@@ -29,6 +29,77 @@ env:
   RUST_TEST_NOCAPTURE: "1"
 
 jobs:
+  mainnet-fixture:
+    name: Mainnet fixture tests
+    runs-on: ubuntu-24.04
+    # The small serializer oracle needs no Sui build or archive download.
+    # Allow cold Cargo setup plus the bounded tests and cache save.
+    timeout-minutes: 10
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/experiments/sui-mainnet/serializer-reference/target
+      RUSTUP_TOOLCHAIN: "1.90"
+      CARGO_NET_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tidehunter_repo_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Verify retained mainnet fixture hashes
+        # Fail before dependency installation/build if any committed byte changed.
+        timeout-minutes: 1
+        run: |
+          python3 -B - <<'PY'
+          import pathlib
+          import sys
+          sys.path.insert(0, "experiments/sui-mainnet")
+          import trace_format as tf
+          root = pathlib.Path("experiments/sui-mainnet/fixture")
+          manifest = tf.admit(root, "4264e79e0cbe4a1e36d94468df2f049f988eac57877c9bf2e7e175489dc922fa")
+          print(f"Verified SHA-256 and size of all {len(manifest['files'])} retained fixture files")
+          PY
+
+      - name: Set up repository Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+        with:
+          toolchain: "1.90"
+
+      - name: Cache serializer Cargo dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.90-mainnet-serializer-deps-${{ hashFiles('experiments/sui-mainnet/serializer-reference/Cargo.lock') }}
+
+      - name: Cache serializer build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: experiments/sui-mainnet/serializer-reference/target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.90-mainnet-serializer-${{ hashFiles('experiments/sui-mainnet/serializer-reference/Cargo.lock') }}-${{ hashFiles('experiments/sui-mainnet/serializer-reference/src/**/*.rs', 'experiments/sui-mainnet/serializer-reference/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rust-1.90-mainnet-serializer-${{ hashFiles('experiments/sui-mainnet/serializer-reference/Cargo.lock') }}-
+
+      - name: Install checkpoint decompressor
+        # Bound package-mirror stalls; no Sui archive is downloaded.
+        timeout-minutes: 2
+        run: |
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends zstd
+
+      - name: Build independent serializer reference
+        # Cold compilation is only serde, JSON, BCS and bincode, not the workspace.
+        timeout-minutes: 3
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo +1.90 build --locked --manifest-path experiments/sui-mainnet/serializer-reference/Cargo.toml
+
+      - name: Test deterministic mainnet fixture and Rust serializer agreement
+        # Each Rust cross-check has its own 180-second subprocess bound.
+        timeout-minutes: 4
+        run: python3 -B -m unittest discover -s experiments/sui-mainnet -p 'test_*.py' -v
+
   test:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04

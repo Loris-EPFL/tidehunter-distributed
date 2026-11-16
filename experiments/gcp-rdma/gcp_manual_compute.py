@@ -25,6 +25,12 @@ MCP_CALL_SECONDS = 30
 # Allow 153.859035 s margin; the whole cleanup remains bounded by 600 s.
 DELETE_CALL_SECONDS = 300
 READ_ATTEMPTS = 3
+# Local gcloud transport failures before any response: retrying an idempotent
+# read is safe. Denials, invalid replies and every mutation stay fail-closed.
+TRANSPORT_FAILURE = re.compile(
+    r'gcloud crashed \((?:ConnectionError|SSLError|ProtocolError|ReadTimeout|TransportError)\)'
+    r'|Connection aborted|RemoteDisconnected|Connection reset by peer'
+    r'|Temporary failure in name resolution|Max retries exceeded')
 CLEANUP_SECONDS = 600
 CREATE_ABSENCE_ROUNDS = 3
 CREATE_ABSENCE_SECONDS = 30
@@ -88,6 +94,14 @@ def _id(value):
 
 def _end(value, suffix):
     return isinstance(value, str) and (value == suffix or value.endswith('/' + suffix))
+
+
+def _transport_failure(response):
+    """A nonzero gcloud exit whose diagnostic names a local transport crash."""
+    if not isinstance(response, dict) or response.get('exit_code', 0) in (0, None):
+        return False
+    diagnostic = ' '.join(str(response.get(k, '')) for k in ('stderr', 'stdout', 'text'))
+    return bool(TRANSPORT_FAILURE.search(diagnostic))
 
 
 def _json_response(response):
@@ -205,6 +219,12 @@ class Compute:
             except (TimeoutError, subprocess.TimeoutExpired) as exc:
                 if not read_only or attempt + 1 == READ_ATTEMPTS:
                     raise ComputeError('MCP call timed out; outcome may be unknown') from exc
+                continue
+            if read_only and _transport_failure(response):
+                if attempt + 1 == READ_ATTEMPTS:
+                    raise ComputeError('read transport failed after bounded retries')
+                # A dropped connection needs time to recover; stay inside the deadline.
+                await asyncio.sleep(min(2.0 * (attempt + 1), max(remaining - 1.0, 0.0)))
                 continue
             if creation:
                 rejection = _definitive_create_rejection(response)
