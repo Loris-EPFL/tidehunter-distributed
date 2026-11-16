@@ -28,8 +28,13 @@ CONFIG = {'project_id': 'mysten-research', 'project_number': '514867804006',
           'ordinary_subnet': 'projects/mysten-research/regions/us-central1/subnetworks/default',
           'rdma_subnet': 'projects/mysten-research/regions/us-central1/subnetworks/rdma'}]}
 
-QUOTAS = [{'metric': metric, 'limit': 10**9, 'usage': 0}
-          for metric in ('Z4M_CPUS', 'LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY')]
+# Projection of the actual F7 v3 regional response, control-log/0008.json.
+QUOTAS = [
+    {'metric': 'CPUS', 'limit': 5000.0, 'usage': 4.0},
+    {'metric': 'IN_USE_ADDRESSES', 'limit': 2300.0, 'usage': 2.0},
+    {'metric': 'LOCAL_SSD_TOTAL_GB', 'limit': 9.223372036854776e+18, 'usage': 0.0},
+    {'metric': 'INSTANCES', 'limit': 24000.0, 'usage': 3.0},
+]
 
 SPDK_IDENTITY = {
     'target_scope': 'file_aio_direct_live_and_sealed',

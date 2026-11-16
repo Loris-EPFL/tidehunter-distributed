@@ -720,6 +720,33 @@ def run_campaign(api, config, budget, state, state_path, receipt, spec, output, 
         raise workload_error
 
 
+def is_admission_refusal(state):
+    if state.get('cleanup_reason') != 'admission_refused_before_lease':
+        return False
+    if (state.get('cleanup_verified') is not True or state.get('phase') != 'admission_refused'
+            or state.get('cleanup_result') != 'no lease, no resources by construction'
+            or state.get('lease_token') or state.get('children')
+            or state.get('instances') or state.get('policy')):
+        raise RuntimeError('invalid admission refusal state')
+    return True
+
+
+def record_admission_refusal(store, state, state_path):
+    """Called only by launchers at their pre-resource admission boundary."""
+    if (state.get('lease_token') or state.get('children')
+            or state.get('instances') or state.get('policy')):
+        return False
+    if gcp_lease.read(store, state['run_id']) is not None:
+        # An acquire error can follow an uncertain committed registry write.
+        # Never convert that ambiguity into proof that no lease exists.
+        return False
+    state.update(phase='admission_refused', cleanup_verified=True,
+                 cleanup_reason='admission_refused_before_lease',
+                 cleanup_result='no lease, no resources by construction')
+    save(state_path, state)
+    return True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('plan', 'preflight', 'run', 'cleanup', 'recover-cleanup'))
@@ -750,6 +777,12 @@ def main(argv=None):
             raise ValueError('cleanup arguments do not match persisted identity')
         store = api.objects(config['bucket'])
         current = gcp_lease.read(store, args.run_id)
+        if is_admission_refusal(state):
+            if current is not None:
+                raise RuntimeError('admission refusal has an unexpected active lease')
+            Path(output, 'cleanup-receipt.json').write_bytes(json_bytes(
+                {'run_id': args.run_id, 'result': state['cleanup_result']}))
+            return
         if state.get('cleanup_verified') is True and (current is None or current[0].get('run_id') != args.run_id):
             Path(output, 'cleanup-receipt.json').write_bytes(json_bytes({'run_id': args.run_id, 'result': 'owned resources absent'}))
             return
@@ -762,9 +795,6 @@ def main(argv=None):
             derived = 'bench-' + hashlib.sha256((run + ':' + attempt).encode()).hexdigest()[:16]
             if not trusted or not run.isdecimal() or not attempt.isdecimal() or derived != args.run_id:
                 raise RuntimeError('early recovery requires the trusted terminal cleanup job for this exact workflow run')
-        if current is None and not state.get('instances') and not state.get('policy'):
-            Path(output, 'cleanup-receipt.json').write_bytes(json_bytes({'run_id': args.run_id, 'result': 'lease was never acquired; no fleet created'}))
-            return
         lease = gcp_lease.owned(store, state)
         cleanup(api, state, state_path)
         state['cleanup_verified'] = True
@@ -802,18 +832,26 @@ def main(argv=None):
         raise ValueError('refusing to overwrite existing run state')
     state_path = StateFile(args.state, api.objects(config['bucket']), args.run_id)
     cpus = int(config['machine_type'].rsplit('-', 1)[-1])
-    state = {'version': 1, 'project_id': config['project_id'], 'run_id': args.run_id, 'source_sha256': args.source_sha, 'deadline': args.deadline, 'instances': [],
+    state = {'version': 1, 'project_id': config['project_id'], 'run_id': args.run_id, 'source_sha256': args.source_sha, 'deadline': args.deadline, 'instances': [], 'cleanup_verified': False,
              'reservation': {'cents': budget['run_upper_bound_cents'], 'region': 'us-central1',
-                             'vcpus': cpus * 6, 'local_ssds': LOCAL_SSD_COUNTS[config['machine_type']] * 6,
+                             'instances': 6, 'vcpus': cpus * 6,
+                             'local_ssds': LOCAL_SSD_COUNTS[config['machine_type']] * 6,
                              'local_ssd_gib': LOCAL_SSD_COUNTS[config['machine_type']] * 6 * 14000}}
     save(state_path, state)
-    region = api.request('GET', 'regions/us-central1')
-    if region.get('quotaStatusWarning'):
-        raise ValueError('regional quota fetch returned a warning')
-    quotas = region['quotas']
-    lease = gcp_lease.acquire(api.objects(config['bucket']), state,
-                              max_runs=config.get('max_concurrent_runs', 3),
-                              ceiling_cents=config.get('active_run_limit_cents', 14500), quotas=quotas)
+    try:
+        region = api.request('GET', 'regions/us-central1')
+        if region.get('quotaStatusWarning'):
+            raise ValueError('regional quota fetch returned a warning')
+        quotas = region['quotas']
+        lease = gcp_lease.acquire(api.objects(config['bucket']), state,
+                                  max_runs=config.get('max_concurrent_runs', 3),
+                                  ceiling_cents=config.get('active_run_limit_cents', 14500), quotas=quotas)
+    except BaseException:
+        # Preflight above is read-only. launch() is called only through
+        # run_campaign() below, after acquire returns; no VM, disk or placement
+        # policy can exist for this state at this admission failure boundary.
+        record_admission_refusal(api.objects(config['bucket']), state, state_path)
+        raise
     run_campaign(api, config, budget, state, state_path, receipt, spec, output, lease)
 
 

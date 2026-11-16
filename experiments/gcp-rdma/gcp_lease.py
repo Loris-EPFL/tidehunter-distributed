@@ -64,7 +64,12 @@ def read(store, run_id=None):
 def reservation(state):
     """Recover the old manual parent's quote and full admitted fleet shape."""
     if 'reservation' in state:
-        result = state['reservation']
+        result = dict(state['reservation'])
+        if 'instances' not in result:
+            # Older registry entries omitted VM count. Each admitted Z4M VM has
+            # at least one SSD, so one VM per SSD is a conservative upper bound.
+            result['instances'] = state.get('children', {}).get('fleet', {}).get(
+                'host_count', result.get('local_ssds'))
     else:
         budget = state.get('budget', {})
         fleet = state.get('children', {}).get('fleet', {})
@@ -82,10 +87,10 @@ def reservation(state):
         cpus, hosts = shapes[0]
         result = {'cents': budget.get('ceiling_cents'), 'region': 'us-central1',
                   'vcpus': cpus * hosts, 'local_ssds': hosts * (cpus // 16),
-                  'local_ssd_gib': 14000 * hosts * (cpus // 16)}
+                  'local_ssd_gib': 14000 * hosts * (cpus // 16), 'instances': hosts}
     if (not isinstance(result, dict) or result.get('region') != 'us-central1'
             or any(type(result.get(k)) is not int or result[k] <= 0
-                   for k in ('cents', 'vcpus', 'local_ssds', 'local_ssd_gib'))):
+                   for k in ('cents', 'vcpus', 'local_ssds', 'local_ssd_gib', 'instances'))):
         raise ValueError('invalid active fleet reservation')
     return dict(result)
 
@@ -153,9 +158,24 @@ def check_quota(quotas, reservations):
     This can over-reserve already allocated active VMs, but also covers unrelated
     regional usage and active fleets still waiting for package upload.
     """
-    for metric, field in (('Z4M_CPUS', 'vcpus'),
-                          ('LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY', 'local_ssd_gib')):
+    # The reviewed regional API reports CPUS, LOCAL_SSD_TOTAL_GB and INSTANCES.
+    # Cloud Quotas family visibility is not required: that API is denied here.
+    # For immediate VM-create errors, only structured Compute JSON codes
+    # QUOTA_EXCEEDED, ZONE_RESOURCE_POOL_EXHAUSTED and
+    # ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS prove no create
+    # (gcp_manual_compute.CreateRejected). A well-formed DONE operation error is
+    # already a terminal provider result for every code. Both paths still verify
+    # absence before release; immediate unknown errors/timeouts retain the lease.
+    required = (('CPUS', 'vcpus'), ('LOCAL_SSD_TOTAL_GB', 'local_ssd_gib'),
+                ('INSTANCES', 'instances'))
+    optional = (('Z4M_CPUS', 'vcpus'),
+                ('LOCAL_SSD_TOTAL_GB_PER_VM_FAMILY', 'local_ssd_gib'))
+    # Both launchers create private-only NICs, so no IN_USE_ADDRESSES is reserved.
+    # Family quotas absent from this API remain enforced by VM creation.
+    for metric, field in (*required, *optional):
         rows = [row for row in quotas if row.get('metric') == metric]
+        if not rows and (metric, field) in optional:
+            continue
         if len(rows) != 1:
             raise ValueError('regional quota missing or ambiguous: ' + metric)
         row = rows[0]
