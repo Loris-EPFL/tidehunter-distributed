@@ -49,7 +49,7 @@ def _require_six_host_spec(spec):
 def validate_spec(spec):
     """Reject unsupported selections before any fleet allocation."""
     import workflow_input
-    if not isinstance(spec, dict) or spec.get('suite') not in {'kv', 'sui', 'both'}:
+    if not isinstance(spec, dict) or spec.get('suite') != 'kv':
         raise ValueError('invalid campaign suite')
     backends = spec.get('backends')
     if (not isinstance(backends, list) or not backends
@@ -65,12 +65,7 @@ def validate_spec(spec):
         return
     if spec['mode'] == 'standard' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
         raise ValueError('NVMe backends require an NVMe-oF mode')
-    if spec['suite'] in {'kv', 'both'}:
-        extras = {'suite', 'sui_fixture', 'sui_verification', 'sui_transports'}
-        workflow_input.cloud_campaign.make_matrix({key: value for key, value in spec.items() if key not in extras})
-    if spec['suite'] in {'sui', 'both'}:
-        import gcp_sui
-        gcp_sui.selected_transports(spec)
+    workflow_input.cloud_campaign.make_matrix({key: value for key, value in spec.items() if key != 'suite'})
 
 
 def validate(config, budget, run_id, source, deadline):
@@ -318,8 +313,6 @@ def preflight(api, config, receipt, spec):
                                     live=live_mode(spec))
     gcp_image.admit_spdk(qualification, spec)
     gcp_image.admit_abi(qualification, receipt.get('abi'))
-    if spec.get('suite') in ('sui', 'both'):
-        gcp_image.admit_abi(qualification, receipt.get('sui_abi'))
     if image_info.get('status') != 'READY':
         raise ValueError('configured image is not READY')
     for c in config['candidates']:
@@ -561,13 +554,6 @@ def launch(api, config, budget, state, state_path, receipt, spec, output):
         raise ValueError('sealed package source identity mismatch')
     receipt['object_key'] = prefix + 'package.tar'
     receipt['generation'] = upload_file(store, receipt['archive_path'], receipt['sha256'], receipt['object_key'])
-    if receipt.get('sui_archive_path'):
-        receipt['sui_object_key'] = prefix + 'sui-package.tar'
-        receipt['sui_generation'] = upload_file(store, receipt['sui_archive_path'], receipt['sui_sha256'], receipt['sui_object_key'])
-    if receipt.get('verification_archive_path'):
-        key = prefix + 'sui-verification.tar'
-        generation = upload_file(store, receipt['verification_archive_path'], receipt['verification_sha256'], key)
-        spec['sui_verification'] = {'key': key, 'generation': generation, 'sha256': receipt['verification_sha256']}
     store.put(prefix + 'package.json', json_bytes(receipt), content_type='application/json', if_generation_match=0)
     startup = startup_script(config['bucket'], state['run_id'], state['source_sha256'], state['deadline'])
     fleet = []
@@ -698,12 +684,8 @@ def run_campaign(api, config, budget, state, state_path, receipt, spec, output, 
     try:
         inventory = collect_results(api.objects(config['bucket']), state['run_id'], output)
         if workload_error is None:
-            required = set()
-            if spec.get('suite') in ('kv', 'both'):
-                required.update(('controller.tar.gz', 'controller-inventory.json', 'receipt.json'))
-            if spec.get('suite') in ('sui', 'both'):
-                required.add('sui-results.tar.gz')
-            if not required or not required.issubset({x['key'].removeprefix(state['run_id'] + '/results/') for x in inventory}):
+            required = {'controller.tar.gz', 'controller-inventory.json', 'receipt.json'}
+            if not required.issubset({x['key'].removeprefix(state['run_id'] + '/results/') for x in inventory}):
                 workload_error = RuntimeError('coordinator returned success without complete suite exports')
     except Exception as exc:
         if workload_error is None:

@@ -22,6 +22,7 @@ DEVICE_WINDOW = 'Device counters cover the window between the two controller sna
 SETTINGS = ('group', 'arm', 'backend', 'route', 'write mode', 'acknowledgement contract', 'target I/O', 'live export mode', 'inline reads', 'read lanes', 'I/O queues', 'queue size', 'poll queues', 'owner fragment bytes', 'owner WAL file bytes', 'mapped fragments', 'history persistence', 'coordinator cache bytes', 'cache procedure', 'keys', 'key distribution', 'value bytes', 'concurrency', 'repetitions', 'cases', 'differs from engine default')
 REMOTE_DEFAULTS = dict(owner_wal_geometry='native_default', history_persistence='wal_replay', coordinator_cache_bytes=8388608, read_lanes=2)
 LIVE_DEFAULTS = dict(live_export_mode='on_demand', live_write_mode='reserved', live_inline_reads=True, live_io_queues=4, live_io_queue_size=128, live_poll_queues=0, target_io='buffered', live_lease_ahead=True, live_polled_writes=False, live_leased_write_window=None)
+# `sui_harness` is generic geometry: 16 MiB fragments and 256 MiB files, not tied to any fixture.
 GEOMETRY = {'native_default': (134217728, 10737418240, 16), 'research': (4194304, 1073741824, 3), 'sui_harness': (16777216, 268435456, 3)}
 # The arm columns identify a row without the settings table: several arms share operation, size and concurrency.
 ARM = ('route', 'tier', 'history_persistence', 'lease_ahead', 'polled_writes', 'media_expected', 'keys', 'read_lanes', 'io_queues', 'queue_size', 'poll_queues', 'inline_reads', 'diagnostic')

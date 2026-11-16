@@ -15,7 +15,6 @@ import gcp_campaign
 import gcp_lease
 import gcp_manual_preflight
 import manual_campaign as manual
-import manual_sui
 from gcp_api import ApiError
 from test_gcp_lease import CasStore
 from test_gcp_lifecycle import FakeApi
@@ -338,8 +337,6 @@ class ReservationWindowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'non-compute quote'):
             manual._check_config(dict(CONFIG, machine_type='z4m-highmem-32'), spec, 890)
         self.assertEqual(4834 + 4834, 9668)
-        sui = dict(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'], reservation_hours=3)
-        self.assertTrue(manual_sui.reviewed_sui_spec(sui))
         for bad in (1, 7, True, 2.5, '3'):
             with self.subTest(hours=bad), self.assertRaisesRegex(ValueError, 'reservation_hours'):
                 manual._reviewed_jobs(dict(spec, reservation_hours=bad))

@@ -347,19 +347,6 @@ def serve(config, *, api=None, poll_seconds=1):
     api = api or gcp_api.GoogleApi(config['project_id'], token_provider=gcp_api.metadata_token)
     gcp_runtime.verify_fleet({'platform': {'runtime': config}}, {'platform': api})
     nvmet_fix = gcp_runtime.admit_nvmet_fix(config, host, admission)
-    # Sui-only runs do not start the KV controller, so admit their selected
-    # physical verbs interface before this worker can accept replay requests.
-    if config['spec'].get('suite') in ('sui', 'both'):
-        import gcp_sui
-        transports = {cell['transport'] for cell in gcp_sui.sui_cells(config['spec'])}
-        if transports & {'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'}:
-            backends = ['tidehunter_nvme_rdma'] if 'tidehunter_nvme_rdma' in transports else []
-            gcp_runtime.admit_fabrics(
-                {'spec': {'backends': backends, 'mode': config['spec'].get('mode')},
-                 'platform': {'runtime': config}},
-                config['fleet'].index(host) - 1, {}, None)
-        if 'tidehunter_nvme_rdma' in transports:
-            gcp_runtime.admit_live_qualification(config)
     storage_evidence = prepare_storage(config, host, api)
     store = api.objects(config['bucket'])
     gate_root = Path('/var/lib/tidehunter-gcp-control') / config['run_id']

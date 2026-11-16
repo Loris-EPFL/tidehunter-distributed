@@ -1,32 +1,16 @@
 #!/usr/bin/env python3
-"""Source-bound, unattended GitHub/OIDC six-host benchmark operator.
-
-``preflight`` performs local admission and live read-only discovery. ``plan
---offline --run-id th-...`` never creates AWS clients. Explicit ``cleanup
---run-id th-...`` also permits account-checked local recovery using the immutable
-owned journal, without building, uploading inputs or allocating compute. Guest IAM
-is restricted to six exact per-run roles/profiles under a pre-provisioned boundary.
-Every mutation intent precedes its request in an S3 conditional-write journal;
-ambiguous RunInstances acknowledgements are reconciled, never blindly retried.
-"""
+"""Shared journalled six-host lifecycle for independently admitted KV campaigns."""
 from __future__ import annotations
 
-import argparse
 import base64
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, localcontext
-import gzip
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
-import signal
 import sys
-import tarfile
-import tempfile
 import time
 
 sys.dont_write_bytecode = True
@@ -34,14 +18,11 @@ HERE = Path(__file__).resolve().parent
 
 from bootstrap import INSTANCE_STORE_DISKS
 from ci_budget import DEFAULT_BUDGET, load_budget
-from checkpoint_matrix import TRANSPORTS
 REPOSITORY = 'Loris-EPFL/tidehunter-distributed'
 BRANCH = 'bench/aws-efa'
 REGIONS = ('us-west-2', 'us-east-1', 'us-east-2', 'eu-west-1', 'eu-central-1')
 TYPES = ('g6.8xlarge', 'g6e.8xlarge', 'g6.16xlarge', 'c6id.32xlarge')
 ROLES = {'controller', *(f'storage-{i}' for i in range(5))}
-BINARIES = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit', 'rocksdb-audit', 'transport-floor'}
-CHECKPOINT = 'EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6'
 CAPACITY_ERRORS = {'InsufficientInstanceCapacity', 'InstanceLimitExceeded', 'VcpuLimitExceeded',
                    'InsufficientFreeAddressesInSubnet', 'Unsupported', 'UnsupportedOperation'}
 MISSING = {'NoSuchKey', '404', 'NotFound', 'InvalidGroup.NotFound', 'InvalidPlacementGroup.Unknown',
@@ -176,186 +157,10 @@ def trusted_run(env=None):
     return 'th-' + hashlib.sha256(identity.encode()).hexdigest()[:16]
 
 
-def load_config(path, env=None):
-    env = os.environ if env is None else env
-    cfg = read_json(path)
-    if {'weekly_budget_usd', 'weekly_limit_usd'} & cfg.keys():
-        raise ValueError('weekly budget authority belongs only in budget.json, not benchmark config')
-    for name in ('bucket', 'bucket_region', 'guest_boundary_arn', 'watchdog_function', 'watchdog_rule'):
-        if not cfg.get(name):
-            cfg[name] = env.get('AWS_BENCH_' + name.upper())
-    if (cfg.get('schema') != 1 or cfg.get('repository') != REPOSITORY or cfg.get('branch') != BRANCH
-            or not re.fullmatch(r'[0-9]{12}', cfg.get('account', ''))
-            or type(cfg.get('ttl_seconds')) is not int or not 3600 <= cfg['ttl_seconds'] <= 7200
-            or cfg.get('export_reserve_seconds') != 600
-            or not isinstance(cfg.get('regions'), list) or not cfg['regions']
-            or len(set(cfg['regions'])) != len(cfg['regions']) or not set(cfg['regions']) <= set(REGIONS)
-            or not isinstance(cfg.get('instance_types'), list) or not cfg['instance_types']
-            or not set(cfg['instance_types']) <= set(TYPES)
-            or len(set(cfg['instance_types'])) != len(cfg['instance_types'])
-            or set(cfg.get('transports', [])) != set(TRANSPORTS)
-            or len(cfg['transports']) != len(TRANSPORTS)
-            or cfg.get('kv_suite', {}).get('scope') not in ('full', 'targeted')
-            or cfg.get('kv_suite', {}).get('diagnostics') is not True):
-        raise ValueError('CI config must retain exact branch, approved hardware, fixed TTL and complete TCP/EFA/Direct/Native/Sui/KV populations')
-    from checkpoint_matrix import matrix_plan
-    from checkpoint_kv import validate_options
-    matrix_plan(cfg)
-    validate_options(cfg['kv_suite'])
-    for name in ('coordinator_cache_mib',):
-        if type(cfg.get(name)) is not int or not 0 <= cfg[name] <= 128:
-            raise ValueError('invalid cache budget')
-    if type(cfg.get('replay_deadline_seconds')) is not int or not 30 <= cfg['replay_deadline_seconds'] <= 3600:
-        raise ValueError('invalid replay deadline')
-    for name in ('bucket', 'bucket_region', 'guest_boundary_arn', 'watchdog_function', 'watchdog_rule'):
-        if not cfg.get(name):
-            raise ValueError('required setup output absent: ' + name)
-    if (not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', cfg['bucket'])
-            or cfg['bucket_region'] not in REGIONS):
-        raise ValueError('invalid owned results bucket or region')
-    if not re.fullmatch(r'arn:aws:iam::' + cfg['account'] + r':policy/(?:[\w+=,.@-]+/)*[\w+=,.@-]+',
-                        cfg['guest_boundary_arn']):
-        raise ValueError('approved same-account immutable guest permissions boundary ARN required')
-    overrides = cfg.get('regional_overrides', {})
-    if not isinstance(overrides, dict) or not set(overrides) <= set(cfg['regions']):
-        raise ValueError('regional overrides outside approved regions')
-    for name in ('retention_days', 'result_gib', 'request_count', 'reconciliation_seconds'):
-        if type(cfg.get('cost_assumptions', {}).get(name)) is not int or cfg['cost_assumptions'][name] <= 0:
-            raise ValueError('positive reviewed cost_assumptions.' + name + ' required')
-    return cfg
 
 
-def current_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
-def fresh_archive(destination, entries):
-    """Fresh current-source bytes, deterministic across retries of one attempt."""
-    def normalized(member):
-        member.mtime, member.uid, member.gid = 0, 0, 0
-        member.uname = member.gname = ''
-        return member
-    with Path(destination).open('wb') as output:
-        with gzip.GzipFile(filename='', fileobj=output, mode='wb', mtime=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode='w') as archive:
-                for path, name in entries:
-                    archive.add(path, arcname=name, filter=normalized)
-
-
-def archive_files(path):
-    with tarfile.open(path) as archive:
-        members = archive.getmembers()
-        names = set()
-        if len(members) > 500000 or sum(item.size for item in members) > 32 << 30:
-            raise ValueError('input archive exceeds bounded expansion')
-        for item in members:
-            rel = PurePosixPath(item.name)
-            if (rel.is_absolute() or '..' in rel.parts or not rel.parts or str(rel) in names
-                    or not (item.isdir() or item.isfile())):
-                raise ValueError('unsafe/duplicate input archive member')
-            names.add(str(rel))
-        return {str(PurePosixPath(item.name)): item for item in members if item.isfile()}
-
-
-def admit_inputs(build, fixture, verification, output):
-    """Reuse maintained build and Sui proof checks, not historical frozen imports."""
-    import sui_checkpoint as supervisor
-    build, fixture, verification, output = map(Path, (build, fixture, verification, output))
-    build = build.resolve(strict=True)
-    fixture = fixture.resolve(strict=True)
-    verification = verification.resolve(strict=True)
-    output.mkdir(parents=True, exist_ok=True)
-    manifest = read_json(build / 'build-manifest.json')
-    identities = read_json(build / 'source-manifest.json')
-    plan = read_json(build / 'plan.json')
-    if (manifest.get('protocol') != plan['protocol'] or manifest.get('fabric') is not True
-            or set(manifest.get('binaries', {})) != BINARIES
-            or sha(build / 'sources.tar.gz') != manifest['source_archive_sha256']
-            or sha(build / 'source-manifest.json') != manifest['source_manifest_sha256']):
-        raise ValueError('incomplete source-bound fabric build')
-    builder = current_module('ci_maintained_build', HERE.parent / 'sui-checkpoint/build.py')
-    builder.verify_staged(build, identities)
-    with tempfile.TemporaryDirectory(prefix='ci-source-admission-') as temporary:
-        supervisor.safe_extract(build / 'sources.tar.gz', Path(temporary) / 'unpack', symlinks=True)
-        builder.verify_staged(Path(temporary) / 'unpack', identities)
-    # The currently executing operator and every bootstrap/runtime helper must
-    # be part of this build's source identity, not a downloaded frozen importer.
-    source_records = identities['tidehunter-sharded-wal']['files']
-    for path in [*(HERE.parent.parent / relative for relative in
-                   supervisor.runner_helper_origins(source_records).values()),
-                 *(HERE.parent / 'sui-checkpoint').glob('*.py')]:
-        rel = str(path.relative_to(HERE.parent.parent))
-        if path.is_symlink() or not path.is_file() or sha(path) != source_records.get(rel, {}).get('sha256'):
-            raise ValueError('current source differs from build: ' + rel)
-    commands = manifest.get('commands', [])
-    if len(commands) != 6 or {item['label'] for item in commands} != BINARIES:
-        raise ValueError('six successful source-bound Cargo invocations required')
-    for command in commands:
-        name = command['label']
-        if (sha(build / 'binaries' / name) != manifest['binaries'][name]
-                or command['sha256'] != manifest['binaries'][name]
-                or sha(build / f'build-{name}.log') != command['log_sha256']
-                or sha(build / f'build-{name}.jsonl') != command['messages_sha256']
-                or command['finished_ns'] <= command['started_ns']):
-            raise ValueError('build command/artifact receipt differs: ' + name)
-    files = archive_files(build / 'build-bundle.tar.gz')
-    required = {'build-manifest.json', 'source-manifest.json', 'sources.tar.gz', 'plan.json', 'portability.json',
-                *(f'binaries/{name}' for name in BINARIES),
-                *(f'build-{name}.{suffix}' for name in BINARIES for suffix in ('log', 'jsonl'))}
-    if not required <= files.keys():
-        raise ValueError('build archive missing required source/binary/log envelope')
-    with tarfile.open(build / 'build-bundle.tar.gz') as archive:
-        for name in files:
-            local = build / name
-            if not local.is_file() or local.is_symlink():
-                raise ValueError('build archive contains unbound file: ' + name)
-            with archive.extractfile(files[name]) as stream:
-                if hashlib.file_digest(stream, 'sha256').hexdigest() != sha(local):
-                    raise ValueError('build archive differs from admitted directory: ' + name)
-    bindings = dict(build_manifest_sha256=sha(build / 'build-manifest.json'),
-                    source_archive_sha256=manifest['source_archive_sha256'],
-                    source_manifest_sha256=manifest['source_manifest_sha256'],
-                    binaries=manifest['binaries'], checkpoint_digest=CHECKPOINT, checkpoint_limit=1775,
-                    transports=list(TRANSPORTS))
-    with tempfile.TemporaryDirectory(prefix='ci-admission-') as temporary:
-        temporary = Path(temporary)
-        archive_files(fixture)
-        supervisor.safe_extract(fixture, temporary / 'fixture-input')
-        staged = temporary / 'verification'
-        staged.mkdir()
-        for name in ('receipt.json', 'evidence.tar.gz'):
-            shutil.copy2(verification / name, staged / name)
-        shutil.copytree(verification / 'experiment', staged / 'experiment')
-        checker = supervisor.SuiCampaign.__new__(supervisor.SuiCampaign)
-        checker.cfg, checker.fixture, checker.verification, checker.results = bindings, temporary / 'fixture-input/fixture', staged, output
-        checker.verify_local()
-        verification_bundle = output / 'verification.tar.gz'
-        fresh_archive(verification_bundle, [(staged / name, 'verification/' + name)
-                      for name in ('receipt.json', 'evidence.tar.gz', 'experiment')])
-    runner = output / 'bundle.tar.gz'
-    with tempfile.TemporaryDirectory(prefix='ci-runner-assembly-') as temporary:
-        staged = supervisor.assemble_runner(HERE.parent.parent, Path(temporary) / 'runner', source_records)
-        fresh_archive(runner, [(staged, 'runner')])
-    if runner.stat().st_size > 512 << 20:
-        raise ValueError('bootstrap bundle exceeds guest bound')
-    # Exercise the controller's installed-layout binding on the actual archive
-    # before exposing an admitted runner to any paid fleet.
-    with tempfile.TemporaryDirectory(prefix='ci-runner-admission-') as temporary:
-        installed = Path(temporary) / 'installed'
-        supervisor.safe_extract(runner, installed, max_bytes=512 << 20)
-        runner_entrypoint = supervisor.validate_runner_entrypoint(installed / 'runner', source_records)
-    paths = dict(build_bundle=build / 'build-bundle.tar.gz', fixture_bundle=fixture,
-                 verification_bundle=verification_bundle, runner_bundle=runner)
-    result = dict(bindings=bindings, inputs={name: dict(path=str(path), bytes=path.stat().st_size, sha256=sha(path))
-                                           for name, path in paths.items()},
-                  bootstrap_sha256=sha(HERE / 'bootstrap.py'), atomic_start_sha256=sha(HERE / 'atomic_start.py'),
-                  runner_entrypoint=runner_entrypoint)
-    dump(output / 'input-admission.json', result)
-    return result
 
 
 class AWS:
@@ -672,56 +477,6 @@ def planned_profiles(cfg, run_id):
         arn=f"arn:aws:iam::{cfg['account']}:instance-profile/tidehunter-ci-{run_id}-{role}") for role in ROLES}
 
 
-def guest_policy(cfg, run_id, role, *, region, expires_at, instances=None):
-    """Narrow the existing reviewed Autopilot-derived guest policy templates."""
-    import control
-    if role not in ROLES:
-        raise ValueError('invalid final guest role')
-    tags = ownership(run_id) | {'ExpiresAt': expires_at}
-    p = dict(bucket=cfg['bucket'], prefix=run_id, run_id=run_id, account=cfg['account'],
-             region=region, tags=tags, atomic_controller=True, protected_instances=[])
-    base = control.role_policy(p, 'controller' if role == 'controller' else 'node')
-    read_action = [action for action in base['Statement'][1]['Action'] if action == 's3:GetObject']
-    write_actions = [action for action in base['Statement'][1]['Action'] if action != 's3:GetObject']
-    read = [run_id + '/input/bundle.tar.gz']
-    write = []
-    if instances is not None:
-        if len(instances) != 6 or {item['AmiLaunchIndex'] for item in instances} != set(range(6)):
-            raise ValueError('exact six launch-index identities required for final guest policy')
-        if role == 'controller':
-            read += [run_id + suffix for suffix in ('/inputs/*', '/results/*', '/deploy/*', '/case-artifacts/*')]
-            write += [run_id + '/results/' + name for name in (
-                'startup.json', 'atomic-start.log', 'controller-autostart.log', 'progress.json',
-                'controller.tar.gz', 'receipt.json', 'export-permission-probe.json')]
-            write += [run_id + suffix for suffix in (
-                '/deploy/cells/*', '/case-artifacts/*', '/inputs/kv-storage-node')]
-        else:
-            from checkpoint_matrix import matrix_plan
-            partition = int(role.rsplit('-', 1)[1])
-            cells = [item['cell_id'] for item in matrix_plan(cfg)]
-            read += [f'{run_id}/deploy/cells/{cell}/storage-{partition}.tar.gz' for cell in cells]
-            read += [run_id + suffix for suffix in (
-                f'/case-artifacts/*/node-{partition}.tar.gz', '/inputs/kv-storage-node')]
-            write += [f'{run_id}/results/cells/{cell}/storage/{partition}/*' for cell in [*cells, 'startup']]
-            write.append(f'{run_id}/results/nodes/*/node-{partition}.tar.gz*')
-        read += write
-    prefixes = sorted(set(read + write))
-    listing = dict(base['Statement'][0])
-    listing['Condition'] = {'StringLike': {'s3:prefix': prefixes}}
-    statements = [listing, dict(Effect='Allow', Action=read_action,
-        Resource=[f"arn:aws:s3:::{cfg['bucket']}/{key}" for key in sorted(set(read))])]
-    if write:
-        statements.append(dict(Effect='Allow', Action=write_actions,
-            Resource=[f"arn:aws:s3:::{cfg['bucket']}/{key}" for key in sorted(set(write))]))
-    if instances is not None and role == 'controller':
-        statements.extend(base['Statement'][2:])
-        for statement in statements:
-            if statement.get('Action') == 'ec2:TerminateInstances':
-                statement['Resource'] = [f"arn:aws:ec2:{region}:{cfg['account']}:instance/{item['InstanceId']}"
-                                         for item in instances]
-        storage_ids = [item['InstanceId'] for item in instances if item['AmiLaunchIndex'] < 5]
-        statements.extend(control.command_policy(p, storage_ids)['Statement'])
-    return dict(Version=base['Version'], Statement=statements)
 
 
 def live_preflight(aws, cfg):
@@ -818,7 +573,6 @@ class Journal:
 
 
 class Campaign:
-    guest_policy = staticmethod(guest_policy)
 
     def __init__(self, aws, cfg, run_id, output, *, clock=time, cleanup_only=False):
         self.aws, self.cfg, self.run_id, self.output, self.clock = aws, cfg, run_id, Path(output), clock
@@ -1205,39 +959,6 @@ class Campaign:
         self.exact(observed[0])
         return group_id
 
-    def request(self, candidate, group_id, admission, profiles):
-        import control
-        bindings = dict(admission['bindings'])
-        bindings.update({name: self.journal.data['uploads'][name] for name in
-                         ('build_bundle', 'fixture_bundle', 'verification_bundle')})
-        bindings.update({name: self.cfg[name] for name in ('transports', 'repetitions', 'read_profile_limits',
-                         'write_profile_limits', 'native_write_profile_limits', 'kv_suite')})
-        bindings.update({name: self.cfg[name] for name in
-            ('coordinator_cache_mib_by_repetition',) if name in self.cfg})
-        runner = admission['inputs']['runner_bundle']
-        plan = dict(run_id=self.run_id, account=self.cfg['account'], region=candidate['region'],
-            bucket=self.cfg['bucket'], prefix=self.run_id, ttl_seconds=self.cfg['ttl_seconds'], export_reserve_seconds=600,
-            instance_type=candidate['instance_type'], placement_group=self.run_id, az=candidate['az'],
-            protected_instances=[], bundle_sha256=runner['sha256'], bundle_bytes=runner['bytes'],
-            atomic_bindings=bindings, atomic_controller=True, atomic_client_token=candidate_token(self.run_id, candidate),
-            instance_profiles=profiles, ownership_tags={key: value for key, value in
-                (ownership(self.run_id) | {'ExpiresAt': self.journal.data['expires_at']}).items()
-                if key in ('Repository', 'BenchmarkBranch', 'ExpiresAt')}, efa=True)
-        userdata = control.user_data(plan)
-        tags = ownership(self.run_id) | {'ExpiresAt': self.journal.data['expires_at'],
-                                       'Role': 'bootstrap', 'Name': self.run_id}
-        request = dict(ImageId=candidate['ami'], InstanceType=candidate['instance_type'], MinCount=6, MaxCount=6,
-            ClientToken=candidate_token(self.run_id, candidate),
-            NetworkInterfaces=[dict(DeviceIndex=0, NetworkCardIndex=0, InterfaceType='efa',
-                SubnetId=candidate['subnet'], Groups=[group_id], DeleteOnTermination=True, AssociatePublicIpAddress=True)],
-            Placement=dict(AvailabilityZone=candidate['az'], GroupName=self.run_id),
-            BlockDeviceMappings=[dict(DeviceName=candidate['root_device'], Ebs=dict(VolumeSize=candidate['root_gib'],
-                VolumeType='gp3', Encrypted=True, DeleteOnTermination=True))],
-            MetadataOptions=dict(HttpEndpoint='enabled', HttpTokens='required', HttpPutResponseHopLimit=1,
-                                 InstanceMetadataTags='enabled'), InstanceInitiatedShutdownBehavior='terminate',
-            TagSpecifications=[dict(ResourceType=kind, Tags=aws_tags(tags)) for kind in ('instance', 'volume', 'network-interface')],
-            UserData=userdata)
-        return request, plan
 
     def validate_fleet(self, records, candidate):
         if len(records) != 6 or len({item['instance']['InstanceId'] for item in records}) != 6:
@@ -1306,9 +1027,7 @@ class Campaign:
         self.journal.save()
         self.report_budget(ledger, 'reserve')
         for name, item in admission['inputs'].items():
-            filename = {'build_bundle': 'build-bundle.tar.gz', 'fixture_bundle': 'fixture.tar.gz',
-                        'verification_bundle': 'verification.tar.gz', 'runner_bundle': 'bundle.tar.gz'}[name]
-            key = self.run_id + ('/input/' if name == 'runner_bundle' else '/inputs/') + filename
+            key = self.run_id + '/input/bundle.tar.gz'
             data['uploads'][name] = self.upload(item['path'], key)
             self.journal.save()
         if not data['expires_at']:
@@ -1406,53 +1125,6 @@ class Campaign:
             self.clock.sleep(5)
         raise TimeoutError('final exact per-run profiles did not converge')
 
-    def configure(self, instances, candidate, plan):
-        from checkpoint_matrix import validate_placement
-        import sui_checkpoint as supervisor
-        ec2 = self.aws.client('ec2', candidate['region'])
-        end = min(self.clock.time() + 240, parsed(self.journal.data['expires_at']).timestamp() - 1200)
-        while self.clock.time() < end:
-            current = self.validate_fleet(self.active(), candidate)
-            if all(item['State']['Name'] == 'running' and item.get('PrivateIpAddress') for item in current):
-                break
-            self.clock.sleep(5)
-        else:
-            raise TimeoutError('six-host running readiness exceeded original startup reserve')
-        current = self.bind_profiles(current, candidate, plan['instance_profiles'], end)
-        index = {item['AmiLaunchIndex']: item for item in current}
-        deadline = min(parsed(self.journal.data['expires_at']),
-                       *(parsed(item['LaunchTime']) + timedelta(seconds=self.cfg['ttl_seconds']) for item in current))
-        cfg = {key: self.cfg[key] for key in ('transports', 'repetitions', 'read_profile_limits',
-            'write_profile_limits', 'native_write_profile_limits', 'kv_suite', 'coordinator_cache_mib',
-            'replay_deadline_seconds')}
-        cfg.update({name: self.cfg[name] for name in
-            ('coordinator_cache_mib_by_repetition',) if name in self.cfg})
-        cfg.update(plan['atomic_bindings'])
-        cfg.update(campaign='sui-checkpoint', run_id=self.run_id, account=self.cfg['account'], region=candidate['region'],
-            availability_zone=candidate['az'], placement_group=self.run_id, bucket=self.cfg['bucket'], s3_prefix=self.run_id,
-            run_root='/mnt/tidehunter/' + self.run_id, deadline_utc=utc(deadline), export_reserve_seconds=600,
-            terminate_on_finish=True, instance_type=candidate['instance_type'], coordinator_instance_id=index[5]['InstanceId'],
-            coordinator_private_ip=index[5]['PrivateIpAddress'], nodes=[dict(partition=i, instance_id=index[i]['InstanceId'],
-            private_ip=index[i]['PrivateIpAddress']) for i in range(5)])
-        cfg.update(config_audit(self.cfg, self.journal.data))
-        supervisor.validate_cfg(cfg)
-        groups = ec2.describe_placement_groups(GroupNames=[self.run_id])['PlacementGroups']
-        for group in groups:
-            self.exact(group)
-        validate_placement(cfg, current, groups)
-        target = self.output / 'controller-config.json'
-        dump(target, cfg)
-        receipt = self.upload(target, self.run_id + '/inputs/controller-config.json')
-        self.journal.data['controller_config'] = cfg
-        self.journal.data['controller_config_sha256'] = receipt['sha256']
-        self.journal.save()
-        # Role tags are the final guest-side permission to acquire credentials.
-        for i in range(6):
-            tags = {'Role': 'controller' if i == 5 else f'storage-{i}'}
-            if i == 5:
-                tags['ControllerConfigSha256'] = receipt['sha256']
-            self.mutate('create_tags', candidate['region'], dict(Resources=[index[i]['InstanceId']], Tags=aws_tags(tags)))
-        return cfg
 
     def object_json(self, key):
         try:
@@ -1470,26 +1142,6 @@ class Campaign:
             raise ValueError('guest JSON digest mismatch')
         return json.loads(raw)
 
-    def monitor(self, cfg):
-        end = parsed(cfg['deadline_utc']).timestamp() - 15
-        while self.clock.time() < end:
-            receipt = self.object_json(self.run_id + '/results/receipt.json')
-            if receipt:
-                if (receipt.get('run_id') != self.run_id or receipt.get('bucket') != self.cfg['bucket']
-                        or receipt.get('key') != self.run_id + '/results/controller.tar.gz'
-                        or receipt.get('build_manifest_sha256') != cfg['build_manifest_sha256']
-                        or receipt.get('checkpoint_digest') != CHECKPOINT
-                        or not re.fullmatch(r'[a-f0-9]{64}', receipt.get('sha256', ''))):
-                    raise ValueError('controller export receipt identity differs')
-                head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=receipt['key'], ExpectedBucketOwner=self.cfg['account'])
-                if head['ContentLength'] != receipt['bytes'] or head.get('Metadata', {}).get('sha256') != receipt['sha256']:
-                    raise ValueError('controller S3 export was not durably bound before termination')
-                dump(self.output / 'export-receipt.json', dict(receipt, **config_audit(self.cfg, self.journal.data)))
-                return receipt
-            if not self.active():
-                raise RuntimeError('fleet terminated without requested final result export')
-            self.clock.sleep(10)
-        raise TimeoutError('original absolute campaign/export deadline reached')
 
     def exact_instance(self, region, instance_id):
         ec2 = self.aws.client('ec2', region)
@@ -1944,70 +1596,6 @@ class Campaign:
         return record
 
 
-    def validate_results(self, cfg):
-        import sui_checkpoint as supervisor
-        from checkpoint_matrix import validate_matrix, fabric_local_log, fabric_local_archive_log
-        from checkpoint_kv import plan as kv_plan, validate_auxiliary
-        root = self.output / 's3' / self.run_id / 'results'
-        receipt = read_json(root / 'receipt.json')
-        archive = root / 'controller.tar.gz'
-        if receipt.get('complete') is not True or sha(archive) != receipt['sha256']:
-            raise ValueError('requested campaign did not export complete bound results')
-        expanded = self.output / 'controller-evidence'
-        supervisor.safe_extract(archive, expanded)
-        results = expanded / 'results'
-        state = read_json(results / 'campaign-receipt.json')
-        if state.get('complete') is not True or state.get('failures') or state.get('run_id') != self.run_id:
-            raise ValueError('controller campaign receipt incomplete')
-        validate_matrix(cfg, state['cells'])
-        fabric_sui = []
-        for cell in state['cells']:
-            directory = results / 'cells' / cell['cell_id']
-            if sha(directory / 'replay-evidence.tar.gz') != cell['replay_evidence_sha256'] or sha(directory / 'resources.json') != cell['resources_sha256']:
-                raise ValueError('matrix retained replay/resource digest differs')
-            replay = read_json(directory / 'replay-logs/results.json')
-            audit = read_json(directory / 'replay-logs/audit.json')
-            if (replay.get('complete') is not True or replay.get('failure') or replay.get('audit') != audit
-                    or audit.get('all_equal') is not True or not audit.get('databases') or not audit.get('rocksdb')
-                    or replay['build_manifest_sha256'] != cfg['build_manifest_sha256']
-                    or replay['binaries'] != cfg['binaries']
-                    or any(replay[mode]['completed_checkpoint_digest'] != CHECKPOINT for mode in ('native', 'remote'))):
-                raise ValueError('requested cell missing real checkpoint/full-state audit proof')
-            diagnostic = bool(cell['read_profile_limit'] or cell.get('write_profile_limit', 0))
-            cell_fabric = dict(cell_id=cell['cell_id'], transport=cell['transport'],
-                population='diagnostic' if diagnostic else 'clean', clients=[], storage=[],
-                scope='emitted finalized local endpoint windows only; SIGTERM can bypass Drop; not packetization, RTT or latency')
-            for mode in ('native', 'remote'):
-                cell_fabric['clients'].append(fabric_local_log(
-                    directory / 'replay-logs' / (mode + '.log'),
-                    forbidden=mode == 'native' or not diagnostic))
-            for node in cfg['nodes']:
-                expected = cell['node_archives'][node['instance_id']]
-                local = self.output / 's3' / expected['key']
-                if not local.is_file() or sha(local) != expected['sha256']:
-                    raise ValueError('requested cell storage evidence missing/different')
-                with tarfile.open(local, 'r:gz') as stream:
-                    names = sorted(member.name for member in stream.getmembers()
-                        if re.fullmatch(r'cloud-node-logs/namespace-[0-9]+\.stderr\.log', member.name))
-                    if not names:
-                        raise ValueError('Sui node archive omitted namespace stderr logs')
-                    logs = [fabric_local_archive_log(stream, name, forbidden=not diagnostic) for name in names]
-                cell_fabric['storage'].append(dict(partition=node['partition'], archive=str(local), logs=logs))
-            fabric_sui.append(cell_fabric)
-        kv = state.get('kv_suite', {})
-        expected_plan = kv_plan(cfg['kv_suite'], cfg['transports'])
-        if (kv.get('complete') is not True or kv.get('failures') or kv.get('plan') != expected_plan
-                or len(kv.get('completed_cases', [])) != 2 * len(expected_plan)
-                or kv.get('source_archive_sha256') != cfg['source_archive_sha256']
-                or kv.get('binary_sha256') != cfg['binaries']['storage-node']):
-            raise ValueError('full requested KV suite missing or narrowed')
-        auxiliary = validate_auxiliary(results / 'kv', kv, cfg)
-        dump(self.output / 'auxiliary-measurements.json', auxiliary)
-        dump(self.output / 'fabric-local-diagnostics.json', dict(sui=fabric_sui,
-            kv=auxiliary['fabric_local_diagnostics']))
-        dump(self.output / 'completion-proof.json', dict(run_id=self.run_id, complete=True,
-             controller_sha256=sha(archive), cells=len(state['cells']), kv_cases=len(kv['completed_cases']),
-             cleanup_sha256=sha(self.output / 'cleanup-receipt.json'), **config_audit(self.cfg, self.journal.data)))
 
     def report_budget(self, ledger, phase):
         """Aggregate publication/reporting is separate from financial mutation."""
@@ -2174,118 +1762,3 @@ class Campaign:
             raise failure
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('run', 'preflight', 'plan', 'cleanup'))
-    parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--build', type=Path)
-    parser.add_argument('--fixture', type=Path)
-    parser.add_argument('--verification', type=Path)
-    parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--budget-file', type=Path, default=DEFAULT_BUDGET)
-    parser.add_argument('--offline', action='store_true')
-    parser.add_argument('--run-id')
-    parser.add_argument('--expected-account', help='explicit configured owner for non-GitHub cleanup recovery')
-    parser.add_argument('--reconcile-usage', action='store_true', help='explicitly correct a completed legacy estimate')
-    parser.add_argument('--previous-settlement-digest', help='CAS digest from the existing ledger settlement')
-    args = parser.parse_args()
-    cfg, run_id, aws, campaign = None, None, None, None
-    work_started = False
-    try:
-        cfg = load_config(args.config)
-        cfg['budget_path'] = str(args.budget_file.absolute())
-        if args.reconcile_usage != bool(args.previous_settlement_digest):
-            raise ValueError('--reconcile-usage and --previous-settlement-digest are required together')
-        if args.reconcile_usage and (args.action != 'cleanup' or not args.run_id):
-            raise ValueError('reconciliation requires cleanup with an explicit old --run-id')
-        if args.previous_settlement_digest and not re.fullmatch(r'[a-f0-9]{64}', args.previous_settlement_digest):
-            raise ValueError('invalid previous settlement digest')
-        if args.expected_account is not None and (args.action != 'cleanup' or args.expected_account != cfg['account']):
-            raise ValueError('expected cleanup account must match configured owner')
-        if args.action == 'plan':
-            if not args.offline or not args.run_id:
-                raise ValueError('offline illustration requires plan --offline --run-id')
-            ownership(args.run_id)
-            run_id = args.run_id
-        else:
-            if args.offline or (args.run_id and args.action != 'cleanup'):
-                raise ValueError('live allocation identity derives only from trusted GitHub environment')
-            if args.action == 'cleanup' and args.run_id:
-                ownership(args.run_id)
-                if os.environ.get('GITHUB_ACTIONS') == 'true':
-                    trusted_run()
-                elif args.expected_account != cfg['account']:
-                    raise ValueError('local cleanup requires explicit --expected-account matching configured owner')
-                run_id = args.run_id
-            else:
-                run_id = trusted_run()
-        if args.action != 'cleanup':
-            if not all((args.build, args.fixture, args.verification)):
-                raise ValueError('build, fixture and local verification are required before admission')
-            admission = admit_inputs(args.build, args.fixture, args.verification, args.output)
-            admission.update(config_audit(cfg))
-            dump(args.output / 'input-admission.json', admission)
-        if args.action == 'plan':
-            policy = load_budget(args.budget_file)
-            dump(args.output / 'offline-plan.json', dict(run_id=run_id, config=cfg, admission=admission,
-                 budget_policy=policy, live_readiness_required=True, aws_calls=False, allocation_authorized=False,
-                 **config_audit(cfg, {'budget_policy': policy})))
-            return 0
-        aws = AWS()
-        if args.action == 'cleanup':
-            identity = aws.client('sts', cfg['bucket_region']).get_caller_identity()
-            if identity['Account'] != cfg['account']:
-                raise ValueError('cleanup caller account differs from configured owner')
-            campaign = Campaign(aws, cfg, run_id, args.output, cleanup_only=True)
-            if args.run_id and (not campaign.journal.data or campaign.journal_error):
-                raise ValueError('explicit old-run recovery requires its immutable same-account owned S3 journal')
-            if args.reconcile_usage:
-                pending = campaign.authorize_reconciliation(args.previous_settlement_digest)
-                if pending:
-                    cleanup = pending['replacement']['receipt']['cleanup_evidence']
-                    campaign.settle(cleanup, reconcile_digest=args.previous_settlement_digest)
-                    return 0
-            cleanup = campaign.cleanup()
-            try:
-                campaign.retrieve()
-            finally:
-                campaign.settle(cleanup, reconcile_digest=args.previous_settlement_digest)
-            return 0 if cleanup['cleanup_complete'] else 1
-        preflight = live_preflight(aws, cfg)
-        dump(args.output / 'live-preflight.json', preflight)
-        if args.action == 'preflight':
-            return 0
-        campaign = Campaign(aws, cfg, run_id, args.output)
-        def interrupted(number, frame):
-            raise InterruptedError('CI cancellation signal ' + str(number))
-        signal.signal(signal.SIGTERM, interrupted)
-        signal.signal(signal.SIGINT, interrupted)
-        work_started = True
-        campaign.run(admission, preflight)
-        return 0
-    except BaseException as error:
-        if args.action == 'run' and run_id and not work_started:
-            # A restart may fail source/readiness admission while the prior
-            # process still owns hosts. Cleanup needs no build or watchdog gate.
-            try:
-                aws = aws or AWS()
-                identity = aws.client('sts', cfg['bucket_region']).get_caller_identity()
-                if identity.get('Account') != cfg['account']:
-                    raise ValueError('emergency cleanup account mismatch')
-                campaign = Campaign(aws, cfg, run_id, args.output, cleanup_only=True)
-                cleanup = campaign.cleanup()
-                try:
-                    campaign.retrieve()
-                finally:
-                    campaign.settle(cleanup)
-            except BaseException as cleanup_error:
-                dump(args.output / 'emergency-cleanup-failure.json', dict(error=repr(cleanup_error), at=utc(),
-                     **config_audit(cfg, campaign.journal.data if campaign else None)))
-        dump(args.output / 'operator-failure.json', dict(error=repr(error), at=utc(),
-             **config_audit(cfg, campaign.journal.data if campaign else None)))
-        print('ci_campaign: ' + str(error), file=sys.stderr)
-        return 1
-
-
-if __name__ == '__main__':
-    sys.exit(main())

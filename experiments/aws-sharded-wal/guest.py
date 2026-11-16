@@ -616,9 +616,8 @@ def node_action(payload):
                     'instance_id': info['identity']['instanceId'], 'partition': node['partition']})
             write_json(state_path, desired)
             if payload.get('require_efa_proof'):
-                from checkpoint_matrix import efa_snapshot, validate_provider
+                from checkpoint_matrix import efa_snapshot, validate_provider, fabric_preflight
                 transport = payload.get('transport', 'efa')
-                from sui_checkpoint import fabric_preflight
                 fabric_preflight(node_dir, transport)
                 provider = node_dir / 'efa-provider.txt'
                 validate_provider(provider.read_text(), transport)

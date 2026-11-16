@@ -14,7 +14,6 @@ import hashlib
 import importlib.util
 import ipaddress
 import json
-import lzma
 import os
 from pathlib import Path
 import re
@@ -855,29 +854,6 @@ with tarfile.open(archive) as stream:
 (root / 'bundle-ready').write_text({p['bundle_sha256']!r})
 '''
     bootstrap_command = f'printf %s {shlex.quote(bootstrap)} | base64 -d > /root/sharded-wal-bootstrap.py'
-    if p.get('atomic_controller') is True:
-        from atomic_start import launch_contract
-        # LZMA and Base85 keep the complete source/metadata capsule within the
-        # checked EC2 wire limit. Boto3 owns API base64 encoding, so the result
-        # remains an ordinary shell script rather than pre-encoded user data.
-        capsule = base64.b85encode(lzma.compress(encoded({
-            'bootstrap': (HERE / 'bootstrap.py').read_text(),
-            'atomic': (HERE / 'atomic_start.py').read_text(),
-            'plan': launch_contract(p),
-        }))).decode()
-        bootstrap_command = '/usr/bin/python3 -c ' + shlex.quote(
-            "import base64,json,lzma,pathlib;"
-            f"data=json.loads(lzma.decompress(base64.b85decode({capsule!r})));"
-            "pathlib.Path('/root/sharded-wal-bootstrap.py').write_text(data['bootstrap']);"
-            "pathlib.Path('/root/sharded-wal-atomic-start.py').write_text(data['atomic']);"
-            "pathlib.Path('/root/sharded-wal-atomic-plan.json').write_text(json.dumps(data['plan']))")
-        setup = f'''import pathlib, subprocess
-root = pathlib.Path('/mnt/tidehunter/{p['run_id']}')
-plan = root / 'atomic-plan.json'
-with plan.open('xb') as output:
-    output.write(pathlib.Path('/root/sharded-wal-atomic-plan.json').read_bytes())
-subprocess.run(['/usr/bin/python3', '/root/sharded-wal-atomic-start.py', 'start', '--plan', str(plan)], check=True)
-'''
     script = f'''#!/bin/bash
 set -eu
 /usr/sbin/shutdown -h +{p['ttl_seconds'] // 60}
@@ -900,8 +876,6 @@ fi
 /usr/bin/python3 - <<'SHARDED_WAL_SETUP'
 {setup}SHARDED_WAL_SETUP
 '''
-    if p.get('atomic_controller') is True and len(script.encode()) > 16384:
-        raise ValueError('atomic user data exceeds EC2 16 KiB limit')
     return script
 
 

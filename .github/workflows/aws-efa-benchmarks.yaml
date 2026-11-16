@@ -13,7 +13,7 @@ on:
       suite:
         description: "Use the committed suite selection or explicitly override it"
         type: choice
-        options: [configured, sui-transport, kv-comparison]
+        options: [configured, kv-comparison]
         default: configured
       backends:
         description: "KV only: comma-separated subset of cloud-campaign.json IDs; blank uses tracked list"
@@ -24,14 +24,6 @@ on:
         type: choice
         options: [standard, read-tier, read-tier-focused, nvmeof-focused]
         default: standard
-      reconcile_run_id:
-        description: "Optional closed campaign to remeasure during cost-report"
-        type: string
-        default: ""
-      reconcile_previous_digest:
-        description: "Expected prior settlement digest for the closed campaign"
-        type: string
-        default: ""
 
 permissions:
   contents: read
@@ -47,13 +39,11 @@ env:
   AWS_BENCH_OPERATION: ${{ inputs.operation || 'benchmark' }}
   AWS_BENCH_SUITE: ${{ inputs.suite || 'configured' }}
   AWS_BENCH_ROLE_ARN: ${{ vars.AWS_BENCH_ROLE_ARN }}
-  AWS_BENCH_INPUT_ROLE_ARN: ${{ vars.AWS_BENCH_INPUT_ROLE_ARN }}
   AWS_BENCH_BUCKET: ${{ vars.AWS_BENCH_BUCKET }}
   AWS_BENCH_BUCKET_REGION: ${{ vars.AWS_BENCH_BUCKET_REGION }}
   AWS_BENCH_GUEST_BOUNDARY_ARN: ${{ vars.AWS_BENCH_GUEST_BOUNDARY_ARN }}
   AWS_BENCH_WATCHDOG_FUNCTION: ${{ vars.AWS_BENCH_WATCHDOG_FUNCTION }}
   AWS_BENCH_WATCHDOG_RULE: ${{ vars.AWS_BENCH_WATCHDOG_RULE }}
-  AWS_BENCH_SUI_SHA: ${{ vars.AWS_BENCH_SUI_SHA }}
 
 jobs:
   selection:
@@ -75,158 +65,6 @@ jobs:
       - name: Admit one committed suite on the exact trusted branch
         id: settings
         run: python3 engine/experiments/aws-sharded-wal/suite.py settings
-
-  prepare:
-    needs: selection
-    if: needs.selection.outputs.enabled == 'true' && needs.selection.outputs.suite == 'sui-transport'
-    runs-on: ${{ vars.AWS_BENCH_BUILD_RUNNER || 'ubuntu-24.04' }}
-    environment: rdma-bench-inputs
-    timeout-minutes: 360
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      enabled: ${{ steps.settings.outputs.enabled }}
-      package_sha256: ${{ steps.package.outputs.package_sha256 }}
-      package_artifact_name: ${{ steps.package.outputs.package_artifact_name }}
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      RUST_TEST_THREADS: "2"
-      CARGO_PROFILE_RELEASE_DEBUG: "0"
-      CARGO_TERM_COLOR: always
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          path: engine
-          persist-credentials: false
-      - name: Check exact branch and explicit activation
-        id: settings
-        run: python3 engine/experiments/aws-sharded-wal/ci_prepare.py settings
-      - name: Select the isolated libfabric prefix on the runner
-        if: steps.settings.outputs.enabled == 'true'
-        run: |
-          prefix="$RUNNER_TEMP/benchmark-libfabric-2.6.0"
-          printf 'TIDEHUNTER_LIBFABRIC_PREFIX=%s\nPKG_CONFIG_PATH=%s/lib/pkgconfig\nLD_LIBRARY_PATH=%s/lib\n' \
-            "$prefix" "$prefix" "$prefix" >> "$GITHUB_ENV"
-      - name: Reclaim unused SDK space on a disposable GitHub runner
-        if: steps.settings.outputs.enabled == 'true' && runner.environment == 'github-hosted'
-        run: |
-          set -euo pipefail
-          test "$GITHUB_ACTIONS" = true
-          test "$RUNNER_ENVIRONMENT" = github-hosted
-          # Authorized only on this disposable VM, never a laptop/self-hosted runner.
-          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc
-          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-      - name: Check out the reviewed Sui commit
-        if: steps.settings.outputs.enabled == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Loris-EPFL/sui-tidehunter-distributed
-          ref: ${{ vars.AWS_BENCH_SUI_SHA }}
-          path: sui
-          token: ${{ secrets.SUI_CHECKOUT_TOKEN || github.token }}
-          persist-credentials: false
-      - name: Prepare isolated Python/native tools
-        if: steps.settings.outputs.enabled == 'true'
-        timeout-minutes: 10
-        run: |
-          python3 -m venv --system-site-packages "$RUNNER_TEMP/benchmark-tools"
-          "$RUNNER_TEMP/benchmark-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 \
-            boto3==1.35.99 PyYAML==6.0.2 cmake==3.31.6 ninja==1.11.1.4 protoc-wheel-0==29.3
-          echo "$RUNNER_TEMP/benchmark-tools/bin" >> "$GITHUB_PATH"
-      - name: Cache the exact frozen checkpoint fixture
-        if: steps.settings.outputs.enabled == 'true'
-        id: fixture-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/fixture.tar.gz
-          key: sui-fixture-7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15
-      - name: Obtain input-only temporary credentials
-        if: steps.settings.outputs.enabled == 'true' && steps.fixture-cache.outputs.cache-hit != 'true'
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ vars.AWS_BENCH_INPUT_ROLE_ARN }}
-          role-session-name: input-${{ github.run_id }}-${{ github.run_attempt }}
-          aws-region: ${{ vars.AWS_BENCH_BUCKET_REGION }}
-          allowed-account-ids: "354775971805"
-          role-duration-seconds: 3600
-      - name: Download the frozen fixture
-        if: steps.settings.outputs.enabled == 'true' && steps.fixture-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 10
-        run: |
-          timeout 540 aws s3api get-object --bucket "$AWS_BENCH_BUCKET" \
-            --key fixtures/sui-genesis-1775/fixture.tar.gz --expected-bucket-owner 354775971805 \
-            "$RUNNER_TEMP/fixture.tar.gz"
-      - name: Cache Cargo downloads
-        if: steps.settings.outputs.enabled == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: aws-bench-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engine/Cargo.lock', 'sui/Cargo.lock') }}
-      - name: Prepare software build dependencies, not EFA hardware
-        if: steps.settings.outputs.enabled == 'true'
-        timeout-minutes: 35
-        run: |
-          bash engine/.github/scripts/setup.sh fabric
-          sui_toolchain=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("sui/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
-          timeout 900 rustup toolchain install "$sui_toolchain" --profile minimal
-      - name: Check native, distributed and offline campaign correctness
-        if: steps.settings.outputs.enabled == 'true'
-        timeout-minutes: 70
-        run: |
-          python3 engine/.github/scripts/checks.py native
-          python3 engine/.github/scripts/checks.py distributed
-          python3 engine/.github/scripts/checks.py software-fabric
-          python3 engine/.github/scripts/checks.py harness
-      - name: Rebuild six binaries and audit the same build locally
-        if: steps.settings.outputs.enabled == 'true'
-        timeout-minutes: 185
-        run: |
-          python3 engine/experiments/aws-sharded-wal/ci_prepare.py build \
-            --engine "$GITHUB_WORKSPACE/engine" --sui "$GITHUB_WORKSPACE/sui" \
-            --fixture "$RUNNER_TEMP/fixture.tar.gz" --output "$RUNNER_TEMP/benchmark-inputs" \
-            --target "$RUNNER_TEMP/benchmark-release-target" --deadline 10800 --jobs 2
-      - name: Package only current build inputs and local proof
-        if: steps.settings.outputs.enabled == 'true'
-        id: package
-        env:
-          PACKAGE_ARTIFACT_NAME: campaign-inputs-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          python3 engine/experiments/aws-sharded-wal/ci_prepare.py package \
-            --inputs "$RUNNER_TEMP/benchmark-inputs" --fixture "$RUNNER_TEMP/fixture.tar.gz" \
-            --output "$RUNNER_TEMP/campaign-inputs.tar.gz"
-          printf 'package_artifact_name=%s\n' "$PACKAGE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
-      - name: Transfer the hash-bound package to a separate orchestration VM
-        if: steps.settings.outputs.enabled == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ${{ steps.package.outputs.package_artifact_name }}
-          path: ${{ runner.temp }}/campaign-inputs.tar.gz
-          compression-level: 0
-          retention-days: 2
-          if-no-files-found: error
-      - name: Retain failed build diagnostics without databases
-        if: failure() && steps.settings.outputs.enabled == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: build-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/benchmark-inputs/build/*.log
-            ${{ runner.temp }}/benchmark-inputs/local-replay/receipt.json
-            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/*.log
-            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/*.jsonl
-            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/*.prom
-            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/results.json
-          retention-days: 7
-          if-no-files-found: warn
 
   prepare-kv:
     needs: selection
@@ -324,8 +162,8 @@ jobs:
           if-no-files-found: warn
 
   benchmark:
-    needs: [selection, prepare, prepare-kv]
-    if: always() && github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa' && needs.selection.outputs.enabled == 'true' && ((needs.selection.outputs.suite == 'sui-transport' && needs.prepare.result == 'success') || (needs.selection.outputs.suite == 'kv-comparison' && needs.prepare-kv.result == 'success'))
+    needs: [selection, prepare-kv]
+    if: always() && github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa' && needs.selection.outputs.enabled == 'true' && needs.prepare-kv.result == 'success'
     runs-on: ubuntu-24.04
     environment: rdma-bench
     timeout-minutes: 360
@@ -353,34 +191,21 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         timeout-minutes: 10
         with:
-          name: ${{ needs.prepare.outputs.package_artifact_name || needs.prepare-kv.outputs.package_artifact_name }}
+          name: ${{ needs.prepare-kv.outputs.package_artifact_name }}
           path: ${{ runner.temp }}/incoming
       - name: Verify and restore the source-bound package before AWS access
         timeout-minutes: 10
         env:
-          PACKAGE_SHA256: ${{ needs.prepare.outputs.package_sha256 || needs.prepare-kv.outputs.package_sha256 }}
-          SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
+          PACKAGE_SHA256: ${{ needs.prepare-kv.outputs.package_sha256 }}
         run: |
-          if [ "$SELECTED_SUITE" = kv-comparison ]; then
-            python3 engine/experiments/kv-comparison/ci_prepare.py restore \
-              --archive "$RUNNER_TEMP/incoming/campaign-inputs.tar.gz" --sha256 "$PACKAGE_SHA256" \
-              --output "$RUNNER_TEMP/benchmark-inputs"
-          else
-            python3 engine/experiments/aws-sharded-wal/ci_prepare.py restore \
-              --archive "$RUNNER_TEMP/incoming/campaign-inputs.tar.gz" --sha256 "$PACKAGE_SHA256" \
-              --output "$RUNNER_TEMP/benchmark-inputs"
-          fi
+          python3 engine/experiments/kv-comparison/ci_prepare.py restore \
+            --archive "$RUNNER_TEMP/incoming/campaign-inputs.tar.gz" --sha256 "$PACKAGE_SHA256" \
+            --output "$RUNNER_TEMP/benchmark-inputs"
       - name: Validate selected KV backends before obtaining AWS credentials
-        if: needs.selection.outputs.suite == 'kv-comparison' || inputs.backends != '' || inputs.kv_mode == 'read-tier' || inputs.kv_mode == 'read-tier-focused' || inputs.kv_mode == 'nvmeof-focused'
         env:
           SELECTED_BACKENDS: ${{ inputs.backends || '' }}
           SELECTED_KV_MODE: ${{ inputs.kv_mode || 'standard' }}
-          SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
         run: |
-          if [ "$SELECTED_SUITE" != kv-comparison ]; then
-            echo "backends selection is valid only for kv-comparison" >&2
-            exit 1
-          fi
           args=(validate --config engine/experiments/kv-comparison/ci-config.json --mode "$SELECTED_KV_MODE")
           if [ -n "$SELECTED_BACKENDS" ]; then
             args+=(--backends "$SELECTED_BACKENDS")
@@ -406,26 +231,17 @@ jobs:
         id: campaign
         timeout-minutes: 240
         env:
-          SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
           SELECTED_BACKENDS: ${{ inputs.backends || '' }}
           SELECTED_KV_MODE: ${{ inputs.kv_mode || 'standard' }}
         run: |
           echo 'invoked=true' >> "$GITHUB_OUTPUT"
-          if [ "$SELECTED_SUITE" = kv-comparison ]; then
-            args=(run --config engine/experiments/kv-comparison/ci-config.json --mode "$SELECTED_KV_MODE")
-            if [ -n "$SELECTED_BACKENDS" ]; then
-              args+=(--backends "$SELECTED_BACKENDS")
-            fi
-            python3 engine/experiments/kv-comparison/ci_campaign.py "${args[@]}" \
-              --inputs "$RUNNER_TEMP/benchmark-inputs" --output "$RUNNER_TEMP/aws-campaign" \
-              --budget-file engine/experiments/aws-sharded-wal/budget.json
-          else
-            python3 engine/experiments/aws-sharded-wal/ci_campaign.py run \
-              --config engine/experiments/aws-sharded-wal/ci-config.json \
-              --build "$RUNNER_TEMP/benchmark-inputs/build" --fixture "$RUNNER_TEMP/benchmark-inputs/fixture.tar.gz" \
-              --verification "$RUNNER_TEMP/benchmark-inputs/verification" --output "$RUNNER_TEMP/aws-campaign" \
-              --budget-file engine/experiments/aws-sharded-wal/budget.json
+          args=(run --config engine/experiments/kv-comparison/ci-config.json --mode "$SELECTED_KV_MODE")
+          if [ -n "$SELECTED_BACKENDS" ]; then
+            args+=(--backends "$SELECTED_BACKENDS")
           fi
+          python3 engine/experiments/kv-comparison/ci_campaign.py "${args[@]}" \
+            --inputs "$RUNNER_TEMP/benchmark-inputs" --output "$RUNNER_TEMP/aws-campaign" \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json
       - name: Obtain fresh cleanup credentials after success or failure
         if: always() && steps.campaign.outputs.invoked == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -440,18 +256,10 @@ jobs:
       - name: Reconcile exact-owned cleanup after success or failure
         if: always() && steps.campaign.outputs.invoked == 'true'
         timeout-minutes: 45
-        env:
-          SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
         run: |
-          if [ "$SELECTED_SUITE" = kv-comparison ]; then
-            python3 engine/experiments/kv-comparison/ci_campaign.py cleanup \
-              --config engine/experiments/kv-comparison/ci-config.json --output "$RUNNER_TEMP/aws-campaign" \
-              --budget-file engine/experiments/aws-sharded-wal/budget.json
-          else
-            python3 engine/experiments/aws-sharded-wal/ci_campaign.py cleanup \
-              --config engine/experiments/aws-sharded-wal/ci-config.json --output "$RUNNER_TEMP/aws-campaign" \
-              --budget-file engine/experiments/aws-sharded-wal/budget.json
-          fi
+          python3 engine/experiments/kv-comparison/ci_campaign.py cleanup \
+            --config engine/experiments/kv-comparison/ci-config.json --output "$RUNNER_TEMP/aws-campaign" \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json
       - name: Retain downloaded raw evidence and receipts
         if: always() && steps.campaign.outputs.invoked == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -463,7 +271,7 @@ jobs:
           if-no-files-found: error
 
   accounting:
-    needs: [selection, prepare, prepare-kv, benchmark]
+    needs: [selection, prepare-kv, benchmark]
     if: always() && github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa'
     runs-on: ubuntu-24.04
     environment: rdma-bench
@@ -500,18 +308,6 @@ jobs:
           aws-region: ${{ vars.AWS_BENCH_BUCKET_REGION }}
           allowed-account-ids: "354775971805"
           role-duration-seconds: 3600
-      - name: Reconcile observed usage for an explicitly selected closed campaign
-        if: steps.settings.outputs.enabled == 'true' && inputs.operation == 'cost-report' && (inputs.reconcile_run_id != '' || inputs.reconcile_previous_digest != '')
-        env:
-          RECONCILE_RUN_ID: ${{ inputs.reconcile_run_id }}
-          RECONCILE_PREVIOUS_DIGEST: ${{ inputs.reconcile_previous_digest }}
-        run: |
-          python3 engine/experiments/aws-sharded-wal/ci_campaign.py cleanup \
-            --config engine/experiments/aws-sharded-wal/ci-config.json \
-            --budget-file engine/experiments/aws-sharded-wal/budget.json \
-            --output "$RUNNER_TEMP/cost-reconciliation" \
-            --run-id "$RECONCILE_RUN_ID" --expected-account 354775971805 \
-            --reconcile-usage --previous-settlement-digest "$RECONCILE_PREVIOUS_DIGEST"
       - name: Refresh delayed billing; unavailable data is not zero
         if: steps.settings.outputs.enabled == 'true'
         timeout-minutes: 5
@@ -535,6 +331,5 @@ jobs:
           path: |
             ${{ runner.temp }}/aggregate.json
             ${{ runner.temp }}/billing-refresh.json
-            ${{ runner.temp }}/cost-reconciliation/*.json
           retention-days: 30
           if-no-files-found: error

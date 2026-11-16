@@ -2667,8 +2667,6 @@ def validate_focused_job(job):
     if not isinstance(job, dict):
         raise ValueError("focused job must be an object")
     active_owner_count(job)
-    if job.get("case_kind") == "sui_trace_replay":
-        raise ValueError("Sui trace replay is reserved and not admitted")
     case_id = job.get("case_id")
     if not isinstance(case_id, str):
         raise ValueError("focused case_id is required")

@@ -346,11 +346,6 @@ def _reviewed_jobs(spec):
         # A shape pinned by the reviewed selection is part of its exact contract.
         if 'machine_type' not in REVIEWED_SPECS.get(spec.get('selection'), {}):
             spec = {key: value for key, value in spec.items() if key != 'machine_type'}
-    if isinstance(spec, dict) and spec.get("suite") in ("sui", "both"):
-        import manual_sui
-        if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(spec)):
-            raise ValueError("an exact reviewed focused specification is required")
-        return [] if spec["suite"] == "sui" else _reviewed_jobs(manual_sui.kv_spec(manual_sui.reviewed_part(spec)))
     if isinstance(spec, dict) and any(_json(spec) == _json(reviewed)
                                      for reviewed in (REVIEWED_SPEC, REVIEWED_CONTRACT_SPEC)):
         return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
@@ -419,8 +414,7 @@ def _admit_package(package_dir, revision, spec):
     receipt = json.loads((package_dir / 'package-receipt.json').read_text())
     root = package_dir / 'package'
     verified = package.verify_directory(root)
-    import manual_sui
-    focused = manual_sui.focused_qualification(spec)
+    focused = spec.get('mode') == 'focused'
     expected_profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
     if focused and verified.get('build_profile') != expected_profile:
         raise ValueError('focused campaign requires its exact package profile')
@@ -467,16 +461,12 @@ def _admit_package(package_dir, revision, spec):
     prepare.ci_prepare.admit_qualification(package_dir / 'qualification', proof,
                                            **({'focused': True} if focused else {}))
     _check_snapshot(source, revision)
-    if spec.get('suite') in ('sui', 'both'):
-        manual_sui.admit_sui_package(package_dir, receipt)
     receipt['archive_path'] = str(archive.resolve())
     return receipt, source
 
 
 def _qualify_observer(package_dir, spec):
     """Exercise the admitted package's own matrix and observer without cloud access."""
-    if spec.get("suite") == "sui":
-        return {"skipped": "sui suite has no KV matrix"}
     script = Path(package_dir).resolve() / 'package/source/experiments/gcp-rdma/qualify_observer_matrix.py'
     result = subprocess.run([sys.executable, '-I', '-B', str(script)], input=json.dumps(spec),
                             capture_output=True, text=True, timeout=120)
@@ -501,17 +491,12 @@ def _put_json(store, key, value):
     return {'object': key, 'generation': str(meta['generation']), 'sha256': _digest(raw)}
 
 
-def _stage(store, bucket, state, receipt, wheels=None, *, qualification=False, spec=None, fixture=None):
+def _stage(store, bucket, state, receipt, wheels=None, *, qualification=False):
     """Stage the same locally admitted source and archive for each child."""
     prefix = 'runs/' + state['run_id'] + '/'
     package = dict(receipt)
     package['object_key'] = prefix + 'package.tar'
     package['generation'] = campaign.upload_file(store, package['archive_path'], package['sha256'], package['object_key'])
-    if spec is not None and spec.get('suite') in ('sui', 'both'):
-        import manual_sui
-        staged = manual_sui.stage_sui(store, prefix, receipt, fixture)
-        package.update({k: staged[k] for k in ('sui_object_key', 'sui_generation')})
-        spec.update({k: staged[k] for k in ('sui_fixture', 'sui_verification')})
     _put_json(store, prefix + 'package.json', package)
     # The qualification bootstrap only uses these identity fields. Normal fleet
     # runtime is written later, once all numeric IDs and addresses are admitted.
@@ -1022,19 +1007,8 @@ async def recover_cleanup(config, *, run_id, state_path, execute, artifacts=None
     return parent
 
 
-def _terminal_export(store, state, package, *, require_complete=True, result=None, suite=None):
+def _terminal_export(store, state, package, *, require_complete=True):
     """Pin the final controller receipt and its durable archive descriptors."""
-    if result is not None:
-        import manual_sui
-        references = {}
-        if 'kv' in result or suite == 'both':
-            try:
-                references.update(_terminal_export(store, state, package, require_complete=require_complete))
-            except ApiError as error:
-                if require_complete or error.status != 404:
-                    raise
-        references.update(manual_sui.terminal_export_sui(store, state, result, require_complete=require_complete))
-        return references
     prefix = state['run_id'] + '/results/'
     key = prefix + 'receipt.json'
     meta = store.head(key)
@@ -1244,37 +1218,27 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
             # The runtime prints the result as its last line; earlier lines are
             # output of verification subprocesses (for example `verified: true` blocks).
             result = json.loads(terminal['stdout'].strip().splitlines()[-1])
-            if spec.get('suite') == 'sui':
-                import manual_sui
-                if not manual_sui.sui_complete(result, spec):
-                    raise RuntimeError('coordinator did not complete the reviewed Sui suite')
-            else:
-                kv = result.get('kv', {})
-                expected_cases = (spec['job_count'] if spec.get('mode') == 'focused' else
-                                  len(workflow_input.cloud_campaign.make_matrix(
-                                      {k: v for k, v in spec.items() if k != 'suite'})))
-                if kv.get('complete') is not True or kv.get('planned_cases') != expected_cases or kv.get('completed_cases') != expected_cases:
-                    raise RuntimeError('coordinator did not complete the reviewed combined suite')
-                profiles = spec.get('valkey_reproduction_profiles', [])
-                if profiles:
-                    native = kv.get('native_valkey_reproduction', {})
-                    expected = {(profile, transport) for profile in profiles for transport in ('tcp', 'rdma')}
-                    cases = native.get('cases', [])
-                    observed = {(case.get('profile'), case.get('transport')) for case in cases}
-                    if (native.get('complete') is not True or observed != expected or len(cases) != len(expected)
-                            or native.get('planned_cases') != len(expected) or native.get('completed_cases') != len(expected)
-                            or any(case.get('complete') is not True or case.get('owned_server_stopped') is not True for case in cases)):
-                        raise RuntimeError('coordinator did not complete every isolated native Valkey control')
-            if spec.get('suite') == 'both':
-                import manual_sui
-                if not manual_sui.sui_complete(result, spec):
-                    raise RuntimeError('coordinator did not complete the reviewed Sui suite')
+            kv = result.get('kv', {})
+            expected_cases = (spec['job_count'] if spec.get('mode') == 'focused' else
+                              len(workflow_input.cloud_campaign.make_matrix(
+                                  {k: v for k, v in spec.items() if k != 'suite'})))
+            if kv.get('complete') is not True or kv.get('planned_cases') != expected_cases or kv.get('completed_cases') != expected_cases:
+                raise RuntimeError('coordinator did not complete the reviewed combined suite')
+            profiles = spec.get('valkey_reproduction_profiles', [])
+            if profiles:
+                native = kv.get('native_valkey_reproduction', {})
+                expected = {(profile, transport) for profile in profiles for transport in ('tcp', 'rdma')}
+                cases = native.get('cases', [])
+                observed = {(case.get('profile'), case.get('transport')) for case in cases}
+                if (native.get('complete') is not True or observed != expected or len(cases) != len(expected)
+                        or native.get('planned_cases') != len(expected) or native.get('completed_cases') != len(expected)
+                        or any(case.get('complete') is not True or case.get('owned_server_stopped') is not True for case in cases)):
+                    raise RuntimeError('coordinator did not complete every isolated native Valkey control')
         except Exception as exc:
             workload_error = exc
     try:
         references = await _blocking(_terminal_export, store, state, package,
-                                     require_complete=workload_error is None,
-                                     **({"result": result, "suite": spec["suite"]} if spec.get("suite") in ("sui", "both") else {}))
+                                     require_complete=workload_error is None)
         state['terminal_export'] = references
         try:
             await _blocking(campaign.save, path, state)
@@ -1360,7 +1324,7 @@ async def _finish_campaign(config, parent, path, store, execute, output, error):
 
 async def run(config, *, package_dir, revision, spec, wheels, base_image,
               base_image_id, rdma_device, output, execute, artifacts=None,
-              surcharge_cents, preflight_api=None, fixture=None):
+              surcharge_cents, preflight_api=None):
     """Run one reviewed campaign; never creates a replacement on failure.
 
     ``execute`` is an async callback accepting gcloud argv without ``gcloud``.
@@ -1370,9 +1334,6 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     """
     from gcp_manual_compute import Compute, _json_response
 
-    import manual_sui
-    if spec.get("suite") in ("sui", "both") and fixture is None:
-        raise ValueError("Sui suite requires a fixture path")
     _check_config(config, spec, surcharge_cents)
     spec = copy.deepcopy(spec)
     host_count = spec.get('owner_hosts', 5) + 1
@@ -1449,8 +1410,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await _blocking(_record, path, parent, 'fleet')
         fleet_state, fleet_path = await _blocking(_new_child, parent, path, 'fleet', duration)
         fleet_state['host_count'] = host_count
-        package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels,
-                                                **({"spec": spec, "fixture": fixture} if spec.get("suite") in ("sui", "both") else {}))
+        package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels)
         fleet_state['package'] = package
         fleet_state['preparation_sha256'] = prep_sha
         await _blocking(campaign.save, fleet_path, fleet_state)
@@ -1476,8 +1436,8 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
             receipt['manifest_sha256'], prep_sha, members=fleet, rdma_device=rdma_device,
             machine_type=config['machine_type'], live_transports=live_transports,
             live_spdk=bool(spec.get('spdk_comparison') and gcp_runtime.live_mode(spec)),
-            **({'qualification_profile': 'focused', 'selection': spec.get('selection'), **({'suite_spec': manual_sui.reviewed_part(spec), 'sui_extra_libraries': manual_sui.extra_libraries(receipt), 'sui_needed_libraries': receipt['sui_abi']['needed']} if spec.get('suite') in ('sui', 'both') else {})}
-               if manual_sui.focused_qualification(spec) else {}))
+            **({'qualification_profile': 'focused', 'selection': spec.get('selection')}
+               if spec.get('mode') == 'focused' else {}))
         await _blocking(_record, path, parent, 'preparation')
         async with asyncio.timeout(PREPARATION_SECONDS):
             for host in fleet:
@@ -1522,17 +1482,14 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         image_receipt = gcp_image_receipt.make_receipt(
             {'image': image, 'runtime_sha256': receipt['manifest_sha256'],
              'service_account': config['service_account'], 'evidence': evidence},
-            **({'qualification_profile': 'focused'} if manual_sui.focused_qualification(spec) else {}))
+            **({'qualification_profile': 'focused'} if spec.get('mode') == 'focused' else {}))
         reference = await _blocking(_put_json, store, 'runs/' + fleet_state['run_id'] + '/qualification/image-receipt.json', image_receipt)
         reference['bucket'] = config['bucket']
         fleet_state['qualification_receipt'] = reference
         await _blocking(campaign.save, fleet_path, fleet_state)
         (out / 'image-receipt.json').write_bytes(_json(image_receipt))
         admitted_config = dict(config, image=image['path'], image_qualification=reference)
-        if spec.get('suite') in ('sui', 'both'):
-            admitted_config['sui_extra_libraries'] = manual_sui.extra_libraries(receipt)
-            admitted_config['sui_needed_libraries'] = receipt['sui_abi']['needed']
-        if manual_sui.focused_qualification(spec):
+        if spec.get('mode') == 'focused':
             admitted_config['qualification_profile'] = 'focused'
         if gcp_runtime.live_mode(spec):
             admitted_config['live_qualification'] = {
@@ -1552,8 +1509,6 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
                                         live=gcp_runtime.live_mode(spec))
         gcp_image.admit_spdk(qualification, spec)
         gcp_image.admit_abi(qualification, receipt['abi'])
-        if spec.get('suite') in ('sui', 'both'):
-            gcp_image.admit_abi(qualification, receipt['sui_abi'], sui=True)
         if await fleet_compute.admit_guests() != fleet:
             raise RuntimeError('guest fleet identity changed after qualification')
         await _admit_boot_images(fleet_compute, fleet_state, image)

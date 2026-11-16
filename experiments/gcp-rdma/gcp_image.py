@@ -123,7 +123,7 @@ def _abi(abi):
     return set(needed), _versions(abi['version_requirements'])
 
 
-def _envelope(record, *, sui=False):
+def _envelope(record):
     package = record['outputs']['package']
     _, baseline_versions = _abi(package.get('abi'))
     sonames = set()
@@ -131,8 +131,6 @@ def _envelope(record, *, sui=False):
     proofs = [package['linkage'], *package.get('valkey_runtime_linkage', {}).values()]
     if 'spdk' in package:
         proofs.append(package['spdk_runtime_linkage'])
-    if sui:
-        proofs = [package.get('sui_library_linkage')]
     for proof in proofs:
         for elf in _linkage(proof).values():
             if elf.get('soname'):
@@ -144,13 +142,13 @@ def _envelope(record, *, sui=False):
     return sonames, versions
 
 
-def admit_abi(qualification, abi, *, sui=False):
+def admit_abi(qualification, abi):
     """Check SONAMEs and four version families, not full symbol ABI or hardware execution."""
     needed, required = _abi(abi)
     records = qualification.get('_records') if isinstance(qualification, dict) else None
     if not isinstance(records, list) or len(records) != 2:
         raise ValueError('validated physical qualification records required')
-    envelopes = [_envelope(record, sui=sui) for record in records]
+    envelopes = [_envelope(record) for record in records]
     if envelopes[0] != envelopes[1]:
         raise ValueError('qualified guest ABI envelopes differ')
     sonames, versions = envelopes[0]
@@ -162,7 +160,7 @@ def admit_abi(qualification, abi, *, sui=False):
             raise ValueError(f'{family} versions absent from qualified guest: ' + ', '.join(sorted(missing)))
 
 
-def validate_pair(records, image, runtime_sha, service_account, *, qualification_profile='full', sui_needed_libraries=()):
+def validate_pair(records, image, runtime_sha, service_account, *, qualification_profile='full'):
     """Validate two reciprocal real-command records, not a pass/fail checklist."""
     _digest(runtime_sha, 'runtime manifest')
     if qualification_profile not in ('full', 'focused'):
@@ -214,19 +212,6 @@ def validate_pair(records, image, runtime_sha, service_account, *, qualification
         if not isinstance(package, dict) or package.get('manifest_sha256') != runtime_sha or package.get('runtime_checked') is not True:
             raise ValueError('sealed runtime linkage evidence mismatch')
         resolved = _linkage(package.get('linkage'))
-        if sui_needed_libraries:
-            if package.get('sui_needed_libraries') != list(sui_needed_libraries):
-                raise ValueError('Sui library proof does not bind the requested SONAMEs')
-            extra = _linkage(package.get('sui_library_linkage'))
-            if 'ld_library_path' not in package['sui_library_linkage'] or (
-                    package['sui_library_linkage']['ld_library_path'] is not None
-                    and not isinstance(package['sui_library_linkage']['ld_library_path'], str)):
-                raise ValueError('Sui library proof search path is missing or invalid')
-            missing = set(sui_needed_libraries) - {elf.get('soname') for elf in extra.values()}
-            if missing:
-                raise ValueError('Sui libraries absent from guest proof: ' + ', '.join(sorted(missing)))
-        elif 'sui_library_linkage' in package:
-            _linkage(package['sui_library_linkage'])
         valkey_linkage = package.get('valkey_runtime_linkage')
         needs_valkey = qualification_profile == 'full' or package.get('build_profile') == 'focused_valkey'
         if qualification_profile == 'focused':
@@ -315,10 +300,6 @@ def validate_pair(records, image, runtime_sha, service_account, *, qualification
     packages = [record['outputs']['package'] for record in records]
     if qualification_profile == 'focused' and packages[0]['build_profile'] != packages[1]['build_profile']:
         raise ValueError('qualification guests differ in focused build profile')
-    if any('sui_library_linkage' in package for package in packages):
-        if (_envelope(records[0], sui=True) != _envelope(records[1], sui=True)
-                or packages[0]['sui_library_linkage'].get('ld_library_path') != packages[1]['sui_library_linkage'].get('ld_library_path')):
-            raise ValueError('qualification guests differ in Sui library linkage')
     if _envelope(records[0]) != _envelope(records[1]):
         raise ValueError('qualified guest ABI envelopes differ')
 
@@ -416,5 +397,5 @@ def admit_image(api, config, image_info):
         raise ValueError('two generation-pinned hardware evidence objects required')
     records = [_load(api, item, config['bucket'], 16 * 1024 * 1024) for item in evidence]
     validate_pair(records, identity, receipt.get('runtime_sha256'), config.get('service_account'),
-                  qualification_profile=profile, sui_needed_libraries=config.get('sui_needed_libraries', ()))
+                  qualification_profile=profile)
     return {**receipt, '_records': records}
