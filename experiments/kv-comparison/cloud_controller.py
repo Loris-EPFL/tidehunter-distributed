@@ -159,6 +159,19 @@ def controller_matrix(spec):
     return cloud_campaign.make_matrix(spec)
 
 
+def apply_case_namespace(config, job, prefix):
+    """Give each synthetic case its own key namespace. Hybrid puts share their dataset's
+    keys, and replay keys come from the pinned mainnet fixture, whose typed config has no
+    namespace field."""
+    if job.get("case_kind") in ("hybrid_put", "mainnet_replay"):
+        return
+    # Write controls use a separate namespace and run after every sealed read.
+    namespace = f"{prefix}:{job['repeat']}"
+    if job.get("cohort") == "native_write_regression":
+        namespace += ":write-control"
+    config["key_namespace_hex"] = hashlib.blake2b(namespace.encode(), digest_size=16).hexdigest()
+
+
 def bind_native_dataset_config(receipt, config, job):
     """Reopen the prepared database with the case's measured durability."""
     import nvme_campaign_native
@@ -4907,12 +4920,7 @@ class Controller:
                                else self.config["spec"]["case_deadline_seconds"])
             seconds = min(client_deadline, int(self.remaining()))
             config = cloud_campaign.make_run_config(job, directory, options, self.config["source_revision"], seconds)
-            if job.get("case_kind") != "hybrid_put":
-                # Write controls use a separate namespace and run after every sealed read.
-                namespace = f"{self.config['prefix']}:{job['repeat']}"
-                if job.get("cohort") == "native_write_regression":
-                    namespace += ":write-control"
-                config["key_namespace_hex"] = hashlib.blake2b(namespace.encode(), digest_size=16).hexdigest()
+            apply_case_namespace(config, job, self.config["prefix"])
             if backend == "native" and "sealed_dataset" in job:
                 import nvme_campaign_native
                 source = job["sealed_dataset"]["source_id"]
