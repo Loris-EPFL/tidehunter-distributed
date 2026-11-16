@@ -35,6 +35,10 @@ TIKV_NOFILE = 1_048_576
 TIKV_STABLE_SECONDS = 5
 
 
+class ContainerExitedError(RuntimeError):
+    """An owned service with restart=no cannot recover within readiness."""
+
+
 class TikvSteadyAdmission:
     def __init__(self):
         self.first = None
@@ -307,12 +311,17 @@ def topology(backend, layout, directory, owner, ack_contract="synced"):
                    "--config=/config/pd.toml"]
         add("pd0", "pd", 1.0, "512m", pd_args)
         services["pd0"]["volumes"].append(str(directory / "pd.toml") + ":/config/pd.toml:ro")
+        # Local qualification startup peaked at 2.072 GiB; add 25%, round to 512 MiB.
+        # 3 GiB + PD 0.5 + monitoring 1.75 + client 3 = 8.25 GiB of a 16 GiB runner.
+        # The explicit 1 GiB cache-eviction watermark/256 MiB block cache stay unchanged.
+        memory = "3g" if layout == "qualification" else "1536m"
         for i in range(count):
-            add(f"tikv{i}", "tikv", 2.0, "1536m", ["--addr", f"127.0.0.1:{20160+i}",
+            add(f"tikv{i}", "tikv", 2.0, memory, ["--addr", f"127.0.0.1:{20160+i}",
                 "--advertise-addr", f"127.0.0.1:{20160+i}", "--status-addr", f"127.0.0.1:{20180+i}",
                 "--pd", "127.0.0.1:2379", "--data-dir", "/data", "--config", "/config/tikv.toml",
                 "--labels", f"zone=local-process-{i}"],
-                ulimits={"nofile": {"soft": TIKV_NOFILE, "hard": TIKV_NOFILE}})
+                ulimits={"nofile": {"soft": TIKV_NOFILE, "hard": TIKV_NOFILE}},
+                **({"memswap_limit": memory} if layout == "qualification" else {}))
             services[f"tikv{i}"]["volumes"].append(str(directory / "tikv.toml") + ":/config/tikv.toml:ro")
     elif backend == "cassandra":
         for i in range(count):
@@ -396,6 +405,13 @@ def probe(state):
         return local_valkey_rdma.probe(state)
     backend, count = state["backend"], state["nodes"]
     items = inspect_owned(state)
+    for item in items:
+        runtime = item["State"]
+        if runtime["Status"] in {"exited", "dead"}:
+            service = item["Config"]["Labels"]["com.docker.compose.service"]
+            raise ContainerExitedError(f"requested service {service} {runtime['Status']}: "
+                                       f"exit={runtime['ExitCode']} oom={runtime['OOMKilled']} "
+                                       f"error={runtime['Error']!r}")
     if len(items) != count + (backend == "tikv") or any(not x["State"]["Running"] for x in items):
         raise RuntimeError("not all requested containers are running")
     if backend in ("garnet", "kvrocks"):
@@ -508,6 +524,8 @@ def ready(state, timeout):
                 raise RuntimeError("readiness deadline reached during probe")
             dump(Path(state["directory"]) / "deployment.json", {"observed_at_unix": time.time(), "topology": state, "observed": proof})
             return proof
+        except ContainerExitedError as exc:
+            raise RuntimeError(f"requested {state['backend']} readiness failed: {exc}") from exc
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
             error = str(exc)
             if steady is not None:
