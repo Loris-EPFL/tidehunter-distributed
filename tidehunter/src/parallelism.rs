@@ -10,6 +10,7 @@ pub fn available() -> usize {
 }
 
 /// Resolve an automatic count without persisting the current host's CPU count.
+#[cfg(any(feature = "experimental-distributed", test))]
 pub(crate) fn resolve_count(explicit: Option<usize>, available: usize) -> usize {
     explicit.unwrap_or(available)
 }
