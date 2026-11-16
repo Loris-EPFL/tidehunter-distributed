@@ -1433,13 +1433,31 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     } else {
         "failed"
     };
-    let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:info.configuration.get("durability").unwrap_or(&info.configuration).clone(),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
+    let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:replay_durability(&info),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
         execution:serde_json::json!({"effective_client_shards":1}),
         phase_counts:serde_json::json!({"scope":trace.scope(),"profile":metrics,"preload_ns":preload_ns,"counts":m.counts,"error":result.as_ref().err().map(ToString::to_string),"resources":resources,"sustained_30s_qualified":result.is_ok() && unresolved_workers==0 && elapsed.as_secs_f64()>=30.0,"run_status":run_status,"unknown_outcomes":unknown_outcomes,"unresolved_workers":unresolved_workers,"shutdown_contract":"join completed callers; after deadline plus grace detach only unresolved calls, under external process supervision; no cancellation or rollback"}),
         distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
     reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":trace.scope(),"config":config,"binary":resources["binary"],"trace_manifest":trace.manifest,"profile":metrics}))?;
     result
 }
+/// Backend durability evidence plus the tier the backend confirmed from owner receipts,
+/// in the field the campaign admits (`confirmed_by_backend_receipt`), as the runner records it.
+fn replay_durability(info: &BackendInfo) -> serde_json::Value {
+    let mut durability = info
+        .configuration
+        .get("durability")
+        .unwrap_or(&info.configuration)
+        .clone();
+    if let (Some(tier), Some(fields)) = (
+        info.configuration.get("durability_tier"),
+        durability.as_object_mut(),
+    ) {
+        fields.insert("tier".into(), tier.clone());
+        fields.insert("confirmed_by_backend_receipt".into(), tier.clone());
+    }
+    durability
+}
+
 async fn open_backend(
     config: &ReplayConfig,
     trace: &Trace,
