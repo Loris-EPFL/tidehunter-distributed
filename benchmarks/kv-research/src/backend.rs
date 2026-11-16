@@ -214,6 +214,11 @@ pub struct BackendInfo {
 /// `get_many` returns exactly one entry per key, in caller order, or an error.
 pub trait KvBackend: Send + Sync + 'static {
     fn info(&self) -> BackendInfo;
+    /// Cold, nonblocking local engine health observation. `None` means that
+    /// this backend exposes no local background-thread health capability.
+    fn check_background_health(&self) -> Option<BackendResult<()>> {
+        None
+    }
     fn get(&self, key: &[u8]) -> impl Future<Output = BackendResult<Option<Bytes>>> + Send;
     fn put(&self, key: Bytes, value: Bytes) -> impl Future<Output = BackendResult<()>> + Send;
     fn delete(&self, key: Bytes) -> impl Future<Output = BackendResult<()>> + Send;

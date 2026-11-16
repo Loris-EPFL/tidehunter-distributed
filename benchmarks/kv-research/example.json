@@ -14,6 +14,7 @@
     "entropy": 1.0
   },
   "workload": {
+    "kind": "synthetic",
     "distribution": "uniform",
     "mix": {
       "read": 70,
