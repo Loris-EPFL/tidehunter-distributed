@@ -439,7 +439,7 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
     .synchronous();
     let mut original = fixture.open();
     leased::prepare_database(&mut original);
-    let writer = original.clients[0].client.clone();
+    let writer = original.core.clients[0].client.clone();
     let log = fixture.nodes[0].log_for_test(original.epoch());
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let first: Vec<_> = (0..57)

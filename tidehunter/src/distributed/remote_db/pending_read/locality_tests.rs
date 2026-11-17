@@ -84,7 +84,7 @@ fn nvme_fixture(
 fn coordinator_cache_and_nvme_reader_preserve_retained_cut() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 64 * 1024;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
         .unwrap();
     let mut db = reopen_cold(&fixture, db);
@@ -97,9 +97,10 @@ fn coordinator_cache_and_nvme_reader_preserve_retained_cut() {
         .collect();
     let (config, path) = nvme_fixture(&fixture, 0, &references, "nvme-cache");
     assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
-    wait_read_retirement(&db.reads);
-    db.reads
-        .install_nvmeof_file_fixture(config.clone(), &db.config, &db.shape, &path)
+    wait_read_retirement(&db.core.reads);
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(config.clone(), &db.core.config, &db.core.shape, &path)
         .unwrap();
     let old_cut = db.published_cut().unwrap();
     let _pin = db.pin_cut(old_cut.clone()).unwrap();
@@ -125,7 +126,7 @@ fn coordinator_cache_and_nvme_reader_preserve_retained_cut() {
         value(7)
     );
     assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(9));
-    wait_read_retirement(&db.reads);
+    wait_read_retirement(&db.core.reads);
     let cache_hits = db.read_cache_stats().hits;
     let rpc_count = db.read_rpc_count();
     db.clear_nvmeof_reader().unwrap();
@@ -142,16 +143,17 @@ fn coordinator_cache_and_nvme_reader_preserve_retained_cut() {
         .join("namespaces")
         .join(config.manifest.nsid.to_string());
     std::fs::write(ns.join("enable"), "1\n").unwrap();
-    wait_read_retirement(&db.reads);
-    db.reads
-        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+    wait_read_retirement(&db.core.reads);
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(config, &db.core.config, &db.core.shape, &path)
         .unwrap();
     let cache_hits = db.read_cache_stats().hits;
     assert_eq!(db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap(), value(8));
     assert!(db.read_cache_stats().hits > cache_hits);
-    db.reads.state.poison();
+    db.core.reads.state.poison();
     assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
-    wait_read_retirement(&db.reads);
+    wait_read_retirement(&db.core.reads);
     db.clear_nvmeof_reader().unwrap();
     assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
 }
@@ -161,7 +163,7 @@ fn coordinator_cache_and_nvme_reader_preserve_retained_cut() {
 fn file_backed_routes_mixed_ordered_reads_and_concurrent_calls() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
         .unwrap();
     db.write_batch(fixture.operation(1, 1), vec![put(2, 9)])
@@ -179,21 +181,25 @@ fn file_backed_routes_mixed_ordered_reads_and_concurrent_calls() {
     let mut forged = first.clone();
     forged.manifest.catalog[0].offset += 1;
     assert!(
-        db.reads
-            .install_nvmeof_file_fixture(forged, &db.config, &db.shape, &first_path)
+        db.core
+            .reads
+            .install_nvmeof_file_fixture(forged, &db.core.config, &db.core.shape, &first_path)
             .is_err()
     );
     assert!(db.nvmeof_stats().is_empty());
-    db.reads
-        .install_nvmeof_file_fixture(first.clone(), &db.config, &db.shape, &first_path)
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(first.clone(), &db.core.config, &db.core.shape, &first_path)
         .unwrap();
     assert!(
-        db.reads
-            .install_nvmeof_file_fixture(first, &db.config, &db.shape, &first_path)
+        db.core
+            .reads
+            .install_nvmeof_file_fixture(first, &db.core.config, &db.core.shape, &first_path)
             .is_err()
     );
-    db.reads
-        .install_nvmeof_file_fixture(second, &db.config, &db.shape, &second_path)
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(second, &db.core.config, &db.core.shape, &second_path)
         .unwrap();
     let keys: Vec<_> = [2u32, 1, 0, 2, 1]
         .iter()
@@ -250,10 +256,10 @@ fn file_backed_routes_mixed_ordered_reads_and_concurrent_calls() {
 fn sui_adapter_reads_through_verified_file_fixture_after_reopen() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(5, 42)])
         .unwrap();
-    let mut db = reopen_cold(&fixture, db);
+    let db = reopen_cold(&fixture, db);
     let reference = db
         .index_reference(KeySpace(0), &5u32.to_be_bytes(), IndexReadCut::Latest)
         .unwrap()
@@ -288,7 +294,7 @@ fn file_backed_corruption_is_fail_closed_and_idle_is_required() {
     use std::os::unix::fs::FileExt;
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(3, 7)])
         .unwrap();
     let mut db = reopen_cold(&fixture, db);
@@ -297,19 +303,21 @@ fn file_backed_corruption_is_fail_closed_and_idle_is_required() {
         .unwrap()
         .unwrap();
     let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-corrupt");
-    let lane = db.reads.lane_client(node_for(&db, 3), 0);
+    let lane = db.core.reads.lane_client(node_for(&db, 3), 0);
     let held = lane.lock();
     let pending = db.submit_get(KeySpace(0), &3u32.to_be_bytes()).unwrap();
     assert!(
-        db.reads
-            .install_nvmeof_file_fixture(config.clone(), &db.config, &db.shape, &path)
+        db.core
+            .reads
+            .install_nvmeof_file_fixture(config.clone(), &db.core.config, &db.core.shape, &path)
             .is_err()
     );
     drop(held);
     assert_eq!(db.finish_get(pending).unwrap(), value(7));
-    wait_read_retirement(&db.reads);
-    db.reads
-        .install_nvmeof_file_fixture(config.clone(), &db.config, &db.shape, &path)
+    wait_read_retirement(&db.core.reads);
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(config.clone(), &db.core.config, &db.core.shape, &path)
         .unwrap();
     // Deliberately break the immutable test image to exercise consumer checks.
     use std::os::unix::fs::PermissionsExt;
@@ -334,24 +342,26 @@ fn file_backed_corruption_is_fail_closed_and_idle_is_required() {
 fn nvmeof_shutdown_drains_an_already_admitted_read() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(4, 11)])
         .unwrap();
-    let mut db = reopen_cold(&fixture, db);
+    let db = reopen_cold(&fixture, db);
     let reference = db
         .index_reference(KeySpace(0), &4u32.to_be_bytes(), IndexReadCut::Latest)
         .unwrap()
         .unwrap();
-    let node = db.partition_indexes[&reference.batch_address.partition];
+    let node = db.core.partition_indexes[&reference.batch_address.partition];
     let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-shutdown");
-    db.reads
-        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(config, &db.core.config, &db.core.shape, &path)
         .unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
-    *db.reads.state.reactor_pause[node].lock() = Some((entered_tx, resume_rx));
+    *db.core.reads.state.reactor_pause[node].lock() = Some((entered_tx, resume_rx));
     assert!(
-        db.reads
+        db.core
+            .reads
             .sender
             .lock()
             .get(node)
@@ -362,10 +372,11 @@ fn nvmeof_shutdown_drains_an_already_admitted_read() {
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let pin = db.pin_cut(IndexReadCut::Latest).unwrap();
     let pending = db
+        .core
         .reads
         .submit(node, vec![reference], 0, false, Some(pin))
         .unwrap();
-    let reads = db.reads.clone();
+    let reads = db.core.reads.clone();
     let stopped = reads.state.clone();
     let stop = thread::spawn(move || reads.stop());
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -386,7 +397,7 @@ fn nvmeof_shutdown_drains_an_already_admitted_read() {
     assert_eq!(ready, expected);
     stop.join().unwrap();
     assert_eq!(pending.finish().unwrap().0, vec![put(4, 11)]);
-    assert!(!db.reads.failed());
+    assert!(!db.core.reads.failed());
     assert!(
         db.nvmeof_stats().is_empty(),
         "drained readers must release their leases"
@@ -399,7 +410,7 @@ fn nvmeof_shutdown_drains_an_already_admitted_read() {
 fn nvmeof_reader_cannot_serve_after_owner_fence() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(6, 12)])
         .unwrap();
     let mut db = reopen_cold(&fixture, db);
@@ -408,42 +419,43 @@ fn nvmeof_reader_cannot_serve_after_owner_fence() {
         .unwrap()
         .unwrap();
     let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-fence");
-    db.reads
-        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(config, &db.core.config, &db.core.shape, &path)
         .unwrap();
-    let node = db.partition_indexes[&reference.batch_address.partition];
+    let node = db.core.partition_indexes[&reference.batch_address.partition];
     assert!(
-        db.clients[node]
+        db.core.clients[node]
             .client
             .lock()
-            .fence_to(db.epoch + 1)
+            .fence_to(db.epoch() + 1)
             .is_err(),
         "owner must refuse fencing while an NVMe-oF lease is live"
     );
-    let other = db.partition_indexes[&1];
+    let other = db.core.partition_indexes[&1];
     assert!(
-        db.clients[other]
+        db.core.clients[other]
             .client
             .lock()
-            .fence_to(db.epoch + 1)
+            .fence_to(db.epoch() + 1)
             .is_err(),
         "an owner without an export must also pin the coordinator epoch"
     );
     assert_eq!(db.get(KeySpace(0), &6u32.to_be_bytes()).unwrap(), value(12));
     db.clear_nvmeof_reader().unwrap();
     assert!(
-        db.clients[node]
+        db.core.clients[node]
             .client
             .lock()
-            .fence_to(db.epoch + 1)
+            .fence_to(db.epoch() + 1)
             .is_ok(),
         "fencing must proceed after the reader is drained, closed, and released"
     );
     assert!(
-        db.clients[other]
+        db.core.clients[other]
             .client
             .lock()
-            .fence_to(db.epoch + 1)
+            .fence_to(db.epoch() + 1)
             .is_ok(),
         "all owner epoch pins must be released after the reader closes"
     );
@@ -456,25 +468,32 @@ fn identical_misses_share_one_physical_credit_and_survive_leader_drop() {
     fixture.config.read_cache_bytes = 0;
     fixture.config.read_lanes = Some(1);
     fixture.config.max_pending_reads = 1;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(7, 9)])
         .unwrap();
     let mut db = reopen_cold(&fixture, db);
-    let lane = db.reads.lane_client(node_for(&db, 7), 0);
+    let lane = db.core.reads.lane_client(node_for(&db, 7), 0);
     let held = lane.lock();
     let first = db.submit_get(KeySpace(0), &7u32.to_be_bytes()).unwrap();
-    let first_bytes = db.reads.state.retained.lock().1;
+    let first_bytes = db.core.reads.state.retained.lock().1;
     let second = db.submit_get(KeySpace(0), &7u32.to_be_bytes()).unwrap();
-    assert_eq!(db.reads.state.retained.lock().0, 1);
-    assert!(db.reads.state.retained.lock().1 > first_bytes);
-    assert_eq!(db.reads.state.coalesced_members.load(Ordering::Relaxed), 1);
+    assert_eq!(db.core.reads.state.retained.lock().0, 1);
+    assert!(db.core.reads.state.retained.lock().1 > first_bytes);
+    assert_eq!(
+        db.core
+            .reads
+            .state
+            .coalesced_members
+            .load(Ordering::Relaxed),
+        1
+    );
     drop(first);
-    assert_eq!(db.reads.state.retained.lock().0, 1);
+    assert_eq!(db.core.reads.state.retained.lock().0, 1);
     drop(held);
     assert_eq!(db.finish_get(second).unwrap(), value(9));
     assert_eq!(db.read_rpc_count(), 1);
-    wait_read_retirement(&db.reads);
-    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    wait_read_retirement(&db.core.reads);
+    assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
     db.shutdown().unwrap();
 }
 
@@ -483,13 +502,13 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
     fixture.config.read_lanes = Some(1);
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(
         fixture.operation(0, 0),
         vec![put(0, 7), put(1, 8), put(2, 9)],
     )
     .unwrap();
-    let pin = db.index.pin_cut(IndexReadCut::Latest).unwrap();
+    let pin = db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
     let references: Vec<_> = (0u32..3)
         .map(|key| {
             db.index_reference(KeySpace(0), &key.to_be_bytes(), pin.cut())
@@ -497,14 +516,16 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
                 .unwrap()
         })
         .collect();
-    let node = db.partition_indexes[&references[0].batch_address.partition];
-    let lane = db.reads.lane_client(node, 0);
+    let node = db.core.partition_indexes[&references[0].batch_address.partition];
+    let lane = db.core.reads.lane_client(node, 0);
     let held = lane.lock();
     let first = db
+        .core
         .reads
         .submit(node, references[..2].to_vec(), 0, false, Some(pin.clone()))
         .unwrap();
     let second = db
+        .core
         .reads
         .submit_until(
             node,
@@ -512,22 +533,29 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
             0,
             false,
             ReadContext {
-                deadline: Instant::now() + db.config.timeout,
+                deadline: Instant::now() + db.core.config.timeout,
                 pin: Some(pin),
                 trace: None,
             },
         )
         .unwrap();
-    assert_eq!(db.reads.state.retained.lock().0, 2);
-    assert_eq!(db.reads.state.coalesced_members.load(Ordering::Relaxed), 2);
+    assert_eq!(db.core.reads.state.retained.lock().0, 2);
+    assert_eq!(
+        db.core
+            .reads
+            .state
+            .coalesced_members
+            .load(Ordering::Relaxed),
+        2
+    );
     drop(held);
     let (second_values, _) = second.finish().unwrap();
     let (first_values, _) = first.finish().unwrap();
     assert_eq!(first_values, vec![put(0, 7), put(1, 8)]);
     assert_eq!(second_values, vec![put(1, 8), put(2, 9), put(1, 8)]);
     assert_eq!(db.read_rpc_count(), 2);
-    wait_read_retirement(&db.reads);
-    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    wait_read_retirement(&db.core.reads);
+    assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
     db.shutdown().unwrap();
 }
 
@@ -540,7 +568,7 @@ fn old_and_current_cut_misses_never_merge_versions() {
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();
     let cut = db.published_cut().unwrap();
-    let lane = db.reads.lane_client(node_for(&db, 0), 0);
+    let lane = db.core.reads.lane_client(node_for(&db, 0), 0);
     let held = lane.lock();
     let old = db
         .submit_get_cut(KeySpace(0), &0u32.to_be_bytes(), cut.clone())
@@ -551,14 +579,14 @@ fn old_and_current_cut_misses_never_merge_versions() {
     let old_again = db
         .submit_get_cut(KeySpace(0), &0u32.to_be_bytes(), cut)
         .unwrap();
-    assert_eq!(db.reads.state.retained.lock().0, 2);
+    assert_eq!(db.core.reads.state.retained.lock().0, 2);
     drop(held);
     assert_eq!(db.finish_get(current).unwrap(), value(8));
     assert_eq!(db.finish_get(old_again).unwrap(), value(7));
     assert_eq!(db.finish_get(old).unwrap(), value(7));
     assert_eq!(db.read_rpc_count(), 2);
-    wait_read_retirement(&db.reads);
-    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    wait_read_retirement(&db.core.reads);
+    assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
     db.shutdown().unwrap();
 }
 
@@ -571,28 +599,28 @@ fn abandoned_shared_failure_poison_and_all_owned_credits_retire() {
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();
     let node = node_for(&db, 0);
-    let lane = db.reads.lane_client(node, 0);
+    let lane = db.core.reads.lane_client(node, 0);
     let held = lane.lock();
     let first = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     let second = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     drop(first);
-    db.clients[node]
+    db.core.clients[node]
         .client
         .lock()
-        .fence_to(db.epoch + 1)
+        .fence_to(db.epoch() + 1)
         .unwrap();
     drop(held);
     let completion = second.wait();
     assert!(db.finish_ready_get(completion).is_err());
-    db.reads.stop();
-    assert!(db.reads.failed());
-    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.core.reads.stop();
+    assert!(db.core.reads.failed());
+    assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert!(db.shutdown().is_err());
 }
 
 fn open_sui_scan_fixture(fixture: &Fixture) -> Arc<crate::distributed::sui::Db> {
-    let mut original = fixture.open();
+    let original = fixture.open();
     for (batch, partition) in [(0u32, 0u32), (1, 1), (2, 1)] {
         original
             .write_batch(
@@ -749,7 +777,7 @@ fn sui_reseek_and_checkpoint_pins_preserve_old_cut_until_final_drop() {
 fn sealed_fixture(name: &str) -> (Fixture, RemoteDatabase, ValueRecordReference) {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
         .unwrap();
     let db = reopen_cold(&fixture, db);
@@ -761,8 +789,9 @@ fn sealed_fixture(name: &str) -> (Fixture, RemoteDatabase, ValueRecordReference)
         })
         .collect();
     let (config, path) = nvme_fixture(&fixture, 0, &references, name);
-    db.reads
-        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+    db.core
+        .reads
+        .install_nvmeof_file_fixture(config, &db.core.config, &db.core.shape, &path)
         .unwrap();
     (fixture, db, references[0])
 }
@@ -785,15 +814,15 @@ fn retry_counts(reads: &ReadService) -> [u64; 6] {
 #[test]
 fn only_reader_set_changes_advance_the_routing_generation() {
     let (_fixture, mut db, _) = sealed_fixture("nvme-generation");
-    let routing = db.reads.routing().generation;
-    let wakeups = db.reads.admission_generation();
+    let routing = db.core.reads.routing().generation;
+    let wakeups = db.core.reads.admission_generation();
     assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
-    wait_read_retirement(&db.reads);
+    wait_read_retirement(&db.core.reads);
     // The credit release woke waiters but did not touch the reader set.
-    assert!(db.reads.admission_generation() > wakeups);
-    assert_eq!(db.reads.routing().generation, routing);
+    assert!(db.core.reads.admission_generation() > wakeups);
+    assert_eq!(db.core.reads.routing().generation, routing);
     db.clear_nvmeof_reader().unwrap();
-    assert!(db.reads.routing().generation > routing);
+    assert!(db.core.reads.routing().generation > routing);
     db.shutdown().unwrap();
 }
 
@@ -801,20 +830,21 @@ fn only_reader_set_changes_advance_the_routing_generation() {
 #[test]
 fn stale_plans_are_the_only_sealed_admission_retry() {
     let (_fixture, mut db, reference) = sealed_fixture("nvme-stale-plan");
-    let node = db.partition_indexes[&reference.batch_address.partition];
-    let routing = db.reads.routing();
-    let plans = [db.reads.plan_member(&routing, &reference).unwrap()];
+    let node = db.core.partition_indexes[&reference.batch_address.partition];
+    let routing = db.core.reads.routing();
+    let plans = [db.core.reads.plan_member(&routing, &reference).unwrap()];
     let generation = routing.generation;
     drop(routing);
     // Credit churn between planning and admission is not a retry cause.
     assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
-    wait_read_retirement(&db.reads);
+    wait_read_retirement(&db.core.reads);
     let context = || ReadContext {
-        deadline: Instant::now() + db.config.timeout,
+        deadline: Instant::now() + db.core.config.timeout,
         pin: None,
         trace: None,
     };
     let admitted = db
+        .core
         .reads
         .submit_until_owned(
             node,
@@ -830,12 +860,13 @@ fn stale_plans_are_the_only_sealed_admission_retry() {
         )
         .unwrap();
     assert_eq!(admitted.finish().unwrap().0, vec![put(0, 7)]);
-    wait_read_retirement(&db.reads);
-    assert_eq!(retry_counts(&db.reads), [0; 6]);
+    wait_read_retirement(&db.core.reads);
+    assert_eq!(retry_counts(&db.core.reads), [0; 6]);
     // A reader-set change makes the same plans stale: one counted retry, no
     // credit left behind.
     db.clear_nvmeof_reader().unwrap();
     let error = db
+        .core
         .reads
         .submit_until_owned(
             node,
@@ -852,8 +883,8 @@ fn stale_plans_are_the_only_sealed_admission_retry() {
         .err()
         .unwrap();
     assert!(RemoteDatabase::read_backpressured(&error));
-    assert_eq!(retry_counts(&db.reads), [0, 0, 0, 0, 1, 0]);
-    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(retry_counts(&db.core.reads), [0, 0, 0, 0, 1, 0]);
+    assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
     db.shutdown().unwrap();
 }
 

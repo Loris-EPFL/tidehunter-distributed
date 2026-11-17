@@ -137,7 +137,6 @@ impl Fixture {
             read_cache_bytes: 64 * 1024,
             index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
             read_memory_allowance_bytes: 512 * 1024 * 1024,
-            preparation_workers: 2,
             scan_prefetch_pages: 2,
             read_lanes: Some(2),
             pin_read_lanes: false,
@@ -308,6 +307,147 @@ fn value(db: &mut RemoteDatabase, key: u32) -> Option<Vec<u8>> {
         .map(|v| v.to_vec())
 }
 
+/// Wait until the owner worker has processed every expected receipt under
+/// writer→publisher: published, or durable and parked behind an unresolved
+/// predecessor. Workers publish on their own thread; there is no authority
+/// completion route left to consume.
+fn settle_publication(db: &RemoteDatabase, expected: &[u64]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for &sequence in expected {
+        while !db.core.publication_settled(sequence) {
+            db.core.ensure_healthy().expect("owner append failed");
+            assert!(
+                Instant::now() < deadline,
+                "owner receipts were not processed"
+            );
+            thread::yield_now();
+        }
+    }
+}
+
+/// Validate each real owner receipt (exact version and owner, strictly
+/// increasing physical owner stream) and return the worker's exact formed
+/// groups, which must cover `expected` exactly. Leased workers can merge
+/// WorkerItems; this RPC fixture forms one group per WorkerItem.
+pub(super) fn complete_owner(db: &RemoteDatabase, owner: usize, expected: &[u64]) -> Vec<Vec<u64>> {
+    settle_publication(db, expected);
+    let partition = db.core.config.endpoints[owner].partition;
+    let receipts: Vec<_> = expected
+        .iter()
+        .map(|&sequence| {
+            let receipt = db
+                .core
+                .durable_receipt(sequence)
+                .expect("processed generation retains its receipt");
+            assert_eq!(
+                receipt.appended().version(),
+                BatchVersion {
+                    epoch: db.epoch(),
+                    sequence
+                }
+            );
+            assert_eq!(receipt.appended().address().partition, partition);
+            receipt
+        })
+        .collect();
+    for pair in receipts.windows(2) {
+        let earlier = pair[0].appended().address();
+        let later = pair[1].appended().address();
+        assert!(
+            (earlier.segment_generation, earlier.offset) < (later.segment_generation, later.offset),
+            "correlated callback order must not reorder the physical owner stream"
+        );
+    }
+    let mut groups: Vec<Vec<u64>> = db.core.clients[owner]
+        .accounting
+        .formed_groups
+        .lock()
+        .iter()
+        .filter(|group| group.iter().any(|sequence| expected.contains(sequence)))
+        .cloned()
+        .collect();
+    groups.sort_unstable_by_key(|group| group[0]);
+    assert_eq!(
+        groups.iter().flatten().copied().collect::<Vec<_>>(),
+        expected
+    );
+    groups
+}
+
+/// Publication finalization (slot return, Admission release) follows the
+/// published-floor notification, so tests settle before asserting zero.
+fn settle(db: &RemoteDatabase) {
+    db.core.wait_settled().unwrap();
+}
+
+/// Wait until exactly `batches` admitted generations still hold their
+/// partition charge. Finalization (outcome, key cleanup) precedes that
+/// release, so every other generation has finished its publication pass.
+fn wait_unpublished(db: &RemoteDatabase, batches: usize) {
+    assert!(
+        db.core
+            .admission
+            .wait_charges(Instant::now() + Duration::from_secs(10), |charges| charges
+                .partition_batches
+                == batches),
+        "publication finalization did not complete"
+    );
+}
+
+fn worker_groups(db: &RemoteDatabase, owner: usize) -> usize {
+    db.core.clients[owner]
+        .accounting
+        .groups
+        .load(Ordering::Relaxed)
+}
+
+fn worker_bytes(db: &RemoteDatabase, owner: usize) -> usize {
+    db.core.clients[owner]
+        .accounting
+        .bytes
+        .load(Ordering::Relaxed)
+}
+
+/// Exact worker transport charge for groups whose members have not yet
+/// published (their canonical payload is still retained by the slot).
+fn assert_worker_bytes(db: &RemoteDatabase, owner: usize, groups: usize, sequences: &[u64]) {
+    let batch_bytes: usize = sequences
+        .iter()
+        .map(|&sequence| {
+            db.core
+                .pending_encoded_len(sequence)
+                .expect("unpublished generation retains its payload")
+                + 64
+        })
+        .sum();
+    assert_eq!(worker_bytes(db, owner), groups * 64 + batch_bytes);
+    assert!(worker_bytes(db, owner) <= super::super::tcp::APPEND_SESSION_BYTES - 64 * 1024);
+}
+
+/// Observe submitted RPC flights, not worker-local queued groups. Persistence
+/// is explicitly paused by the caller, so the expected count cannot retire.
+fn wait_for_flights(db: &RemoteDatabase, owner: usize, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let flights = db.core.clients[owner]
+            .client
+            .lock()
+            .append_flights_in_flight();
+        assert!(
+            flights <= expected,
+            "worker exceeded its exact flight window"
+        );
+        if flights == expected {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not submit its ready groups"
+        );
+        thread::yield_now();
+    }
+}
+
 #[test]
 fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     let fixture = Fixture::new();
@@ -315,6 +455,7 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     // Hold every connection before any append is enqueued. This proves a
     // bounded per-node window dispatches groups without waiting for a reply.
     let connections: Vec<_> = db
+        .core
         .clients
         .iter()
         .map(|worker| Arc::clone(&worker.client))
@@ -330,31 +471,68 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
         let version = db.submit(operation, vec![mutation.clone()]).unwrap();
         originals.push((operation, mutation, version));
     }
+    let queued: Vec<_> = db
+        .core
+        .clients
+        .iter()
+        .map(|worker| worker.queue.snapshot())
+        .collect();
     let before = (
-        db.pipeline_stats.early_dispatches,
-        db.pipeline_stats.append_requests,
-        db.pipeline_stats.peak_inflight_nodes,
-        db.inflight.iter().all(|queue| !queue.is_empty()),
-        db.staged.iter().map(VecDeque::len).sum::<usize>(),
-        db.publication.published_prefix().next_sequence(),
-        db.pending_bytes,
-        db.submissions
+        db.core
+            .clients
             .iter()
-            .map(|entry| entry.credit)
-            .sum::<usize>(),
+            .map(|worker| worker.accounting.formed.load(Ordering::Relaxed))
+            .sum::<u64>(),
+        (0..5).map(|owner| worker_groups(&db, owner)).sum::<usize>(),
+        (0..5).map(|owner| worker_bytes(&db, owner)).sum::<usize>(),
+        db.core.published_next(),
+        db.core.admission.charges(),
     );
     drop(held);
-    assert_eq!((before.0, before.1, before.2), (10, 10, 5));
-    assert!(before.3);
-    assert_eq!((before.4, before.5), (12, 0));
-    assert_eq!(before.6, before.7);
-    assert!(before.6 > 0);
+    // Group formation now runs under each worker's client lock: all 32
+    // batches are READY, but no WorkerItem or transport flight exists yet.
+    assert_eq!((before.0, before.1, before.2), (0, 0, 0));
+    for (owner, (head, next, entries)) in queued.iter().enumerate() {
+        let expected: Vec<_> = (0..32u64).filter(|seq| *seq % 5 == owner as u64).collect();
+        assert_eq!((*head, *next), (1, expected.len() as u64 + 1));
+        assert_eq!(
+            *entries,
+            expected
+                .iter()
+                .enumerate()
+                .map(|(offset, &seq)| (offset as u64 + 1, seq, 1))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(before.3, 0);
+    // Callers returned their request/byte credit at submit; each allocated
+    // generation keeps its slot, index and partition charges until published.
+    assert_eq!((before.4.requests, before.4.bytes), (0, 0));
+    assert_eq!(before.4.slots, 32);
+    assert_eq!(before.4.partition_batches, 32);
+    assert!(before.4.index_bytes > 0);
+    // Owner populations are 7,7,6,6,6; max_batches=2 yields exactly
+    // 4+4+3+3+3=17 WorkerItems, including the two one-member tails.
+    for owner in 0..5 {
+        let sequences: Vec<_> = (0..32u64).filter(|seq| *seq % 5 == owner as u64).collect();
+        let expected: Vec<_> = sequences.chunks(2).map(<[u64]>::to_vec).collect();
+        assert_eq!(complete_owner(&db, owner, &sequences), expected);
+        assert_eq!(
+            db.core.clients[owner]
+                .accounting
+                .formed
+                .load(Ordering::Relaxed),
+            expected.len() as u64
+        );
+    }
     db.drain().unwrap();
-    assert!(db.inflight.iter().all(VecDeque::is_empty));
-    assert!(db.staged.iter().all(VecDeque::is_empty));
-    assert_eq!(db.publication.published_prefix().next_sequence(), 32);
-    assert_eq!(db.pending_bytes, 0);
-    assert_eq!(db.reserved_index_bytes, 0);
+    settle(&db);
+    assert_eq!(db.core.published_next(), 32);
+    let charges = db.core.admission.charges();
+    assert_eq!(
+        (charges.slots, charges.bytes, charges.index_bytes),
+        (0, 0, 0)
+    );
     for key in 0..32u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
     }
@@ -390,12 +568,12 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     }
     // The same original ID never creates a new version or overwrites newer state.
     let (operation, mutation, version) = &originals[0];
-    let admissions = db.stats.admitted_batches;
+    let admissions = db.stats().admitted_batches;
     assert_eq!(
         db.submit(*operation, vec![mutation.clone()]).unwrap(),
         *version
     );
-    assert_eq!(db.stats.admitted_batches, admissions);
+    assert_eq!(db.stats().admitted_batches, admissions);
     db.drain().unwrap();
     assert_eq!(value(&mut db, 0), Some(vec![99; 32]));
     assert_eq!(db.scan(KeySpace(0)).unwrap().len(), 31);
@@ -412,113 +590,75 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
         reopened.submit(*operation, vec![mutation.clone()]).unwrap(),
         *version
     );
-    assert_eq!(reopened.stats.admitted_batches, 0);
+    assert_eq!(reopened.stats().admitted_batches, 0);
     reopened.shutdown().unwrap();
 }
 
+/// Writes take no sparse-view quota: the publisher's standing budget, reserved
+/// at open, covers every view install. With all remaining view quota taken
+/// and a full window in flight, reserved view bytes stay constant and every
+/// sparse replacement under writer → publisher still succeeds.
 #[test]
-fn exhausted_publication_view_budget_rejects_before_admission_and_allows_retry() {
+fn full_window_in_flight_takes_no_view_quota_and_sparse_replacements_never_fail() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
-    let sentinel_operation = fixture.operation(0, 39);
-    let sentinel = db.submit(sentinel_operation, vec![put(39, 39)]).unwrap();
-    let max_excluded = db.config.max_pending_batches - 1;
     let mut reservations = Vec::new();
     loop {
-        match db.index.reserve_publication_view(max_excluded) {
+        match db.core.index.reserve_publication_view(1) {
             Ok(reservation) => reservations.push(reservation),
             Err(super::super::native_index::NativeIndexError::Capacity) => break,
             Err(error) => panic!("unexpected reservation failure: {error}"),
         }
     }
-    assert!(!reservations.is_empty());
-    // Consume the remainder with one-exclusion reservations: one max-sized
-    // reservation may leave enough slack for the smaller next-window charges.
-    let mut small_reservations = Vec::new();
-    loop {
-        match db.index.reserve_publication_view(1) {
-            Ok(reservation) => small_reservations.push(reservation),
-            Err(super::super::native_index::NativeIndexError::Capacity) => break,
-            Err(error) => panic!("unexpected reservation failure: {error}"),
+    let reserved = db.core.index.stats().transient_metadata_bytes;
+    let held_connection = Arc::clone(&db.core.clients[0].client);
+    let held = held_connection.lock();
+    let window = db.core.config.max_pending_batches - 1;
+    let first = db
+        .submit(fixture.operation(0, 1000), vec![put(1000, 1)])
+        .unwrap();
+    let mut later = Vec::with_capacity(window - 1);
+    let mut reader_view = None;
+    for n in 1..window as u64 {
+        let owner = 1 + (n % 4) as u32;
+        let key = 1000 + n as u32;
+        let version = db
+            .submit(fixture.operation(owner, 1000 + n), vec![put(key, n as u8)])
+            .unwrap();
+        later.push(version.sequence);
+        assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
+        if n == window as u64 / 2 {
+            settle_publication(&db, &later);
+            // A reader-held replaced view keeps only its floor pin.
+            reader_view = Some(db.core.index.latest_cut());
         }
     }
-
-    let operation = fixture.operation(0, 40);
-    let id = BatchId {
-        database: fixture.config.storage.database,
-        operation,
-    };
-    let next = db.submission_next();
-    let prefix = db.publication.published_prefix().next_sequence();
-    let appends = db.pipeline_stats.append_requests;
-    let active = db.active_identities.len();
-    let submissions = db.submissions.len();
-    let writers: usize = db.pending_writers.values().map(|table| table.len()).sum();
-    let pending_bytes = db.pending_bytes;
-    let reserved_index_bytes = db.reserved_index_bytes;
-    let staged: Vec<_> = db.staged.iter().map(|queue| queue.len()).collect();
-    let inflight: Vec<_> = db.inflight.iter().map(|queue| queue.len()).collect();
-    let sentinel_id = BatchId {
-        database: fixture.config.storage.database,
-        operation: sentinel_operation,
-    };
-    assert!(
-        !fixture.nodes[0]
-            .contains_batch(db.epoch, sentinel_id)
-            .unwrap()
-    );
-    assert!(!fixture.nodes[0].contains_batch(db.epoch, id).unwrap());
-    let error = db.submit(operation, vec![put(40, 42)]).unwrap_err();
-    assert!(error.uncertain_version.is_none());
-    assert!(db.healthy);
-    assert_eq!(db.submission_next(), next);
-    assert_eq!(db.publication.published_prefix().next_sequence(), prefix);
-    assert_eq!(db.active_identities.len(), active);
-    assert_eq!(db.submissions.len(), submissions);
-    assert_eq!(
-        db.pending_writers
-            .values()
-            .map(|table| table.len())
-            .sum::<usize>(),
-        writers
-    );
-    assert_eq!(db.pending_bytes, pending_bytes);
-    assert_eq!(db.reserved_index_bytes, reserved_index_bytes);
-    assert_eq!(
-        db.staged
-            .iter()
-            .map(|queue| queue.len())
-            .collect::<Vec<_>>(),
-        staged
-    );
-    assert_eq!(
-        db.inflight
-            .iter()
-            .map(|queue| queue.len())
-            .collect::<Vec<_>>(),
-        inflight
-    );
-    assert_eq!(db.pipeline_stats.append_requests, appends);
-    assert!(!fixture.nodes[0].contains_batch(db.epoch, id).unwrap());
-    assert!(
-        !fixture.nodes[0]
-            .contains_batch(db.epoch, sentinel_id)
-            .unwrap()
-    );
-
-    drop(reservations.pop().unwrap());
-    let version = db.submit(operation, vec![put(40, 42)]).unwrap();
-    assert_eq!(
-        version.sequence, next,
-        "rejection must not advance the clock"
-    );
+    settle_publication(&db, &later);
+    for &sequence in &later {
+        assert!(db.core.is_published(BatchVersion {
+            epoch: db.epoch(),
+            sequence,
+        }));
+    }
+    assert!(!db.core.is_published(first));
+    assert!(matches!(reader_view, Some(IndexReadCut::Sparse(_))));
+    assert!(matches!(
+        db.core.index.latest_cut(),
+        IndexReadCut::Sparse(_)
+    ));
+    assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
+    assert!(db.core.ensure_healthy().is_ok());
+    drop(held);
     db.drain().unwrap();
-    assert_eq!(sentinel.sequence + 1, version.sequence);
-    assert_eq!(value(&mut db, 39), Some(vec![39; 32]));
-    assert_eq!(value(&mut db, 40), Some(vec![42; 32]));
-    assert!(fixture.nodes[0].contains_batch(db.epoch, id).unwrap());
+    assert!(matches!(db.core.index.latest_cut(), IndexReadCut::At(_)));
+    drop(reader_view);
+    assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
+    assert_eq!(value(&mut db, 1000), Some(vec![1; 32]));
+    assert_eq!(
+        value(&mut db, 1000 + window as u32 - 1),
+        Some(vec![(window - 1) as u8; 32])
+    );
     drop(reservations);
-    drop(small_reservations);
     db.shutdown().unwrap();
 }
 
@@ -528,29 +668,32 @@ fn active_checkpoint_capture_and_sparse_publication_have_separate_budgets() {
     let mut db = fixture.open();
     db.write_batch(fixture.operation(2, 50), vec![put(50, 50)])
         .unwrap();
-    let max_excluded = db.config.max_pending_batches - 1;
+    let max_excluded = db.core.config.max_pending_batches - 1;
     let mut reservations = Vec::new();
     loop {
-        match db.index.reserve_publication_view(max_excluded) {
+        match db.core.index.reserve_publication_view(max_excluded) {
             Ok(reservation) => reservations.push(reservation),
             Err(super::super::native_index::NativeIndexError::Capacity) => break,
             Err(error) => panic!("unexpected reservation failure: {error}"),
         }
     }
     assert!(reservations.len() >= 3);
-    let before_capture = db.index.stats().transient_metadata_bytes;
+    let before_capture = db.core.index.stats().transient_metadata_bytes;
     let capture = db
+        .core
         .index
         .writer()
         .prepare_image(IndexReadCut::Latest)
         .unwrap();
-    assert!(db.index.stats().transient_metadata_bytes > before_capture);
+    assert!(db.core.index.stats().transient_metadata_bytes > before_capture);
     for _ in 0..3 {
         drop(reservations.pop().unwrap());
     }
 
-    let blocked = Arc::clone(&db.clients[0].client);
+    let blocked = Arc::clone(&db.core.clients[0].client);
     let guard = blocked.lock();
+    let later_connection = Arc::clone(&db.core.clients[1].client);
+    let later_guard = later_connection.lock();
     let first = db
         .submit(fixture.operation(0, 51), vec![put(51, 51)])
         .unwrap();
@@ -559,17 +702,13 @@ fn active_checkpoint_capture_and_sparse_publication_have_separate_budgets() {
         .unwrap();
     db.submit(fixture.operation(1, 53), vec![put(53, 53)])
         .unwrap();
-    let group = db.inflight[1].pop_front().unwrap();
-    db.inflight_bytes[1] -= group.charge;
-    let receipts = group
-        .reply
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    db.accept_receipts(receipts).unwrap();
-    db.publish_completed().unwrap();
-    let first_published = db.publication.is_published(first);
-    let later_published = db.publication.is_published(later);
+    drop(later_guard);
+    assert_eq!(
+        complete_owner(&db, 1, &[later.sequence, later.sequence + 1]),
+        vec![vec![later.sequence, later.sequence + 1]]
+    );
+    let first_published = db.core.is_published(first);
+    let later_published = db.core.is_published(later);
     let later_value = value(&mut db, 52);
     let first_value = value(&mut db, 51);
     drop(guard);
@@ -581,7 +720,13 @@ fn active_checkpoint_capture_and_sparse_publication_have_separate_budgets() {
     db.drain().unwrap();
     assert_eq!(value(&mut db, 51), Some(vec![51; 32]));
     drop(capture);
-    assert!(db.index.writer().cleanup_failed_capture_step(32).unwrap());
+    assert!(
+        db.core
+            .index
+            .writer()
+            .cleanup_failed_capture_step(32)
+            .unwrap()
+    );
     db.shutdown().unwrap();
 }
 
@@ -601,9 +746,9 @@ fn nonempty_dependency_tables_shrink_while_a_prefix_holds_window_credit() {
         value: vec![space + 1; 32].into(),
     };
 
-    let first_client = Arc::clone(&db.clients[0].client);
+    let first_client = Arc::clone(&db.core.clients[0].client);
     let first_guard = first_client.lock();
-    let suffix_client = Arc::clone(&db.clients[1].client);
+    let suffix_client = Arc::clone(&db.core.clients[1].client);
     let suffix_guard = suffix_client.lock();
     let sentinel = db
         .submit(
@@ -618,54 +763,42 @@ fn nonempty_dependency_tables_shrink_while_a_prefix_holds_window_credit() {
         )
         .unwrap();
     }
-    for space in [KeySpace(0), KeySpace(1)] {
-        let writers = &db.pending_writers[&space];
-        assert_eq!(writers.len(), 33);
-        assert!(writers.capacity() > 4);
-    }
-    assert_eq!(db.submissions.len(), 33);
-    assert_eq!(db.inflight[1].len(), 2);
-    assert_eq!(db.staged[1].len(), 28);
-    drop(suffix_guard);
-    while !db.inflight[1].is_empty() || !db.staged[1].is_empty() {
-        db.progress_pipeline(false).unwrap();
-        let Some(group) = db.inflight[1].pop_front() else {
-            continue;
-        };
-        db.inflight_bytes[1] -= group.charge;
-        let receipts = group
-            .reply
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-        db.accept_receipts(receipts).unwrap();
-        db.publish_completed().unwrap();
-        db.progress_pipeline(false).unwrap();
-    }
-    assert!(!db.publication.is_published(sentinel));
-    assert_eq!(db.publication.published_prefix().next_sequence(), 0);
-    assert_eq!(db.submissions.len(), 33);
+    // One sharded registry covers both keyspaces: 33 batches × 2 keys.
+    assert_eq!(db.core.pending_dependencies(), 66);
+    assert!(db.core.dependency_capacity() > 4 * 2);
+    assert_eq!(db.core.retained_slots(), 33);
+    assert_eq!(worker_groups(&db, 1), 0);
+    assert_eq!(worker_bytes(&db, 1), 0);
+    let (head, next, entries) = db.core.clients[1].queue.snapshot();
+    assert_eq!((head, next), (1, 33));
     assert_eq!(
-        db.submissions
-            .iter()
-            .filter(|entry| entry.batch.is_some())
-            .count(),
-        1
+        entries,
+        (1..=32).map(|seq| (seq, seq, 2)).collect::<Vec<_>>()
     );
-    for space in [KeySpace(0), KeySpace(1)] {
-        let writers = &db.pending_writers[&space];
-        assert_eq!(writers.len(), 1);
-        assert!(writers.capacity() <= 4 * writers.len());
-    }
+    drop(suffix_guard);
+    let sequences: Vec<_> = (1..=32).collect();
+    assert_eq!(
+        complete_owner(&db, 1, &sequences),
+        sequences.chunks(2).map(<[u64]>::to_vec).collect::<Vec<_>>()
+    );
+    // Key cleanup follows publication; the sentinel keeps one partition charge.
+    wait_unpublished(&db, 1);
+    assert!(!db.core.is_published(sentinel));
+    assert_eq!(db.core.published_next(), 0);
+    assert_eq!(db.core.retained_slots(), 33);
+    assert_eq!(db.core.unresolved_slots(), 1);
+    assert_eq!(db.core.pending_dependencies(), 2);
+    assert!(db.core.dependency_capacity() <= 4 * db.core.pending_dependencies());
     assert!(
         db.submit(fixture.operation(2, 200), vec![mutation(0, 100)])
             .is_err()
     );
-    assert!(db.healthy);
-    assert_eq!(db.submission_next(), 33);
+    assert!(db.core.ensure_healthy().is_ok());
+    assert_eq!(db.core.next_sequence(), 33);
     drop(first_guard);
     db.drain().unwrap();
-    assert!(db.pending_writers.is_empty());
+    settle(&db);
+    assert_eq!(db.core.pending_dependencies(), 0);
     db.submit(fixture.operation(2, 200), vec![mutation(0, 100)])
         .unwrap();
     db.drain().unwrap();
@@ -678,45 +811,45 @@ fn sparse_publication_retains_bounded_window_until_earlier_prefix_publishes() {
     let mut fixture = Fixture::new();
     fixture.config.max_pending_batches = 4;
     let mut db = fixture.open();
-    let blocked = Arc::clone(&db.clients[0].client);
+    let blocked = Arc::clone(&db.core.clients[0].client);
     let guard = blocked.lock();
+    let later_connection = Arc::clone(&db.core.clients[1].client);
+    let later_guard = later_connection.lock();
     let first = fixture.operation(0, 0);
     let version = db.submit(first, vec![put(0, 1)]).unwrap();
     db.submit(fixture.operation(0, 1), vec![put(1, 2)]).unwrap();
     db.submit(fixture.operation(1, 2), vec![put(2, 3)]).unwrap();
     db.submit(fixture.operation(1, 3), vec![put(3, 4)]).unwrap();
-    let credits = db.pending_bytes;
-    let dispatches = db.pipeline_stats.early_dispatches;
-    // Observe the later group's real durable reply, deliberately leaving node 0
-    // blocked. No sleep or assumed persistence timing determines this ordering.
-    let later = db.inflight[1].pop_front().unwrap();
-    db.inflight_bytes[1] -= later.charge;
-    let receipts = later
-        .reply
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    db.accept_receipts(receipts).unwrap();
-    db.publish_completed().unwrap();
-    let prefix = db.publication.published_prefix().next_sequence();
-    let pending = db.pending_bytes;
-    let retained = db.submissions.len();
-    let unpublished = db
-        .submissions
-        .iter()
-        .filter(|entry| entry.batch.is_some())
-        .count();
+    let credits = db.core.admission.charges();
+    // The two later READY batches form one WorkerItem only after their
+    // owner's lock is released; they are not authority-dispatched groups.
+    assert_eq!(
+        db.core.clients[1].queue.snapshot(),
+        (1, 3, vec![(1, 2, 1), (2, 3, 1)])
+    );
+    assert_eq!(worker_groups(&db, 1), 0);
+    assert_eq!(worker_bytes(&db, 1), 0);
+    drop(later_guard);
+    assert_eq!(complete_owner(&db, 1, &[2, 3]), vec![vec![2, 3]]);
+    wait_unpublished(&db, 2);
+    let prefix = db.core.published_next();
+    let pending = db.core.admission.charges();
+    let retained = db.core.retained_slots();
+    let unpublished = db.core.unresolved_slots();
     let later_value = db.get(KeySpace(0), &2u32.to_be_bytes());
     let retry = db.submit(first, vec![put(0, 1)]);
     let conflicting_retry = db.submit(first, vec![put(0, 9)]);
     let excess = db.submit(fixture.operation(2, 4), vec![put(4, 5)]);
-    let next = db.submission_next();
-    let healthy = db.healthy;
+    let next = db.core.next_sequence();
+    let healthy = db.core.ensure_healthy().is_ok();
     drop(guard);
-    assert_eq!(dispatches, 2);
-    assert!(credits > 0);
+    // Published batches return their index charge; their slots stay behind
+    // the unresolved prefix, so the bounded window remains fully charged.
+    assert_eq!(credits.slots, 4);
+    assert!(credits.index_bytes > 0);
     assert_eq!(prefix, 0);
-    assert!(pending < credits);
+    assert_eq!(pending.slots, 4);
+    assert!(pending.index_bytes < credits.index_bytes);
     assert_eq!(retained, 4);
     assert_eq!(unpublished, 2);
     assert_eq!(later_value.unwrap().unwrap().as_ref(), &[3; 32]);
@@ -726,12 +859,16 @@ fn sparse_publication_retains_bounded_window_until_earlier_prefix_publishes() {
     assert_eq!(next, 4);
     assert!(healthy);
     db.drain().unwrap();
-    assert_eq!(db.publication.published_prefix().next_sequence(), 4);
-    assert_eq!(db.pending_bytes, 0);
-    assert_eq!(db.reserved_index_bytes, 0);
-    assert!(db.submissions.is_empty());
-    assert_eq!(db.publication.retained_batches(), 0);
-    assert!(db.pending_writers.is_empty());
+    settle(&db);
+    assert_eq!(db.core.published_next(), 4);
+    let charges = db.core.admission.charges();
+    assert_eq!(
+        (charges.bytes, charges.index_bytes, charges.slots),
+        (0, 0, 0)
+    );
+    assert_eq!(db.core.retained_slots(), 0);
+    assert_eq!(db.core.unresolved_slots(), 0);
+    assert_eq!(db.core.pending_dependencies(), 0);
     assert_eq!(value(&mut db, 2), Some(vec![3; 32]));
     db.submit(fixture.operation(2, 4), vec![put(4, 5)]).unwrap();
     db.drain().unwrap();
@@ -741,26 +878,15 @@ fn sparse_publication_retains_bounded_window_until_earlier_prefix_publishes() {
 
 #[test]
 fn conflicting_and_transitive_batches_wait_for_their_whole_predecessors() {
-    let wait_for_receipts = |db: &mut RemoteDatabase, expected| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            db.progress_pipeline(false).unwrap();
-            if db.pipeline_stats.durable_batches == expected {
-                break;
-            }
-            assert!(Instant::now() < deadline, "owner replies did not complete");
-            let _ = db
-                .completion_wake
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
-        }
-    };
     for (transitive, harvest_before_last) in
         [(false, false), (false, true), (true, false), (true, true)]
     {
         let fixture = Fixture::new();
         let mut db = fixture.open();
-        let connection = Arc::clone(&db.clients[0].client);
+        let connection = Arc::clone(&db.core.clients[0].client);
         let held = connection.lock();
+        let last_connection = Arc::clone(&db.core.clients[2].client);
+        let last_guard = last_connection.lock();
         let first = db
             .submit(fixture.operation(0, 10), vec![put(0, 1)])
             .unwrap();
@@ -782,20 +908,20 @@ fn conflicting_and_transitive_batches_wait_for_their_whole_predecessors() {
         db.submit(fixture.operation(1, 13), vec![put(10, 10)])
             .unwrap();
         if harvest_before_last {
-            // Force the reply to be harvested before the next submit, which
-            // can also harvest it during normal admission.
-            wait_for_receipts(&mut db, 2);
-            assert!(db.inflight[1].is_empty());
+            // Force owner 1's real receipts to be processed before the next
+            // submit; its worker has consumed both READY queue entries.
+            settle_publication(&db, &[second.sequence, second.sequence + 2]);
+            assert!(db.core.clients[1].queue.snapshot().2.is_empty());
         }
         db.submit(fixture.operation(2, 14), vec![put(11, 11)])
             .unwrap();
-        // Admission may already have harvested either owner's reply. Wait for
-        // all four receipts without flushing the blocked first owner's tail.
-        wait_for_receipts(&mut db, 4);
+        drop(last_guard);
+        // Wait for all four receipts without flushing the blocked first owner.
+        settle_publication(&db, &[1, 2, 3, 4]);
         let before = (
-            db.publication.is_published(first),
-            db.publication.is_published(second),
-            db.publication.is_published(third),
+            db.core.is_published(first),
+            db.core.is_published(second),
+            db.core.is_published(third),
             db.get(KeySpace(0), &0u32.to_be_bytes()),
             db.get(KeySpace(0), &1u32.to_be_bytes()),
             db.get(KeySpace(0), &10u32.to_be_bytes()),
@@ -815,8 +941,9 @@ fn conflicting_and_transitive_batches_wait_for_their_whole_predecessors() {
         if transitive {
             assert_eq!(value(&mut db, 1), Some(vec![4; 32]));
         }
-        assert!(db.submissions.is_empty());
-        assert_eq!(db.publication.retained_batches(), 0);
+        settle(&db);
+        assert_eq!(db.core.retained_slots(), 0);
+        assert_eq!(db.core.unresolved_slots(), 0);
         db.shutdown().unwrap();
     }
 }
@@ -832,8 +959,10 @@ fn distinct_keys_with_same_native_reduction_cannot_publish_out_of_order() {
     );
     let fixture = Fixture::new_with_shape(128, shape);
     let mut db = fixture.open();
-    let connection = Arc::clone(&db.clients[0].client);
+    let connection = Arc::clone(&db.core.clients[0].client);
     let held = connection.lock();
+    let later_connection = Arc::clone(&db.core.clients[1].client);
+    let later_guard = later_connection.lock();
     let mutation = |key: [u8; 8], value: u8| Mutation::Put {
         keyspace: KeySpace(0),
         key: key.to_vec().into(),
@@ -849,16 +978,12 @@ fn distinct_keys_with_same_native_reduction_cannot_publish_out_of_order() {
         .unwrap();
     db.submit(fixture.operation(1, 22), vec![mutation(other_key, 3)])
         .unwrap();
-    let group = db.inflight[1].pop_front().unwrap();
-    db.inflight_bytes[1] -= group.charge;
-    let receipts = group
-        .reply
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    db.accept_receipts(receipts).unwrap();
-    db.publish_completed().unwrap();
-    let second_published = db.publication.is_published(second);
+    drop(later_guard);
+    assert_eq!(
+        complete_owner(&db, 1, &[second.sequence, second.sequence + 1]),
+        vec![vec![second.sequence, second.sequence + 1]]
+    );
+    let second_published = db.core.is_published(second);
     let independent = db.get(KeySpace(0), &other_key);
     drop(held);
     assert!(!second_published);
@@ -881,15 +1006,20 @@ fn lost_append_response_blocks_cached_reads_and_reopen_recovers_uncertain_group(
     assert_eq!(value(&mut db, 0), Some(vec![1; 32]));
     assert_eq!(value(&mut db, 0), Some(vec![1; 32]));
     assert!(db.read_cache_stats().hits > 0);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 2);
+    assert_eq!(db.core.published_next(), 2);
     fixture.nodes[2].inject_drop_next_append_response();
+    let connection = Arc::clone(&db.core.clients[2].client);
+    let held = connection.lock();
     let operation = fixture.operation(2, 2);
     let version = db.submit(operation, vec![put(2, 3)]).unwrap();
     db.submit(fixture.operation(2, 3), vec![put(3, 4)]).unwrap();
+    drop(held);
     assert!(db.drain().is_err());
-    assert!(!db.healthy);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 2);
-    assert!(db.pending_bytes > 0);
+    assert!(db.core.ensure_healthy().is_err());
+    assert_eq!(db.core.published_next(), 2);
+    // UNKNOWN generations never return their slot or index charge.
+    let charges = db.core.admission.charges();
+    assert!(charges.slots > 0 && charges.index_bytes > 0);
     // A verified hot-cache record cannot let an unhealthy authority keep serving.
     let hits = db.read_cache_stats().hits;
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
@@ -906,7 +1036,7 @@ fn lost_append_response_blocks_cached_reads_and_reopen_recovers_uncertain_group(
         reopened.submit(operation, vec![put(2, 3)]).unwrap(),
         version
     );
-    assert_eq!(reopened.stats.admitted_batches, 0);
+    assert_eq!(reopened.stats().admitted_batches, 0);
     reopened.shutdown().unwrap();
 }
 
@@ -926,9 +1056,13 @@ fn observed_stale_epoch_read_stops_authority_before_any_later_cache_hit() {
     // authority has no background lease protocol: this test begins its safety
     // assertion when an uncached RPC actually observes that its epoch is stale.
     let next_epoch = db.epoch() + 1;
-    db.clients[0].client.lock().fence_to(next_epoch).unwrap();
+    db.core.clients[0]
+        .client
+        .lock()
+        .fence_to(next_epoch)
+        .unwrap();
     assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
-    assert!(!db.healthy);
+    assert!(db.core.ensure_healthy().is_err());
     let hits = db.read_cache_stats().hits;
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert!(db.get_profiled(KeySpace(0), &0u32.to_be_bytes()).is_err());
@@ -940,8 +1074,8 @@ fn observed_stale_epoch_read_stops_authority_before_any_later_cache_hit() {
 fn drain_refills_a_ready_node_while_the_first_logical_group_is_stalled() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
-    let first_connection = Arc::clone(&db.clients[0].client);
-    let later_connection = Arc::clone(&db.clients[1].client);
+    let first_connection = Arc::clone(&db.core.clients[0].client);
+    let later_connection = Arc::clone(&db.core.clients[1].client);
     let first_guard = first_connection.lock();
     let later_guard = later_connection.lock();
     for key in 0..6u32 {
@@ -952,72 +1086,56 @@ fn drain_refills_a_ready_node_while_the_first_logical_group_is_stalled() {
         )
         .unwrap();
     }
-    let before = (
-        !db.inflight[0].is_empty() && !db.inflight[1].is_empty(),
-        db.inflight[1].len(),
-        db.staged[1].is_empty(),
-        db.publication.published_prefix().next_sequence(),
+    assert_eq!(
+        db.core.clients[0].queue.snapshot(),
+        (1, 3, vec![(1, 0, 1), (2, 1, 1)])
     );
-
-    // A separate authenticated observer reads the storage group's durable count;
-    // it does not hold or alter the authority's worker connection or replies.
-    let endpoint = &fixture.config.endpoints[1];
-    let mut tls = fixture.config.tls.clone();
-    tls.server_name = endpoint.server_name.clone();
-    let mut observer = Client::connect(
-        &endpoint.address,
-        &tls,
-        Duration::from_secs(5),
-        fixture.config.partition_config(1, endpoint.partition),
-        &fixture.shape,
-    )
-    .unwrap();
+    assert_eq!(
+        db.core.clients[1].queue.snapshot(),
+        (1, 5, vec![(1, 2, 1), (2, 3, 1), (3, 4, 1), (4, 5, 1)])
+    );
+    assert_eq!((worker_groups(&db, 0), worker_groups(&db, 1)), (0, 0));
+    assert_eq!(db.core.published_next(), 0);
+    drop(later_guard);
+    // The worker drains both ready pairs without an authority refill pass.
+    // Owner 0 is still locked throughout both real completion callbacks.
+    assert_eq!(
+        complete_owner(&db, 1, &[2, 3, 4, 5]),
+        vec![vec![2, 3], vec![4, 5]]
+    );
+    assert_eq!(
+        db.core.clients[1].accounting.formed.load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(db.core.published_next(), 0);
+    for key in 2..6u32 {
+        assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
+    }
+    let (entered, entering) = mpsc::sync_channel(1);
+    db.core.test_hooks.lock().drain_wait_entered = Some(entered);
     let (finished, completion) = mpsc::sync_channel(1);
     let drainer = thread::spawn(move || {
         let result = db.drain();
         assert!(finished.send((db, result)).is_ok());
     });
-    drop(later_guard);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut premature = None;
-    let refilled = loop {
-        if let Ok(result) = completion.try_recv() {
-            premature = Some(result);
-            break false;
-        }
-        if observer.stats().unwrap().appended_groups == 2 {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        // This is a bounded progress assertion, not a latency comparison. The
-        // earlier group's explicit guard remains held for the entire observation.
-        thread::sleep(Duration::from_millis(1));
-    };
-    if premature.is_none() {
-        premature = completion.try_recv().ok();
-    }
-    let returned_before_gap_completed = premature.is_some();
-    drop(first_guard);
-    let (mut db, result) = match premature {
-        Some(result) => result,
-        None => completion.recv_timeout(Duration::from_secs(10)).unwrap(),
-    };
-    drainer.join().unwrap();
-    assert!(before.0 && before.2);
-    assert_eq!((before.1, before.3), (2, 0));
-    result.unwrap();
+    // The signal comes from drain's unresolved-work completion wait, not
+    // thread startup. Owner 0 remains locked throughout this observation.
+    entering.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(
-        refilled,
-        "a later node must receive its next group while the earliest node is stalled"
-    );
-    assert!(
-        !returned_before_gap_completed,
+        matches!(completion.try_recv(), Err(mpsc::TryRecvError::Empty)),
         "drain must not acknowledge beyond the unresolved prefix"
     );
-    assert_eq!(db.publication.published_prefix().next_sequence(), 6);
-    assert_eq!(db.pending_bytes, 0);
+    drop(first_guard);
+    let (mut db, result) = completion.recv_timeout(Duration::from_secs(10)).unwrap();
+    drainer.join().unwrap();
+    result.unwrap();
+    assert_eq!(db.core.published_next(), 6);
+    settle(&db);
+    let charges = db.core.admission.charges();
+    assert_eq!(
+        (charges.bytes, charges.slots, charges.index_bytes),
+        (0, 0, 0)
+    );
     for key in 0..6u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
     }
@@ -1025,40 +1143,59 @@ fn drain_refills_a_ready_node_while_the_first_logical_group_is_stalled() {
 }
 
 #[test]
-fn lone_direct_append_keeps_durability_and_unknown_response_recovery_rules() {
+fn lone_worker_append_keeps_durability_and_unknown_response_recovery_rules() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
     let first_operation = fixture.operation(0, 0);
     let first_version = db.write_batch(first_operation, vec![put(0, 17)]).unwrap();
-    assert_eq!(db.pipeline_stats.direct_appends, 1);
-    assert_eq!(db.pipeline_stats.append_requests, 1);
-    assert_eq!(db.pipeline_stats.early_dispatches, 0);
-    assert!(db.inflight.iter().all(VecDeque::is_empty));
-    assert!(db.staged.iter().all(VecDeque::is_empty));
-    assert!(db.staged_bytes.iter().all(|bytes| *bytes == 0));
-    assert_eq!(db.pending_bytes, 0);
-    assert_eq!(db.reserved_index_bytes, 0);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 1);
-    assert!(db.healthy);
+    // Acquire the worker lock after the callback before sampling released
+    // transport credits; receipt delivery can precede GroupCompletion::drop.
+    let connection = Arc::clone(&db.core.clients[0].client);
+    let settled = connection.lock();
+    // A lone batch uses the same worker queue and one-member WorkerItem as
+    // every other write; the removed direct authority path has no counter.
+    assert_eq!(
+        db.core.clients[0].accounting.formed.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(db.core.clients[0].queue.snapshot(), (2, 2, vec![]));
+    assert_eq!(worker_groups(&db, 0), 0);
+    assert_eq!(worker_bytes(&db, 0), 0);
+    settle(&db);
+    let charges = db.core.admission.charges();
+    assert_eq!(
+        (charges.bytes, charges.slots, charges.index_bytes),
+        (0, 0, 0)
+    );
+    assert_eq!(db.core.published_next(), 1);
+    assert!(db.core.ensure_healthy().is_ok());
+    drop(settled);
     assert_eq!(value(&mut db, 0), Some(vec![17; 32]));
     assert_eq!(value(&mut db, 0), Some(vec![17; 32]));
     assert!(db.read_cache_stats().hits > 0);
 
-    // The direct caller path reaches the exact same durable storage operation.
-    // Losing its response cannot refund the batch or keep cached reads serving.
+    // Losing the worker's response cannot refund the batch or keep cached
+    // reads serving, exactly as for a multi-member frame.
     fixture.nodes[1].inject_drop_next_append_response();
     let uncertain_operation = fixture.operation(1, 1);
     let uncertain_version = db.submit(uncertain_operation, vec![put(1, 231)]).unwrap();
-    assert_eq!(db.pipeline_stats.direct_appends, 1);
+    assert_eq!(
+        db.core.clients[0].accounting.formed.load(Ordering::Relaxed),
+        1
+    );
     let error = db.drain().unwrap_err();
     assert_eq!(error.uncertain_version, Some(uncertain_version));
-    assert_eq!(db.pipeline_stats.direct_appends, 2);
-    assert_eq!(db.pipeline_stats.append_requests, 2);
-    assert!(!db.healthy);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 1);
-    assert_eq!(db.staged[1].len(), 1);
-    assert!(db.staged_bytes[1] > 0);
-    assert!(db.pending_bytes > 0 && db.reserved_index_bytes > 0);
+    assert_eq!(
+        db.core.clients[1].accounting.formed.load(Ordering::Relaxed),
+        1
+    );
+    assert!(db.core.ensure_healthy().is_err());
+    assert_eq!(db.core.published_next(), 1);
+    // UNKNOWN retains publication/admission charges; the worker has consumed
+    // owner generation 1 into its failed frame.
+    assert_eq!(db.core.clients[1].queue.snapshot(), (2, 2, vec![]));
+    let charges = db.core.admission.charges();
+    assert!(charges.slots > 0 && charges.index_bytes > 0);
     let hits = db.read_cache_stats().hits;
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert_eq!(db.read_cache_stats().hits, hits);
@@ -1079,13 +1216,13 @@ fn lone_direct_append_keeps_durability_and_unknown_response_recovery_rules() {
             .unwrap(),
         uncertain_version
     );
-    assert_eq!(reopened.stats.admitted_batches, 0);
-    assert_eq!(reopened.pipeline_stats.append_requests, 0);
+    assert_eq!(reopened.stats().admitted_batches, 0);
+    assert_eq!(reopened.pipeline_stats().append_requests, 0);
     reopened.shutdown().unwrap();
 }
 
 #[test]
-fn parallel_preparation_preserves_order_retries_and_complete_recovery() {
+fn submit_many_preserves_order_retries_and_complete_recovery() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
     let known = fixture.operation(0, 0);
@@ -1109,32 +1246,31 @@ fn parallel_preparation_preserves_order_retries_and_complete_recovery() {
         versions.iter().map(|v| v.sequence).collect::<Vec<_>>(),
         [0, 2, 1, 2, 3]
     );
-    assert_eq!(db.stats.admitted_batches, 4);
-    assert_eq!(db.pipeline_stats.parallel_prepared_batches, 5);
-    assert!(db.pipeline_stats.prepare_reserved_bytes_peak <= fixture.config.max_pending_bytes);
+    assert_eq!(db.stats().admitted_batches, 4);
     db.drain().unwrap();
-    assert_eq!(db.pending_bytes, 0);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 4);
+    settle(&db);
+    assert_eq!(db.core.admission.charges().bytes, 0);
+    assert_eq!(db.core.published_next(), 4);
     for key in 0..4 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8 + 7; 32]));
     }
     db.shutdown().unwrap();
     drop(db);
-    let mut reopened = fixture.open();
+    let reopened = fixture.open();
     assert_eq!(reopened.submit_many(&window).unwrap(), versions);
-    assert_eq!(reopened.stats.admitted_batches, 0);
-    assert_eq!(reopened.pipeline_stats.append_requests, 0);
+    assert_eq!(reopened.stats().admitted_batches, 0);
+    assert_eq!(reopened.pipeline_stats().append_requests, 0);
     reopened.shutdown().unwrap();
 }
 
 #[test]
-fn parallel_preparation_rejects_late_conflicts_without_admitting_a_prefix() {
+fn submit_many_rejects_late_conflicts_without_admitting_a_prefix() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
     let known = fixture.operation(0, 0);
     let next = fixture.operation(1, 1);
     db.write_batch(known, vec![put(0, 21)]).unwrap();
-    let appends = db.pipeline_stats.append_requests;
+    let appends = db.pipeline_stats().append_requests;
     assert!(
         db.submit_many(&[(next, vec![put(1, 22)]), (known, vec![put(0, 99)])])
             .is_err()
@@ -1158,10 +1294,10 @@ fn parallel_preparation_rejects_late_conflicts_without_admitting_a_prefix() {
         ])
         .is_err()
     );
-    assert!(db.healthy);
-    assert_eq!(db.submission_next(), 1);
-    assert_eq!(db.pipeline_stats.append_requests, appends);
-    assert_eq!(db.pending_bytes, 0);
+    assert!(db.core.ensure_healthy().is_ok());
+    assert_eq!(db.core.next_sequence(), 1);
+    assert_eq!(db.pipeline_stats().append_requests, appends);
+    assert_eq!(db.core.admission.charges().bytes, 0);
     assert_eq!(value(&mut db, 0), Some(vec![21; 32]));
     assert_eq!(value(&mut db, 1), None);
     assert_eq!(db.write_batch(next, vec![put(1, 22)]).unwrap().sequence, 1);
@@ -1171,37 +1307,61 @@ fn parallel_preparation_rejects_late_conflicts_without_admitting_a_prefix() {
 #[test]
 fn preparation_budget_and_lost_reply_keep_the_existing_failure_contract() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
     let window = vec![
         (fixture.operation(0, 0), vec![put(0, 41)]),
         (fixture.operation(0, 1), vec![put(1, 42)]),
     ];
-    db.config.max_pending_bytes = 1;
-    assert!(db.submit_many(&window).is_err());
-    assert_eq!(db.pipeline_stats.prepare_calls, 0);
-    assert_eq!(db.submissions.len(), 0);
-    db.config.max_pending_bytes = fixture.config.max_pending_bytes;
+    // The core's configuration is immutable: open once with the smallest byte
+    // budget open accepts (one replay group per owner) and submit a window
+    // whose whole-window credit exceeds it, proving rejection precedes
+    // encoding and allocation.
+    let mut tight = fixture.config.clone();
+    tight.max_pending_bytes = tight.storage.group_limits.max_encoded_bytes * tight.endpoints.len();
+    let oversized: Vec<_> = (0..64u64)
+        .map(|seed| (fixture.operation(0, 100 + seed), vec![put(seed as u32, 41)]))
+        .collect();
+    let db = RemoteDatabase::open(
+        &fixture.temp.path().join("authority"),
+        &fixture.shape,
+        tight,
+        metrics(),
+    )
+    .unwrap();
+    let error = db.submit_many(&oversized).unwrap_err();
+    assert!(
+        error.to_string().contains("admission byte budget"),
+        "{error}"
+    );
+    assert_eq!(db.pipeline_stats().prepare_calls, 0);
+    assert_eq!(db.core.next_sequence(), 0);
+    assert_eq!(db.core.retained_slots(), 0);
+    db.shutdown().unwrap();
+    drop(db);
+    let mut db = fixture.open();
     fixture.nodes[0].inject_drop_next_append_response();
+    let connection = Arc::clone(&db.core.clients[0].client);
+    let held = connection.lock();
     let versions = db.submit_many(&window).unwrap();
+    drop(held);
     assert!(db.drain().is_err());
-    assert!(!db.healthy);
-    assert!(db.pending_bytes > 0);
+    assert!(db.core.ensure_healthy().is_err());
+    assert!(db.core.admission.charges().slots > 0);
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert!(db.shutdown().is_err());
     drop(db);
     let mut reopened = fixture.open();
     assert_eq!(reopened.submit_many(&window).unwrap(), versions);
-    assert_eq!(reopened.stats.admitted_batches, 0);
+    assert_eq!(reopened.stats().admitted_batches, 0);
     assert_eq!(value(&mut reopened, 0), Some(vec![41; 32]));
     assert_eq!(value(&mut reopened, 1), Some(vec![42; 32]));
     reopened.shutdown().unwrap();
 }
 
 #[test]
-fn preparation_services_previous_groups_without_admitting_invalid_next_chunk() {
+fn paused_caller_does_not_stall_owner_progress_or_admit_invalid_chunk() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
-    let connection = Arc::clone(&db.clients[0].client);
+    let db = fixture.open();
+    let connection = Arc::clone(&db.core.clients[0].client);
     let guard = connection.lock();
     for key in 0..6u32 {
         db.submit(
@@ -1210,12 +1370,16 @@ fn preparation_services_previous_groups_without_admitting_invalid_next_chunk() {
         )
         .unwrap();
     }
-    let before = (db.inflight[0].len(), db.staged[0].is_empty());
+    let before = db.core.clients[0].queue.snapshot();
+    assert_eq!((worker_groups(&db, 0), worker_bytes(&db, 0)), (0, 0));
+    // A caller holding a granted retry window is paused after its identity
+    // check. Owner workers form and submit groups without any caller.
     let (entered, entering) = mpsc::sync_channel(1);
     let (resume, resuming) = mpsc::sync_channel(1);
-    db.before_preparation = Some((entered, resuming));
-    // Conflict discovered only AFTER canonical preparation. No member of this
-    // chunk may be admitted while older groups make storage progress.
+    db.core.test_hooks.lock().after_grant = Some((entered, resuming));
+    let retry = vec![(fixture.operation(0, 0), vec![put(0, 0)])];
+    // The conflicting identity is caught by the retry digest check, before any
+    // allocation: no member of this chunk may be admitted.
     let next = vec![
         (fixture.operation(1, 7), vec![put(7, 7)]),
         (fixture.operation(0, 0), vec![put(0, 99)]),
@@ -1233,43 +1397,44 @@ fn preparation_services_previous_groups_without_admitting_invalid_next_chunk() {
     .unwrap();
     let (finished, completion) = mpsc::sync_channel(1);
     let preparer = thread::spawn(move || {
-        let result = db.submit_many(&next);
-        assert!(finished.send((db, result)).is_ok());
+        let retried = db.submit_many(&retry);
+        let invalid = db.submit_many(&next);
+        assert!(finished.send((db, retried, invalid)).is_ok());
     });
     let entered_in_time = entering.recv_timeout(Duration::from_secs(10)).is_ok();
     drop(guard);
     let deadline = Instant::now() + Duration::from_secs(10);
     let refilled = loop {
-        if observer
-            .stats()
-            .map(|stats| stats.appended_groups == 3)
-            .unwrap_or(false)
-        {
+        if observer.stats().unwrap().appended_groups == 3 {
             break true;
         }
         if Instant::now() >= deadline {
             break false;
         }
-        thread::sleep(Duration::from_millis(1));
+        thread::yield_now();
     };
     // Always release the explicit gate before checking assertions.
     resume.send(()).unwrap();
-    let (mut db, result) = completion.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (mut db, retried, result) = completion.recv_timeout(Duration::from_secs(10)).unwrap();
     preparer.join().unwrap();
-    assert_eq!(before.0, 2);
-    assert!(!before.1);
+    // Six READY batches wait in the owner ring; the worker forms three pairs.
+    assert_eq!(
+        before,
+        (1, 7, (0..6).map(|seq| (seq + 1, seq, 1)).collect())
+    );
     assert!(entered_in_time);
     assert!(
         refilled,
-        "storage actors must refill while next preparation is blocked"
+        "owner workers must make progress while a caller is paused"
     );
+    assert_eq!(retried.unwrap()[0].sequence, 0);
     assert!(result.is_err());
     assert_eq!(
-        db.submission_next(),
+        db.core.next_sequence(),
         6,
         "invalid chunk cannot allocate logical slots"
     );
-    assert!(db.healthy);
+    assert!(db.core.ensure_healthy().is_ok());
     db.drain().unwrap();
     assert_eq!(value(&mut db, 7), None);
     for key in 0..6u32 {
@@ -1289,7 +1454,7 @@ fn preparation_services_previous_groups_without_admitting_invalid_next_chunk() {
         assert_eq!(version.sequence, u64::from(key));
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 32]));
     }
-    assert_eq!(reopened.stats.admitted_batches, 0);
+    assert_eq!(reopened.stats().admitted_batches, 0);
     reopened.shutdown().unwrap();
 }
 
@@ -1299,15 +1464,20 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
     let mut db = fixture.open();
     let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
     let operations: Vec<_> = (0..4u64).map(|seed| fixture.operation(0, seed)).collect();
+    let connection = Arc::clone(&db.core.clients[0].client);
+    let first_guard = connection.lock();
     for (key, operation) in operations.iter().copied().enumerate().take(2) {
         db.submit(operation, vec![put(key as u32, key as u8)])
             .unwrap();
     }
+    drop(first_guard);
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let later_guard = connection.lock();
     for (key, operation) in operations.iter().copied().enumerate().skip(2) {
         db.submit(operation, vec![put(key as u32, key as u8)])
             .unwrap();
     }
+    drop(later_guard);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let later_appended = loop {
@@ -1332,30 +1502,32 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
         later_appended,
         "successor must reach the appender during the stall"
     );
-    assert_eq!(db.inflight[0].len(), 2);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 0);
-    assert_eq!(
-        db.publication.durable_prefix().next_sequence(),
-        0,
+    assert_eq!(worker_groups(&db, 0), 2);
+    wait_for_flights(&db, 0, 2);
+    assert_eq!(db.core.clients[0].queue.snapshot(), (5, 5, vec![]));
+    assert_worker_bytes(&db, 0, 2, &[0, 1, 2, 3]);
+    assert_eq!(db.core.published_next(), 0);
+    assert!(
+        (0..4).all(|sequence| db.core.durable_receipt(sequence).is_none()),
         "the later append must not make a response while its prefix is stalled"
     );
-    assert!(
-        db.inflight[0]
-            .iter()
-            .all(|pending| matches!(pending.reply.try_recv(), Err(mpsc::TryRecvError::Empty)))
-    );
     assert!((0..4u32).all(|key| {
-        db.index
+        db.core
+            .index
             .get(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
             .unwrap()
             .is_none()
     }));
 
     release.send(()).unwrap();
+    assert_eq!(
+        complete_owner(&db, 0, &[0, 1, 2, 3]),
+        vec![vec![0, 1], vec![2, 3]]
+    );
     db.drain().unwrap();
-    assert!(db.inflight.iter().all(VecDeque::is_empty));
-    assert_eq!(db.publication.published_prefix().next_sequence(), 4);
-    assert_eq!(db.pending_bytes, 0);
+    settle(&db);
+    assert_eq!(db.core.published_next(), 4);
+    assert_eq!(db.core.admission.charges().slots, 0);
     for key in 0..4u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
     }
@@ -1377,7 +1549,6 @@ fn tail_flush_dispatches_third_group_before_prior_durability() {
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     db.submit(operations[1], vec![put(801, 1)]).unwrap();
     db.submit(operations[2], vec![put(802, 2)]).unwrap();
-    db.progress_pipeline(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let reached_owner = loop {
         if fixture.nodes[0]
@@ -1397,11 +1568,11 @@ fn tail_flush_dispatches_third_group_before_prior_durability() {
         }
         thread::yield_now();
     };
-    let in_flight = db.inflight[0].len();
-    let acknowledgements_held = db.inflight[0]
-        .iter()
-        .all(|pending| matches!(pending.reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    let published = db.publication.published_prefix().next_sequence();
+    let in_flight = worker_groups(&db, 0);
+    wait_for_flights(&db, 0, 3);
+    assert_worker_bytes(&db, 0, 3, &[0, 1, 2]);
+    let acknowledgements_held = (0..3).all(|sequence| db.core.durable_receipt(sequence).is_none());
+    let published = db.core.published_next();
     release.send(()).unwrap();
     assert!(
         reached_owner,
@@ -1410,6 +1581,10 @@ fn tail_flush_dispatches_third_group_before_prior_durability() {
     assert_eq!(in_flight, 3);
     assert!(acknowledgements_held);
     assert_eq!(published, 0);
+    assert_eq!(
+        complete_owner(&db, 0, &[0, 1, 2]),
+        vec![vec![0], vec![1], vec![2]]
+    );
     db.drain().unwrap();
     for key in 800..803u32 {
         assert_eq!(value(&mut db, key), Some(vec![(key - 800) as u8; 32]));
@@ -1430,7 +1605,7 @@ fn tail_flush_respects_bounded_owner_command_window() {
         .synchronous()
         .history(HistoryPersistence::OnDisk);
     fixture.config.owner_append_occupancy = super::super::tcp::APPEND_COMMAND_WINDOW;
-    let mut db = fixture.open();
+    let db = fixture.open();
     let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
     let count = super::super::tcp::APPEND_COMMAND_WINDOW + 4;
     db.submit(fixture.operation(0, 900), vec![put(900, 0)])
@@ -1443,12 +1618,32 @@ fn tail_flush_respects_bounded_owner_command_window() {
         )
         .unwrap();
     }
-    db.progress_pipeline(true).unwrap();
-    let in_flight = db.inflight[0].len();
-    let staged = db.staged[0].len();
+    wait_for_flights(&db, 0, super::super::tcp::APPEND_COMMAND_WINDOW);
+    let in_flight = worker_groups(&db, 0);
+    let (head, next, queued) = db.core.clients[0].queue.snapshot();
+    let staged = queued.len();
+    assert_eq!(head, in_flight as u64 + 1);
+    assert_eq!(next, count as u64 + 1);
+    assert_eq!(
+        queued,
+        (in_flight as u64..count as u64)
+            .map(|seq| (seq + 1, seq, 1))
+            .collect::<Vec<_>>()
+    );
+    assert_worker_bytes(
+        &db,
+        0,
+        in_flight,
+        &(0..in_flight as u64).collect::<Vec<_>>(),
+    );
     let (checkpoint_reply, checkpoint_result) = mpsc::sync_channel(1);
-    db.clients[0]
-        .send(Command::Checkpoint(db.epoch, db.epoch, 0, checkpoint_reply))
+    db.core.clients[0]
+        .send(Command::Checkpoint(
+            db.epoch(),
+            db.epoch(),
+            0,
+            checkpoint_reply,
+        ))
         .unwrap();
     let checkpoint_held = matches!(checkpoint_result.try_recv(), Err(mpsc::TryRecvError::Empty));
     release.send(()).unwrap();
@@ -1460,6 +1655,11 @@ fn tail_flush_respects_bounded_owner_command_window() {
         .unwrap();
     assert_eq!(proof.prefix, 0);
     assert_eq!(staged, count - super::super::tcp::APPEND_COMMAND_WINDOW);
+    let sequences: Vec<_> = (0..count as u64).collect();
+    assert_eq!(
+        complete_owner(&db, 0, &sequences),
+        sequences.iter().map(|&seq| vec![seq]).collect::<Vec<_>>()
+    );
     db.drain().unwrap();
     db.shutdown().unwrap();
 }
@@ -1479,7 +1679,7 @@ fn large_groups_bypass_small_tail_window_but_respect_admission_cap() {
         },
     );
     let mut db = fixture.open();
-    let connection = Arc::clone(&db.clients[0].client);
+    let connection = Arc::clone(&db.core.clients[0].client);
     let held = connection.lock();
     let mutations = |key: u32| {
         vec![
@@ -1498,28 +1698,45 @@ fn large_groups_bypass_small_tail_window_but_respect_admission_cap() {
                 .unwrap(),
         );
     }
-    assert_eq!(db.inflight[0].len(), 4);
-    assert!(db.staged[0].is_empty());
-    assert_eq!(db.pipeline_stats.append_requests, 4);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 0);
-    let pending_bytes = db.pending_bytes;
-    let next = db.submission_next();
+    // The held client prevents worker grouping. Admission still bounds four
+    // whole two-key batches before any transport-side effect.
+    let queued = db.core.clients[0].queue.snapshot();
+    assert_eq!(
+        queued,
+        (1, 5, (0..4).map(|seq| (seq + 1, seq, 2)).collect())
+    );
+    assert_eq!((worker_groups(&db, 0), worker_bytes(&db, 0)), (0, 0));
+    assert_eq!(db.core.published_next(), 0);
+    let charges = db.core.admission.charges();
+    let next = db.core.next_sequence();
     let error = db
         .submit(fixture.operation(0, 4), mutations(4))
         .unwrap_err();
     assert!(error.uncertain_version.is_none());
-    assert!(db.healthy);
-    assert_eq!(db.submission_next(), next);
-    assert_eq!(db.pending_bytes, pending_bytes);
-    assert_eq!(db.inflight[0].len(), 4);
+    assert!(db.core.ensure_healthy().is_ok());
+    assert_eq!(db.core.next_sequence(), next);
+    assert_eq!(db.core.admission.charges(), charges);
+    assert_eq!(db.core.clients[0].queue.snapshot(), queued);
     for key in 0..4u32 {
         assert_eq!(value(&mut db, key), None);
         assert_eq!(value(&mut db, 100 + key), None);
     }
     drop(held);
     db.drain().unwrap();
-    assert_eq!(db.pending_bytes, 0);
-    assert_eq!(db.publication.published_prefix().next_sequence(), 4);
+    assert_eq!(
+        db.core.clients[0].accounting.formed.load(Ordering::Relaxed),
+        4
+    );
+    assert!(
+        db.core.clients[0]
+            .accounting
+            .peak_groups
+            .load(Ordering::Relaxed)
+            <= db.core.config.owner_append_occupancy
+    );
+    settle(&db);
+    assert_eq!(db.core.admission.charges().bytes, 0);
+    assert_eq!(db.core.published_next(), 4);
     for key in 0..4u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 33 * 1024]));
         assert_eq!(value(&mut db, 100 + key), Some(vec![key as u8; 32]));
@@ -1547,8 +1764,10 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
     let fixture =
         Fixture::new_with_shape_and_group(128, KeyShape::new_single(4, 1, KeyType::uniform(1)), 4);
     let mut db = fixture.open();
-    let connection = Arc::clone(&db.clients[0].client);
+    let connection = Arc::clone(&db.core.clients[0].client);
     let held = connection.lock();
+    let other_connection = Arc::clone(&db.core.clients[1].client);
+    let other_guard = other_connection.lock();
     let mut versions = Vec::new();
     for key in 0..11u32 {
         versions.push(
@@ -1570,32 +1789,25 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         )
         .unwrap();
     }
-    assert_eq!(db.inflight[0].len(), 2);
-    assert_eq!(db.staged[0].len(), 3);
-    assert_eq!(db.inflight[1].len(), 1);
-    assert_eq!(db.inflight[0][0].first, versions[0]);
-    assert_eq!(db.inflight[0][1].first, versions[4]);
-    for &slot in &db.staged[0] {
-        assert_eq!(
-            db.submissions[slot - db.submission_base as usize]
-                .batch
-                .as_ref()
-                .unwrap()
-                .mutations()
-                .len(),
-            3
-        );
-    }
-    let other = db.inflight[1].pop_front().unwrap();
-    db.inflight_bytes[1] -= other.charge;
-    let receipts = other
-        .reply
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    db.accept_receipts(receipts).unwrap();
-    db.publish_completed().unwrap();
-    assert_eq!(db.publication.published_prefix().next_sequence(), 0);
+    // All eleven whole batches remain READY until the worker owns its client.
+    // With max_batches=4 it will form [0..4), [4..8), [8..11), not authority
+    // groups plus three staged batches.
+    assert_eq!(
+        db.core.clients[0].queue.snapshot(),
+        (1, 12, (0..11).map(|seq| (seq + 1, seq, 3)).collect())
+    );
+    assert_eq!(
+        db.core.clients[1].queue.snapshot(),
+        (1, 5, (11..15).map(|seq| (seq - 10, seq, 1)).collect())
+    );
+    assert_eq!((worker_groups(&db, 0), worker_groups(&db, 1)), (0, 0));
+    assert_eq!((worker_bytes(&db, 0), worker_bytes(&db, 1)), (0, 0));
+    drop(other_guard);
+    assert_eq!(
+        complete_owner(&db, 1, &[11, 12, 13, 14]),
+        vec![vec![11, 12, 13, 14]]
+    );
+    assert_eq!(db.core.published_next(), 0);
     for key in 0..4u32 {
         assert_eq!(value(&mut db, 200 + key), Some(vec![key as u8; 32]));
     }
@@ -1604,42 +1816,72 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         assert_eq!(value(&mut db, 100 + key), None);
     }
     assert_eq!(value(&mut db, 300), None);
+    // Pause owner 0's worker before its first publication pass, then observe
+    // pinned cuts while its groups publish: a batch is visible whole or not
+    // at all, and the key-300 chain makes visibility a prefix of 0..11.
+    let (entered, entering) = mpsc::sync_channel(1);
+    let (resume, resuming) = mpsc::sync_channel(1);
+    db.core.test_hooks.lock().before_publish = Some((entered, resuming));
     drop(held);
-
-    // Completion refills this owner even though the three staged batches are a
-    // partial group. Unrelated owners' tails are not flushed by this pass.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        db.progress_pipeline(false).unwrap();
-        if db.inflight[0]
-            .iter()
-            .any(|group| group.first == versions[8])
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "owner did not refill");
-        let _ = db.completion_wake.recv_timeout(Duration::from_millis(100));
-    }
-    assert!(db.staged[0].is_empty());
-    assert!(db.inflight[0].len() <= db.config.owner_append_occupancy);
-    assert_eq!(db.pipeline_stats.append_requests, 4);
-    // Either correlated durable reply can arrive first. Every already
-    // published batch must expose both distinct keys; its whole successors
-    // remain invisible until their native-key dependencies resolve.
-    for key in 0..8u32 {
-        let expected = db
-            .publication
-            .is_published(versions[key as usize])
-            .then(|| vec![key as u8; 32]);
-        assert_eq!(value(&mut db, key), expected);
-        assert_eq!(value(&mut db, 100 + key), expected);
-    }
-    for key in 8..11u32 {
-        assert_eq!(value(&mut db, key), None);
-        assert_eq!(value(&mut db, 100 + key), None);
-    }
+    entering.recv_timeout(Duration::from_secs(10)).unwrap();
+    let visible_prefix = |db: &RemoteDatabase| {
+        let (cut, pin) = db.protected_published_cut().unwrap();
+        let visible: Vec<bool> = (0..11u32)
+            .map(|key| {
+                let reference = |key: u32| {
+                    db.index_reference(KeySpace(0), &key.to_be_bytes(), cut.clone())
+                        .unwrap()
+                        .is_some()
+                };
+                let first = reference(key);
+                assert_eq!(first, reference(100 + key), "batch visible only whole");
+                first
+            })
+            .collect();
+        drop(pin);
+        assert!(
+            visible.windows(2).all(|pair| pair[0] || !pair[1]),
+            "same-key successors stay invisible until predecessors publish"
+        );
+        visible.iter().filter(|visible| **visible).count()
+    };
+    let paused = visible_prefix(&db);
+    let paused_published = db.core.published_next();
+    resume.send(()).unwrap();
+    assert_eq!(paused, 0);
+    assert_eq!(paused_published, 0);
+    visible_prefix(&db);
+    assert_eq!(
+        complete_owner(&db, 0, &(0..11).collect::<Vec<_>>()),
+        vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10]]
+    );
+    assert_eq!(visible_prefix(&db), 11);
+    assert_eq!(db.core.clients[0].queue.snapshot(), (12, 12, vec![]));
+    assert_eq!(
+        db.core.clients[0].accounting.formed.load(Ordering::Relaxed),
+        3
+    );
+    assert_eq!(
+        db.core.clients[1].accounting.formed.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        db.core.clients[0]
+            .accounting
+            .peak_groups
+            .load(Ordering::Relaxed),
+        3
+    );
+    assert!(
+        db.core.clients[0]
+            .accounting
+            .peak_groups
+            .load(Ordering::Relaxed)
+            <= db.core.config.owner_append_occupancy
+    );
+    assert!(worker_bytes(&db, 0) <= super::super::tcp::APPEND_SESSION_BYTES - 64 * 1024);
     db.drain().unwrap();
-    assert_eq!(db.publication.published_prefix().next_sequence(), 15);
+    assert_eq!(db.core.published_next(), 15);
     for key in 0..11u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
         assert_eq!(value(&mut db, 100 + key), Some(vec![key as u8; 32]));
@@ -1673,7 +1915,7 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
 #[test]
 fn checkpoint_diagnostic_cursor_survives_profile_rearming() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.arm_write_profile(1).unwrap();
     db.write_batch(fixture.operation(0, 301), vec![put(301, 1)])
         .unwrap();
@@ -1701,14 +1943,14 @@ fn checkpoint_diagnostic_cursor_survives_profile_rearming() {
 fn write_profile_limit_stops_dispatch_after_one_selected_append() {
     let mut fixture = Fixture::new();
     fixture.config.write_profile_limit = 1;
-    let mut db = fixture.open();
+    let db = fixture.open();
     for key in 0..4u64 {
         db.submit(fixture.operation(0, key), vec![put(key as u32, key as u8)])
             .unwrap();
     }
     db.drain().unwrap();
     db.finish_write_profile().unwrap();
-    let profile = *db.write_profile.lock();
+    let profile = *db.core.write_profile.lock();
     assert_eq!(profile.sampled_requests, 1);
     assert_eq!(profile.captured_connections, 1);
     db.shutdown().unwrap();
@@ -1717,7 +1959,7 @@ fn write_profile_limit_stops_dispatch_after_one_selected_append() {
 #[test]
 fn synchronous_append_preserves_other_correlated_completions() {
     let fixture = Fixture::new();
-    let mut authority = fixture.open();
+    let authority = fixture.open();
     let endpoint = &fixture.config.endpoints[0];
     let mut tls = fixture.config.tls.clone();
     tls.server_name = endpoint.server_name.clone();

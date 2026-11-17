@@ -860,9 +860,9 @@ exported before the exact-owned fleet termination attempt.
   `read_rpcs` counts submitted groups; negotiated limits can split one group into
   several wire requests. `read_profile_wire_requests` counts those wire requests
   in successful sampled profiles, not in unsampled traffic.
-* `write_durable_batches` distinguishes storage progress from acknowledged
-  `write_concurrent_completed`. Admission, pending/queued/byte peaks and
-  `write_peak_inflight_nodes` expose whether application writes actually overlap.
+* `write_append_requests` counts owner-worker groups and
+  `write_concurrent_admitted` counts admitted application batches. Admission
+  pending/queued/byte peaks expose whether application writes actually overlap.
   These peaks are cumulative, and separately scraped counters are not atomic
   snapshots. The local implementation and remaining locks are documented in
   [the concurrency cutover](../../docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md).
