@@ -836,6 +836,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 queue_geometry: Default::default(),
                 export_mode: Default::default(),
             }),
+            checkpoint_mode: CheckpointMode::Exact,
         };
         let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
         let database = RemoteDatabase::open(

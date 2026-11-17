@@ -485,12 +485,18 @@ impl IndexWriter<'_> {
             state.capture = Some(capture);
             return None;
         }
+        // One encoder share of the payload scratch allowance (spec §3.1).
+        let scratch_limit = super::snapshot::cell_scratch_limit(
+            index.max_metadata_bytes,
+            cell_flushers(index.shards.len()),
+        );
         Some(PreparedIndexImage::new(
             index.database,
             capture.schema,
             capture.cells,
             capture.cut,
             capture.lease,
+            scratch_limit,
         ))
     }
 

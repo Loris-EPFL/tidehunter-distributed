@@ -46,9 +46,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use typenum::U32;
 
+mod checkpoint_contract;
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
+pub use checkpoint_contract::CheckpointMode;
+use checkpoint_contract::{CellCheckpointCommit, manifest_checkpoint_mode};
 use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
@@ -433,6 +436,10 @@ pub struct RemoteDatabaseConfig {
     /// Select direct live owner-WAL NVMe-oF before opening or recovering.
     #[serde(default)]
     pub live_nvme: Option<super::tcp::LiveClientConfig>,
+    /// The database's one checkpoint protocol. Only `Exact` is active; absent
+    /// means `Exact`, so existing configuration documents are unchanged.
+    #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
+    pub checkpoint_mode: CheckpointMode,
 }
 
 fn default_max_pending_reads() -> usize {
@@ -582,6 +589,11 @@ impl RemoteDatabaseConfig {
         {
             return Err(LocalDbError::new(
                 "index_shards must be a power of two in 1..=MAX_INDEX_SHARDS",
+            ));
+        }
+        if !self.checkpoint_mode.is_exact() {
+            return Err(LocalDbError::new(
+                "checkpoint_mode per_cell is inactive in this revision",
             ));
         }
         if let Some(live) = &self.live_nvme {
@@ -792,8 +804,19 @@ struct AuthorityManifest {
     #[serde(default)]
     checkpoint_staging: Option<CheckpointFiles>,
     /// Previous committed files, removable only after the new root is durable.
+    /// In format 5 it can still be the last exact commit during migration.
     #[serde(default)]
     checkpoint_obsolete: Option<CheckpointCommit>,
+    /// Format 5 only. Absent (`Exact`) in formats 2 to 4, so their bytes are
+    /// unchanged; [`manifest_checkpoint_mode`] rejects mixed tags.
+    #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
+    checkpoint_mode: CheckpointMode,
+    /// Format 5 only: the adopted per-cell commit. `checkpoint` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_checkpoint: Option<CellCheckpointCommit>,
+    /// Format 5 only: the previous per-cell commit, retained until GC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_checkpoint_obsolete: Option<CellCheckpointCommit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1615,6 +1638,9 @@ impl RemoteDatabase {
                 checkpoint: None,
                 checkpoint_staging: None,
                 checkpoint_obsolete: None,
+                checkpoint_mode: CheckpointMode::Exact,
+                cell_checkpoint: None,
+                cell_checkpoint_obsolete: None,
             };
             persist_manifest(&path, &manifest)?;
             manifest
@@ -1622,6 +1648,12 @@ impl RemoteDatabase {
         if manifest.history_persistence != config.history_persistence {
             return Err(LocalDbError::new(
                 "authority manifest history persistence differs",
+            ));
+        }
+        // No fallback: a per-cell manifest never opens in `Exact` mode.
+        if manifest_checkpoint_mode(&manifest)? != config.checkpoint_mode {
+            return Err(LocalDbError::new(
+                "authority manifest checkpoint mode differs",
             ));
         }
         if !matches!(manifest.format, 2..=4)
@@ -3891,6 +3923,8 @@ mod position_tests;
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(test)]
+mod legacy_fixture_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
