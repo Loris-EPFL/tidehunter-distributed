@@ -25,15 +25,22 @@ class OwnerPrewriteTests(unittest.TestCase):
                         self.assertRaisesRegex(ValueError, field):
                     validate_prewrite_receipts(invalid, 4)
 
-    def test_local_owner_receives_prewrite_flag_before_validation(self):
+    def test_local_owner_writes_explicit_prewrite_before_validation(self):
         import yaml
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temporary:
+        # (local override, reviewed case job, explicit launch value)
+        for override, job, expected in ((None, {}, False), (False, {}, False), (True, {}, True),
+                                        (None, {"owner_wal_prewrite": False}, False),
+                                        (None, {"owner_wal_prewrite": True}, True)):
+            with self.subTest(override=override, job=job), tempfile.TemporaryDirectory() as temporary:
                 mode = object.__new__(local_dry_run.LocalMode)
                 mode.fixture = Path(temporary)
-                mode.config = {"prefix": "owned", "wal_prewrite": enabled}
+                mode.config = {"prefix": "owned"}
+                if override is not None:
+                    mode.config["wal_prewrite"] = override
                 mode.controller = mock.Mock()
                 mode.cloud = mock.Mock()
+                mode.cloud.case_owner_job.return_value = job
+                mode.cloud.bind_owner_wal_prewrite.side_effect = cloud_controller.bind_owner_wal_prewrite
                 mode.cloud.digest.return_value = "digest"
                 mode.cloud.download_object.side_effect = (
                     lambda clients, config, key, destination: destination.touch())
@@ -47,9 +54,17 @@ class OwnerPrewriteTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "stop before launch"):
                     mode.start_owner(0, request, "case", 10)
                 launch = mode.cloud.validate_launch.call_args.args[1]
-                self.assertEqual(launch["node"].get("wal_prewrite", False), enabled)
+                self.assertIs(launch["node"]["wal_prewrite"], expected)
                 saved = yaml.safe_load((mode.fixture / "cells/case/node-0/launch.yaml").read_text())
                 self.assertEqual(saved, launch)
+
+    def test_local_cli_prewrite_defaults_on_with_explicit_opt_out(self):
+        from local_multiowner_check import parse_args
+        base = ["--binary", "b", "--libs", "l", "--output", "o"]
+        self.assertIs(parse_args(base).wal_prewrite, True)
+        self.assertIs(parse_args(base + ["--wal-prewrite"]).wal_prewrite, True)
+        self.assertIs(parse_args(base + ["--no-wal-prewrite"]).wal_prewrite, False)
+
 
 class OperationScalingTests(unittest.TestCase):
     def test_layout_inventory_does_not_own_local_client_lifecycle(self):

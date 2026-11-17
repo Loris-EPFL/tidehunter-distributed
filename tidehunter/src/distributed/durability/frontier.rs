@@ -237,6 +237,10 @@ struct State {
     syncer_exited: bool,
     failure: Option<String>,
     counters: Counters,
+    /// Flush waits that reached their first park. Test barrier only, see
+    /// [`Frontier::wait_parked_flush_waits`].
+    #[cfg(test)]
+    parked_flush_waits: u64,
 }
 
 /// The appended frontier at the instant the syncer picked its fsync target.
@@ -271,6 +275,9 @@ pub struct Frontier {
     syncer_cv: Condvar,
     /// Notified when the pending buffer shrinks, on stop and on failure.
     space_cv: Condvar,
+    /// Notified when a flush wait first parks. Test barrier only.
+    #[cfg(test)]
+    parked_cv: Condvar,
 }
 
 impl Frontier {
@@ -302,11 +309,15 @@ impl Frontier {
                 syncer_exited: false,
                 failure: None,
                 counters: Counters::default(),
+                #[cfg(test)]
+                parked_flush_waits: 0,
             }),
             appended_cv: Condvar::new(),
             synced_cv: Condvar::new(),
             syncer_cv: Condvar::new(),
             space_cv: Condvar::new(),
+            #[cfg(test)]
+            parked_cv: Condvar::new(),
         }))
     }
 
@@ -515,6 +526,8 @@ impl Frontier {
             st.demand_end = target;
             self.syncer_cv.notify_one();
         }
+        #[cfg(test)]
+        let mut parked = false;
         let outcome = loop {
             let reached = match kind {
                 WaitKind::Appended => st.appended_end >= target,
@@ -532,6 +545,15 @@ impl Frontier {
             };
             if stopped {
                 break Err(FrontierError::Stopped);
+            }
+            // Test barrier. The waiter holds the state lock from here until the park below
+            // releases it, so a test that sees this count under the lock knows the waiter is
+            // parked or past its park, and is in the slow path, which always counts the wait.
+            #[cfg(test)]
+            if kind == WaitKind::Flush && !parked {
+                parked = true;
+                st.parked_flush_waits += 1;
+                self.parked_cv.notify_all();
             }
             match deadline {
                 None => condvar.wait(&mut st),
@@ -569,6 +591,24 @@ impl Frontier {
             }
         }
         outcome
+    }
+
+    /// Test barrier: block until `count` flush waits have parked at least once, or until
+    /// `deadline`; returns whether the count was reached.
+    ///
+    /// `flush_waits` counts only waits that missed the lock-free check in
+    /// [`Frontier::wait_flush`]. A test that releases an fsync while a flusher may still be
+    /// before that check races the flusher: the flusher can find the target synced and not
+    /// wait at all. Releasing the fsync only after this barrier returns removes that race.
+    #[cfg(test)]
+    pub(super) fn wait_parked_flush_waits(&self, count: u64, deadline: Instant) -> bool {
+        let mut st = self.state.lock();
+        while st.parked_flush_waits < count {
+            if self.parked_cv.wait_until(&mut st, deadline).timed_out() {
+                return st.parked_flush_waits >= count;
+            }
+        }
+        true
     }
 
     /// Poison the frontier. Every waiter and later completion gets [`FrontierError::Failed`].

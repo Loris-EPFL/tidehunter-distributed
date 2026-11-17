@@ -21,7 +21,7 @@ fn paused_scan_and_retained_history_cursors_survive_unload_and_base_replacement(
         .flush_and_unload(&temp.path().join("base.index"), IndexReadCut::Latest)
         .unwrap();
     install(&index, &log, &batches[1], receipts[1]);
-    let cut = index.latest_cut();
+    let cut = index.call_cut();
     let pin = index.pin_cut(cut.clone()).unwrap();
     let expected = index
         .scan(KeySpace(0), None, false, 100, cut.clone())

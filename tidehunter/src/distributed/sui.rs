@@ -976,6 +976,10 @@ impl Db {
                 index.transient_metadata_bytes as u64,
             );
             set(
+                "index_reader_held_view_bytes",
+                index.reader_held_view_bytes as u64,
+            );
+            set(
                 "index_history_bytes",
                 remote.db.index_history_bytes() as u64,
             );
@@ -1139,14 +1143,7 @@ impl Db {
                 );
                 let pipeline = snapshot.pipeline;
                 set("write_append_requests", pipeline.append_requests);
-                set("write_direct_appends", pipeline.direct_appends);
-                set(
-                    "write_peak_inflight_nodes",
-                    pipeline.peak_inflight_nodes as u64,
-                );
-                set("write_durable_batches", pipeline.durable_batches);
                 set("write_concurrent_admitted", pipeline.concurrent_admitted);
-                set("write_concurrent_completed", pipeline.concurrent_completed);
                 set(
                     "write_concurrent_pending_peak",
                     pipeline.concurrent_pending_peak as u64,
@@ -1281,6 +1278,10 @@ impl Db {
             set(
                 "index_transient_metadata_bytes",
                 index.transient_metadata_bytes as u64,
+            );
+            set(
+                "index_reader_held_view_bytes",
+                index.reader_held_view_bytes as u64,
             );
             set("index_history_bytes", history_bytes as u64);
             set("index_retained_versions", index.retained_versions as u64);
@@ -1442,14 +1443,7 @@ impl Db {
                 );
                 let pipeline = snapshot.pipeline;
                 set("write_append_requests", pipeline.append_requests);
-                set("write_direct_appends", pipeline.direct_appends);
-                set(
-                    "write_peak_inflight_nodes",
-                    pipeline.peak_inflight_nodes as u64,
-                );
-                set("write_durable_batches", pipeline.durable_batches);
                 set("write_concurrent_admitted", pipeline.concurrent_admitted);
-                set("write_concurrent_completed", pipeline.concurrent_completed);
                 set(
                     "write_concurrent_pending_peak",
                     pipeline.concurrent_pending_peak as u64,
@@ -1671,34 +1665,54 @@ impl Db {
             }
             return Vec::new();
         }
-        let (cut, _pin) = if keys.len() > 256 {
-            match remote.db.protected_published_cut() {
-                Ok((cut, pin)) => (cut, Some(pin)),
-                Err(e) => {
-                    if let Some(trace) = trace {
-                        trace.finish(false);
-                    }
-                    return keys.iter().map(|_| Err(error(&e))).collect();
-                }
-            }
-        } else {
+        let mut output = Vec::with_capacity(keys.len());
+        if keys.len() <= 256 {
             // One bounded window resolves under one index guard and pins only
             // misses. Cache-only bulk reads allocate no retention pin.
-            (IndexReadCut::Latest, None)
-        };
-        let mut output = Vec::with_capacity(keys.len());
-        for (window, chunk) in keys.chunks(256).enumerate() {
-            match remote.bulk_read.run(|| {
+            let values = remote.bulk_read.run(|| {
                 if let Some(trace) = trace.as_ref() {
                     remote
                         .db
-                        .traced_get_many_cut(ks, chunk, cut.clone(), Some(trace), window * 256)
+                        .traced_get_many_cut(ks, keys, IndexReadCut::Latest, Some(trace), 0)
                 } else {
-                    remote.db.get_many_cut(ks, chunk, cut.clone())
+                    remote.db.get_many_cut(ks, keys, IndexReadCut::Latest)
                 }
-            }) {
+            });
+            match values {
                 Ok(values) => output.extend(values.into_iter().map(|value| value.map_err(error))),
-                Err(e) => output.extend(chunk.iter().map(|_| Err(error(&e)))),
+                Err(e) => output.extend(keys.iter().map(|_| Err(error(&e)))),
+            }
+        } else {
+            // One cut for every window, with no owner charge and so no view
+            // budget failure: every key is looked up first (never waiting for
+            // admission), then the view is dropped and the windows fetch
+            // under one floor pin (see `StandingViewBudget`). The references
+            // are one per key, bounded like `output` by the caller's keys.
+            match remote.db.resolve_published_keys(ks, keys) {
+                Ok(resolved) => {
+                    let pin = resolved.pin;
+                    let mut references = resolved.references.into_iter();
+                    for (window, chunk) in keys.chunks(256).enumerate() {
+                        let window_references: Vec<_> =
+                            references.by_ref().take(chunk.len()).collect();
+                        match remote.bulk_read.run(|| {
+                            remote.db.fetch_resolved_window(
+                                ks,
+                                chunk,
+                                window_references,
+                                pin.as_ref(),
+                                trace.as_ref(),
+                                window * 256,
+                            )
+                        }) {
+                            Ok(values) => {
+                                output.extend(values.into_iter().map(|value| value.map_err(error)))
+                            }
+                            Err(e) => output.extend(chunk.iter().map(|_| Err(error(&e)))),
+                        }
+                    }
+                }
+                Err(e) => output.extend(keys.iter().map(|_| Err(error(&e)))),
             }
         }
         if let Some(trace) = trace {
@@ -1735,7 +1749,8 @@ impl Db {
             Backend::Native(db) => keys.iter().map(|key| db.exists(ks, key)).collect(),
             Backend::Remote(remote) => {
                 let db = &remote.db;
-                let (cut, _pin) = match db.protected_published_cut() {
+                // The cut ends with this call: no owner charge.
+                let (cut, _pin) = match db.call_protected_cut() {
                     Ok(protected) => protected,
                     Err(e) => return keys.iter().map(|_| Err(error(&e))).collect(),
                 };
@@ -1992,7 +2007,9 @@ impl Db {
         let Backend::Remote(remote) = &self.backend else {
             unreachable!()
         };
-        let (cut, pin) = remote.db.protected_published_cut().map_err(error)?;
+        // Write-gated: these in-call cuts end with this call, one call at a
+        // time, so they take no owner charge (see `StandingViewBudget`).
+        let (cut, pin) = remote.db.call_protected_cut().map_err(error)?;
         let mut cutoff: Option<BatchVersion> = None;
         // Native wal_based_relocation scans retained WAL records, not just live
         // keys. Retained index history includes overwritten Stop puts, including
@@ -2037,7 +2054,7 @@ impl Db {
                 let Backend::Remote(remote) = &self.backend else {
                     unreachable!()
                 };
-                let cut = remote.db.published_cut().map_err(error)?;
+                let cut = remote.db.call_published_cut().map_err(error)?;
                 let mut after: Option<Bytes> = None;
                 let mut cell = None;
                 let mut rows = Vec::new();
@@ -2065,7 +2082,7 @@ impl Db {
             let Some(filter) = descriptor.relocation_filter() else {
                 continue;
             };
-            let cut = remote.db.published_cut().map_err(error)?;
+            let cut = remote.db.call_published_cut().map_err(error)?;
             let mut after = None;
             let mut deletes =
                 Vec::with_capacity((remote.batch_limits.max_operations as usize).min(256));
@@ -2179,7 +2196,8 @@ impl Db {
         let Backend::Remote(remote) = &self.backend else {
             unreachable!()
         };
-        let (_, pin) = remote.db.protected_published_cut().map_err(error)?;
+        // Called only under `start_relocation`'s write gate.
+        let (_, pin) = remote.db.call_protected_cut().map_err(error)?;
         let retain = compactor(&mut rows.iter().map(|(key, _)| key));
         let mut deletes =
             Vec::with_capacity((remote.batch_limits.max_operations as usize).min(256));
@@ -2233,7 +2251,8 @@ impl Db {
             unreachable!()
         };
         let mut retained_bytes = 128usize;
-        let (cut, pin) = remote.db.protected_published_cut().map_err(error)?;
+        // Write-gated and in-call: no owner charge (see `StandingViewBudget`).
+        let (cut, pin) = remote.db.call_protected_cut().map_err(error)?;
         // The validated endpoints denote complete reduced cells. A full-key
         // iterator bound would wrongly exclude colliding keys whose suffix sorts
         // below `from`; include the reduced lower key and then page exclusively.

@@ -48,11 +48,21 @@ impl ReplayLimits {
         batches >= (self.max_batches / 4).max(1) || bytes >= (self.max_encoded_bytes / 4).max(1)
     }
 
-    pub(super) fn requires_flush(self, batches: usize, bytes: usize, incoming: usize) -> bool {
-        batches >= self.max_batches
-            || bytes
-                .checked_add(incoming)
-                .is_none_or(|total| total > self.max_encoded_bytes)
+    /// Hard bound: the granted tail plus an incoming window must fit, with
+    /// overflow treated as not fitting.
+    pub(super) fn admits(
+        self,
+        batches: usize,
+        bytes: usize,
+        incoming_batches: usize,
+        incoming_bytes: usize,
+    ) -> bool {
+        batches
+            .checked_add(incoming_batches)
+            .is_some_and(|total| total <= self.max_batches)
+            && bytes
+                .checked_add(incoming_bytes)
+                .is_some_and(|total| total <= self.max_encoded_bytes)
     }
 
     /// A smaller operator setting cannot reinterpret an already acknowledged
@@ -73,10 +83,13 @@ mod tests {
             max_batches: 3,
             max_encoded_bytes: 100,
         };
-        assert!(!limits.requires_flush(2, 80, 20));
-        assert!(limits.requires_flush(3, 0, 1));
-        assert!(limits.requires_flush(2, 80, 21));
-        assert!(limits.requires_flush(0, usize::MAX, 1));
+        assert!(limits.admits(2, 80, 1, 20));
+        assert!(!limits.admits(3, 0, 1, 1));
+        assert!(!limits.admits(2, 80, 1, 21));
+        assert!(!limits.admits(0, usize::MAX, 1, 1));
+        assert!(!limits.admits(usize::MAX, 0, 1, 0));
+        assert!(limits.admits(1, 60, 2, 40));
+        assert!(!limits.admits(1, 60, 3, 0));
     }
 
     #[test]
@@ -88,7 +101,7 @@ mod tests {
         assert!(!limits.checkpoint_due(3, 99));
         assert!(limits.checkpoint_due(4, 0));
         assert!(limits.checkpoint_due(0, 100));
-        assert!(!limits.requires_flush(4, 100, 1));
+        assert!(limits.admits(4, 100, 1, 1));
         let tiny = ReplayLimits {
             max_batches: 1,
             max_encoded_bytes: 1,

@@ -32,13 +32,13 @@ fn wal_replay_retry_older_than_window_is_written_again_and_newest_wins() {
             .unwrap();
     }
     db.flush_index().unwrap();
-    assert!(db.receipt_history.is_none());
-    assert!(!db.path.join("receipt-history-v2").exists());
-    assert_eq!(db.recent.len(), WAL_REPLAY_WINDOW_BATCHES);
-    assert!(!db.recent_ids.contains_key(&BatchId {
-        database: fixture.config.storage.database,
-        operation
-    }));
+    assert!(db.core.publisher.lock().receipt_history.is_none());
+    assert!(!db.core.path.join("receipt-history-v2").exists());
+    assert_eq!(
+        db.core.publisher.lock().recent.len(),
+        WAL_REPLAY_WINDOW_BATCHES
+    );
+    assert!(!db.core.recent_identity(operation));
     let newest = db
         .write_batch(operation, vec![checkpoint_put(1, 1)])
         .unwrap();
@@ -66,7 +66,7 @@ fn wal_replay_retry_older_than_window_is_written_again_and_newest_wins() {
             .as_ref(),
         &[1; 32]
     );
-    assert!(!reopened.path.join("receipt-history-v2").exists());
+    assert!(!reopened.core.path.join("receipt-history-v2").exists());
 }
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -80,8 +80,8 @@ fn wal_replay_checkpointed_dataset_exports_all_keys_and_owner_restart_reads_them
     let mut fixture = Fixture::new_with_capacity(8192).synchronous();
     fixture.config.max_index_bytes = 64 * 1024 * 1024;
     fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
-    let epoch = db.epoch;
+    let db = fixture.open();
+    let epoch = db.epoch();
     for id in 0..5000u32 {
         db.write_batch(
             fixture.operation(0, u64::from(id)),
@@ -92,7 +92,7 @@ fn wal_replay_checkpointed_dataset_exports_all_keys_and_owner_restart_reads_them
             db.flush_index().unwrap();
             // The position proof persists the owner root at this fragment.
             // Thus the restart window no longer starts at WAL offset zero.
-            assert!(db.positions[&(0, epoch)].replay_from > 0);
+            assert!(db.core.publisher.lock().positions[&(0, epoch)].replay_from > 0);
         }
     }
     db.shutdown().unwrap();
@@ -207,11 +207,11 @@ fn wal_replay_mode_mismatch_fails_open() {
 #[test]
 fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
     let mut fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
         .unwrap();
     db.flush_index().unwrap();
-    let position = db.positions[&(0, 1)].clone();
+    let position = db.core.publisher.lock().positions[&(0, 1)].clone();
     assert!(position.durable_end > 0);
     fail_stop_without_checkpoint(db);
     fixture.stop_owners();
@@ -233,25 +233,43 @@ fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
 #[test]
 fn wal_replay_replay_completion_is_not_committed_before_the_next_image() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
-    assert!(!db.positions[&(0, 1)].complete);
+    assert!(!db.core.publisher.lock().positions[&(0, 1)].complete);
     fail_stop_without_checkpoint(db);
     let db = fixture.open();
     assert_eq!(db.recovery_stats().tail_batches, 0);
-    assert!(db.positions[&(0, 1)].complete);
-    assert!(!db.committed_complete.contains(&(0, 1)));
+    assert!(db.core.publisher.lock().positions[&(0, 1)].complete);
+    assert!(
+        !db.core
+            .publisher
+            .lock()
+            .committed_complete
+            .contains(&(0, 1))
+    );
     // A second crash before an image adopts completion repeats the old scan.
     fail_stop_without_checkpoint(db);
     let mut db = fixture.open();
     assert_eq!(db.recovery_stats().tail_batches, 0);
-    assert!(!db.committed_complete.contains(&(0, 1)));
+    assert!(
+        !db.core
+            .publisher
+            .lock()
+            .committed_complete
+            .contains(&(0, 1))
+    );
     db.write_batch(fixture.operation(0, 2), vec![checkpoint_put(1, 2)])
         .unwrap();
     db.flush_index().unwrap();
-    assert!(db.committed_complete.contains(&(0, 1)));
+    assert!(
+        db.core
+            .publisher
+            .lock()
+            .committed_complete
+            .contains(&(0, 1))
+    );
     assert_eq!(
         db.get(KeySpace(0), &1u32.to_be_bytes())
             .unwrap()
@@ -265,7 +283,7 @@ fn wal_replay_replay_completion_is_not_committed_before_the_next_image() {
 fn wal_replay_retires_sealed_file_only_after_complete_image() {
     let mut fixture = Fixture::new_with_capacity(256);
     fixture.config.max_index_bytes = 16 * 1024 * 1024;
-    let mut db = fixture.open();
+    let db = fixture.open();
     for n in 0..80 {
         db.write_batch(fixture.operation(0, n), vec![checkpoint_put(1, n as u8)])
             .unwrap();
@@ -277,15 +295,27 @@ fn wal_replay_retires_sealed_file_only_after_complete_image() {
         .join("node-0/epoch_0000000000000001/wal_0000000000000000");
     assert!(file.exists());
     fail_stop_without_checkpoint(db);
-    let mut db = fixture.open();
-    assert!(db.positions[&(0, 1)].complete);
-    assert!(!db.committed_complete.contains(&(0, 1)));
-    db.retire_unreachable_sealed_files().unwrap();
+    let db = fixture.open();
+    assert!(db.core.publisher.lock().positions[&(0, 1)].complete);
+    assert!(
+        !db.core
+            .publisher
+            .lock()
+            .committed_complete
+            .contains(&(0, 1))
+    );
+    super::checkpoint_lifecycle::core_retire_unreachable_sealed_files(&db.core).unwrap();
     assert!(file.exists());
     db.write_batch(fixture.operation(0, 81), vec![checkpoint_put(1, 99)])
         .unwrap();
-    db.retire_history_before(IndexReadCut::Latest).unwrap();
-    assert!(db.committed_complete.contains(&(0, 1)));
+    db.core.retire_history_before(IndexReadCut::Latest).unwrap();
+    assert!(
+        db.core
+            .publisher
+            .lock()
+            .committed_complete
+            .contains(&(0, 1))
+    );
     assert!(!file.exists());
     fail_stop_without_checkpoint(db);
     let mut db = fixture.open();
@@ -301,12 +331,12 @@ fn wal_replay_retires_sealed_file_only_after_complete_image() {
 #[test]
 fn wal_replay_checkpoint_timeline_has_control_without_receipt_io() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
-    db.write_timeline.arm(1, 1).unwrap();
+    let db = fixture.open();
+    db.core.write_timeline.arm(1, 1).unwrap();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
-    let timeline = db.write_timeline.finish().unwrap();
+    let timeline = db.core.write_timeline.finish().unwrap();
     let stages: Vec<_> = timeline
         .checkpoint_events
         .iter()
@@ -351,7 +381,7 @@ fn wal_replay_pending_budget_requires_one_whole_group_per_owner() {
 #[test]
 fn wal_replay_second_crash_repeats_suffix_before_committing_completion() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
@@ -390,12 +420,12 @@ fn wal_replay_second_crash_repeats_suffix_before_committing_completion() {
 fn wal_replay_native_owner_loss_beyond_durable_end_keeps_checkpoint() {
     use std::os::unix::fs::FileExt;
     let mut fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
     let frame_end = fixture.nodes[0].log_for_test(1).appended_frontier();
-    assert!(frame_end >= db.positions[&(0, 1)].durable_end);
+    assert!(frame_end >= db.core.publisher.lock().positions[&(0, 1)].durable_end);
     let operation = fixture.operation(0, 2);
     let lost = db
         .write_batch(operation, vec![checkpoint_put(1, 2)])
@@ -434,11 +464,11 @@ fn wal_replay_native_owner_loss_beyond_durable_end_keeps_checkpoint() {
 fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
     for wrong_format in [false, true] {
         let fixture = Fixture::new();
-        let mut db = fixture.open();
+        let db = fixture.open();
         db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
             .unwrap();
         db.flush_index().unwrap();
-        let path = db.path.clone();
+        let path = db.core.path.clone();
         fail_stop_without_checkpoint(db);
         let mut manifest: AuthorityManifest = read_metadata(&path.join(MANIFEST)).unwrap();
         let commit = manifest.checkpoint.as_mut().unwrap();
@@ -475,18 +505,31 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
 #[test]
 fn memory_only_coordinator_keeps_format_two_and_receipt_history() {
     let fixture = Fixture::new().history(HistoryPersistence::MemoryOnly);
-    let mut db = fixture.open();
+    let db = fixture.open();
     let operation = fixture.operation(0, 1);
     let version = db
         .write_batch(operation, vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
-    assert!(db.path.join("receipt-history-v2/nodes.pages").is_file());
-    let commit = db.manifest.checkpoint.as_ref().unwrap();
-    let image: CheckpointImage = read_checkpoint(&db.path.join(commit.metadata_name())).unwrap();
+    assert!(
+        db.core
+            .path
+            .join("receipt-history-v2/nodes.pages")
+            .is_file()
+    );
+    let metadata_name = db
+        .core
+        .publisher
+        .lock()
+        .manifest
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .metadata_name();
+    let image: CheckpointImage = read_checkpoint(&db.core.path.join(metadata_name)).unwrap();
     assert_eq!(image.format, 2);
     fail_stop_without_checkpoint(db);
-    let mut db = fixture.open();
+    let db = fixture.open();
     assert_eq!(
         db.write_batch(operation, vec![checkpoint_put(1, 1)])
             .unwrap(),

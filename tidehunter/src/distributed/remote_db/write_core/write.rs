@@ -44,6 +44,8 @@ struct Planned<'a> {
     bytes: usize,
     keys: Vec<Dependency>,
     identity: Option<IdentityEntry>,
+    /// Identity-shard retirement generation captured with `identity`.
+    retirements: u64,
     allocation: Option<Allocation>,
     publication: Option<SlotPublication>,
 }
@@ -280,6 +282,7 @@ impl WriteCore {
                 bytes: credit,
                 keys,
                 identity: None,
+                retirements: 0,
                 allocation: None,
                 publication: None,
             });
@@ -454,7 +457,7 @@ impl WriteCore {
                 ..WriteGrant::default()
             };
             for plan in plans.iter_mut() {
-                plan.identity = self.lookup_identity(plan.operation)?;
+                (plan.identity, plan.retirements) = self.lookup_identity_at(plan.operation)?;
                 if plan.identity.is_none() {
                     grant.slots += 1;
                     grant.identities += 1;
@@ -554,6 +557,10 @@ impl WriteCore {
             }
             let allocate_started = Instant::now();
             let block_started = self.write_timeline.block_started();
+            // WalReplay has no receipt history: a retired identity is
+            // forgotten, so a repeated lookup would miss again.
+            let with_history = self.config.history_persistence
+                != crate::distributed::storage::HistoryPersistence::WalReplay;
             let allocated = self.identities.with_operations(&operations, |identities| {
                 self.dependencies.with_shards(shards, |keys| {
                     OwnerQueue::with_owners(&owners, |owners| {
@@ -563,8 +570,21 @@ impl WriteCore {
                         // Freeze every identity before allocating any member.
                         // A newly inserted or changed identity must be encoded
                         // and compared outside these locks, never admitted late.
+                        // With receipt history, a miss is also stale once its
+                        // shard retired entries: a same-operation writer may
+                        // have published and moved to a newer history root.
+                        // Replan repeats the lookup outside these locks; each
+                        // repeat needs another checkpoint retirement of this
+                        // shard, and the preflight deadline bounds the loop.
                         for plan in plans.iter() {
                             match (plan.identity, identities.get(plan.operation)) {
+                                (None, None)
+                                    if with_history
+                                        && identities.retirements(plan.operation)
+                                            != plan.retirements =>
+                                {
+                                    return Ok(AllocationResult::Replan);
+                                }
                                 (None, None) | (Some(_), None) => {}
                                 (Some(expected), Some(actual))
                                     if expected.version == actual.version

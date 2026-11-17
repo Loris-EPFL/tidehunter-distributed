@@ -99,6 +99,8 @@ class ReplayCITests(unittest.TestCase):
                 def proof():
                     self.assertEqual(local_dry_run_targets.ROOT, [])
                     prewrite = "--wal-prewrite" in sys.argv
+                    # Both passes state their choice; neither relies on the default.
+                    self.assertNotEqual(prewrite, "--no-wal-prewrite" in sys.argv)
                     calls.append(prewrite)
                     output = Path(sys.argv[sys.argv.index("--output") + 1])
                     output.mkdir()

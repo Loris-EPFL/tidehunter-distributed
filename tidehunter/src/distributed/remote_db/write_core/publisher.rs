@@ -13,6 +13,63 @@ struct Published {
     metadata_charge: usize,
 }
 
+/// Min-heap of the durable generations one publication call still has to
+/// resolve. A generation enters only as a receipt, or as a dependent of the
+/// generation being published or aborted. Key-shard registration gives every
+/// predecessor a lower sequence than its dependent, so each push exceeds the
+/// current pop and pops strictly increase: every lower predecessor in the heap
+/// resolves before its dependents, and a generation is popped at most once.
+#[derive(Default)]
+struct PublicationWork(SmallVec<[u64; 16]>);
+
+impl PublicationWork {
+    fn push(&mut self, sequence: u64) {
+        let heap = &mut self.0;
+        heap.push(sequence);
+        let mut child = heap.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if heap[parent] <= heap[child] {
+                break;
+            }
+            heap.swap(parent, child);
+            child = parent;
+        }
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        let heap = &mut self.0;
+        let last = heap.pop()?;
+        let Some(first) = heap.first_mut() else {
+            return Some(last);
+        };
+        let minimum = std::mem::replace(first, last);
+        let mut parent = 0;
+        loop {
+            let left = 2 * parent + 1;
+            if left >= heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < heap.len() && heap[right] < heap[left] {
+                right
+            } else {
+                left
+            };
+            if heap[parent] <= heap[child] {
+                break;
+            }
+            heap.swap(parent, child);
+            parent = child;
+        }
+        Some(minimum)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Grant-time dimensions for an allocation that never became owner READY.
 pub(super) struct AbortedAllocation {
     pub(super) sequence: u64,
@@ -63,7 +120,7 @@ impl WriteCore {
             if queue.abort(allocation.owner_sequence) {
                 self.wake_owner(allocation.owner)?;
             }
-            self.publish_work(SmallVec::new(), Some((allocation, error)))
+            self.publish_work(PublicationWork::default(), Some((allocation, error)))
         })();
         if let Err(error) = &result {
             self.fail(LocalDbError::new(error.message()));
@@ -126,7 +183,7 @@ impl WriteCore {
         if !self.partition_indexes.contains_key(&owner) {
             return Err(LocalDbError::new("receipt names an unregistered owner"));
         }
-        let mut work = SmallVec::<[u64; 16]>::new();
+        let mut work = PublicationWork::default();
         for (sequence, durable) in receipts {
             let receipt = durable.appended();
             let version = receipt.version();
@@ -174,7 +231,7 @@ impl WriteCore {
 
     fn publish_work(
         self: &Arc<Self>,
-        mut work: SmallVec<[u64; 16]>,
+        mut work: PublicationWork,
         aborted: Option<(AbortedAllocation, LocalDbError)>,
     ) -> Result<(), LocalDbError> {
         let mut published = SmallVec::<[Published; 4]>::new();
@@ -194,11 +251,25 @@ impl WriteCore {
                     .transition(sequence, Resolution::Allocated, Resolution::Aborted)?;
                 data.outcome = Some(Err(LocalDbError::new(error.message())));
                 if let Some(dependents) = publisher.dependents.remove(&sequence) {
-                    work.extend(dependents);
+                    for dependent in dependents {
+                        work.push(dependent);
+                    }
                 }
             }
+            // Pops strictly increase (PublicationWork) and every popped
+            // generation is durable, unresolved and inside the admitted window
+            // [reuse_next, next), whose length is at most the ring capacity.
+            // The bound therefore covers all work; leftover work or a
+            // non-increasing pop is an invariant violation and fail-stops.
+            let mut previous = None;
             for _ in 0..self.sequencer.capacity() {
                 let Some(sequence) = work.pop() else { break };
+                if previous.is_some_and(|previous| sequence <= previous) {
+                    return Err(LocalDbError::new(
+                        "publication work did not increase in sequence order",
+                    ));
+                }
+                previous = Some(sequence);
                 if self.sequencer.resolved(sequence) {
                     continue;
                 }
@@ -281,7 +352,9 @@ impl WriteCore {
                     metadata_charge,
                 });
                 if let Some(dependents) = publisher.dependents.remove(&sequence) {
-                    work.extend(dependents);
+                    for dependent in dependents {
+                        work.push(dependent);
+                    }
                 }
             }
             if !work.is_empty() {
@@ -462,5 +535,53 @@ impl WriteCore {
         // FINALIZED follows outcome, notification and dependency cleanup. The
         // caller may already have released, but cannot reuse this generation.
         self.sequencer.complete_resolve(sequence)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PublicationWork;
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::{Rng, SeedableRng};
+
+    /// Interleaved pushes above the current pop, as dependents arrive while
+    /// their predecessor publishes, always pop in strictly increasing order.
+    #[test]
+    fn publication_work_pops_in_increasing_sequence_order() {
+        let mut rng = StdRng::seed_from_u64(62);
+        for _ in 0..256 {
+            let mut work = PublicationWork::default();
+            let mut expected: Vec<u64> = Vec::new();
+            let mut next = 0u64;
+            for _ in 0..rng.gen_range(1..32) {
+                next += rng.gen_range(1..4);
+                expected.push(next);
+            }
+            let (initial, mut later) = expected.split_at(rng.gen_range(1..=expected.len()));
+            let mut shuffled = initial.to_vec();
+            shuffled.shuffle(&mut rng);
+            for &sequence in &shuffled {
+                work.push(sequence);
+            }
+            let mut popped = Vec::with_capacity(expected.len());
+            while let Some(sequence) = work.pop() {
+                popped.push(sequence);
+                let take = rng.gen_range(0..=later.len().min(3));
+                let (dependents, rest) = later.split_at(take);
+                for &dependent in dependents.iter().rev() {
+                    work.push(dependent);
+                }
+                later = rest;
+            }
+            // The heap drained before every later sequence was pushed.
+            for &sequence in later {
+                work.push(sequence);
+            }
+            while let Some(sequence) = work.pop() {
+                popped.push(sequence);
+            }
+            assert_eq!(popped, expected);
+        }
     }
 }
