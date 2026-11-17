@@ -1686,6 +1686,16 @@ impl Client {
         self.polling
     }
 
+    /// Outstanding transport groups, distinct from worker-local queued groups.
+    #[cfg(test)]
+    pub(crate) fn append_flights_in_flight(&self) -> usize {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_leased_mode() {
+            return self.leased_flights_in_flight();
+        }
+        self.reactor.pending_append_count()
+    }
+
     /// Prime/replace one session-local deterministic diagnostic buffer. No WAL
     /// state is read or changed. Bytes are `i % 251`, length 0..=64 KiB, also
     /// bounded by the negotiated response frame. Not available in normal builds.

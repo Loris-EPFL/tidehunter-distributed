@@ -296,7 +296,7 @@ impl ReadBatch {
             for (slot, reference) in group {
                 let plan = service.plan_member(&routing, &reference)?;
                 // Reject an impossible member before issuing any of this batch's RPCs.
-                if plan.charge > service.max_bytes.saturating_sub(512) {
+                if plan.charge > service.max_bytes().saturating_sub(512) {
                     return Err(LocalDbError::new(BYTE_BUDGET));
                 }
                 members.push_back(PlannedMember {
@@ -312,7 +312,7 @@ impl ReadBatch {
             class: ReadClass::Point,
             pin: None,
             reads: VecDeque::new(),
-            deadline: Instant::now() + service.timeout,
+            deadline: Instant::now() + service.timeout(),
             owned_lanes: Vec::new(),
             state: service.state.clone(),
             signal: None,
@@ -362,7 +362,7 @@ impl ReadBatch {
         while skipped < self.groups.len() {
             let (node, group) = self.groups.front_mut().expect("nonempty groups");
             let retained = *service.state.retained.lock();
-            let available = service.max_bytes - retained.1;
+            let available = service.max_bytes() - retained.1;
             let mut bytes = 512usize;
             let mut count = 0;
             let first_route = group.front().and_then(|member| member.plan.route());
@@ -1131,7 +1131,7 @@ type UnreleasedLiveGrant = (Arc<Mutex<Client>>, u64, Vec<[u8; 16]>);
 
 struct State {
     failed: AtomicBool,
-    first_failure: Arc<std::sync::OnceLock<String>>,
+    first_failure: Arc<std::sync::OnceLock<super::FirstFailure>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_reads: bool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -2358,8 +2358,71 @@ pub(super) struct ReadService {
     max_bytes: usize,
     timeout: Duration,
     epoch: u64,
+    /// Test-only override of `max_bytes`; `usize::MAX` means none. Relaxed:
+    /// a knob read on admission, set by the test thread between operations.
+    #[cfg(test)]
+    test_max_bytes: AtomicUsize,
+    /// Test-only override of `timeout` in nanoseconds; `u64::MAX` means none.
+    #[cfg(test)]
+    test_timeout_ns: AtomicU64,
+    /// Test-only override of `live_inline_reads`: 0 none, 1 off, 2 on.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    test_inline_reads: std::sync::atomic::AtomicU8,
 }
 impl ReadService {
+    #[cfg(not(test))]
+    fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+    #[cfg(test)]
+    fn max_bytes(&self) -> usize {
+        match self.test_max_bytes.load(Ordering::Relaxed) {
+            usize::MAX => self.max_bytes,
+            bytes => bytes,
+        }
+    }
+    #[cfg(not(test))]
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+    #[cfg(test)]
+    fn timeout(&self) -> Duration {
+        match self.test_timeout_ns.load(Ordering::Relaxed) {
+            u64::MAX => self.timeout,
+            nanos => Duration::from_nanos(nanos),
+        }
+    }
+    #[cfg(all(not(test), feature = "experimental-nvmeof", target_os = "linux"))]
+    fn live_inline_reads(&self) -> bool {
+        self.state.live_inline_reads
+    }
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    fn live_inline_reads(&self) -> bool {
+        match self.test_inline_reads.load(Ordering::Relaxed) {
+            0 => self.state.live_inline_reads,
+            value => value == 2,
+        }
+    }
+    /// Switch the immutable live inline-read policy for later reads, in place
+    /// on the same lanes and dataset (tests only).
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn set_inline_reads_for_test(&self, inline_reads: bool) {
+        self.test_inline_reads
+            .store(if inline_reads { 2 } else { 1 }, Ordering::Relaxed);
+    }
+    /// Replace the immutable read limits for later admissions (tests only).
+    #[cfg(test)]
+    pub(super) fn set_limits_for_test(&self, max_bytes: Option<usize>, timeout: Option<Duration>) {
+        if let Some(bytes) = max_bytes {
+            assert_ne!(bytes, usize::MAX);
+            self.test_max_bytes.store(bytes, Ordering::Relaxed);
+        }
+        if let Some(timeout) = timeout {
+            let nanos = u64::try_from(timeout.as_nanos()).unwrap();
+            assert_ne!(nanos, u64::MAX);
+            self.test_timeout_ns.store(nanos, Ordering::Relaxed);
+        }
+    }
     pub(super) fn resolution_monitor(&self) -> Option<ReadProfileMonitor> {
         self.state
             .coordinator_diagnostics
@@ -2438,6 +2501,11 @@ impl ReadRequest {
                 _ => None,
             }
         });
+        // Acquire pairs with begin_poison even if every flight was already
+        // complete when publication failed.
+        if self.credit.state.failed.load(Ordering::Acquire) {
+            return Err(LocalDbError::new("read authority is poisoned"));
+        }
         Ok(Some((values, profile)))
     }
 
@@ -2465,6 +2533,9 @@ impl ReadRequest {
             diagnostics
                 .actor_return_ns
                 .fetch_add(elapsed(worker.finished), Ordering::Relaxed);
+        }
+        if self.credit.state.failed.load(Ordering::Acquire) {
+            return Err(LocalDbError::new("read authority is poisoned"));
         }
         Ok(result)
     }
@@ -2583,7 +2654,7 @@ impl ReadService {
         epoch: u64,
         clients: Vec<Client>,
         recovery_stats: &mut RecoveryStats,
-        first_failure: Arc<std::sync::OnceLock<String>>,
+        first_failure: Arc<std::sync::OnceLock<super::FirstFailure>>,
     ) -> Result<Self, LocalDbError> {
         // Resolve immutable node policy before handing clients to the reactor;
         // startup must not contend with an otherwise idle scalar caller.
@@ -2705,6 +2776,12 @@ impl ReadService {
                 .saturating_sub(flight_metadata_bytes),
             timeout: config.timeout,
             epoch,
+            #[cfg(test)]
+            test_max_bytes: AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            test_timeout_ns: AtomicU64::new(u64::MAX),
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            test_inline_reads: std::sync::atomic::AtomicU8::new(0),
         };
         let mut clients = clients.into_iter();
         let read_lanes = config.effective_read_lanes();
@@ -2826,7 +2903,7 @@ impl ReadService {
             }
         }
         drop(reply);
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.timeout();
         for _ in 0..lanes {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3281,6 +3358,13 @@ impl ReadService {
         }
     }
 
+    /// Stop value delivery without taking read-side notification locks.
+    /// Failure finalization performs the existing wakeups after publication
+    /// locks have been dropped.
+    pub(super) fn begin_poison(&self) {
+        self.state.failed.store(true, Ordering::Release);
+    }
+
     pub(super) fn poison(&self) {
         self.state.poison();
     }
@@ -3351,7 +3435,7 @@ impl ReadService {
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.state.live_reads {
-            if !self.state.live_inline_reads {
+            if !self.live_inline_reads() {
                 return Ok(None);
             }
             return self.read_live_inline(node, epoch, reference, extra_bytes, pin, trace);
@@ -3360,7 +3444,7 @@ impl ReadService {
             .checked_add(extra_bytes)
             .and_then(|bytes| bytes.checked_add(512))
             .ok_or_else(|| LocalDbError::new("read budget overflow"))?;
-        if bytes > self.max_bytes {
+        if bytes > self.max_bytes() {
             return Err(LocalDbError::new(BYTE_BUDGET));
         }
         let mut flights = self.state.flights.lock();
@@ -3387,7 +3471,7 @@ impl ReadService {
             if self.nvmeof_enabled() {
                 return Ok(None);
             }
-            if retained.0 == self.max_requests || bytes > self.max_bytes - retained.1 {
+            if retained.0 == self.max_requests || bytes > self.max_bytes() - retained.1 {
                 return Ok(None);
             }
             let lane_guard = self.lanes.read();
@@ -3531,7 +3615,7 @@ impl ReadService {
             extra_bytes,
             profiled,
             ReadContext {
-                deadline: Instant::now() + self.timeout,
+                deadline: Instant::now() + self.timeout(),
                 pin,
                 trace: None,
             },
@@ -3599,7 +3683,7 @@ impl ReadService {
                 .checked_add(plan.charge)
                 .ok_or_else(|| LocalDbError::new("read budget overflow"))
         })?;
-        if bytes > self.max_bytes {
+        if bytes > self.max_bytes() {
             return Err(LocalDbError::new(BYTE_BUDGET));
         }
         let mut flights = self.state.flights.lock();
@@ -3694,7 +3778,7 @@ impl ReadService {
                 return Err(self.backpressure(&self.state.diagnostics.admission_retry_paused));
             }
             if (new_request != 0 && retained.0 == self.max_requests)
-                || bytes > self.max_bytes - retained.1
+                || bytes > self.max_bytes() - retained.1
             {
                 // Real shortage: the request or byte credit is exhausted now,
                 // checked under the same mutex that reserves it.
@@ -4028,29 +4112,31 @@ impl RemoteDatabase {
     /// Configure once before serving Sui requests. The finite budget counts
     /// actor enqueue attempts after byte/request admission, including failures.
     pub fn set_read_profile_limit(&mut self, limit: u64) {
-        self.reads
+        self.core
+            .reads
             .state
             .diagnostics
             .limit
             .store(limit, Ordering::Relaxed);
-        self.reads
+        self.core
+            .reads
             .state
             .diagnostics
             .remaining
             .store(limit, Ordering::Relaxed);
-        self.reads.state.coordinator_diagnostics.arm(limit);
+        self.core.reads.state.coordinator_diagnostics.arm(limit);
     }
     /// Cumulative first-N sampled RPC counters, never per-request means.
     /// Server spans nest inside exchange/service. Failures without a profiled
     /// owner reply are explicitly counted as unavailable.
     pub fn read_profile_monitor(&self) -> ReadProfileMonitor {
         ReadProfileMonitor {
-            state: self.reads.state.clone(),
-            fabric: self.config.tls.transport.is_fabric(),
+            state: self.core.reads.state.clone(),
+            fabric: self.core.config.tls.transport.is_fabric(),
         }
     }
     pub fn read_rpc_count(&self) -> u64 {
-        self.reads.state.read_rpcs.load(Ordering::Relaxed)
+        self.core.reads.state.read_rpcs.load(Ordering::Relaxed)
     }
     pub fn submit_record(
         &mut self,
@@ -4058,25 +4144,27 @@ impl RemoteDatabase {
     ) -> Result<PendingRecord, LocalDbError> {
         self.ensure_healthy()?;
         let pin = self
+            .core
             .index
             .pin_cut(IndexReadCut::At(MutationVersion {
                 batch: reference.batch_version,
                 operation_index: reference.descriptor.operation_index,
             }))
             .map_err(LocalDbError::component)?;
-        let ready = self.read_cache.get_scan(&reference);
+        let ready = self.core.read_cache.get_scan(&reference);
         let read = if ready.is_none() {
             let node = *self
+                .core
                 .partition_indexes
                 .get(&reference.batch_address.partition)
                 .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
-            Some(self.reads.submit_until(
+            Some(self.core.reads.submit_until(
                 node,
                 std::slice::from_ref(&reference),
                 0,
                 false,
                 ReadContext {
-                    deadline: Instant::now() + self.config.timeout,
+                    deadline: Instant::now() + self.core.config.timeout,
                     pin: Some(pin),
                     trace: None,
                 },
@@ -4085,7 +4173,7 @@ impl RemoteDatabase {
             None
         };
         Ok(PendingRecord {
-            owner: self.reads.state.clone(),
+            owner: self.core.reads.state.clone(),
             reference,
             ready,
             read,
@@ -4098,22 +4186,24 @@ impl RemoteDatabase {
         ks: KeySpace,
         reduced_key: &[u8],
     ) -> Result<Mutation, LocalDbError> {
-        self.stats.value_read_ns += completed.wait_ns;
-        if !Arc::ptr_eq(&self.reads.state, &completed.owner) {
+        self.core
+            .value_read_ns
+            .fetch_add(completed.wait_ns, Ordering::Relaxed);
+        if !Arc::ptr_eq(&self.core.reads.state, &completed.owner) {
             return Err(LocalDbError::new("record belongs to another authority"));
         }
         self.ensure_healthy()?;
-        let mutation = completed.result.inspect_err(|_| self.healthy = false)?;
+        let mutation = completed.result.inspect_err(|error| self.poison(error))?;
         if matches!(mutation, Mutation::Delete { .. })
             || mutation.keyspace() != ks
             || completed.reference.descriptor.keyspace != ks.0
-            || self.shape.ks(ks).reduce_key(mutation.key()).as_ref() != reduced_key
+            || self.core.shape.ks(ks).reduce_key(mutation.key()).as_ref() != reduced_key
         {
-            self.healthy = false;
-            return Err(LocalDbError::new(
-                "scan member does not match its live index reference",
-            ));
+            let error = LocalDbError::new("scan member does not match its live index reference");
+            self.poison(&error);
+            return Err(error);
         }
+        self.ensure_healthy()?;
         Ok(mutation)
     }
 
@@ -4121,7 +4211,9 @@ impl RemoteDatabase {
         &mut self,
         completed: CompletedGet,
     ) -> Result<Option<Bytes>, LocalDbError> {
-        self.stats.value_read_ns += completed.wait_ns;
+        self.core
+            .value_read_ns
+            .fetch_add(completed.wait_ns, Ordering::Relaxed);
         self.check_handle(&completed.pending)?;
         match completed.pending.state {
             GetState::Ready(value) => Ok(value),
@@ -4129,7 +4221,7 @@ impl RemoteDatabase {
                 let (values, _) = completed
                     .result
                     .expect("resolved read has completion")
-                    .inspect_err(|_| self.healthy = false)?;
+                    .inspect_err(|error| self.poison(error))?;
                 self.complete_get(reference, ks, &key, values)
             }
             _ => Err(LocalDbError::new("read is not a detached completion")),
@@ -4160,15 +4252,21 @@ impl RemoteDatabase {
         mut profile: Option<&mut RemoteReadProfile>,
         inline: bool,
     ) -> Result<PendingGet, LocalDbError> {
-        let mut sample = self.reads.state.coordinator_diagnostics.select(false, 1);
+        let mut sample = self
+            .core
+            .reads
+            .state
+            .coordinator_diagnostics
+            .select(false, 1);
         self.ensure_healthy()?;
         let index_started = Instant::now();
         let (reference, pin, cached) = {
             // Resolve the cut once; the lookup and a miss's pin must see the
             // same cut. No lock or guard is held past each call.
-            let cut = self.index.resolve_cut(cut);
+            let cut = self.core.index.resolve_cut(cut);
             let clock = ResolutionSample::start(&sample);
             let reference = self
+                .core
                 .index
                 .get(ks, key, cut.clone())
                 .map_err(LocalDbError::component);
@@ -4186,7 +4284,7 @@ impl RemoteDatabase {
             };
             let cached = if let Some(reference) = reference {
                 let clock = ResolutionSample::start(&sample);
-                let cached = self.read_cache.get_point(&reference, ks, key);
+                let cached = self.core.read_cache.get_point(&reference, ks, key);
                 if let Some(sample) = &sample {
                     sample.stage(ResolutionStage::CacheLookup, clock);
                 }
@@ -4196,7 +4294,11 @@ impl RemoteDatabase {
             };
             let pin = if reference.is_some() && cached.is_none() {
                 let clock = ResolutionSample::start(&sample);
-                let pin = self.index.pin_cut(cut).map_err(LocalDbError::component);
+                let pin = self
+                    .core
+                    .index
+                    .pin_cut(cut)
+                    .map_err(LocalDbError::component);
                 if let Some(sample) = &sample {
                     sample.stage(ResolutionStage::PinPreparation, clock);
                 }
@@ -4216,7 +4318,9 @@ impl RemoteDatabase {
             (reference, pin, cached)
         };
         let index_ns = elapsed(index_started);
-        self.stats.read_resolve_ns += index_ns;
+        self.core
+            .read_resolve_ns
+            .fetch_add(index_ns, Ordering::Relaxed);
         if let Some(profile) = profile.as_deref_mut() {
             profile.index_ns += index_ns;
         }
@@ -4237,6 +4341,7 @@ impl RemoteDatabase {
                 }
                 let clock = ResolutionSample::start(&sample);
                 let node = self
+                    .core
                     .partition_indexes
                     .get(&reference.batch_address.partition)
                     .copied()
@@ -4251,10 +4356,11 @@ impl RemoteDatabase {
                 drop(sample);
                 let inline_started = inline.then(Instant::now);
                 let immediate = if inline {
-                    self.reads
+                    self.core
+                        .reads
                         .read_inline(
                             node,
-                            self.epoch,
+                            self.core.epoch,
                             &reference,
                             key.len(),
                             profile.as_deref_mut().map(|profile| &mut profile.tcp),
@@ -4262,7 +4368,7 @@ impl RemoteDatabase {
                         )
                         .inspect_err(|error| {
                             if !admission_error(error) {
-                                self.healthy = false;
+                                self.poison(error);
                             }
                         })?
                 } else {
@@ -4270,13 +4376,15 @@ impl RemoteDatabase {
                 };
                 if let Some(values) = immediate {
                     let elapsed = elapsed(inline_started.unwrap());
-                    self.stats.value_read_ns += elapsed;
+                    self.core
+                        .value_read_ns
+                        .fetch_add(elapsed, Ordering::Relaxed);
                     if let Some(profile) = profile {
                         profile.inline_read_ns += elapsed;
                     }
                     GetState::Ready(self.complete_get(reference, ks, key, values)?)
                 } else {
-                    let read = self.reads.submit(
+                    let read = self.core.reads.submit(
                         node,
                         vec![reference],
                         key.len(),
@@ -4303,7 +4411,7 @@ impl RemoteDatabase {
         };
         self.ensure_healthy()?;
         Ok(PendingGet {
-            owner: self.reads.state.clone(),
+            owner: self.core.reads.state.clone(),
             state,
         })
     }
@@ -4325,13 +4433,26 @@ impl RemoteDatabase {
         }
     }
     fn check_handle(&mut self, pending: &PendingGet) -> Result<(), LocalDbError> {
-        if !Arc::ptr_eq(&self.reads.state, &pending.owner) {
+        if !Arc::ptr_eq(&self.core.reads.state, &pending.owner) {
             return Err(LocalDbError::new(
                 "read handle belongs to another authority/epoch",
             ));
         }
-        if self.reads.failed() {
-            self.healthy = false;
+        // A read-service failure not yet seen by the core is a new detection:
+        // fail-stop the core once. A core-initiated failure (begin_failure
+        // stores concurrent_failure before poisoning reads) is finalized by
+        // its own thread; observers only return the recorded error and never
+        // re-enter finish_failure, whose publisher lock that thread may hold.
+        if self.core.reads.failed()
+            && !self
+                .core
+                .concurrent_failure
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.poison(&LocalDbError::new(failure_context(
+                &self.core.first_failure,
+                "asynchronous read failed; recovery required",
+            )));
         }
         self.ensure_healthy()
     }
@@ -4344,19 +4465,21 @@ impl RemoteDatabase {
     ) -> Result<Option<Bytes>, LocalDbError> {
         self.ensure_healthy()?;
         if values.len() != 1 {
-            self.healthy = false;
-            return Err(LocalDbError::new("point read count mismatch"));
+            let error = LocalDbError::new("point read count mismatch");
+            self.poison(&error);
+            return Err(error);
         }
         let mutation = values.pop().unwrap();
         if matches!(mutation, Mutation::Delete { .. }) {
-            self.healthy = false;
-            return Err(LocalDbError::new(
-                "live index reference resolves to tombstone",
-            ));
+            let error = LocalDbError::new("live index reference resolves to tombstone");
+            self.poison(&error);
+            return Err(error);
         }
-        let prepared = self.read_cache.prepare_verified(reference, &mutation);
-        self.read_cache.insert_prepared(prepared);
-        Self::point_value(ks, key, mutation)
+        let prepared = self.core.read_cache.prepare_verified(reference, &mutation);
+        self.core.read_cache.insert_prepared(prepared);
+        let result = Self::point_value(ks, key, mutation);
+        self.ensure_healthy()?;
+        result
     }
     /// `None` means pending; `Some(None)` is a completed absence. A completion
     /// consumes the handle's result exactly once and refunds retained capacity.
@@ -4396,7 +4519,10 @@ impl RemoteDatabase {
         else {
             unreachable!()
         };
-        self.stats.value_read_ns += elapsed(read.deadline - self.config.timeout);
+        self.core.value_read_ns.fetch_add(
+            elapsed(read.deadline - self.core.config.timeout),
+            Ordering::Relaxed,
+        );
         let (values, _) = result?;
         self.complete_get(reference, ks, &key, values).map(Some)
     }
@@ -4417,13 +4543,13 @@ impl RemoteDatabase {
                 ks,
                 key,
             } => {
-                let value_started = read.deadline - self.config.timeout;
+                let value_started = read.deadline - self.core.config.timeout;
                 let wait_started = profile.as_ref().map(|_| Instant::now());
                 let result = read.finish();
-                self.stats.value_read_ns += elapsed(value_started);
-                let (values, worker) = result.inspect_err(|_| {
-                    self.healthy = false;
-                })?;
+                self.core
+                    .value_read_ns
+                    .fetch_add(elapsed(value_started), Ordering::Relaxed);
+                let (values, worker) = result.inspect_err(|error| self.poison(error))?;
                 if let (Some(profile), Some(worker)) = (profile, worker) {
                     profile.wait_ns += elapsed(wait_started.unwrap());
                     profile.actor_return_ns += elapsed(worker.finished);
@@ -4457,14 +4583,14 @@ mod live_worker_tests {
     fn live_grant_barrier_waits_for_lane_owner() {
         let mut fixture = Fixture::new();
         fixture.config.read_lanes = Some(1);
-        let mut db = fixture.open();
-        let lanes = db.reads.lanes.read()[0].clone();
+        let db = fixture.open();
+        let lanes = db.core.reads.lanes.read()[0].clone();
         let client = lanes[0].client.clone();
         let base = lanes[0].index;
-        let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
-        let state = db.reads.state.clone();
-        let epoch = db.reads.epoch;
-        let max_requests = db.reads.max_requests;
+        let (sender, receiver) = mpsc::sync_channel(db.core.reads.max_requests + 1);
+        let state = db.core.reads.state.clone();
+        let epoch = db.core.reads.epoch;
+        let max_requests = db.core.reads.max_requests;
         let held = client.lock();
         let worker = thread::spawn(move || {
             drive_live_reads(state, receiver, lanes, 0, base, epoch, max_requests)
@@ -4484,7 +4610,7 @@ mod live_worker_tests {
         );
         drop(sender);
         worker.join().unwrap();
-        assert!(!db.reads.failed());
+        assert!(!db.core.reads.failed());
         db.shutdown().unwrap();
     }
 
@@ -4493,26 +4619,27 @@ mod live_worker_tests {
         let mut fixture = Fixture::new();
         fixture.config.read_cache_bytes = 0;
         fixture.config.read_lanes = Some(1);
-        let mut db = fixture.open();
+        let db = fixture.open();
         db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
             .unwrap();
         let reference = db
             .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
             .unwrap()
             .unwrap();
-        let node = db.partition_indexes[&reference.batch_address.partition];
-        let lane = db.reads.lane_client(node, 0);
+        let node = db.core.partition_indexes[&reference.batch_address.partition];
+        let lane = db.core.reads.lane_client(node, 0);
         let held = lane.lock();
         let request = db
+            .core
             .reads
             .submit(node, vec![reference], 0, false, None)
             .unwrap();
-        assert!(db.reads.pause_idle_nvmeof(false).is_err());
-        assert!(!db.reads.failed());
+        assert!(db.core.reads.pause_idle_nvmeof(false).is_err());
+        assert!(!db.core.reads.failed());
         drop(held);
         let (values, _) = request.finish().unwrap();
         assert_eq!(values, vec![super::tests::put(0, 7)]);
-        drop(db.reads.pause_idle_nvmeof(false).unwrap());
+        drop(db.core.reads.pause_idle_nvmeof(false).unwrap());
         db.shutdown().unwrap();
     }
 
@@ -4523,25 +4650,26 @@ mod live_worker_tests {
         let mut fixture = Fixture::new();
         fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
-        let mut db = fixture.open();
+        let db = fixture.open();
         db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
             .unwrap();
         let reference = db
             .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
             .unwrap()
             .unwrap();
-        let node = db.partition_indexes[&reference.batch_address.partition];
-        let lanes = db.reads.lanes.read()[node].clone();
+        let node = db.core.partition_indexes[&reference.batch_address.partition];
+        let lanes = db.core.reads.lanes.read()[node].clone();
         let base = lanes[0].index;
-        let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
-        let state = db.reads.state.clone();
-        let epoch = db.reads.epoch;
-        let max_requests = db.reads.max_requests;
+        let (sender, receiver) = mpsc::sync_channel(db.core.reads.max_requests + 1);
+        let state = db.core.reads.state.clone();
+        let epoch = db.core.reads.epoch;
+        let max_requests = db.core.reads.max_requests;
         let worker = thread::spawn(move || {
             drive_live_reads(state, receiver, lanes, node, base, epoch, max_requests)
         });
-        db.reads.sender.lock()[node] = sender;
+        db.core.reads.sender.lock()[node] = sender;
         let request = db
+            .core
             .reads
             .submit(node, vec![reference], 0, false, None)
             .unwrap();
@@ -4550,9 +4678,9 @@ mod live_worker_tests {
             Ok(_) => panic!("unconfigured live worker unexpectedly succeeded"),
         };
         assert!(error.to_string().contains("live NVMe is not configured"));
-        assert!(db.reads.failed());
-        assert_eq!(*db.reads.state.retained.lock(), (0, 0));
-        db.reads.sender.lock().clear();
+        assert!(db.core.reads.failed());
+        assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
+        db.core.reads.sender.lock().clear();
         worker.join().unwrap();
     }
 
@@ -4561,7 +4689,7 @@ mod live_worker_tests {
         let mut fixture = Fixture::new();
         fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
-        let mut original = fixture.open();
+        let original = fixture.open();
         original
             .write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
             .unwrap();
@@ -4604,7 +4732,7 @@ mod live_worker_tests {
         let mut fixture = Fixture::new();
         fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
-        let mut db = fixture.open();
+        let db = fixture.open();
         // A batch holds at most four operations; two batches put eight members
         // on one owner.
         for batch in 0u32..2 {
@@ -4621,42 +4749,45 @@ mod live_worker_tests {
                     .unwrap()
             })
             .collect();
-        let node = db.partition_indexes[&references[0].batch_address.partition];
+        let node = db.core.partition_indexes[&references[0].batch_address.partition];
         let same_owner: Vec<_> = references
             .into_iter()
-            .filter(|reference| db.partition_indexes[&reference.batch_address.partition] == node)
+            .filter(|reference| {
+                db.core.partition_indexes[&reference.batch_address.partition] == node
+            })
             .take(6)
             .collect();
         assert!(same_owner.len() >= 5, "need distinct flights on one lane");
-        let lanes = db.reads.lanes.read()[node].clone();
+        let lanes = db.core.reads.lanes.read()[node].clone();
         let base = lanes[0].index;
         let client = lanes[0].client.clone();
-        let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
-        let state = db.reads.state.clone();
-        let epoch = db.reads.epoch;
+        let (sender, receiver) = mpsc::sync_channel(db.core.reads.max_requests + 1);
+        let state = db.core.reads.state.clone();
+        let epoch = db.core.reads.epoch;
         // A lane inbox of two entries, and a worker stuck behind the client lock.
         let held = client.lock();
         let actor =
             thread::spawn(move || drive_live_reads(state, receiver, lanes, node, base, epoch, 2));
-        db.reads.sender.lock()[node] = sender.clone();
+        db.core.reads.sender.lock()[node] = sender.clone();
         let pending: Vec<_> = same_owner
             .iter()
             .map(|reference| {
-                db.reads
+                db.core
+                    .reads
                     .submit(node, vec![*reference], 0, false, None)
                     .unwrap()
             })
             .collect();
-        let diagnostics = &db.reads.state.diagnostics;
+        let diagnostics = &db.core.reads.state.diagnostics;
         let deadline = Instant::now() + Duration::from_secs(5);
         while diagnostics.live_lane_full.load(Ordering::Relaxed) == 0 {
             assert!(Instant::now() < deadline, "the lane inbox never filled");
             thread::yield_now();
         }
         // The actor still serves its own channel while one lane is full.
-        db.reads.state.wake_pending[node].store(true, Ordering::Release);
+        db.core.reads.state.wake_pending[node].store(true, Ordering::Release);
         assert!(sender.try_send(ReadCommand::Wake).is_ok());
-        while db.reads.state.wake_pending[node].load(Ordering::Acquire) {
+        while db.core.reads.state.wake_pending[node].load(Ordering::Acquire) {
             assert!(
                 Instant::now() < deadline,
                 "the actor blocked on a full lane"
@@ -4670,9 +4801,9 @@ mod live_worker_tests {
         for request in pending {
             assert!(request.finish().is_err());
         }
-        assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+        assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
         drop(sender);
-        db.reads.sender.lock().clear();
+        db.core.reads.sender.lock().clear();
         actor.join().unwrap();
         drop(db);
     }

@@ -341,7 +341,7 @@ impl ConcurrentRemoteDatabase {
                 let result = batch.finish_one();
                 self.value_read_ns
                     .fetch_add(elapsed(started), Ordering::Relaxed);
-                result.inspect_err(|_| self.poison())?;
+                result.inspect_err(|error| self.poison(error))?;
             }
         }
         if let Some(sample) = &sample {
@@ -375,7 +375,7 @@ impl ConcurrentRemoteDatabase {
                     key.as_ref(),
                     mutation.expect("every live reference was resolved"),
                 )
-                .inspect_err(|_| self.poison()),
+                .inspect_err(|error| self.poison(error)),
             })
             .collect();
         if let Some(sample) = &sample {
@@ -567,7 +567,7 @@ impl ConcurrentRemoteDatabase {
                 key.len(),
                 false,
                 ReadContext {
-                    deadline: Instant::now() + self.reads.timeout,
+                    deadline: Instant::now() + self.reads.timeout(),
                     pin: Some(pin),
                     trace,
                 },
@@ -608,7 +608,7 @@ impl ConcurrentRemoteDatabase {
                 let (values, _) = completed
                     .result
                     .expect("resolved read has completion")
-                    .inspect_err(|_| self.poison())?;
+                    .inspect_err(|error| self.poison(error))?;
                 self.complete_concurrent_get(reference, ks, &key, values)
             }
             _ => Err(LocalDbError::new("read is not a detached completion")),
@@ -626,10 +626,9 @@ impl ConcurrentRemoteDatabase {
     ) -> Result<Option<Bytes>, LocalDbError> {
         self.ensure_healthy()?;
         if values.len() != 1 || matches!(values.first(), Some(Mutation::Delete { .. })) {
-            self.poison();
-            return Err(LocalDbError::new(
-                "live point reference returned an invalid record",
-            ));
+            let error = LocalDbError::new("live point reference returned an invalid record");
+            self.poison(&error);
+            return Err(error);
         }
         let mutation = values.pop().unwrap();
         let prepared = self.cache.prepare_verified(reference, &mutation);
@@ -701,16 +700,15 @@ impl ConcurrentRemoteDatabase {
         self.value_read_ns
             .fetch_add(completed.wait_ns, Ordering::Relaxed);
         self.ensure_healthy()?;
-        let mutation = completed.result.inspect_err(|_| self.poison())?;
+        let mutation = completed.result.inspect_err(|error| self.poison(error))?;
         if matches!(mutation, Mutation::Delete { .. })
             || mutation.keyspace() != ks
             || completed.reference.descriptor.keyspace != ks.0
             || self.shape.ks(ks).reduce_key(mutation.key()).as_ref() != reduced_key
         {
-            self.poison();
-            return Err(LocalDbError::new(
-                "scan member does not match its live index reference",
-            ));
+            let error = LocalDbError::new("scan member does not match its live index reference");
+            self.poison(&error);
+            return Err(error);
         }
         self.ensure_healthy()?;
         Ok(mutation)

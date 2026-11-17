@@ -12,7 +12,6 @@ use super::completion::{CompletionEvent, CompletionInbox, CompletionTicket};
 use super::local_inventory::{LocalInventory, LocalInventoryConfig};
 use super::native_index::{IndexReadCut, IndexReadPin, NativeIndex};
 use super::native_publication::PreparedNativePublication;
-use super::publication::PublicationTracker;
 use super::sequence::LogicalClock;
 use super::storage::{PartitionLog, PartitionStats, RecordReadProfile};
 use super::types::{
@@ -22,6 +21,7 @@ use super::worker::{GroupCommitWorker, PendingBatch, WorkerConfig, WorkerStats};
 use crate::key_shape::{KeyShape, KeySpace};
 use crate::metrics::Metrics;
 use minibytes::Bytes;
+use publication::PublicationTracker;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod checkpoint;
+pub(super) mod publication;
 pub const BACKEND_ID: &str = "experimental-native-cell-sharded-value-wal-local-rf1";
 
 #[derive(Clone, Debug)]

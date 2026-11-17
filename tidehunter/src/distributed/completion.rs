@@ -285,7 +285,7 @@ mod tests {
     use super::*;
     use crate::distributed::codec::{BatchLimits, Mutation};
     use crate::distributed::group::{CompleteGroup, GroupLimits};
-    use crate::distributed::publication::{PublicationState, PublicationTracker};
+    use crate::distributed::local_db::publication::{PublicationState, PublicationTracker};
     use crate::distributed::storage::{PartitionConfig, PartitionLog, StaticInventory};
     use crate::distributed::types::RequestAuthority;
     use crate::key_shape::{KeyShape, KeySpace, KeyType};
