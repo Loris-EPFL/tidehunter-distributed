@@ -1443,6 +1443,8 @@ pub(super) struct ClientState {
     position_target: Option<super::super::write_timeline::ControlTimelineTarget>,
     message_read_requests: u64,
     progressed: bool,
+    #[cfg(test)]
+    append_hold: Option<AppendHold>,
 }
 impl ClientState {
     fn allocate_id(&mut self) -> Result<u64, TcpError> {
@@ -1456,6 +1458,46 @@ impl ClientState {
     #[cfg(test)]
     pub(super) fn pending_append_count(&self) -> usize {
         self.appends.len()
+    }
+}
+
+/// Test-only hold on the client receive path, below the reactor's harvest.
+/// The first two harvested append completions are withheld from the caller.
+/// Once both have arrived, so both groups are appended at the owner, the
+/// lower-sequence group A is returned. Its successors are returned before A
+/// (`successor_first`), or stay withheld for the life of this client, exactly
+/// like a reply still in flight when the caller fail-stops.
+#[cfg(test)]
+struct AppendHold {
+    successor_first: bool,
+    held: Vec<AppendCompletion>,
+    released: bool,
+}
+
+#[cfg(test)]
+impl AppendHold {
+    fn filter(&mut self, completions: &mut Vec<AppendCompletion>) {
+        if self.released {
+            return;
+        }
+        self.held.append(completions);
+        if self.held.len() < 2 {
+            return;
+        }
+        self.released = true;
+        self.held.sort_by_key(|completion| {
+            completion
+                .result
+                .as_ref()
+                .ok()
+                .and_then(|receipts| receipts.first())
+                .map_or(u64::MAX, |receipt| receipt.appended().version().sequence)
+        });
+        let first = self.held.remove(0);
+        if self.successor_first {
+            completions.append(&mut self.held);
+        }
+        completions.push(first);
     }
 }
 
@@ -1982,7 +2024,21 @@ impl Client {
             self.reactor.retained_append_bytes -= queued.charge;
             completions.push(queued.completion);
         }
+        #[cfg(test)]
+        if let Some(hold) = self.reactor.append_hold.as_mut() {
+            hold.filter(&mut completions);
+        }
         Ok(completions)
+    }
+    /// Arms the one-shot test hold on this client's next two harvested append
+    /// completions; see `AppendHold`.
+    #[cfg(test)]
+    pub(crate) fn hold_append_completions(&mut self, successor_first: bool) {
+        self.reactor.append_hold = Some(AppendHold {
+            successor_first,
+            held: Vec::new(),
+            released: false,
+        });
     }
     pub(super) fn take_append_completion(
         &mut self,

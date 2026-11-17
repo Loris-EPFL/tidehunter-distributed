@@ -214,8 +214,11 @@ def bounded(command, deadline, *, environment=None, cwd=None):
 
 
 def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environment,
-                       durability_tier=cloud_campaign.DEFAULT_DURABILITY_TIER):
-    """Exercise the built binary against five real local TCP owner processes."""
+                       durability_tier="synchronous"):
+    """Exercise the built binary against five real local TCP owner processes.
+
+    The diagnostic qualifies the stricter synchronous tier of the strict CI cohort; it keeps
+    that tier explicitly now that native is the matrix default."""
     binary = Path(binary).resolve(strict=True)
     import yaml
     work, proof = Path(work).absolute(), Path(proof).absolute()

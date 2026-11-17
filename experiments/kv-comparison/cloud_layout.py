@@ -130,6 +130,18 @@ def backend_options(fleet, backend, root, ack_contract="synced"):
     raise ValueError("unsupported backend")
 
 
+def arm_component(backend, ack_contract="synced"):
+    """Directory name for one backend acknowledgement arm.
+
+    Changing arms resets data but keeps the ownership receipt (owner.json, store config), and
+    require_state demands an exact match. Each relaxed arm therefore owns its own directory and
+    receipt; synced keeps the historical path.
+    """
+    import ack_contract as contracts
+    selected = contracts.selected(backend, ack_contract)
+    return backend if selected == "synced" else f"{backend}-{selected}"
+
+
 def node_config(fleet, backend, index, ack_contract="synced"):
     import ack_contract as contracts
     contracts.selected(backend, ack_contract)
@@ -146,7 +158,7 @@ def node_config(fleet, backend, index, ack_contract="synced"):
     host = fleet["coordinator"] if coordinator else fleet["nodes"][index]
     address, pd = host["address"], fleet["coordinator"]["address"]
     role = "coordinator" if coordinator else f"node-{index}"
-    directory = Path(fleet["data_root"]) / backend / role
+    directory = Path(fleet["data_root"]) / arm_component(backend, ack_contract) / role
     owner = digest({"fleet": fleet, "backend": backend})
     labels = {local.OWNER_LABEL: owner, RUN_LABEL: fleet["run_id"], NODE_LABEL: role, BACKEND_LABEL: backend}
     files, containers = {}, []
@@ -417,7 +429,8 @@ def require_state(config):
     if config["qualification_only"]:
         roots.append(Path("/tmp/tidehunter-kv-comparison"))
     if (config["backend"] not in BACKENDS or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", config["run_id"]) or
-            directory not in [root / config["run_id"] / config["backend"] / role for root in roots]):
+            directory not in [root / config["run_id"] / arm_component(config["backend"], config.get("ack_contract", "synced")) / role
+                              for root in roots]):
         raise ValueError("owned directory escapes admitted run root")
     saved = json.loads(guarded(directory / "owner.json").read_text())
     if saved != config:
@@ -826,7 +839,8 @@ def probe_once(fleet, config, cluster=False):
             observed["cluster_bus"] = "TCP control network" if clustered else None
         proof.update(observed)
         save(directory / "probe-attempt.json", proof)
-        data_dirs = ({x["address"] + ":6379": str(Path(fleet["data_root"]) / backend / f"node-{x['index']}" / "data")
+        data_dirs = ({x["address"] + ":6379": str(Path(fleet["data_root"]) / arm_component(backend, config.get("ack_contract", "synced"))
+                                                  / f"node-{x['index']}" / "data")
                       for x in fleet["nodes"]} if config.get("paired_valkey") else "/data")
         proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, clustered, complete=complete, data_dir=data_dirs, ack_contract=config.get("ack_contract", "synced"))
         if backend == "valkey_rdma" and complete:

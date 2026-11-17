@@ -253,7 +253,7 @@ impl RemoteDatabase {
         prefetch: usize,
     ) -> Result<Vec<(Bytes, Bytes)>, LocalDbError> {
         self.ensure_healthy()?;
-        let cut = self.core.index.latest_cut();
+        let cut = self.core.index.call_cut();
         // Reject unsupported/invalid keyspace scans before issuing any RPC or
         // poisoning a serving authority for a caller's invalid request.
         let resolve_started = Instant::now();
@@ -261,7 +261,7 @@ impl RemoteDatabase {
             let pin = self
                 .core
                 .index
-                .pin_cut(cut)
+                .pin_call_cut(cut)
                 .map_err(LocalDbError::component)?;
             let cursor = self
                 .core

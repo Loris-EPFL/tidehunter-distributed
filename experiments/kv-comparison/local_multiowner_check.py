@@ -96,15 +96,20 @@ def kernel_log_interval(before, after):
             'io_errors_or_controller_recovery': errors}
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--libs', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--owners', type=int, choices=(4, 16), default=16)
-    parser.add_argument('--wal-prewrite', action='store_true',
-                        help='pre-write and sync owner WAL files before grants')
-    args = parser.parse_args()
+    parser.add_argument('--wal-prewrite', action=argparse.BooleanOptionalAction, default=True,
+                        help='pre-write and sync owner WAL files before grants (default); '
+                             '--no-wal-prewrite keeps fallocated, unwritten WAL extents')
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
     if os.geteuid() != 0:
         raise SystemExit('requires the privileged host namespace wrapper')
     uptime = subprocess.check_output(['uptime'], text=True).strip()

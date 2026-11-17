@@ -346,7 +346,12 @@ impl ClientWorker {
                             }
                             drop(client);
                             if controls.len() == queue_capacity {
-                                receiver.park_full();
+                                // Receive no more controls while local metadata
+                                // is full, but keep the 1 ms cadence: no reply
+                                // wakes this thread, and this thread alone
+                                // drives and harvests the adoption and its
+                                // deadline.
+                                receiver.park_full_timeout(Duration::from_millis(1));
                                 worker_queue.unpark();
                                 continue;
                             }

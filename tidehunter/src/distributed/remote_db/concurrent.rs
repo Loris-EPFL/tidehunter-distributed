@@ -1123,22 +1123,38 @@ impl ConcurrentRemoteDatabase {
         self.ensure_healthy()
     }
 
+    /// The caller can keep the cut: a standing-budget view takes its owner
+    /// charge first.
+    ///
     /// # Errors
-    /// Rejects an unhealthy authority before or after capturing its committed cut.
+    /// Rejects an unhealthy authority before or after capturing its committed
+    /// cut, and returns the index `Capacity` error when the view allowance
+    /// cannot hold the owner charge.
     pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
         self.ensure_healthy()?;
-        let cut = self.index.latest_cut();
+        let cut = self.index.latest_cut().map_err(LocalDbError::component)?;
         self.ensure_healthy()?;
         Ok(cut)
     }
 
-    /// Capture and protect one published cut without a retention race.
+    /// Like [`Self::published_cut`] without the owner charge. Hold the cut
+    /// only until the calling API returns (see `StandingViewBudget`).
+    pub(crate) fn call_published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
+        self.ensure_healthy()?;
+        let cut = self.index.call_cut();
+        self.ensure_healthy()?;
+        Ok(cut)
+    }
+
+    /// Capture and protect one published cut without a retention race. The
+    /// caller can keep it: a standing-budget view takes its owner charge
+    /// (`Capacity` when full).
     pub fn protected_published_cut(
         &self,
     ) -> Result<(IndexReadCut, super::super::native_index::IndexReadPin), LocalDbError> {
         self.ensure_healthy()?;
         let index = &self.index;
-        let cut = index.latest_cut();
+        let cut = index.latest_cut().map_err(LocalDbError::component)?;
         let pin = index
             .pin_cut(cut.clone())
             .map_err(LocalDbError::component)?;
@@ -1146,6 +1162,23 @@ impl ConcurrentRemoteDatabase {
         Ok((cut, pin))
     }
 
+    /// Like [`Self::protected_published_cut`] without the owner charge. Hold
+    /// both only until the calling API returns (see `StandingViewBudget`).
+    pub(crate) fn call_protected_cut(
+        &self,
+    ) -> Result<(IndexReadCut, super::super::native_index::IndexReadPin), LocalDbError> {
+        self.ensure_healthy()?;
+        let index = &self.index;
+        let cut = index.call_cut();
+        let pin = index
+            .pin_call_cut(cut.clone())
+            .map_err(LocalDbError::component)?;
+        self.ensure_healthy()?;
+        Ok((cut, pin))
+    }
+
+    /// The caller can keep the pin: a standing-budget view takes its owner
+    /// charge (`Capacity` when full).
     pub fn pin_cut(
         &self,
         cut: IndexReadCut,

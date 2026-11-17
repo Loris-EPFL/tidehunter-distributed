@@ -40,6 +40,17 @@ class IndustryAdmissionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 service.admit(backend, nodes, endpoints)
 
+    def test_cloud_probe_evidence_call_accepts_the_ack_contract(self):
+        # cloud_layout's probe passes ack_contract to evidence(); a missing keyword failed fleet startup.
+        replies = {"server": "kvrocks_version:2.17.0", "replication": "role:master", "cluster": "",
+                   "persistence": "", "memory": ""}
+        with mock.patch.object(service, "settings", return_value={"dir": "/data"}), \
+                mock.patch.object(service, "request", side_effect=lambda _e, *args: replies[args[1]]), \
+                mock.patch.object(service, "info", side_effect=lambda text: {"raw": text}):
+            observed = service.evidence("kvrocks", ["10.0.0.2:6379"], complete=False, ack_contract="page_cache")
+        self.assertEqual(observed["nodes"][0]["effective_config"], {"dir": "/data"})
+        self.assertEqual(observed["nodes"][0]["info_server"], {"raw": "kvrocks_version:2.17.0"})
+
     def test_unhealthy_inconsistent_and_duplicate_slot_views(self):
         for change in ("unhealthy", "overlap", "disagree", "missing", "replica", "foreign"):
             nodes, endpoints = valid_nodes("garnet")

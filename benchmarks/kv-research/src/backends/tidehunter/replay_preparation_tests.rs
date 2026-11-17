@@ -52,14 +52,16 @@ fn absent_replay_preparation_inputs_preserve_every_synthetic_output_byte() {
     prepare_external_case_file(&input, &output).unwrap();
     // Captured from the pre-extension 3bbd706 CLI using this exact trusted-TCP
     // input. No paths, identities, fields or bytes are normalized by this check.
-    // Only the launch hash is re-pinned for the uniform overlap budget:
-    // explicit 2 lanes plus 2 controls, doubled, now needs 8 connections.
+    // The launch hash is re-pinned for the uniform overlap budget (explicit
+    // 2 lanes plus 2 controls, doubled, now needs 8 connections) and for the
+    // explicit legacy line `wal_prewrite: false` (the owner default is now on),
+    // which is its only other change.
     // The remote hashes are re-pinned for the removed coordinator preparation
     // pool: the only difference is the deleted `preparation_workers: 8` field.
     let expected = [
         ("durability.json", "389117a6498def40a97d89ca4fa7ed4a116597a762532440e391ebddc3d1dd2b155fd923f57db426aa1de4becd585f59767614b7d7bddb4ee58376453035487a"),
         ("external_owner_read_config.json", "1cdb078424efc8a57b42df8f41b193f87d8f5e4efc4fbdc15819bac2bfa919bbb956b58f220a0a60741625016003b163b7d4fda5cd7ea9755069516292da6571"),
-        ("node-0/launch.yaml", "e9349a3d6a7fab70a8afc411cb52b62dcaf575683c69bfd60731ac2b014f78c0e70deaf25ed9042d1e0a0ea10312e6ff890b2142522779d0a83b1c5f94888503"),
+        ("node-0/launch.yaml", "e4127bd8a76477180cb2656a6b78949a1c39324cd3c16d851d22d594fbf83f68df11e02d5c3660ffe503be7d3d93cd8958be7be5e56944bff0b5429be367c6f7"),
         ("owner_transports.json", "5c3f7f89d4ec1232155e1e5899765fb285a47198b950f7c9b174c8151bb6d1403c17c839ac9a2ab7b943d62f28c2f8423dd1ca792ebe6c087916156ee3ca54f7"),
         ("remote.json", "4852ecb72a28976ff3aa70c5095dd793eacb24842fcf8daab92e8706b6bd52bbe6b7e4e54ad769a70b84d629905ef68ff92d1e1c88dade300cae55da8b289516"),
         ("remote.yaml", "a0cbd90461ccac4fbf9ebe40dc88a8fc83ad87d55ce2a489e0ad8bd6edd524ec6234c6478abc6e1a8c1860cf66fc0bdd00ff99842d3943791be9fa41161a15f8"),
