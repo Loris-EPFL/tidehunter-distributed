@@ -68,14 +68,14 @@ impl ReadService {
         pin: Option<IndexReadPin>,
         trace: Option<&ReadTraceChild>,
     ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.timeout();
         let bytes = self
             .plan_member(&self.routing(), reference)?
             .charge
             .checked_add(extra_bytes)
             .and_then(|n| n.checked_add(512))
             .ok_or_else(|| LocalDbError::new("read budget overflow"))?;
-        if bytes > self.max_bytes {
+        if bytes > self.max_bytes() {
             return Err(LocalDbError::new(BYTE_BUDGET));
         }
         let fallback = |counter, reason| self.live_inline_fallback(node, counter, reason, trace);
@@ -117,7 +117,7 @@ impl ReadService {
                     "live_inline_fallback_paused",
                 );
             }
-            if retained.0 == self.max_requests || bytes > self.max_bytes - retained.1 {
+            if retained.0 == self.max_requests || bytes > self.max_bytes() - retained.1 {
                 return fallback(
                     |d| &d.live_inline_fallback_credit,
                     "live_inline_fallback_credit",

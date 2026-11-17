@@ -120,7 +120,11 @@ pub(crate) struct ValidatedMutations<'a> {
     routing_heap_bound: usize,
 }
 
-impl ValidatedMutations<'_> {
+impl<'a> ValidatedMutations<'a> {
+    pub(crate) fn mutations(&self) -> &'a [Mutation] {
+        self.mutations
+    }
+
     pub(crate) fn encoded_len(&self) -> usize {
         self.encoded_len
     }

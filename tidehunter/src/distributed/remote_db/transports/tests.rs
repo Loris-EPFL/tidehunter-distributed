@@ -80,7 +80,7 @@ fn clean_reuse_recovers_retry_identity_and_rejects_old_read_handles() {
 fn reused_transport_refreshes_inventory_before_reserving_an_epoch() {
     let fixture = Fixture::new();
     let pool = Arc::new(RemoteTransportPool::new());
-    let mut db = open(&fixture, &pool).unwrap();
+    let db = open(&fixture, &pool).unwrap();
     db.write_batch(fixture.operation(0, 1), vec![put(9)])
         .unwrap();
     db.shutdown().unwrap();
@@ -106,7 +106,7 @@ fn changed_trust_anchor_cannot_reuse_an_authenticated_old_connection() {
     let fixture = Fixture::new();
     let other = Fixture::new();
     let pool = Arc::new(RemoteTransportPool::new());
-    let mut db = open(&fixture, &pool).unwrap();
+    let db = open(&fixture, &pool).unwrap();
     db.write_batch(fixture.operation(0, 1), vec![put(9)])
         .unwrap();
     db.shutdown().unwrap();
@@ -128,10 +128,10 @@ fn changed_trust_anchor_cannot_reuse_an_authenticated_old_connection() {
 fn failed_checkpoint_shutdown_discards_transports_and_recovers_durable_tail() {
     let fixture = Fixture::new();
     let pool = Arc::new(RemoteTransportPool::new());
-    let mut db = open(&fixture, &pool).unwrap();
+    let db = open(&fixture, &pool).unwrap();
     db.write_batch(fixture.operation(0, 1), vec![put(9)])
         .unwrap();
-    db.checkpoint_interruption = Some(1);
+    db.core.test_hooks.lock().checkpoint_interruption = Some(1);
     assert!(db.shutdown().is_err());
     drop(db);
     assert!(pool.idle.lock().is_none());

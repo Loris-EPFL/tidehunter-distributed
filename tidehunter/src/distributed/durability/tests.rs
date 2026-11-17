@@ -262,6 +262,9 @@ fn flush_waits_for_everything_appended_before_it() {
         thread::spawn(move || native::flush(&f, soon()))
     };
     assert_eq!(stall.entered.recv_timeout(LIMIT), Ok(10));
+    // `flush_waits` counts only waits that blocked. The first flusher may still be between
+    // `begin_flush` and its wait; release the fsync only once it is parked.
+    assert!(f.wait_parked_flush_waits(1, Instant::now() + LIMIT));
 
     // Acknowledged after the first flush began, before the second one begins.
     f.complete(10, 20, 1).unwrap();
@@ -280,8 +283,15 @@ fn flush_waits_for_everything_appended_before_it() {
         f.finish_flush(ticket, Some(Instant::now() + SETTLE)),
         Err(FrontierError::Timeout)
     );
+    // The timed-out wait parked (count 2). Park the finishing wait (count 3) before the
+    // fsync of 0..20 is released, for the same reason as the first one.
+    let second = {
+        let f = Arc::clone(&f);
+        thread::spawn(move || f.finish_flush(ticket, soon()))
+    };
+    assert!(f.wait_parked_flush_waits(3, Instant::now() + LIMIT));
     stall.release.send(()).unwrap();
-    assert_eq!(f.finish_flush(ticket, soon()), Ok(20));
+    assert_eq!(second.join().unwrap(), Ok(20));
 
     let stats = f.stats();
     assert_eq!(stats.flush_requests, 2);

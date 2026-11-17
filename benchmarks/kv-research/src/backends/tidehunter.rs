@@ -519,7 +519,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     let mut remote: tidehunter::distributed::remote_db::RemoteDatabaseConfig =
         serde_yaml::from_slice(&fs::read(&remote_path)?)?;
     remote.history_persistence = input.history_persistence;
-    remote.preparation_workers = 8;
     remote.pin_read_lanes = input.pin_read_lanes;
     remote.read_lanes = input.read_lanes;
     remote.read_cache_bytes = input.coordinator_cache_bytes;
@@ -650,7 +649,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
 }
 // Checkpoint phase sums are charged on completion, including work begun before
 // the measurement boundary. They are not per-request latency or network clocks.
-const COORDINATOR_INTERVAL_COUNTERS: [&str; 33] = [
+const COORDINATOR_INTERVAL_COUNTERS: [&str; 30] = [
     "write_storage_wait_ns",
     "write_publication_ns",
     "write_dispatch_ns",
@@ -670,10 +669,7 @@ const COORDINATOR_INTERVAL_COUNTERS: [&str; 33] = [
     "write_durable_receipt_publication_blocked_ns",
     "write_durable_receipt_publication_blocked_batches",
     "write_append_requests",
-    "write_direct_appends",
-    "write_durable_batches",
     "write_concurrent_admitted",
-    "write_concurrent_completed",
     "write_out_of_prefix_published_batches",
     "write_dependency_wait_batches",
     "write_checkpoint_diagnostic_root_adoption_ns",
@@ -1100,7 +1096,6 @@ async fn open_with_shape(
             let config = cluster.config.clone();
             (Some(cluster), config)
         };
-    remote_config.preparation_workers = 8;
     if !remote_config.tls.transport.same_protocol(&transport) {
         return Err(format!(
             "{} requires transport {}",
@@ -1259,7 +1254,6 @@ async fn open_with_shape(
             "pipelined_writes": remote_config.pipelined_writes,
             "read_cache_bytes": remote_config.read_cache_bytes,
             "read_memory_allowance_bytes": remote_config.read_memory_allowance_bytes,
-            "preparation_workers": remote_config.preparation_workers,
             "scan_prefetch_pages": remote_config.scan_prefetch_pages,
             "read_lanes": remote_config.effective_read_lanes(),
             "pin_read_lanes": remote_config.pin_read_lanes,
@@ -2657,7 +2651,6 @@ mod tests {
             prepare_external_case_file(&input, &output).unwrap();
             let remote: RemoteDatabaseConfig =
                 serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
-            assert_eq!(remote.preparation_workers, 8);
             assert_eq!(remote.storage.fragment_bytes, fragment_bytes);
             assert_eq!(remote.storage.wal_file_bytes, wal_file_bytes);
             if geometry == Some("research") {

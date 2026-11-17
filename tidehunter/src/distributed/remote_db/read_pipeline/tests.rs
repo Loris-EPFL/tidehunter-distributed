@@ -7,6 +7,7 @@ use crate::distributed::types::{
 };
 use crate::key_shape::{KeyShape, KeyType};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 fn put(key: u32, value: u8) -> Mutation {
     Mutation::Put {
@@ -127,7 +128,7 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
     }
     db.drain().unwrap();
     let checkpoint = db.checkpoint().unwrap();
-    let pin = db.index.pin_cut(db.index.latest_cut()).unwrap();
+    let pin = db.core.index.pin_cut(db.core.index.call_cut()).unwrap();
     let captured_rows: Vec<_> = expected
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -174,6 +175,7 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
             .collect::<Vec<_>>()
     };
     let mut cursor = db
+        .core
         .index
         .scan_cursor(KeySpace(0), None, false, pin.cut())
         .unwrap();
@@ -181,8 +183,14 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
     assert_eq!(first.rows.len(), PAGE_RECORDS);
     assert_eq!(
         as_rows(
-            db.scan_prefetched(KeySpace(0), &mut cursor, Some(first), pin)
-                .unwrap()
+            db.scan_prefetched(
+                KeySpace(0),
+                &mut cursor,
+                Some(first),
+                pin,
+                db.core.config.scan_prefetch_pages
+            )
+            .unwrap()
         ),
         captured_rows,
         "captured cut must span page boundaries despite later updates/deletes"
@@ -205,15 +213,26 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
 
     // This admitted write is outside the captured published cut. A scan must
     // neither publish it nor implicitly change acknowledgement semantics.
-    let prefix = db.publication.published_prefix();
+    // Holding every owner client keeps the queued batch from becoming durable.
+    let owners: Vec<_> = db
+        .core
+        .clients
+        .iter()
+        .map(|worker| Arc::clone(&worker.client))
+        .collect();
+    let held: Vec<_> = owners.iter().map(|client| client.lock()).collect();
+    let prefix = db.core.published_next();
     db.submit(fixture.operation(3, 101), vec![put(400, 77)])
         .unwrap();
     assert_eq!(as_rows(db.scan(KeySpace(0)).unwrap()), expected_rows);
-    assert_eq!(db.publication.published_prefix(), prefix);
+    assert_eq!(db.core.published_next(), prefix);
     assert_eq!(db.read_cache_stats().inserts, inserts);
-    db.config.scan_prefetch_pages = 1;
-    assert_eq!(as_rows(db.scan(KeySpace(0)).unwrap()), expected_rows);
-    db.config.scan_prefetch_pages = 2;
+    assert_eq!(
+        as_rows(db.scan_with_prefetch(KeySpace(0), 1).unwrap()),
+        expected_rows
+    );
+    assert_eq!(db.core.published_next(), prefix);
+    drop(held);
     db.flush_index().unwrap();
     expected.insert(400u32.to_be_bytes().to_vec(), vec![77; 32]);
     let expected_rows: Vec<_> = expected.into_iter().collect();
@@ -228,7 +247,7 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
 #[test]
 fn later_page_node_completes_while_first_node_is_explicitly_stalled() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();
     db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
@@ -237,14 +256,15 @@ fn later_page_node_completes_while_first_node_is_explicitly_stalled() {
     drop(db);
     let mut db = fixture.open();
     let rows = db
+        .core
         .index
         .scan(KeySpace(0), None, false, 2, IndexReadCut::Latest)
         .unwrap();
-    let first_node = db.partition_indexes[&rows[0].1.batch_address.partition];
-    let second_node = db.partition_indexes[&rows[1].1.batch_address.partition];
+    let first_node = db.core.partition_indexes[&rows[0].1.batch_address.partition];
+    let second_node = db.core.partition_indexes[&rows[1].1.batch_address.partition];
     assert_ne!(first_node, second_node);
-    let pin = db.index.pin_cut(IndexReadCut::Latest).unwrap();
-    let connection = db.reads.lane_client(first_node, 0);
+    let pin = db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
+    let connection = db.core.reads.lane_client(first_node, 0);
     let held = connection.lock();
     let first = db
         .dispatch_scan_page(bounded_page(vec![rows[0].clone()]).unwrap(), pin.clone())
@@ -278,7 +298,7 @@ fn later_page_node_completes_while_first_node_is_explicitly_stalled() {
 #[test]
 fn observed_scan_fence_failure_blocks_later_cached_reads() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();
     db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
@@ -292,10 +312,14 @@ fn observed_scan_fence_failure_blocks_later_cached_reads() {
         .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
         .unwrap()
         .unwrap();
-    let node = db.partition_indexes[&reference.batch_address.partition];
-    db.clients[node].client.lock().fence_to(next_epoch).unwrap();
+    let node = db.core.partition_indexes[&reference.batch_address.partition];
+    db.core.clients[node]
+        .client
+        .lock()
+        .fence_to(next_epoch)
+        .unwrap();
     assert!(db.scan(KeySpace(0)).is_err());
-    assert!(!db.healthy);
+    assert!(db.ensure_healthy().is_err());
     let hits = db.read_cache_stats().hits;
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert_eq!(db.read_cache_stats().hits, hits);

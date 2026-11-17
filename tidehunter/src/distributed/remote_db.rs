@@ -12,14 +12,11 @@
 //! native-routed index references and bounded in-flight complete batches.
 
 use super::codec::{CompleteBatch, Mutation};
-use super::group::{CompleteGroup, GROUP_HEADER_LEN};
 use super::local_db::{LocalCheckpoint, LocalDbError, LocalDbStats};
 use super::local_inventory::LocalInventoryConfig;
-use super::native_index::{IndexReadCut, NativeIndex, PublicationViewReservation};
+use super::native_index::{IndexReadCut, NativeIndex};
 use super::native_publication::{NativePublicationRouting, PreparedNativePublication};
-use super::publication::PublicationTracker;
 use super::reference_directory::ReferenceDirectory;
-use super::sequence::LogicalClock;
 use super::storage::{
     AppendedBatch, DurableBatch, HistoryPersistence, PartitionConfig, PartitionStats,
     StaticInventory, WAL_REPLAY_WINDOW_BATCHES, encode_metadata, install_metadata, read_metadata,
@@ -40,7 +37,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -49,9 +46,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use typenum::U32;
 
+mod checkpoint_contract;
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
+pub use checkpoint_contract::CheckpointMode;
+use checkpoint_contract::{CellCheckpointCommit, manifest_checkpoint_mode};
 use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
@@ -62,19 +62,22 @@ use coordinator_profile::{
     CoordinatorResolutionDiagnostics, MemberOutcome, ResolutionSample, ResolutionStage,
 };
 pub use coordinator_profile::{CoordinatorResolutionSnapshot, CoordinatorResolutionStage};
-mod owner_dispatch;
 mod pending_read;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use pending_read::ReadTraceChild;
 pub use pending_read::ReadTraceSnapshot;
-mod preparation;
 mod receipt_history;
 mod replay_limits;
-use owner_dispatch::{
-    AppendByteBudget, DEFAULT_OWNER_APPEND_OCCUPANCY, DispatchMode, OwnerDispatchPolicy,
-};
+mod write_core;
 use receipt_history::{HistoryPointer, ReceiptHistory};
 pub use replay_limits::ReplayLimits;
+use write_core::completion::{AppendCompletion, GroupCompletion, WorkerAccounting};
+use write_core::owner_queue::OwnerQueue;
+use write_core::owner_sender::{OrderedCommand, OwnerSender};
+use write_core::transport_budget::{
+    AppendByteBudget, DEFAULT_OWNER_APPEND_OCCUPANCY, validate_owner_occupancy,
+};
+use write_core::worker_group::{GroupDrain, WorkerPolicy, take_ready_group};
 mod read_cache;
 mod read_pipeline;
 mod transports;
@@ -232,7 +235,7 @@ impl OperationalReadIoSampler {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&self) {
         let (state, stop, worker) = {
             let mut lifecycle = self.lifecycle.lock();
             lifecycle.stopped = true;
@@ -413,9 +416,6 @@ pub struct RemoteDatabaseConfig {
     /// Explicit host slice for cache ownership and bounded pending read buffers.
     #[serde(default = "default_read_memory_allowance_bytes")]
     pub read_memory_allowance_bytes: usize,
-    /// CPU workers for the bounded borrowed-window submit_many API.
-    #[serde(default = "default_preparation_workers")]
-    pub preparation_workers: usize,
     /// Bounded scan-page lookahead; one is the serial control.
     #[serde(default = "default_scan_prefetch_pages")]
     pub scan_prefetch_pages: usize,
@@ -436,6 +436,10 @@ pub struct RemoteDatabaseConfig {
     /// Select direct live owner-WAL NVMe-oF before opening or recovering.
     #[serde(default)]
     pub live_nvme: Option<super::tcp::LiveClientConfig>,
+    /// The database's one checkpoint protocol. Only `Exact` is active; absent
+    /// means `Exact`, so existing configuration documents are unchanged.
+    #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
+    pub checkpoint_mode: CheckpointMode,
 }
 
 fn default_max_pending_reads() -> usize {
@@ -445,9 +449,6 @@ fn default_max_pending_read_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-fn default_preparation_workers() -> usize {
-    2
-}
 fn default_scan_prefetch_pages() -> usize {
     2
 }
@@ -590,6 +591,11 @@ impl RemoteDatabaseConfig {
                 "index_shards must be a power of two in 1..=MAX_INDEX_SHARDS",
             ));
         }
+        if !self.checkpoint_mode.is_exact() {
+            return Err(LocalDbError::new(
+                "checkpoint_mode per_cell is inactive in this revision",
+            ));
+        }
         if let Some(live) = &self.live_nvme {
             live.validate().map_err(LocalDbError::new)?;
             if let Some(read_lanes) = self.read_lanes {
@@ -652,7 +658,7 @@ impl RemoteDatabaseConfig {
             }
         }
         self.replay_limits.validate().map_err(LocalDbError::new)?;
-        OwnerDispatchPolicy::new(self.owner_append_occupancy).map_err(LocalDbError::new)?;
+        validate_owner_occupancy(self.owner_append_occupancy).map_err(LocalDbError::new)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.live_nvme.as_ref().is_some_and(|live| {
             live.write_mode == super::tcp::LiveWriteMode::Leased
@@ -686,7 +692,6 @@ impl RemoteDatabaseConfig {
             || self.max_pending_batches > 4096
             || self.max_pending_bytes == 0
             || self.max_pending_bytes > 256 * 1024 * 1024
-            || !(1..=8).contains(&self.preparation_workers)
             || !(1..=2).contains(&self.scan_prefetch_pages)
             || self.read_memory_allowance_bytes == 0
             // Cache bytes include all fixed arrays and charged live entries.
@@ -799,8 +804,19 @@ struct AuthorityManifest {
     #[serde(default)]
     checkpoint_staging: Option<CheckpointFiles>,
     /// Previous committed files, removable only after the new root is durable.
+    /// In format 5 it can still be the last exact commit during migration.
     #[serde(default)]
     checkpoint_obsolete: Option<CheckpointCommit>,
+    /// Format 5 only. Absent (`Exact`) in formats 2 to 4, so their bytes are
+    /// unchanged; [`manifest_checkpoint_mode`] rejects mixed tags.
+    #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
+    checkpoint_mode: CheckpointMode,
+    /// Format 5 only: the adopted per-cell commit. `checkpoint` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_checkpoint: Option<CellCheckpointCommit>,
+    /// Format 5 only: the previous per-cell commit, retained until GC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_checkpoint_obsolete: Option<CellCheckpointCommit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -965,68 +981,6 @@ impl RecoveryStats {
 // Own only reduced key bytes: a dependency must not pin an old value's batch.
 type DependencyKey = SmallVec<[u8; 32]>;
 
-struct Submission {
-    batch: Option<CompleteBatch>,
-    routing: Option<NativePublicationRouting>,
-    publication_view: Option<PublicationViewReservation>,
-    /// Immediate native-index predecessors; transitive order follows their batches.
-    predecessors: SmallVec<[u64; 4]>,
-    dependency_blocked: bool,
-    last_mutation: MutationVersion,
-    encoded_bytes: usize,
-    metadata_bytes: usize,
-    credit: usize,
-}
-
-struct PreparedAdmission {
-    batch: CompleteBatch,
-    routing: NativePublicationRouting,
-    partition: usize,
-    metadata_bytes: usize,
-    credit: usize,
-    group_charge: usize,
-}
-
-/// Rayon terminates its workers on drop but does not join their OS threads.
-/// Retain handles so even failed construction releases no authority lock early.
-struct PreparationPool {
-    pool: Option<Arc<rayon::ThreadPool>>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-impl PreparationPool {
-    fn build(count: usize) -> Result<Self, LocalDbError> {
-        let threads = Arc::new(Mutex::new(Vec::with_capacity(count)));
-        let handles = threads.clone();
-        let result = rayon::ThreadPoolBuilder::new()
-            .num_threads(count)
-            .thread_name(|index| format!("value-wal-prepare-{index}"))
-            .spawn_handler(move |worker| {
-                let handle = thread::Builder::new()
-                    .name(worker.name().unwrap_or("value-wal-prepare").to_owned())
-                    .spawn(move || worker.run())?;
-                handles.lock().push(handle);
-                Ok(())
-            })
-            .build();
-        let mut owner = Self {
-            pool: None,
-            threads: std::mem::take(&mut *threads.lock()),
-        };
-        owner.pool = Some(Arc::new(result.map_err(LocalDbError::component)?));
-        Ok(owner)
-    }
-}
-
-impl Drop for PreparationPool {
-    fn drop(&mut self) {
-        self.pool.take();
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum OpenInterruption {
     #[cfg(any(test, feature = "test-utils"))]
@@ -1037,46 +991,18 @@ enum OpenInterruption {
     DuringReplay,
 }
 
-#[derive(Clone, Copy)]
-enum AdmissionPressure {
-    Tail {
-        encoded_bytes: usize,
-        identity: bool,
-    },
-    Partition {
-        partition: usize,
-        records: usize,
-    },
-    Index {
-        additional_bytes: usize,
-    },
-}
-
-struct PendingAppend {
-    first: BatchVersion,
-    reply: Pending<Vec<DurableBatch>>,
-    charge: usize,
-}
+/// Test-only open hook over a read-only config clone and the read-lane clients.
+#[cfg(test)]
+type ReadHook<'a> = Box<dyn FnOnce(&mut RemoteDatabaseConfig, &mut Vec<Client>) + 'a>;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PipelineStats {
     pub prepare_calls: u64,
-    pub parallel_prepared_batches: u64,
     pub prepare_wall_ns: u64,
     /// Sum of worker elapsed durations: overlaps; not process CPU time.
     pub prepare_task_ns: u64,
-    pub prepare_reserved_bytes_peak: usize,
-    /// Completion replies consumed while the next preparation is running.
-    pub prepare_progress_completions: u64,
-    pub prepare_progress_passes: u64,
     pub append_requests: u64,
-    pub durable_batches: u64,
-    pub direct_appends: u64,
-    pub early_dispatches: u64,
-    pub completions_before_drain: u64,
-    pub peak_inflight_nodes: usize,
     pub concurrent_admitted: u64,
-    pub concurrent_completed: u64,
     pub concurrent_pending_peak: usize,
     pub concurrent_queued_peak: usize,
     pub concurrent_queue_bytes_peak: usize,
@@ -1440,116 +1366,18 @@ struct WorkerReadProfile {
 }
 
 pub struct RemoteDatabase {
-    clients: Vec<ClientWorker>,
-    reads: Arc<ReadService>,
-    preparation_pool: Option<PreparationPool>,
-    read_cache: Arc<ReadCache>,
-    write_profile: Arc<Mutex<WriteProfileSnapshot>>,
-    write_timeline: Arc<WriteTimeline>,
-    transport_pool: Option<Arc<RemoteTransportPool>>,
-    transport_key: Option<[u8; 32]>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
-    config: RemoteDatabaseConfig,
-    operational_sampler: OperationalReadIoSampler,
-    shape: KeyShape,
-    path: PathBuf,
-    epoch: u64,
-    index: Arc<NativeIndex>,
-    partition_indexes: HashMap<u32, usize>,
-    inventory: StaticInventory,
-    known: HashMap<BatchId, AppendedBatch>,
-    receipt_history: Option<ReceiptHistory>,
-    stream_last: BTreeMap<(u32, u64), (u64, u32)>,
-    positions: BTreeMap<(u32, u64), StreamPosition>,
-    committed_complete: BTreeSet<(u32, u64)>,
-    recent: VecDeque<RecentReceipt>,
-    recent_ids: HashMap<BatchId, (BatchVersion, super::types::PayloadDigest)>,
-    active_identities: HashMap<BatchId, usize>,
-    pending_writers: HashMap<KeySpace, HashMap<DependencyKey, u64>>,
-    predecessor_marks: Vec<u64>,
-    clock: LogicalClock,
-    publication: PublicationTracker,
-    submission_base: u64,
-    submissions: VecDeque<Submission>,
-    durable_wait_started: VecDeque<Option<Instant>>,
-    staged: Vec<VecDeque<usize>>,
-    staged_bytes: Vec<usize>,
-    inflight: Vec<VecDeque<PendingAppend>>,
-    completed_nodes: Vec<bool>,
-    unresolved_append: Option<BatchVersion>,
-    completion_wake: mpsc::Receiver<()>,
-    preparation_wake: mpsc::SyncSender<()>,
-    pipeline_stats: PipelineStats,
-    reserved_index_bytes: usize,
-    pending_bytes: usize,
-    partition_admissions: Vec<usize>,
-    partition_records: Vec<usize>,
-    /// Greatest complete contiguous publication, never the live sparse upper cut.
-    latest: Option<MutationVersion>,
-    live_latest: Option<MutationVersion>,
-    snapshot_generation: u64,
-    inflight_bytes: Vec<usize>,
-    owner_dispatch: OwnerDispatchPolicy,
-    append_byte_budget: AppendByteBudget,
-    manifest: AuthorityManifest,
-    retained_epochs: Vec<Vec<u64>>,
-    checkpoint_tail_batches: usize,
-    checkpoint_tail_bytes: usize,
-    background_checkpoint: Option<BackgroundCheckpoint>,
-    recovery_stats: RecoveryStats,
-    write_stats: AuthorityWriteStats,
-    checkpoint_diagnostics: Option<VecDeque<CheckpointDiagnostic>>,
-    checkpoint_diagnostic_summary: CheckpointDiagnosticSummary,
-    next_checkpoint_diagnostic: u64,
-    dropped_checkpoint_diagnostics: u64,
-    last_checkpoint_diagnostic: Option<CheckpointDiagnostic>,
-    shutdown_stats: ShutdownStats,
-    #[cfg(test)]
-    checkpoint_interruption: Option<u8>,
-    #[cfg(test)]
-    checkpoint_receipt_limit: Option<usize>,
-    #[cfg(test)]
-    retire_preflight_busy_once: bool,
-    healthy: bool,
-    // Unlike `healthy`, this never marks a protected in-progress transition.
-    // It is monotonic and shared with reads and append workers.
-    concurrent_failure: Arc<std::sync::atomic::AtomicBool>,
-    first_failure: Arc<std::sync::OnceLock<String>>,
-    stopped: bool,
-    stats: LocalDbStats,
-    #[cfg(test)]
-    before_preparation: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    #[cfg(test)]
-    owner_start_pause: Option<mpsc::Receiver<()>>,
-    #[cfg(test)]
-    fail_prepared_operation: Option<[u8; 16]>,
-    #[cfg(test)]
-    concurrent_progress: Arc<Mutex<Option<mpsc::SyncSender<PipelineStats>>>>,
-    #[cfg(test)]
-    before_checkpoint_io: Option<mpsc::SyncSender<()>>,
-    #[cfg(test)]
-    checkpoint_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    #[cfg(test)]
-    checkpoint_prefix_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    #[cfg(test)]
-    corrupt_checkpoint_proof: bool,
-    #[cfg(test)]
-    checkpoint_adoption_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    #[cfg(test)]
-    checkpoint_cleanup_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    #[cfg(test)]
-    panic_after_concurrent_admissions: Option<u64>,
-    // Network workers are joined before this host's authority lock is released.
+    core: Arc<write_core::core::WriteCore>,
+    // The shared core joins every worker before this directory lock is dropped.
     _lock: DbLock,
 }
 
 impl RemoteDatabase {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_nvmeof_stats(&self) -> Option<super::nvmeof::live_metrics::LiveNvmeStats> {
-        self.live_metrics.as_ref().map(|metrics| metrics.snapshot())
+        self.core
+            .live_metrics
+            .as_ref()
+            .map(|metrics| metrics.snapshot())
     }
 
     /// Install a verified sealed-WAL reader while all reads are idle.
@@ -1559,18 +1387,19 @@ impl RemoteDatabase {
         config: super::nvmeof::NvmeofReaderConfig,
     ) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
-        self.reads
-            .install_nvmeof_reader(config, &self.config, &self.shape)
+        self.core
+            .reads
+            .install_nvmeof_reader(config, &self.core.config, &self.core.shape)
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn clear_nvmeof_reader(&self) -> Result<(), LocalDbError> {
-        self.reads.clear_nvmeof_reader()
+        self.core.reads.clear_nvmeof_reader()
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn nvmeof_stats(&self) -> Vec<super::nvmeof::NvmeofStats> {
-        self.reads.nvmeof_stats()
+        self.core.reads.nvmeof_stats()
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1578,77 +1407,36 @@ impl RemoteDatabase {
         &self,
         registry: &prometheus::Registry,
     ) -> Result<(), LocalDbError> {
-        self.reads.register_nvmeof_metrics(registry)
-    }
-
-    fn submission_next(&self) -> u64 {
-        self.submission_base + self.submissions.len() as u64
+        self.core.reads.register_nvmeof_metrics(registry)
     }
 
     pub fn index_stats(&self) -> super::native_index::NativeIndexStats {
-        self.index.stats()
+        self.core.index.stats()
     }
 
     /// Logical retained index charge, including pageable historical references.
     pub fn index_history_bytes(&self) -> usize {
-        self.index.retained_metadata_bytes()
+        self.core.index.retained_metadata_bytes()
     }
 
     /// Resident completed/in-flight authority bookkeeping, excluding pageable
     /// receipt files, allocator overhead and the separately reported index.
     pub fn metadata_history_bytes(&self) -> usize {
-        self.known.capacity()
-            * (std::mem::size_of::<BatchId>() + std::mem::size_of::<AppendedBatch>())
-            + self.submissions.capacity() * std::mem::size_of::<Submission>()
-            + self.durable_wait_started.capacity() * std::mem::size_of::<Option<Instant>>()
-            + self.active_identities.capacity()
-                * (std::mem::size_of::<BatchId>() + std::mem::size_of::<usize>())
-            + self.pending_writers.capacity()
-                * std::mem::size_of::<(KeySpace, HashMap<DependencyKey, u64>)>()
-            + self
-                .pending_writers
-                .values()
-                .map(|writers| {
-                    writers.capacity() * std::mem::size_of::<(DependencyKey, u64)>()
-                        + writers
-                            .keys()
-                            .filter(|key| key.spilled())
-                            .map(SmallVec::capacity)
-                            .sum::<usize>()
-                })
-                .sum::<usize>()
-            + self.predecessor_marks.capacity() * std::mem::size_of::<u64>()
-            + self
-                .submissions
-                .iter()
-                .map(|entry| {
-                    if entry.predecessors.spilled() {
-                        entry.predecessors.capacity() * std::mem::size_of::<u64>()
-                    } else {
-                        0
-                    }
-                })
-                .sum::<usize>()
-            + self.publication.resident_metadata_bytes()
-            + self
-                .receipt_history
-                .as_ref()
-                .map_or(0, ReceiptHistory::cached_metadata_bytes)
-            + self.recent.capacity() * std::mem::size_of::<RecentReceipt>()
-            + self.recent_ids.capacity()
-                * std::mem::size_of::<(BatchId, (BatchVersion, super::types::PayloadDigest))>()
+        self.core.metadata_history_bytes()
     }
 
     pub fn retention_floor(&self) -> IndexReadCut {
-        self.index.retention_floor()
+        self.core.index.retention_floor()
     }
 
+    /// Capture and protect one published cut that the caller can keep: a
+    /// standing-budget view takes its owner charge (`Capacity` when full).
     pub fn protected_published_cut(
         &self,
     ) -> Result<(IndexReadCut, super::native_index::IndexReadPin), LocalDbError> {
         self.ensure_healthy()?;
-        let index = &self.index;
-        let cut = index.latest_cut();
+        let index = &self.core.index;
+        let cut = index.latest_cut().map_err(LocalDbError::component)?;
         let pin = index
             .pin_cut(cut.clone())
             .map_err(LocalDbError::component)?;
@@ -1660,7 +1448,10 @@ impl RemoteDatabase {
         cut: IndexReadCut,
     ) -> Result<super::native_index::IndexReadPin, LocalDbError> {
         self.ensure_healthy()?;
-        self.index.pin_cut(cut).map_err(LocalDbError::component)
+        self.core
+            .index
+            .pin_cut(cut)
+            .map_err(LocalDbError::component)
     }
     /// Resolve the authoritative owner of a key for benchmark evidence.
     ///
@@ -1676,6 +1467,7 @@ impl RemoteDatabase {
     ) -> Result<Option<u32>, LocalDbError> {
         let (cut, pin) = self.protected_published_cut()?;
         let reference = self
+            .core
             .index
             .get(keyspace, full_key, cut)
             .map_err(LocalDbError::component)?;
@@ -1700,12 +1492,12 @@ impl RemoteDatabase {
         target_os = "linux"
     ))]
     pub(crate) fn enable_local_live_fixture(&mut self, buffered: bool) -> Result<(), LocalDbError> {
-        if self.config.live_nvme.is_none() {
+        if self.core.config.live_nvme.is_none() {
             return Err(LocalDbError::new(
                 "local live fixture requires live_nvme configuration",
             ));
         }
-        for worker in &self.clients {
+        for worker in &self.core.clients {
             worker.client.lock().bench_local_live_fixture(buffered);
         }
         Ok(())
@@ -1748,12 +1540,44 @@ impl RemoteDatabase {
         )
     }
 
+    /// Open with a hook over the read-lane clients and a read-only config clone
+    /// before `ReadService::from_clients`. The write route, worker clients and
+    /// manifest identity use the unmodified `config`.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(in crate::distributed::remote_db) fn open_with_read_hook(
+        path: &Path,
+        shape: &KeyShape,
+        config: RemoteDatabaseConfig,
+        hook: impl FnOnce(&mut RemoteDatabaseConfig, &mut Vec<Client>),
+    ) -> Result<Self, LocalDbError> {
+        Self::open_inner_with(path, shape, config, None, None, Some(Box::new(hook)))
+    }
+
     fn open_inner(
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
         transport_pool: Option<Arc<RemoteTransportPool>>,
         interruption: Option<OpenInterruption>,
+    ) -> Result<Self, LocalDbError> {
+        Self::open_inner_with(
+            path,
+            shape,
+            config,
+            transport_pool,
+            interruption,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn open_inner_with(
+        path: &Path,
+        shape: &KeyShape,
+        config: RemoteDatabaseConfig,
+        transport_pool: Option<Arc<RemoteTransportPool>>,
+        interruption: Option<OpenInterruption>,
+        #[cfg(test)] read_hook: Option<ReadHook<'_>>,
     ) -> Result<Self, LocalDbError> {
         config.validate()?;
         config.validate_read_lane_pinning(config.effective_read_lanes())?;
@@ -1816,6 +1640,9 @@ impl RemoteDatabase {
                 checkpoint: None,
                 checkpoint_staging: None,
                 checkpoint_obsolete: None,
+                checkpoint_mode: CheckpointMode::Exact,
+                cell_checkpoint: None,
+                cell_checkpoint_obsolete: None,
             };
             persist_manifest(&path, &manifest)?;
             manifest
@@ -1823,6 +1650,12 @@ impl RemoteDatabase {
         if manifest.history_persistence != config.history_persistence {
             return Err(LocalDbError::new(
                 "authority manifest history persistence differs",
+            ));
+        }
+        // No fallback: a per-cell manifest never opens in `Exact` mode.
+        if manifest_checkpoint_mode(&manifest)? != config.checkpoint_mode {
+            return Err(LocalDbError::new(
+                "authority manifest checkpoint mode differs",
             ));
         }
         if !matches!(manifest.format, 2..=4)
@@ -2091,11 +1924,25 @@ impl RemoteDatabase {
         // Current checkpoint/proofs and the complete tail have now validated.
         // Resolve only durably named cleanup intents before allowing more work.
         cleanup_checkpoint_artifacts(&path, &mut manifest, false)?;
-        let preparation_pool = if config.preparation_workers > 1 {
-            Some(PreparationPool::build(config.preparation_workers)?)
-        } else {
-            None
-        };
+        // One constant sparse-view quota for the serialized publisher: the
+        // installed view and its replacement at max_pending_batches - 1
+        // exclusions. No write reserves view quota, and no publication can then
+        // fail on view capacity after its WAL write. A cut that leaves one read
+        // call takes an owner charge from the view allowance instead (that
+        // reader API fails with Capacity when full). Views held inside one read
+        // stay uncharged, and no reader holds one while it waits for read
+        // admission: extra memory <= max_pending_reads x
+        // view_charge(max_pending_batches - 1), plus the transient and fixed
+        // holders listed at `StandingViewBudget` (metric
+        // `index_reader_held_view_bytes`).
+        let view_budget = index
+            .reserve_standing_view_budget(config.max_pending_batches - 1)
+            .map_err(|error| {
+                LocalDbError::new(format!(
+                    "max_index_bytes cannot hold the standing sparse publication view \
+                     budget for max_pending_batches: {error}"
+                ))
+            })?;
         let mut workers = Vec::new();
         let write_profile = Arc::new(Mutex::new(WriteProfileSnapshot {
             limit_per_connection: config.write_profile_limit,
@@ -2107,26 +1954,32 @@ impl RemoteDatabase {
         ));
         let concurrent_failure = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first_failure = Arc::new(std::sync::OnceLock::new());
-        let (wake_sender, completion_wake) = mpsc::sync_channel(clients.len());
+        let completion = Arc::new(write_core::completion::CoreCompletion::unbound());
         for client in clients {
-            workers.push(
-                ClientWorker::start(
-                    client,
-                    config
-                        .max_pending_batches
-                        .max(config.effective_owner_append_occupancy()),
-                    wake_sender.clone(),
-                    concurrent_failure.clone(),
-                    WorkerDiagnostics {
-                        write_profile_limit: config.write_profile_limit,
-                        write_profile: write_profile.clone(),
-                        write_timeline: write_timeline.clone(),
-                        first_failure: first_failure.clone(),
-                        partition: config.endpoints[workers.len()].partition,
-                    },
-                )
-                .map_err(LocalDbError::component)?,
-            );
+            let partition = config.endpoints[workers.len()].partition;
+            let worker = ClientWorker::start(
+                client,
+                config
+                    .max_pending_batches
+                    .max(config.effective_owner_append_occupancy()),
+                concurrent_failure.clone(),
+                WorkerDiagnostics {
+                    timeout: config.timeout,
+                    write_profile_limit: config.write_profile_limit,
+                    write_profile: write_profile.clone(),
+                    write_timeline: write_timeline.clone(),
+                    first_failure: first_failure.clone(),
+                    partition,
+                    policy: WorkerPolicy::new(
+                        config.partition_config(epoch, partition),
+                        config.max_pending_batches,
+                        config.effective_owner_append_occupancy(),
+                    )?,
+                },
+                completion.clone(),
+            )
+            .map_err(LocalDbError::component)?;
+            workers.push(worker);
         }
         let connection_started = Instant::now();
         let prepared_reads = read_setup.finish()?;
@@ -2135,8 +1988,20 @@ impl RemoteDatabase {
         recovery_stats.created_connections +=
             (prepared_reads.clients.len() - prepared_reads.reused) as u64;
         recovery_stats.reused_connections += prepared_reads.reused as u64;
+        #[cfg(test)]
+        let mut prepared_reads = prepared_reads;
+        #[cfg(test)]
+        let read_config = read_hook.map(|hook| {
+            let mut read_config = config.clone();
+            hook(&mut read_config, &mut prepared_reads.clients);
+            read_config
+        });
+        #[cfg(test)]
+        let read_config = read_config.as_ref().unwrap_or(&config);
+        #[cfg(not(test))]
+        let read_config = &config;
         let reads = ReadService::from_clients(
-            &config,
+            read_config,
             epoch,
             prepared_reads.clients,
             &mut recovery_stats,
@@ -2152,9 +2017,6 @@ impl RemoteDatabase {
         manifest.format = 4;
         manifest.replay_limits = config.replay_limits;
         persist_manifest(&path, &manifest)?;
-        let count = workers.len();
-        let database = config.storage.database;
-        let limit = config.max_admitted_batches;
         let partition_indexes = config
             .endpoints
             .iter()
@@ -2166,10 +2028,9 @@ impl RemoteDatabase {
         let reads = Arc::new(reads);
         let operational_sampler =
             OperationalReadIoSampler::dormant(config.clone(), shape.clone(), tls_config);
-        let mut database = Self {
+        let core = write_core::core::WriteCore::new(write_core::core::OpenState {
             clients: workers,
             reads,
-            preparation_pool,
             read_cache: Arc::new(ReadCache::new(config.read_cache_bytes)),
             write_profile,
             write_timeline,
@@ -2180,9 +2041,6 @@ impl RemoteDatabase {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics,
             inventory: config.inventory(epoch),
-            owner_dispatch: OwnerDispatchPolicy::new(config.effective_owner_append_occupancy())
-                .map_err(LocalDbError::new)?,
-            append_byte_budget: config.append_byte_budget()?,
             config,
             operational_sampler,
             shape,
@@ -2190,101 +2048,55 @@ impl RemoteDatabase {
             epoch,
             index: Arc::new(index),
             partition_indexes,
-            known,
-            receipt_history,
-            stream_last: BTreeMap::new(),
-            positions,
-            committed_complete,
-            recent,
-            recent_ids,
-            active_identities: HashMap::new(),
-            pending_writers: HashMap::new(),
-            predecessor_marks: Vec::new(),
-            clock: LogicalClock::new_fenced_epoch(epoch),
-            publication: PublicationTracker::new(database, epoch, limit)
-                .map_err(LocalDbError::component)?,
-            submission_base: 0,
-            submissions: VecDeque::new(),
-            durable_wait_started: VecDeque::new(),
-            staged: (0..count).map(|_| VecDeque::new()).collect(),
-            staged_bytes: vec![0; count],
-            inflight: (0..count).map(|_| VecDeque::new()).collect(),
-            inflight_bytes: vec![0; count],
-            completed_nodes: vec![false; count],
-            unresolved_append: None,
-            completion_wake,
-            preparation_wake: wake_sender,
-            pipeline_stats: PipelineStats::default(),
-            reserved_index_bytes: 0,
-            pending_bytes: 0,
-            partition_admissions: vec![0; count],
-            partition_records: vec![0; count],
-            latest,
-            live_latest: latest,
-            snapshot_generation: 0,
-            manifest,
-            retained_epochs: histories
-                .into_iter()
-                .map(|mut epochs| {
-                    epochs.push(epoch);
-                    epochs
-                })
-                .collect(),
-            checkpoint_tail_batches: recovery_stats.tail_batches as usize,
-            checkpoint_tail_bytes: recovery_stats.tail_bytes as usize,
-            background_checkpoint: None,
-            recovery_stats,
-            write_stats: AuthorityWriteStats::default(),
-            checkpoint_diagnostic_summary: CheckpointDiagnosticSummary {
-                available: checkpoint_diagnostics.is_some(),
-                ..CheckpointDiagnosticSummary::default()
+            publisher: write_core::core::PublisherState {
+                view_budget,
+                known,
+                receipt_history,
+                stream_last: BTreeMap::new(),
+                positions,
+                committed_complete,
+                recent,
+                published_next: 0,
+                upper: latest,
+                dependents: HashMap::new(),
+                latest,
+                live_latest: latest,
+                snapshot_generation: 0,
+                manifest,
+                retained_epochs: histories
+                    .into_iter()
+                    .map(|mut epochs| {
+                        epochs.push(epoch);
+                        epochs
+                    })
+                    .collect(),
+                checkpoint_tail_batches: recovery_stats.tail_batches as usize,
+                checkpoint_tail_bytes: recovery_stats.tail_bytes as usize,
+                background_checkpoint: None,
+                checkpoint_diagnostic_summary: CheckpointDiagnosticSummary {
+                    available: checkpoint_diagnostics.is_some(),
+                    ..CheckpointDiagnosticSummary::default()
+                },
+                checkpoint_diagnostics,
+                next_checkpoint_diagnostic: 0,
+                dropped_checkpoint_diagnostics: 0,
+                last_checkpoint_diagnostic: None,
             },
-            checkpoint_diagnostics,
-            next_checkpoint_diagnostic: 0,
-            dropped_checkpoint_diagnostics: 0,
-            last_checkpoint_diagnostic: None,
-            shutdown_stats: ShutdownStats::default(),
-            #[cfg(test)]
-            checkpoint_interruption: None,
-            #[cfg(test)]
-            checkpoint_receipt_limit: None,
-            #[cfg(test)]
-            retire_preflight_busy_once: false,
-            healthy: true,
             concurrent_failure,
             first_failure,
-            stopped: false,
-            stats: LocalDbStats::default(),
-            #[cfg(test)]
-            before_preparation: None,
-            #[cfg(test)]
-            owner_start_pause: None,
-            #[cfg(test)]
-            fail_prepared_operation: None,
-            #[cfg(test)]
-            concurrent_progress: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            before_checkpoint_io: None,
-            #[cfg(test)]
-            checkpoint_pause: None,
-            #[cfg(test)]
-            checkpoint_prefix_pause: None,
-            #[cfg(test)]
-            corrupt_checkpoint_proof: false,
-            #[cfg(test)]
-            checkpoint_adoption_pause: None,
-            #[cfg(test)]
-            checkpoint_cleanup_pause: None,
-            #[cfg(test)]
-            panic_after_concurrent_admissions: None,
-            _lock: lock,
-        };
+            stats: write_core::core::CoreStats {
+                recovery: recovery_stats,
+                ..write_core::core::CoreStats::default()
+            },
+        });
+        completion.bind(&core);
+        let database = Self { core, _lock: lock };
         // A successful recovery establishes a new baseline before admitting
         // another bounded tail, including after repeated crash/reopen cycles.
-        if database.checkpoint_tail_batches != 0 {
+        if database.core.publisher.lock().checkpoint_tail_batches != 0 {
             let started = Instant::now();
-            database.commit_checkpoint()?;
-            database.recovery_stats.checkpoint_commit_ns = elapsed(started);
+            database.core.commit_checkpoint()?;
+            database.core.stats.lock().recovery.checkpoint_commit_ns = elapsed(started);
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(guard) = &mut live_open_guard {
@@ -2294,7 +2106,7 @@ impl RemoteDatabase {
     }
 
     pub fn backend_id(&self) -> &'static str {
-        match &self.config.tls.transport {
+        match &self.core.config.tls.transport {
             super::tcp::Transport::Tcp => BACKEND_ID,
             super::tcp::Transport::TcpTrusted => "tidehunter-tcp-trusted-rf1",
             super::tcp::Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
@@ -2326,33 +2138,39 @@ impl RemoteDatabase {
         }
     }
     pub fn epoch(&self) -> u64 {
-        self.epoch
+        self.core.epoch
     }
 
     pub fn read_evidence_monitor(&self) -> ReadEvidenceMonitor {
         ReadEvidenceMonitor {
             clients: self
+                .core
                 .config
                 .endpoints
                 .iter()
-                .zip(&self.clients)
+                .zip(&self.core.clients)
                 .map(|(endpoint, worker)| (endpoint.partition, worker.control_handle()))
                 .collect(),
-            reads: self.reads.clone(),
+            reads: self.core.reads.clone(),
         }
     }
     pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
-        self.operational_sampler.activate();
-        self.operational_sampler.monitor()
+        self.core.operational_sampler.activate();
+        self.core.operational_sampler.monitor()
     }
 
     pub fn validate_cached_read(&self) -> Result<(), LocalDbError> {
         self.ensure_healthy()
     }
 
+    /// The caller can keep the cut: a standing-budget view takes its owner
+    /// charge (`Capacity` when full).
     pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
         self.ensure_healthy()?;
-        Ok(self.index.latest_cut())
+        self.core
+            .index
+            .latest_cut()
+            .map_err(LocalDbError::component)
     }
 
     /// Bounded index-only page. Values are fetched outside the authority lock
@@ -2365,7 +2183,8 @@ impl RemoteDatabase {
         cut: IndexReadCut,
     ) -> Result<Vec<(Bytes, ValueRecordReference)>, LocalDbError> {
         self.ensure_healthy()?;
-        self.index
+        self.core
+            .index
             .scan_reduced(ks, after_reduced, reverse, 256, cut)
             .map_err(LocalDbError::component)
     }
@@ -2377,1388 +2196,54 @@ impl RemoteDatabase {
         cut: IndexReadCut,
     ) -> Result<Option<ValueRecordReference>, LocalDbError> {
         self.ensure_healthy()?;
-        self.index
+        self.core
+            .index
             .get(ks, key, cut)
             .map_err(LocalDbError::component)
     }
 
     fn ensure_healthy(&self) -> Result<(), LocalDbError> {
-        if !self.healthy
-            || self.stopped
-            || self.reads.failed()
-            || self
-                .concurrent_failure
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            if let Some(version) = self.unresolved_append {
-                return Err(LocalDbError::unknown(
-                    version,
-                    failure_context(
-                        &self.first_failure,
-                        "TCP authority requires recovery with unresolved append",
-                    ),
-                ));
-            }
-            if let Some(pending) = self.inflight.iter().find_map(|queue| queue.front()) {
-                return Err(LocalDbError::unknown(
-                    pending.first,
-                    failure_context(
-                        &self.first_failure,
-                        "TCP authority requires recovery with unresolved append",
-                    ),
-                ));
-            }
-            return Err(LocalDbError::new(failure_context(
-                &self.first_failure,
-                "TCP authority requires recovery or is closed",
-            )));
-        }
-        self.publication
-            .ensure_publication_healthy()
-            .map_err(LocalDbError::component)
+        self.core.ensure_healthy()
     }
 
-    /// Bounded admission, possibly starting storage I/O before returning.
-    /// Success is NOT a durability/visibility acknowledgement: use drain.
+    /// A failed or mismatched verified read is fail-stop for the whole engine.
+    /// The read's exact error becomes the first recorded cause.
+    pub(super) fn poison(&self, cause: &LocalDbError) {
+        self.core.fail(write_core::write::copy_error(cause));
+    }
+
+    /// Enqueue without acknowledging durability. Capacity rejection has no effect.
     pub fn submit(
-        &mut self,
+        &self,
         operation: [u8; 16],
         mutations: Vec<Mutation>,
     ) -> Result<BatchVersion, LocalDbError> {
-        let started = Instant::now();
-        let before = self.authority_write_stats();
-        let result = self.submit_inner(operation, mutations);
-        self.record_admission_span(started, before);
-        result
+        self.core.submit(operation, mutations)
     }
 
-    fn record_admission_span(&mut self, started: Instant, before: AuthorityWriteStats) {
-        let after = self.authority_write_stats();
-        let nested = (after.checkpoint_ns - before.checkpoint_ns)
-            .saturating_add(after.storage_wait_ns - before.storage_wait_ns)
-            .saturating_add(after.publication_ns - before.publication_ns)
-            .saturating_add(after.dispatch_ns - before.dispatch_ns);
-        self.write_stats.preparation_admission_ns += elapsed(started).saturating_sub(nested);
-    }
-
-    fn submit_inner(
-        &mut self,
-        operation: [u8; 16],
-        mutations: Vec<Mutation>,
-    ) -> Result<BatchVersion, LocalDbError> {
-        let prepared = self.prepare_submit(operation, mutations, None)?;
-        self.admit_prepared(prepared)
-    }
-
-    fn prepare_submit(
-        &mut self,
-        operation: [u8; 16],
-        mutations: Vec<Mutation>,
-        authority: Option<&concurrent::AuthorityCounters>,
-    ) -> Result<PreparedAdmission, LocalDbError> {
-        self.ensure_healthy()?;
-        let started = Instant::now();
-        let id = BatchId {
-            database: self.config.storage.database,
-            operation,
-        };
-        let version = self
-            .existing_identity(id)?
-            .map(|(v, _)| v)
-            .unwrap_or(BatchVersion {
-                epoch: self.epoch,
-                sequence: self.submission_next(),
-            });
-        let prepare_span = authority.map(concurrent::AuthorityCounters::preparing);
-        let batch = CompleteBatch::new(
-            &self.shape,
-            id,
-            version,
-            mutations,
-            self.config.storage.batch_limits,
-        )
-        .map_err(LocalDbError::component);
-        drop(prepare_span);
-        let batch = batch?;
-        let prepared = self.prepare_admission(batch)?;
-        self.write_timeline.batch(operation, version);
-        self.stats.validation_ns += elapsed(started);
-        Ok(prepared)
-    }
-
-    fn check_checkpoint_capacity(&self, additional_identities: usize) -> Result<(), LocalDbError> {
-        let receipts = self
-            .known
-            .len()
-            .checked_add(self.active_identities.len())
-            .and_then(|count| count.checked_add(additional_identities))
-            .ok_or_else(|| LocalDbError::new("checkpoint receipt admission count overflow"))?;
-        let receipts = if self.config.history_persistence == HistoryPersistence::WalReplay {
-            receipts.min(WAL_REPLAY_WINDOW_BATCHES)
-        } else {
-            receipts
-        };
-        let fits = checkpoint_metadata_fits(&self.config, receipts);
-        // Exercise the same admission boundary without constructing a million
-        // metadata entries merely to reach the production byte ceiling.
-        #[cfg(test)]
-        let fits = fits
-            && self
-                .checkpoint_receipt_limit
-                .is_none_or(|limit| receipts <= limit);
-        if !fits {
-            return Err(LocalDbError::new(
-                "checkpoint receipt metadata admission capacity reached",
-            ));
-        }
-        Ok(())
-    }
-
-    fn existing_identity(
+    /// Validate the entire window, including retry conflicts, before allocating
+    /// any member. A window larger than one partition's metadata window spills
+    /// into consecutive segments; each later segment waits for the earlier
+    /// segments' publication. A capacity, deadline or closed error in a later
+    /// segment can leave earlier segments admitted (an uncertain prefix).
+    /// `drain` remains the durable acknowledgement.
+    pub fn submit_many(
         &self,
-        id: BatchId,
-    ) -> Result<Option<(BatchVersion, super::types::PayloadDigest)>, LocalDbError> {
-        if let Some(receipt) = self.known.get(&id).copied() {
-            return Ok(Some((receipt.version(), receipt.digest())));
-        }
-        if let Some(identity) = self.recent_ids.get(&id) {
-            return Ok(Some(*identity));
-        }
-        let block_started = self.write_timeline.block_started();
-        if let Some(receipt) = self
-            .receipt_history
-            .as_ref()
-            .map(|history| history.lookup(id))
-            .transpose()
-            .inspect_err(|error| {
-                record_first_failure(
-                    &self.first_failure,
-                    None,
-                    None,
-                    "receipt_history_lookup",
-                    error,
-                );
-                self.concurrent_failure
-                    .store(true, std::sync::atomic::Ordering::Release);
-                self.reads.poison();
-            })?
-            .flatten()
-        {
-            return Ok(Some((receipt.version(), receipt.digest())));
-        }
-        self.write_timeline.block_finished(
-            super::write_timeline::WriteBlockStage::IdentityLookup,
-            block_started,
-            self.known.len(),
-        );
-        Ok(self.active_identities.get(&id).map(|i| {
-            let batch = self.submissions[*i - self.submission_base as usize]
-                .batch
-                .as_ref()
-                .unwrap();
-            (batch.version(), batch.digest())
-        }))
+        batches: &[([u8; 16], Vec<Mutation>)],
+    ) -> Result<Vec<BatchVersion>, LocalDbError> {
+        self.core.submit_many(batches)
     }
 
-    fn prepare_admission(&self, batch: CompleteBatch) -> Result<PreparedAdmission, LocalDbError> {
-        #[cfg(test)]
-        if self.fail_prepared_operation == Some(batch.id().operation) {
-            return Err(LocalDbError::new("injected admission preparation failure"));
-        }
-        let batch = batch.into_canonical_owned();
-        let partition = self
-            .inventory
-            .partition_for_validated(batch.id())
-            .map_err(LocalDbError::component)?;
-        let partition = self.partition_indexes[&partition];
-        let routing = NativePublicationRouting::prepare(&self.shape, &batch)
-            .map_err(LocalDbError::component)?;
-        let metadata_bytes = self
-            .index
-            .estimated_routed_bytes(routing.operations())
-            .map_err(LocalDbError::component)?;
-        let worker_metadata = batch
-            .mutations()
-            .len()
-            .checked_mul(
-                std::mem::size_of::<Mutation>()
-                    + std::mem::size_of::<super::types::RecordDescriptor>()
-                    // Include geometric dependency-table slack until it shrinks.
-                    + 4 * std::mem::size_of::<(DependencyKey, u64)>()
-                    + 2 * std::mem::size_of::<u64>(),
-            )
-            .ok_or_else(|| LocalDbError::new("worker metadata reservation overflow"))?;
-        let dependency_key_bytes = routing
-            .operations()
-            .iter()
-            .try_fold(0usize, |bytes, operation| {
-                bytes.checked_add(if operation.reduced_key().len() > 32 {
-                    operation.reduced_key().len().checked_mul(2)?
-                } else {
-                    0
-                })
-            })
-            .ok_or_else(|| LocalDbError::new("dependency key reservation overflow"))?;
-        let credit = batch
-            .canonical_heap_bytes()
-            .and_then(|bytes| bytes.checked_add(worker_metadata))
-            .and_then(|bytes| bytes.checked_add(dependency_key_bytes))
-            .and_then(|bytes| bytes.checked_add(routing.owned_bytes(&self.shape)?))
-            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<CompleteBatch>() + 512))
-            .ok_or_else(|| LocalDbError::new("pending byte overflow"))?;
-        let group_charge = CompleteGroup::encoded_member_len(batch.encoded().len())
-            .map_err(LocalDbError::component)?;
-        Ok(PreparedAdmission {
-            batch,
-            routing,
-            partition,
-            metadata_bytes,
-            credit,
-            group_charge,
-        })
-    }
-
-    fn check_storage_group_capacity(
-        &self,
-        batches: usize,
-        records: usize,
-    ) -> Result<(), LocalDbError> {
-        ReferenceDirectory::check_fresh_total_capacity(
-            self.config.storage.max_batches_per_partition.min(1024),
-            self.config.storage.max_reference_metadata_bytes,
-            batches,
-            records,
-        )
-        .map_err(LocalDbError::component)
-    }
-    fn admission_pressure_fits(&self, pressure: AdmissionPressure) -> bool {
-        match pressure {
-            AdmissionPressure::Tail {
-                encoded_bytes,
-                identity,
-            } => {
-                (self.config.history_persistence == HistoryPersistence::WalReplay
-                    || !self.config.replay_limits.requires_flush(
-                        self.checkpoint_tail_batches,
-                        self.checkpoint_tail_bytes,
-                        encoded_bytes,
-                    ))
-                    && (!identity
-                        || self
-                            .known
-                            .len()
-                            .saturating_add(self.active_identities.len())
-                            < self.config.max_admitted_batches)
-            }
-            AdmissionPressure::Partition { partition, records } => self
-                .check_storage_group_capacity(
-                    self.partition_admissions[partition].saturating_add(1),
-                    self.partition_records[partition].saturating_add(records),
-                )
-                .is_ok(),
-            AdmissionPressure::Index { additional_bytes } => self
-                .reserved_index_bytes
-                .checked_add(additional_bytes)
-                .is_some_and(|reserved| self.index.check_capacity(reserved).is_ok()),
-        }
-    }
-
-    fn ensure_admission_pressure(
-        &mut self,
-        pressure: AdmissionPressure,
-    ) -> Result<(), LocalDbError> {
-        let enabled = self.checkpoint_diagnostics.is_some();
-        let started = Instant::now();
-        let requested_cut = self.latest;
-        let before_index = self.reserved_index_bytes;
-        let identity_pressure = self
-            .known
-            .len()
-            .saturating_add(self.active_identities.len())
-            >= self.config.max_admitted_batches;
-        let mut details = CheckpointDiagnostic::default();
-        let result =
-            self.ensure_admission_pressure_inner(pressure, enabled.then_some(&mut details));
-        let pressure_wait_ns = elapsed(started);
-        if result.is_err() && details.outcome.is_none() {
-            details.outcome = Some(CheckpointProgressOutcome::ProgressError);
-        }
-        if enabled {
-            let trigger = match pressure {
-                AdmissionPressure::Tail { identity: true, .. } if identity_pressure => {
-                    CheckpointTrigger::KnownIdentities
-                }
-                AdmissionPressure::Tail { .. } => CheckpointTrigger::Tail,
-                AdmissionPressure::Partition { .. } => CheckpointTrigger::PartitionWindow,
-                AdmissionPressure::Index { .. } => CheckpointTrigger::IndexReservation,
-            };
-            let record = CheckpointDiagnostic {
-                epoch: self.epoch,
-                generation: None,
-                trigger: Some(trigger),
-                requested_cut,
-                reserved_index_bytes_before: before_index,
-                reserved_index_bytes_after: self.reserved_index_bytes,
-                pressure_wait_ns: Some(pressure_wait_ns),
-                ..details
-            };
-            self.record_checkpoint_diagnostic(record);
-        }
-        self.write_stats.foreground_checkpoint_ns += pressure_wait_ns;
-        self.write_stats.foreground_checkpoint_count += 1;
-        result
-    }
-
-    fn ensure_admission_pressure_inner(
-        &mut self,
-        pressure: AdmissionPressure,
-        mut diagnostic: Option<&mut CheckpointDiagnostic>,
-    ) -> Result<(), LocalDbError> {
-        match pressure {
-            AdmissionPressure::Tail { encoded_bytes, .. }
-                if self.config.history_persistence != HistoryPersistence::WalReplay
-                    && encoded_bytes > self.config.replay_limits.max_encoded_bytes =>
-            {
-                return Err(LocalDbError::new(
-                    "batch exceeds checkpoint tail byte bound",
-                ));
-            }
-            AdmissionPressure::Partition { records, .. } => {
-                self.check_storage_group_capacity(1, records)?;
-            }
-            AdmissionPressure::Tail { .. } => {}
-            AdmissionPressure::Index { .. } => {}
-        }
-        if diagnostic.is_some() {
-            self.last_checkpoint_diagnostic = None;
-        }
-        if self.admission_pressure_fits(pressure) {
-            if let Some(diagnostic) = diagnostic.as_deref_mut() {
-                diagnostic.outcome = Some(CheckpointProgressOutcome::AlreadyAvailable);
-            }
-            return Ok(());
-        }
-
-        let drain_started = diagnostic.as_ref().map(|_| Instant::now());
-        self.drain()?;
-        if let (Some(diagnostic), Some(started)) = (diagnostic.as_deref_mut(), drain_started) {
-            diagnostic.drain_ns = Some(elapsed(started));
-        }
-        if self.admission_pressure_fits(pressure) {
-            if let Some(diagnostic) = diagnostic.as_deref_mut() {
-                diagnostic.outcome = Some(CheckpointProgressOutcome::AfterDrain);
-            }
-            return Ok(());
-        }
-        if self.background_checkpoint.is_some() {
-            let started = diagnostic.as_ref().map(|_| Instant::now());
-            self.progress_checkpoint(true)?;
-            if let (Some(diagnostic), Some(started)) = (diagnostic.as_deref_mut(), started) {
-                diagnostic.existing_capture_wait_ns = Some(elapsed(started));
-            }
-            if let Some(diagnostic) = diagnostic.as_deref_mut() {
-                self.include_checkpoint_diagnostic(diagnostic);
-            }
-        }
-        if self.admission_pressure_fits(pressure) {
-            if let Some(diagnostic) = diagnostic.as_deref_mut() {
-                diagnostic.outcome = Some(CheckpointProgressOutcome::AfterExistingCapture);
-            }
-            return Ok(());
-        }
-
-        let started = diagnostic.as_ref().map(|_| Instant::now());
-        self.start_checkpoint()?;
-        if self.background_checkpoint.is_some() {
-            self.progress_checkpoint(true)?;
-        }
-        if let (Some(diagnostic), Some(started)) = (diagnostic.as_deref_mut(), started) {
-            diagnostic.new_capture_wait_ns = Some(elapsed(started));
-        }
-        if let Some(diagnostic) = diagnostic.as_deref_mut() {
-            self.include_checkpoint_diagnostic(diagnostic);
-        }
-        if self.admission_pressure_fits(pressure) {
-            if let Some(diagnostic) = diagnostic.as_deref_mut() {
-                diagnostic.outcome = Some(CheckpointProgressOutcome::AfterNewCapture);
-            }
-            return Ok(());
-        }
-        if let Some(diagnostic) = diagnostic {
-            diagnostic.outcome = Some(CheckpointProgressOutcome::CapacityError);
-        }
-        self.admission_capacity_error(pressure)
-    }
-
-    fn admission_capacity_error(&self, pressure: AdmissionPressure) -> Result<(), LocalDbError> {
-        match pressure {
-            AdmissionPressure::Tail { identity: true, .. } => {
-                Err(LocalDbError::new("checkpoint identity capacity reached"))
-            }
-            AdmissionPressure::Tail { .. } => {
-                Err(LocalDbError::new("checkpoint tail capacity reached"))
-            }
-            AdmissionPressure::Partition { partition, records } => {
-                let batches = self.partition_admissions[partition]
-                    .checked_add(1)
-                    .ok_or_else(|| LocalDbError::new("partition reservation overflow"))?;
-                let records = self.partition_records[partition]
-                    .checked_add(records)
-                    .ok_or_else(|| LocalDbError::new("reference reservation overflow"))?;
-                self.check_storage_group_capacity(batches, records)
-            }
-            AdmissionPressure::Index { additional_bytes } => {
-                let reserved = self
-                    .reserved_index_bytes
-                    .checked_add(additional_bytes)
-                    .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-                self.index
-                    .check_capacity(reserved)
-                    .map_err(LocalDbError::component)
-            }
-        }
-    }
-    fn trace_admission_pressure(&self, pressure: Option<&AdmissionPressure>) {
-        if !self.write_timeline.enabled() {
-            return;
-        }
-        let (reason, incoming_encoded_bytes) = match pressure {
-            Some(AdmissionPressure::Tail { encoded_bytes, .. }) => {
-                let reason =
-                    if self.checkpoint_tail_batches >= self.config.replay_limits.max_batches {
-                        "tail_batches"
-                    } else if self
-                        .checkpoint_tail_bytes
-                        .checked_add(*encoded_bytes)
-                        .is_none_or(|bytes| bytes > self.config.replay_limits.max_encoded_bytes)
-                    {
-                        "tail_bytes"
-                    } else {
-                        "identity"
-                    };
-                (reason, Some(*encoded_bytes))
-            }
-            Some(AdmissionPressure::Partition { .. }) => ("partition", None),
-            Some(AdmissionPressure::Index { .. }) => ("index", None),
-            None => ("pending", None),
-        };
-        self.write_timeline.checkpoint_pressure(
-            self.epoch,
-            self.background_checkpoint
-                .as_ref()
-                .map(|_| self.snapshot_generation),
-            CheckpointPressure {
-                reason,
-                batches: self.checkpoint_tail_batches,
-                encoded_bytes: self.checkpoint_tail_bytes,
-                max_batches: self.config.replay_limits.max_batches,
-                max_encoded_bytes: self.config.replay_limits.max_encoded_bytes,
-                incoming_encoded_bytes,
-            },
-        );
-    }
-
-    fn include_checkpoint_diagnostic(&self, diagnostic: &mut CheckpointDiagnostic) {
-        let Some(checkpoint) = self.last_checkpoint_diagnostic else {
-            return;
-        };
-        diagnostic.checkpoint_generation = checkpoint.generation;
-        diagnostic.captured_cut = checkpoint.captured_cut;
-        diagnostic.captured_batches = checkpoint.captured_batches;
-        diagnostic.captured_bytes = checkpoint.captured_bytes;
-    }
-    // Shared by synchronous admission and the actor's deferred FIFO head.
-    // No version or reservation is allocated here.
-    fn prepared_pressure(
-        &self,
-        prepared: &PreparedAdmission,
-    ) -> Result<Option<AdmissionPressure>, LocalDbError> {
-        let batch = &prepared.batch;
-        if let Some((version, digest)) = self.existing_identity(batch.id())? {
-            if batch.version() != version || batch.digest() != digest {
-                return Err(LocalDbError::new("retry changed original batch"));
-            }
-            return Ok(None);
-        }
-        let encoded_bytes = batch.encoded().len();
-        if encoded_bytes > self.config.replay_limits.max_encoded_bytes {
-            return Err(LocalDbError::new(
-                "batch exceeds checkpoint tail byte bound",
-            ));
-        }
-        let records = batch.mutations().len();
-        self.check_storage_group_capacity(1, records)?;
-        self.partition_records[prepared.partition]
-            .checked_add(records)
-            .ok_or_else(|| LocalDbError::new("reference reservation overflow"))?;
-        self.reserved_index_bytes
-            .checked_add(prepared.metadata_bytes)
-            .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-        for pressure in [
-            AdmissionPressure::Tail {
-                encoded_bytes,
-                identity: true,
-            },
-            AdmissionPressure::Partition {
-                partition: prepared.partition,
-                records,
-            },
-            AdmissionPressure::Index {
-                additional_bytes: prepared.metadata_bytes,
-            },
-        ] {
-            if !self.admission_pressure_fits(pressure) {
-                return Ok(Some(pressure));
-            }
-        }
-        Ok(None)
-    }
-
-    // Only private, locally constructed CompleteBatch values reach this path.
-    // Preparation does not allocate a logical slot or confer authority.
-    fn admit_prepared(
-        &mut self,
-        prepared: PreparedAdmission,
-    ) -> Result<BatchVersion, LocalDbError> {
-        self.admit_prepared_with_progress(prepared, true)
-    }
-
-    fn admit_prepared_with_progress(
-        &mut self,
-        prepared: PreparedAdmission,
-        progress: bool,
-    ) -> Result<BatchVersion, LocalDbError> {
-        self.ensure_healthy()?;
-        if progress
-            && self.config.pipelined_writes
-            && self.inflight.iter().any(|queue| !queue.is_empty())
-        {
-            self.progress_pipeline(false)?;
-        }
-        let started = Instant::now();
-        let mut validation_excluded_ns = 0;
-        let id = prepared.batch.id();
-        let version = prepared.batch.version();
-        if let Some((previous, digest)) = self.existing_identity(id)? {
-            if version != previous || prepared.batch.digest() != digest {
-                return Err(LocalDbError::new("retry changed original batch"));
-            }
-            return Ok(previous);
-        }
-        if self.submissions.len() >= self.config.max_admitted_batches
-            || self.submissions.len() >= self.config.max_pending_batches
-        {
-            return Err(LocalDbError::new(
-                "TCP authority admission capacity reached",
-            ));
-        }
-        // Reserve checkpoint receipt space BEFORE remote effects, including all
-        // outstanding identities and worst-case future retained empty epochs.
-        self.check_checkpoint_capacity(1)?;
-        while let Some(pressure) = self.prepared_pressure(&prepared)? {
-            self.ensure_admission_pressure(pressure)?;
-            validation_excluded_ns = elapsed(started);
-        }
-        let PreparedAdmission {
-            batch,
-            routing,
-            partition,
-            metadata_bytes,
-            credit,
-            group_charge,
-        } = prepared;
-        let encoded_bytes = batch.encoded().len();
-        if id.database != self.config.storage.database
-            || version
-                != (BatchVersion {
-                    epoch: self.epoch,
-                    sequence: self.submission_next(),
-                })
-        {
-            return Err(LocalDbError::new(
-                "prepared identity/version is not next admission",
-            ));
-        }
-        let reserved = self
-            .reserved_index_bytes
-            .checked_add(metadata_bytes)
-            .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-        self.index
-            .check_capacity(reserved)
-            .map_err(LocalDbError::component)?;
-        let records = self.partition_records[partition]
-            .checked_add(batch.mutations().len())
-            .ok_or_else(|| LocalDbError::new("reference reservation overflow"))?;
-        let pending_bytes = self
-            .pending_bytes
-            .checked_add(credit)
-            .filter(|n| *n <= self.config.max_pending_bytes)
-            .ok_or_else(|| LocalDbError::new("pending byte budget reached"))?;
-        let staged_bytes = self.staged_bytes[partition]
-            .checked_add(group_charge)
-            .ok_or_else(|| LocalDbError::new("staging byte overflow"))?;
-        // Marks are indexed by the bounded dense admission window. A unique
-        // admission sequence deduplicates repeated keys without allocating a
-        // temporary set or a vector sized to every operation in a large batch.
-        self.predecessor_marks
-            .resize(self.submissions.len(), u64::MAX);
-        let mut predecessors = SmallVec::new();
-        for operation in routing.operations() {
-            if let Some(&prior) = self
-                .pending_writers
-                .get(&operation.ks())
-                .and_then(|writers| writers.get(operation.reduced_key().as_ref()))
-            {
-                let mark = &mut self.predecessor_marks[(prior - self.submission_base) as usize];
-                if *mark != version.sequence {
-                    *mark = version.sequence;
-                    predecessors.push(prior);
-                }
-            }
-        }
-        let last_mutation = batch
-            .mutation_version(batch.mutations().len() - 1)
-            .ok_or_else(|| LocalDbError::new("empty admitted batch"))?;
-        // New admissions can become exclusions in a later frozen view. Grow all
-        // outstanding reservations before exposing that possibility to WAL I/O.
-        // A serial write has no exclusions and therefore needs no view quota.
-        //
-        // Every admission grows each older live reservation to at least its own
-        // exclusion capacity and reserves exactly that capacity for itself, so
-        // capacity never increases from the oldest live reservation to the newest
-        // (published entries drop theirs; they never rejoin). The reservations
-        // needing growth are thus a newest-first run, and one pass stops at the
-        // first one that already fits. While the window grows every older one
-        // needs growth, so the pass is bounded by the window, not by the batch.
-        let publication_view = {
-            let max_excluded = self.submissions.len();
-            let mut additional = NativeIndex::publication_view_charge(max_excluded)
-                .map_err(LocalDbError::component)?;
-            let mut scanned = 0u64;
-            let mut growing = 0usize;
-            for reservation in self
-                .submissions
-                .iter()
-                .rev()
-                .filter_map(|entry| entry.publication_view.as_ref())
-            {
-                scanned += 1;
-                let needed = reservation
-                    .additional_charge(max_excluded)
-                    .map_err(LocalDbError::component)?;
-                if needed == 0 {
-                    break;
-                }
-                additional = additional
-                    .checked_add(needed)
-                    .ok_or_else(|| LocalDbError::new("publication view reservation overflow"))?;
-                growing += 1;
-            }
-            // The writer handle excludes every other index writer (publication,
-            // checkpoint capture), never readers. A reader pin may take quota
-            // between the preflight and the growth; the growth then reports
-            // `Capacity` before any WAL effect, and an already grown reservation
-            // only holds more headroom for later admissions.
-            let block_started = self.write_timeline.block_started();
-            let index = self.index.writer();
-            self.write_timeline.block_finished(
-                super::write_timeline::WriteBlockStage::AdmissionIndexLock,
-                block_started,
-                self.submissions.len(),
-            );
-            let exclusive = Instant::now();
-            index
-                .check_publication_view_capacity(additional)
-                .map_err(LocalDbError::component)?;
-            for reservation in self
-                .submissions
-                .iter_mut()
-                .rev()
-                .filter_map(|entry| entry.publication_view.as_mut())
-                .take(growing)
-            {
-                index
-                    .grow_publication_view(reservation, max_excluded)
-                    .map_err(LocalDbError::component)?;
-            }
-            let reserved = index
-                .reserve_publication_view(max_excluded)
-                .map_err(LocalDbError::component)?;
-            let held = elapsed(exclusive);
-            self.write_stats.admission_view_scanned += scanned;
-            self.write_stats.admission_view_grown += growing as u64;
-            self.write_stats.admission_exclusive_lock_ns += held;
-            self.write_stats.admission_exclusive_lock_max_ns =
-                self.write_stats.admission_exclusive_lock_max_ns.max(held);
-            reserved
-        };
-        self.stats.validation_ns += elapsed(started).saturating_sub(validation_excluded_ns);
-        self.healthy = false;
-        if self.clock.allocate() != Some(version) {
-            return Err(LocalDbError::unknown(
-                version,
-                "logical allocation mismatch",
-            ));
-        }
-        self.publication
-            .admit(&batch)
-            .map_err(|e| LocalDbError::unknown(version, e))?;
-        self.publication
-            .mark_in_flight(id)
-            .map_err(|e| LocalDbError::unknown(version, e))?;
-        self.active_identities.insert(id, version.sequence as usize);
-        for operation in routing.operations() {
-            let writers = self.pending_writers.entry(operation.ks()).or_default();
-            if let Some(writer) = writers.get_mut(operation.reduced_key().as_ref()) {
-                *writer = version.sequence;
-            } else {
-                writers.insert(
-                    DependencyKey::from_slice(operation.reduced_key().as_ref()),
-                    version.sequence,
-                );
-            }
-        }
-        self.submissions.push_back(Submission {
-            batch: Some(batch),
-            publication_view: Some(publication_view),
-            predecessors,
-            dependency_blocked: false,
-            last_mutation,
-            encoded_bytes,
-            metadata_bytes,
-            credit,
-            routing: Some(routing),
-        });
-        self.durable_wait_started.push_back(None);
-        self.staged[partition].push_back(version.sequence as usize);
-        if self.background_checkpoint.is_some() {
-            self.write_stats.background_checkpoint_suffix_batches += 1;
-        }
-        self.staged_bytes[partition] = staged_bytes;
-        self.partition_admissions[partition] += 1;
-        self.partition_records[partition] = records;
-        self.pending_bytes = pending_bytes;
-        self.reserved_index_bytes = reserved;
-        self.stats.admitted_batches += 1;
-        self.checkpoint_tail_batches += 1;
-        self.checkpoint_tail_bytes += encoded_bytes;
-        self.healthy = true;
-        self.write_timeline
-            .wait_enter(WriteWait::AdmittedToAppendEnqueue, 1);
-        self.write_timeline
-            .batch_event(version, WriteTimelineStage::Admitted, None, None);
-        if self.config.pipelined_writes && self.ready_group(partition) {
-            self.progress_pipeline(false)?;
-        }
-        Ok(version)
-    }
-
-    /// Finish all accepted work. Only this barrier (or write_batch) acknowledges
-    /// durable ordered visibility. Earlier submit calls may already have appended.
-    pub fn drain(&mut self) -> Result<(), LocalDbError> {
-        if let Err(error) = self.ensure_healthy() {
-            if self.unresolved_append.is_none() {
-                self.unresolved_append = self
-                    .inflight
-                    .iter()
-                    .find_map(|queue| queue.front().map(|pending| pending.first));
-            }
-            self.healthy = false;
-            self.inflight.iter_mut().for_each(VecDeque::clear);
-            self.inflight_bytes.fill(0);
-            return Err(error);
-        }
-        if self.config.pipelined_writes
-            && self.submissions.len() == 1
-            && self.inflight.iter().all(VecDeque::is_empty)
-        {
-            return self.drain_single();
-        }
-        loop {
-            self.progress_pipeline(true)?;
-            if self.submissions.is_empty() {
-                return Ok(());
-            }
-            if self.inflight.iter().all(VecDeque::is_empty) {
-                self.healthy = false;
-                return Err(LocalDbError::new(
-                    "unresolved publication without storage work",
-                ));
-            }
-            // Wake on ANY node completion so a slow prefix does not stop other
-            // nodes receiving their next group. Replies remain authoritative;
-            // stale/coalesced notifications are harmless, bounded hints.
-            let started = Instant::now();
-            let _ = self
-                .completion_wake
-                .recv_timeout(Duration::from_millis(100));
-            self.stats.storage_wait_ns += elapsed(started);
-            // A timeout only repolls the result receivers. It never fabricates
-            // an aborted batch; disconnected receivers are handled above.
-        }
-    }
-
-    /// A lone write has no independent storage work to overlap. Message mode
-    /// may use the caller's protected stream; live mode and overlapping
-    /// checkpoints dispatch through the owner worker. Publication is identical.
-    fn drain_single(&mut self) -> Result<(), LocalDbError> {
-        self.healthy = false;
-        let node = self
-            .staged
-            .iter()
-            .position(|queue| !queue.is_empty())
-            .ok_or_else(|| LocalDbError::new("single admission has no staged request"))?;
-        let slot = *self.staged[node].front().unwrap();
-        if self.staged.iter().map(VecDeque::len).sum::<usize>() != 1
-            || slot != self.publication.published_prefix().next_sequence() as usize
-        {
-            return Err(LocalDbError::new(
-                "single write staging disagrees with publication prefix",
-            ));
-        }
-        let batch = self.submissions[slot - self.submission_base as usize]
-            .batch
-            .as_ref()
-            .unwrap();
-        let version = batch.version();
-        self.pipeline_stats.append_requests += 1;
-        self.pipeline_stats.peak_inflight_nodes = self.pipeline_stats.peak_inflight_nodes.max(1);
-        let started = Instant::now();
-        let receipts = if self.background_checkpoint.is_some() || self.config.live_nvme.is_some() {
-            self.clients[node]
-                .append(self.epoch, vec![batch.clone()])
-                .and_then(receive)
-                .map_err(|error| {
-                    self.unresolved_append = Some(version);
-                    LocalDbError::unknown(version, error)
-                })?
-        } else {
-            self.pipeline_stats.direct_appends += 1;
-            match self.clients[node]
-                .client
-                .lock()
-                .append_many(self.epoch, std::slice::from_ref(batch))
-            {
-                Ok(receipts) => receipts,
-                Err(error) => {
-                    self.unresolved_append = Some(version);
-                    return Err(LocalDbError::unknown(version, error));
-                }
-            }
-        };
-        self.stats.storage_wait_ns += elapsed(started);
-        self.staged[node].pop_front();
-        self.staged_bytes[node] = 0;
-        self.accept_receipts(receipts)?;
-        self.publish_completed()?;
-        if !self.submissions.is_empty() {
-            return Err(LocalDbError::unknown(
-                version,
-                "single write did not publish",
-            ));
-        }
-        self.healthy = true;
-        self.progress_checkpoint(false)?;
-        if self.checkpoint_due() {
-            self.start_checkpoint()?;
-        }
-        Ok(())
-    }
-
-    fn accept_receipts(&mut self, receipts: Vec<DurableBatch>) -> Result<(), LocalDbError> {
-        for receipt in receipts {
-            let version = receipt.appended().version();
-            self.write_timeline
-                .wait_leave(WriteWait::HarvestToDurable, 1);
-            self.write_timeline.batch_event(
-                version,
-                WriteTimelineStage::DurableObserved,
-                None,
-                None,
-            );
-            if version.epoch != self.epoch
-                || version.sequence < self.submission_base
-                || version.sequence >= self.submission_next()
-            {
-                return Err(LocalDbError::unknown(
-                    version,
-                    "receipt outside active admission window",
-                ));
-            }
-            let durable_prefix = self.publication.durable_prefix().next_sequence();
-            if version.sequence > durable_prefix
-                && let Some(wait_started) = self
-                    .durable_wait_started
-                    .get_mut((version.sequence - self.submission_base) as usize)
-                && wait_started.is_none()
-            {
-                *wait_started = Some(Instant::now());
-                self.write_stats.durable_receipt_publication_waiting_batches += 1;
-                self.write_stats.durable_receipt_publication_waiting_peak = self
-                    .write_stats
-                    .durable_receipt_publication_waiting_peak
-                    .max(self.write_stats.durable_receipt_publication_waiting_batches);
-            }
-            self.publication
-                .record_durable(receipt)
-                .map_err(|e| LocalDbError::unknown(version, e))?;
-            self.pipeline_stats.durable_batches += 1;
-        }
-        Ok(())
-    }
-
-    fn ready_group(&self, node: usize) -> bool {
-        let limits = self.config.storage.group_limits;
-        !self.staged[node].is_empty()
-            && (self.staged[node].len() >= limits.max_batches as usize
-                || self.staged_bytes[node] + GROUP_HEADER_LEN
-                    >= limits.max_encoded_bytes - limits.max_encoded_bytes / 4)
-    }
-
-    fn progress_pipeline(&mut self, flush_tails: bool) -> Result<(), LocalDbError> {
-        let block_started = self.write_timeline.block_started();
-        self.healthy = false;
-        let result = (|| {
-            self.completed_nodes.fill(false);
-            for node in 0..self.inflight.len() {
-                let owner = self.config.endpoints[node].partition;
-                self.write_timeline.owner_queue(
-                    owner,
-                    super::write_timeline::WriteOwnerQueue::AuthorityStaged,
-                    self.staged[node].len(),
-                );
-                self.write_timeline.owner_queue(
-                    owner,
-                    super::write_timeline::WriteOwnerQueue::AuthorityOutstanding,
-                    self.inflight[node].len(),
-                );
-                let mut position = 0;
-                while position < self.inflight[node].len() {
-                    let pending = &self.inflight[node][position];
-                    let completed = match pending.reply.try_recv() {
-                        Ok(result) => Some(
-                            result.map_err(|error| LocalDbError::unknown(pending.first, error)),
-                        ),
-                        Err(mpsc::TryRecvError::Empty) => None,
-                        Err(mpsc::TryRecvError::Disconnected) => Some(Err(LocalDbError::unknown(
-                            pending.first,
-                            "TCP worker lost request outcome",
-                        ))),
-                    };
-                    if let Some(receipts) = completed {
-                        let first = pending.first;
-                        self.inflight_bytes[node] -= pending.charge;
-                        self.inflight[node].remove(position);
-                        match receipts {
-                            Ok(receipts) => {
-                                if let Err(error) = self.accept_receipts(receipts) {
-                                    self.unresolved_append = Some(first);
-                                    return Err(error);
-                                }
-                                self.completed_nodes[node] = true;
-                                if !flush_tails {
-                                    self.pipeline_stats.completions_before_drain += 1;
-                                }
-                            }
-                            Err(error) => {
-                                self.unresolved_append = Some(first);
-                                return Err(error);
-                            }
-                        }
-                    } else {
-                        position += 1;
-                    }
-                }
-            }
-
-            let started = Instant::now();
-            let mode = if flush_tails {
-                DispatchMode::DrainReady
-            } else {
-                DispatchMode::Early
-            };
-            // Bounded fair rounds flush only work already admitted. Each owner
-            // gets at most one group per round, including queued worker commands.
-            for _ in 0..self.owner_dispatch.rounds(mode) {
-                let mut dispatched = false;
-                for node in 0..self.clients.len() {
-                    let refill = self.completed_nodes[node];
-                    if !self.owner_dispatch.should_form_group(
-                        mode,
-                        self.inflight[node].len(),
-                        self.staged[node].len(),
-                        self.staged_bytes[node],
-                        GROUP_HEADER_LEN,
-                        self.ready_group(node),
-                        refill,
-                    ) {
-                        continue;
-                    }
-                    let (count, charge) = {
-                        let limits = self.config.storage.group_limits;
-                        let mut bytes = GROUP_HEADER_LEN;
-                        let mut count = 0;
-                        let mut records = 0usize;
-                        let mut charge = 64usize;
-                        let mut byte_limited = false;
-                        for &slot in &self.staged[node] {
-                            let batch = self.submissions[slot - self.submission_base as usize]
-                                .batch
-                                .as_ref()
-                                .unwrap();
-                            let next = CompleteGroup::encoded_member_len(batch.encoded().len())
-                                .map_err(LocalDbError::component)?;
-                            let next_records = records
-                                .checked_add(batch.mutations().len())
-                                .ok_or_else(|| {
-                                    LocalDbError::new("group reference reservation overflow")
-                                })?;
-                            if count == limits.max_batches as usize
-                                || bytes + next > limits.max_encoded_bytes
-                                || self
-                                    .check_storage_group_capacity(count + 1, next_records)
-                                    .is_err()
-                            {
-                                break;
-                            }
-                            let next_charge =
-                                AppendByteBudget::add_batch_charge(charge, batch.encoded().len())
-                                    .ok_or_else(|| {
-                                    LocalDbError::new("owner append byte charge overflow")
-                                })?;
-                            if !self
-                                .append_byte_budget
-                                .admits(self.inflight_bytes[node], next_charge)
-                            {
-                                byte_limited = true;
-                                break;
-                            }
-                            charge = next_charge;
-                            bytes += next;
-                            records = next_records;
-                            count += 1;
-                        }
-                        if count == 0 {
-                            if byte_limited {
-                                continue;
-                            }
-                            return Err(LocalDbError::new("batch cannot fit remote group"));
-                        }
-                        let full = count == limits.max_batches as usize
-                            || count < self.staged[node].len()
-                            || bytes >= limits.max_encoded_bytes - limits.max_encoded_bytes / 4;
-                        if !self
-                            .owner_dispatch
-                            .should_dispatch_group(mode, refill, full)
-                        {
-                            continue;
-                        }
-                        (count, charge)
-                    };
-                    let submissions = &self.submissions;
-                    let submission_base = self.submission_base as usize;
-                    let batches: Vec<_> = self.staged[node]
-                        .drain(..count)
-                        .map(|slot| {
-                            submissions[slot - submission_base]
-                                .batch
-                                .as_ref()
-                                .unwrap()
-                                .clone()
-                        })
-                        .collect();
-                    for batch in &batches {
-                        self.staged_bytes[node] -=
-                            CompleteGroup::encoded_member_len(batch.encoded().len())
-                                .map_err(LocalDbError::component)?;
-                    }
-                    self.write_timeline
-                        .wait_leave(WriteWait::AdmittedToAppendEnqueue, batches.len());
-                    if self.write_timeline.enabled() {
-                        for batch in &batches {
-                            self.write_timeline.batch_event(
-                                batch.version(),
-                                WriteTimelineStage::AppendEnqueueStarted,
-                                Some(self.config.endpoints[node].partition),
-                                None,
-                            );
-                        }
-                    }
-                    let first = batches[0].version();
-                    let send_started = self.write_timeline.block_started();
-                    let reply = match self.clients[node].append(self.epoch, batches) {
-                        Ok(reply) => reply,
-                        Err(error) => {
-                            self.unresolved_append = Some(first);
-                            return Err(LocalDbError::unknown(first, error));
-                        }
-                    };
-                    self.write_timeline.block_finished(
-                        super::write_timeline::WriteBlockStage::AppendSend,
-                        send_started,
-                        self.inflight[node].len(),
-                    );
-                    self.inflight_bytes[node] += charge;
-                    self.inflight[node].push_back(PendingAppend {
-                        first,
-                        reply,
-                        charge,
-                    });
-                    dispatched = true;
-                    self.pipeline_stats.append_requests += 1;
-                    if !flush_tails {
-                        self.pipeline_stats.early_dispatches += 1;
-                    }
-                }
-                if !flush_tails || !dispatched {
-                    break;
-                }
-            }
-            self.stats.dispatch_ns += elapsed(started);
-            self.pipeline_stats.peak_inflight_nodes = self.pipeline_stats.peak_inflight_nodes.max(
-                self.inflight
-                    .iter()
-                    .filter(|queue| !queue.is_empty())
-                    .count(),
-            );
-            self.publish_completed()?;
-            Ok(())
-        })();
-        if let Err(error) = &result {
-            record_first_failure(
-                &self.first_failure,
-                None,
-                error.uncertain_version,
-                "progress_pipeline",
-                error,
-            );
-            self.concurrent_failure
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.reads.poison();
-            self.inflight.iter_mut().for_each(VecDeque::clear);
-            self.inflight_bytes.fill(0);
-        } else {
-            self.healthy = true;
-        }
-        if result.is_ok() {
-            self.progress_checkpoint(false)?;
-            if self.checkpoint_due() {
-                self.start_checkpoint()?;
-            }
-        }
-        self.write_timeline.block_finished(
-            super::write_timeline::WriteBlockStage::Progress,
-            block_started,
-            self.submissions.len(),
-        );
-        result
-    }
-
-    fn publish_completed(&mut self) -> Result<(), LocalDbError> {
-        if self.publication.durable_unpublished() == 0 {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let mut cache_candidates = SmallVec::<[_; 4]>::new();
-        let mut publication_view = None;
-        let submissions = &mut self.submissions;
-        let submission_base = self.submission_base;
-        let mut contiguous_next = self.publication.published_prefix().next_sequence();
-        let block_started = self.write_timeline.block_started();
-        let mut index_guard = self.index.writer();
-        self.write_timeline.block_finished(
-            super::write_timeline::WriteBlockStage::PublicationIndexLock,
-            block_started,
-            submissions.len(),
-        );
-        let _poison = concurrent::FailureOnPanic(self.concurrent_failure.clone());
-        let index = &mut index_guard;
-        let known = &mut self.known;
-        let active = &mut self.active_identities;
-        let pending_writers = &mut self.pending_writers;
-        let latest = &mut self.latest;
-        let live_latest = &mut self.live_latest;
-        let reserved = &mut self.reserved_index_bytes;
-        let waits = &mut self.durable_wait_started;
-        let write_stats = &mut self.write_stats;
-        let progress = self
-            .publication
-            .publish_available(|durable| {
-                let receipt = durable.appended();
-                let sequence = receipt.version().sequence;
-                let slot = (sequence - submission_base) as usize;
-                let entry = submissions
-                    .get(slot)
-                    .ok_or_else(|| LocalDbError::new("receipt outside admission inventory"))?;
-                if entry.predecessors.iter().any(|&prior| {
-                    prior >= submission_base
-                        && submissions[(prior - submission_base) as usize]
-                            .batch
-                            .is_some()
-                }) {
-                    let entry = &mut submissions[slot];
-                    if !entry.dependency_blocked {
-                        entry.dependency_blocked = true;
-                        write_stats.dependency_wait_batches += 1;
-                    }
-                    return Ok(false);
-                }
-                let entry = &mut submissions[slot];
-                let batch = entry
-                    .batch
-                    .as_ref()
-                    .ok_or_else(|| LocalDbError::new("batch already published"))?;
-                let routing = entry
-                    .routing
-                    .take()
-                    .ok_or_else(|| LocalDbError::new("missing prepared publication routing"))?;
-                // Only the last pending writer owns this dependency-map entry.
-                // Colliding full keys intentionally share their native reduced slot.
-                for operation in routing.operations() {
-                    if let std::collections::hash_map::Entry::Occupied(mut space) =
-                        pending_writers.entry(operation.ks())
-                    {
-                        let writers = space.get_mut();
-                        if writers.get(operation.reduced_key().as_ref()) == Some(&sequence) {
-                            writers.remove(operation.reduced_key().as_ref());
-                        }
-                        // Release the table before returning its admission
-                        // credit; otherwise each keyspace retains a full window.
-                        if writers.is_empty() {
-                            space.remove();
-                        } else if writers.capacity() > writers.len().saturating_mul(4) {
-                            // A stalled writer can keep this keyspace nonempty.
-                            // Geometric shrinking bounds its retained buckets
-                            // by live dependencies, not historical batch sizes.
-                            writers.shrink_to(writers.len());
-                        }
-                    }
-                }
-                #[cfg(test)]
-                crate::failpoints::write_model::boundary("publication_before");
-                routing
-                    .publish_authenticated(batch, durable, index)
-                    .map_err(LocalDbError::component)?;
-                index.promote_committed().map_err(LocalDbError::component)?;
-                #[cfg(test)]
-                crate::failpoints::write_model::boundary("publication_after");
-                *live_latest = Some(live_latest.map_or(entry.last_mutation, |previous| {
-                    previous.max(entry.last_mutation)
-                }));
-                known.insert(receipt.id(), receipt);
-                active.remove(&receipt.id());
-                *reserved -= entry.metadata_bytes;
-                if sequence != contiguous_next {
-                    write_stats.out_of_prefix_published_batches += 1;
-                }
-                if let Some(wait_started) = waits[slot].take() {
-                    write_stats.durable_receipt_publication_blocked_batches += 1;
-                    write_stats.durable_receipt_publication_blocked_ns += elapsed(wait_started);
-                    write_stats.durable_receipt_publication_waiting_batches -= 1;
-                }
-                let batch = entry
-                    .batch
-                    .take()
-                    .ok_or_else(|| LocalDbError::new("batch disappeared during publication"))?;
-                entry.predecessors = SmallVec::new();
-                publication_view = entry.publication_view.take();
-                cache_candidates.push((receipt.address(), batch, entry.credit));
-                // The recovery frontier cannot include a still-unpublished slot.
-                while let Some(entry) =
-                    submissions.get((contiguous_next - submission_base) as usize)
-                    && entry.batch.is_none()
-                {
-                    *latest = Some(entry.last_mutation);
-                    contiguous_next += 1;
-                }
-                Ok::<_, LocalDbError>(true)
-            })
-            .inspect_err(|_| {
-                self.concurrent_failure
-                    .store(true, std::sync::atomic::Ordering::Release);
-            })
-            .map_err(LocalDbError::component)?;
-        let published_prefix = self.publication.published_prefix().next_sequence();
-        debug_assert_eq!(contiguous_next, published_prefix);
-        if progress.callbacks_completed != 0 {
-            let upper = self.live_latest.expect("published batch has a mutation");
-            let excluded_count = self
-                .publication
-                .unpublished_versions()
-                .take_while(|version| *version <= upper.batch)
-                .count();
-            let mut excluded = Vec::with_capacity(excluded_count);
-            excluded.extend(
-                self.publication
-                    .unpublished_versions()
-                    .take_while(|version| *version <= upper.batch),
-            );
-            let floor = self
-                .latest
-                .map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
-            index
-                .install_reserved_live_view(
-                    upper,
-                    floor,
-                    excluded,
-                    publication_view.expect("published batch reserved a live view"),
-                )
-                .inspect_err(|_| {
-                    self.concurrent_failure
-                        .store(true, std::sync::atomic::Ordering::Release);
-                })
-                .map_err(LocalDbError::component)?;
-        }
-        drop(index_guard);
-        if self.write_timeline.enabled() {
-            for (_, batch, _) in &cache_candidates {
-                self.write_timeline.batch_event(
-                    batch.version(),
-                    WriteTimelineStage::Published,
-                    None,
-                    None,
-                );
-            }
-        }
-        for _ in submission_base..published_prefix {
-            self.submissions.pop_front();
-            self.durable_wait_started.pop_front();
-        }
-        self.submission_base = published_prefix;
-        self.publication
-            .retire_published()
-            .map_err(LocalDbError::component)?;
-        for (address, batch, credit) in cache_candidates {
-            let partition = self.partition_indexes[&address.partition];
-            self.partition_admissions[partition] -= 1;
-            self.partition_records[partition] -= batch.mutations().len();
-            if self.config.read_cache_bytes != 0 {
-                for operation in 0..batch.mutations().len() {
-                    let reference = batch
-                        .record_reference(address, operation)
-                        .map_err(LocalDbError::component)?;
-                    let prepared = self
-                        .read_cache
-                        .prepare_post_publish(reference, &batch.mutations()[operation]);
-                    self.read_cache.insert_prepared(prepared);
-                }
-            }
-            drop(batch);
-            self.pending_bytes -= credit;
-        }
-        self.stats.publication_ns += elapsed(started);
-        self.stats.published_batches += progress.callbacks_completed;
-        Ok(())
+    pub fn drain(&self) -> Result<(), LocalDbError> {
+        self.core.drain()
     }
 
     pub fn write_batch(
-        &mut self,
+        &self,
         operation: [u8; 16],
         mutations: Vec<Mutation>,
     ) -> Result<BatchVersion, LocalDbError> {
-        let version = self.submit(operation, mutations)?;
-        self.drain()?;
-        Ok(version)
+        self.core.write(operation, mutations, None)
     }
 
     fn fetch(
@@ -3775,7 +2260,7 @@ impl RemoteDatabase {
         let mut slots = Vec::new();
         for (slot, reference) in references.iter().enumerate() {
             let clock = ResolutionSample::start(sample);
-            let cached = self.read_cache.get(reference);
+            let cached = self.core.read_cache.get(reference);
             if let Some(sample) = sample.as_ref() {
                 sample.stage(ResolutionStage::CacheLookup, clock);
             }
@@ -3795,18 +2280,20 @@ impl RemoteDatabase {
         if !missing.is_empty() {
             let values = self.fetch_uncached(&missing, sample)?;
             if values.len() != missing.len() {
-                self.healthy = false;
-                return Err(LocalDbError::new("read result count mismatch"));
+                let error = LocalDbError::new("read result count mismatch");
+                self.poison(&error);
+                return Err(error);
             }
             self.ensure_healthy()?;
             for ((slot, reference), value) in slots.into_iter().zip(missing).zip(values) {
-                let prepared = self.read_cache.prepare_verified(reference, &value);
-                self.read_cache.insert_prepared(prepared);
+                let prepared = self.core.read_cache.prepare_verified(reference, &value);
+                self.core.read_cache.insert_prepared(prepared);
                 output[slot] = Some(value);
             }
         } else if let Some(sample) = sample.as_mut() {
             sample.success();
         }
+        self.ensure_healthy()?;
         Ok(output.into_iter().map(Option::unwrap).collect())
     }
 
@@ -3820,10 +2307,11 @@ impl RemoteDatabase {
         }
         let started = Instant::now();
         let mut groups: Vec<Vec<(usize, ValueRecordReference)>> =
-            vec![Vec::new(); self.clients.len()];
+            vec![Vec::new(); self.core.clients.len()];
         for (i, reference) in references.iter().enumerate() {
             let clock = ResolutionSample::start(sample);
             let node = self
+                .core
                 .partition_indexes
                 .get(&reference.batch_address.partition)
                 .copied()
@@ -3838,7 +2326,7 @@ impl RemoteDatabase {
         }
         let values = vec![None; references.len()];
         let clock = ResolutionSample::start(sample);
-        let batch = pending_read::ReadBatch::new(&self.reads, values, groups);
+        let batch = pending_read::ReadBatch::new(&self.core.reads, values, groups);
         if let Some(sample) = sample.as_ref() {
             sample.stage(ResolutionStage::BatchPreparation, clock);
         }
@@ -3846,11 +2334,13 @@ impl RemoteDatabase {
         // These private grouped fetch callers resolve the current committed cut
         // under the sole owner. Transfer its protection through physical read
         // completion, even if the aggregate caller exits early on an error.
+        // The references are resolved, so only the retention floor is pinned.
         self.ensure_healthy()?;
         let clock = ResolutionSample::start(sample);
         let pin = self
+            .core
             .index
-            .pin_cut(IndexReadCut::Latest)
+            .pin_call_floor(IndexReadCut::Latest)
             .map_err(LocalDbError::component);
         if let Some(sample) = sample.as_ref() {
             sample.stage(ResolutionStage::PinPreparation, clock);
@@ -3860,12 +2350,15 @@ impl RemoteDatabase {
             sample.success();
         }
         while !batch.complete() {
-            batch.dispatch(&self.reads)?;
+            batch.dispatch(&self.core.reads)?;
             // If nothing belongs to this call, only external handles hold the
             // missing capacity; leave them to their owner and report pressure.
             batch.finish_one()?;
         }
-        self.stats.value_read_ns += elapsed(started);
+        // Relaxed: diagnostic time only, never publication authority.
+        self.core
+            .value_read_ns
+            .fetch_add(elapsed(started), std::sync::atomic::Ordering::Relaxed);
         self.ensure_healthy()?;
         batch
             .values
@@ -3905,7 +2398,7 @@ impl RemoteDatabase {
         ks: KeySpace,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Bytes>>, LocalDbError> {
-        let monitor = self.reads.resolution_monitor();
+        let monitor = self.core.reads.resolution_monitor();
         let mut sample = monitor
             .as_ref()
             .and_then(|monitor| monitor.select_resolution(true, keys.len()));
@@ -3916,7 +2409,7 @@ impl RemoteDatabase {
         let resolve_started = Instant::now();
         let clock = ResolutionSample::start(&sample);
         // One resolved cut for every key of the batch: no key sees a later publication.
-        let cut = self.index.latest_cut();
+        let cut = self.core.index.call_cut();
         if let Some(sample) = &sample {
             sample.stage(ResolutionStage::CutCapture, clock);
         }
@@ -3925,6 +2418,7 @@ impl RemoteDatabase {
         for (slot, key) in keys.iter().enumerate() {
             let clock = ResolutionSample::start(&sample);
             let reference = self
+                .core
                 .index
                 .get(ks, key, cut.clone())
                 .map_err(LocalDbError::component);
@@ -3949,7 +2443,10 @@ impl RemoteDatabase {
                 }
             }
         }
-        self.stats.read_resolve_ns += elapsed(resolve_started);
+        self.core.read_resolve_ns.fetch_add(
+            elapsed(resolve_started),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut output = vec![None; keys.len()];
         for (slot, mutation) in slots.into_iter().zip(self.fetch(&references, &mut sample)?) {
             output[slot] = Self::point_value(ks, &keys[slot], mutation)?;
@@ -3963,14 +2460,17 @@ impl RemoteDatabase {
         self.ensure_healthy()?;
         let started = Instant::now();
         let reference = self
+            .core
             .index
             .get(ks, key, IndexReadCut::Latest)
             .map_err(LocalDbError::component)?;
-        self.stats.read_resolve_ns += elapsed(started);
+        self.core
+            .read_resolve_ns
+            .fetch_add(elapsed(started), std::sync::atomic::Ordering::Relaxed);
         let Some(reference) = reference else {
             return Ok(false);
         };
-        if !self.shape.ks(ks).need_check_index_key() {
+        if !self.core.shape.ks(ks).need_check_index_key() {
             return Ok(true);
         }
         match self.fetch(&[reference], &mut None)?.remove(0) {
@@ -3986,15 +2486,14 @@ impl RemoteDatabase {
     }
     pub fn checkpoint(&mut self) -> Result<LocalCheckpoint, LocalDbError> {
         self.drain()?;
+        let latest = self.core.publisher.lock().latest;
         Ok(LocalCheckpoint {
-            database: self.config.storage.database,
-            cut: self.latest,
+            database: self.core.config.storage.database,
+            cut: latest,
             pin: Some(
-                self.index
-                    .pin_cut(
-                        self.latest
-                            .map_or(IndexReadCut::BeforeAll, IndexReadCut::At),
-                    )
+                self.core
+                    .index
+                    .pin_cut(latest.map_or(IndexReadCut::BeforeAll, IndexReadCut::At))
                     .map_err(LocalDbError::component)?,
             ),
         })
@@ -4005,7 +2504,7 @@ impl RemoteDatabase {
         key: &[u8],
         checkpoint: &LocalCheckpoint,
     ) -> Result<Option<Bytes>, LocalDbError> {
-        if checkpoint.database != self.config.storage.database {
+        if checkpoint.database != self.core.config.storage.database {
             return Err(LocalDbError::new("checkpoint belongs to another database"));
         }
         self.get_cut(
@@ -4019,61 +2518,37 @@ impl RemoteDatabase {
     // Checkpoint freezing, background persistence and durable adoption live in
     // checkpoint_lifecycle; the authority owns every resulting root transition.
 
-    pub fn flush_index(&mut self) -> Result<(), LocalDbError> {
-        self.drain()?;
-        self.commit_checkpoint()
+    pub fn flush_index(&self) -> Result<(), LocalDbError> {
+        self.core.flush_index()
     }
-    pub fn unload_index(&mut self) -> Result<(), LocalDbError> {
+    pub fn unload_index(&self) -> Result<(), LocalDbError> {
         self.flush_index()
     }
     pub fn pipeline_stats(&self) -> PipelineStats {
-        self.pipeline_stats
+        self.core.pipeline_stats()
     }
     pub fn recovery_stats(&self) -> RecoveryStats {
-        self.recovery_stats
+        self.core.stats.lock().recovery
     }
     pub fn authority_write_stats(&self) -> AuthorityWriteStats {
-        AuthorityWriteStats {
-            storage_wait_ns: self.stats.storage_wait_ns,
-            publication_ns: self.stats.publication_ns,
-            dispatch_ns: self.stats.dispatch_ns,
-            ..self.write_stats
-        }
+        self.core.authority_write_stats()
     }
     pub fn checkpoint_diagnostic_summary(&self) -> CheckpointDiagnosticSummary {
-        self.checkpoint_diagnostic_summary
+        self.core.publisher.lock().checkpoint_diagnostic_summary
     }
 
-    fn record_checkpoint_diagnostic(
-        &mut self,
-        mut record: CheckpointDiagnostic,
-    ) -> CheckpointDiagnostic {
-        let Some(records) = self.checkpoint_diagnostics.as_mut() else {
-            return record;
-        };
-        record.cursor = self.next_checkpoint_diagnostic;
-        if records.len() == 128 {
-            records.pop_front();
-            self.dropped_checkpoint_diagnostics =
-                self.dropped_checkpoint_diagnostics.saturating_add(1);
-        }
-        records.push_back(record);
-        self.next_checkpoint_diagnostic = self.next_checkpoint_diagnostic.saturating_add(1);
-        self.checkpoint_diagnostic_summary.record(record);
-        self.checkpoint_diagnostic_summary.dropped_records = self.dropped_checkpoint_diagnostics;
-        record
-    }
     /// Cursor for bounded checkpoint diagnostics. A zero-profile database has
     /// no diagnostic ring and returns an empty snapshot.
     pub fn checkpoint_diagnostic_cursor(&self) -> u64 {
-        self.next_checkpoint_diagnostic
+        self.core.publisher.lock().next_checkpoint_diagnostic
     }
 
     pub fn checkpoint_diagnostics_since(&self, cursor: u64) -> CheckpointDiagnosticsSnapshot {
+        let publisher = self.core.publisher.lock();
         CheckpointDiagnosticsSnapshot {
-            next_cursor: self.next_checkpoint_diagnostic,
-            dropped_records: self.dropped_checkpoint_diagnostics,
-            records: self
+            next_cursor: publisher.next_checkpoint_diagnostic,
+            dropped_records: publisher.dropped_checkpoint_diagnostics,
+            records: publisher
                 .checkpoint_diagnostics
                 .as_ref()
                 .into_iter()
@@ -4085,82 +2560,42 @@ impl RemoteDatabase {
     }
     /// Arm fresh bounded append and checkpoint profiles after warm-up.
     /// Finish any pre-existing checkpoint before resetting the phase counters.
-    pub fn arm_write_profile(&mut self, limit: usize) -> Result<(), LocalDbError> {
-        if limit > 65_536 {
-            return Err(LocalDbError::new("write profile limit exceeds 65536"));
-        }
-        self.drain()?;
-        self.progress_checkpoint(true)?;
-        if limit == 0 {
-            self.checkpoint_diagnostics = None;
-        } else if let Some(records) = self.checkpoint_diagnostics.as_mut() {
-            records.clear();
-        } else {
-            self.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
-        }
-        self.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
-            available: limit != 0,
-            ..CheckpointDiagnosticSummary::default()
-        };
-        self.dropped_checkpoint_diagnostics = 0;
-        self.last_checkpoint_diagnostic = None;
-        self.config.write_profile_limit = limit;
-        *self.write_profile.lock() = WriteProfileSnapshot {
-            limit_per_connection: limit,
-            expected_connections: self.clients.len(),
-            ..WriteProfileSnapshot::default()
-        };
-        for client in &self.clients {
-            client.arm_profile(limit)?;
-        }
-        Ok(())
+    pub fn arm_write_profile(&self, limit: usize) -> Result<(), LocalDbError> {
+        self.core.arm_write_profile(limit)
     }
     /// Capture partial opt-in append profiles after all admitted writes have drained.
     /// With a zero limit, this returns without issuing any diagnostic RPC.
-    pub fn finish_write_profile(&mut self) -> Result<(), LocalDbError> {
-        self.drain()?;
-        if self.config.write_profile_limit == 0 {
-            return Ok(());
-        }
-        let mut first_error = None;
-        for client in &self.clients {
-            if let Err(error) = client.finish_profile() {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
+    pub fn finish_write_profile(&self) -> Result<(), LocalDbError> {
+        self.core.finish_write_profile()
     }
     pub fn shutdown_stats(&self) -> ShutdownStats {
-        self.shutdown_stats
+        self.core.stats.lock().shutdown
     }
     pub fn read_cache_stats(&self) -> ReadCacheStats {
-        self.read_cache.stats()
+        self.core.read_cache.stats()
     }
     /// Per-shard load of the coordinator index (lock acquisitions, contention, waits).
     pub fn index_shard_stats(&self) -> super::native_index::IndexShardStats {
-        self.index.shard_stats()
+        self.core.index.shard_stats()
     }
     /// Per-shard load of the coordinator read cache.
     pub fn read_cache_shard_stats(&self) -> ReadCacheShardStats {
-        self.read_cache.shard_stats()
+        self.core.read_cache.shard_stats()
     }
     pub fn per_keyspace_read_cache_stats(
         &self,
     ) -> [PerKeyspaceReadCacheStats; KEYSPACE_COUNTER_COUNT] {
-        self.read_cache.per_keyspace_stats()
+        self.core.read_cache.per_keyspace_stats()
     }
     /// Enable private Sui checkpoint cache policy using live shape names.
     pub(super) fn configure_sui_read_cache(&mut self) {
-        let policy = ReadCachePolicy::for_sui_shape(&self.shape);
-        self.read_cache.configure_policy(policy);
+        let policy = ReadCachePolicy::for_sui_shape(&self.core.shape);
+        self.core.read_cache.configure_policy(policy);
     }
 
     /// Discard derivative cache contents without changing index/WAL state.
     pub fn clear_read_cache(&mut self) {
-        self.read_cache.clear();
+        self.core.read_cache.clear();
     }
 
     /// Read-only node counters outside timed reads. Outstanding work makes a
@@ -4168,15 +2603,16 @@ impl RemoteDatabase {
     /// Counter sampling does not close current or preleased writer extents.
     pub fn read_io_stats(&self) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
         self.ensure_healthy()?;
-        self.reads.ensure_idle()?;
-        if !self.submissions.is_empty() {
+        self.core.reads.ensure_idle()?;
+        if self.core.publisher.lock().published_next < self.core.next_sequence() {
             return Err(LocalDbError::new(
                 "read I/O statistics require drained writes",
             ));
         }
-        self.clients
+        self.core
+            .clients
             .iter()
-            .zip(&self.config.endpoints)
+            .zip(&self.core.config.endpoints)
             .map(|(client, endpoint)| {
                 client
                     .read_io_stats()
@@ -4195,12 +2631,13 @@ impl RemoteDatabase {
         reset: bool,
     ) -> Result<Vec<(u32, super::tcp::ConnectionProfile)>, LocalDbError> {
         self.ensure_healthy()?;
-        self.reads.ensure_idle()?;
+        self.core.reads.ensure_idle()?;
         self.drain()?;
-        let read_profiles = self.reads.profiles(enabled, reset)?;
-        self.clients
+        let read_profiles = self.core.reads.profiles(enabled, reset)?;
+        self.core
+            .clients
             .iter()
-            .zip(&self.config.endpoints)
+            .zip(&self.core.config.endpoints)
             .zip(read_profiles)
             .map(|((client, endpoint), reads)| {
                 let mut profile =
@@ -4219,15 +2656,16 @@ impl RemoteDatabase {
         evict: bool,
     ) -> Result<Vec<(u32, crate::read_probe::ReadEvidence)>, LocalDbError> {
         self.ensure_healthy()?;
-        self.reads.ensure_idle()?;
+        self.core.reads.ensure_idle()?;
         self.drain()?;
         if evict {
             self.clear_read_cache();
         }
-        let epoch = self.epoch;
-        self.clients
+        let epoch = self.core.epoch;
+        self.core
+            .clients
             .iter()
-            .zip(&self.config.endpoints)
+            .zip(&self.core.config.endpoints)
             .map(|(client, endpoint)| {
                 client
                     .control(move |client| client.read_evidence_for_benchmark(epoch, evict))
@@ -4244,12 +2682,13 @@ impl RemoteDatabase {
         &mut self,
     ) -> Result<Vec<(u32, crate::read_probe::ProcessResources)>, LocalDbError> {
         self.ensure_healthy()?;
-        self.reads.ensure_idle()?;
+        self.core.reads.ensure_idle()?;
         self.drain()?;
-        let epoch = self.epoch;
-        self.clients
+        let epoch = self.core.epoch;
+        self.core
+            .clients
             .iter()
-            .zip(&self.config.endpoints)
+            .zip(&self.core.config.endpoints)
             .map(|(client, endpoint)| {
                 client
                     .control(move |client| client.process_resources_for_benchmark(epoch))
@@ -4259,11 +2698,11 @@ impl RemoteDatabase {
     }
 
     pub fn stats(&self) -> LocalDbStats {
-        self.stats
+        self.core.database_stats()
     }
     pub fn storage_stats(&self) -> Result<PartitionStats, LocalDbError> {
         let mut total = PartitionStats::default();
-        for client in &self.clients {
+        for client in &self.core.clients {
             let stats = receive(client.stats()?)?;
             total.appended_groups += stats.appended_groups;
             total.persistence_barriers += stats.persistence_barriers;
@@ -4276,193 +2715,8 @@ impl RemoteDatabase {
         }
         Ok(total)
     }
-    pub fn shutdown(&mut self) -> Result<(), LocalDbError> {
-        self.shutdown_with(|_| Ok(()))
-    }
-
-    /// Final owner-process teardown, distinct from an ordinary reopenable close.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn shutdown_live_target_final(
-        &mut self,
-    ) -> Result<Vec<(u32, super::nvmeof::LiveTargetStats)>, LocalDbError> {
-        if self.config.live_nvme.is_none() || self.stopped {
-            return Err(LocalDbError::new(
-                "final live shutdown requires an open live database",
-            ));
-        }
-        let mut targets = Vec::with_capacity(self.clients.len());
-        self.shutdown_with(|database| {
-            for (endpoint, worker) in database.config.endpoints.iter().zip(&database.clients) {
-                let target = worker
-                    .client
-                    .lock()
-                    .shutdown_live_target(database.epoch)
-                    .map_err(LocalDbError::component)?;
-                targets.push((endpoint.partition, target));
-            }
-            Ok(())
-        })?;
-        Ok(targets)
-    }
-
-    fn shutdown_with(
-        &mut self,
-        after_seal: impl FnOnce(&mut Self) -> Result<(), LocalDbError>,
-    ) -> Result<(), LocalDbError> {
-        if self.stopped {
-            return Ok(());
-        }
-        self.operational_sampler.stop();
-        let started = Instant::now();
-        let mut result = self.drain();
-        self.shutdown_stats.drain_ns = elapsed(started);
-        let started = Instant::now();
-        if result.is_ok() {
-            result = self.commit_checkpoint();
-        }
-        self.shutdown_stats.checkpoint_ns = elapsed(started);
-        let started = Instant::now();
-        let read_clients = if result.is_ok() && self.transport_pool.is_some() {
-            self.reads.stop_with_clients()
-        } else {
-            self.reads.stop();
-            Vec::new()
-        };
-        self.shutdown_stats.join_ns = elapsed(started);
-        if self.reads.failed() && result.is_ok() {
-            result = Err(LocalDbError::new(
-                "asynchronous read failed before shutdown",
-            ));
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_pool.is_some() {
-            let mut drain_failed = false;
-            for worker in &self.clients {
-                // The thread observing a failed close owns its DMA retirement;
-                // an idle worker may already be asleep in receiver.recv().
-                let (closed, failed_writer) = {
-                    let mut client = worker.client.lock();
-                    // Acquire observes any earlier owner failure. Poisoned
-                    // authority can retire DMA, but cannot close/adopt extents.
-                    if self
-                        .concurrent_failure
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        client.record_live_write_error();
-                    }
-                    if !self
-                        .concurrent_failure
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        assert_eq!(
-                            client.leased_flights_in_flight(),
-                            0,
-                            "shutdown has waiting leased replies"
-                        );
-                    }
-                    let closed = client.close_live_writer(&mut Vec::new(), None);
-                    let failed_writer = if closed.is_err() {
-                        client.take_failed_live_writer()
-                    } else {
-                        None
-                    };
-                    (closed, failed_writer)
-                };
-                let closed = closed.map_err(LocalDbError::component);
-                if closed.is_err() {
-                    // Release publishes poison before the potentially slow drain.
-                    self.concurrent_failure
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-                let closed = if let Some(mut writer) = failed_writer {
-                    match writer.drain_failed() {
-                        Ok(()) => closed,
-                        Err(error) => Err(match closed {
-                            Ok(()) => LocalDbError::component(error),
-                            Err(primary) => LocalDbError::new(format!(
-                                "{primary}; detached live writer drain failed: {error}",
-                            )),
-                        }),
-                    }
-                } else {
-                    closed
-                };
-                if let Err(error) = closed {
-                    drain_failed = true;
-                    result = Err(match result {
-                        Ok(()) => error,
-                        Err(primary) => LocalDbError::new(format!(
-                            "{primary}; live writer drain failed: {error}",
-                        )),
-                    });
-                }
-            }
-            if drain_failed {
-                // Retain poisoned clients and the pool for recovery. A failed
-                // retirement remains owned by its queue's fail-stop Drop.
-                self.healthy = false;
-                self.concurrent_failure
-                    .store(true, std::sync::atomic::Ordering::Release);
-                self.reads.poison();
-                return result;
-            }
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Some(pool) = &self.live_pool
-            && let Err(error) = pool.shutdown(Instant::now() + self.config.timeout)
-        {
-            result = Err(match result {
-                Ok(()) => LocalDbError::component(error),
-                Err(primary) => LocalDbError::new(format!(
-                    "{primary}; live controller cleanup remains quarantined: {error}",
-                )),
-            });
-        }
-        let started = Instant::now();
-        if result.is_ok() {
-            // Issue all seals before waiting for any; drain every submitted reply.
-            let seals: Vec<_> = self
-                .clients
-                .iter()
-                .map(|client| client.seal(self.epoch))
-                .collect();
-            for seal in seals {
-                let sealed = seal.and_then(receive);
-                if result.is_ok() {
-                    result = sealed;
-                }
-            }
-        }
-        self.shutdown_stats.seal_ns = elapsed(started);
-        if result.is_ok() {
-            result = after_seal(self);
-        }
-        self.stopped = true;
-        let started = Instant::now();
-        let control_clients = if result.is_ok() && self.transport_pool.is_some() {
-            self.clients
-                .iter()
-                .map(|worker| worker.client.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // A failed shutdown can still have a checkpoint holding worker senders.
-        // Join it while the workers can service or reject its pending control.
-        self.background_checkpoint.take();
-        self.clients.clear();
-        self.preparation_pool.take();
-        self.shutdown_stats.join_ns += elapsed(started);
-        if result.is_ok()
-            && let Some((pool, key)) = self.transport_pool.as_ref().zip(self.transport_key)
-        {
-            pool.retain(transports::IdleTransports {
-                key,
-                controls: control_clients,
-                reads: read_clients,
-            });
-        }
-        result
+    pub fn shutdown(&self) -> Result<(), LocalDbError> {
+        self.core.shutdown()
     }
 }
 
@@ -4961,7 +3215,7 @@ fn load_checkpoint(
         config.index_shards,
     )
     .map_err(LocalDbError::component)?;
-    if restored.latest_cut() != image.cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At) {
+    if restored.call_cut() != image.cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At) {
         return Err(LocalDbError::new(
             "checkpoint index does not match exact published cut",
         ));
@@ -5246,10 +3500,38 @@ fn record_write_profile_error(shared: &Mutex<WriteProfileSnapshot>, activation: 
         snapshot.profile_capture_errors += 1;
     }
 }
+/// First causal fail-stop record: the bounded message plus the uncertain
+/// version it names. It is written once, before any failure flag is stored,
+/// so a control wait that observes the flag can report the typed version.
+#[derive(Debug)]
+struct FirstFailure {
+    message: String,
+    version: Option<BatchVersion>,
+}
+
+impl FirstFailure {
+    fn version(&self) -> Option<BatchVersion> {
+        self.version
+    }
+}
+
+impl std::ops::Deref for FirstFailure {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for FirstFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 // Failure-only evidence. No caller data is included, and formatting is capped
 // while writing rather than allocating an unbounded intermediate error string.
 fn record_first_failure(
-    slot: &std::sync::OnceLock<String>,
+    slot: &std::sync::OnceLock<FirstFailure>,
     partition: Option<u32>,
     version: Option<BatchVersion>,
     stage: &'static str,
@@ -5278,11 +3560,14 @@ fn record_first_failure(
         if message.1 {
             message.0.push_str(" [truncated]");
         }
-        let _ = slot.set(message.0);
+        let _ = slot.set(FirstFailure {
+            message: message.0,
+            version,
+        });
     }
 }
 
-fn failure_context(slot: &std::sync::OnceLock<String>, message: &str) -> String {
+fn failure_context(slot: &std::sync::OnceLock<FirstFailure>, message: &str) -> String {
     match slot.get() {
         Some(cause) => format!("{message}; first causal failure: {cause}"),
         None => message.to_owned(),
@@ -5291,7 +3576,7 @@ fn failure_context(slot: &std::sync::OnceLock<String>, message: &str) -> String 
 
 type Pending<T> = mpsc::Receiver<Result<T, LocalDbError>>;
 enum Command {
-    Append(u64, Vec<CompleteBatch>, Reply<Vec<DurableBatch>>),
+    QueueReady,
     Checkpoint(
         u64,
         u64,
@@ -5308,10 +3593,19 @@ enum Command {
     FinishProfile(Reply<()>),
     Control(Box<dyn FnOnce(&mut Client) + Send>),
 }
-fn trace_worker_dequeue(timeline: &WriteTimeline, partition: u32, command: &Command) {
-    if timeline.enabled()
-        && let Command::Append(_, batches, _) = command
-    {
+
+/// Append groups exist only inside their owner worker. The control channel
+/// carries Command, which cannot carry a batch or a per-write reply channel.
+enum WorkerItem {
+    Append(u64, Vec<CompleteBatch>, GroupCompletion),
+    Control(Command),
+}
+fn trace_worker_dequeue(timeline: &WriteTimeline, partition: u32, command: &WorkerItem) {
+    let WorkerItem::Append(_, batches, _) = command else {
+        return;
+    };
+    timeline.wait_leave(WriteWait::OwnerEnqueueToDequeue, batches.len());
+    if timeline.enabled() {
         for batch in batches {
             timeline.batch_event(
                 batch.version(),
@@ -5326,7 +3620,7 @@ fn trace_worker_dequeue(timeline: &WriteTimeline, partition: u32, command: &Comm
 struct ControlHandle {
     #[cfg(any(test, feature = "experimental-fabric"))]
     client: Arc<Mutex<Client>>,
-    sender: std::sync::Weak<mpsc::SyncSender<Command>>,
+    sender: std::sync::Weak<OwnerSender>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     worker_wake: std::sync::Weak<std::os::fd::OwnedFd>,
 }
@@ -5345,8 +3639,7 @@ impl ControlHandle {
         self.sender
             .upgrade()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
-            .send(Command::ReadIoStats(reply))
-            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+            .send(Command::ReadIoStats(reply))?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.wake_worker()?;
         receive(pending)
@@ -5356,8 +3649,7 @@ impl ControlHandle {
         self.sender
             .upgrade()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
-            .send(Command::OwnerTimelineArm(limit, reply))
-            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+            .send(Command::OwnerTimelineArm(limit, reply))?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.wake_worker()?;
         receive(pending)
@@ -5373,8 +3665,7 @@ impl ControlHandle {
         self.sender
             .upgrade()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
-            .send(command)
-            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+            .send(command)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.wake_worker()?;
         receive(pending)
@@ -5385,7 +3676,7 @@ impl ControlHandle {
         operation: impl FnOnce(&mut Client) -> Result<T, super::tcp::TcpError> + Send + 'static,
     ) -> Result<T, LocalDbError> {
         let (reply, pending) = mpsc::sync_channel(1);
-        let mut command = Command::Control(Box::new(move |client| {
+        let command = Command::Control(Box::new(move |client| {
             if Instant::now() < deadline {
                 let _ = reply.send(operation(client).map_err(LocalDbError::component));
             }
@@ -5394,35 +3685,16 @@ impl ControlHandle {
             .sender
             .upgrade()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(LocalDbError::new("owner timeline control deadline expired"));
-            }
-            match sender.try_send(command) {
-                Ok(()) => {
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    self.wake_worker()?;
-                    break;
-                }
-                Err(mpsc::TrySendError::Full(returned)) => {
-                    command = returned;
-                    thread::sleep(
-                        Duration::from_millis(1)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    return Err(LocalDbError::new("TCP worker stopped"));
-                }
-            }
-        }
+        sender.send_until(command, deadline)?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        self.wake_worker()?;
         pending
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|_| LocalDbError::new("owner timeline control deadline expired"))?
     }
 }
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-type LeasedMembers = Vec<(BatchVersion, usize, Reply<Vec<DurableBatch>>)>;
+type LeasedMembers = Vec<(BatchVersion, usize, GroupCompletion)>;
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn release_leased_replies(
@@ -5469,1152 +3741,33 @@ fn signal_worker_wake(fd: &std::os::fd::OwnedFd) -> Result<(), LocalDbError> {
 
 struct ClientWorker {
     client: Arc<Mutex<Client>>,
-    sender: Option<Arc<mpsc::SyncSender<Command>>>,
+    sender: Option<Arc<OwnerSender>>,
     /// The worker owns this fd. Command senders and CQEs add to its counter.
     /// The worker reads it after poll; drop closes it after the queue stops.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     worker_wake: Arc<std::os::fd::OwnedFd>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+    queue: Arc<OwnerQueue>,
+    accounting: Arc<WorkerAccounting>,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    partition: u32,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    test_completion: Option<Arc<write_core::test_completion::TestCompletion>>,
 }
 struct WorkerDiagnostics {
+    timeout: Duration,
     write_profile_limit: usize,
     write_profile: Arc<Mutex<WriteProfileSnapshot>>,
     write_timeline: Arc<WriteTimeline>,
-    first_failure: Arc<std::sync::OnceLock<String>>,
+    first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
     partition: u32,
+    policy: WorkerPolicy,
 }
 impl ClientWorker {
-    fn start(
-        mut client: Client,
-        queue_capacity: usize,
-        wake: mpsc::SyncSender<()>,
-        failure: Arc<std::sync::atomic::AtomicBool>,
-        diagnostics: WorkerDiagnostics,
-    ) -> std::io::Result<Self> {
-        let WorkerDiagnostics {
-            write_profile_limit,
-            write_profile,
-            write_timeline,
-            first_failure,
-            partition,
-        } = diagnostics;
-        client.trace_controls(Arc::clone(&write_timeline), partition);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let worker_wake = {
-            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-            // SAFETY: eventfd has plain value arguments. Check its result before taking ownership.
-            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: fd is a new, valid descriptor and has no other owner.
-            let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-            client.set_worker_wake(fd.as_raw_fd());
-            fd
-        };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let thread_wake = Arc::clone(&worker_wake);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let leased_write_window = client.leased_write_window();
-        let client = Arc::new(Mutex::new(client));
-        let worker_client = Arc::clone(&client);
-        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
-        let thread = thread::Builder::new()
-            .name("value-wal-tcp".into())
-            .spawn(move || {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _thread_wake = thread_wake;
-                let mut write_profile_limit = write_profile_limit;
-                let mut profile_attempted = false;
-                let mut profile_enabled = false;
-                let mut profile_requests = 0usize;
-                let mut checkpoint_samples = 0usize;
-                let mut checkpoint_stalls = 0u64;
-                let mut checkpoint_started: Option<Instant> = None;
-                let mut checkpoint_admission_deadline: Option<Instant> = None;
-                let mut checkpoint_append_completions = 0u64;
-                let mut queued = VecDeque::new();
-                // One fixed-cut proof may wait outside the append FIFO. Later
-                // non-append commands never pass it. Earlier covered appends
-                // have already run; passing appends have later WAL positions.
-                let mut parked_checkpoint: Option<Command> = None;
-                let mut appends: HashMap<u64, (BatchVersion, Reply<Vec<DurableBatch>>)> =
-                    HashMap::new();
-                let mut checkpoint: Option<(
-                    u64,
-                    usize,
-                    Reply<super::tcp::checkpoint::CheckpointProof>,
-                )> = None;
-                let mut position: Option<(u64, u64, Reply<CheckpointPositionProof>)> = None;
-                let mut disconnected = false;
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let mut leased_replies: VecDeque<(u64, LeasedMembers)> =
-                    VecDeque::with_capacity(leased_write_window);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let mut deferred: Option<(u64, Vec<CompleteBatch>, LeasedMembers)> = None;
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let mut released = Vec::with_capacity(leased_write_window);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let prepare_leased_command =
-                    |client: &mut Client,
-                     command: &Command,
-                     released: &mut Vec<(u64, Vec<DurableBatch>)>,
-                     replies: &mut VecDeque<(u64, LeasedMembers)>| {
-                        if !client.live_leased_mode() {
-                            return true;
-                        }
-                        // Acquire observes a fatal checkpoint or another owner's
-                        // failure immediately before dispatching another command.
-                        if failure.load(std::sync::atomic::Ordering::Acquire) {
-                            client.record_live_write_error();
-                            return false;
-                        }
-                        let result = match command {
-                            Command::Checkpoint(..) => {
-                                client.settle_leased_extent(released, Some(&write_timeline))
-                            }
-                            Command::CheckpointPosition(..) => Ok(()),
-                            Command::ReadIoStats(_) => {
-                                client.wait_leased_control(released, Some(&write_timeline))
-                            }
-                            Command::Seal(..) | Command::Control(_) => {
-                                client.close_leased_extent(released, Some(&write_timeline))
-                            }
-                            Command::Stats(_)
-                            | Command::ArmProfile(..)
-                            | Command::OwnerTimelineArm(..)
-                            | Command::FinishProfile(_) => {
-                                client.wait_leased_control(released, Some(&write_timeline))
-                            }
-                            Command::Append(..) => Ok(()),
-                        };
-                        let result =
-                            result.and_then(|()| release_leased_replies(released, replies));
-                        if let Err(error) = result {
-                            client.record_live_write_error();
-                            record_first_failure(
-                                &first_failure,
-                                Some(partition),
-                                None,
-                                "leased_command",
-                                &error,
-                            );
-                            // Release publishes the failure before any queued command runs.
-                            failure.store(true, std::sync::atomic::Ordering::Release);
-                            let _ = wake.try_send(());
-                            return false;
-                        }
-                        true
-                    };
-                loop {
-                    let mut client = worker_client.lock();
-                    while !disconnected && queued.len() < queue_capacity {
-                        match receiver.try_recv() {
-                            Ok(command) => {
-                                trace_worker_dequeue(&write_timeline, partition, &command);
-                                queued.push_back(command);
-                            }
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => disconnected = true,
-                        }
-                    }
-                    write_timeline.owner_queue(
-                        partition,
-                        super::write_timeline::WriteOwnerQueue::WorkerQueued,
-                        queued.len(),
-                    );
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    if client.live_leased_mode() {
-                        write_timeline.owner_queue(
-                            partition,
-                            super::write_timeline::WriteOwnerQueue::LeasedFlights,
-                            client.leased_flights_in_flight(),
-                        );
-                        // Acquire observes authority failure before another control
-                        // exchange or write can be admitted by this worker.
-                        if failure.load(std::sync::atomic::Ordering::Acquire) {
-                            client.record_live_write_error();
-                            break;
-                        }
-                        let mut leased_failure_stage = "live_group";
-                        let result = (|| {
-                            client.progress_leased_flights(&mut released, Some(&write_timeline))?;
-                            let has_released = !released.is_empty();
-                            if let Err(error) =
-                                release_leased_replies(&mut released, &mut leased_replies)
-                            {
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    None,
-                                    "leased_release_order",
-                                    &error,
-                                );
-                                return Err(error);
-                            }
-                            if has_released {
-                                let _ = wake.try_send(());
-                            }
-                            leased_failure_stage = "leased_adoption";
-                            if client.leased_adoption_pending() {
-                                client.progress_appends()?;
-                                client.harvest_leased_adoption()?;
-                            }
-                            if parked_checkpoint.is_none()
-                                && checkpoint.is_none()
-                                && position.is_none()
-                                && matches!(
-                                    queued.front(),
-                                    Some(Command::CheckpointPosition(..) | Command::Checkpoint(..))
-                                )
-                            {
-                                parked_checkpoint = queued.pop_front();
-                            }
-                            if let Some(command) = parked_checkpoint.as_ref() {
-                                let ready = if matches!(command, Command::CheckpointPosition(..)) {
-                                    client.prepare_leased_position()?;
-                                    true
-                                } else {
-                                    !client.leased_adoption_pending()
-                                };
-                                if ready {
-                                    // Fixed through/prefix proofs tolerate later appends:
-                                    // position persistence validates its captured offset;
-                                    // on-disk receipt history retains the exact prefix.
-                                    // Checkpoint still settles its extent before submission.
-                                    queued.push_front(parked_checkpoint.take().unwrap());
-                                }
-                            }
-                            if appends.is_empty()
-                                && checkpoint.is_none()
-                                && parked_checkpoint.is_none()
-                                && matches!(queued.front(), Some(Command::Append(..)) | None)
-                            {
-                                client.submit_leased_adoption()?;
-                            }
-                            Ok::<(), super::tcp::TcpError>(())
-                        })();
-                        if let Err(error) = result {
-                            client.record_live_write_error();
-                            record_first_failure(
-                                &first_failure,
-                                Some(partition),
-                                None,
-                                leased_failure_stage,
-                                &error,
-                            );
-                            // Release publishes the fatal outcome to the authority.
-                            failure.store(true, std::sync::atomic::Ordering::Release);
-                            let _ = wake.try_send(());
-                            break;
-                        }
-                        if checkpoint.is_none()
-                            && position.is_none()
-                            && client.leased_adoption_pending()
-                            && client.leased_flights_in_flight() == 0
-                            && !matches!(
-                                queued.front(),
-                                Some(Command::Append(..) | Command::CheckpointPosition(..))
-                            )
-                        {
-                            // The control slot progresses only on this thread. Do
-                            // not park forever on the command channel or spin on
-                            // an adoption: wake within 1 ms to drive its deadline.
-                            #[cfg(test)]
-                            if !queued.is_empty() {
-                                client.leased_test_note_command_adoption_wait();
-                            }
-                            // A guard regression would wait here with a frame in flight.
-                            #[cfg(test)]
-                            if client.leased_flights_in_flight() != 0 {
-                                client.leased_test_note_flight_adoption_wait();
-                            }
-                            drop(client);
-                            if disconnected || queued.len() == queue_capacity {
-                                // Keep the bounded FIFO intact while a command
-                                // waits for the adoption slot, without a CQ spin.
-                                thread::park_timeout(Duration::from_millis(1));
-                                continue;
-                            }
-                            match receiver.recv_timeout(Duration::from_millis(1)) {
-                                Ok(command) => {
-                                    trace_worker_dequeue(&write_timeline, partition, &command);
-                                    queued.push_back(command);
-                                }
-                                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                                Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
-                            }
-                            continue;
-                        }
-                    }
-
-                    if !disconnected
-                        && queued.is_empty()
-                        && parked_checkpoint.is_none()
-                        && appends.is_empty()
-                        && !client.has_pending_io()
-                        && {
-                            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                            {
-                                client.leased_flights_in_flight() == 0 && deferred.is_none()
-                            }
-                            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                            {
-                                true
-                            }
-                        }
-                    {
-                        drop(client);
-                        match receiver.recv() {
-                            Ok(command) => {
-                                trace_worker_dequeue(&write_timeline, partition, &command);
-                                queued.push_back(command);
-                            }
-                            Err(_) => disconnected = true,
-                        }
-                        continue;
-                    }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    if let Some((epoch, batches, members)) = deferred.take() {
-                        match client.submit_leased_group(
-                            epoch,
-                            batches,
-                            &write_timeline,
-                            partition,
-                            queued.is_empty(),
-                        ) {
-                            Ok(super::tcp::LeasedSubmit::Submitted(id)) => {
-                                leased_replies.push_back((id, members));
-                                if position.is_none() {
-                                    continue;
-                                }
-                            }
-                            Ok(super::tcp::LeasedSubmit::Deferred(batches)) => {
-                                deferred = Some((epoch, batches, members));
-                            }
-                            Err(error) => {
-                                deferred = Some((epoch, Vec::new(), members));
-                                client.record_live_write_error();
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    None,
-                                    "live_group",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                let _ = wake.try_send(());
-                                break;
-                            }
-                        }
-                    }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    if client.leased_flights_in_flight() != 0
-                        && (deferred.is_some()
-                            || !matches!(queued.front(), Some(Command::Append(..)))
-                            || client.leased_flights_in_flight() >= client.leased_write_window())
-                        && !matches!(queued.front(), Some(Command::CheckpointPosition(..)))
-                    {
-                        if let Err(error) = client.wait_leased_flights(true) {
-                            client.record_live_write_error();
-                            record_first_failure(
-                                &first_failure,
-                                Some(partition),
-                                None,
-                                "live_group",
-                                &error,
-                            );
-                            failure.store(true, std::sync::atomic::Ordering::Release);
-                            let _ = wake.try_send(());
-                            break;
-                        }
-                        if position.is_none() {
-                            continue;
-                        }
-                    }
-                    // Merge ready same-epoch appends without crossing a control
-                    // barrier. Reserved writes keep one reservation in flight.
-                    // Leased frames use the configured completion window.
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    if client.live_nvme_configured()
-                        && appends.is_empty()
-                        && checkpoint.is_none()
-                        && (position.is_none() || client.live_leased_mode())
-                        && (!client.live_leased_mode()
-                            || (deferred.is_none()
-                                && client.leased_flights_in_flight()
-                                    < client.leased_write_window()))
-                        && let Some(Command::Append(epoch, _, _)) = queued.front()
-                    {
-                        let epoch = *epoch;
-                        let budget = client.live_group_budget();
-                        let mut take = 0usize;
-                        let mut count = 0usize;
-                        let mut payload = super::tcp::LiveGroupBudget::EMPTY_PAYLOAD;
-                        for command in &queued {
-                            let Command::Append(command_epoch, batches, _) = command else {
-                                break;
-                            };
-                            if *command_epoch != epoch {
-                                break;
-                            }
-                            match budget.extend(count, payload, batches) {
-                                Some((next_count, next_payload)) => {
-                                    let frame = (next_payload + 8 + 4095) & !4095;
-                                    // Harvest a pending prelease in the worker before
-                                    // a boundary write consumes it. This gives the
-                                    // parked proof its first free control turn.
-                                    if (position.is_some() || parked_checkpoint.is_some())
-                                        && client.leased_append_needs_control(Some(frame))
-                                        && client.leased_adoption_pending()
-                                    {
-                                        break;
-                                    }
-                                    count = next_count;
-                                    payload = next_payload;
-                                    take += 1;
-                                }
-                                // The first group is sent alone even if it exceeds the
-                                // budget, so the owner reports the real limit error.
-                                None if take == 0 => {
-                                    if (position.is_none() && parked_checkpoint.is_none())
-                                        || !client.leased_append_needs_control(None)
-                                        || !client.leased_adoption_pending()
-                                    {
-                                        take = 1;
-                                    }
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-                        if take != 0 {
-                            let leased = client.live_leased_mode();
-                            let mut merged = if leased {
-                                Vec::new()
-                            } else {
-                                Vec::with_capacity(count.max(1))
-                            };
-                            let mut members: LeasedMembers = Vec::with_capacity(take);
-                            for _ in 0..take {
-                                let Some(Command::Append(_, batches, reply)) = queued.pop_front()
-                                else {
-                                    unreachable!("append queue front changed");
-                                };
-                                members.push((batches[0].version(), batches.len(), reply));
-                                if leased && merged.is_empty() {
-                                    // Transfer the first command's allocation with its batches.
-                                    merged = batches;
-                                } else {
-                                    merged.extend(batches);
-                                }
-                            }
-                            let first = members[0].0;
-                            if leased {
-                                match client.submit_leased_group(
-                                    epoch,
-                                    merged,
-                                    &write_timeline,
-                                    partition,
-                                    queued.is_empty(),
-                                ) {
-                                    Ok(super::tcp::LeasedSubmit::Submitted(id)) => {
-                                        leased_replies.push_back((id, members));
-                                    }
-                                    Ok(super::tcp::LeasedSubmit::Deferred(batches)) => {
-                                        deferred = Some((epoch, batches, members));
-                                    }
-                                    Err(error) => {
-                                        deferred = Some((epoch, Vec::new(), members));
-                                        client.record_live_write_error();
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            Some(first),
-                                            "live_group",
-                                            &error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                        let _ = wake.try_send(());
-                                        break;
-                                    }
-                                }
-                                if position.is_none() {
-                                    continue;
-                                }
-                            } else {
-                                match client.write_live_group(
-                                    epoch,
-                                    &merged,
-                                    &write_timeline,
-                                    partition,
-                                ) {
-                                    Ok(receipts) => {
-                                        let mut receipts = receipts.into_iter();
-                                        for (_, len, reply) in members.drain(..) {
-                                            let _ = reply
-                                                .send(Ok(receipts.by_ref().take(len).collect()));
-                                        }
-                                    }
-                                    Err(error) => {
-                                        client.record_live_write_error();
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            Some(first),
-                                            "live_group",
-                                            &error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                        for (version, _, reply) in members.drain(..) {
-                                            let _ = reply
-                                                .send(Err(LocalDbError::unknown(version, &error)));
-                                        }
-                                        let _ = wake.try_send(());
-                                        break;
-                                    }
-                                }
-                                let _ = wake.try_send(());
-                            }
-                            // While a proof is pending, also drive its reply/deadline
-                            // after each direct frame. A full append FIFO cannot starve it.
-                            if position.is_none() {
-                                continue;
-                            }
-                        }
-                    }
-
-                    let mut progressed = false;
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    let live_append = client.live_nvme_configured();
-                    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                    let live_append = false;
-                    if let Some(Command::Append(epoch, batches, _)) = queued.front()
-                        && !live_append
-                        && (!profile_enabled || profile_requests < write_profile_limit)
-                    {
-                        if write_profile_limit > 0
-                            && !profile_attempted
-                            && appends.is_empty()
-                            && checkpoint.is_none()
-                            && position.is_none()
-                        {
-                            profile_attempted = true;
-                            match client.connection_profile(true, false) {
-                                Ok(_) => profile_enabled = true,
-                                Err(_) => record_write_profile_error(&write_profile, true),
-                            }
-                        }
-                        let first = batches[0].version();
-                        match client.submit_append_many(*epoch, batches) {
-                            Ok(Some(id)) => {
-                                if write_timeline.enabled() {
-                                    for batch in batches {
-                                        write_timeline.batch_event(
-                                            batch.version(),
-                                            WriteTimelineStage::TxQueued,
-                                            Some(partition),
-                                            Some(id),
-                                        );
-                                    }
-                                }
-                                let Command::Append(_, _, reply) =
-                                    queued.pop_front().expect("front append exists")
-                                else {
-                                    unreachable!("append queue front changed");
-                                };
-                                appends.insert(id, (first, reply));
-                                if profile_enabled {
-                                    profile_requests += 1;
-                                    write_profile.lock().sampled_requests += 1;
-                                }
-                                progressed = true;
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                let Command::Append(_, _, reply) =
-                                    queued.pop_front().expect("front append exists")
-                                else {
-                                    unreachable!("append queue front changed");
-                                };
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    Some(first),
-                                    "append_submit",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                let _ = reply.send(Err(LocalDbError::unknown(first, error)));
-                                let _ = wake.try_send(());
-                                progressed = true;
-                            }
-                        }
-                    }
-                    if checkpoint.is_none()
-                        && parked_checkpoint.is_none()
-                        && position.is_none()
-                        && let Some(Command::Checkpoint(authority, epoch, prefix, _)) =
-                            queued.front()
-                    {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                        if let Some(command) = queued.front()
-                            && !prepare_leased_command(
-                                &mut client,
-                                command,
-                                &mut released,
-                                &mut leased_replies,
-                            )
-                        {
-                            break;
-                        }
-                        let deadline = *checkpoint_admission_deadline
-                            .get_or_insert_with(|| client.checkpoint_deadline());
-                        match client.submit_checkpoint(*authority, *epoch, *prefix, deadline) {
-                            Ok(true) => {
-                                let Command::Checkpoint(_, epoch, prefix, reply) =
-                                    queued.pop_front().expect("front checkpoint exists")
-                                else {
-                                    unreachable!("checkpoint queue front changed");
-                                };
-                                write_timeline.checkpoint(
-                                    "control_submit",
-                                    Some(partition),
-                                    epoch,
-                                    Some(prefix),
-                                );
-                                checkpoint_admission_deadline = None;
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_samples += 1;
-                                    checkpoint_started = Some(Instant::now());
-                                    let mut profile = write_profile.lock();
-                                    profile.checkpoint_requests += 1;
-                                    profile.checkpoint_admission_stalls = profile
-                                        .checkpoint_admission_stalls
-                                        .saturating_add(checkpoint_stalls);
-                                }
-                                checkpoint_stalls = 0;
-                                checkpoint = Some((epoch, prefix, reply));
-                                progressed = true;
-                            }
-                            Ok(false) => {
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_stalls = checkpoint_stalls.saturating_add(1);
-                                }
-                            }
-                            Err(error) => {
-                                let Command::Checkpoint(_, _, _, reply) =
-                                    queued.pop_front().expect("front checkpoint exists")
-                                else {
-                                    unreachable!("checkpoint queue front changed");
-                                };
-                                checkpoint_admission_deadline = None;
-                                checkpoint_stalls = 0;
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    None,
-                                    "checkpoint_submit",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                let _ = reply.send(Err(LocalDbError::component(error)));
-                                let _ = wake.try_send(());
-                                progressed = true;
-                            }
-                        }
-                    }
-
-                    if checkpoint.is_none()
-                        && parked_checkpoint.is_none()
-                        && position.is_none()
-                        && let Some(Command::CheckpointPosition(authority, epoch, through, _)) =
-                            queued.front()
-                    {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                        if let Some(command) = queued.front()
-                            && !prepare_leased_command(
-                                &mut client,
-                                command,
-                                &mut released,
-                                &mut leased_replies,
-                            )
-                        {
-                            break;
-                        }
-                        let deadline = *checkpoint_admission_deadline
-                            .get_or_insert_with(|| client.position_deadline());
-                        match client
-                            .submit_checkpoint_position(*authority, *epoch, *through, deadline)
-                        {
-                            Ok(true) => {
-                                let Some(Command::CheckpointPosition(_, epoch, through, reply)) =
-                                    queued.pop_front()
-                                else {
-                                    unreachable!()
-                                };
-                                write_timeline.checkpoint(
-                                    "control_submit",
-                                    Some(partition),
-                                    epoch,
-                                    None,
-                                );
-                                checkpoint_admission_deadline = None;
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_samples += 1;
-                                    checkpoint_started = Some(Instant::now());
-                                    let mut profile = write_profile.lock();
-                                    profile.checkpoint_requests += 1;
-                                    profile.checkpoint_admission_stalls = profile
-                                        .checkpoint_admission_stalls
-                                        .saturating_add(checkpoint_stalls);
-                                }
-                                checkpoint_stalls = 0;
-                                position = Some((epoch, through, reply));
-                                progressed = true;
-                            }
-                            Ok(false) => {
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_stalls = checkpoint_stalls.saturating_add(1);
-                                }
-                            }
-                            Err(error) => {
-                                let Some(Command::CheckpointPosition(_, _, _, reply)) =
-                                    queued.pop_front()
-                                else {
-                                    unreachable!()
-                                };
-                                checkpoint_admission_deadline = None;
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    None,
-                                    "checkpoint_position_submit",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                let _ = reply.send(Err(LocalDbError::component(error)));
-                                let _ = wake.try_send(());
-                                progressed = true;
-                            }
-                        }
-                    }
-                    if !appends.is_empty() || client.has_pending_io() {
-                        match client.progress_appends() {
-                            Ok(completions) => {
-                                if !completions.is_empty() {
-                                    progressed = true;
-                                }
-                                for completion in completions {
-                                    if checkpoint_started.is_some()
-                                        && appends.contains_key(&completion.id)
-                                    {
-                                        checkpoint_append_completions =
-                                            checkpoint_append_completions.saturating_add(1);
-                                    }
-                                    write_timeline.response(partition, completion.id);
-                                    if let Some((first, reply)) = appends.remove(&completion.id) {
-                                        let result = completion
-                                            .result
-                                            .map_err(|error| LocalDbError::unknown(first, error));
-                                        if let Ok(receipts) = &result {
-                                            write_timeline.wait_enter(
-                                                WriteWait::HarvestToDurable,
-                                                receipts.len(),
-                                            );
-                                        }
-                                        if let Err(error) = &result {
-                                            record_first_failure(
-                                                &first_failure,
-                                                Some(partition),
-                                                Some(first),
-                                                "append_completion",
-                                                error,
-                                            );
-                                            failure
-                                                .store(true, std::sync::atomic::Ordering::Release);
-                                        }
-                                        let wake_count = write_timeline.completion_wake_started();
-                                        let _ = reply.send(result);
-                                        let wake_result = wake.try_send(());
-                                        if let Some(wake_count) = wake_count {
-                                            wake_count.complete(matches!(
-                                                wake_result,
-                                                Err(mpsc::TrySendError::Full(()))
-                                            ));
-                                        }
-                                    }
-                                }
-                                if let Some((epoch, through, _)) = position.as_ref()
-                                    && let Some(result) =
-                                        client.take_checkpoint_position(*epoch, *through)
-                                {
-                                    write_timeline.checkpoint(
-                                        "control_retire",
-                                        Some(partition),
-                                        *epoch,
-                                        None,
-                                    );
-                                    if let Some(started) = checkpoint_started.take() {
-                                        let mut profile = write_profile.lock();
-                                        profile.checkpoint_completed += 1;
-                                        profile.checkpoint_wait_ns = profile
-                                            .checkpoint_wait_ns
-                                            .saturating_add(elapsed(started));
-                                        profile.checkpoint_append_completions = profile
-                                            .checkpoint_append_completions
-                                            .saturating_add(checkpoint_append_completions);
-                                        checkpoint_append_completions = 0;
-                                    }
-                                    let (_, _, reply) = position.take().expect("position exists");
-                                    let result = result.map_err(LocalDbError::component);
-                                    if let Err(error) = &result {
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            None,
-                                            "checkpoint_position_completion",
-                                            error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                    }
-                                    let _ = reply.send(result);
-                                    let _ = wake.try_send(());
-                                    progressed = true;
-                                }
-                                if let Some((epoch, prefix, _)) = checkpoint.as_ref()
-                                    && let Some(result) = client.take_checkpoint(*epoch, *prefix)
-                                {
-                                    write_timeline.checkpoint(
-                                        "control_retire",
-                                        Some(partition),
-                                        *epoch,
-                                        Some(*prefix),
-                                    );
-                                    if let Some(started) = checkpoint_started.take() {
-                                        let mut profile = write_profile.lock();
-                                        profile.checkpoint_completed += 1;
-                                        profile.checkpoint_wait_ns = profile
-                                            .checkpoint_wait_ns
-                                            .saturating_add(elapsed(started));
-                                        profile.checkpoint_append_completions = profile
-                                            .checkpoint_append_completions
-                                            .saturating_add(checkpoint_append_completions);
-                                        checkpoint_append_completions = 0;
-                                    }
-                                    let (_, _, reply) =
-                                        checkpoint.take().expect("checkpoint exists");
-                                    let result = result.map_err(LocalDbError::component);
-                                    if let Err(error) = &result {
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            None,
-                                            "checkpoint_completion",
-                                            error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                    }
-                                    let _ = reply.send(result);
-                                    let _ = wake.try_send(());
-                                    progressed = true;
-                                }
-                            }
-                            Err(error) => {
-                                let first = appends.values().next().map(|(first, _)| *first);
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    first,
-                                    "transport_progress",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                for (_, (first, reply)) in appends.drain() {
-                                    let _ = reply.send(Err(LocalDbError::unknown(first, &error)));
-                                    let _ = wake.try_send(());
-                                }
-                                if let Some(started) = checkpoint_started.take() {
-                                    let mut profile = write_profile.lock();
-                                    profile.checkpoint_completed += 1;
-                                    profile.checkpoint_wait_ns =
-                                        profile.checkpoint_wait_ns.saturating_add(elapsed(started));
-                                    profile.checkpoint_append_completions = profile
-                                        .checkpoint_append_completions
-                                        .saturating_add(checkpoint_append_completions);
-                                }
-                                if let Some((_, _, reply)) = checkpoint.take() {
-                                    let _ = reply.send(Err(LocalDbError::new(error.to_string())));
-                                    let _ = wake.try_send(());
-                                }
-                                if let Some((_, _, reply)) = position.take() {
-                                    let _ = reply.send(Err(LocalDbError::new(error.to_string())));
-                                    let _ = wake.try_send(());
-                                }
-                                let message = error.to_string();
-                                for command in queued.drain(..) {
-                                    match command {
-                                        Command::Append(_, batches, reply) => {
-                                            let first = batches[0].version();
-                                            let _ = reply
-                                                .send(Err(LocalDbError::unknown(first, &message)));
-                                            let _ = wake.try_send(());
-                                        }
-                                        Command::Stats(reply) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        Command::ReadIoStats(reply) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        Command::CheckpointPosition(_, _, _, reply) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        Command::Checkpoint(_, _, _, reply) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        Command::ArmProfile(_, reply)
-                                        | Command::OwnerTimelineArm(_, reply)
-                                        | Command::Seal(_, reply)
-                                        | Command::FinishProfile(reply) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        Command::Control(_) => {}
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    // Acquire observes checkpoint submission/completion failure in
-                    // this pass before profile control, queued commands or close.
-                    if client.live_leased_mode()
-                        && failure.load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        client.record_live_write_error();
-                        break;
-                    }
-
-                    if profile_enabled
-                        && profile_requests >= write_profile_limit
-                        && appends.is_empty()
-                        && checkpoint.is_none()
-                        && position.is_none()
-                    {
-                        match client.connection_profile(false, false) {
-                            Ok(profile) => capture_write_profile(&write_profile, profile),
-                            Err(_) => record_write_profile_error(&write_profile, false),
-                        }
-                        profile_enabled = false;
-                        progressed = true;
-                    }
-
-                    if appends.is_empty()
-                        && checkpoint.is_none()
-                        && position.is_none()
-                        && parked_checkpoint.is_none()
-                    {
-                        match queued.front() {
-                            Some(Command::Stats(_))
-                            | Some(Command::ReadIoStats(_))
-                            | Some(Command::OwnerTimelineArm(_, _))
-                            | Some(Command::Seal(_, _))
-                            | Some(Command::ArmProfile(_, _))
-                            | Some(Command::FinishProfile(_))
-                            | Some(Command::Control(_)) => {
-                                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                                if let Some(command) = queued.front()
-                                    && !prepare_leased_command(
-                                        &mut client,
-                                        command,
-                                        &mut released,
-                                        &mut leased_replies,
-                                    )
-                                {
-                                    break;
-                                }
-                                match queued.pop_front().expect("front control exists") {
-                                    Command::Control(operation) => operation(&mut client),
-                                    Command::Stats(reply) => {
-                                        let _ = reply
-                                            .send(client.stats().map_err(LocalDbError::component));
-                                    }
-                                    Command::OwnerTimelineArm(limit, reply) => {
-                                        let _ = reply.send(
-                                            client
-                                                .owner_timeline_arm(limit)
-                                                .map_err(LocalDbError::component),
-                                        );
-                                    }
-                                    Command::ReadIoStats(reply) => {
-                                        let _ = reply.send(
-                                            client.read_io_stats().map_err(LocalDbError::component),
-                                        );
-                                    }
-                                    Command::Seal(epoch, reply) => {
-                                        let _ = reply.send(
-                                            client.seal(epoch).map_err(LocalDbError::component),
-                                        );
-                                    }
-                                    Command::ArmProfile(limit, reply) => {
-                                        write_profile_limit = limit;
-                                        profile_requests = 0;
-                                        checkpoint_samples = 0;
-                                        checkpoint_stalls = 0;
-                                        profile_attempted = limit != 0;
-                                        let enabled = limit != 0;
-                                        let result = client
-                                            .connection_profile(enabled, true)
-                                            .map(|_| profile_enabled = enabled)
-                                            .map_err(LocalDbError::component);
-                                        if result.is_err() {
-                                            record_write_profile_error(&write_profile, true);
-                                            profile_enabled = false;
-                                        }
-                                        let _ = reply.send(result);
-                                    }
-                                    Command::FinishProfile(reply) => {
-                                        checkpoint_samples = write_profile_limit;
-                                        let result = if profile_enabled {
-                                            match client.connection_profile(false, false) {
-                                                Ok(profile) => {
-                                                    capture_write_profile(&write_profile, profile);
-                                                    profile_enabled = false;
-                                                    Ok(())
-                                                }
-                                                Err(error) => {
-                                                    record_write_profile_error(
-                                                        &write_profile,
-                                                        false,
-                                                    );
-                                                    profile_enabled = false;
-                                                    Err(LocalDbError::component(error))
-                                                }
-                                            }
-                                        } else {
-                                            Ok(())
-                                        };
-                                        let _ = reply.send(result);
-                                    }
-                                    Command::Append(..)
-                                    | Command::Checkpoint(..)
-                                    | Command::CheckpointPosition(..) => unreachable!(),
-                                }
-                                progressed = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if disconnected
-                        && queued.is_empty()
-                        && appends.is_empty()
-                        && checkpoint.is_none()
-                        && position.is_none()
-                        && parked_checkpoint.is_none()
-                    {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                        if client.live_leased_mode()
-                            && let Err(error) =
-                                client.close_leased_extent(&mut released, Some(&write_timeline))
-                        {
-                            client.record_live_write_error();
-                            record_first_failure(
-                                &first_failure,
-                                Some(partition),
-                                None,
-                                "leased_close",
-                                &error,
-                            );
-                            // Release publishes the fatal outcome to the authority.
-                            failure.store(true, std::sync::atomic::Ordering::Release);
-                            let _ = wake.try_send(());
-                        }
-                        break;
-                    }
-                    drop(client);
-                    if !progressed {
-                        thread::yield_now();
-                    }
-                }
-                if let Some((_, _, reply)) = position.take() {
-                    let message =
-                        failure_context(&first_failure, "TCP worker stopped during position proof");
-                    let _ = reply.send(Err(LocalDbError::new(message)));
-                }
-                if let Some((_, _, reply)) = checkpoint.take() {
-                    let message = failure_context(
-                        &first_failure,
-                        "TCP worker stopped during checkpoint proof",
-                    );
-                    let _ = reply.send(Err(LocalDbError::new(message)));
-                }
-                if let Some(command) = parked_checkpoint.take() {
-                    let message = failure_context(
-                        &first_failure,
-                        "TCP worker stopped before proof submission",
-                    );
-                    match command {
-                        Command::CheckpointPosition(_, _, _, reply) => {
-                            let _ = reply.send(Err(LocalDbError::new(message)));
-                        }
-                        Command::Checkpoint(_, _, _, reply) => {
-                            let _ = reply.send(Err(LocalDbError::new(message)));
-                        }
-                        _ => unreachable!("only fixed-cut proofs may be parked"),
-                    }
-                }
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                {
-                    let message = failure_context(
-                        &first_failure,
-                        "leased worker stopped with unknown write outcome",
-                    );
-                    for (_, members) in leased_replies.drain(..) {
-                        for (version, _, reply) in members {
-                            let _ = reply.send(Err(LocalDbError::unknown(version, &message)));
-                        }
-                    }
-                    if let Some((_, _, members)) = deferred.take() {
-                        for (version, _, reply) in members {
-                            let _ = reply.send(Err(LocalDbError::unknown(version, &message)));
-                        }
-                    }
-                    let _ = wake.try_send(());
-                    // Take only ownership under the lock. Terminal DMA drain
-                    // stays on this worker, outside the mutex needed by shutdown.
-                    let failed_writer = worker_client.lock().take_failed_live_writer();
-                    if let Some(mut writer) = failed_writer
-                        && let Err(error) = writer.drain_failed()
-                    {
-                        record_first_failure(
-                            &first_failure,
-                            Some(partition),
-                            None,
-                            "leased_drain",
-                            &error,
-                        );
-                        // Release publishes drain failure without returning DMA.
-                        failure.store(true, std::sync::atomic::Ordering::Release);
-                        let _ = wake.try_send(());
-                    }
-                }
-                // Acquire keeps profile control off a failed authority.
-                if profile_enabled && !failure.load(std::sync::atomic::Ordering::Acquire) {
-                    let mut client = worker_client.lock();
-                    match client.connection_profile(false, false) {
-                        Ok(profile) => capture_write_profile(&write_profile, profile),
-                        Err(_) => record_write_profile_error(&write_profile, false),
-                    }
-                }
-            })?;
-        Ok(Self {
-            client,
-            sender: Some(Arc::new(sender)),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            worker_wake,
-            thread: Some(thread),
-        })
-    }
     fn control_handle(&self) -> ControlHandle {
         ControlHandle {
             #[cfg(any(test, feature = "experimental-fabric"))]
@@ -6639,20 +3792,79 @@ impl ClientWorker {
         self.sender
             .as_ref()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
-            .send(command)
-            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+            .send(command)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         signal_worker_wake(&self.worker_wake)?;
         Ok(())
     }
-    fn append(
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    fn enqueue_batch(&self, batch: CompleteBatch) -> Result<(), LocalDbError> {
+        if self.failure.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LocalDbError::unknown(
+                batch.version(),
+                failure_context(
+                    &self.first_failure,
+                    "TCP worker stopped before queue admission",
+                ),
+            ));
+        }
+        let sequence = batch.version().sequence;
+        let (owner_sequence, _) = self.queue.reserve(|| sequence);
+        if self.queue.ready(owner_sequence, sequence, batch) {
+            let sender = self
+                .sender
+                .as_ref()
+                .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?;
+            match sender.try_send(Command::QueueReady) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(LocalDbError::new("TCP worker lost queue wake"));
+                }
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            signal_worker_wake(&self.worker_wake)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    fn enqueue(
         &self,
         epoch: u64,
         batches: Vec<CompleteBatch>,
     ) -> Result<Pending<Vec<DurableBatch>>, LocalDbError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.send(Command::Append(epoch, batches, tx))?;
-        Ok(rx)
+        if self.failure.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LocalDbError::new(failure_context(
+                &self.first_failure,
+                "TCP worker stopped",
+            )));
+        }
+        let completion = self
+            .test_completion
+            .as_ref()
+            .ok_or_else(|| LocalDbError::new("test completion sink is not installed"))?;
+        if batches.iter().any(|batch| batch.version().epoch != epoch) {
+            return Err(LocalDbError::new("test enqueue crossed writer epochs"));
+        }
+        let receiver = completion.register(&batches).map_err(|error| {
+            LocalDbError::new(failure_context(&self.first_failure, error.message()))
+        })?;
+        for batch in batches {
+            if let Err(error) = self.enqueue_batch(batch) {
+                record_first_failure(
+                    &self.first_failure,
+                    Some(self.partition),
+                    error.uncertain_version,
+                    "test_enqueue",
+                    &error,
+                );
+                self.failure
+                    .store(true, std::sync::atomic::Ordering::Release);
+                completion.failed(self.partition, &[], LocalDbError::new(error.message()));
+                return Err(error);
+            }
+        }
+        Ok(receiver)
     }
     fn stats(&self) -> Result<Pending<PartitionStats>, LocalDbError> {
         let (tx, rx) = mpsc::sync_channel(1);
@@ -6675,14 +3887,28 @@ impl ClientWorker {
         Ok(rx)
     }
 }
+impl ClientWorker {
+    fn stop(&self) -> Result<(), LocalDbError> {
+        if let Some(sender) = &self.sender {
+            sender.close();
+        }
+        let worker = self.thread.lock().take();
+        if let Some(worker) = worker {
+            // The join handle is owned locally; no mutex or allocation-order
+            // guard may remain held while the worker drains and exits.
+            let result = worker
+                .join()
+                .map_err(|_| LocalDbError::new("TCP worker panicked during shutdown"));
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            self.client.lock().clear_worker_wake();
+            result?;
+        }
+        Ok(())
+    }
+}
 impl Drop for ClientWorker {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        self.client.lock().clear_worker_wake();
+        let _ = self.stop();
     }
 }
 fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {
@@ -6708,6 +3934,8 @@ mod position_tests;
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(test)]
+mod legacy_fixture_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

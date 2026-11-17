@@ -188,6 +188,9 @@ pub fn prepare_external_case_with_durability(
                 max_epochs: storage.max_epochs,
                 read_workers,
                 wal_member_read,
+                // Legacy harness behaviour, written explicitly because the owner
+                // default is on. The cloud and local harnesses rebind each case's
+                // owner_wal_prewrite before validating the launch.
                 wal_prewrite: false,
                 read_resident_first,
                 read_memory_allowance_bytes,
@@ -260,7 +263,6 @@ pub fn prepare_external_case_with_durability(
         pipelined_writes: true,
         read_cache_bytes: 8 * 1024 * 1024,
         read_memory_allowance_bytes: 512 * 1024 * 1024,
-        preparation_workers: 2,
         scan_prefetch_pages: 2,
         read_lanes,
         pin_read_lanes: false,
@@ -268,6 +270,7 @@ pub fn prepare_external_case_with_durability(
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
         index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
+        checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
     };
     fs::write(
         directory.join("remote.yaml"),
@@ -970,6 +973,8 @@ impl LoopbackCluster {
                     max_epochs: storage.max_epochs,
                     read_workers: Some(read_workers),
                     wal_member_read,
+                    // No live target here, so no external WAL file exists to
+                    // prewrite; kept explicit as the pre-default behaviour.
                     wal_prewrite: false,
                     read_resident_first,
                     read_memory_allowance_bytes,
@@ -1044,7 +1049,6 @@ impl LoopbackCluster {
             pipelined_writes: true,
             read_cache_bytes: 8 * 1024 * 1024,
             read_memory_allowance_bytes: 512 * 1024 * 1024,
-            preparation_workers: 2,
             scan_prefetch_pages: 2,
             read_lanes: None,
             pin_read_lanes: false,
@@ -1052,6 +1056,7 @@ impl LoopbackCluster {
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,
             index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
+            checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
         };
         // TLS configuration contains only paths, but it must not be presented as
         // a persistent usable credential bundle after the private tempdir closes.

@@ -18,6 +18,7 @@ use crate::distributed::native_index::IndexReadPin;
 use crate::distributed::native_index::NativeIndexScan;
 use std::collections::VecDeque;
 use std::mem::size_of;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 const PAGE_RECORDS: usize = 256;
@@ -160,7 +161,10 @@ impl ConcurrentRemoteDatabase {
             if pending.batch.reads.is_empty() {
                 self.wait_read_admission(generation, pending.batch.deadline)?;
             } else {
-                pending.batch.finish_one().inspect_err(|_| self.poison())?;
+                pending
+                    .batch
+                    .finish_one()
+                    .inspect_err(|error| self.poison(error))?;
             }
         }
         self.ensure_healthy()?;
@@ -173,10 +177,12 @@ impl ConcurrentRemoteDatabase {
                 let mutation =
                     mutation.ok_or_else(|| LocalDbError::new("missing remote scan result"))?;
                 if reference.descriptor.keyspace != ks.0 {
-                    self.poison();
-                    return Err(LocalDbError::new("scan reference has wrong keyspace"));
+                    let error = LocalDbError::new("scan reference has wrong keyspace");
+                    self.poison(&error);
+                    return Err(error);
                 }
-                checked_row(&self.shape, ks, &index_key, mutation).inspect_err(|_| self.poison())
+                checked_row(&self.shape, ks, &index_key, mutation)
+                    .inspect_err(|error| self.poison(error))
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.ensure_healthy()?;
@@ -237,31 +243,48 @@ impl RemoteDatabase {
     /// The returned collection itself is caller-sized, as in the previous API;
     /// only additional prefetch storage has the two-page bound.
     pub fn scan(&mut self, ks: KeySpace) -> Result<Vec<(Bytes, Bytes)>, LocalDbError> {
+        self.scan_with_prefetch(ks, self.core.config.scan_prefetch_pages)
+    }
+
+    /// `prefetch` is the validated page lookahead; one is the serial control.
+    pub(super) fn scan_with_prefetch(
+        &mut self,
+        ks: KeySpace,
+        prefetch: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>, LocalDbError> {
         self.ensure_healthy()?;
-        let cut = self.index.latest_cut();
+        let cut = self.core.index.call_cut();
         // Reject unsupported/invalid keyspace scans before issuing any RPC or
         // poisoning a serving authority for a caller's invalid request.
         let resolve_started = Instant::now();
         let (mut cursor, pin) = {
-            let pin = self.index.pin_cut(cut).map_err(LocalDbError::component)?;
+            let pin = self
+                .core
+                .index
+                .pin_call_cut(cut)
+                .map_err(LocalDbError::component)?;
             let cursor = self
+                .core
                 .index
                 .scan_cursor(ks, None, false, pin.cut())
                 .map_err(LocalDbError::component)?;
             (cursor, pin)
         };
-        self.stats.read_resolve_ns += elapsed(resolve_started);
+        self.core
+            .read_resolve_ns
+            .fetch_add(elapsed(resolve_started), Ordering::Relaxed);
         let first = self.next_scan_page(&mut cursor)?;
         let started = Instant::now();
-        let result = self.scan_prefetched(ks, &mut cursor, first, pin);
-        self.stats.value_read_ns += elapsed(started);
-        if result
-            .as_ref()
-            .is_err_and(|error| !super::pending_read::admission_error(error))
+        let result = self.scan_prefetched(ks, &mut cursor, first, pin, prefetch);
+        self.core
+            .value_read_ns
+            .fetch_add(elapsed(started), Ordering::Relaxed);
+        if let Err(error) = &result
+            && !super::pending_read::admission_error(error)
         {
             // A failed/fenced response cannot be hidden by subsequent cached
             // reads. Already queued immutable reads may finish; no writes occur.
-            self.healthy = false;
+            self.poison(error);
         }
         result
     }
@@ -271,8 +294,10 @@ impl RemoteDatabase {
         cursor: &mut NativeIndexScan,
     ) -> Result<Option<ScanPage>, LocalDbError> {
         let started = Instant::now();
-        let page = ScanPage::next(cursor, &self.index);
-        self.stats.read_resolve_ns += elapsed(started);
+        let page = ScanPage::next(cursor, &self.core.index);
+        self.core
+            .read_resolve_ns
+            .fetch_add(elapsed(started), Ordering::Relaxed);
         page
     }
 
@@ -282,13 +307,14 @@ impl RemoteDatabase {
         cursor: &mut NativeIndexScan,
         first: Option<ScanPage>,
         pin: IndexReadPin,
+        prefetch: usize,
     ) -> Result<Vec<(Bytes, Bytes)>, LocalDbError> {
         let mut ready = first;
         let mut pending: VecDeque<PendingScanPage> = VecDeque::new();
         let mut exhausted = ready.is_none();
         let mut output = Vec::new();
         loop {
-            while pending.len() < self.config.scan_prefetch_pages && !exhausted {
+            while pending.len() < prefetch && !exhausted {
                 // An incompletely admitted page must finish its own waves
                 // before later pages compete for credits it still needs.
                 if pending
@@ -334,21 +360,22 @@ impl RemoteDatabase {
         pin: IndexReadPin,
     ) -> Result<PendingScanPage, LocalDbError> {
         let mut values = vec![None; page.rows.len()];
-        let mut groups = vec![Vec::new(); self.clients.len()];
+        let mut groups = vec![Vec::new(); self.core.clients.len()];
         for (slot, (_, reference)) in page.rows.iter().enumerate() {
-            if let Some(value) = self.read_cache.get_scan(reference) {
+            if let Some(value) = self.core.read_cache.get_scan(reference) {
                 values[slot] = Some(value);
             } else {
                 let node = *self
+                    .core
                     .partition_indexes
                     .get(&reference.batch_address.partition)
                     .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
                 groups[node].push((slot, *reference));
             }
         }
-        let mut batch = super::pending_read::ReadBatch::new_scan(&self.reads, values, groups)?;
+        let mut batch = super::pending_read::ReadBatch::new_scan(&self.core.reads, values, groups)?;
         batch.pin = Some(pin);
-        batch.dispatch(&self.reads)?;
+        batch.dispatch(&self.core.reads)?;
         Ok(PendingScanPage { page, batch })
     }
 
@@ -359,13 +386,13 @@ impl RemoteDatabase {
         output: &mut Vec<(Bytes, Bytes)>,
     ) -> Result<(), LocalDbError> {
         while !pending.batch.complete() {
-            pending.batch.dispatch(&self.reads)?;
+            pending.batch.dispatch(&self.core.reads)?;
             pending.batch.finish_one()?;
         }
         for ((index_key, _), mutation) in pending.page.rows.into_iter().zip(pending.batch.values) {
             let mutation =
                 mutation.ok_or_else(|| LocalDbError::new("missing remote scan result"))?;
-            output.push(checked_row(&self.shape, ks, &index_key, mutation)?);
+            output.push(checked_row(&self.core.shape, ks, &index_key, mutation)?);
         }
         self.ensure_healthy()?;
         // Deliberately no cache fill: a one-pass scan must not evict point reads.
