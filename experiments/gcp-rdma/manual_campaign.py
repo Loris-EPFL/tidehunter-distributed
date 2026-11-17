@@ -88,6 +88,18 @@ REVIEWED_CONTRACT_SPEC = {
              'kvrocks': ['synced', 'page_cache']},
 }
 
+# F2b adds owner RPC TCP and selects intermediate values; F2 stays unchanged.
+REVIEWED_CONTRACT_MID_SPEC = {
+    **copy.deepcopy(REVIEWED_CONTRACT_SPEC), 'value_sizes': [512, 4096],
+    'backends': ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
+                 'tidehunter_nvme_rdma', 'valkey_tcp', 'valkey_rdma', 'kvrocks'],
+    'arms': {**copy.deepcopy(REVIEWED_CONTRACT_SPEC['arms']),
+             'tidehunter_tcp': ['synchronous', 'native']},
+}
+REVIEWED_CONTRACT_MID_SPEC_SHA256 = '19b35bfb072c9e35a14687fbb205433565ba2acf9a05601de198f1664f1ee886'
+REVIEWED_CONTRACT_MID_SEALED_SPEC_SHA256 = '8e20863701b41515dd3c05dd5e6980ccbffacf1b9a037f20588fd88f4276eb7c'
+REVIEWED_CONTRACT_MID_MATRIX_SHA256 = '5966571f1721883d6a0078f2e9d4d924087b2b82e8059709b9026ffe5b43635f'
+
 # Full focused estimate: 4.8892 fleet hours and $123.09 with allowance.
 # It is a planning estimate, not a bound; the full $145 quote is reserved.
 # Matrix digests bind the exact reviewed job order and content.
@@ -365,8 +377,15 @@ def _reviewed_jobs(spec):
         if 'machine_type' not in REVIEWED_SPECS.get(spec.get('selection'), {}):
             spec = {key: value for key, value in spec.items() if key != 'machine_type'}
     if isinstance(spec, dict) and any(_json(spec) == _json(reviewed)
-                                     for reviewed in (REVIEWED_SPEC, REVIEWED_CONTRACT_SPEC)):
-        return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
+                                     for reviewed in (REVIEWED_SPEC, REVIEWED_CONTRACT_SPEC,
+                                                      REVIEWED_CONTRACT_MID_SPEC)):
+        jobs = workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
+        if spec == REVIEWED_CONTRACT_MID_SPEC and (
+                _digest(_json(spec)) != REVIEWED_CONTRACT_MID_SPEC_SHA256
+                or len(jobs) != 182
+                or _digest(_json(jobs)) != REVIEWED_CONTRACT_MID_MATRIX_SHA256):
+            raise ValueError('contract mid matrix differs from the reviewed specification')
+        return jobs
     reviewed = REVIEWED_SPECS.get(spec.get('selection')) if isinstance(spec, dict) else None
     if isinstance(spec, dict) and spec.get('selection') in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
         reviewed = m3_spec(spec.get('owner_hosts'))

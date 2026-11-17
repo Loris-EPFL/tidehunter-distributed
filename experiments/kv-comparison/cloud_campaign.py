@@ -256,8 +256,9 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     if spec["export_reserve_seconds"] >= spec["hard_deadline_seconds"] // 3:
         raise ValueError("export reserve consumes the campaign")
     sizes, backends, rates = spec["value_sizes"], spec["backends"], spec["offered_rates"]
-    if set(sizes) != {64, 256, 1024, 8192, 65536} or len(sizes) != 5:
-        raise ValueError("full campaign requires all five value sizes without duplicates")
+    mid_contract = spec.get("shapes") == "contract_core" and sizes == [512, 4096]
+    if not mid_contract and (set(sizes) != {64, 256, 1024, 8192, 65536} or len(sizes) != 5):
+        raise ValueError("full campaign requires all five value sizes without duplicates; contract_core also accepts [512, 4096]")
     if type(spec.get("spdk_comparison", False)) is not bool:
         raise ValueError("spdk_comparison must be a boolean")
     if type(spec.get("native_durability_cohort", False)) is not bool:
@@ -281,6 +282,7 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
         raise ValueError("shapes must be contract_core")
     if "arms" in spec:
         allowed = {
+            "tidehunter_tcp": ("synchronous", "native"),
             "tidehunter_verbs_native": ("synchronous", "native"),
             "tidehunter_nvme_rdma": ("synchronous", "native"),
             "native": ("value_wal_barrier", "page_cache"),
@@ -324,6 +326,8 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
             raise ValueError("contract_core requires a standard campaign")
         base = {key: value for key, value in spec.items() if key not in ("shapes", "arms")}
         base.update(mode="standard", max_cases=2000, spdk_comparison=False, native_durability_cohort=False)
+        if mid_contract:
+            base["value_sizes"] = [64, 256, 1024, 8192, 65536]
         sources = make_matrix(base, _allow_live_nvme=_allow_live_nvme or spec.get("mode") == "standard-with-live-nvmeof")
         return _contract_core_matrix(spec, sources)
     if spec.get("mode") in ("standard-with-nvmeof", "standard-with-live-nvmeof"):
@@ -536,6 +540,7 @@ def _contract_core_matrix(spec, sources):
         live_settings.update(owner_count=5, history_persistence="wal_replay",
                              live_lease_ahead=True, live_polled_writes=False)
     jobs = []
+    selected_sizes = spec["value_sizes"] if spec["value_sizes"] == [512, 4096] else [1024, 65536]
     for source in sources:
         if (source["cohort"] != "primary_rf1" or source["value_size"] not in (1024, 65536)
                 or source["profile"] not in ("write-concurrent", "read-concurrent")):
@@ -543,9 +548,12 @@ def _contract_core_matrix(spec, sources):
         writing = source["profile"] == "write-concurrent"
         shapes = [copy.deepcopy(source), {**copy.deepcopy(source),
                   "profile": "write-c1" if writing else "read-c1", "concurrency": 1}]
+        for shape in shapes:
+            shape["value_size"] = selected_sizes[(1024, 65536).index(source["value_size"])]
         if writing and source["value_size"] == 1024 and source["repeat"] == 0:
             shapes.append({**copy.deepcopy(source), "profile": "write-sustained",
                            "measurement_operations": 200000})
+            shapes[-1]["value_size"] = selected_sizes[0]
         backend = source["backend"]
         # A Tidehunter source already carries the spec's tier (make_matrix stamped it).
         default = source["durability_tier"] if backend in TRANSPORTS else (
