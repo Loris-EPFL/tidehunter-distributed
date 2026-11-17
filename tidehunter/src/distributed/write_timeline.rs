@@ -15,31 +15,29 @@ const MAX_EVENTS: usize = 32;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WriteBlockStage {
     AdmissionCredit,
-    ReplyCreditRelease,
+    Allocate,
     IdentityLookup,
     AdmissionIndexLock,
     PublicationIndexLock,
-    AppendSend,
-    Progress,
-    OrderedAdmission,
+    Encode,
+    OwnerQueue,
+    PublishLock,
+    Publish,
     Checkpoint,
     Snapshot,
-    CreditReleaseLock,
-    CreditNotify,
 }
-const BLOCK_STAGES: [WriteBlockStage; 12] = [
+const BLOCK_STAGES: [WriteBlockStage; 11] = [
     WriteBlockStage::AdmissionCredit,
-    WriteBlockStage::ReplyCreditRelease,
+    WriteBlockStage::Allocate,
     WriteBlockStage::IdentityLookup,
     WriteBlockStage::AdmissionIndexLock,
     WriteBlockStage::PublicationIndexLock,
-    WriteBlockStage::AppendSend,
-    WriteBlockStage::Progress,
-    WriteBlockStage::OrderedAdmission,
+    WriteBlockStage::Encode,
+    WriteBlockStage::OwnerQueue,
+    WriteBlockStage::PublishLock,
+    WriteBlockStage::Publish,
     WriteBlockStage::Checkpoint,
     WriteBlockStage::Snapshot,
-    WriteBlockStage::CreditReleaseLock,
-    WriteBlockStage::CreditNotify,
 ];
 const BLOCK_BUCKETS: usize = 64;
 
@@ -106,14 +104,10 @@ impl BlockCounters {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WriteOwnerQueue {
-    AuthorityStaged,
-    AuthorityOutstanding,
     WorkerQueued,
     LeasedFlights,
 }
-const OWNER_QUEUES: [WriteOwnerQueue; 4] = [
-    WriteOwnerQueue::AuthorityStaged,
-    WriteOwnerQueue::AuthorityOutstanding,
+const OWNER_QUEUES: [WriteOwnerQueue; 2] = [
     WriteOwnerQueue::WorkerQueued,
     WriteOwnerQueue::LeasedFlights,
 ];
@@ -206,18 +200,21 @@ impl OwnerCounters {
 /// Exact local batch counts for the three coordinator write waits.
 ///
 /// Observations count entries. Depth is the number of batches inside the wait
-/// window, sampled at entry including the new batch. W1 includes blocked command
-/// senders, not just mpsc occupancy. W2 counts staged batches before append
-/// enqueue. W3 counts successful receipt batches harvested before durable
-/// observation. W1 and W3 wakes count actual command and completion hint
-/// `try_send` calls. A full hint channel counts as coalesced; a disconnected
-/// channel does not. W2 has no wake call and its wake counts stay zero.
+/// window, sampled at entry including the new batch. W1 counts owner-queue
+/// READY entries until the owner worker dequeues them into a group. W2 counts
+/// caller-allocated batches until the caller marks them READY in their owner
+/// queue (validation-free encode and handoff). W3 counts successful owner-RPC
+/// receipt batches harvested by the worker until its publication callback.
+/// Wake attempts count handoffs to the consuming thread: one per W1 READY entry
+/// and one per W3 harvested completion. A handoff is coalesced when it sent no
+/// new hint: the W1 worker was not parked (it rechecks its queue before parking)
+/// or its bounded `QueueReady` channel was full; W3 publication runs on the
+/// harvesting worker, so every W3 handoff is coalesced. W2 has no handoff and
+/// its wake counts stay zero.
 ///
 /// No durations or clocks are collected. Counters saturate at `u64::MAX` and
 /// set `saturated` when any counter reaches that cap. Storage has a fixed size.
-/// `complete` is false if a trailing completion-hint count is still pending at
-/// export. Deadline-based finish drains those counts within its existing
-/// deadline. This drain does not extend or fail the write timeline capture.
+/// `complete` is always true: no wake count is deferred past export.
 #[derive(Debug, Serialize)]
 pub struct WriteWaitMetrics {
     pub enabled: bool,
@@ -258,7 +255,6 @@ struct WaitCounters {
 struct WriteWaitCounters {
     windows: [WaitCounters; 3],
     saturated: AtomicBool,
-    active_wakes: AtomicU64,
 }
 
 impl WriteWaitCounters {
@@ -292,7 +288,7 @@ impl WriteWaitCounters {
     }
 
     fn snapshot(&self) -> WriteWaitMetrics {
-        let complete = self.active_wakes.load(Ordering::Acquire) == 0;
+        let complete = true; // No wake count is deferred past export.
         let names = [
             "owner_enqueue_to_dequeue",
             "admitted_to_append_enqueue",
@@ -314,29 +310,6 @@ impl WriteWaitCounters {
                 }
             }),
         }
-    }
-}
-
-/// Keeps a harvested completion's hint count inside the armed export.
-/// Each append worker can hold at most one guard, so the count is worker-bounded.
-pub(crate) struct CompletionWake<'a> {
-    counters: &'a WriteWaitCounters,
-}
-
-impl CompletionWake<'_> {
-    pub(crate) fn complete(self, coalesced: bool) {
-        let window = &self.counters.windows[WriteWait::HarvestToDurable as usize];
-        self.counters.add(&window.wake_attempts, 1);
-        if coalesced {
-            self.counters.add(&window.wake_coalesced, 1);
-        }
-    }
-}
-
-impl Drop for CompletionWake<'_> {
-    fn drop(&mut self) {
-        // Publish the final hint counts before the finalizer observes zero.
-        self.counters.active_wakes.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -656,9 +629,6 @@ impl WriteTimeline {
             session.take();
         }
         if limit != 0 {
-            if self.waits.active_wakes.load(Ordering::Acquire) != 0 {
-                return Err("write wait completion hint is still active");
-            }
             let generation = self
                 .generation
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -762,28 +732,6 @@ impl WriteTimeline {
         }
     }
 
-    #[inline]
-    pub(crate) fn completion_wake_started(&self) -> Option<CompletionWake<'_>> {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return None;
-        }
-        // Only the guard lifetime is counted here. Reply channels carry write data.
-        self.waits.active_wakes.fetch_add(1, Ordering::Relaxed);
-        Some(CompletionWake {
-            counters: &self.waits,
-        })
-    }
-
-    fn drain_completion_wakes_until(&self, deadline: Instant) -> bool {
-        // Acquire pairs with each guard's release of its final hint counts.
-        while self.waits.active_wakes.load(Ordering::Acquire) != 0 {
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::yield_now();
-        }
-        true
-    }
     pub fn set_owner_records(
         &self,
         records: Vec<OwnerTimelineRecord>,
@@ -842,10 +790,7 @@ impl WriteTimeline {
             session.export.deadline_exceeded = true;
             session.export.owner_storage_durations_available = false;
         }
-        // Do not turn a metrics-only drain timeout into a timeline failure.
-        let complete = self.drain_completion_wakes_until(deadline);
         session.export.write_wait_metrics = self.waits.snapshot();
-        session.export.write_wait_metrics.complete = complete;
         session.export.blocking_spans = self.blocks.snapshot();
         self.snapshot_sampling(&mut session.export);
         session.export.owner_diagnostics =
@@ -944,17 +889,6 @@ impl WriteTimeline {
         {
             record.operation = Some(operation);
             s.operations.insert(operation, sample.index);
-        }
-    }
-    pub fn operation_event(&self, operation: [u8; 16], stage: WriteTimelineStage) {
-        if !self.enabled() {
-            return;
-        }
-        let mut guard = self.session.lock();
-        if let Some(s) = guard.as_mut()
-            && let Some(&index) = s.operations.get(&operation)
-        {
-            Self::push(s, index, stage, None, None);
         }
     }
     pub(crate) fn control_event(
@@ -1060,18 +994,6 @@ impl WriteTimeline {
         {
             s.export.records[index].batch = Some(version);
             s.versions.insert(version, index);
-        }
-    }
-    pub fn forget_version(&self, operation: [u8; 16], version: BatchVersion) {
-        if !self.enabled() {
-            return;
-        }
-        let mut guard = self.session.lock();
-        if let Some(s) = guard.as_mut()
-            && let Some(&index) = s.operations.get(&operation)
-            && s.versions.get(&version) == Some(&index)
-        {
-            s.versions.remove(&version);
         }
     }
     pub fn event(&self, sample: WriteTimelineSample, stage: WriteTimelineStage) {
@@ -1347,8 +1269,6 @@ mod tests {
         timeline.wait_enter(WriteWait::OwnerEnqueueToDequeue, 2);
         timeline.wait_leave(WriteWait::OwnerEnqueueToDequeue, 1);
         timeline.wait_wake(WriteWait::OwnerEnqueueToDequeue, true);
-        assert!(timeline.completion_wake_started().is_none());
-        assert_eq!(timeline.waits.active_wakes.load(Ordering::Relaxed), 0);
         assert_eq!(window.depth.load(Ordering::Relaxed), 9);
         let snapshot = timeline.waits.snapshot();
         let row = &snapshot.windows[0];
@@ -1460,79 +1380,6 @@ mod tests {
         let next = timeline.finish().unwrap();
         assert_eq!(next.write_wait_metrics.windows[0].observations, 0);
         assert_eq!(next.write_wait_metrics.windows[0].wake_attempts, 0);
-    }
-
-    fn no_owner_records() -> OwnerTimelineCollection {
-        OwnerTimelineCollection {
-            records: Vec::new(),
-            dropped: 0,
-            incomplete: 0,
-            expected: 0,
-            captured: 0,
-            errors: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn finish_drains_the_armed_hint_after_recording_is_disabled() {
-        let timeline = WriteTimeline::default();
-        timeline.arm(1, 1).unwrap();
-        let wake = timeline.completion_wake_started().unwrap();
-        std::thread::scope(|scope| {
-            let finish = scope.spawn(|| {
-                timeline
-                    .finish_with_owner_until(
-                        Instant::now() + std::time::Duration::from_secs(5),
-                        no_owner_records(),
-                    )
-                    .unwrap()
-            });
-            let deadline = Instant::now() + std::time::Duration::from_secs(5);
-            while timeline.enabled() && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            assert!(!timeline.enabled(), "finalizer did not stop recording");
-            wake.complete(true);
-            let export = finish.join().unwrap();
-            assert!(export.write_wait_metrics.complete);
-            let row = &export.write_wait_metrics.windows[2];
-            assert_eq!(row.wake_attempts, 1);
-            assert_eq!(row.wake_coalesced, 1);
-        });
-    }
-
-    #[test]
-    fn pending_hint_at_deadline_is_incomplete_and_blocks_rearm_until_drop() {
-        let timeline = WriteTimeline::default();
-        timeline.arm(1, 1).unwrap();
-        let wake = timeline.completion_wake_started().unwrap();
-        let export = timeline
-            .finish_with_owner_until(
-                Instant::now() + std::time::Duration::from_millis(20),
-                no_owner_records(),
-            )
-            .unwrap();
-        assert!(!export.write_wait_metrics.complete);
-        assert_eq!(export.write_wait_metrics.windows[2].wake_attempts, 0);
-        assert!(timeline.arm(1, 1).is_err());
-        wake.complete(false);
-        timeline.arm(1, 1).unwrap();
-        let next = timeline.finish().unwrap();
-        assert!(next.write_wait_metrics.complete);
-        assert_eq!(next.write_wait_metrics.windows[2].wake_attempts, 0);
-    }
-
-    #[test]
-    fn dropped_hint_guard_does_not_invent_a_wake_or_hold_the_next_arm() {
-        let timeline = WriteTimeline::default();
-        timeline.arm(1, 1).unwrap();
-        let wake = timeline.completion_wake_started().unwrap();
-        drop(wake);
-        let export = timeline.finish().unwrap();
-        assert!(export.write_wait_metrics.complete);
-        assert_eq!(export.write_wait_metrics.windows[2].wake_attempts, 0);
-        timeline.arm(1, 1).unwrap();
-        assert!(timeline.finish().unwrap().write_wait_metrics.complete);
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1768,7 +1615,7 @@ mod block_tests {
         let timeline = WriteTimeline::default();
         assert!(timeline.block_started().is_none());
         timeline.arm(1, 1).unwrap();
-        timeline.block_finished(WriteBlockStage::AppendSend, timeline.block_started(), 7);
+        timeline.block_finished(WriteBlockStage::OwnerQueue, timeline.block_started(), 7);
         let export = timeline.finish().unwrap();
         assert_eq!(export.blocking_spans.len(), 1);
         assert_eq!(export.blocking_spans[0].calls, 1);
@@ -1776,7 +1623,7 @@ mod block_tests {
         assert!(timeline.block_started().is_none());
         timeline.arm(1, 1).unwrap();
         timeline.blocks.origin_ns.store(0, Ordering::Relaxed);
-        timeline.block_finished(WriteBlockStage::Progress, timeline.block_started(), 128);
+        timeline.block_finished(WriteBlockStage::Publish, timeline.block_started(), 128);
         let export = timeline.finish().unwrap();
         assert_eq!(export.blocking_spans.len(), 1);
         assert_eq!(export.blocking_spans[0].second, BLOCK_BUCKETS - 1);

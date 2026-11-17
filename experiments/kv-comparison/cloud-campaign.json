@@ -11,5 +11,6 @@
   "case_deadline_seconds": 600,
   "hard_deadline_seconds": 10800,
   "export_reserve_seconds": 600,
+  "durability_tier": "synchronous",
   "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256}
 }

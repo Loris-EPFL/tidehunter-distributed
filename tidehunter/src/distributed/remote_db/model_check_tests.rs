@@ -527,6 +527,7 @@ fn write_child(directory: &Path, case: &Case) {
     };
     let readers = Readers::new(&fixture.config, &fixture.shape, original.epoch());
     let clients: Vec<_> = original
+        .core
         .clients
         .iter()
         .map(|worker| worker.client.clone())
@@ -547,7 +548,7 @@ fn write_child(directory: &Path, case: &Case) {
         readers
     };
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let live_metrics = original.live_metrics.clone();
+    let live_metrics = original.core.live_metrics.clone();
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let recorder = Recorder::open(&directory.join("history.jsonl"));
     write_call(&db, &recorder, case, &operations, &plan, baseline);

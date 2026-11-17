@@ -549,14 +549,15 @@ impl LiveTargetManager {
         Ok(())
     }
 
-    pub(super) fn spdk_fence(&mut self, group: Option<[u8; 16]>) -> io::Result<()> {
+    pub(super) fn spdk_fence(&mut self, groups: Option<&[[u8; 16]]>) -> io::Result<()> {
         let exports: Vec<_> = self
             .state
             .exports
             .iter()
-            .filter(|e| group.is_none_or(|g| e.binding.uuid == g))
+            .filter(|e| groups.is_none_or(|g| g.contains(&e.binding.uuid)))
             .cloned()
             .collect();
+        let mut sealed = false;
         for export in exports {
             match export.spdk_phase {
                 Some(Phase::Active) => {
@@ -583,18 +584,23 @@ impl LiveTargetManager {
             }
             if !export.readonly {
                 self.write_sealed(&export.file)?;
+                sealed = true;
             }
+        }
+        // One barrier makes every marker durable before cleanup retires its export.
+        if sealed {
+            self.sealed_directory.sync_all()?;
         }
         Ok(())
     }
 
-    pub(super) fn spdk_cleanup(&mut self, group: Option<[u8; 16]>) -> io::Result<()> {
-        self.spdk_fence(group)?;
+    pub(super) fn spdk_cleanup(&mut self, groups: Option<&[[u8; 16]]>) -> io::Result<()> {
+        self.spdk_fence(groups)?;
         let exports: Vec<_> = self
             .state
             .exports
             .iter()
-            .filter(|e| group.is_none_or(|g| e.binding.uuid == g))
+            .filter(|e| groups.is_none_or(|g| g.contains(&e.binding.uuid)))
             .cloned()
             .collect();
         for export in exports {

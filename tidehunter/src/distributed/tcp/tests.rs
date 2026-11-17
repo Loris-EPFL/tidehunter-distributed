@@ -12,6 +12,19 @@ pub(in crate::distributed::tcp) mod multiplexed;
 mod wal_replay;
 
 #[test]
+fn default_owner_limits_admit_an_automatic_coordinator_and_its_reopen() {
+    use crate::distributed::remote_db::RemoteDatabaseConfig;
+    let limits = TcpLimits::default();
+    limits.validate().unwrap();
+    // A coordinator that omits `read_lanes` sizes its lanes from the host up to the cap;
+    // default owner limits must admit two such session sets.
+    assert!(
+        limits.max_connections
+            >= RemoteDatabaseConfig::generated_owner_connection_limit(None).unwrap()
+    );
+}
+
+#[test]
 fn production_wire_variant_tags_do_not_depend_on_features() {
     fn tag(value: &impl Serialize) -> u32 {
         let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(value).unwrap();
@@ -173,6 +186,7 @@ pub(super) fn config(root: &Path) -> NodeConfig {
         },
         read_workers: Some(2),
         wal_member_read: Default::default(),
+        // Shared fixture keeps fallocated, unwritten WAL extents; prewrite tests opt in.
         wal_prewrite: false,
         read_resident_first: false,
         read_memory_allowance_bytes: default_read_memory_allowance_bytes(),
@@ -1507,17 +1521,24 @@ fn memory_only_owner_rpc_accepts_4096_puts_and_checkpoint() {
 }
 
 #[test]
-fn node_wal_prewrite_defaults_off_and_round_trips() {
+fn node_wal_prewrite_defaults_on_and_is_always_serialized() {
     let temp = tempdir::TempDir::new("node-wal-prewrite").unwrap();
     let config = config(temp.path());
+    for enabled in [false, true] {
+        let mut explicit = config.clone();
+        explicit.wal_prewrite = enabled;
+        explicit.validate().unwrap();
+        let value = serde_yaml::to_value(&explicit).unwrap();
+        // Both values are written, so no reader relies on the default.
+        assert_eq!(value["wal_prewrite"].as_bool(), Some(enabled));
+        let restored: NodeConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(restored.wal_prewrite, enabled);
+    }
     let mut value = serde_yaml::to_value(&config).unwrap();
     value.as_mapping_mut().unwrap().remove("wal_prewrite");
     let restored: NodeConfig = serde_yaml::from_value(value).unwrap();
-    assert!(!restored.wal_prewrite);
-    let mut enabled = restored;
-    enabled.wal_prewrite = true;
-    enabled.validate().unwrap();
-    let restored: NodeConfig =
-        serde_yaml::from_str(&serde_yaml::to_string(&enabled).unwrap()).unwrap();
-    assert!(restored.wal_prewrite);
+    assert!(
+        restored.wal_prewrite,
+        "an absent key is the prewrite default"
+    );
 }

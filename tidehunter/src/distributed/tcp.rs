@@ -162,8 +162,10 @@ pub struct NodeConfig {
     pub read_workers: Option<usize>,
     #[serde(default = "default_async_read_policy")]
     pub wal_member_read: super::storage::WalMemberReadPolicy,
-    /// Write and sync zeros across each external WAL file before it is usable.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Write and sync zeros across each external WAL file before it is usable,
+    /// so live writes never convert unwritten extents. On by default and always
+    /// serialized: an absent key means on, and opting out requires `false`.
+    #[serde(default = "default_wal_prewrite")]
     pub wal_prewrite: bool,
     /// Opt-in NOWAIT prefix reads; compare with forced-async on the target host.
     #[serde(default)]
@@ -241,6 +243,9 @@ impl NodeConfig {
     }
 }
 
+fn default_wal_prewrite() -> bool {
+    true
+}
 fn default_async_read_policy() -> super::storage::WalMemberReadPolicy {
     super::storage::WalMemberReadPolicy::Async
 }
@@ -316,7 +321,12 @@ impl Default for TcpLimits {
     fn default() -> Self {
         Self {
             max_frame_bytes: 16 * 1024 * 1024,
-            max_connections: 16,
+            // Two automatic coordinator session sets (MAX_AUTO_READ_LANES read lanes plus the
+            // append/control and operational connections each), so a coordinator that omits
+            // `read_lanes` can open, and reopen while old sessions drain, against default limits.
+            max_connections: 2
+                * (super::remote_db::RemoteDatabaseConfig::MAX_AUTO_READ_LANES
+                    + super::remote_db::RemoteDatabaseConfig::NON_READ_CONNECTIONS),
             max_reads: 256,
             recovery_page_batches: 128,
             io_timeout: Duration::from_secs(10),
@@ -1679,6 +1689,16 @@ impl Client {
     /// The node's authenticated policy, adopted by ordinary read/control drivers.
     pub fn polling_policy(&self) -> PollingPolicy {
         self.polling
+    }
+
+    /// Outstanding transport groups, distinct from worker-local queued groups.
+    #[cfg(test)]
+    pub(crate) fn append_flights_in_flight(&self) -> usize {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_leased_mode() {
+            return self.leased_flights_in_flight();
+        }
+        self.reactor.pending_append_count()
     }
 
     /// Prime/replace one session-local deterministic diagnostic buffer. No WAL

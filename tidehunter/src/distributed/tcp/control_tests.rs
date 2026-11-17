@@ -89,6 +89,34 @@ fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
     assert_eq!(log.stats().persistence_barriers, 1);
 }
 
+/// A reply is the last effect of an admitted command, so its holder must see
+/// the admission released on every completion path: an exclusive control and
+/// a failed command (worker), a native append (worker hand-off) and a
+/// synchronous append (flusher). Final target teardown relies on this.
+#[test]
+fn reply_follows_admission_release_on_every_completion_path() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let temp = tempdir::TempDir::new("control-reply-after-release").unwrap();
+        let config = config(&temp.path().join("node"));
+        let node = StorageNode::open(config.clone(), metrics()).unwrap();
+        node.set_durability(DurabilityConfig::with_tier(tier))
+            .unwrap();
+        node.inventory.lock().fence_to(1).unwrap();
+        let (completed, completions) = mpsc::sync_channel(1);
+        let requests = [
+            (append_request(&config, 1, 0), true),
+            (Request::Fence { epoch: 2 }, true),
+            // Epoch 1 is fenced now, so this append fails in the worker.
+            (append_request(&config, 1, 1), false),
+        ];
+        for (id, (request, succeeds)) in (1..).zip(requests) {
+            assert!(command(&node, id, request, 4096, &completed).is_ok());
+            assert_eq!(receive(&completions, id).response.is_ok(), succeeds);
+            assert_eq!(node.control.pending_requests_for_test(), 0);
+        }
+    }
+}
+
 #[test]
 fn appender_services_next_group_while_captured_persistence_is_paused() {
     let temp = tempdir::TempDir::new("control-captured-prefix").unwrap();
@@ -741,6 +769,26 @@ mod live_fencing {
     use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
     use std::os::unix::fs::FileExt;
 
+    /// Block until at most `streams` stream slots are active, or 5 s pass, and
+    /// return the queue guard so the caller asserts on that same snapshot.
+    /// `Slot::drop` decrements the count and calls `ready.notify_all()` under
+    /// the queue lock, so this predicate wait cannot miss the release. A
+    /// waiter here could absorb the `notify_one` that `try_submit` meant for a
+    /// worker; forwarding a `notify_all` on exit hands that wakeup back.
+    fn wait_active_streams_at_most(
+        node: &StorageNode,
+        streams: usize,
+    ) -> parking_lot::MutexGuard<'_, Queue> {
+        let shared = &node.control.shared;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut queue = shared.queue.lock();
+        while queue.active_appends > streams
+            && !shared.ready.wait_until(&mut queue, deadline).timed_out()
+        {}
+        shared.ready.notify_all();
+        queue
+    }
+
     // Exercise the actual WAL/control lifecycle with the existing journal-only
     // target fixture. This is not evidence of kernel namespace I/O drain.
     fn open_live(root: &std::path::Path, tier: DurabilityTier) -> (NodeConfig, Arc<StorageNode>) {
@@ -752,7 +800,15 @@ mod live_fencing {
         tier: DurabilityTier,
         mode: LiveExportMode,
     ) -> (NodeConfig, Arc<StorageNode>) {
-        let mut config = config(&root.join("node"));
+        open_live_with(root, tier, mode, config(&root.join("node")))
+    }
+
+    fn open_live_with(
+        root: &std::path::Path,
+        tier: DurabilityTier,
+        mode: LiveExportMode,
+        mut config: NodeConfig,
+    ) -> (NodeConfig, Arc<StorageNode>) {
         // A complete 4 KiB live group stays below the native fragment trigger.
         config.partition.fragment_bytes = 16 * 1024;
         config.partition.wal_file_bytes = 32 * 1024;
@@ -788,6 +844,57 @@ mod live_fencing {
             inventory.fence_to(1).unwrap();
         }
         (config, node)
+    }
+
+    /// Lease the first live extent and return its whole WAL file.
+    fn leased_wal_file(node: &StorageNode) -> (fs::File, u64) {
+        let Response::LiveLeased(leased) =
+            extent_exchange(node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected lease")
+        };
+        let segment = &leased.extent.segment;
+        (fs::File::open(&segment.path).unwrap(), segment.bytes)
+    }
+
+    #[test]
+    fn default_owner_grants_prewritten_files_without_unwritten_extents() {
+        let temp = tempdir::TempDir::new("default-owner-prewrite").unwrap();
+        // An owner launch that omits the key gets the default.
+        let mut value = serde_yaml::to_value(config(&temp.path().join("node"))).unwrap();
+        value.as_mapping_mut().unwrap().remove("wal_prewrite");
+        let default = serde_yaml::from_value(value).unwrap();
+        let (config, node) = open_live_with(
+            temp.path(),
+            DurabilityTier::Synchronous,
+            LiveExportMode::OnDemand,
+            default,
+        );
+        assert!(config.wal_prewrite);
+        let (file, bytes) = leased_wal_file(&node);
+        crate::wal::fiemap::assert_written_extents(&file, bytes);
+        assert!(node.wal_prewrite_stats().0 >= bytes);
+    }
+
+    #[test]
+    fn explicit_false_owner_grants_files_with_unwritten_extents() {
+        let temp = tempdir::TempDir::new("explicit-false-owner-prewrite").unwrap();
+        let mut explicit = config(&temp.path().join("node"));
+        explicit.wal_prewrite = false;
+        let (_, node) = open_live_with(
+            temp.path(),
+            DurabilityTier::Synchronous,
+            LiveExportMode::OnDemand,
+            explicit,
+        );
+        let (file, bytes) = leased_wal_file(&node);
+        assert!(
+            crate::wal::fiemap::extents(&file, bytes)
+                .iter()
+                .any(|&(_, _, unwritten)| unwritten),
+            "an opted-out owner must keep fallocated extents unwritten"
+        );
+        assert_eq!(node.wal_prewrite_stats(), (0, 0, 0));
     }
 
     #[test]
@@ -2383,6 +2490,10 @@ mod live_fencing {
             ) else {
                 panic!("expected preleased extent")
             };
+            // The lease replies can precede their slot releases (see
+            // `wait_active_streams_at_most`). Start from an idle stream count
+            // so the close/resolver count below is exact.
+            assert_eq!(wait_active_streams_at_most(&node, 0).active_appends, 0);
             let mut reference = None;
             for (sequence, extent) in [(0, &first.extent), (1, &next.extent)] {
                 let group = CompleteGroup::new_live(
@@ -2470,8 +2581,14 @@ mod live_fencing {
                 Response::LiveAdopted(_)
             ));
             {
-                let queue = node.control.shared.queue.lock();
+                // `run` sends a command's completion before that worker's
+                // `Slot` binding drops, so the close reply alone does not
+                // order the close slot's release before this read. Wait for
+                // the release event itself; the paused resolver keeps one
+                // slot, so the exact count below is still the contract.
+                let queue = wait_active_streams_at_most(&node, 1);
                 assert_eq!(queue.active_appends, 1);
+                assert!(!queue.control_active);
                 assert!(queue.work.iter().any(|work| work.id == 3));
             }
             drop(log);

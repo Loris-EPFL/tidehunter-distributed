@@ -1878,14 +1878,27 @@ def live_target_for_owner(config, case, index, transport, host_nqn, target="kern
     return result
 
 
+def case_owner_wal_prewrite(job):
+    """The case's owner WAL prewrite choice. A case that does not set it keeps the
+    legacy owner behaviour (off), so historical selections reproduce exactly; new
+    selections that want prewritten owners must set owner_wal_prewrite: true."""
+    value = job.get("owner_wal_prewrite", False)
+    if type(value) is not bool:
+        raise SafetyError("owner_wal_prewrite must be boolean")
+    return value
+
+
 def bind_owner_wal_prewrite(job, launch):
-    if "owner_wal_prewrite" in job:
-        if type(job["owner_wal_prewrite"]) is not bool:
-            raise SafetyError("owner_wal_prewrite must be boolean")
-        if job["owner_wal_prewrite"]:
-            launch["node"]["wal_prewrite"] = True
-        else:
-            launch["node"].pop("wal_prewrite", None)
+    """Write the case's choice as an explicit boolean: owners read an absent key as on."""
+    launch["node"]["wal_prewrite"] = case_owner_wal_prewrite(job)
+
+
+def load_owner_launch(job, launch_path):
+    """Read a prepared owner launch and bind the case's WAL prewrite choice before any validation."""
+    import yaml
+    launch = yaml.safe_load(Path(launch_path).read_text())
+    bind_owner_wal_prewrite(job, launch)
+    return launch
 
 
 def validate_launch(config, launch, case, index, polling=None):
@@ -1902,13 +1915,11 @@ def validate_launch(config, launch, case, index, polling=None):
         raise SafetyError("typed database root escapes exact case/node")
     guarded(node / "storage", root)
     job = case_owner_job(config, case)
-    if "owner_wal_prewrite" in job:
-        expected_prewrite = job["owner_wal_prewrite"]
-        actual_prewrite = launch.get("node", {}).get("wal_prewrite", False)
-        if (type(expected_prewrite) is not bool or type(actual_prewrite) is not bool
-                or actual_prewrite != expected_prewrite
-                or not expected_prewrite and "wal_prewrite" in launch.get("node", {})):
-            raise SafetyError("owner wal_prewrite differs from the exact reviewed case")
+    actual_prewrite = launch.get("node", {}).get("wal_prewrite")
+    if type(actual_prewrite) is not bool:
+        raise SafetyError("owner launch must carry an explicit boolean wal_prewrite")
+    if "owner_wal_prewrite" in job and actual_prewrite != case_owner_wal_prewrite(job):
+        raise SafetyError("owner wal_prewrite differs from the exact reviewed case")
     live_target = launch.get("node", {}).get("live_target")
     if live_target is not None:
         if not isinstance(live_target, dict):
@@ -3763,7 +3774,7 @@ class Controller:
             target.chmod(0o600)
         def start(index):
             launch_path = prepared / f"node-{index}" / "launch.yaml"
-            launch = yaml.safe_load(launch_path.read_text())
+            launch = load_owner_launch(job, launch_path)
             if job.get("nvmeof_route") == "live" and job.get("nvmeof_target") == "spdk":
                 validate_launch(self.config, launch, case, index, polling)
                 nqn = owner_identities.get(str(index), {}).get("host_nqn", host_nqn)
@@ -3781,7 +3792,6 @@ class Controller:
                     raise SafetyError("prepared live target is missing or differs from selected transport")
             elif launch.get("node", {}).get("live_target") is not None:
                 raise SafetyError("unexpected live target in non-live campaign case")
-            bind_owner_wal_prewrite(job, launch)
             launch["launch_nonce"] = nonces[index] = secrets.token_hex(16)
             launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
             files = {"launch.yaml": launch_path}

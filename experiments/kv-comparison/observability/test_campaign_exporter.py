@@ -1132,7 +1132,7 @@ class CaseIdentityTests(unittest.TestCase):
         value["profile"]["coordinator_interval"] = {
             "scope": "measurement_boundary_cumulative_delta",
             "clock_scope": "separate full measurement interval",
-            "stages": {"write_concurrent_completed": 4096, "write_publication_ns": 9000000000}}
+            "stages": {"write_concurrent_admitted": 4096, "write_publication_ns": 9000000000}}
         text = campaign.write_diagnostic_metrics(value, {})
         self.assertIn('component="stages",stage="transport_267_ns"} 267.0', text)
         self.assertIn('component="coordinator_interval",stage="write_publication_ns"} 9.0', text)
@@ -1153,14 +1153,14 @@ class CaseIdentityTests(unittest.TestCase):
             "scope": "measurement_boundary_cumulative_delta",
             "clock_scope": "coordinator counters before release through completion gate",
             "stages": {"write_storage_wait_ns": 2000000000, "write_publication_ns": 300000000,
-                       "write_checkpoint_count": 4, "write_concurrent_completed": 100,
+                       "write_checkpoint_count": 4, "write_concurrent_admitted": 100,
                        "write_out_of_prefix_published_batches": 3, "write_dependency_wait_batches": 2}}
         text = campaign.write_diagnostic_metrics(value, {})
         boundary = ('phase="measurement",scope="measurement_boundary_cumulative_delta",'
                     'diagnostic_backend="native",component="coordinator_interval"')
         self.assertIn('stage_seconds{' + boundary + ',stage="write_storage_wait_ns"} 2.0', text)
         self.assertIn('stage_count{' + boundary + ',counter="write_checkpoint_count"} 4', text)
-        self.assertIn('stage_count{' + boundary + ',counter="write_concurrent_completed"} 100', text)
+        self.assertIn('stage_count{' + boundary + ',counter="write_concurrent_admitted"} 100', text)
         self.assertIn('stage_count{' + boundary + ',counter="write_out_of_prefix_published_batches"} 3', text)
         self.assertIn('stage_count{' + boundary + ',counter="write_dependency_wait_batches"} 2', text)
         self.assertNotIn('component="stages"', text)
