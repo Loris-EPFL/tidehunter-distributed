@@ -48,8 +48,8 @@ mod shards;
 mod snapshot;
 mod writer;
 pub use retention::IndexReadPin;
-pub(crate) use retention::PublicationViewReservation;
 use retention::{CaptureLease, RetentionState, position, view_charge};
+pub(crate) use retention::{PublicationViewReservation, StandingViewBudget};
 use shards::{Accounting, Cells, PublicationHistogram};
 pub use shards::{
     DEFAULT_INDEX_SHARDS, IndexShardLoad, IndexShardStats, MAX_INDEX_SHARDS,
@@ -90,6 +90,8 @@ pub struct SparseIndexView {
     excluded: Vec<BatchVersion>,
     retention: std::sync::Arc<RetentionState>,
     charge: usize,
+    /// Bytes owned by the standing budget, not by `charge`; zero otherwise.
+    uncharged: usize,
 }
 
 impl PartialEq for SparseIndexView {
@@ -104,7 +106,16 @@ impl Eq for SparseIndexView {}
 
 impl Drop for SparseIndexView {
     fn drop(&mut self) {
-        self.retention.release_view(self.floor, self.charge);
+        self.retention
+            .release_view(self.floor, self.charge, self.uncharged);
+    }
+}
+
+#[cfg(test)]
+impl SparseIndexView {
+    /// Test observation of the installed view: (upper, floor, excluded).
+    pub(crate) fn parts(&self) -> (MutationVersion, Option<MutationVersion>, &[BatchVersion]) {
+        (self.upper, self.floor, &self.excluded)
     }
 }
 
@@ -180,6 +191,9 @@ pub struct NativeIndexStats {
     /// Frozen capture plus sparse views and their reservations. Capture and view
     /// allowances are independently bounded, so the sum can reach twice the budget.
     pub transient_metadata_bytes: usize,
+    /// Replaced standing-budget sparse views still held by readers. Not part of
+    /// either budget; bounded by the concurrent reads and lasting one read.
+    pub reader_held_view_bytes: usize,
 }
 
 impl NativeIndexStats {
@@ -577,6 +591,7 @@ impl NativeIndex {
             retained_versions: self.accounting.retained_versions(),
             charged_metadata_bytes: self.resident_bytes(),
             transient_metadata_bytes: self.transient_bytes(),
+            reader_held_view_bytes: self.reader_held_view_bytes(),
             ..NativeIndexStats::default()
         }
     }

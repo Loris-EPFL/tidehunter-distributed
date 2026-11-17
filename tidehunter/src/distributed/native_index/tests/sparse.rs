@@ -269,44 +269,86 @@ fn publication_reservations_are_bounded_and_released() {
     assert_eq!(index.stats().transient_metadata_bytes, 0);
 }
 
+/// The standing budget is the only view quota: with nothing else left, every
+/// replacement install succeeds, reader-held replaced views add no charge,
+/// and the reserved total stays twice the worst-case view charge.
 #[test]
-fn publication_reservation_growth_is_preflighted_and_never_shrinks() {
+fn standing_budget_replacements_take_no_quota_and_stay_constant() {
     let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    let foreign = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    let charge = NativeIndex::publication_view_charge(1).unwrap();
-    index.max_metadata_bytes = charge * 2;
-    let mut first = index.reserve_publication_view(0).unwrap();
-    let mut second = index.reserve_publication_view(0).unwrap();
-    assert_eq!(index.stats().transient_metadata_bytes, 0);
-    let additional = first.additional_charge(1).unwrap() + second.additional_charge(1).unwrap();
-    assert_eq!(additional, charge * 2);
+    let upper = match cut(3, 0) {
+        IndexReadCut::At(version) => version,
+        _ => unreachable!(),
+    };
+    index.writer.lock().latest = Some(upper);
+    let budget = index.reserve_standing_view_budget(2).unwrap();
+    let charge = index.stats().transient_metadata_bytes;
+    assert_eq!(charge, 2 * view_charge(2).unwrap());
+    index.max_metadata_bytes = charge;
     assert!(matches!(
-        index.check_publication_view_capacity(additional + 1),
+        index.reserve_publication_view(1),
         Err(NativeIndexError::Capacity)
     ));
-    assert_eq!(index.stats().transient_metadata_bytes, 0);
-    index.check_publication_view_capacity(additional).unwrap();
+    let view = view_charge(2).unwrap();
+    let mut readers = Vec::new();
+    for round in 0..8u64 {
+        let mut excluded = Vec::with_capacity(2);
+        excluded.push(BatchVersion {
+            epoch: EPOCH,
+            sequence: 1 + round % 2,
+        });
+        index
+            .writer()
+            .install_standing_live_view(upper, IndexReadCut::BeforeAll, excluded, &budget)
+            .unwrap();
+        let installed = index.latest_cut();
+        assert!(matches!(installed, IndexReadCut::Sparse(_)));
+        readers.push(installed);
+        assert_eq!(index.stats().transient_metadata_bytes, charge);
+        // Every earlier view is replaced and still held by `readers`.
+        let held = usize::try_from(round).unwrap() * view;
+        assert_eq!(index.stats().reader_held_view_bytes, held);
+    }
+    let installed = index.latest_cut();
+    let mut oversized = Vec::with_capacity(3);
+    oversized.push(BatchVersion {
+        epoch: EPOCH,
+        sequence: 1,
+    });
     assert!(matches!(
-        foreign.grow_publication_view(&mut first, 1),
+        index.writer().install_standing_live_view(
+            upper,
+            IndexReadCut::BeforeAll,
+            oversized,
+            &budget
+        ),
         Err(NativeIndexError::Invalid(_))
     ));
-    index.grow_publication_view(&mut first, 1).unwrap();
-    index.grow_publication_view(&mut second, 1).unwrap();
-    assert_eq!(index.stats().transient_metadata_bytes, charge * 2);
+    let foreign = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    let foreign_budget = foreign.reserve_standing_view_budget(2).unwrap();
     assert!(matches!(
-        index.grow_publication_view(&mut first, 2),
-        Err(NativeIndexError::Capacity)
+        index.writer().install_standing_live_view(
+            upper,
+            IndexReadCut::BeforeAll,
+            vec![BatchVersion {
+                epoch: EPOCH,
+                sequence: 1,
+            }],
+            &foreign_budget
+        ),
+        Err(NativeIndexError::Invalid(_))
     ));
-    assert_eq!(first.additional_charge(1).unwrap(), 0);
-    index.grow_publication_view(&mut first, 0).unwrap();
-    assert_eq!(index.stats().transient_metadata_bytes, charge * 2);
-    drop(second);
-    index.grow_publication_view(&mut first, 2).unwrap();
-    assert_eq!(
-        index.stats().transient_metadata_bytes,
-        NativeIndex::publication_view_charge(2).unwrap()
-    );
-    drop(first);
+    assert_eq!(index.latest_cut(), installed);
+    drop(installed);
+    index
+        .writer()
+        .install_standing_live_view(upper, IndexReadCut::BeforeAll, vec![], &budget)
+        .unwrap();
+    assert_eq!(index.latest_cut(), IndexReadCut::At(upper));
+    assert_eq!(index.stats().reader_held_view_bytes, 8 * view);
+    drop(readers);
+    assert_eq!(index.stats().transient_metadata_bytes, charge);
+    assert_eq!(index.stats().reader_held_view_bytes, 0);
+    drop(budget);
     assert_eq!(index.stats().transient_metadata_bytes, 0);
 }
 
@@ -339,6 +381,8 @@ fn reserved_view_conversion_keeps_frozen_clones_charged_until_last_drop() {
         .install_live_view(upper, IndexReadCut::BeforeAll, vec![])
         .unwrap();
     assert_eq!(index.stats().transient_metadata_bytes, charged);
+    // A charged replaced view is inside the budget, not reader-held extra.
+    assert_eq!(index.stats().reader_held_view_bytes, 0);
     drop(frozen);
     assert_eq!(index.stats().transient_metadata_bytes, charged);
     drop(clone);

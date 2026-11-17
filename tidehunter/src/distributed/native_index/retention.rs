@@ -85,6 +85,9 @@ struct Cold {
     transient_bytes: usize,
     view_bytes: usize,
     reserved_view_bytes: usize,
+    /// Live standing-budget sparse views (installed or reader-held). Their
+    /// bytes are not in `view_bytes`: the standing budget owns them.
+    uncharged_view_bytes: usize,
     /// Sparse views pin their stable floor like a reader pin.
     view_pins: BTreeMap<Option<MutationVersion>, usize>,
     active: bool,
@@ -211,7 +214,12 @@ impl RetentionState {
         }
     }
 
-    pub(super) fn release_view(&self, key: Option<MutationVersion>, charge: usize) {
+    pub(super) fn release_view(
+        &self,
+        key: Option<MutationVersion>,
+        charge: usize,
+        uncharged: usize,
+    ) {
         let mut cold = self.cold.lock();
         let count = cold
             .view_pins
@@ -222,6 +230,7 @@ impl RetentionState {
             cold.view_pins.remove(&key);
         }
         cold.view_bytes -= charge;
+        cold.uncharged_view_bytes -= uncharged;
     }
 
     #[cfg(test)]
@@ -286,14 +295,6 @@ pub(crate) struct PublicationViewReservation {
 }
 
 impl PublicationViewReservation {
-    /// Additional quota needed to support this exclusion capacity, without shrinking.
-    pub(crate) fn additional_charge(&self, max_excluded: usize) -> Result<usize, NativeIndexError> {
-        if max_excluded <= self.max_excluded {
-            return Ok(0);
-        }
-        Ok(view_charge(max_excluded)? - self.charge)
-    }
-
     pub(super) fn max_excluded(&self) -> usize {
         self.max_excluded
     }
@@ -320,6 +321,44 @@ impl Drop for PublicationViewReservation {
     }
 }
 
+/// The constant sparse-view quota of the one serialized publisher, reserved
+/// once at open. It covers the installed view and the replacement being built
+/// beside it (two views at the worst-case size), so a standing install takes no
+/// quota and cannot fail on view capacity after its batches are durable. Views
+/// installed from it carry no own charge: replacing one returns its share to
+/// this budget at the store, not when the last reader-held clone drops. Such a
+/// clone keeps only its retention floor pin. Dropping the budget releases it.
+///
+/// Bound on the memory outside `max_index_bytes`: replaced views still held by
+/// readers are not charged. Extra memory <= (distinct replaced views still
+/// held by readers) x `view_charge(max_pending_batches - 1)`. The concurrent
+/// read limit bounds the number of such views, and each lasts one read.
+/// `NativeIndexStats::reader_held_view_bytes` reports the current amount.
+#[derive(Debug)]
+pub(crate) struct StandingViewBudget {
+    retention: Arc<RetentionState>,
+    charge: usize,
+    max_excluded: usize,
+}
+
+impl StandingViewBudget {
+    pub(super) fn max_excluded(&self) -> usize {
+        self.max_excluded
+    }
+
+    pub(super) fn belongs_to(&self, retention: &Arc<RetentionState>) -> bool {
+        Arc::ptr_eq(&self.retention, retention)
+    }
+}
+
+impl Drop for StandingViewBudget {
+    fn drop(&mut self) {
+        if self.charge != 0 {
+            self.retention.cold.lock().reserved_view_bytes -= self.charge;
+        }
+    }
+}
+
 pub(super) fn view_charge(capacity: usize) -> Result<usize, NativeIndexError> {
     if capacity == 0 {
         return Ok(0);
@@ -336,61 +375,38 @@ pub(super) fn view_charge(capacity: usize) -> Result<usize, NativeIndexError> {
 }
 
 impl NativeIndex {
-    pub(crate) fn publication_view_charge(max_excluded: usize) -> Result<usize, NativeIndexError> {
-        view_charge(max_excluded)
-    }
-
-    /// Callers that preflight and then upgrade several reservations hold the
-    /// index writer across both steps, which serializes them against other
-    /// reservers on the owner. Each step is itself atomic under `cold`.
-    pub(crate) fn check_publication_view_capacity(
-        &self,
-        additional_bytes: usize,
-    ) -> Result<(), NativeIndexError> {
-        let cold = self.retention.cold.lock();
-        let total = cold
-            .view_bytes
-            .checked_add(cold.reserved_view_bytes)
-            .and_then(|n| n.checked_add(additional_bytes))
-            .ok_or(NativeIndexError::Capacity)?;
-        if total > self.max_metadata_bytes {
-            return Err(NativeIndexError::Capacity);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn grow_publication_view(
-        &self,
-        reservation: &mut PublicationViewReservation,
-        max_excluded: usize,
-    ) -> Result<(), NativeIndexError> {
-        if !reservation.belongs_to(&self.retention) {
-            return Err(NativeIndexError::Invalid(
-                "foreign publication view reservation",
-            ));
-        }
-        let additional = reservation.additional_charge(max_excluded)?;
-        let mut cold = self.retention.cold.lock();
-        let total = cold
-            .view_bytes
-            .checked_add(cold.reserved_view_bytes)
-            .and_then(|n| n.checked_add(additional))
-            .ok_or(NativeIndexError::Capacity)?;
-        if total > self.max_metadata_bytes {
-            return Err(NativeIndexError::Capacity);
-        }
-        cold.reserved_view_bytes += additional;
-        reservation.charge += additional;
-        reservation.max_excluded = reservation.max_excluded.max(max_excluded);
-        Ok(())
-    }
-
     /// Reserve the worst-case sparse view before any irreversible publication.
     pub(crate) fn reserve_publication_view(
         &self,
         max_excluded: usize,
     ) -> Result<PublicationViewReservation, NativeIndexError> {
         let charge = view_charge(max_excluded)?;
+        self.reserve_view_bytes(charge)?;
+        Ok(PublicationViewReservation {
+            retention: Arc::clone(&self.retention),
+            charge,
+            max_excluded,
+        })
+    }
+
+    /// Reserve the publisher's constant view quota: the installed view plus
+    /// its replacement, each with `max_excluded` exclusions.
+    pub(crate) fn reserve_standing_view_budget(
+        &self,
+        max_excluded: usize,
+    ) -> Result<StandingViewBudget, NativeIndexError> {
+        let charge = view_charge(max_excluded)?
+            .checked_mul(2)
+            .ok_or(NativeIndexError::Capacity)?;
+        self.reserve_view_bytes(charge)?;
+        Ok(StandingViewBudget {
+            retention: Arc::clone(&self.retention),
+            charge,
+            max_excluded,
+        })
+    }
+
+    fn reserve_view_bytes(&self, charge: usize) -> Result<(), NativeIndexError> {
         let mut cold = self.retention.cold.lock();
         let total = cold
             .view_bytes
@@ -401,28 +417,31 @@ impl NativeIndex {
             return Err(NativeIndexError::Capacity);
         }
         cold.reserved_view_bytes += charge;
-        Ok(PublicationViewReservation {
-            retention: Arc::clone(&self.retention),
-            charge,
-            max_excluded,
-        })
+        Ok(())
     }
 
-    /// Check a sparse view against its reservation and move its quota from
-    /// reserved to allocated. Called by the writer; the view pins its floor.
+    /// Validate a sparse view's floor under the retention lock and pin it.
+    /// A per-call reservation moves its quota from reserved to allocated
+    /// (`charge`); a standing-budget view has `charge` 0 and reports its bytes
+    /// as `uncharged`. Called by the writer.
     pub(super) fn register_live_view(
         &self,
         stable_floor: &IndexReadCut,
         charge: usize,
-        reservation: &mut PublicationViewReservation,
+        uncharged: usize,
+        reservation: Option<&mut PublicationViewReservation>,
+        sparse: bool,
     ) -> Result<(), NativeIndexError> {
         let key = position(stable_floor);
         let mut cold = self.retention.cold.lock();
         self.retention.validate(stable_floor)?;
-        cold.reserved_view_bytes -= reservation.charge();
-        reservation.consume();
-        if charge != 0 {
+        if let Some(reservation) = reservation {
+            cold.reserved_view_bytes -= reservation.charge();
+            reservation.consume();
+        }
+        if sparse {
             cold.view_bytes += charge;
+            cold.uncharged_view_bytes += uncharged;
             *cold.view_pins.entry(key).or_default() += 1;
         }
         Ok(())
@@ -564,6 +583,26 @@ impl NativeIndex {
         cold.transient_bytes
             .saturating_add(cold.view_bytes)
             .saturating_add(cold.reserved_view_bytes)
+    }
+
+    /// Bytes of standing-budget views that were replaced but are still held by
+    /// readers; not charged to the budget. Sampled without the writer: the
+    /// view being installed counts for the instant between its registration
+    /// and the watermark store.
+    pub(super) fn reader_held_view_bytes(&self) -> usize {
+        // Drop the watermark guard before the cold lock: it can own the last
+        // reference to a replaced view, whose drop takes the cold lock.
+        let installed = match &**self.published.load() {
+            IndexReadCut::Sparse(view) => view.uncharged,
+            _ => 0,
+        };
+        // Saturating: the installed view can be replaced and dropped between
+        // the load and the lock.
+        self.retention
+            .cold
+            .lock()
+            .uncharged_view_bytes
+            .saturating_sub(installed)
     }
 }
 
