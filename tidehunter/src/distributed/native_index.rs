@@ -44,12 +44,22 @@ use std::path::Path;
 use typenum::U32;
 
 mod cell_contract;
+mod cell_flush;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
 use cell_contract::cell_flushers;
 pub(crate) use cell_contract::{CellRootHeader, PrefixCut};
+// The crate-visible option C flush API for the flusher stage (remote_db). The
+// expectation fails once that stage uses every item, forcing its removal.
+use cell_flush::CellFlushState;
+#[expect(unused_imports, reason = "used by the cell flusher stage")]
+pub(crate) use cell_flush::{
+    CELL_FLIGHTS_PER_FLUSHER, CellCapture, CellCaptureOutcome, CellDirty, CellEncodeSource,
+    CellFlushPermit, CellFlushResult, CellInstall, CellRetired, CellSkip, NewCellBase,
+    PreparedCell, ROOT_DESCRIPTOR_SLICE, RootCellDescriptor, SourceTotals,
+};
 pub use retention::IndexReadPin;
 use retention::{CaptureLease, RetentionState, position, view_charge};
 pub(crate) use retention::{PublicationViewReservation, StandingViewBudget};
@@ -191,8 +201,9 @@ pub struct NativeIndexStats {
     pub pending_operations: usize,
     /// Resident dirty-reference, key and cell-directory charge; not process RSS.
     pub charged_metadata_bytes: usize,
-    /// Frozen capture plus sparse views and their reservations. Capture and view
-    /// allowances are independently bounded, so the sum can reach twice the budget.
+    /// Frozen capture, sparse views and their reservations, and cell flush
+    /// permits. The capture, view and cell flush allowances are independently
+    /// bounded, so the sum can reach three times the budget.
     pub transient_metadata_bytes: usize,
     /// Replaced standing-budget sparse views still held by readers. Not part of
     /// either budget; bounded by the concurrent reads and lasting one read.
@@ -213,10 +224,14 @@ impl NativeIndexStats {
 #[derive(Default)]
 struct CellIndex {
     pending: PendingTable<ValueRecordReference>,
+    /// Active overlay: new publications.
     overlay: Overlay<ValueRecordReference>,
+    /// Exact mode: the generation frozen by a global capture.
     sealed: Option<std::sync::Arc<Overlay<ValueRecordReference>>>,
     generation: u64,
     base: Option<SortedBlock>,
+    /// Option C: carry, flight, coverage and dirty totals. See `cell_flush`.
+    flush: CellFlushState,
 }
 
 /// One database's native-routed cells with typed logical versions and locations.
@@ -240,6 +255,8 @@ pub struct NativeIndex {
     accounting: Accounting,
     publication_shards: PublicationHistogram,
     retention: std::sync::Arc<RetentionState>,
+    /// Set by promotion: a coalesced cell-flush maintenance hint.
+    cell_dirty: std::sync::atomic::AtomicBool,
 }
 
 /// Digest of the exact durable CRC-framed image, usable by its manifest owner.
@@ -487,6 +504,7 @@ impl NativeIndex {
             accounting: Accounting::default(),
             publication_shards: PublicationHistogram::default(),
             retention: RetentionState::new(),
+            cell_dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -782,13 +800,11 @@ impl NativeIndex {
             for ((_, cell_id), cell) in shard.get_mut().iter() {
                 directory += cell_directory_charge(cell_id);
                 versions += cell
-                    .overlay
-                    .values()
-                    .map(|values| values.len())
-                    .sum::<usize>()
-                    + cell.sealed.as_ref().map_or(0, |sealed| {
-                        sealed.values().map(|values| values.len()).sum::<usize>()
-                    });
+                    .overlays()
+                    .into_iter()
+                    .flatten()
+                    .map(|overlay| overlay.values().map(|values| values.len()).sum::<usize>())
+                    .sum::<usize>();
                 if let Some(block) = &cell.base {
                     if !block.mapped {
                         loaded += block.bytes.len();
@@ -842,22 +858,19 @@ impl NativeIndex {
         };
         self.shards.iter().any(|shard| {
             shard.read().values().any(|cell| {
-                cell.overlay
-                    .values()
-                    .any(|values| values.iter().any(&references))
-                    || cell.sealed.as_ref().is_some_and(|sealed| {
-                        sealed.values().any(|values| values.iter().any(&references))
-                    })
-                    || cell.base.as_ref().is_some_and(|block| {
-                        (0..block.count).any(|n| {
-                            block.entry(n).1.chunks_exact(REFERENCE_BYTES).any(|bytes| {
-                                references(
-                                    &decode_reference(bytes)
-                                        .expect("validated immutable reference"),
-                                )
-                            })
+                cell.overlays().into_iter().flatten().any(|overlay| {
+                    overlay
+                        .values()
+                        .any(|values| values.iter().any(&references))
+                }) || cell.base.as_ref().is_some_and(|block| {
+                    (0..block.count).any(|n| {
+                        block.entry(n).1.chunks_exact(REFERENCE_BYTES).any(|bytes| {
+                            references(
+                                &decode_reference(bytes).expect("validated immutable reference"),
+                            )
                         })
                     })
+                })
             })
         })
     }
@@ -1006,6 +1019,20 @@ impl CellIndex {
         }
     }
 
+    /// Every overlay read source: active, the exact sealed generation, and
+    /// the option C carry and flight sources. Versions are distinct across
+    /// sources; readers merge them by logical version under the shard lock.
+    fn overlays(&self) -> [Option<&Overlay<ValueRecordReference>>; 5] {
+        let [carry, flight_carry, flight_active] = self.flush.sources();
+        [
+            Some(&self.overlay),
+            self.sealed.as_deref(),
+            carry,
+            flight_carry,
+            flight_active,
+        ]
+    }
+
     fn exact(&self, key: &[u8], version: MutationVersion) -> Option<ValueRecordReference> {
         let selected = self.get(key, &IndexReadCut::At(version));
         selected.filter(|reference| reference.mutation_version() == version)
@@ -1020,10 +1047,11 @@ impl CellIndex {
                     .copied()
             })
         };
-        let overlay = newest(
-            selected(&self.overlay),
-            self.sealed.as_deref().and_then(selected),
-        );
+        let overlay = self
+            .overlays()
+            .into_iter()
+            .flatten()
+            .fold(None, |newer, overlay| newest(newer, selected(overlay)));
         let base = self.base.as_ref().and_then(|block| block.get(key, cut));
         newest(overlay, base)
     }
@@ -1056,21 +1084,26 @@ impl CellIndex {
                     .find_map(select)
             }
         };
-        match (next(&self.overlay), self.sealed.as_deref().and_then(next)) {
-            (None, other) | (other, None) => other,
-            (Some(a), Some(b)) => {
-                let order = if reverse {
-                    b.0.cmp(&a.0)
-                } else {
-                    a.0.cmp(&b.0)
-                };
-                Some(match order {
-                    Ordering::Less => a,
-                    Ordering::Greater => b,
-                    Ordering::Equal => (a.0, newest(Some(a.1), Some(b.1)).expect("overlay heads")),
-                })
-            }
-        }
+        self.overlays()
+            .into_iter()
+            .flatten()
+            .fold(None, |head, overlay| match (head, next(overlay)) {
+                (None, other) | (other, None) => other,
+                (Some(a), Some(b)) => {
+                    let order = if reverse {
+                        b.0.cmp(&a.0)
+                    } else {
+                        a.0.cmp(&b.0)
+                    };
+                    Some(match order {
+                        Ordering::Less => a,
+                        Ordering::Greater => b,
+                        Ordering::Equal => {
+                            (a.0, newest(Some(a.1), Some(b.1)).expect("overlay heads"))
+                        }
+                    })
+                }
+            })
     }
 
     fn next_history(
@@ -1125,7 +1158,13 @@ impl CellIndex {
                         .map(|reference| (key.clone(), *reference))
                 })
         };
-        let overlay = earliest_history(next(&self.overlay), self.sealed.as_deref().and_then(next));
+        let overlay = self
+            .overlays()
+            .into_iter()
+            .flatten()
+            .fold(None, |earliest, overlay| {
+                earliest_history(earliest, next(overlay))
+            });
         earliest_history(base, overlay)
     }
 }

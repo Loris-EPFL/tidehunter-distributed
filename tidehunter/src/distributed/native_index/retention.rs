@@ -91,6 +91,10 @@ struct Cold {
     /// Sparse views pin their stable floor like a reader pin.
     view_pins: BTreeMap<Option<MutationVersion>, usize>,
     active: bool,
+    /// Option C cell flush permits: residual bytes and outstanding flights.
+    /// An allowance independent of the capture and view allowances.
+    cell_bytes: usize,
+    cell_flights: usize,
 }
 
 /// One pin registry in its own cache line.
@@ -248,6 +252,49 @@ impl RetentionState {
             }
         }
         merged
+    }
+}
+
+impl RetentionState {
+    /// Reserve one cell flush permit without waiting.
+    pub(super) fn reserve_cell_flush(
+        &self,
+        bytes: usize,
+        max_bytes: usize,
+        max_flights: usize,
+    ) -> Result<(), NativeIndexError> {
+        let mut cold = self.cold.lock();
+        if cold.cell_flights >= max_flights
+            || cold
+                .cell_bytes
+                .checked_add(bytes)
+                .is_none_or(|total| total > max_bytes)
+        {
+            return Err(NativeIndexError::Capacity);
+        }
+        cold.cell_flights += 1;
+        cold.cell_bytes += bytes;
+        Ok(())
+    }
+
+    /// Add `extra` bytes to an existing permit without waiting.
+    pub(super) fn grow_cell_flush(&self, extra: usize, max_bytes: usize) -> bool {
+        let mut cold = self.cold.lock();
+        let Some(total) = cold
+            .cell_bytes
+            .checked_add(extra)
+            .filter(|total| *total <= max_bytes)
+        else {
+            return false;
+        };
+        cold.cell_bytes = total;
+        true
+    }
+
+    pub(super) fn release_cell_flush(&self, bytes: usize) {
+        let mut cold = self.cold.lock();
+        cold.cell_flights -= 1;
+        cold.cell_bytes -= bytes;
     }
 }
 
@@ -577,12 +624,14 @@ impl NativeIndex {
     }
 
     pub(super) fn transient_bytes(&self) -> usize {
-        // The capture and view allowances are independent. View accounting
-        // includes pre-admitted reservations as well as allocated views.
+        // The capture, view and cell flush allowances are independent. View
+        // accounting includes pre-admitted reservations as well as allocated
+        // views; cell flush accounting is the reserved permit bytes.
         let cold = self.retention.cold.lock();
         cold.transient_bytes
             .saturating_add(cold.view_bytes)
             .saturating_add(cold.reserved_view_bytes)
+            .saturating_add(cold.cell_bytes)
     }
 
     /// Bytes of standing-budget views that were replaced but are still held by

@@ -2,10 +2,12 @@
 //!
 //! Readers never take the `writer` mutex. It serializes the callers that change
 //! what the index holds or how it is laid out: publication (`promote_committed`,
-//! live views) and checkpoint capture/installation. In the distributed design
-//! one owner already serializes those calls (the paper's single background
-//! tracker); the mutex makes the contract explicit and keeps `generation`,
-//! `touched`, `latest` and the capture/installation cursors consistent.
+//! live views), exact checkpoint capture/installation, and option C per-cell
+//! capture/installation (`cell_flush`). In the distributed design one owner
+//! already serializes those calls (the paper's single background tracker);
+//! the mutex makes the contract explicit and keeps `generation`, `touched`,
+//! `latest`, the per-cell flight counters and the capture/installation
+//! cursors consistent. Exact and per-cell checkpoints are exclusive.
 //!
 //! The writer applies entries to shards one shard at a time, in ascending shard
 //! index, holding at most one shard lock. Applying never changes what readers
@@ -14,6 +16,7 @@
 //! [`IndexWriter::install_standing_live_view`] move the visible cut (see the
 //! module documentation of `shards`).
 
+use super::cell_flush::CellDirectory;
 use super::shards::{CellKey, add, sub};
 use super::snapshot::FrozenCell;
 use super::*;
@@ -51,6 +54,8 @@ pub(super) struct WriterState {
     /// Newest promoted version. Not what readers see; see `published`.
     pub latest: Option<MutationVersion>,
     pub installation: Option<ImageInstallation>,
+    /// Option C flight counters, lifecycle and new-cell coverage.
+    pub cells: CellDirectory,
     /// Reused by `promote_committed` so a promotion allocates nothing.
     scratch: Vec<(usize, CellKey)>,
 }
@@ -58,8 +63,8 @@ pub(super) struct WriterState {
 /// Exclusive publication/maintenance access. Dereferences to the index so every
 /// reader method stays available. Never block on it while holding a shard lock.
 pub struct IndexWriter<'a> {
-    index: &'a NativeIndex,
-    state: MutexGuard<'a, WriterState>,
+    pub(super) index: &'a NativeIndex,
+    pub(super) state: MutexGuard<'a, WriterState>,
 }
 
 impl Deref for IndexWriter<'_> {
@@ -120,6 +125,7 @@ impl NativePendingSink for IndexWriter<'_> {
                 identity.clone(),
                 CellIndex {
                     generation: state.generation,
+                    flush: CellFlushState::new(state.cells.floor),
                     ..Default::default()
                 },
             );
@@ -209,7 +215,9 @@ impl IndexWriter<'_> {
                         cell.generation = state.generation;
                     }
                     let key = change.key.into_owned();
+                    let key_len = key.len();
                     let values = cell.overlay.entry(key).or_default();
+                    let new_row = values.is_empty();
                     if let Some(old) = insert_unique_by(values, reference, |a, b| {
                         a.mutation_version().cmp(&b.mutation_version())
                     }) && old != reference
@@ -219,6 +227,10 @@ impl IndexWriter<'_> {
                     add(&index.accounting.retained_bytes, charge);
                     add(&index.accounting.overlay, charge);
                     add(&index.accounting.retained_versions, 1);
+                    // Scalar dirty metadata of this cell; the totals mirror
+                    // the accounting adds above (spec §9.1).
+                    cell.flush
+                        .record_active(key_len, reference.batch_version, new_row);
                     state.latest = Some(state.latest.map_or(reference.mutation_version(), |v| {
                         v.max(reference.mutation_version())
                     }));
@@ -229,6 +241,14 @@ impl IndexWriter<'_> {
             at += run;
         }
         index.publication_shards.record(shards_touched);
+        if promoted != 0 {
+            // Release: a flush scheduler that observes the hint with Acquire
+            // then rereads cell metadata under shard locks; the hint carries
+            // no data itself.
+            index
+                .cell_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         order.clear();
         state.scratch = order;
         Ok(promoted)
@@ -432,6 +452,11 @@ impl IndexWriter<'_> {
         let state = &mut *self.state;
         if state.sealed_count != 0 {
             return Err(NativeIndexError::CheckpointInProgress);
+        }
+        // One checkpoint protocol per database: carries and flights are not
+        // part of a global generation, so an exact image would miss them.
+        if state.cells.active {
+            return Err(NativeIndexError::Invalid("per-cell flush state is active"));
         }
         for identity in &state.touched {
             if index.shard_for(identity).read()[identity].pending.len() != 0 {
