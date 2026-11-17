@@ -169,6 +169,11 @@ def runtime_options(config):
     return options
 
 
+# Exact per-repetition population of the perpetual-database mainnet replay (manifest v1).
+PERPETUAL_REPLAY_PER_REPETITION = {"checkpoints": 1, "store_gets": 507, "overlay_demands": 116,
+                                   "put_members": 654, "write_calls": 3, "transactions": 45}
+
+
 def admit_replay_summary(config, summary):
     if config.get("workload", {}).get("kind") != "sui_mainnet_replay":
         return
@@ -178,13 +183,20 @@ def admit_replay_summary(config, summary):
     if summary["status"] != "completed":
         return
     repetitions = config["workload"]["repetitions"]
-    expected = {"checkpoints": repetitions, "store_gets": 507 * repetitions,
-                "overlay_demands": 116 * repetitions, "put_members": 654 * repetitions,
-                "write_calls": 3 * repetitions, "transactions": 45 * repetitions}
+    expected = {name: count * repetitions for name, count in PERPETUAL_REPLAY_PER_REPETITION.items()}
     if (phase.get("counts") != expected or phase.get("unknown_outcomes") != 0
             or phase.get("unresolved_workers") != 0
             or phase.get("profile", {}).get("functional_qualification") is not True):
         raise ValueError("replay did not complete its exact filtered population")
+
+
+def planned_measurement_calls(config):
+    """Raw sample rows a completed case must contain: one per store get and per write call for
+    the perpetual replay, which has no `phases`; the planned measurement operations otherwise."""
+    if config.get("workload", {}).get("kind") == "sui_mainnet_replay":
+        per = PERPETUAL_REPLAY_PER_REPETITION
+        return (per["store_gets"] + per["write_calls"]) * config["workload"]["repetitions"]
+    return config["phases"]["measurement_operations"]
 
 
 def admit_durability_tier(job, options, manifest_path):
@@ -4384,9 +4396,10 @@ def summarize_case(directory, *, local_mode=False):
     if elapsed <= 0:
         raise ValueError("measurement exposure must be positive")
     good = [row for row in samples if row["outcome"] in ("ok", "success")]
+    planned = planned_measurement_calls(config)
     totals.update({"elapsed_seconds": elapsed, "exposure": "observed raw measurement span",
-        "planned_measurement_calls": config["phases"]["measurement_operations"],
-        "measurement_rows_complete": len(samples) == config["phases"]["measurement_operations"],
+        "planned_measurement_calls": planned,
+        "measurement_rows_complete": len(samples) == planned,
         "success_calls_per_second": len(good) / elapsed,
         "success_logical_keys_per_second": sum(row["logical_keys"] for row in good) / elapsed,
         "success_value_mib_per_second": sum(row["bytes"] for row in good) / elapsed / 1024**2})

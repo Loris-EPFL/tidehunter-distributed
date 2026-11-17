@@ -44,9 +44,9 @@ impl ClientWorker {
         let worker_queue = Arc::clone(&queue);
         let accounting = Arc::new(WorkerAccounting::default());
         let worker_accounting = Arc::clone(&accounting);
-        #[cfg(test)]
+        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
         let caller_failure = Arc::clone(&failure);
-        #[cfg(test)]
+        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
         let caller_first_failure = Arc::clone(&first_failure);
         let thread = thread::Builder::new()
             .name("value-wal-tcp".into())
@@ -1286,13 +1286,13 @@ impl ClientWorker {
             thread: Mutex::new(Some(thread)),
             queue,
             accounting,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
             failure: caller_failure,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
             first_failure: caller_first_failure,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
             partition,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
             test_completion: None,
         })
     }

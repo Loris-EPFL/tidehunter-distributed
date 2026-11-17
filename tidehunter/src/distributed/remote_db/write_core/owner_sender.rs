@@ -86,7 +86,7 @@ impl OwnerSender {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn observe_full_park(&self, entered: mpsc::SyncSender<()>) {
         *self.capacity.full_park.lock() = Some(entered);
     }
@@ -222,6 +222,8 @@ impl OwnerReceiver {
         result
     }
 
+    /// Only the leased worker loop waits with a deadline on the control channel.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn recv_timeout(
         &self,
         timeout: Duration,
