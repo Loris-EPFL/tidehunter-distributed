@@ -89,6 +89,34 @@ fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
     assert_eq!(log.stats().persistence_barriers, 1);
 }
 
+/// A reply is the last effect of an admitted command, so its holder must see
+/// the admission released on every completion path: an exclusive control and
+/// a failed command (worker), a native append (worker hand-off) and a
+/// synchronous append (flusher). Final target teardown relies on this.
+#[test]
+fn reply_follows_admission_release_on_every_completion_path() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let temp = tempdir::TempDir::new("control-reply-after-release").unwrap();
+        let config = config(&temp.path().join("node"));
+        let node = StorageNode::open(config.clone(), metrics()).unwrap();
+        node.set_durability(DurabilityConfig::with_tier(tier))
+            .unwrap();
+        node.inventory.lock().fence_to(1).unwrap();
+        let (completed, completions) = mpsc::sync_channel(1);
+        let requests = [
+            (append_request(&config, 1, 0), true),
+            (Request::Fence { epoch: 2 }, true),
+            // Epoch 1 is fenced now, so this append fails in the worker.
+            (append_request(&config, 1, 1), false),
+        ];
+        for (id, (request, succeeds)) in (1..).zip(requests) {
+            assert!(command(&node, id, request, 4096, &completed).is_ok());
+            assert_eq!(receive(&completions, id).response.is_ok(), succeeds);
+            assert_eq!(node.control.pending_requests_for_test(), 0);
+        }
+    }
+}
+
 #[test]
 fn appender_services_next_group_while_captured_persistence_is_paused() {
     let temp = tempdir::TempDir::new("control-captured-prefix").unwrap();
