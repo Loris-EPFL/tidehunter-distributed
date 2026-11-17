@@ -183,6 +183,75 @@ fn full_local_controls_wake_on_ready_and_keep_each_owner_fence() {
     assert!(!failure.load(Ordering::Acquire));
 }
 
+/// PR #62 P2: a pending adoption with no leased flight, and full local
+/// controls behind an earlier ALLOCATED owner entry. The worker must keep its
+/// 1 ms adoption cadence: after the owner replies, no sender, READY entry or
+/// eventfd signal wakes it, yet it still harvests the adoption.
+#[test]
+fn full_local_controls_keep_driving_pending_adoption() {
+    use crate::distributed::storage::LivePausePoint;
+    let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+    let mut client = fixture.writer();
+    client
+        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .unwrap();
+    client.wait_leased_control(&mut Vec::new(), None).unwrap(); // Initial prelease.
+    let (entered, release) = fixture
+        .node
+        .log_for_test(1)
+        .pause_live(LivePausePoint::FrameProbe);
+    client.submit_leased_adoption().unwrap();
+    let (worker, failure) = worker_with_capacity(&fixture, client, 1);
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let guard = worker.client.lock();
+    // The earlier allocation stays ALLOCATED, so the control behind its
+    // owner-sequence fence fills the one-entry local control metadata.
+    let (fence, _) = worker.queue.reserve(|| 1);
+    let (reply, control) = mpsc::sync_channel(1);
+    worker
+        .send(Command::Control(Box::new(move |_| {
+            let _ = reply.send(());
+        })))
+        .unwrap();
+    let (parked_entered, parked) = mpsc::sync_channel(1);
+    let sender = worker.sender.as_ref().unwrap();
+    sender.observe_full_park(parked_entered);
+    let before = fixture.metrics.snapshot().counts.adoption_async_samples;
+    drop(guard);
+    let parked_full = parked.recv_timeout(Duration::from_secs(5));
+    let pending_when_parked = worker.client.lock().leased_adoption_pending();
+    let released = release.send(());
+    // Liveness guard only: the harvest needs one 1 ms worker turn.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let harvested = loop {
+        if fixture.metrics.snapshot().counts.adoption_async_samples != before {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::yield_now();
+    };
+    let pending_after = worker.client.lock().leased_adoption_pending();
+    let control_fenced = matches!(control.try_recv(), Err(mpsc::TryRecvError::Empty));
+    // Abort the fence before any assertion, so a failure cannot leave the
+    // control (and worker teardown) behind an entry that never resolves.
+    worker.queue.abort(fence);
+    let _ = sender.try_send(Command::QueueReady);
+    parked_full.unwrap();
+    released.unwrap();
+    assert!(pending_when_parked);
+    assert!(
+        harvested,
+        "full local controls stalled the pending adoption"
+    );
+    assert!(!pending_after);
+    assert!(control_fenced, "the control must wait behind its fence");
+    control.recv_timeout(Duration::from_secs(5)).unwrap();
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
 #[test]
 fn leased_worker_merges_ready_appends_and_splits_receipts_in_order() {
     let fixture = Fixture::new(DurabilityTier::Synchronous, 16384);
@@ -836,6 +905,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 queue_geometry: Default::default(),
                 export_mode: Default::default(),
             }),
+            checkpoint_mode: CheckpointMode::Exact,
         };
         let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
         let database = RemoteDatabase::open(

@@ -95,6 +95,9 @@ class WriteEngineTests(unittest.TestCase):
             self.assertEqual(config["workload"]["minimum_measurement_seconds"], 15)
             self.assertEqual(config["execution"]["concurrency"], 16)
             self.assertEqual(runner.planned_timing_rows(config)["measurement"], 4096 * 510)
+            # The terminal case summary counts the same rows; replay configs carry no `phases`.
+            self.assertNotIn("phases", config)
+            self.assertEqual(campaign.planned_measurement_calls(config), 4096 * 510)
             manifest = Path(config["workload"]["manifest_path"])
             self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), config["workload"]["manifest_sha256"])
             summary = {"status": "completed", "phase_counts": {
@@ -142,47 +145,98 @@ class WriteEngineTests(unittest.TestCase):
             self.assertEqual(prep["durability_tier"], job["durability_tier"])
 
     def test_prepared_owner_launch_validates_for_both_arms(self):
-        # Prepared launches never carry wal_prewrite (false is not serialized); the loaded
-        # launch must already match the case before validate_launch runs.
+        # Whatever the prepared launch carries (the preparer's explicit false, true, or
+        # a legacy launch without the key), the loaded launch states the case's choice
+        # as an explicit boolean before validate_launch runs.
         config = {"spec": {"selection": SELECTION}, "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * 2}}
+        arms = set()
         for job in campaign.make_focused_matrix(SELECTION):
+            arms.add((job["arm"], job["owner_wal_prewrite"]))
             node = Path(config["fleet"]["data_root"]) / "cells" / job["case_id"] / "node-0"
             tls = {"transport": campaign.TRANSPORTS[job["backend"]], "ca": str(node / "tls" / "ca.der"),
                    "cert": str(node / "tls" / "tidehunter-node-0.der"),
                    "key": str(node / "tls" / "tidehunter-node-0.pk8")}
-            prepared = {"ready_file": str(node / "ready"), "stop_file": str(node / "stop"),
-                        "listen": "10.0.0.1:9400", "node": {"root": str(node / "storage")}, "tls": tls}
-            with tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp) / "launch.yaml"
-                path.write_text(json.dumps(prepared))
-                launch = controller.load_owner_launch(job, path)
-            self.assertEqual(launch["node"].get("wal_prewrite", False), job["owner_wal_prewrite"])
-            with patch.object(controller, "guarded", side_effect=lambda path, *_args, **_kwargs: Path(path)), \
-                 patch.object(controller, "logical_owner_hosts", return_value=[{"address": "10.0.0.1"}]):
-                controller.validate_launch(config, launch, job["case_id"], 0)
+            for prepared_prewrite in (True, False, None):
+                prepared = {"ready_file": str(node / "ready"), "stop_file": str(node / "stop"),
+                            "listen": "10.0.0.1:9400", "node": {"root": str(node / "storage")}, "tls": tls}
+                if prepared_prewrite is not None:
+                    prepared["node"]["wal_prewrite"] = prepared_prewrite
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "launch.yaml"
+                    path.write_text(json.dumps(prepared))
+                    launch = controller.load_owner_launch(job, path)
+                self.assertIs(launch["node"]["wal_prewrite"], job["owner_wal_prewrite"])
+                with patch.object(controller, "guarded", side_effect=lambda path, *_args, **_kwargs: Path(path)), \
+                     patch.object(controller, "logical_owner_hosts", return_value=[{"address": "10.0.0.1"}]):
+                    controller.validate_launch(config, launch, job["case_id"], 0)
+        self.assertEqual(arms, {("file", False), ("prewritten", True)})
 
     def test_owner_launch_binds_and_validates_prewrite_boolean(self):
+        config = {"spec": {"selection": SELECTION}, "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * 2}}
         for job in campaign.make_focused_matrix(SELECTION):
-            launch = {"node": {"wal_prewrite": False}}
-            controller.bind_owner_wal_prewrite(job, launch)
-            if job["owner_wal_prewrite"]:
-                self.assertIs(launch["node"]["wal_prewrite"], True)
-            else:
-                self.assertNotIn("wal_prewrite", launch["node"])
+            for prepared in ({"wal_prewrite": True}, {"wal_prewrite": False}, {}):
+                launch = {"node": dict(prepared)}
+                controller.bind_owner_wal_prewrite(job, launch)
+                self.assertIs(launch["node"]["wal_prewrite"], job["owner_wal_prewrite"])
             invalid = copy.deepcopy(job)
             invalid["owner_wal_prewrite"] = 1
             with self.assertRaises(controller.SafetyError):
                 controller.bind_owner_wal_prewrite(invalid, launch)
-            config = {"spec": {"selection": SELECTION}, "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * 2}}
             node = Path(config["fleet"]["data_root"]) / "cells" / job["case_id"] / "node-0"
             launch.update(ready_file=str(node / "ready"), stop_file=str(node / "stop"))
             launch["node"].update(root=str(node / "storage"), wal_prewrite=not job["owner_wal_prewrite"])
             with self.assertRaisesRegex(controller.SafetyError, "wal_prewrite differs"):
                 controller.validate_launch(config, launch, job["case_id"], 0)
-            if not job["owner_wal_prewrite"]:
-                launch["node"]["wal_prewrite"] = False
-                with self.assertRaisesRegex(controller.SafetyError, "wal_prewrite differs"):
+            # An absent key would mean "on" to the owner, so the file arm could never
+            # be confirmed; any non-boolean is equally ambiguous.
+            for ambiguous in (None, 0, "false"):
+                if ambiguous is None:
+                    launch["node"].pop("wal_prewrite")
+                else:
+                    launch["node"]["wal_prewrite"] = ambiguous
+                with self.assertRaisesRegex(controller.SafetyError, "explicit boolean wal_prewrite"):
                     controller.validate_launch(config, launch, job["case_id"], 0)
+
+    def test_unset_case_binds_explicit_legacy_false(self):
+        launch = {"node": {"wal_prewrite": True}}
+        controller.bind_owner_wal_prewrite({}, launch)
+        self.assertIs(launch["node"]["wal_prewrite"], False)
+
+    def test_historical_selection_owner_launches_carry_explicit_false(self):
+        # Older reviewed selections never set owner_wal_prewrite; their owners must keep
+        # the legacy behaviour even though an owner reads an absent key as on.
+        for selection in ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put"):
+            jobs = campaign.make_focused_matrix(selection)
+            self.assertTrue(jobs)
+            for job in jobs:
+                self.assertNotIn("owner_wal_prewrite", job)
+                hosts = campaign.job_owner_hosts(job)
+                config = {"spec": {"selection": selection},
+                          "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * hosts}}
+                node = Path(config["fleet"]["data_root"]) / "cells" / job["case_id"] / "node-0"
+                transport = campaign.TRANSPORTS[job["backend"]]
+                trusted = controller.is_trusted(controller.validate_transport(transport))
+                tls = {"transport": transport}
+                for field, name in (("ca", "ca.der"), ("cert", "tidehunter-node-0.der"),
+                                    ("key", "tidehunter-node-0.pk8")):
+                    tls[field] = "" if trusted else str(node / "tls" / name)
+                for prepared_prewrite in (True, False, None):
+                    prepared = {"ready_file": str(node / "ready"), "stop_file": str(node / "stop"),
+                                "listen": "10.0.0.1:9400", "node": {"root": str(node / "storage")},
+                                "tls": tls}
+                    if prepared_prewrite is not None:
+                        prepared["node"]["wal_prewrite"] = prepared_prewrite
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = Path(tmp) / "launch.yaml"
+                        path.write_text(json.dumps(prepared))
+                        launch = controller.load_owner_launch(job, path)
+                    with self.subTest(selection=selection, case=job["case_id"], prepared=prepared_prewrite):
+                        self.assertIs(launch["node"]["wal_prewrite"], False)
+                        with patch.object(controller, "guarded",
+                                          side_effect=lambda path, *_args, **_kwargs: Path(path)), \
+                             patch.object(controller, "logical_owner_hosts",
+                                          return_value=[{"address": "10.0.0.1"}]):
+                            controller.validate_launch(config, launch, job["case_id"], 0)
 
 
 if __name__ == "__main__":

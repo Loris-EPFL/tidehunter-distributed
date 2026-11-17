@@ -147,6 +147,79 @@ class ManualCampaignTest(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 manual._reviewed_jobs(changed)
 
+    def test_reviewed_contract_mid_spec_exact_admission_and_matrix(self):
+        spec = manual.REVIEWED_CONTRACT_MID_SPEC
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual(len(jobs), 182)
+        digest = lambda value: hashlib.sha256(json.dumps(
+            value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(digest(spec), manual.REVIEWED_CONTRACT_MID_SPEC_SHA256)
+        self.assertEqual(digest(jobs), manual.REVIEWED_CONTRACT_MID_MATRIX_SHA256)
+        sealed = {**spec, 'reservation_hours': 2, 'hard_deadline_seconds': 7200,
+                  'machine_type': 'z4m-highmem-16'}
+        self.assertEqual(digest(sealed), manual.REVIEWED_CONTRACT_MID_SEALED_SPEC_SHA256)
+        self.assertEqual(manual._reviewed_jobs(sealed), jobs)
+        self.assertEqual({key: value for key, value in spec.items()
+                          if key not in ('backends', 'arms', 'value_sizes')},
+                         {key: value for key, value in manual.REVIEWED_CONTRACT_SPEC.items()
+                          if key not in ('backends', 'arms', 'value_sizes')})
+        self.assertEqual(spec['backends'], ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
+                                          'tidehunter_nvme_rdma', 'valkey_tcp', 'valkey_rdma', 'kvrocks'])
+        self.assertEqual(spec['arms'], {**manual.REVIEWED_CONTRACT_SPEC['arms'],
+                                       'tidehunter_tcp': ['synchronous', 'native']})
+        self.assertEqual({job['value_size'] for job in jobs}, {512, 4096})
+        self.assertEqual({job['concurrency'] for job in jobs}, {1, 16})
+        self.assertEqual({job['repeat'] for job in jobs}, {0, 1})
+        old_jobs = manual._reviewed_jobs(manual.REVIEWED_CONTRACT_SPEC)
+        expected = []
+        for old in old_jobs:
+            size = {1024: 512, 65536: 4096}[old['value_size']]
+            expected.append({**old, 'value_size': size,
+                             'case_id': old['case_id'].split('-', 1)[1].replace(
+                                 f"-{old['value_size']}-", f"-{size}-")})
+        retained = [{**job, 'case_id': job['case_id'].split('-', 1)[1]}
+                    for job in jobs if job['backend'] != 'tidehunter_tcp']
+        self.assertEqual(sorted(map(manual._json, expected)), sorted(map(manual._json, retained)))
+        tcp = [job for job in jobs if job['backend'] == 'tidehunter_tcp']
+        self.assertEqual(len(tcp), 26)
+        def comparable(job):
+            return {key: value for key, value in job.items() if key not in ('backend', 'case_id')}
+        self.assertEqual(sorted(manual._json(comparable(job)) for job in tcp),
+                         sorted(manual._json(comparable(job)) for job in jobs
+                                if job['backend'] == 'tidehunter_verbs_native'))
+        for job in jobs:
+            self.assertEqual(job['coordinator_cache_bytes'], 0)
+            self.assertEqual(job['keys'], 4096)
+        for backend in ('tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'):
+            self.assertEqual({job['durability_tier'] for job in jobs
+                              if job['backend'] == backend}, {'native', 'synchronous'})
+        for key in spec:
+            changed = copy.deepcopy(spec)
+            changed[key] = None
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                manual._reviewed_jobs(changed)
+
+    def test_contract_mid_reservation_and_export_envelope(self):
+        spec = manual.REVIEWED_CONTRACT_MID_SPEC
+        self.assertEqual(manual.reservation_quote({**spec, 'reservation_hours': 2},
+                                                 'z4m-highmem-16'), (7200, 3945, 4834))
+        jobs = manual._reviewed_jobs(spec)
+        estimate = sum((job['keys'] + job['warmup_operations'] + job['measurement_operations'])
+                       * 256 + 8 * 1024**2 for job in jobs) + 256 * 1024**2
+        self.assertEqual(estimate, 2961539072)
+        self.assertLessEqual(estimate, 3_000_000_000)
+
+    def test_contract_mid_sizes_require_the_contract_shape(self):
+        cloud = manual.workflow_input.cloud_campaign
+        base = {key: value for key, value in manual.REVIEWED_CONTRACT_MID_SPEC.items()
+                if key != 'suite'}
+        for sizes in ([512], [4096, 512], [512, 4096, 4096], [512, 65536]):
+            with self.subTest(sizes=sizes), self.assertRaises(ValueError):
+                cloud.make_matrix({**base, 'value_sizes': sizes})
+        with self.assertRaises(ValueError):
+            cloud.make_matrix({key: value for key, value in base.items()
+                               if key not in ('shapes', 'arms')})
+
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
             expected_count = manual.workflow_input.cloud_campaign.FOCUSED_COUNTS[selection]
@@ -1942,6 +2015,25 @@ class ReviewedKvMatrixRegressionTests(unittest.TestCase):
                 if name == 'nvmeof_f8':
                     self.assertNotIn('live_leased_sync', spec)
                     self.assertNotIn('live_leased_flush_min_frame_bytes', spec)
+
+    def test_reviewed_standard_specs_keep_their_synchronous_matrices(self):
+        # Digests of the generated matrices before native became the matrix default.
+        campaign = manual.workflow_input.cloud_campaign
+        for spec, count, digest, relies_on_spec_tier in (
+                (manual.REVIEWED_SPEC, 652, 'f48f60156261589c539ca030d535d80cba8a0d987df30184d597a419f82adb9d', True),
+                # Contract arms name every Tidehunter tier, so it never used the spec default.
+                (manual.REVIEWED_CONTRACT_SPEC, 156, '32cda41becb0128f3d7f50cf02a4ffc4c9c9650ce9e708226516d862e1cca8e2',
+                 False)):
+            with self.subTest(shapes=spec.get('shapes')):
+                self.assertEqual(spec['durability_tier'], 'synchronous')
+                jobs = campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
+                self.assertEqual(len(jobs), count)
+                self.assertEqual(hashlib.sha256(json.dumps(
+                    jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest(), digest)
+                unpinned = campaign.make_matrix({k: v for k, v in spec.items()
+                                                 if k not in ('suite', 'durability_tier')})
+                # Without the explicit tier, the standard spec would plan the native default.
+                self.assertEqual(jobs != unpinned, relies_on_spec_tier)
 
 
 if __name__ == '__main__':

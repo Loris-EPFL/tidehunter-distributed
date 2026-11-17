@@ -57,6 +57,23 @@ The fixture, export mode, queue geometry and deadlines match `sui_nvmeof_compact
 Admission compares the complete specification, not a KV matrix hash; all existing
 specifications and matrix pins remain unchanged.
 
+Owner WAL prewrite (`NodeConfig.wal_prewrite`) is on by default in the engine: a
+default owner zero-fills and syncs each new external (live NVMe-oF) WAL file once,
+before its first grant, so live writes never convert ext4 unwritten extents. The
+key is always serialized; an absent key means on, and opting out requires an
+explicit `wal_prewrite: false`. The harness keeps historical selections
+reproducible: the controller writes each owner launch's value from the case's
+`owner_wal_prewrite`, and a case that does not set it gets an explicit
+`wal_prewrite: false` (the legacy behaviour). Only cases that set
+`owner_wal_prewrite: true` prewrite (today the `prewritten` arm of
+`nvmeof_p9_write_engine`; its `file` arm sets `false`); new selections must set
+it explicitly. `validate_launch` rejects a launch without an explicit boolean or
+one that differs from a case that sets the value. `local_multiowner_check.py`
+prewrites by default (`--no-wal-prewrite` opts out; `--wal-prewrite` is still
+accepted), and `local_dry_run.py --wal-prewrite`/`--no-wal-prewrite` overrides a
+case that does not set the value. The CI kernel NVMe/TCP proof runs a gating
+`--no-wal-prewrite` pass, then a non-gating `--wal-prewrite` pass.
+
 ## Linux page-cache owner branch
 
 On `experiment/linux-pagecache-nvme-rdma`, the coordinator value cache remains,
@@ -2244,11 +2261,19 @@ in the parent workspace.
 
 ## Tidehunter durability tier
 
-Every Tidehunter case (`cloud_campaign.TRANSPORTS`) carries `durability_tier`: `synchronous`
-(default; ack after the covering WAL barrier; matches native `value_wal_barrier` and Valkey
-`appendfsync always`) or `native` (ack after the WAL page-cache write; matches only native
-`page_cache`). Tiers are never mixed in one comparison; the plots treat the tier as part of a
-backend's implementation contract, so a tier change between repeats is rejected.
+Every Tidehunter case (`cloud_campaign.TRANSPORTS`) carries `durability_tier`: `native`
+(default, the native Tidehunter contract: ack after the WAL page-cache write; matches only
+native `page_cache`) or `synchronous` (the stricter option: ack after the covering WAL barrier;
+matches native `value_wal_barrier` and Valkey `appendfsync always`). The difference is crash
+loss: after an owner kernel crash or power loss, `native` can lose acknowledged batches above
+the owner's synced frontier, while `synchronous` loses none; both survive an owner or
+coordinator process crash. A job without a tier, and a generated standard matrix whose spec
+has no `durability_tier`, plan `native`. Reviewed specs that were generated with the earlier
+synchronous default (`REVIEWED_SPEC`, `REVIEWED_CONTRACT_SPEC`, `cloud-campaign.json`,
+`cloud-nvmeof-campaign.json`, workflow specs) name `durability_tier: "synchronous"`, so their
+matrices are unchanged; focused selections name their tiers per job. Tiers are never mixed in
+one comparison; the plots treat the tier as part of a backend's implementation contract, so a
+tier change between repeats is rejected.
 
 The controller writes the tier into the prepare input and a fresh `launch_nonce` into each owner
 launch file (omitted tier means native). The owner process applies the tier and publishes a

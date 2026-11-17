@@ -162,8 +162,10 @@ pub struct NodeConfig {
     pub read_workers: Option<usize>,
     #[serde(default = "default_async_read_policy")]
     pub wal_member_read: super::storage::WalMemberReadPolicy,
-    /// Write and sync zeros across each external WAL file before it is usable.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Write and sync zeros across each external WAL file before it is usable,
+    /// so live writes never convert unwritten extents. On by default and always
+    /// serialized: an absent key means on, and opting out requires `false`.
+    #[serde(default = "default_wal_prewrite")]
     pub wal_prewrite: bool,
     /// Opt-in NOWAIT prefix reads; compare with forced-async on the target host.
     #[serde(default)]
@@ -241,6 +243,9 @@ impl NodeConfig {
     }
 }
 
+fn default_wal_prewrite() -> bool {
+    true
+}
 fn default_async_read_policy() -> super::storage::WalMemberReadPolicy {
     super::storage::WalMemberReadPolicy::Async
 }

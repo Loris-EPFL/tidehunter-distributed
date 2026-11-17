@@ -128,7 +128,7 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
     }
     db.drain().unwrap();
     let checkpoint = db.checkpoint().unwrap();
-    let pin = db.core.index.pin_cut(db.core.index.latest_cut()).unwrap();
+    let pin = db.core.index.pin_cut(db.core.index.call_cut()).unwrap();
     let captured_rows: Vec<_> = expected
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))

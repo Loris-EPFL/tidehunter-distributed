@@ -6,6 +6,9 @@
 //! callers out until it restores the cache. Both locks are free during sleep.
 //! Input: a bounded `sync_channel` of `max_requests`; every entry holds a
 //! global flight credit. The actor uses `try_send` and bounded overflow.
+//! Exit: however the worker stops, it closes its inbox and completes every
+//! request it holds or that is still in the channel, so no caller waits for
+//! its deadline (`LaneInbox::close`).
 //!
 //! Requests are admitted in arrival order while the cache has room, finish in
 //! any order, and each caller reads its own result slot, so per-caller result
@@ -26,6 +29,16 @@ const MAX_POLL_WAIT: Duration = Duration::from_secs(1);
 
 /// The waker the actor uses after queueing a request on this lane.
 pub(super) type LaneWaker = Arc<OnceLock<LiveReadWaker>>;
+
+/// Set in a lane's `depth` once its worker takes no more requests. The rest
+/// of `depth` counts requests the actor has counted and not yet uncounted or
+/// handed to the worker. Both sides update `depth` with read-modify-writes,
+/// so the atomic's modification order puts each actor count either before
+/// the close (the worker waits for that request) or after it (the actor sees
+/// this bit and fails the request itself).
+pub(super) const LANE_CLOSED: usize = 1 << (usize::BITS - 1);
+/// How long a closing worker waits for one racing request at a time.
+const CLOSE_POLL: Duration = Duration::from_micros(100);
 
 struct LaneInbox<'a> {
     state: &'a State,
@@ -106,9 +119,38 @@ impl LaneInbox<'_> {
         for (_, request) in self.flying.drain() {
             request.complete_nvme(Err(LocalDbError::new(message)));
         }
+        self.fail_waiting(message);
+    }
+    /// Fail the requests not yet submitted; they own no device I/O.
+    fn fail_waiting(&mut self, message: &str) {
         for request in self.waiting.drain(..) {
             request.complete_nvme(Err(LocalDbError::new(message)));
         }
+    }
+    /// Stop taking requests and complete every request already counted.
+    ///
+    /// A count that precedes the close belongs to an actor that has not yet
+    /// sent or uncounted that request. Its next, non-blocking step either
+    /// sends the request, which is received here, or finds the inbox full and
+    /// uncounts it, so the wait is bounded by that step. Each received
+    /// request is completed by `intake` (poisoned) or queued in `waiting` for
+    /// `fail_waiting`. Drain commands left in the channel are dropped with it, as
+    /// before; their callers see the reply channel close.
+    fn close(&mut self) {
+        // Relaxed: see `LANE_CLOSED`; only the modification order matters.
+        self.depth.fetch_or(LANE_CLOSED, Ordering::Relaxed);
+        while !self.disconnected && self.depth.load(Ordering::Relaxed) & !LANE_CLOSED != 0 {
+            self.wait_one(CLOSE_POLL);
+        }
+    }
+}
+
+impl Drop for LaneInbox<'_> {
+    /// Every exit path, including early returns and unwinding, completes the
+    /// requests the worker holds or could still receive.
+    fn drop(&mut self) {
+        self.close();
+        self.fail_all("live read lane stopped");
     }
 }
 
@@ -122,6 +164,18 @@ pub(super) fn run(
     max_requests: usize,
 ) {
     let _poison = PoisonOnPanic(&state);
+    // Built first so that its `Drop` completes queued requests on every exit,
+    // including the early return below; it is dropped before `_poison`.
+    let mut inbox = LaneInbox {
+        state: &state,
+        receiver,
+        depth,
+        waiting: VecDeque::new(),
+        flying: HashMap::new(),
+        drains: Vec::new(),
+        done: Vec::new(),
+        disconnected: false,
+    };
     let mut driver = lane.driver.lock();
     #[cfg(test)]
     let node = driver.node;
@@ -145,16 +199,6 @@ pub(super) fn run(
     drop(driver);
     let mut sleeping_cache = None;
     let mut pin_pending = state.pin_read_lanes;
-    let mut inbox = LaneInbox {
-        state: &state,
-        receiver,
-        depth,
-        waiting: VecDeque::new(),
-        flying: HashMap::new(),
-        drains: Vec::new(),
-        done: Vec::new(),
-        disconnected: false,
-    };
     'lane: loop {
         if inbox.waiting.is_empty() && inbox.flying.is_empty() {
             if inbox.disconnected || state.failed.load(Ordering::Acquire) {
@@ -296,6 +340,11 @@ pub(super) fn run(
         }
         sleeping_cache = Some(cache);
     }
+    // Fail queued and unsubmitted requests now, before the locks and the I/O
+    // shutdown below; only submitted requests wait for that shutdown. The
+    // inbox's `Drop` repeats this on the early returns.
+    inbox.close();
+    inbox.fail_waiting("live read lane stopped");
     let mut driver = lane.driver.lock();
     let Some(mut cache) = sleeping_cache.take().or_else(|| driver.live_cache.take()) else {
         state.poison();

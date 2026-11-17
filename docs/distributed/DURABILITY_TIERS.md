@@ -5,7 +5,7 @@ No wire format and no disk format changes. `ReceiptDurability` is an in-memory l
 
 ## Decision
 
-Distributed Tidehunter offers two write-acknowledgement tiers. The default is `native`, the contract of native Tidehunter. Both tiers use one frontier tracker and one syncer per owner WAL. They differ only in the acknowledgement condition.
+Distributed Tidehunter offers two write-acknowledgement tiers. `native`, the contract of native Tidehunter (page-cache acknowledgement), is the default everywhere: in the engine (`DurabilityConfig::default`), in the kv-research adapter, and in the comparison campaign (`cloud_campaign.DEFAULT_DURABILITY_TIER`, used by a job or spec that names no tier). `synchronous` is the stricter option and stays available, unchanged, when selected explicitly; reviewed campaign specs generated with the earlier synchronous matrix default name it explicitly. The crash-loss difference: after an owner kernel crash or power loss, `native` can lose acknowledged batches above the owner's synced frontier, while `synchronous` loses none (see the failure matrix). Both tiers use one frontier tracker and one syncer per owner WAL. They differ only in the acknowledgement condition.
 
 | | `native` (default) | `synchronous` |
 |---|---|---|

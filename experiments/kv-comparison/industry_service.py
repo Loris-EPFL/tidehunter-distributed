@@ -114,7 +114,12 @@ def settings(endpoint, backend):
     return result
 
 
-def evidence(backend, endpoints, complete=True):
+def evidence(backend, endpoints, complete=True, ack_contract="synced"):
+    """Collect raw effective settings; `admit` checks them against `ack_contract`.
+
+    The cloud probe passes the case's contract to both calls, so this signature must accept it.
+    """
+    del ack_contract
     nodes = []
     for endpoint in endpoints:
         node = {"endpoint": endpoint, "effective_config": settings(endpoint, backend)}

@@ -29,7 +29,7 @@ fn sparse_view_survives_hole_closure_pages_history_and_compaction() {
         .writer()
         .install_live_view(upper, cut(0, 1), vec![hole])
         .unwrap();
-    let frozen = index.latest_cut();
+    let frozen = index.call_cut();
     let pin = index.pin_cut(frozen.clone()).unwrap();
     assert!(matches!(
         index.writer().prepare_image(frozen.clone()),
@@ -212,7 +212,7 @@ fn sparse_view_metadata_is_bounded_and_failed_install_preserves_live_view() {
         .writer()
         .install_live_view(upper, cut(0, 0), vec![hole])
         .unwrap();
-    let old = index.latest_cut();
+    let old = index.call_cut();
     let charged = index.stats().transient_metadata_bytes;
     assert!(charged > 0);
     let mut oversized = Vec::with_capacity(BUDGET / std::mem::size_of::<BatchVersion>() + 1);
@@ -223,7 +223,7 @@ fn sparse_view_metadata_is_bounded_and_failed_install_preserves_live_view() {
             .install_live_view(upper, cut(0, 0), oversized),
         Err(NativeIndexError::Capacity)
     ));
-    assert_eq!(index.latest_cut(), old);
+    assert_eq!(index.call_cut(), old);
     let capture = index
         .writer()
         .prepare_compacted_image(cut(0, u32::MAX), cut(0, 0))
@@ -300,7 +300,7 @@ fn standing_budget_replacements_take_no_quota_and_stay_constant() {
             .writer()
             .install_standing_live_view(upper, IndexReadCut::BeforeAll, excluded, &budget)
             .unwrap();
-        let installed = index.latest_cut();
+        let installed = index.call_cut();
         assert!(matches!(installed, IndexReadCut::Sparse(_)));
         readers.push(installed);
         assert_eq!(index.stats().transient_metadata_bytes, charge);
@@ -308,7 +308,7 @@ fn standing_budget_replacements_take_no_quota_and_stay_constant() {
         let held = usize::try_from(round).unwrap() * view;
         assert_eq!(index.stats().reader_held_view_bytes, held);
     }
-    let installed = index.latest_cut();
+    let installed = index.call_cut();
     let mut oversized = Vec::with_capacity(3);
     oversized.push(BatchVersion {
         epoch: EPOCH,
@@ -337,17 +337,166 @@ fn standing_budget_replacements_take_no_quota_and_stay_constant() {
         ),
         Err(NativeIndexError::Invalid(_))
     ));
-    assert_eq!(index.latest_cut(), installed);
+    assert_eq!(index.call_cut(), installed);
     drop(installed);
     index
         .writer()
         .install_standing_live_view(upper, IndexReadCut::BeforeAll, vec![], &budget)
         .unwrap();
-    assert_eq!(index.latest_cut(), IndexReadCut::At(upper));
+    assert_eq!(index.call_cut(), IndexReadCut::At(upper));
     assert_eq!(index.stats().reader_held_view_bytes, 8 * view);
     drop(readers);
     assert_eq!(index.stats().transient_metadata_bytes, charge);
     assert_eq!(index.stats().reader_held_view_bytes, 0);
+    drop(budget);
+    assert_eq!(index.stats().transient_metadata_bytes, 0);
+}
+
+/// A cut that leaves one read call charges its standing view to the view
+/// allowance. Cuts retained across successive publications fill it; the
+/// reader API then fails with `Capacity` while publication still succeeds.
+/// The last reference of each view releases its charge exactly once. Views
+/// held inside one read stay uncharged and are the only reader-held bytes.
+#[test]
+fn owned_standing_cuts_stay_charged_until_last_drop_and_fail_only_the_reader() {
+    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    let upper = match cut(3, 0) {
+        IndexReadCut::At(version) => version,
+        _ => unreachable!(),
+    };
+    index.writer.lock().latest = Some(upper);
+    let budget = index.reserve_standing_view_budget(2).unwrap();
+    let standing = index.stats().transient_metadata_bytes;
+    let view = view_charge(2).unwrap();
+    // Room for exactly three owner charges.
+    index.max_metadata_bytes = standing + 3 * view + view / 2;
+    let install = |index: &NativeIndex, sequence: u64| {
+        let mut excluded = Vec::with_capacity(2);
+        excluded.push(BatchVersion {
+            epoch: EPOCH,
+            sequence,
+        });
+        index
+            .writer()
+            .install_standing_live_view(upper, IndexReadCut::BeforeAll, excluded, &budget)
+            .unwrap();
+    };
+    let transient = |index: &NativeIndex| index.stats().transient_metadata_bytes;
+    let held = |index: &NativeIndex| index.stats().reader_held_view_bytes;
+    let mut owned = Vec::new();
+    for round in 0..3 {
+        install(&index, 1 + round % 2);
+        let cut = index.latest_cut().unwrap();
+        assert!(matches!(cut, IndexReadCut::Sparse(_)));
+        // A second owner of the same view shares its one charge.
+        let pin = index.pin_cut(IndexReadCut::Latest).unwrap();
+        assert_eq!(pin.cut(), cut);
+        owned.push((cut, pin));
+        assert_eq!(transient(&index), standing + owned.len() * view);
+        assert_eq!(held(&index), 0, "charged views are not reader-held");
+    }
+    install(&index, 1);
+    assert!(matches!(
+        index.latest_cut(),
+        Err(NativeIndexError::Capacity)
+    ));
+    assert!(matches!(
+        index.pin_cut(IndexReadCut::Latest),
+        Err(NativeIndexError::Capacity)
+    ));
+    assert_eq!(
+        index.retention.registrations(),
+        3,
+        "a failed pin registers nothing"
+    );
+    // Publication never takes an owner charge.
+    for round in 0..4 {
+        install(&index, 1 + round % 2);
+    }
+    assert_eq!(transient(&index), standing + 3 * view);
+    // Views held inside one read are uncharged; the installed view is not
+    // reader-held until it is replaced.
+    let in_read = index.call_cut();
+    let in_read_pin = index.pin_call_cut(IndexReadCut::Latest).unwrap();
+    assert_eq!(in_read_pin.cut(), in_read);
+    assert_eq!(held(&index), 0);
+    install(&index, 2);
+    assert_eq!(held(&index), view);
+    assert_eq!(transient(&index), standing + 3 * view);
+    // A clone keeps the shared charge; the last reference releases it once.
+    let (first, first_pin) = owned.remove(0);
+    let clone = first.clone();
+    drop(first);
+    drop(first_pin);
+    assert_eq!(transient(&index), standing + 3 * view);
+    drop(clone);
+    assert_eq!(transient(&index), standing + 2 * view);
+    // The freed room admits the installed view; it stays charged while the
+    // watermark holds it, and its replacement releases the charge.
+    let again = index.latest_cut().unwrap();
+    assert_eq!(transient(&index), standing + 3 * view);
+    drop(again);
+    drop(owned);
+    assert_eq!(transient(&index), standing + view);
+    index
+        .writer()
+        .install_standing_live_view(upper, IndexReadCut::BeforeAll, vec![], &budget)
+        .unwrap();
+    assert_eq!(transient(&index), standing);
+    assert_eq!(held(&index), view);
+    drop(in_read);
+    drop(in_read_pin);
+    assert_eq!(held(&index), 0);
+    drop(budget);
+    assert_eq!(transient(&index), 0);
+}
+
+/// A floor pin keeps the view's retention key (its stable floor) without
+/// keeping the view: once the view is replaced, only view-keeping pins count
+/// as reader-held bytes.
+#[test]
+fn floor_pin_keeps_retention_floor_without_the_view() {
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    let version = |cut: IndexReadCut| match cut {
+        IndexReadCut::At(version) => version,
+        _ => unreachable!(),
+    };
+    let (upper, floor) = (version(cut(3, 0)), version(cut(0, 0)));
+    index.writer.lock().latest = Some(upper);
+    let budget = index.reserve_standing_view_budget(2).unwrap();
+    let mut excluded = Vec::with_capacity(2);
+    excluded.push(BatchVersion {
+        epoch: EPOCH,
+        sequence: 2,
+    });
+    index
+        .writer()
+        .install_standing_live_view(upper, IndexReadCut::At(floor), excluded, &budget)
+        .unwrap();
+    let floor_pin = index.pin_call_floor(IndexReadCut::Latest).unwrap();
+    assert_eq!(floor_pin.cut(), IndexReadCut::At(floor));
+    let view_pin = index.pin_call_cut(IndexReadCut::Latest).unwrap();
+    assert!(matches!(view_pin.cut(), IndexReadCut::Sparse(_)));
+    assert_eq!(
+        index.retention.pin_counts(),
+        std::collections::BTreeMap::from([(Some(floor), 2)])
+    );
+    index
+        .writer()
+        .install_standing_live_view(upper, IndexReadCut::At(floor), vec![], &budget)
+        .unwrap();
+    assert_eq!(
+        index.stats().reader_held_view_bytes,
+        view_charge(2).unwrap()
+    );
+    drop(view_pin);
+    assert_eq!(index.stats().reader_held_view_bytes, 0);
+    assert_eq!(
+        index.retention.pin_counts(),
+        std::collections::BTreeMap::from([(Some(floor), 1)])
+    );
+    drop(floor_pin);
+    assert!(index.retention.pin_counts().is_empty());
     drop(budget);
     assert_eq!(index.stats().transient_metadata_bytes, 0);
 }
@@ -372,7 +521,7 @@ fn reserved_view_conversion_keeps_frozen_clones_charged_until_last_drop() {
         .unwrap();
     let charged = index.stats().transient_metadata_bytes;
     assert!(charged > 0 && charged < reserved);
-    let frozen = index.latest_cut();
+    let frozen = index.call_cut();
     let clone = frozen.clone();
     // Replacing the last live owner takes the same retention lock in Drop.
     // This must finish without holding that lock, even for an empty view.
@@ -485,7 +634,7 @@ fn foreign_and_undersized_reservations_reject_without_changing_view() {
         ),
         Err(NativeIndexError::Invalid(_))
     ));
-    assert_eq!(index.latest_cut(), IndexReadCut::At(upper));
+    assert_eq!(index.call_cut(), IndexReadCut::At(upper));
     assert_eq!(index.stats().transient_metadata_bytes, 0);
 }
 
@@ -527,7 +676,7 @@ fn sparse_gap_generations_merge_for_install_and_abandoned_capture() {
             .writer()
             .install_live_view(upper, cut(0, 0), excluded)
             .unwrap();
-        let frozen = index.latest_cut();
+        let frozen = index.call_cut();
         let _pin = index.pin_cut(frozen.clone()).unwrap();
         index
             .writer()
