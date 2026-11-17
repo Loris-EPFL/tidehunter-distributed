@@ -166,12 +166,25 @@ impl OwnerReceiver {
     /// Local metadata is full, so stop receiving: the bounded channel fills and
     /// control senders back off on Capacity.changed. READY independently wakes
     /// the Thread token even when its QueueReady hint cannot enter that channel.
+    /// Only for a worker with no adoption or flight progress pending.
     pub fn park_full(&self) {
+        self.note_full_park();
+        thread::park();
+    }
+
+    /// `park_full` for a worker that must still drive a pending leased
+    /// adoption and its deadline: wake after `timeout` at the latest.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn park_full_timeout(&self, timeout: Duration) {
+        self.note_full_park();
+        thread::park_timeout(timeout);
+    }
+
+    fn note_full_park(&self) {
         #[cfg(test)]
         if let Some(entered) = self.capacity.full_park.lock().take() {
             let _ = entered.try_send(());
         }
-        thread::park();
     }
 
     fn notify_capacity(&self) {

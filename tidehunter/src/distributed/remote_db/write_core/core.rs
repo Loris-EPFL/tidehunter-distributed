@@ -388,17 +388,26 @@ impl WriteCore {
         &self,
         operation: [u8; 16],
     ) -> Result<Option<IdentityEntry>, LocalDbError> {
+        self.lookup_identity_at(operation)
+            .map(|(identity, _)| identity)
+    }
+
+    /// `lookup_identity` plus the identity shard's retirement generation,
+    /// captured with the table miss and before the history snapshot. A miss
+    /// is a valid first-write decision at allocation only while the generation
+    /// is unchanged: a concurrent writer of the same operation may otherwise
+    /// have published and been retired into a newer history root meanwhile.
+    pub(super) fn lookup_identity_at(
+        &self,
+        operation: [u8; 16],
+    ) -> Result<(Option<IdentityEntry>, u64), LocalDbError> {
         self.ensure_healthy()?;
-        if let Some(identity) = self
-            .identities
-            .with_operation(operation, |entries| entries.get(&operation).copied())
+        let (identity, retirements) = self.identities.lookup(operation);
+        if identity.is_some()
+            || self.config.history_persistence
+                == crate::distributed::storage::HistoryPersistence::WalReplay
         {
-            return Ok(Some(identity));
-        }
-        if self.config.history_persistence
-            == crate::distributed::storage::HistoryPersistence::WalReplay
-        {
-            return Ok(None);
+            return Ok((identity, retirements));
         }
         let history = self
             .publisher
@@ -418,12 +427,13 @@ impl WriteCore {
             .inspect_err(|error| self.fail(LocalDbError::new(error.message())))?
             .flatten();
         self.ensure_healthy()?;
-        Ok(receipt.map(|receipt| IdentityEntry {
+        let identity = receipt.map(|receipt| IdentityEntry {
             version: receipt.version(),
             digest: Some(receipt.digest()),
             seq: receipt.version().sequence,
             class: IdentityClass::Recent,
-        }))
+        });
+        Ok((identity, retirements))
     }
 
     /// Resident completed/in-flight write bookkeeping, excluding pageable

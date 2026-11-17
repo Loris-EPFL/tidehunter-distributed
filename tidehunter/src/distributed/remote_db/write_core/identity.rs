@@ -21,13 +21,23 @@ pub(super) struct IdentityEntry {
 
 type Identities = HashMap<[u8; 16], IdentityEntry>;
 
+#[derive(Default)]
+struct IdentityShard {
+    entries: Identities,
+    /// Advances, under this shard's lock, whenever checkpoint retirement
+    /// removes an entry. A negative lookup captured at generation `g` is still
+    /// valid under the same lock only while the generation is `g`: otherwise
+    /// a retired identity may have moved to a newer receipt-history root.
+    retirements: u64,
+}
+
 pub(super) struct IdentityTable {
-    shards: Box<[Mutex<Identities>]>,
+    shards: Box<[Mutex<IdentityShard>]>,
     hash: RandomState,
 }
 
 pub(super) struct LockedIdentities<'a> {
-    shards: Vec<(usize, MutexGuard<'a, Identities>)>,
+    shards: Vec<(usize, MutexGuard<'a, IdentityShard>)>,
     hash: &'a RandomState,
     mask: usize,
 }
@@ -36,7 +46,7 @@ impl IdentityTable {
     pub(super) fn new(parallelism: usize, hash: RandomState) -> Self {
         Self {
             shards: (0..shard_count(parallelism))
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| Mutex::new(IdentityShard::default()))
                 .collect(),
             hash,
         }
@@ -47,8 +57,17 @@ impl IdentityTable {
         operation: [u8; 16],
         apply: impl FnOnce(&mut Identities) -> T,
     ) -> T {
-        let index = self.hash.hash_one(operation) as usize & (self.shards.len() - 1);
-        apply(&mut self.shards[index].lock())
+        apply(&mut self.shard(operation).lock().entries)
+    }
+
+    /// The entry and its shard's retirement generation, read under one lock.
+    pub(super) fn lookup(&self, operation: [u8; 16]) -> (Option<IdentityEntry>, u64) {
+        let shard = self.shard(operation).lock();
+        (shard.entries.get(&operation).copied(), shard.retirements)
+    }
+
+    fn shard(&self, operation: [u8; 16]) -> &Mutex<IdentityShard> {
+        &self.shards[self.hash.hash_one(operation) as usize & (self.shards.len() - 1)]
     }
 
     pub(super) fn with_operations<T>(
@@ -88,7 +107,8 @@ impl IdentityTable {
         let mut returned = 0;
         for shard in &self.shards {
             let mut shard = shard.lock();
-            shard.retain(|operation, entry| {
+            let held = shard.entries.len();
+            shard.entries.retain(|operation, entry| {
                 if entry.class != IdentityClass::Recent
                     && cut.is_some_and(|cut| entry.version <= cut)
                 {
@@ -103,14 +123,17 @@ impl IdentityTable {
                         *version == entry.version && Some(*digest) == entry.digest
                     })
             });
+            if shard.entries.len() != held {
+                shard.retirements += 1;
+            }
             // Same policy as DependencyRegistry cleanup, on this cold path:
             // retired completed identities must not pin a shard's historical
             // peak, so retained buckets stay tied to live entries.
-            if shard.is_empty() && shard.capacity() != 0 {
-                *shard = HashMap::new();
-            } else if shard.capacity() > shard.len().saturating_mul(4) {
-                let len = shard.len();
-                shard.shrink_to(len);
+            if shard.entries.is_empty() && shard.entries.capacity() != 0 {
+                shard.entries = HashMap::new();
+            } else if shard.entries.capacity() > shard.entries.len().saturating_mul(4) {
+                let len = shard.entries.len();
+                shard.entries.shrink_to(len);
             }
         }
         returned
@@ -120,7 +143,7 @@ impl IdentityTable {
     pub(super) fn resident_bytes(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| Self::shard_bytes(&shard.lock()))
+            .map(|shard| Self::shard_bytes(&shard.lock().entries))
             .sum()
     }
 
@@ -129,7 +152,11 @@ impl IdentityTable {
     pub(super) fn try_resident_bytes(&self) -> Option<usize> {
         self.shards
             .iter()
-            .map(|shard| shard.try_lock().map(|shard| Self::shard_bytes(&shard)))
+            .map(|shard| {
+                shard
+                    .try_lock()
+                    .map(|shard| Self::shard_bytes(&shard.entries))
+            })
             .sum()
     }
 
@@ -144,6 +171,7 @@ impl IdentityTable {
             .map(|shard| {
                 shard
                     .lock()
+                    .entries
                     .values()
                     .filter(|entry| entry.class == class)
                     .count()
@@ -153,7 +181,7 @@ impl IdentityTable {
 }
 
 impl LockedIdentities<'_> {
-    fn entries(&mut self, operation: [u8; 16]) -> &mut Identities {
+    fn locked(&mut self, operation: [u8; 16]) -> &mut IdentityShard {
         let index = self.hash.hash_one(operation) as usize & self.mask;
         let position = self.shards.partition_point(|(shard, _)| *shard < index);
         // Only operations in the prelocked window reach these accessors.
@@ -165,11 +193,16 @@ impl LockedIdentities<'_> {
     }
 
     pub(super) fn get(&mut self, operation: [u8; 16]) -> Option<IdentityEntry> {
-        self.entries(operation).get(&operation).copied()
+        self.locked(operation).entries.get(&operation).copied()
+    }
+
+    /// The shard's retirement generation, stable while this window is locked.
+    pub(super) fn retirements(&mut self, operation: [u8; 16]) -> u64 {
+        self.locked(operation).retirements
     }
 
     pub(super) fn insert(&mut self, operation: [u8; 16], entry: IdentityEntry) {
-        self.entries(operation).insert(operation, entry);
+        self.locked(operation).entries.insert(operation, entry);
     }
 }
 
@@ -210,7 +243,12 @@ mod tests {
         };
         assert_eq!(table.checkpoint(Some(below), &recent), 0);
         table.with_operation([1; 16], |entries| assert_eq!(entries.len(), 1));
+        // Only a removal advances the shard's retirement generation.
+        assert_eq!(table.lookup([1; 16]).1, 0);
         assert_eq!(table.checkpoint(Some(version), &recent), 1);
+        let (entry, retirements) = table.lookup([1; 16]);
+        assert!(entry.is_none());
+        assert_eq!(retirements, 1);
         // Retirement also frees the emptied shard's buckets, so resident
         // bookkeeping does not keep a lifetime high-water mark.
         table.with_operation([1; 16], |entries| {

@@ -584,6 +584,64 @@ fn concurrent_first_writes_of_one_id_allocate_once() {
     db.shutdown().unwrap();
 }
 
+/// PR #63 P1: with receipt history, caller A misses the table and history and
+/// is held after its first-write grant. Caller B then allocates the same
+/// operation, publishes, and a checkpoint retires B's identity into history.
+/// A's stale miss must not allocate a second version: it repeats the lookup,
+/// takes the retry path and returns B's outcome, or the conflict error when
+/// its batch differs.
+#[test]
+fn negative_identity_lookup_revalidates_after_checkpoint_retirement() {
+    use crate::distributed::storage::HistoryPersistence;
+    for same_batch in [true, false] {
+        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+        let mut db = fixture.open();
+        let core = Arc::clone(&db.core);
+        let operation = fixture.operation(0, 1);
+        let original = vec![put(1, 1), put(2, 1)];
+        let late_batch = if same_batch {
+            original.clone()
+        } else {
+            vec![put(1, 9)]
+        };
+        let (hook, granted, resume) = gate();
+        core.test_hooks.lock().after_grant = Some(hook);
+        let late = spawn_write(&core, operation, late_batch);
+        granted.recv_timeout(WAIT).unwrap();
+        let winner = core.write(operation, original, None).unwrap();
+        assert_eq!(winner, version(&core, 0));
+        core.flush_index().unwrap();
+        assert!(
+            core.identities
+                .with_operation(operation, |entries| entries.get(&operation).copied())
+                .is_none(),
+            "checkpoint retired the winner's identity into receipt history"
+        );
+        assert_eq!(core.next_sequence(), 1);
+
+        resume.send(()).unwrap();
+        let result = late.recv_timeout(WAIT).unwrap();
+        if same_batch {
+            assert_eq!(result.unwrap(), winner);
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.message().contains("retry changed original batch"),
+                "{error}"
+            );
+            assert_eq!(error.uncertain_version, None);
+        }
+        assert_eq!(core.next_sequence(), 1);
+        core.ensure_healthy().unwrap();
+        core.wait_settled().unwrap();
+        assert_eq!(core.admission.charges(), AdmissionCharges::default());
+        assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
+        assert_eq!(value(&mut db, 2), Some(vec![1; 32]));
+        drop(core);
+        db.shutdown().unwrap();
+    }
+}
+
 #[test]
 fn sequence_zero_flush_checkpoint_and_publication_wait() {
     let fixture = Fixture::new();
@@ -894,6 +952,154 @@ fn flush_waits_only_for_writes_allocated_before_it() {
     assert_eq!(core.published_next(), 3);
     for key in 1..=3u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
+    }
+    drop(core);
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+}
+
+/// PR #62 P1, exact schedule. Window 3; keys A = 1, B = 2. Sequence 0 (owner
+/// 0) writes A/B, 1 (owner 1) writes A, 2 (owner 2) writes B/A, so 2 depends
+/// on 0 and 1 and parks behind 0 first. With owner 0 held, 1 and then 2 become
+/// durable and park. Owner 0's receipt then wakes both in one publication
+/// call: 2 must not move to 1 and back, so the three-slot work bound holds.
+#[test]
+fn fan_in_dependent_publishes_once_within_three_slot_window() {
+    let fixture = Fixture::new_with_config(128, shape(), 2, |config| {
+        config.max_pending_batches = 3;
+    });
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let held_client = Arc::clone(&core.clients[0].client);
+    let held = held_client.lock();
+    let first = core
+        .submit(fixture.operation(0, 1), vec![put(1, 1), put(2, 1)])
+        .unwrap();
+    assert_eq!(first, version(&core, 0));
+    let second = core
+        .submit(fixture.operation(1, 2), vec![put(1, 2)])
+        .unwrap();
+    assert_eq!(second, version(&core, 1));
+    wait_for("sequence 1 durable behind 0", || {
+        core.publication_settled(1)
+    });
+    let third = core
+        .submit(fixture.operation(2, 3), vec![put(2, 3), put(1, 3)])
+        .unwrap();
+    assert_eq!(third, version(&core, 2));
+    wait_for("sequence 2 durable behind 0", || {
+        core.publication_settled(2)
+    });
+    assert_eq!(core.sequencer.resolution(0), Some(Resolution::Ready));
+    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Durable));
+    assert_eq!(core.sequencer.resolution(2), Some(Resolution::Durable));
+    assert_eq!(
+        core.publisher.lock().dependents.get(&0).map(Vec::as_slice),
+        Some(&[1u64, 2][..])
+    );
+
+    drop(held);
+    db.drain().unwrap();
+    core.ensure_healthy().unwrap();
+    for sequence in 0..3 {
+        assert_eq!(
+            core.sequencer.resolution(sequence),
+            Some(Resolution::Published)
+        );
+    }
+    assert_eq!(core.published_next(), 3);
+    assert!(core.publisher.lock().dependents.is_empty());
+    assert_eq!(value(&mut db, 1), Some(vec![3; 32]));
+    assert_eq!(value(&mut db, 2), Some(vec![3; 32]));
+    core.wait_settled().unwrap();
+    drop(core);
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+}
+
+/// Seeded fan-in/fan-out over small windows: each round holds a random owner
+/// subset, admits a full window of random multi-key batches on random owners,
+/// then releases the held owners in random order. Every batch publishes, the
+/// database stays healthy, and each key holds its highest-sequence write.
+#[test]
+fn random_fan_in_fan_out_windows_publish_every_batch() {
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::{Rng, SeedableRng};
+
+    const WINDOW: usize = 4;
+    const OWNERS: usize = 5;
+    const KEYS: u32 = 3;
+    let fixture = Fixture::new_with_config(128, shape(), 2, |config| {
+        config.max_pending_batches = WINDOW;
+    });
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let mut rng = StdRng::seed_from_u64(0x62_fa_9f);
+    let mut latest = [None::<u8>; KEYS as usize];
+    let mut seed = 0u64;
+    for round in 0..16u8 {
+        let window = rng.gen_range(2..=WINDOW);
+        let clients: Vec<_> = (0..OWNERS)
+            .map(|owner| Arc::clone(&core.clients[owner].client))
+            .collect();
+        let mut held: Vec<_> = (0..OWNERS)
+            .filter(|_| rng.gen_bool(0.5))
+            .map(|owner| (owner, clients[owner].lock()))
+            .collect();
+        let mut batches = Vec::with_capacity(window);
+        for slot in 0..window {
+            let owner = rng.gen_range(0..OWNERS);
+            let mut keys: Vec<u32> = (0..KEYS).collect();
+            keys.shuffle(&mut rng);
+            keys.truncate(rng.gen_range(1..=KEYS as usize));
+            let marker = round * WINDOW as u8 + slot as u8 + 1;
+            seed += 1;
+            let version = core
+                .submit(
+                    fixture.operation(owner as u32, seed),
+                    keys.iter().map(|&key| put(key, marker)).collect(),
+                )
+                .unwrap();
+            batches.push((owner, version.sequence));
+            for key in keys {
+                latest[key as usize] = Some(marker);
+            }
+        }
+        for &(owner, sequence) in &batches {
+            if held.iter().all(|(held, _)| *held != owner) {
+                wait_for("unheld owner batch settled", || {
+                    core.publication_settled(sequence)
+                });
+            }
+        }
+        held.shuffle(&mut rng);
+        while let Some((owner, guard)) = held.pop() {
+            drop(guard);
+            for &(_, sequence) in batches.iter().filter(|batch| batch.0 == owner) {
+                wait_for("released owner batch settled", || {
+                    core.publication_settled(sequence)
+                });
+            }
+        }
+        db.drain().unwrap();
+        core.ensure_healthy().unwrap();
+        for &(_, sequence) in &batches {
+            assert_eq!(
+                core.sequencer.resolution(sequence),
+                Some(Resolution::Published),
+                "round {round}"
+            );
+        }
+        assert!(core.publisher.lock().dependents.is_empty(), "round {round}");
+        core.wait_settled().unwrap();
+        for key in 0..KEYS {
+            assert_eq!(
+                value(&mut db, key),
+                latest[key as usize].map(|marker| vec![marker; 32]),
+                "round {round} key {key}"
+            );
+        }
     }
     drop(core);
     db.flush_index().unwrap();

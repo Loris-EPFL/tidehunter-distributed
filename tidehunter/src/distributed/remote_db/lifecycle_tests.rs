@@ -1290,33 +1290,54 @@ fn skewed_submit_window_spills_one_partition_without_lifetime_rejection() {
 fn publication_failure_fences_and_recovers_dispatched_successor_group() {
     let fixture = Fixture::new();
     let db = fixture.open();
+    // Every batch writes key 1, so each generation depends on the previous
+    // one. The predecessor on owner 1 stays held, so the owner-0 groups become
+    // durable and park before the failing publication can run. Publication
+    // runs on the owner-0 worker after its receipt: without this order, that
+    // worker can harvest the first group's reply and fail-stop before it has
+    // sent the successor group at all.
+    let predecessor_connection = std::sync::Arc::clone(&db.core.clients[1].client);
+    let held_predecessor = predecessor_connection.lock();
+    let mut identities = Vec::new();
+    let operation = fixture.operation(1, 100);
+    let version = db.submit(operation, vec![put(100)]).unwrap();
+    identities.push((operation, 100, version));
     let connection = std::sync::Arc::clone(&db.core.clients[0].client);
     let held = connection.lock();
-    let mut identities = Vec::new();
     for key in 0..4u32 {
         let operation = fixture.operation(0, u64::from(key));
         let version = db.submit(operation, vec![put(key as u8)]).unwrap();
-        identities.push((operation, version));
+        identities.push((operation, key as u8, version));
     }
-    // A native publication callback error for the first generation: already
-    // dispatched successor work can outlive it. Recovery must reconcile its
-    // storage outcome rather than discard it.
-    db.core.test_hooks.lock().fail_publication = Some(identities[0].1.sequence);
+    // A native publication callback error for the first owner-0 generation:
+    // its already dispatched, durable successor group outlives it. Recovery
+    // must reconcile that storage outcome rather than discard it.
+    db.core.test_hooks.lock().fail_publication = Some(identities[1].2.sequence);
     drop(held);
+    // Liveness guard only: both owner-0 groups are durable and parked.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for (_, _, version) in &identities[1..] {
+        while !db.core.publication_settled(version.sequence) {
+            db.core.ensure_healthy().unwrap();
+            assert!(Instant::now() < deadline, "owner-0 receipts not processed");
+            thread::yield_now();
+        }
+    }
+    drop(held_predecessor);
     assert!(db.drain().is_err());
     assert!(db.core.ensure_healthy().is_err());
     assert!(db.ensure_healthy().is_err());
+    // The failed publication call returns before it advances the floor, so
+    // the predecessor published in that same call is not installed either.
     assert_eq!(db.core.published_next(), 0);
     assert!(db.core.admission.charges().slots > 0);
     drop(db);
 
     let mut reopened = fixture.open();
-    assert_eq!(reopened.recovery_stats().tail_batches, 4);
-    for (operation, version) in identities {
+    assert_eq!(reopened.recovery_stats().tail_batches, 5);
+    for (operation, value, version) in identities {
         assert_eq!(
-            reopened
-                .submit(operation, vec![put(version.sequence as u8)])
-                .unwrap(),
+            reopened.submit(operation, vec![put(value)]).unwrap(),
             version
         );
     }
