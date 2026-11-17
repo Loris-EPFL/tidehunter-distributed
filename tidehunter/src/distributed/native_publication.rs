@@ -383,8 +383,45 @@ impl PreparedNativePublication {
         self,
         sink: &mut S,
     ) -> Result<(), NativePublicationError<S::Error>> {
+        self.stage(None, sink).map(drop)
+    }
+
+    /// Routing and exact reference of every member, in operation order. Mixed-
+    /// cut recovery (option C spec §8.1 step 5) classifies each member by its
+    /// cell's coverage before anything is staged.
+    pub(crate) fn members(&self) -> &[(PendingOp, ValueRecordReference)] {
+        &self.operations
+    }
+
+    /// Mixed-cut recovery only (option C spec §8.1 steps 5-6): stage, in one
+    /// committed native transaction, exactly the members with `apply[i]`
+    /// set; the caller has compared every other member with its cell base.
+    /// The whole batch was authenticated by `prepare_authenticated` and keeps
+    /// its original id, digest, address and operation indexes; no subset
+    /// batch or digest is formed. Returns the number of staged members.
+    pub(crate) fn publish_members<S: NativePendingSink>(
+        self,
+        apply: &[bool],
+        sink: &mut S,
+    ) -> Result<usize, NativePublicationError<S::Error>> {
+        if apply.len() != self.operations.len() {
+            return Err(NativePublicationError::SkippedOperation);
+        }
+        self.stage(Some(apply), sink)
+    }
+
+    /// Stage every member, or those selected by `apply` (same length).
+    fn stage<S: NativePendingSink>(
+        self,
+        apply: Option<&[bool]>,
+        sink: &mut S,
+    ) -> Result<usize, NativePublicationError<S::Error>> {
         let transaction = Transaction::default();
-        for (pending, reference) in self.operations {
+        let mut staged = 0;
+        for (n, (pending, reference)) in self.operations.into_iter().enumerate() {
+            if apply.is_some_and(|apply| !apply[n]) {
+                continue;
+            }
             let keyspace = pending.ks();
             let cell = pending.cell_id().clone();
             let mut installed = false;
@@ -405,9 +442,10 @@ impl PreparedNativePublication {
             if !installed {
                 return Err(NativePublicationError::SkippedOperation);
             }
+            staged += 1;
         }
         transaction.commit();
-        Ok(())
+        Ok(staged)
     }
 }
 

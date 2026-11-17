@@ -20,7 +20,7 @@ pub(super) struct CellFile {
     pub floor: IndexReadCut,
 }
 
-fn cell_digest(bytes: &[u8]) -> [u8; 32] {
+pub(super) fn cell_digest(bytes: &[u8]) -> [u8; 32] {
     // Cell frames use BLAKE2b-32, not truncated BLAKE2b-512.
     let hash = blake2b_simd::Params::new().hash_length(32).hash(bytes);
     let mut digest = [0; 32];
@@ -323,7 +323,7 @@ fn output_parts(path: &Path) -> Result<(&Path, &str), NativeIndexError> {
 }
 
 /// The shared container may exceed one GiB; roots and individual frames may not.
-fn map_file(file: &File, maximum: Option<u64>) -> Result<Bytes, NativeIndexError> {
+pub(super) fn map_file(file: &File, maximum: Option<u64>) -> Result<Bytes, NativeIndexError> {
     let length = file.metadata()?.len();
     if length < 8 || length > isize::MAX as u64 || maximum.is_some_and(|maximum| length > maximum) {
         return Err(NativeIndexError::Invalid("image size"));
@@ -396,7 +396,7 @@ fn open_frame(
     Ok(frame)
 }
 
-fn frame_payload(mapped: &Bytes) -> Result<Bytes, NativeIndexError> {
+pub(super) fn frame_payload(mapped: &Bytes) -> Result<Bytes, NativeIndexError> {
     let payload = CrcFrame::read_from_bytes(mapped, 0)
         .map_err(|_| NativeIndexError::Invalid("index image CRC"))?;
     if payload.len() + 8 != mapped.len() {
@@ -530,128 +530,207 @@ pub(super) fn open(
     Ok(index)
 }
 
-struct Rows<'a> {
+/// The immutable inputs of one cell encoding: an optional base and `N`
+/// frozen overlays. Exact mode has its one frozen overlay (`N = 1`); option C
+/// has the captured carry and the captured active overlay (`N = 2`, spec
+/// §5.1); the new active overlay is never encoded. The overlay count is a
+/// constant so the Exact path compiles to the single-overlay merge. Versions
+/// are distinct across overlays (C2). A base version equal to an overlay
+/// version is taken from the base, as the single-overlay encoder always did.
+#[derive(Clone, Copy)]
+struct CellSources<'a, const N: usize> {
     base: Option<&'a SortedBlock>,
-    position: usize,
-    overlay: std::iter::Peekable<
-        std::collections::btree_map::Iter<'a, Bytes, NativeVersions<ValueRecordReference>>,
-    >,
+    overlays: [Option<&'a Overlay<ValueRecordReference>>; N],
 }
 
-impl<'a> Rows<'a> {
-    fn new(cell: &'a FrozenCell) -> Self {
+impl<'a> CellSources<'a, 1> {
+    fn frozen(cell: &'a FrozenCell) -> Self {
         Self {
             base: cell.base.as_ref(),
-            position: 0,
-            overlay: cell.overlay.iter().peekable(),
+            overlays: [Some(&*cell.overlay)],
         }
     }
 }
 
-impl<'a> Iterator for Rows<'a> {
-    type Item = (&'a [u8], &'a [u8], &'a [ValueRecordReference]);
+impl<'a> CellSources<'a, 2> {
+    fn captured(source: &CellEncodeSource<'a>) -> Self {
+        let active: &'a std::sync::Arc<Overlay<ValueRecordReference>> = source.active;
+        Self {
+            base: source.base,
+            overlays: [source.carry, Some(&**active)],
+        }
+    }
+}
+
+type OverlayRows<'a> = std::iter::Peekable<
+    std::collections::btree_map::Iter<'a, Bytes, NativeVersions<ValueRecordReference>>,
+>;
+
+/// One merged row: its key, the encoded base versions and the versions of
+/// each overlay source. A source without the key contributes nothing.
+struct Row<'a, const N: usize> {
+    key: &'a [u8],
+    base: &'a [u8],
+    overlays: [&'a [ValueRecordReference]; N],
+}
+
+/// Sorted merge of the base rows and the rows of every overlay source by key:
+/// each key once, with the versions of every source that holds it.
+struct Rows<'a, const N: usize> {
+    base: Option<&'a SortedBlock>,
+    position: usize,
+    overlays: [Option<OverlayRows<'a>>; N],
+}
+
+impl<'a, const N: usize> Rows<'a, N> {
+    fn new(sources: CellSources<'a, N>) -> Self {
+        Self {
+            base: sources.base,
+            position: 0,
+            overlays: sources
+                .overlays
+                .map(|overlay| overlay.map(|overlay| overlay.iter().peekable())),
+        }
+    }
+}
+
+impl<'a, const N: usize> Iterator for Rows<'a, N> {
+    type Item = Row<'a, N>;
     fn next(&mut self) -> Option<Self::Item> {
         let base = self
             .base
             .filter(|base| self.position < base.count)
             .map(|base| base.entry(self.position));
-        let overlay = self.overlay.peek();
-        match (base, overlay) {
-            (None, None) => None,
-            (Some((key, versions)), None) => {
-                self.position += 1;
-                Some((key, versions, &[]))
+        // One key comparison per source: track which sources hold the
+        // smallest key while finding it.
+        let mut key = base.map(|(key, _)| key);
+        let mut in_base = base.is_some();
+        let mut holders = [false; N];
+        for (source, rows) in self.overlays.iter_mut().enumerate() {
+            let Some(&(other, _)) = rows.as_mut().and_then(OverlayRows::peek) else {
+                continue;
+            };
+            let other: &'a [u8] = &other[..];
+            match key.map(|key| other.cmp(key)) {
+                Some(Ordering::Greater) => {}
+                Some(Ordering::Equal) => holders[source] = true,
+                Some(Ordering::Less) | None => {
+                    key = Some(other);
+                    in_base = false;
+                    holders = [false; N];
+                    holders[source] = true;
+                }
             }
-            (None, Some(_)) => self
-                .overlay
-                .next()
-                .map(|(key, values)| (key.as_ref(), &[][..], values.as_slice())),
-            (Some((key, versions)), Some((other, _))) => match key.cmp(other.as_ref()) {
-                Ordering::Less => {
-                    self.position += 1;
-                    Some((key, versions, &[]))
-                }
-                Ordering::Greater => self
-                    .overlay
-                    .next()
-                    .map(|(key, values)| (key.as_ref(), &[][..], values.as_slice())),
-                Ordering::Equal => {
-                    self.position += 1;
-                    let (_, values) = self.overlay.next().unwrap();
-                    Some((key, versions, values))
-                }
-            },
         }
+        let key = key?;
+        let mut row = Row {
+            key,
+            base: &[],
+            overlays: [&[]; N],
+        };
+        if in_base && let Some((_, versions)) = base {
+            self.position += 1;
+            row.base = versions;
+        }
+        for ((slot, rows), holds) in row.overlays.iter_mut().zip(&mut self.overlays).zip(holders) {
+            if holds && let Some((_, values)) = rows.as_mut().and_then(Iterator::next) {
+                *slot = values.as_slice();
+            }
+        }
+        Some(row)
     }
 }
 
-struct Versions<'a> {
+/// Ascending merge of one row's retained versions from the base and every
+/// overlay source. A base version equal to an overlay version is taken from
+/// the base and both advance, as in the single-overlay encoder. An equal
+/// version in two overlays breaks the C2 invariant that versions are distinct
+/// across sources, so it fails the encoding instead of choosing one.
+struct Versions<'a, const N: usize> {
     base: std::slice::ChunksExact<'a, u8>,
-    overlay: std::slice::Iter<'a, ValueRecordReference>,
-    a: Option<ValueRecordReference>,
-    b: Option<ValueRecordReference>,
+    overlays: [std::slice::Iter<'a, ValueRecordReference>; N],
+    base_head: Option<ValueRecordReference>,
+    heads: [Option<ValueRecordReference>; N],
 }
 
-impl<'a> Versions<'a> {
-    fn new(base: &'a [u8], overlay: &'a [ValueRecordReference]) -> Self {
-        let mut result = Self {
-            base: base.chunks_exact(REFERENCE_BYTES),
-            overlay: overlay.iter(),
-            a: None,
-            b: None,
-        };
-        result.a = result
+impl<'a, const N: usize> Versions<'a, N> {
+    fn new(base: &'a [u8], overlays: [&'a [ValueRecordReference]; N]) -> Self {
+        let mut base = base.chunks_exact(REFERENCE_BYTES);
+        let mut overlays = overlays.map(<[ValueRecordReference]>::iter);
+        let base_head = base
+            .next()
+            .map(|bytes| decode_reference(bytes).expect("validated immutable reference"));
+        let heads = std::array::from_fn(|n| overlays[n].next().copied());
+        Self {
+            base,
+            overlays,
+            base_head,
+            heads,
+        }
+    }
+
+    fn advance_base(&mut self) {
+        self.base_head = self
             .base
             .next()
             .map(|bytes| decode_reference(bytes).expect("validated immutable reference"));
-        result.b = result.overlay.next().copied();
-        result
+    }
+
+    fn advance_overlay(&mut self, source: usize) {
+        self.heads[source] = self.overlays[source].next().copied();
     }
 }
 
-impl Iterator for Versions<'_> {
-    type Item = ValueRecordReference;
+impl<const N: usize> Iterator for Versions<'_, N> {
+    type Item = Result<ValueRecordReference, NativeIndexError>;
     fn next(&mut self) -> Option<Self::Item> {
-        let result = match (self.a, self.b) {
-            (None, None) => return None,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (Some(a), Some(b)) => {
-                if a.mutation_version() <= b.mutation_version() {
-                    a
-                } else {
-                    b
+        let mut lowest: Option<(usize, ValueRecordReference)> = None;
+        for (source, head) in self.heads.iter().enumerate() {
+            let Some(head) = *head else { continue };
+            match lowest.map(|(_, low)| low.mutation_version().cmp(&head.mutation_version())) {
+                Some(Ordering::Less) => {}
+                Some(Ordering::Equal) => {
+                    return Some(Err(NativeIndexError::Invalid(
+                        "version repeated across overlay sources",
+                    )));
                 }
+                Some(Ordering::Greater) | None => lowest = Some((source, head)),
+            }
+        }
+        let result = match (self.base_head, lowest) {
+            (None, None) => return None,
+            (Some(base), None) => {
+                self.advance_base();
+                base
+            }
+            (Some(base), Some((source, overlay)))
+                if base.mutation_version() <= overlay.mutation_version() =>
+            {
+                if base.mutation_version() == overlay.mutation_version() {
+                    self.advance_overlay(source);
+                }
+                self.advance_base();
+                base
+            }
+            (_, Some((source, overlay))) => {
+                self.advance_overlay(source);
+                overlay
             }
         };
-        if self
-            .a
-            .is_some_and(|a| a.mutation_version() == result.mutation_version())
-        {
-            self.a = self
-                .base
-                .next()
-                .map(|bytes| decode_reference(bytes).expect("validated immutable reference"));
-        }
-        if self
-            .b
-            .is_some_and(|b| b.mutation_version() == result.mutation_version())
-        {
-            self.b = self.overlay.next().copied();
-        }
-        Some(result)
+        Some(Ok(result))
     }
 }
 
-fn retained<'a>(
-    base: &'a [u8],
-    overlay: &'a [ValueRecordReference],
+fn retained<'a, const N: usize>(
+    row: &Row<'a, N>,
     cut: &IndexReadCut,
     floor: &IndexReadCut,
-) -> Versions<'a> {
+) -> Versions<'a, N> {
     // Preserve one anchor at/before the floor, including a tombstone, and every
     // later version. Binary-search old histories instead of scanning discarded
-    // versions once per serialization pass.
+    // versions once per serialization pass. The anchor is the newest one of
+    // every source, so the selection equals that of the merged history.
+    let base = row.base;
     let count = base.len() / REFERENCE_BYTES;
     let reference = |n| {
         decode_reference(&base[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
@@ -659,27 +738,56 @@ fn retained<'a>(
     };
     let at_floor = lower_bound_by(count, |n| floor.contains(&reference(n)));
     let base_anchor = (at_floor > 0).then(|| reference(at_floor - 1));
-    let overlay_anchor = matching_prefix(overlay, |value| floor.contains(value))
-        .last()
-        .copied();
-    let anchor = newest(base_anchor, overlay_anchor).map(|value| value.mutation_version());
+    let anchor = row
+        .overlays
+        .iter()
+        .fold(base_anchor, |anchor, overlay| {
+            let overlay_anchor = matching_prefix(overlay, |value| floor.contains(value))
+                .last()
+                .copied();
+            newest(anchor, overlay_anchor)
+        })
+        .map(|value| value.mutation_version());
     let base_start = lower_bound_by(count, |n| {
         anchor.is_some_and(|anchor| reference(n).mutation_version() < anchor)
     });
     let base_end = lower_bound_by(count, |n| cut.contains(&reference(n)));
-    let overlay_start = overlay
-        .partition_point(|value| anchor.is_some_and(|anchor| value.mutation_version() < anchor));
-    let overlay_end = overlay.partition_point(|value| cut.contains(value));
+    let overlays = row.overlays.map(|overlay| {
+        let start = overlay.partition_point(|value| {
+            anchor.is_some_and(|anchor| value.mutation_version() < anchor)
+        });
+        let end = overlay.partition_point(|value| cut.contains(value));
+        &overlay[start..end]
+    });
     Versions::new(
         &base[base_start * REFERENCE_BYTES..base_end * REFERENCE_BYTES],
-        &overlay[overlay_start..overlay_end],
+        overlays,
     )
 }
 
+/// Retained version count of one row, or the duplicate-version error.
+fn retained_len<const N: usize>(
+    row: &Row<'_, N>,
+    cut: &IndexReadCut,
+    floor: &IndexReadCut,
+) -> Result<usize, NativeIndexError> {
+    retained(row, cut, floor).try_fold(0usize, |n, reference| reference.map(|_| n + 1))
+}
+
+/// Rows with a retained version. A row whose first retained version is a
+/// duplicate counts; the encoding passes then fail on it.
+fn retained_rows<const N: usize>(
+    sources: CellSources<'_, N>,
+    cut: &IndexReadCut,
+    floor: &IndexReadCut,
+) -> usize {
+    Rows::new(sources)
+        .filter(|row| retained(row, cut, floor).next().is_some())
+        .count()
+}
+
 fn has_rows(cell: &FrozenCell, cut: &IndexReadCut, floor: &IndexReadCut) -> bool {
-    *cut != IndexReadCut::BeforeAll
-        && Rows::new(cell)
-            .any(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
+    *cut != IndexReadCut::BeforeAll && retained_rows(CellSources::frozen(cell), cut, floor) != 0
 }
 
 struct WrittenCell {
@@ -687,6 +795,20 @@ struct WrittenCell {
     count: usize,
     retained_bytes: usize,
     retained_versions: usize,
+}
+
+/// One appended cell frame. `bytes` is the framed length, header included;
+/// `digest` is BLAKE2b-32 of the header, then the payload. `count`,
+/// `retained_bytes` and `retained_versions` equal what a validated
+/// `SortedBlock` of the payload reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CellFrame {
+    pub offset: u64,
+    pub bytes: u64,
+    pub digest: [u8; 32],
+    pub count: usize,
+    pub retained_bytes: usize,
+    pub retained_versions: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -698,8 +820,8 @@ struct PayloadSummary {
 
 /// Emit canonical sorted payload bytes without storing offsets or cold versions
 /// in a heap table. The same traversal supplies the CRC before immutable append.
-fn encode_cell_payload(
-    cell: &FrozenCell,
+fn encode_cell_payload<const N: usize>(
+    sources: CellSources<'_, N>,
     count: usize,
     cut: &IndexReadCut,
     floor: &IndexReadCut,
@@ -724,8 +846,8 @@ fn encode_cell_payload(
     let mut offset = 4usize
         .checked_add(count.checked_mul(4).ok_or(NativeIndexError::Capacity)?)
         .ok_or(NativeIndexError::Capacity)?;
-    for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor).count();
+    for row in Rows::new(sources) {
+        let n = retained_len(&row, cut, floor)?;
         if n == 0 {
             continue;
         }
@@ -736,7 +858,7 @@ fn encode_cell_payload(
         )?;
         let row_bytes = n
             .checked_mul(REFERENCE_BYTES)
-            .and_then(|bytes| bytes.checked_add(8 + key.len()))
+            .and_then(|bytes| bytes.checked_add(8 + row.key.len()))
             .ok_or(NativeIndexError::Capacity)?;
         offset = offset
             .checked_add(row_bytes)
@@ -744,27 +866,27 @@ fn encode_cell_payload(
     }
     let mut retained_bytes = 0usize;
     let mut retained_versions = 0usize;
-    for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor).count();
+    for row in Rows::new(sources) {
+        let n = retained_len(&row, cut, floor)?;
         if n == 0 {
             continue;
         }
         write(
-            &u32::try_from(key.len())
+            &u32::try_from(row.key.len())
                 .map_err(|_| NativeIndexError::Capacity)?
                 .to_be_bytes(),
         )?;
-        write(key)?;
+        write(row.key)?;
         write(
             &u32::try_from(n)
                 .map_err(|_| NativeIndexError::Capacity)?
                 .to_be_bytes(),
         )?;
-        for reference in retained(base, overlay, cut, floor) {
+        for reference in retained(&row, cut, floor) {
             reference_bytes.clear();
-            encode_reference(&reference, reference_bytes);
+            encode_reference(&reference?, reference_bytes);
             write(reference_bytes)?;
-            retained_bytes += VERSION_CHARGE + key.len();
+            retained_bytes += VERSION_CHARGE + row.key.len();
             retained_versions += 1;
         }
     }
@@ -818,8 +940,9 @@ pub(crate) struct CellEncodeStats {
 
 /// One encoder's reused payload and reference scratch. A cell whose
 /// conservative size bound fits `limit` is encoded once into `payload`; any
-/// other cell streams, so the scratch never grows above `limit`.
-struct CellEncoder {
+/// other cell streams, so the scratch never grows above `limit`. Each
+/// persisting thread or cell flusher owns one encoder.
+pub(super) struct CellEncoder {
     payload: Vec<u8>,
     reference: Vec<u8>,
     limit: usize,
@@ -827,7 +950,7 @@ struct CellEncoder {
 }
 
 impl CellEncoder {
-    fn new(limit: usize) -> Self {
+    pub(super) fn new(limit: usize) -> Self {
         Self {
             payload: Vec::new(),
             reference: Vec::with_capacity(REFERENCE_BYTES),
@@ -836,9 +959,19 @@ impl CellEncoder {
         }
     }
 
-    /// Append the canonical frame of `cell` at `offset`. Returns `None`, and
-    /// writes nothing, when the cell retains no row. The path is chosen before
-    /// encoding: a buffered encode never overflows into a second encoding.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "per-worker encoder counters, exported by the metrics stage"
+        )
+    )]
+    pub(super) fn stats(&self) -> CellEncodeStats {
+        self.stats
+    }
+
+    /// Append the canonical frame of an Exact-mode `cell` at `offset`.
+    /// Returns `None`, and writes nothing, when the cell retains no row.
     fn append<W: Write>(
         &mut self,
         cell: &FrozenCell,
@@ -848,33 +981,80 @@ impl CellEncoder {
         cut: &IndexReadCut,
         floor: &IndexReadCut,
     ) -> Result<Option<WrittenCell>, NativeIndexError> {
+        let frame = self.encode(CellSources::frozen(cell), cut, floor, |_| {
+            let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
+            Ok((writer, offset))
+        })?;
+        Ok(frame.map(|frame| WrittenCell {
+            file: CellFile {
+                path: path.to_owned(),
+                offset: frame.offset,
+                bytes: frame.bytes,
+                digest: frame.digest,
+                floor: floor.clone(),
+            },
+            count: frame.count,
+            retained_bytes: frame.retained_bytes,
+            retained_versions: frame.retained_versions,
+        }))
+    }
+
+    /// Encode one option C capture: base, captured carry and captured active
+    /// in one merged traversal, selected at `source.cut` with the history
+    /// floor `source.floor` (spec §3.2). The frame equals the one of a single
+    /// overlay holding both captured overlays.
+    ///
+    /// `choose` receives the final framed length, header included, before any
+    /// byte is written, and returns the writer and the frame offset. It is
+    /// called once per frame and never for a cell without a retained row,
+    /// which returns `None`. An error is fail-stop: `Invalid` for a version
+    /// present in both captured overlays, `Capacity` for a size overflow.
+    pub(super) fn encode_source<'w, W: Write + 'w>(
+        &mut self,
+        source: &CellEncodeSource<'_>,
+        choose: impl FnOnce(u64) -> Result<(&'w mut W, u64), NativeIndexError>,
+    ) -> Result<Option<CellFrame>, NativeIndexError> {
+        self.encode(
+            CellSources::captured(source),
+            &source.cut,
+            &source.floor,
+            choose,
+        )
+    }
+
+    /// The path is chosen before encoding: a buffered encode never overflows
+    /// into a second encoding.
+    fn encode<'w, W: Write + 'w, const N: usize>(
+        &mut self,
+        sources: CellSources<'_, N>,
+        cut: &IndexReadCut,
+        floor: &IndexReadCut,
+        choose: impl FnOnce(u64) -> Result<(&'w mut W, u64), NativeIndexError>,
+    ) -> Result<Option<CellFrame>, NativeIndexError> {
         self.stats.row_passes += 1;
-        let (count, bytes, digest, summary) = if let Some((rows, upper)) =
-            buffered_bound(cell, self.limit)
+        let (offset, count, bytes, digest, summary) = if let Some((rows, upper)) =
+            buffered_bound(sources, self.limit)
         {
-            let Some((count, summary)) = self.encode_buffered(cell, rows, upper, cut, floor)?
+            let Some((count, summary)) = self.encode_buffered(sources, rows, upper, cut, floor)?
             else {
                 self.stats.empty_cells += 1;
                 return Ok(None);
             };
-            let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
+            let (writer, offset) = choose(framed_len(summary.length)?)?;
             let (bytes, digest) = write_frame(&self.payload, offset, writer)?;
             self.stats.buffered_cells += 1;
             self.stats.encode_passes += 1;
             self.stats.buffered_bytes += bytes;
             self.stats.references_encoded += summary.retained_versions as u64;
-            (count, bytes, digest, summary)
+            (offset, count, bytes, digest, summary)
         } else {
-            let count = Rows::new(cell)
-                .filter(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
-                .count();
+            let count = retained_rows(sources, cut, floor);
             if count == 0 {
                 self.stats.empty_cells += 1;
                 return Ok(None);
             }
-            let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
-            let (bytes, digest, summary) =
-                stream_cell(cell, count, cut, floor, offset, writer, &mut self.reference)?;
+            let (offset, bytes, digest, summary) =
+                stream_cell(sources, count, cut, floor, choose, &mut self.reference)?;
             self.stats.streamed_cells += 1;
             self.stats.encode_passes += 2;
             self.stats.row_passes += 4;
@@ -883,16 +1063,12 @@ impl CellEncoder {
             if summary.length <= self.limit {
                 self.stats.conservative_fallbacks += 1;
             }
-            (count, bytes, digest, summary)
+            (offset, count, bytes, digest, summary)
         };
-        Ok(Some(WrittenCell {
-            file: CellFile {
-                path: path.to_owned(),
-                offset,
-                bytes,
-                digest,
-                floor: floor.clone(),
-            },
+        Ok(Some(CellFrame {
+            offset,
+            bytes,
+            digest,
             count,
             retained_bytes: summary.retained_bytes,
             retained_versions: summary.retained_versions,
@@ -904,9 +1080,9 @@ impl CellEncoder {
     /// rows, so the directory is reserved for every candidate row, filled per
     /// emitted row and compacted by at most one move of the row bodies.
     /// Returns the emitted row count, or `None` when no row is retained.
-    fn encode_buffered(
+    fn encode_buffered<const N: usize>(
         &mut self,
-        cell: &FrozenCell,
+        sources: CellSources<'_, N>,
         candidates: usize,
         upper: usize,
         cut: &IndexReadCut,
@@ -924,24 +1100,25 @@ impl CellEncoder {
         let mut rows = 0usize;
         let mut retained_bytes = 0usize;
         let mut retained_versions = 0usize;
-        for (key, base, overlay) in Rows::new(cell) {
-            let mut versions = retained(base, overlay, cut, floor);
+        for row in Rows::new(sources) {
+            let mut versions = retained(&row, cut, floor);
             let Some(first) = versions.next() else {
                 continue;
             };
+            let first = first?;
             let start = u32::try_from(payload.len()).map_err(|_| NativeIndexError::Capacity)?;
             payload[4 + 4 * rows..8 + 4 * rows].copy_from_slice(&start.to_be_bytes());
             payload.extend_from_slice(
-                &u32::try_from(key.len())
+                &u32::try_from(row.key.len())
                     .map_err(|_| NativeIndexError::Capacity)?
                     .to_be_bytes(),
             );
-            payload.extend_from_slice(key);
+            payload.extend_from_slice(row.key);
             let count_at = payload.len();
             payload.extend_from_slice(&[0; 4]);
             let mut n = 0usize;
-            for reference in std::iter::once(first).chain(versions) {
-                encode_reference(&reference, payload);
+            for reference in std::iter::once(Ok(first)).chain(versions) {
+                encode_reference(&reference?, payload);
                 n += 1;
             }
             payload[count_at..count_at + 4].copy_from_slice(
@@ -949,7 +1126,7 @@ impl CellEncoder {
                     .map_err(|_| NativeIndexError::Capacity)?
                     .to_be_bytes(),
             );
-            retained_bytes += n * (VERSION_CHARGE + key.len());
+            retained_bytes += n * (VERSION_CHARGE + row.key.len());
             retained_versions += n;
             rows += 1;
         }
@@ -986,24 +1163,27 @@ impl CellEncoder {
     }
 }
 
-/// Conservative payload bound of `cell` as `(candidate rows, bound)`, or
-/// `None` when the bound exceeds `limit` or overflows. Every base and overlay
-/// row counts its directory slot, row prefix, key and all its versions. Equal
-/// keys, equal versions and discarded versions only reduce the output, so the
-/// bound covers the reserved directory plus row bodies and the final payload.
-/// The overlay walk stops at the limit and decodes no reference.
-fn buffered_bound(cell: &FrozenCell, limit: usize) -> Option<(usize, usize)> {
+/// Conservative payload bound of `sources` as `(candidate rows, bound)`, or
+/// `None` when the bound exceeds `limit` or overflows (spec §3.1 `U`). Every
+/// base and overlay row counts its directory slot, row prefix, key and all
+/// its versions. Equal keys, equal versions and discarded versions only reduce
+/// the output, so the bound covers the reserved directory plus row bodies and
+/// the final payload. The overlay walk stops at the limit and decodes no
+/// reference.
+fn buffered_bound<const N: usize>(
+    sources: CellSources<'_, N>,
+    limit: usize,
+) -> Option<(usize, usize)> {
     // A base payload is `[count][offsets][rows]` with one offset per row.
-    let mut upper = cell.base.as_ref().map_or(4, |base| base.bytes.len());
+    let mut upper = sources.base.map_or(4, |base| base.bytes.len());
     if upper > limit {
         return None;
     }
-    let candidates = cell
-        .base
-        .as_ref()
-        .map_or(0, |base| base.count)
-        .checked_add(cell.overlay.len())?;
-    for (key, versions) in cell.overlay.iter() {
+    let mut candidates = sources.base.map_or(0, |base| base.count);
+    for overlay in sources.overlays.into_iter().flatten() {
+        candidates = candidates.checked_add(overlay.len())?;
+    }
+    for (key, versions) in sources.overlays.into_iter().flatten().flatten() {
         upper = versions
             .len()
             .checked_mul(REFERENCE_BYTES)?
@@ -1014,6 +1194,38 @@ fn buffered_bound(cell: &FrozenCell, limit: usize) -> Option<(usize, usize)> {
         }
     }
     Some((candidates, upper))
+}
+
+/// Test-only base of one capture without a store: the production encoding of
+/// `source` into a heap frame, validated as an unmapped base without a file.
+/// No retained row gives the empty base.
+#[cfg(test)]
+pub(crate) fn encode_heap_base(
+    index: &NativeIndex,
+    source: &CellEncodeSource<'_>,
+) -> Result<NewCellBase, NativeIndexError> {
+    let mut frame = Vec::new();
+    let encoded =
+        CellEncoder::new(CELL_SCRATCH_CEILING).encode_source(source, |_| Ok((&mut frame, 0)))?;
+    if encoded.is_none() {
+        return Ok(NewCellBase::empty());
+    }
+    let (keyspace, cell) = source.identity;
+    Ok(NewCellBase::frame(SortedBlock::validated(
+        Bytes::from(frame).slice(8..),
+        false,
+        index.database,
+        *keyspace,
+        index.descriptor(*keyspace)?,
+        cell,
+        source.cut.clone(),
+    )?))
+}
+
+/// Framed length of a payload: the eight-byte header, then the payload.
+fn framed_len(payload: usize) -> Result<u64, NativeIndexError> {
+    let length = u32::try_from(payload).map_err(|_| NativeIndexError::Capacity)?;
+    Ok(u64::from(length) + 8)
 }
 
 /// Write the CRC frame of a final payload. CRC32 covers the payload; the
@@ -1044,22 +1256,22 @@ fn write_frame(
 /// Exact streaming fallback for a cell with `count` retained rows: one
 /// encoding computes the CRC, a second one hashes and writes. It holds no
 /// payload in memory, so any accepted frame size is still possible.
-fn stream_cell(
-    cell: &FrozenCell,
+fn stream_cell<'w, W: Write + 'w, const N: usize>(
+    sources: CellSources<'_, N>,
     count: usize,
     cut: &IndexReadCut,
     floor: &IndexReadCut,
-    offset: u64,
-    writer: &mut impl Write,
+    choose: impl FnOnce(u64) -> Result<(&'w mut W, u64), NativeIndexError>,
     reference_bytes: &mut Vec<u8>,
-) -> Result<(u64, [u8; 32], PayloadSummary), NativeIndexError> {
+) -> Result<(u64, u64, [u8; 32], PayloadSummary), NativeIndexError> {
     let mut crc = crc32fast::Hasher::new();
-    let summary = encode_cell_payload(cell, count, cut, floor, reference_bytes, |bytes| {
+    let summary = encode_cell_payload(sources, count, cut, floor, reference_bytes, |bytes| {
         crc.update(bytes);
         Ok(())
     })?;
     let length = u32::try_from(summary.length).map_err(|_| NativeIndexError::Capacity)?;
     let bytes = u64::from(length) + 8;
+    let (writer, offset) = choose(bytes)?;
     offset
         .checked_add(bytes)
         .ok_or(NativeIndexError::Capacity)?;
@@ -1069,7 +1281,7 @@ fn stream_cell(
     let mut hash = blake2b_simd::Params::new().hash_length(32).to_state();
     hash.update(&header);
     writer.write_all(&header)?;
-    let emitted = encode_cell_payload(cell, count, cut, floor, reference_bytes, |bytes| {
+    let emitted = encode_cell_payload(sources, count, cut, floor, reference_bytes, |bytes| {
         hash.update(bytes);
         writer.write_all(bytes)?;
         Ok(())
@@ -1077,7 +1289,7 @@ fn stream_cell(
     debug_assert_eq!(emitted, summary, "immutable captured cell serialization");
     let mut digest = [0; 32];
     digest.copy_from_slice(hash.finalize().as_bytes());
-    Ok((bytes, digest, summary))
+    Ok((offset, bytes, digest, summary))
 }
 
 #[cfg(test)]

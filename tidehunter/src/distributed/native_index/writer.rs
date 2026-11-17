@@ -636,6 +636,7 @@ impl IndexWriter<'_> {
                 !values.is_empty()
             });
             cell.merge_overlay(sealed);
+            cell.flush.recount_after_exact_install(&cell.overlay);
             if let Some(base) = &captured.base {
                 add(&accounting.retained_bytes, base.retained_bytes);
                 add(&accounting.retained_versions, base.retained_versions);

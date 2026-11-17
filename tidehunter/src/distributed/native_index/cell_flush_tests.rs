@@ -945,3 +945,68 @@ fn dropped_capture_keeps_reads_and_its_flight() {
         Flushed::Skipped(CellSkip::InFlight)
     );
 }
+
+/// An Exact install moves each cell's captured references into its base, so
+/// it recounts that cell's dirty totals from the overlay left behind.
+/// Otherwise `oldest_uncovered` keeps naming a batch the base holds and
+/// root capture can never advance `D_i` (Exact to per-cell migration).
+#[test]
+fn exact_install_recounts_dirty_totals_so_coverage_can_advance() {
+    let temp = tempdir::TempDir::new("cell-flush-exact-recount").unwrap();
+    let index = index(8, BUDGET);
+    let (a0, a1, b) = (vec![1, 0], vec![1, 1], vec![2, 0]);
+    let (cell_a, cell_b) = (cell_of(&index, &a0), cell_of(&index, &b));
+    publish(&index, 1, &[(a0.clone(), true), (b.clone(), true)]);
+    publish(&index, 2, &[(a1.clone(), true), (a0.clone(), false)]);
+    // Exact capture through 2; batch 3 publishes during the capture, so it
+    // stays in A's overlay after the install.
+    index.writer().begin_capture(at(2)).unwrap();
+    publish(&index, 3, &[(a0.clone(), true)]);
+    let prepared = index.writer().capture_step(usize::MAX).unwrap();
+    let persisted = prepared.persist(&temp.path().join("exact.index")).unwrap();
+    index.writer().install_image(persisted);
+    let dirty_a = index.cell_dirty(KS, &cell_a).unwrap();
+    assert_eq!(
+        (dirty_a.versions, dirty_a.oldest_uncovered),
+        (1, Some(batch(3)))
+    );
+    assert_eq!(dirty_a.upper, 12 + 2 + REFERENCE_BYTES);
+    assert!(dirty_a.dirty_since.is_some());
+    let dirty_b = index.cell_dirty(KS, &cell_b).unwrap();
+    assert_eq!(
+        (
+            dirty_b.versions,
+            dirty_b.oldest_uncovered,
+            dirty_b.upper,
+            dirty_b.dirty_since
+        ),
+        (0, None, 0, None)
+    );
+    for (key, cut, expected) in [
+        (&a0, 1, Some(1)),
+        (&a0, 2, None),
+        (&a0, 3, Some(3)),
+        (&a1, 3, Some(2)),
+        (&b, 3, Some(1)),
+    ] {
+        assert_eq!(read(&index, key, at(cut)), expected);
+    }
+    // Migration: a root capture at the exact cut sets `D_i` of every cell.
+    let len = index.writer().cell_directory_len();
+    let mut output = Vec::with_capacity(ROOT_DESCRIPTOR_SLICE);
+    index
+        .writer()
+        .capture_cell_descriptors(0..len, through(2), &mut output)
+        .unwrap();
+    assert_eq!(find(&output, &cell_a).coverage(), through(2));
+    assert_eq!(find(&output, &cell_b).coverage(), through(2));
+    // Batch 3 is not in A's base, so A's coverage stops at 2; B advances.
+    output.clear();
+    index
+        .writer()
+        .capture_cell_descriptors(0..len, through(3), &mut output)
+        .unwrap();
+    assert_eq!(find(&output, &cell_a).coverage(), through(2));
+    assert_eq!(find(&output, &cell_b).coverage(), through(3));
+    assert_eq!(index.cell_dirty(KS, &cell_a).unwrap().coverage, through(2));
+}

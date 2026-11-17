@@ -46,6 +46,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use typenum::U32;
 
+mod cell_flush;
+mod cell_recovery;
 mod checkpoint_contract;
 mod checkpoint_lifecycle;
 mod concurrent;

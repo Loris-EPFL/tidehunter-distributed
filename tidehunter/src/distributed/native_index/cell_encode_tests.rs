@@ -1,6 +1,8 @@
 //! The buffered cell encoder against the frozen pre-buffering encoder: equal
 //! frames, digests and summaries, a bounded scratch, and an explicit streaming
-//! fallback above the scratch limit.
+//! fallback above the scratch limit. The option C encoder of base, captured
+//! carry and captured active must equal the single-overlay encoder run on one
+//! overlay holding both captured overlays.
 
 use super::*;
 use rand::rngs::StdRng;
@@ -13,6 +15,201 @@ const EPOCH: u64 = 11;
 const OFFSET: u64 = 4096;
 
 type History = BTreeMap<Vec<u8>, Vec<ValueRecordReference>>;
+/// The single-overlay merged rows of the encoder before buffering, frozen,
+/// so the reference does not share code with the encoder under test.
+struct LegacyRows<'a> {
+    base: Option<&'a SortedBlock>,
+    position: usize,
+    overlay: std::iter::Peekable<
+        std::collections::btree_map::Iter<'a, Bytes, NativeVersions<ValueRecordReference>>,
+    >,
+}
+
+impl<'a> LegacyRows<'a> {
+    fn new(cell: &'a FrozenCell) -> Self {
+        Self {
+            base: cell.base.as_ref(),
+            position: 0,
+            overlay: cell.overlay.iter().peekable(),
+        }
+    }
+}
+
+impl<'a> Iterator for LegacyRows<'a> {
+    type Item = (&'a [u8], &'a [u8], &'a [ValueRecordReference]);
+    fn next(&mut self) -> Option<Self::Item> {
+        let base = self
+            .base
+            .filter(|base| self.position < base.count)
+            .map(|base| base.entry(self.position));
+        let overlay = self.overlay.peek();
+        match (base, overlay) {
+            (None, None) => None,
+            (Some((key, versions)), None) => {
+                self.position += 1;
+                Some((key, versions, &[]))
+            }
+            (None, Some(_)) => self
+                .overlay
+                .next()
+                .map(|(key, values)| (key.as_ref(), &[][..], values.as_slice())),
+            (Some((key, versions)), Some((other, _))) => match key.cmp(other.as_ref()) {
+                Ordering::Less => {
+                    self.position += 1;
+                    Some((key, versions, &[]))
+                }
+                Ordering::Greater => self
+                    .overlay
+                    .next()
+                    .map(|(key, values)| (key.as_ref(), &[][..], values.as_slice())),
+                Ordering::Equal => {
+                    self.position += 1;
+                    let (_, values) = self.overlay.next().unwrap();
+                    Some((key, versions, values))
+                }
+            },
+        }
+    }
+}
+
+struct LegacyVersions<'a> {
+    base: std::slice::ChunksExact<'a, u8>,
+    overlay: std::slice::Iter<'a, ValueRecordReference>,
+    a: Option<ValueRecordReference>,
+    b: Option<ValueRecordReference>,
+}
+
+impl<'a> LegacyVersions<'a> {
+    fn new(base: &'a [u8], overlay: &'a [ValueRecordReference]) -> Self {
+        let mut result = Self {
+            base: base.chunks_exact(REFERENCE_BYTES),
+            overlay: overlay.iter(),
+            a: None,
+            b: None,
+        };
+        result.a = result
+            .base
+            .next()
+            .map(|bytes| decode_reference(bytes).unwrap());
+        result.b = result.overlay.next().copied();
+        result
+    }
+}
+
+impl Iterator for LegacyVersions<'_> {
+    type Item = ValueRecordReference;
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = match (self.a, self.b) {
+            (None, None) => return None,
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (Some(a), Some(b)) => {
+                if a.mutation_version() <= b.mutation_version() {
+                    a
+                } else {
+                    b
+                }
+            }
+        };
+        if self
+            .a
+            .is_some_and(|a| a.mutation_version() == result.mutation_version())
+        {
+            self.a = self
+                .base
+                .next()
+                .map(|bytes| decode_reference(bytes).unwrap());
+        }
+        if self
+            .b
+            .is_some_and(|b| b.mutation_version() == result.mutation_version())
+        {
+            self.b = self.overlay.next().copied();
+        }
+        Some(result)
+    }
+}
+
+fn legacy_retained<'a>(
+    base: &'a [u8],
+    overlay: &'a [ValueRecordReference],
+    cut: &IndexReadCut,
+    floor: &IndexReadCut,
+) -> LegacyVersions<'a> {
+    let count = base.len() / REFERENCE_BYTES;
+    let reference =
+        |n| decode_reference(&base[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES]).unwrap();
+    let at_floor = lower_bound_by(count, |n| floor.contains(&reference(n)));
+    let base_anchor = (at_floor > 0).then(|| reference(at_floor - 1));
+    let overlay_anchor = matching_prefix(overlay, |value| floor.contains(value))
+        .last()
+        .copied();
+    let anchor = newest(base_anchor, overlay_anchor).map(|value| value.mutation_version());
+    let base_start = lower_bound_by(count, |n| {
+        anchor.is_some_and(|anchor| reference(n).mutation_version() < anchor)
+    });
+    let base_end = lower_bound_by(count, |n| cut.contains(&reference(n)));
+    let overlay_start = overlay
+        .partition_point(|value| anchor.is_some_and(|anchor| value.mutation_version() < anchor));
+    let overlay_end = overlay.partition_point(|value| cut.contains(value));
+    LegacyVersions::new(
+        &base[base_start * REFERENCE_BYTES..base_end * REFERENCE_BYTES],
+        &overlay[overlay_start..overlay_end],
+    )
+}
+
+fn legacy_payload(
+    cell: &FrozenCell,
+    count: usize,
+    cut: &IndexReadCut,
+    floor: &IndexReadCut,
+    reference_bytes: &mut Vec<u8>,
+    mut emit: impl FnMut(&[u8]) -> Result<(), NativeIndexError>,
+) -> Result<PayloadSummary, NativeIndexError> {
+    let mut length = 0usize;
+    let mut write = |bytes: &[u8]| -> Result<(), NativeIndexError> {
+        length = length
+            .checked_add(bytes.len())
+            .ok_or(NativeIndexError::Capacity)?;
+        if length > MAX_IMAGE_BYTES - 8 {
+            return Err(NativeIndexError::Capacity);
+        }
+        emit(bytes)
+    };
+    write(&u32::try_from(count).unwrap().to_be_bytes())?;
+    let mut offset = 4 + count * 4;
+    for (key, base, overlay) in LegacyRows::new(cell) {
+        let n = legacy_retained(base, overlay, cut, floor).count();
+        if n == 0 {
+            continue;
+        }
+        write(&u32::try_from(offset).unwrap().to_be_bytes())?;
+        offset += n * REFERENCE_BYTES + 8 + key.len();
+    }
+    let mut retained_bytes = 0usize;
+    let mut retained_versions = 0usize;
+    for (key, base, overlay) in LegacyRows::new(cell) {
+        let n = legacy_retained(base, overlay, cut, floor).count();
+        if n == 0 {
+            continue;
+        }
+        write(&u32::try_from(key.len()).unwrap().to_be_bytes())?;
+        write(key)?;
+        write(&u32::try_from(n).unwrap().to_be_bytes())?;
+        for reference in legacy_retained(base, overlay, cut, floor) {
+            reference_bytes.clear();
+            encode_reference(&reference, reference_bytes);
+            write(reference_bytes)?;
+            retained_bytes += VERSION_CHARGE + key.len();
+            retained_versions += 1;
+        }
+    }
+    Ok(PayloadSummary {
+        length,
+        retained_bytes,
+        retained_versions,
+    })
+}
 
 /// The encoder before buffering, frozen: a row count pass, then one encoding
 /// for the CRC and one to hash and write. It rejects a cell without rows.
@@ -25,14 +222,14 @@ fn legacy_append_cell(
     floor: &IndexReadCut,
     reference_bytes: &mut Vec<u8>,
 ) -> Result<WrittenCell, NativeIndexError> {
-    let count = Rows::new(cell)
-        .filter(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
+    let count = LegacyRows::new(cell)
+        .filter(|(_, base, overlay)| legacy_retained(base, overlay, cut, floor).next().is_some())
         .count();
     if count == 0 {
         return Err(NativeIndexError::Invalid("empty cell append"));
     }
     let mut crc = crc32fast::Hasher::new();
-    let summary = encode_cell_payload(cell, count, cut, floor, reference_bytes, |bytes| {
+    let summary = legacy_payload(cell, count, cut, floor, reference_bytes, |bytes| {
         crc.update(bytes);
         Ok(())
     })?;
@@ -47,7 +244,7 @@ fn legacy_append_cell(
     let mut hash = blake2b_simd::Params::new().hash_length(32).to_state();
     hash.update(&header);
     writer.write_all(&header)?;
-    let emitted = encode_cell_payload(cell, count, cut, floor, reference_bytes, |bytes| {
+    let emitted = legacy_payload(cell, count, cut, floor, reference_bytes, |bytes| {
         hash.update(bytes);
         writer.write_all(bytes)?;
         Ok(())
@@ -168,7 +365,9 @@ fn cell(base_history: &History, overlay_history: &History) -> FrozenCell {
 }
 
 fn exact_bound(cell: &FrozenCell) -> usize {
-    buffered_bound(cell, usize::MAX).unwrap().1
+    buffered_bound(CellSources::frozen(cell), usize::MAX)
+        .unwrap()
+        .1
 }
 
 /// Encode with `limit` and with the frozen encoder; assert equal bytes,
@@ -627,7 +826,10 @@ fn limits_are_clamped_and_overflowing_bounds_stream() {
         )])),
     };
     // The candidate row count overflows: streaming is chosen before encoding.
-    assert_eq!(buffered_bound(&impossible, usize::MAX), None);
+    assert_eq!(
+        buffered_bound(CellSources::frozen(&impossible), usize::MAX),
+        None
+    );
     let mut long = History::new();
     long.insert(
         vec![1],
@@ -635,10 +837,537 @@ fn limits_are_clamped_and_overflowing_bounds_stream() {
     );
     let small = cell(&History::new(), &long);
     assert_eq!(
-        buffered_bound(&small, 4 + 12 + 1 + REFERENCE_BYTES),
+        buffered_bound(CellSources::frozen(&small), 4 + 12 + 1 + REFERENCE_BYTES),
         Some((1, 151))
     );
-    assert_eq!(buffered_bound(&small, 150), None);
+    assert_eq!(buffered_bound(CellSources::frozen(&small), 150), None);
+}
+
+/// One overlay holding the versions of both captured overlays, ascending.
+fn merged(carry: &History, active: &History) -> History {
+    let mut merged = carry.clone();
+    for (key, versions) in active {
+        let row = merged.entry(key.clone()).or_default();
+        row.extend_from_slice(versions);
+        row.sort_by_key(|value| value.mutation_version());
+    }
+    merged
+}
+
+/// Conservative bound `U` of base, carry and active.
+fn source_bound(base: Option<&SortedBlock>, carry: Option<&History>, active: &History) -> usize {
+    let carry = carry.map(overlay);
+    let active = overlay(active);
+    let sources = CellSources {
+        base,
+        overlays: [carry.as_deref(), Some(&*active)],
+    };
+    buffered_bound(sources, usize::MAX).unwrap().1
+}
+
+/// Encode base, captured carry and captured active through the option C
+/// entry point with `limit`. Assert the frame, its framing, its summary and
+/// the single `choose` call equal the single-overlay encoder (itself checked
+/// against the frozen encoder) run on the merged overlay. Returns the
+/// counters of the option C encoding.
+fn assert_source_matches_merged(
+    base: Option<&SortedBlock>,
+    carry: Option<&History>,
+    active: &History,
+    cut: &IndexReadCut,
+    floor: &IndexReadCut,
+    limit: usize,
+) -> CellEncodeStats {
+    let identity = (KeySpace(0), CellId::Integer(0));
+    let empty = History::new();
+    let single = FrozenCell {
+        identity: identity.clone(),
+        base: base.cloned(),
+        overlay: overlay(&merged(carry.unwrap_or(&empty), active)),
+    };
+    assert_matches_legacy(&single, cut, floor, CELL_SCRATCH_CEILING);
+    let path = Path::new("image.cells");
+    let mut expected_bytes = Vec::new();
+    let expected = CellEncoder::new(CELL_SCRATCH_CEILING)
+        .append(&single, Some(&mut expected_bytes), path, OFFSET, cut, floor)
+        .unwrap();
+
+    let carry = carry.map(overlay);
+    let active = overlay(active);
+    let source = CellEncodeSource {
+        identity: &identity,
+        base,
+        carry: carry.as_deref(),
+        active: &active,
+        cut: cut.clone(),
+        floor: floor.clone(),
+    };
+    let mut encoder = CellEncoder::new(limit);
+    let mut actual_bytes = Vec::new();
+    let mut chosen = Vec::new();
+    let (output, lengths) = (&mut actual_bytes, &mut chosen);
+    let frame = encoder
+        .encode_source(&source, move |length| {
+            lengths.push(length);
+            Ok((output, OFFSET))
+        })
+        .unwrap();
+    match expected {
+        None => {
+            assert_eq!(frame, None, "the merged overlay retains no row");
+            assert!(actual_bytes.is_empty() && chosen.is_empty());
+            assert_eq!(encoder.stats.empty_cells, 1);
+        }
+        Some(expected) => {
+            let frame = frame.expect("the merged overlay wrote a frame");
+            assert_eq!(actual_bytes, expected_bytes, "frame bytes");
+            assert_eq!(chosen, [frame.bytes], "length before write, once");
+            assert_eq!(frame.offset, OFFSET);
+            assert_eq!(frame.bytes, expected.file.bytes);
+            assert_eq!(frame.digest, expected.file.digest);
+            assert_eq!(frame.count, expected.count);
+            assert_eq!(frame.retained_bytes, expected.retained_bytes);
+            assert_eq!(frame.retained_versions, expected.retained_versions);
+            assert_eq!(frame.bytes, actual_bytes.len() as u64);
+            let payload = &actual_bytes[8..];
+            assert_eq!(&actual_bytes[..4], &(payload.len() as u32).to_be_bytes());
+            assert_eq!(&actual_bytes[4..8], &crc32fast::hash(payload).to_be_bytes());
+            assert_eq!(frame.digest, cell_digest(&actual_bytes));
+            assert_eq!(&payload[..4], &(frame.count as u32).to_be_bytes());
+            assert_eq!(
+                encoder.stats.buffered_cells + encoder.stats.streamed_cells,
+                1
+            );
+        }
+    }
+    assert!(encoder.payload.capacity() <= encoder.limit);
+    assert_eq!(encoder.stats(), encoder.stats);
+    encoder.stats
+}
+
+/// Random base, carry and active histories with distinct versions across
+/// the two overlays. A base version can repeat in one overlay with other
+/// content; the base copy wins, as in the single-overlay encoder. The share
+/// of overlay versions sent to the carry varies by round: none, all, half or
+/// random.
+fn random_split(rng: &mut StdRng) -> (History, History, History) {
+    let width = rng.gen_bool(0.5).then_some(4);
+    let carry_share = match rng.gen_range(0..4) {
+        0 => 0.0,
+        1 => 1.0,
+        2 => 0.5,
+        _ => rng.r#gen(),
+    };
+    let with_base = rng.gen_bool(0.7);
+    let (mut base, mut carry, mut active) = (History::new(), History::new(), History::new());
+    for _ in 0..rng.gen_range(0..48) {
+        let key = random_key(rng, width);
+        let mut versions: Vec<MutationVersion> = (0..rng.gen_range(1..=6))
+            .map(|_| version(rng.gen_range(1..64), rng.gen_range(0..3)))
+            .collect();
+        versions.sort_unstable();
+        versions.dedup();
+        for at in versions {
+            let kind = if rng.gen_bool(0.25) {
+                RecordKind::Delete
+            } else {
+                RecordKind::Put
+            };
+            let in_base = with_base && rng.gen_bool(0.4);
+            if in_base {
+                base.entry(key.clone())
+                    .or_default()
+                    .push(reference(at, kind, key.len(), 0));
+            }
+            if !in_base || rng.gen_bool(0.2) {
+                let target = if rng.gen_bool(carry_share) {
+                    &mut carry
+                } else {
+                    &mut active
+                };
+                target
+                    .entry(key.clone())
+                    .or_default()
+                    .push(reference(at, kind, key.len(), 1));
+            }
+        }
+    }
+    (base, carry, active)
+}
+
+#[test]
+fn captured_sources_match_the_merged_overlay_for_random_histories() {
+    let mut rng = StdRng::seed_from_u64(0x5eed_00c3);
+    let (mut buffered, mut empty, mut gaps, mut split) = (0, 0, 0, 0);
+    for round in 0..600 {
+        let (base_history, carry, active) = random_split(&mut rng);
+        let base = base(&base_history);
+        let carry = (!carry.is_empty() || rng.gen_bool(0.5)).then_some(carry);
+        split += u64::from(carry.as_ref().is_some_and(|c| !c.is_empty()) && !active.is_empty());
+        let (cut, floor) = random_cut(&mut rng);
+        let run = |limit| {
+            assert_source_matches_merged(
+                base.as_ref(),
+                carry.as_ref(),
+                &active,
+                &cut,
+                &floor,
+                limit,
+            )
+        };
+        let stats = run(CELL_SCRATCH_CEILING);
+        assert_eq!(stats.streamed_cells, 0, "round {round}");
+        assert_eq!(stats.row_passes, 1, "round {round}");
+        buffered += stats.buffered_cells;
+        empty += stats.empty_cells;
+        gaps += u64::from(stats.moved_bytes != 0);
+        assert_eq!(run(0).buffered_cells, 0, "round {round}");
+        let bound = source_bound(base.as_ref(), carry.as_ref(), &active);
+        if bound > 4 {
+            let below = run(bound - 1);
+            assert_eq!(below.buffered_cells, 0, "round {round}");
+        }
+        for limit in [bound, bound + 1] {
+            let stats = run(limit);
+            assert_eq!(
+                (stats.streamed_cells, stats.row_passes),
+                (0, 1),
+                "round {round}"
+            );
+            assert!(stats.scratch_capacity <= bound as u64);
+        }
+    }
+    assert!(
+        buffered > 300 && empty > 10 && gaps > 100 && split > 100,
+        "{buffered} {empty} {gaps} {split}"
+    );
+}
+
+#[test]
+fn every_partition_of_a_history_matches_the_merged_overlay() {
+    // Five versions of one key, the third a tombstone, plus a base-only key.
+    let key = vec![9; 4];
+    let kind = |sequence| {
+        if sequence == 3 {
+            RecordKind::Delete
+        } else {
+            RecordKind::Put
+        }
+    };
+    let floors = [
+        IndexReadCut::BeforeAll,
+        IndexReadCut::At(version(2, 0)),
+        // The tombstone is the anchor at the history floor.
+        IndexReadCut::At(version(3, 0)),
+    ];
+    let cuts = [
+        IndexReadCut::BeforeAll,
+        IndexReadCut::At(version(3, 0)),
+        IndexReadCut::At(version(4, 0)),
+        IndexReadCut::At(version(5, u32::MAX)),
+    ];
+    let mut checked = 0;
+    for assignment in 0..3u32.pow(5) {
+        let (mut base_history, mut carry, mut active) =
+            (History::new(), History::new(), History::new());
+        base_history.insert(
+            vec![1; 4],
+            vec![reference(version(1, 1), RecordKind::Put, 4, 0)],
+        );
+        for sequence in 1..=5u64 {
+            let target = match assignment / 3u32.pow(sequence as u32 - 1) % 3 {
+                0 => &mut base_history,
+                1 => &mut carry,
+                _ => &mut active,
+            };
+            target.entry(key.clone()).or_default().push(reference(
+                version(sequence, 0),
+                kind(sequence),
+                4,
+                2,
+            ));
+        }
+        let base = base(&base_history);
+        let carries = if carry.is_empty() {
+            vec![None, Some(&carry)]
+        } else {
+            vec![Some(&carry)]
+        };
+        for carry in carries {
+            for cut in &cuts {
+                for floor in &floors {
+                    if retention::position(floor) > retention::position(cut) {
+                        continue;
+                    }
+                    for limit in [CELL_SCRATCH_CEILING, 0] {
+                        assert_source_matches_merged(
+                            base.as_ref(),
+                            carry,
+                            &active,
+                            cut,
+                            floor,
+                            limit,
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 3000, "{checked}");
+    // All five versions in the overlays, split by parity: the tombstone
+    // anchor at the floor and every later version through the cut are kept.
+    let mut carry = History::new();
+    let mut active = History::new();
+    for sequence in 1..=5u64 {
+        let target = if sequence % 2 == 0 {
+            &mut carry
+        } else {
+            &mut active
+        };
+        target.entry(key.clone()).or_default().push(reference(
+            version(sequence, 0),
+            kind(sequence),
+            4,
+            2,
+        ));
+    }
+    let stats = assert_source_matches_merged(
+        None,
+        Some(&carry),
+        &active,
+        &IndexReadCut::At(version(5, 0)),
+        &IndexReadCut::At(version(3, 0)),
+        CELL_SCRATCH_CEILING,
+    );
+    assert_eq!(stats.references_encoded, 3);
+}
+
+#[test]
+fn sparse_post_cut_references_stay_out_of_the_frame() {
+    // The carry holds published sparse references above the cut; the active
+    // overlay holds references through it. One carry-only key has nothing
+    // through the cut, so its directory slot is dropped.
+    let cut = IndexReadCut::At(version(20, u32::MAX));
+    let mut carry = History::new();
+    let mut active = History::new();
+    for n in 0..64u32 {
+        let key = n.to_be_bytes().to_vec();
+        carry.insert(
+            key.clone(),
+            vec![reference(
+                version(30 + u64::from(n), 0),
+                RecordKind::Put,
+                4,
+                1,
+            )],
+        );
+        if n != 7 {
+            active.insert(
+                key,
+                vec![reference(
+                    version(1 + u64::from(n % 20), 0),
+                    RecordKind::Put,
+                    4,
+                    0,
+                )],
+            );
+        }
+    }
+    for limit in [CELL_SCRATCH_CEILING, 0] {
+        let stats = assert_source_matches_merged(
+            None,
+            Some(&carry),
+            &active,
+            &cut,
+            &IndexReadCut::BeforeAll,
+            limit,
+        );
+        assert_eq!(
+            stats.references_encoded,
+            63 * if limit == 0 { 2 } else { 1 }
+        );
+    }
+    let stats = assert_source_matches_merged(
+        None,
+        Some(&carry),
+        &active,
+        &cut,
+        &IndexReadCut::BeforeAll,
+        CELL_SCRATCH_CEILING,
+    );
+    // 128 candidate rows, 63 emitted: 65 slots dropped by one body move.
+    assert_eq!(stats.moved_bytes, 63 * (4 + 4 + 4 + REFERENCE_BYTES as u64));
+}
+
+#[test]
+fn long_histories_split_across_sources_match_the_merged_overlay() {
+    let key = vec![1; 4];
+    let (mut base_history, mut carry, mut active) =
+        (History::new(), History::new(), History::new());
+    for sequence in 1..4000u64 {
+        let target = match sequence % 4 {
+            1 | 3 => &mut base_history,
+            2 => &mut carry,
+            _ => &mut active,
+        };
+        target.entry(key.clone()).or_default().push(reference(
+            version(sequence, 0),
+            RecordKind::Put,
+            4,
+            0,
+        ));
+    }
+    let base = base(&base_history);
+    let bound = source_bound(base.as_ref(), Some(&carry), &active);
+    for floor in [
+        IndexReadCut::BeforeAll,
+        IndexReadCut::At(version(10, 0)),
+        IndexReadCut::At(version(2999, 0)),
+    ] {
+        let cut = IndexReadCut::At(version(3000, 0));
+        for limit in [CELL_SCRATCH_CEILING, 0, bound - 1, bound, bound + 1] {
+            let stats = assert_source_matches_merged(
+                base.as_ref(),
+                Some(&carry),
+                &active,
+                &cut,
+                &floor,
+                limit,
+            );
+            let streamed = limit < bound;
+            assert_eq!(stats.streamed_cells, u64::from(streamed));
+            assert_eq!(stats.encode_passes, if streamed { 2 } else { 1 });
+        }
+    }
+}
+
+#[test]
+fn versions_repeated_across_overlays_fail_before_any_write() {
+    let cut = IndexReadCut::At(version(10, 0));
+    let duplicate = |first_row: bool, first_version: bool| {
+        let mut carry = History::new();
+        let mut active = History::new();
+        active.insert(
+            vec![0],
+            vec![reference(version(1, 0), RecordKind::Put, 1, 0)],
+        );
+        let key = if first_row { vec![0] } else { vec![5] };
+        let at = if first_version { 0 } else { 2 };
+        active.entry(key.clone()).or_default().push(reference(
+            version(4, at),
+            RecordKind::Put,
+            1,
+            0,
+        ));
+        carry.insert(key, vec![reference(version(4, at), RecordKind::Put, 1, 1)]);
+        for versions in active.values_mut() {
+            versions.sort_by_key(|value| value.mutation_version());
+        }
+        (carry, active)
+    };
+    for (first_row, first_version) in [(true, false), (false, true), (false, false)] {
+        let (carry, active) = duplicate(first_row, first_version);
+        let identity = (KeySpace(0), CellId::Integer(0));
+        let (carry, active) = (overlay(&carry), overlay(&active));
+        for limit in [CELL_SCRATCH_CEILING, 0] {
+            let source = CellEncodeSource {
+                identity: &identity,
+                base: None,
+                carry: Some(&carry),
+                active: &active,
+                cut: cut.clone(),
+                floor: IndexReadCut::BeforeAll,
+            };
+            let mut output = Vec::new();
+            let mut called = false;
+            let (sink, flag) = (&mut output, &mut called);
+            let result = CellEncoder::new(limit).encode_source(&source, move |_| {
+                *flag = true;
+                Ok((sink, 0))
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(NativeIndexError::Invalid(
+                        "version repeated across overlay sources"
+                    ))
+                ),
+                "{first_row} {first_version} {limit}"
+            );
+            assert!(!called && output.is_empty());
+        }
+    }
+}
+
+#[test]
+fn heap_bases_of_captures_pass_frame_validation() {
+    let shape = plain_shape();
+    let index = NativeIndex::new(&shape, DATABASE, 1 << 20).unwrap();
+    let mut rng = StdRng::seed_from_u64(23);
+    let mut history = History::new();
+    while history.len() < 200 {
+        let key = random_key(&mut rng, Some(4));
+        history.insert(key, Vec::new());
+    }
+    let cells = cells_of(&index, &history);
+    let (id, keys) = cells
+        .iter()
+        .max_by_key(|(_, keys)| keys.len())
+        .expect("routed cells");
+    let (mut carry, mut active) = (History::new(), History::new());
+    for (n, key) in keys.keys().enumerate() {
+        let n = n as u64;
+        let kind = if n.is_multiple_of(5) {
+            RecordKind::Delete
+        } else {
+            RecordKind::Put
+        };
+        carry.insert(
+            key.clone(),
+            vec![reference(version(2 * n + 1, 0), kind, 4, 0)],
+        );
+        active.insert(
+            key.clone(),
+            vec![reference(version(2 * n + 2, 0), kind, 4, 0)],
+        );
+    }
+    let identity = (KeySpace(0), id.clone());
+    let (carry, active) = (overlay(&carry), overlay(&active));
+    for cut in [IndexReadCut::BeforeAll, IndexReadCut::At(version(1000, 0))] {
+        let source = CellEncodeSource {
+            identity: &identity,
+            base: None,
+            carry: Some(&carry),
+            active: &active,
+            cut,
+            floor: IndexReadCut::BeforeAll,
+        };
+        encode_heap_base(&index, &source).unwrap();
+        let mut frame = Vec::new();
+        let encoded = CellEncoder::new(CELL_SCRATCH_CEILING)
+            .encode_source(&source, |_| Ok((&mut frame, 0)))
+            .unwrap();
+        let Some(encoded) = encoded else {
+            assert_eq!(source.cut, IndexReadCut::BeforeAll);
+            continue;
+        };
+        let block = SortedBlock::validated(
+            Bytes::from(frame).slice(8..),
+            false,
+            DATABASE,
+            KeySpace(0),
+            index.descriptor(KeySpace(0)).unwrap(),
+            id,
+            source.cut.clone(),
+        )
+        .unwrap();
+        assert_eq!(block.count, encoded.count);
+        assert_eq!(block.count, keys.len());
+        assert_eq!(block.retained_bytes, encoded.retained_bytes);
+        assert_eq!(block.retained_versions, encoded.retained_versions);
+        assert_eq!(block.retained_versions, 2 * keys.len());
+    }
 }
 
 fn plain_shape() -> KeyShape {

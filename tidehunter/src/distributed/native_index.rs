@@ -45,20 +45,26 @@ use typenum::U32;
 
 mod cell_contract;
 mod cell_flush;
+mod cell_recovery_support;
+mod cell_snapshot;
+mod index_store;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
-use cell_contract::cell_flushers;
-pub(crate) use cell_contract::{CellRootHeader, PrefixCut};
-// The crate-visible option C flush API for the flusher stage (remote_db). The
-// expectation fails once that stage uses every item, forcing its removal.
-use cell_flush::CellFlushState;
-#[expect(unused_imports, reason = "used by the cell flusher stage")]
+pub(crate) use cell_contract::cell_flushers;
+pub(crate) use cell_contract::{CellRoot, CellRootHeader, PrefixCut};
+#[cfg(test)]
+pub(crate) use cell_contract::{IndexStoreFileId, MemberReplay, RootCell, RootCellBase, RootFile};
+use cell_flush::{CellEncodeSource, CellFlushState, ROOT_DESCRIPTOR_SLICE, RootCellDescriptor};
+#[cfg(test)]
+pub(crate) use index_store::IndexStore;
+pub(crate) use index_store::IndexStoreWriter;
+// The crate-visible option C flush API used by the flusher pool and the
+// mixed-cut recovery (remote_db).
 pub(crate) use cell_flush::{
-    CELL_FLIGHTS_PER_FLUSHER, CellCapture, CellCaptureOutcome, CellDirty, CellEncodeSource,
-    CellFlushPermit, CellFlushResult, CellInstall, CellRetired, CellSkip, NewCellBase,
-    PreparedCell, ROOT_DESCRIPTOR_SLICE, RootCellDescriptor, SourceTotals,
+    CELL_FLIGHTS_PER_FLUSHER, CellCaptureOutcome, CellDirty, CellFlushResult, CellInstall,
+    CellRetired, CellSkip, NewCellBase, PreparedCell,
 };
 pub use retention::IndexReadPin;
 use retention::{CaptureLease, RetentionState, position, view_charge};

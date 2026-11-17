@@ -5,10 +5,6 @@
 //! Exact mode does not use these types: it keeps root format 4 and its global
 //! cut. No code here reads, writes or deletes a file. Per-cell stages build on
 //! these declarations; they must not weaken the rules in `CellRoot::check`.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "option C contract, wired by the per-cell stages")
-)]
 
 use super::*;
 use serde::{Deserialize, Serialize};

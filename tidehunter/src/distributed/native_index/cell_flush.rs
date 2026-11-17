@@ -207,6 +207,26 @@ impl CellFlushState {
         }
     }
 
+    /// An Exact install moved this cell's captured references into its base;
+    /// `overlay` is the active overlay left after the unmerge. Recount the
+    /// active totals from it, so `oldest_uncovered` names only references
+    /// the base lacks and a later `advance_clean` can move `D_i` (Exact to
+    /// per-cell migration). Carry and flight hold no overlay references, so
+    /// their totals stay. Cost: one pass over the remaining references of
+    /// this cell, under the shard lock the install already holds.
+    pub(super) fn recount_after_exact_install(&mut self, overlay: &References) {
+        let mut active = SourceTotals::default();
+        for (key, values) in overlay {
+            for (n, reference) in values.iter().enumerate() {
+                active.record(key.len(), reference.batch_version, n == 0);
+            }
+        }
+        self.active = active;
+        if active.versions == 0 && self.carry_totals.versions == 0 {
+            self.dirty_since = None;
+        }
+    }
+
     /// Smallest batch version not represented by the base, over every source.
     fn oldest_uncovered(&self) -> Option<BatchVersion> {
         let flight = self.flight.as_ref().map(|flight| flight.totals);
