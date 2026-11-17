@@ -12,7 +12,7 @@ use crate::distributed::remote_db::concurrent::AdmissionCharges;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 use crate::distributed::remote_db::{IndexReadCut, RemoteDatabase};
 use crate::distributed::tcp::StorageNode;
-use crate::distributed::types::BatchVersion;
+use crate::distributed::types::{BatchId, BatchVersion};
 use crate::key_shape::{KeyShape, KeySpace, KeyType};
 use crate::metrics::Metrics;
 use std::collections::HashSet;
@@ -840,6 +840,145 @@ fn uncertain_append_fail_stops_with_unknown_everywhere() {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 32]));
     }
     reopened.shutdown().unwrap();
+}
+
+/// Owner 0's worker fail-stops on group A's publication while its successor
+/// group B is appended at the owner. The client holds A's harvested reply
+/// until B's reply has also arrived, so B is in the owner WAL before A can
+/// publish. B's reply is then either processed first (durable, parked behind
+/// A) or withheld, so the worker stops with B's flight outstanding and tears
+/// its completion down after the fail-stop. Recovery replays B exactly once.
+#[test]
+fn publication_failure_with_appended_successor_group_recovers_it_once() {
+    for successor_first in [false, true] {
+        let fixture = Fixture::new();
+        let db = fixture.open();
+        let core = Arc::clone(&db.core);
+        let id = |operation| BatchId {
+            database: fixture.config.storage.database,
+            operation,
+        };
+        // Acknowledged before the failure; it must survive it.
+        let acknowledged = fixture.operation(1, 50);
+        assert_eq!(
+            core.write(acknowledged, vec![put(2, 50)], None).unwrap(),
+            version(&core, 0)
+        );
+        // Sequences 1-4 all write key 1 on owner 0, so each depends on the
+        // previous one. Holding the worker until all four are READY makes
+        // the two-batch group limit form A = [1, 2] and B = [3, 4].
+        let connection = Arc::clone(&core.clients[0].client);
+        let mut held = connection.lock();
+        held.hold_append_completions(successor_first);
+        let mut callers = Vec::new();
+        for value in 1..=4u8 {
+            let operation = fixture.operation(0, u64::from(value));
+            let caller = spawn_write(&core, operation, vec![put(1, value)]);
+            // The owner entry turns READY after the slot does; the worker
+            // forms groups from owner entries.
+            wait_for("caller batch READY in the owner queue", || {
+                core.clients[0].queue.snapshot().2.len() == usize::from(value)
+            });
+            callers.push((operation, value, caller));
+        }
+        let (head, next, ready) = core.clients[0].queue.snapshot();
+        assert_eq!(next - head, 4);
+        assert_eq!(
+            ready
+                .iter()
+                .map(|&(_, sequence, _)| sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        core.test_hooks.lock().fail_publication = Some(1);
+        drop(held);
+
+        // Fail-stop: every caller gets an unknown outcome, never an abort.
+        for (_, value, caller) in &callers {
+            let error = caller.recv_timeout(WAIT).unwrap().unwrap_err();
+            assert_eq!(
+                error.uncertain_version,
+                Some(version(&core, u64::from(*value))),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            *core.clients[0].accounting.formed_groups.lock(),
+            vec![vec![1, 2], vec![3, 4]]
+        );
+        for sequence in 1..=4 {
+            assert_eq!(
+                core.sequencer.resolution(sequence),
+                Some(Resolution::Unknown)
+            );
+        }
+        // A's receipts were accepted before its publication failed. B's
+        // reply was processed only when it was released before A.
+        let receipts: Vec<_> = (1..=4)
+            .map(|sequence| core.durable_receipt(sequence))
+            .collect();
+        assert!(receipts[..2].iter().all(Option::is_some));
+        assert!(
+            receipts[2..]
+                .iter()
+                .all(|receipt| receipt.is_some() == successor_first)
+        );
+        // B is in the owner WAL whether or not its reply was processed.
+        for (operation, _, _) in &callers {
+            assert!(
+                fixture.nodes[0]
+                    .contains_batch(core.epoch, id(*operation))
+                    .unwrap()
+            );
+        }
+        assert!(core.ensure_healthy().is_err());
+        assert!(core.drain().is_err());
+        assert_eq!(core.published_next(), 1);
+        assert!(core.shutdown().is_err());
+        // Workers are joined: B's torn-down completion changed nothing.
+        for sequence in 1..=4 {
+            assert_eq!(
+                core.sequencer.resolution(sequence),
+                Some(Resolution::Unknown)
+            );
+        }
+        assert_eq!(core.published_next(), 1);
+        let epoch = core.epoch;
+        let original = |sequence| BatchVersion { epoch, sequence };
+        drop(core);
+        drop(db);
+
+        let mut reopened = fixture.open();
+        // The acknowledged batch and both owner-0 groups, each exactly once:
+        // a duplicate identity or version would fail recovery.
+        assert_eq!(reopened.recovery_stats().tail_batches, 5);
+        for ((operation, value, _), receipt) in callers.iter().zip(&receipts) {
+            let recovered = reopened.core.lookup_identity(*operation).unwrap().unwrap();
+            assert_eq!(recovered.version, original(u64::from(*value)));
+            if let Some(receipt) = receipt {
+                // The recovered batch is the one whose receipt was accepted.
+                assert_eq!(recovered.digest, Some(receipt.appended().digest()));
+            }
+        }
+        assert_eq!(
+            reopened
+                .write_batch(acknowledged, vec![put(2, 50)])
+                .unwrap(),
+            original(0)
+        );
+        for (operation, value, _) in callers {
+            assert_eq!(
+                reopened
+                    .write_batch(operation, vec![put(1, value)])
+                    .unwrap(),
+                original(u64::from(value))
+            );
+        }
+        assert_eq!(reopened.stats().admitted_batches, 0);
+        assert_eq!(value(&mut reopened, 1), Some(vec![4; 32]));
+        assert_eq!(value(&mut reopened, 2), Some(vec![50; 32]));
+        reopened.shutdown().unwrap();
+    }
 }
 
 #[test]
