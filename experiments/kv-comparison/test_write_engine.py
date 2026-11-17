@@ -95,6 +95,9 @@ class WriteEngineTests(unittest.TestCase):
             self.assertEqual(config["workload"]["minimum_measurement_seconds"], 15)
             self.assertEqual(config["execution"]["concurrency"], 16)
             self.assertEqual(runner.planned_timing_rows(config)["measurement"], 4096 * 510)
+            # The terminal case summary counts the same rows; replay configs carry no `phases`.
+            self.assertNotIn("phases", config)
+            self.assertEqual(campaign.planned_measurement_calls(config), 4096 * 510)
             manifest = Path(config["workload"]["manifest_path"])
             self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), config["workload"]["manifest_sha256"])
             summary = {"status": "completed", "phase_counts": {
