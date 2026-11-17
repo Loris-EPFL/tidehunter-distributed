@@ -114,7 +114,7 @@ fn try_open_node(
 }
 
 pub(super) fn prepare_database(db: &mut RemoteDatabase) {
-    for worker in &db.clients {
+    for worker in &db.core.clients {
         worker.client.lock().bench_local_live_fixture(false);
     }
 }
@@ -136,10 +136,12 @@ pub(super) fn prepare_recovery_reads(db: &RemoteDatabase) -> Vec<RecoveryReadPin
             .or_default()
             .push(reference);
     }
-    let pool = db.live_pool.as_ref().unwrap();
+    let pool = db.core.live_pool.as_ref().unwrap();
     let mut pins = Vec::with_capacity(by_owner.len());
     for (partition, references) in by_owner {
-        let client = db.clients[db.partition_indexes[&partition]].client.clone();
+        let client = db.core.clients[db.core.partition_indexes[&partition]]
+            .client
+            .clone();
         let resolved = client
             .lock()
             .resolve_live_records(db.epoch(), &references)

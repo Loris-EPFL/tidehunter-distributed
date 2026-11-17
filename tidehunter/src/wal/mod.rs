@@ -2,6 +2,8 @@
 pub(crate) mod allocator;
 #[cfg(feature = "experimental-nvmeof")]
 mod external;
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+pub(crate) use external::fiemap;
 pub(crate) mod files;
 pub mod layout;
 mod mapper;

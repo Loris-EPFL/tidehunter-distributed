@@ -189,7 +189,6 @@ struct Args {
     native_read_workers: usize,
     read_resource_evidence: bool,
     tcp_pipeline: Option<bool>,
-    tcp_preparation_workers: Option<usize>,
     tcp_scan_prefetch_pages: Option<usize>,
     tcp_read_lanes: Option<usize>,
     tcp_max_pending_reads: Option<usize>,
@@ -244,7 +243,6 @@ impl Args {
             native_read_workers: 1,
             read_resource_evidence: false,
             tcp_pipeline: None,
-            tcp_preparation_workers: None,
             tcp_scan_prefetch_pages: None,
             tcp_read_lanes: None,
             tcp_max_pending_reads: None,
@@ -271,7 +269,7 @@ impl Args {
         while let Some(flag) = input.next() {
             if flag == "--help" {
                 println!(
-                    "sharded_wal_bench [--transport-config JSON_FILE (canonical Transport JSON; default TCP)] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-workers 1..8] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--cold-single-probes 1..4096 (requires cold read pass)] [--cold-group-probes 1..4096 (requires cold read pass)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--bounded-hot-reads N] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,... --owner-transports JSON_FILE (per-owner Transport array)]"
+                    "sharded_wal_bench [--transport-config JSON_FILE (canonical Transport JSON; default TCP)] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--cold-single-probes 1..4096 (requires cold read pass)] [--cold-group-probes 1..4096 (requires cold read pass)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--bounded-hot-reads N] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,... --owner-transports JSON_FILE (per-owner Transport array)]"
                 );
                 println!(
                     "Trusted transport modes omit application authentication/encryption and require an isolated deployment."
@@ -348,7 +346,6 @@ impl Args {
                 "--native-read-workers" => args.native_read_workers = value.parse()?,
                 "--read-resource-evidence" => args.read_resource_evidence = value.parse()?,
                 "--tcp-pipeline" => args.tcp_pipeline = Some(value.parse()?),
-                "--tcp-preparation-workers" => args.tcp_preparation_workers = Some(value.parse()?),
                 "--tcp-scan-prefetch-pages" => args.tcp_scan_prefetch_pages = Some(value.parse()?),
                 "--tcp-read-lanes" => args.tcp_read_lanes = Some(value.parse()?),
                 "--tcp-max-pending-reads" => args.tcp_max_pending_reads = Some(value.parse()?),
@@ -537,9 +534,6 @@ impl Args {
             args.tcp_read_cache_bytes = Some(0);
         }
         if !(1..=32).contains(&args.tcp_preparation_chunk_batches)
-            || args
-                .tcp_preparation_workers
-                .is_some_and(|workers| !(1..=8).contains(&workers))
             || args
                 .tcp_scan_prefetch_pages
                 .is_some_and(|pages| !(1..=2).contains(&pages))
@@ -1031,15 +1025,6 @@ impl Backend {
                 let authority = db.authority_write_stats();
                 BTreeMap::from([
                     ("prepare_calls", pipeline.prepare_calls),
-                    (
-                        "prepare_progress_completions",
-                        pipeline.prepare_progress_completions,
-                    ),
-                    ("prepare_progress_passes", pipeline.prepare_progress_passes),
-                    (
-                        "parallel_prepared_batches",
-                        pipeline.parallel_prepared_batches,
-                    ),
                     ("prepare_wall_ns", pipeline.prepare_wall_ns),
                     ("prepare_task_elapsed_sum_ns", pipeline.prepare_task_ns),
                     (
@@ -1056,21 +1041,7 @@ impl Backend {
                         "foreground_checkpoint_count",
                         authority.foreground_checkpoint_count,
                     ),
-                    (
-                        "prepare_reserved_bytes_peak",
-                        pipeline.prepare_reserved_bytes_peak as u64,
-                    ),
                     ("pipeline_append_requests", pipeline.append_requests),
-                    ("pipeline_direct_appends", pipeline.direct_appends),
-                    ("pipeline_early_dispatches", pipeline.early_dispatches),
-                    (
-                        "pipeline_completions_before_drain",
-                        pipeline.completions_before_drain,
-                    ),
-                    (
-                        "pipeline_peak_inflight_nodes",
-                        pipeline.peak_inflight_nodes as u64,
-                    ),
                     ("cache_hits", cache.hits),
                     ("cache_misses", cache.misses),
                     ("cache_inserts", cache.inserts),
@@ -1101,7 +1072,7 @@ impl Backend {
         match self {
             Self::Native { db, .. } => db.wait_for_background_threads_to_finish(),
             Self::Sharded(mut db) => db.shutdown()?,
-            Self::Tcp(mut db) => {
+            Self::Tcp(db) => {
                 db.shutdown()?;
                 return Ok(Some(db.shutdown_stats()));
             }
@@ -2270,9 +2241,6 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         if let Some(enabled) = args.tcp_pipeline {
             remote.pipelined_writes = enabled;
         }
-        if let Some(workers) = args.tcp_preparation_workers {
-            remote.preparation_workers = workers;
-        }
         if let Some(pages) = args.tcp_scan_prefetch_pages {
             remote.scan_prefetch_pages = pages;
         }
@@ -3013,9 +2981,6 @@ fn main() -> Result<()> {
         if let Some(enabled) = args.tcp_pipeline {
             config.pipelined_writes = enabled;
         }
-        if let Some(workers) = args.tcp_preparation_workers {
-            config.preparation_workers = workers;
-        }
         if let Some(pages) = args.tcp_scan_prefetch_pages {
             config.scan_prefetch_pages = pages;
         }
@@ -3176,10 +3141,9 @@ fn main() -> Result<()> {
     )?;
     writeln!(
         metadata,
-        "tcp_read_cache_bytes_override={:?}\ntcp_pipeline_override={:?}\ntcp_preparation_workers_override={:?}\ntcp_scan_prefetch_pages_override={:?}\ntcp_write_window_api=bounded_submit_many_chunks_when_window_gt_one\nhot_read_pass={}",
+        "tcp_read_cache_bytes_override={:?}\ntcp_pipeline_override={:?}\ntcp_scan_prefetch_pages_override={:?}\ntcp_write_window_api=bounded_submit_many_chunks_when_window_gt_one\nhot_read_pass={}",
         args.tcp_read_cache_bytes,
         args.tcp_pipeline,
-        args.tcp_preparation_workers,
         args.tcp_scan_prefetch_pages,
         args.hot_read_pass
     )?;

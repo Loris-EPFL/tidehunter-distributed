@@ -114,7 +114,7 @@ fn fixture(
             "tls":tls,"timeout":{"secs":30,"nanos":0},"max_admitted_batches":8192,"max_index_bytes":67108864,
             "max_pending_batches":64,"max_pending_bytes":33554432,"owner_append_occupancy":16,
             "pipelined_writes":true,"read_cache_bytes":0,"read_memory_allowance_bytes":134217728,
-            "preparation_workers":2,"scan_prefetch_pages":1,"read_lanes":2,"pin_read_lanes":false,
+            "scan_prefetch_pages":1,"read_lanes":2,"pin_read_lanes":false,
             "max_pending_reads":64,"max_pending_read_bytes":16777216,"write_profile_limit":0,"index_shards":64
         })).unwrap();
         config.history_persistence =

@@ -325,7 +325,10 @@ and `polling` (`adaptive` or `busy`). The helper fixes the keyshape at 16 mutexe
 × 64 cells and writes `node-{0..4}/launch.yaml`, `remote.yaml`, `remote.json`,
 `shape.yaml`, generated `tls/` material when TLS is selected, and
 `external_owner_read_config.json` extracted from each actual launch file. Owner
-limits remain as configured by the prep helper. A pre-existing output
+limits remain as configured by the prep helper. Each launch states
+`wal_prewrite: false` explicitly (the legacy harness behaviour; an owner reads
+an absent key as on). The cloud and local harnesses rebind it to the case's
+`owner_wal_prewrite` before starting the owner. A pre-existing output
 directory is rejected. The signing key stays in the generated
 coordinator-side TLS tree; stage each node's launch config and required CA
 certificate/server leaf certificate+key to that owner, never the CA signing

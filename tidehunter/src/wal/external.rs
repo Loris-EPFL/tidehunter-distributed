@@ -121,21 +121,12 @@ impl ExternalPreparation {
     }
 }
 
+/// Test-only FIEMAP probe shared by WAL and owner prewrite tests.
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-    use std::fs::OpenOptions;
-
-    fn file() -> (tempdir::TempDir, File) {
-        let directory = tempdir::TempDir::new("wal-prewrite").unwrap();
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(directory.path().join("wal"))
-            .unwrap();
-        (directory, file)
-    }
+pub(crate) mod fiemap {
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
 
     #[derive(Clone, Copy, Default)]
     #[repr(C)]
@@ -159,13 +150,16 @@ mod tests {
         extents: [Extent; 256],
     }
 
-    fn assert_written_extents(file: &File, len: u64) {
+    /// Mapped extents of `file[0..len]` as `(logical, length, unwritten)`,
+    /// after the kernel syncs delayed allocation (`FIEMAP_FLAG_SYNC`).
+    pub(crate) fn extents(file: &File, len: u64) -> Vec<(u64, u64, bool)> {
         const FS_IOC_FIEMAP: libc::c_ulong = 0xc020_660b;
+        const FIEMAP_FLAG_SYNC: u32 = 1;
         const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x800;
         let mut map = Fiemap {
             start: 0,
             length: len,
-            flags: 1,
+            flags: FIEMAP_FLAG_SYNC,
             mapped: 0,
             count: 256,
             reserved: 0,
@@ -180,21 +174,46 @@ mod tests {
             "test filesystem must support FIEMAP: {}",
             io::Error::last_os_error()
         );
-        assert!(
-            map.mapped > 0 && map.mapped < map.count,
-            "bounded FIEMAP buffer exhausted or empty"
-        );
+        assert!(map.mapped < map.count, "bounded FIEMAP buffer exhausted");
+        map.extents[..map.mapped as usize]
+            .iter()
+            .map(|extent| {
+                (
+                    extent.logical,
+                    extent.length,
+                    extent.flags & FIEMAP_EXTENT_UNWRITTEN != 0,
+                )
+            })
+            .collect()
+    }
+
+    /// Written extents cover `0..len` with no hole and no unwritten extent.
+    pub(crate) fn assert_written_extents(file: &File, len: u64) {
         let mut covered = 0;
-        for extent in &map.extents[..map.mapped as usize] {
-            assert_eq!(
-                extent.flags & FIEMAP_EXTENT_UNWRITTEN,
-                0,
-                "prewritten extent is still unwritten"
-            );
-            assert_eq!(extent.logical, covered, "hole in prewritten file");
-            covered += extent.length;
+        for (logical, length, unwritten) in extents(file, len) {
+            assert!(!unwritten, "prewritten extent is still unwritten");
+            assert_eq!(logical, covered, "hole in prewritten file");
+            covered += length;
         }
-        assert!(covered >= len);
+        assert!(covered >= len, "prewritten file is not fully mapped");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::fiemap::assert_written_extents;
+    use super::*;
+    use std::fs::OpenOptions;
+
+    fn file() -> (tempdir::TempDir, File) {
+        let directory = tempdir::TempDir::new("wal-prewrite").unwrap();
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("wal"))
+            .unwrap();
+        (directory, file)
     }
 
     #[test]

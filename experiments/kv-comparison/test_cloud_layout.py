@@ -46,6 +46,29 @@ class Plans(unittest.TestCase):
         with self.assertRaises(ValueError):
             layout.validate_fleet(compact)
 
+    def test_each_acknowledgement_arm_keeps_its_own_ownership_receipt(self):
+        # A contract switch resets data but keeps owner.json; a shared directory made the next arm's
+        # exact receipt check fail on the previous arm's receipt (F2 kvrocks synced -> page_cache).
+        value = fleet(qualification=True)
+        root = Path(value["data_root"])
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        for backend, arms in (("kvrocks", ("synced", "page_cache")),):
+            configs = {arm: layout.node_config(value, backend, 0, ack_contract=arm) for arm in arms}
+            self.assertEqual(configs["synced"]["directory"], str(root / backend / "node-0"))
+            self.assertEqual(len({config["directory"] for config in configs.values()}), len(arms))
+            for config in configs.values():
+                directory = Path(config["directory"])
+                (directory / "data").mkdir(parents=True)
+                for name, text in config["files"].items():
+                    (directory / name).write_text(text if isinstance(text, str) else json.dumps(text))
+                (directory / "owner.json").write_text(json.dumps(config))
+            for arm in ("synced", "page_cache", "synced"):
+                with self.subTest(backend=backend, arm=arm):
+                    self.assertEqual(layout.require_state(configs[arm]), Path(configs[arm]["directory"]))
+            moved = dict(configs["page_cache"], directory=configs["synced"]["directory"])
+            with self.assertRaisesRegex(ValueError, "escapes admitted run root"):
+                layout.require_state(moved)
+
     def test_matched_valkey_uses_distinct_rdma_addresses_and_same_server(self):
         value = fleet()
         value["valkey_rdma_package"] = True

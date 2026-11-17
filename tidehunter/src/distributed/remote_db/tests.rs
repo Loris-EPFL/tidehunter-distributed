@@ -13,10 +13,11 @@ pub(super) fn recovery_metrics() -> Arc<Metrics> {
     Metrics::new_in_enabled(&prometheus::Registry::new(), false)
 }
 
-pub(super) fn fail_stop_without_checkpoint(mut db: RemoteDatabase) {
+pub(super) fn fail_stop_without_checkpoint(db: RemoteDatabase) {
     // A worker may durably adopt its captured root during drop. No explicit
     // checkpoint is requested here; recovery must accept either valid root.
-    db.healthy = false;
+    db.core
+        .begin_failure(&LocalDbError::new("injected fail-stop before reopen"));
     drop(db);
 }
 
@@ -26,6 +27,22 @@ pub(super) fn reopen_result(fixture: &Fixture) -> Result<RemoteDatabase, LocalDb
         &fixture.shape,
         fixture.config.clone(),
         recovery_metrics(),
+    )
+}
+
+fn manifest(db: &RemoteDatabase) -> AuthorityManifest {
+    db.core.publisher.lock().manifest.clone()
+}
+
+fn snapshot_generation(db: &RemoteDatabase) -> u64 {
+    db.core.publisher.lock().snapshot_generation
+}
+
+fn checkpoint_tail(db: &RemoteDatabase) -> (usize, usize) {
+    let publisher = db.core.publisher.lock();
+    (
+        publisher.checkpoint_tail_batches,
+        publisher.checkpoint_tail_bytes,
     )
 }
 #[test]
@@ -97,7 +114,7 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
     }
     let f = Fixture::new();
     let db = f.open();
-    let manifest = &db.manifest;
+    let manifest = &manifest(&db);
     let legacy = LegacyManifest {
         format: manifest.format,
         storage: manifest.storage.clone(),
@@ -180,7 +197,7 @@ fn sui_read_evidence_samples_configured_owners_at_boundaries() {
 #[test]
 fn benchmark_owner_lookup_uses_authoritative_reference_and_reports_absence() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     let key = 11u32.to_be_bytes();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(11, 1)])
         .unwrap();
@@ -229,17 +246,18 @@ fn checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
     mode: HistoryPersistence,
 ) {
     let fixture = Fixture::new().history(mode);
-    let mut db = fixture.open();
+    let db = fixture.open();
     let operation = fixture.operation(0, 1);
     let original = checkpoint_put(1, 1);
     let version = db
         .write_batch(operation, vec![original.clone(), checkpoint_put(2, 2)])
         .unwrap();
     db.flush_index().unwrap();
-    let generation = db.snapshot_generation;
+    let generation = snapshot_generation(&db);
     db.flush_index().unwrap();
     assert_eq!(
-        db.snapshot_generation, generation,
+        snapshot_generation(&db),
+        generation,
         "unchanged flush must not duplicate snapshots"
     );
     db.write_batch(
@@ -287,16 +305,16 @@ fn checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
 fn interrupted_checkpoint_images_and_metadata_never_supersede_committed_pointer() {
     for stage in [1, 2] {
         let fixture = Fixture::new();
-        let mut db = fixture.open();
+        let db = fixture.open();
         db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
             .unwrap();
         db.flush_index().unwrap();
-        let committed = db.manifest.checkpoint.as_ref().unwrap().metadata_name();
+        let committed = manifest(&db).checkpoint.as_ref().unwrap().metadata_name();
         db.write_batch(fixture.operation(1, 2), vec![checkpoint_put(1, 2)])
             .unwrap();
-        db.checkpoint_interruption = Some(stage);
+        db.core.test_hooks.lock().checkpoint_interruption = Some(stage);
         assert!(db.flush_index().is_err());
-        let persisted: AuthorityManifest = read_metadata(&db.path.join(MANIFEST)).unwrap();
+        let persisted: AuthorityManifest = read_metadata(&db.core.path.join(MANIFEST)).unwrap();
         assert_eq!(persisted.checkpoint.unwrap().metadata_name(), committed);
         let staged = persisted.checkpoint_staging.unwrap();
         drop(db);
@@ -312,19 +330,19 @@ fn interrupted_checkpoint_images_and_metadata_never_supersede_committed_pointer(
         );
         for name in staged.names() {
             assert!(
-                !db.path.join(name).exists(),
+                !db.core.path.join(name).exists(),
                 "reserved interrupted output must be retired"
             );
         }
-        assert!(db.manifest.checkpoint_staging.is_none());
-        assert!(db.manifest.checkpoint_obsolete.is_none());
+        assert!(manifest(&db).checkpoint_staging.is_none());
+        assert!(manifest(&db).checkpoint_obsolete.is_none());
     }
 }
 
 #[test]
 fn checkpoint_is_not_adopted_until_every_required_shard_is_fenced() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(4, 1), vec![checkpoint_put(1, 7)])
         .unwrap();
     db.shutdown().unwrap();
@@ -372,12 +390,12 @@ fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointI
 fn committed_checkpoint_corruption_missing_files_and_wrong_prefixes_fail_closed() {
     for damage in 0..7 {
         let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-        let mut db = fixture.open();
+        let db = fixture.open();
         db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
             .unwrap();
         db.shutdown().unwrap();
-        let root = db.path.clone();
-        let commit = db.manifest.checkpoint.clone().unwrap();
+        let root = db.core.path.clone();
+        let commit = manifest(&db).checkpoint.clone().unwrap();
         drop(db);
         match damage {
             0 => fs::remove_file(root.join(commit.index_name())).unwrap(),
@@ -454,11 +472,11 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryP
         &fixture.config,
         MAX_CHECKPOINT_METADATA_BYTES as usize / 128
     ));
-    let mut db = fixture.open();
+    let db = fixture.open();
     let (entered, waiting) = mpsc::sync_channel(1);
     let (resume, gate) = mpsc::sync_channel(1);
     if replay {
-        db.checkpoint_pause = Some((entered, gate));
+        db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
     }
     let mut acknowledged = Vec::new();
     let count = if replay {
@@ -474,19 +492,19 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryP
             .unwrap();
         acknowledged.push((operation, value, version));
         if !replay {
-            assert!(db.checkpoint_tail_batches <= limits.max_batches);
-            assert!(db.checkpoint_tail_bytes <= limits.max_encoded_bytes);
+            assert!(checkpoint_tail(&db).0 <= limits.max_batches);
+            assert!(checkpoint_tail(&db).1 <= limits.max_encoded_bytes);
         }
     }
     if replay {
         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(db.authority_write_stats().foreground_checkpoint_count, 0);
-        assert_eq!(db.checkpoint_tail_batches, count);
-        assert!(!db.path.join("receipt-history-v2").exists());
+        assert_eq!(checkpoint_tail(&db).0, count);
+        assert!(!db.core.path.join("receipt-history-v2").exists());
     } else {
-        assert!(db.manifest.checkpoint.is_some());
+        assert!(manifest(&db).checkpoint.is_some());
     }
-    let retained_tail = db.checkpoint_tail_batches;
+    let retained_tail = checkpoint_tail(&db).0;
     let clocks = db.authority_write_stats();
     assert!(clocks.checkpoint_count > 0);
     assert!(clocks.foreground_checkpoint_count <= clocks.checkpoint_count);
@@ -526,10 +544,11 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryP
 fn checkpoint_does_not_turn_damaged_referenced_value_into_absence() {
     use std::os::unix::fs::FileExt;
     let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     let reference = db
+        .core
         .index
         .get(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
         .unwrap()
@@ -578,9 +597,9 @@ fn checkpoint_retirement_bounds_files_and_preserves_pinned_immutable_index() {
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
-    let first = db.manifest.checkpoint.clone().unwrap();
+    let first = manifest(&db).checkpoint.clone().unwrap();
     let pinned = NativeIndex::open_snapshot(
-        &db.path.join(first.index_name()),
+        &db.core.path.join(first.index_name()),
         &fixture.shape,
         fixture.config.storage.database,
         fixture.config.max_index_bytes,
@@ -590,18 +609,19 @@ fn checkpoint_retirement_bounds_files_and_preserves_pinned_immutable_index() {
         .get(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
         .unwrap();
     for n in 2..6 {
-        let previous = db.manifest.checkpoint.clone().unwrap();
+        let previous = manifest(&db).checkpoint.clone().unwrap();
         db.write_batch(fixture.operation(1, n), vec![checkpoint_put(1, n as u8)])
             .unwrap();
         db.flush_index().unwrap();
-        assert!(!db.path.join(previous.index_name()).exists());
-        assert!(!db.path.join(previous.metadata_name()).exists());
+        assert!(!db.core.path.join(previous.index_name()).exists());
+        assert!(!db.core.path.join(previous.metadata_name()).exists());
         assert!(
-            db.path
-                .join(db.manifest.checkpoint.as_ref().unwrap().index_name())
+            db.core
+                .path
+                .join(manifest(&db).checkpoint.as_ref().unwrap().index_name())
                 .is_file()
         );
-        assert!(db.manifest.checkpoint_obsolete.is_none());
+        assert!(manifest(&db).checkpoint_obsolete.is_none());
     }
     assert_eq!(
         pinned
@@ -622,17 +642,17 @@ fn checkpoint_retirement_bounds_files_and_preserves_pinned_immutable_index() {
 fn committed_checkpoint_resumes_interrupted_retirement_without_rolling_back() {
     for partially_unlinked in [false, true] {
         let fixture = Fixture::new();
-        let mut db = fixture.open();
+        let db = fixture.open();
         db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
             .unwrap();
         db.flush_index().unwrap();
-        let previous = db.manifest.checkpoint.clone().unwrap();
+        let previous = manifest(&db).checkpoint.clone().unwrap();
         db.write_batch(fixture.operation(1, 2), vec![checkpoint_put(1, 2)])
             .unwrap();
-        db.checkpoint_interruption = Some(3);
+        db.core.test_hooks.lock().checkpoint_interruption = Some(3);
         let error = db.flush_index().unwrap_err();
         assert!(error.to_string().contains("checkpoint committed"));
-        let persisted: AuthorityManifest = read_metadata(&db.path.join(MANIFEST)).unwrap();
+        let persisted: AuthorityManifest = read_metadata(&db.core.path.join(MANIFEST)).unwrap();
         assert_eq!(
             persisted.checkpoint.unwrap().generation,
             previous.generation + 1
@@ -642,15 +662,15 @@ fn committed_checkpoint_resumes_interrupted_retirement_without_rolling_back() {
             previous.generation
         );
         if partially_unlinked {
-            fs::remove_file(db.path.join(previous.index_name())).unwrap();
+            fs::remove_file(db.core.path.join(previous.index_name())).unwrap();
         }
         drop(db);
         let mut db = fixture.open();
         assert!(db.recovery_stats().checkpoint_loaded);
         assert_eq!(db.recovery_stats().tail_batches, 0);
-        assert!(!db.path.join(previous.index_name()).exists());
-        assert!(!db.path.join(previous.metadata_name()).exists());
-        assert!(db.manifest.checkpoint_obsolete.is_none());
+        assert!(!db.core.path.join(previous.index_name()).exists());
+        assert!(!db.core.path.join(previous.metadata_name()).exists());
+        assert!(manifest(&db).checkpoint_obsolete.is_none());
         assert_eq!(
             db.get(KeySpace(0), &1u32.to_be_bytes())
                 .unwrap()
@@ -664,13 +684,13 @@ fn committed_checkpoint_resumes_interrupted_retirement_without_rolling_back() {
 #[test]
 fn checkpoint_cleanup_error_reports_committed_root_and_preserves_recovery_intent() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
-    let previous = db.manifest.checkpoint.clone().unwrap();
-    let metadata = db.path.join(previous.metadata_name());
-    let saved = db.path.join("saved-old-metadata");
+    let previous = manifest(&db).checkpoint.clone().unwrap();
+    let metadata = db.core.path.join(previous.metadata_name());
+    let saved = db.core.path.join("saved-old-metadata");
     fs::rename(&metadata, &saved).unwrap();
     fs::create_dir(&metadata).unwrap(); // Inject an actual non-regular cleanup target.
     db.write_batch(fixture.operation(1, 2), vec![checkpoint_put(1, 2)])
@@ -681,15 +701,15 @@ fn checkpoint_cleanup_error_reports_committed_root_and_preserves_recovery_intent
             .to_string()
             .contains("checkpoint committed; artifact cleanup incomplete")
     );
-    assert!(!db.healthy);
-    let persisted: AuthorityManifest = read_metadata(&db.path.join(MANIFEST)).unwrap();
+    assert!(db.core.ensure_healthy().is_err());
+    let persisted: AuthorityManifest = read_metadata(&db.core.path.join(MANIFEST)).unwrap();
     assert_eq!(
         persisted.checkpoint.unwrap().generation,
         previous.generation + 1
     );
     assert!(persisted.checkpoint_obsolete.is_some());
     assert!(
-        db.path.join(previous.index_name()).exists(),
+        db.core.path.join(previous.index_name()).exists(),
         "validate all cleanup targets before unlink"
     );
     fs::remove_dir(&metadata).unwrap();
@@ -710,14 +730,14 @@ fn checkpoint_cleanup_error_reports_committed_root_and_preserves_recovery_intent
 #[test]
 fn checkpoint_never_claims_or_cleans_preexisting_untracked_outputs() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
     db.flush_index().unwrap();
-    let unrelated = db.path.join(format!(
+    let unrelated = db.core.path.join(format!(
         "index-{}-{}.snapshot",
-        db.epoch,
-        db.snapshot_generation + 1
+        db.epoch(),
+        snapshot_generation(&db) + 1
     ));
     fs::write(&unrelated, b"not checkpoint-owned").unwrap();
     db.write_batch(fixture.operation(1, 2), vec![checkpoint_put(1, 2)])
@@ -728,7 +748,7 @@ fn checkpoint_never_claims_or_cleans_preexisting_untracked_outputs() {
             .to_string()
             .contains("output path already exists")
     );
-    assert!(db.manifest.checkpoint_staging.is_none());
+    assert!(manifest(&db).checkpoint_staging.is_none());
     drop(db);
     let mut db = fixture.open();
     assert_eq!(fs::read(unrelated).unwrap(), b"not checkpoint-owned");
@@ -744,8 +764,7 @@ fn checkpoint_never_claims_or_cleans_preexisting_untracked_outputs() {
 #[test]
 fn checkpoint_capacity_preflight_rejects_entire_window_and_deduplicates_retries() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
-    db.config.pipelined_writes = false;
+    let db = fixture.open();
     let known_id = fixture.operation(0, 1);
     let active_id = fixture.operation(1, 2);
     let new_id = fixture.operation(2, 3);
@@ -753,29 +772,32 @@ fn checkpoint_capacity_preflight_rejects_entire_window_and_deduplicates_retries(
     let active = checkpoint_put(2, 2);
     let new = checkpoint_put(3, 3);
     let known_version = db.write_batch(known_id, vec![known.clone()]).unwrap();
+    // Hold the active batch's owner so its identity stays Active (allocated,
+    // unpublished); callers no longer wait for publication on submit.
+    let active_connection = Arc::clone(&db.core.clients[1].client);
+    let active_held = active_connection.lock();
     let active_version = db.submit(active_id, vec![active.clone()]).unwrap();
-    db.checkpoint_receipt_limit = Some(3); // Exactly one distinct new receipt fits.
-    let before_groups = db.storage_stats().unwrap().appended_groups;
+    // Exactly one distinct new receipt fits the identity (receipt metadata) bound.
+    db.core.admission.limit_identities_for_test(3);
+    // Owner stats would need the held client; the worker-formed group count
+    // is the local proof that no rejected member reached a transport append.
+    let before_groups = db.pipeline_stats().append_requests;
     let error = db
         .submit_many(&[
             (new_id, vec![new.clone()]),
             (fixture.operation(3, 4), vec![checkpoint_put(4, 4)]),
         ])
         .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("checkpoint receipt metadata admission capacity")
-    );
+    assert!(error.to_string().contains("admission capacity"), "{error}");
     assert_eq!(
-        db.submission_next(),
+        db.core.next_sequence(),
         2,
         "no member of rejected window may allocate a slot"
     );
-    assert_eq!(db.active_identities.len(), 1);
-    assert_eq!(db.known.len(), 1);
-    assert_eq!(db.storage_stats().unwrap().appended_groups, before_groups);
-    assert!(db.healthy);
+    assert_eq!(db.core.active_identities(), 1);
+    assert_eq!(db.core.publisher.lock().known.len(), 1);
+    assert_eq!(db.pipeline_stats().append_requests, before_groups);
+    assert!(db.core.ensure_healthy().is_ok());
 
     let versions = db
         .submit_many(&[
@@ -788,9 +810,10 @@ fn checkpoint_capacity_preflight_rejects_entire_window_and_deduplicates_retries(
     assert_eq!(versions[0], known_version);
     assert_eq!(versions[1], active_version);
     assert_eq!(versions[2], versions[3]);
-    assert_eq!(db.submission_next(), 3);
+    assert_eq!(db.core.next_sequence(), 3);
+    drop(active_held);
     db.drain().unwrap();
-    assert_eq!(db.known.len(), 3);
+    assert_eq!(db.core.publisher.lock().known.len(), 3);
     assert_eq!(
         db.submit_many(&[
             (known_id, vec![known]),
@@ -801,7 +824,7 @@ fn checkpoint_capacity_preflight_rejects_entire_window_and_deduplicates_retries(
         versions[..3]
     );
     assert_eq!(
-        db.submission_next(),
+        db.core.next_sequence(),
         3,
         "retries consume no additional checkpoint capacity"
     );
@@ -810,16 +833,16 @@ fn checkpoint_capacity_preflight_rejects_entire_window_and_deduplicates_retries(
 #[test]
 fn unchanged_checkpoint_is_a_noop_and_shutdown_clocks_are_retained() {
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     let operation = fixture.operation(0, 200);
     let mutation = checkpoint_put(7, 42);
     let version = db.write_batch(operation, vec![mutation.clone()]).unwrap();
     db.flush_index().unwrap();
     let before = db.authority_write_stats();
-    let generation = db.snapshot_generation;
+    let generation = snapshot_generation(&db);
     let barriers = db.storage_stats().unwrap().persistence_barriers;
     db.flush_index().unwrap();
-    assert_eq!(db.snapshot_generation, generation);
+    assert_eq!(snapshot_generation(&db), generation);
     assert_eq!(
         db.authority_write_stats().checkpoint_count,
         before.checkpoint_count
@@ -834,8 +857,14 @@ fn unchanged_checkpoint_is_a_noop_and_shutdown_clocks_are_retained() {
     let closed = db.shutdown_stats();
     assert!(closed.seal_ns > 0);
     assert!(closed.join_ns > 0);
-    assert!(db.clients.is_empty());
-    assert!(db.preparation_pool.is_none());
+    assert!(db.core.stopped.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        db.core
+            .clients
+            .iter()
+            .all(|worker| worker.thread.lock().is_none()),
+        "shutdown joins every owner worker"
+    );
     assert_eq!(
         db.authority_write_stats().checkpoint_count,
         before.checkpoint_count
@@ -879,7 +908,7 @@ fn failed_setup_joins_owned_workers_and_next_open_reserves_a_new_epoch() {
     let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
     assert_eq!(manifest.epochs.len(), 1);
     assert!(!manifest.epochs[0].active);
-    let mut db = fixture.open();
+    let db = fixture.open();
     assert_eq!(db.epoch(), 2);
     assert_eq!(db.recovery_stats().fabric_worker_ns, None);
     db.write_batch(fixture.operation(4, 201), vec![checkpoint_put(8, 9)])
@@ -1007,7 +1036,7 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
     let root = fixture.temp.path().join("authority");
     for existing in [false, true] {
         if existing {
-            let mut db = fixture.open();
+            let db = fixture.open();
             db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(0, 7)])
                 .unwrap();
             db.shutdown().unwrap();
@@ -1041,19 +1070,6 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
 }
 
 #[test]
-fn preparation_pool_drop_joins_scheduled_work() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let completed = Arc::new(AtomicUsize::new(0));
-    let pool = PreparationPool::build(2).unwrap();
-    let done = completed.clone();
-    pool.pool.as_ref().unwrap().spawn(move || {
-        done.fetch_add(1, Ordering::SeqCst);
-    });
-    drop(pool);
-    assert_eq!(completed.load(Ordering::SeqCst), 1);
-}
-
-#[test]
 fn parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries() {
     parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode(
         HistoryPersistence::OnDisk,
@@ -1081,7 +1097,7 @@ fn parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode
     // to exercise replay refills. Cancel the pending adoption before dropping.
     let (entered, waiting) = mpsc::sync_channel(1);
     let (resume, gate) = mpsc::sync_channel(1);
-    db.checkpoint_adoption_pause = Some((entered, gate));
+    db.core.test_hooks.lock().checkpoint_adoption_pause = Some((entered, gate));
     let mut acknowledged = Vec::new();
     for round in 0..70u64 {
         for node in 0..5 {
@@ -1113,7 +1129,7 @@ fn parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode
     for (operation, mutation, version) in acknowledged {
         assert_eq!(db.write_batch(operation, vec![mutation]).unwrap(), version);
     }
-    assert_eq!(db.checkpoint_tail_batches, 0);
+    assert_eq!(checkpoint_tail(&db).0, 0);
 }
 
 #[test]
@@ -1184,6 +1200,7 @@ fn sui_adapter_pages_reverse_bounds_snapshot_and_reopen() {
     assert!(timing.contains_key("write_durable_receipt_publication_waiting_peak"));
     assert!(timing.contains_key("write_foreground_checkpoint_count"));
     assert!(timing.contains_key("cache_inserts"));
+    assert!(timing.contains_key("index_reader_held_view_bytes"));
     assert!(!timing.contains_key("read_cache_hits"));
     assert!(timing.contains_key("write_profile_expected_connections"));
     assert!(timing.contains_key("write_profile_captured_connections"));
@@ -1867,12 +1884,12 @@ fn recorded_replay_limits_reject_shrink_before_fencing_and_allow_recovered_growt
         max_batches: 32,
         max_encoded_bytes: 1024 * 1024,
     };
-    let mut db = fixture.open();
+    let db = fixture.open();
     let operation = fixture.operation(0, 80);
     let version = db
         .write_batch(operation, vec![checkpoint_put(1, 7)])
         .unwrap();
-    assert!(db.manifest.checkpoint.is_none());
+    assert!(manifest(&db).checkpoint.is_none());
     fail_stop_without_checkpoint(db);
     let root = fixture.temp.path().join("authority");
     let before: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
@@ -1925,7 +1942,7 @@ fn increased_replay_configuration_cannot_relax_the_recorded_recovery_check() {
         max_batches: 32,
         max_encoded_bytes: 1024 * 1024,
     };
-    let mut db = fixture.open();
+    let db = fixture.open();
     for n in 0..3 {
         db.write_batch(
             fixture.operation(n, 90 + n as u64),
@@ -1933,7 +1950,7 @@ fn increased_replay_configuration_cannot_relax_the_recorded_recovery_check() {
         )
         .unwrap();
     }
-    assert!(db.manifest.checkpoint.is_none());
+    assert!(manifest(&db).checkpoint.is_none());
     fail_stop_without_checkpoint(db);
     let root = fixture.temp.path().join("authority");
     let mut recorded: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
@@ -1957,7 +1974,7 @@ fn increased_replay_configuration_cannot_relax_the_recorded_recovery_check() {
 fn legacy_authority_without_explicit_limits_replays_before_format_upgrade() {
     let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     fixture.config.replay_limits = ReplayLimits::legacy();
-    let mut db = fixture.open();
+    let db = fixture.open();
     let operation = fixture.operation(2, 100);
     let version = db
         .write_batch(operation, vec![checkpoint_put(1, 9)])
@@ -1975,7 +1992,7 @@ fn legacy_authority_without_explicit_limits_replays_before_format_upgrade() {
     assert_eq!(restored.replay_limits, ReplayLimits::legacy());
     assert!(restored.live_nvme_identity.is_none());
     fixture.config.replay_limits = ReplayLimits::default();
-    let mut reopened = fixture.open();
+    let reopened = fixture.open();
     assert_eq!(reopened.recovery_stats().tail_batches, 1);
     assert_eq!(
         reopened
@@ -1993,7 +2010,7 @@ fn native_checkpoint_commits_no_image_while_an_owner_sync_is_stalled() {
     // Native owners acknowledge before sync. The position root, not the
     // separately adopted receipt frontier, must cover a committed checkpoint.
     let fixture = Fixture::new();
-    let mut db = fixture.open();
+    let db = fixture.open();
     let epoch = db.epoch();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
         .unwrap();
