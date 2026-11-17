@@ -42,7 +42,9 @@ def specification(suite, backends, mode, selection=None):
             'value_sizes': [64, 256, 1024, 8192, 65536], 'backends': selected,
             'keys': 4096, 'max_cases': 2000, 'offered_rates': [1000, 10000, 50000],
             'offered_seconds': 8, 'case_deadline_seconds': 600, 'hard_deadline_seconds': 10800,
-            'export_reserve_seconds': 600, 'diagnostics': {'write_profile_limit': 256, 'read_profile_limit': 256}}
+            'export_reserve_seconds': 600, 'diagnostics': {'write_profile_limit': 256, 'read_profile_limit': 256},
+            # The strict industry comparison: explicit since native became the matrix default.
+            'durability_tier': 'synchronous'}
     cloud_campaign.make_matrix({key: value for key, value in spec.items() if key != 'suite'})
     return spec
 

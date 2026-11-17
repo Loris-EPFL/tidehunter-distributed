@@ -1540,15 +1540,29 @@ fn complete(
     if measured {
         profile.control_execution_samples = 1;
     }
+    // Retire the admission before publishing the reply. The reply is the last
+    // effect of an admitted command, so a thread that holds it (or is ordered
+    // after its receiver, e.g. by a session join) must see the owner quiescent:
+    // `finish_live_target_shutdown` refuses teardown while `requests != 0`, and
+    // a session retrying a full `try_submit` after this reply must find the
+    // slot free. The queue mutex release is sequenced before `try_send`, and the
+    // channel orders it before the receiver's next queue lock. Crash
+    // consistency is unchanged: every durable effect of the command (the WAL
+    // write, and the covering sync for Synchronous) precedes this call; only
+    // delivery of the already computed reply follows the release. Releasing
+    // first admits at most one extra in-transit completion per worker and the
+    // flusher beyond `MAX_COMMANDS`, so admission stays bounded.
+    {
+        let mut queue = shared.queue.lock();
+        queue.requests -= 1;
+        queue.bytes -= charge;
+    }
     let _ = completed.try_send(reactor::WorkCompletion {
         id,
         response,
         profile,
         is_control: true,
     });
-    let mut queue = shared.queue.lock();
-    queue.requests -= 1;
-    queue.bytes -= charge;
 }
 
 impl ControlContext {

@@ -46,9 +46,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use typenum::U32;
 
+mod checkpoint_contract;
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
+pub use checkpoint_contract::CheckpointMode;
+use checkpoint_contract::{CellCheckpointCommit, manifest_checkpoint_mode};
 use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
@@ -433,6 +436,10 @@ pub struct RemoteDatabaseConfig {
     /// Select direct live owner-WAL NVMe-oF before opening or recovering.
     #[serde(default)]
     pub live_nvme: Option<super::tcp::LiveClientConfig>,
+    /// The database's one checkpoint protocol. Only `Exact` is active; absent
+    /// means `Exact`, so existing configuration documents are unchanged.
+    #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
+    pub checkpoint_mode: CheckpointMode,
 }
 
 fn default_max_pending_reads() -> usize {
@@ -582,6 +589,11 @@ impl RemoteDatabaseConfig {
         {
             return Err(LocalDbError::new(
                 "index_shards must be a power of two in 1..=MAX_INDEX_SHARDS",
+            ));
+        }
+        if !self.checkpoint_mode.is_exact() {
+            return Err(LocalDbError::new(
+                "checkpoint_mode per_cell is inactive in this revision",
             ));
         }
         if let Some(live) = &self.live_nvme {
@@ -792,8 +804,19 @@ struct AuthorityManifest {
     #[serde(default)]
     checkpoint_staging: Option<CheckpointFiles>,
     /// Previous committed files, removable only after the new root is durable.
+    /// In format 5 it can still be the last exact commit during migration.
     #[serde(default)]
     checkpoint_obsolete: Option<CheckpointCommit>,
+    /// Format 5 only. Absent (`Exact`) in formats 2 to 4, so their bytes are
+    /// unchanged; [`manifest_checkpoint_mode`] rejects mixed tags.
+    #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
+    checkpoint_mode: CheckpointMode,
+    /// Format 5 only: the adopted per-cell commit. `checkpoint` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_checkpoint: Option<CellCheckpointCommit>,
+    /// Format 5 only: the previous per-cell commit, retained until GC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_checkpoint_obsolete: Option<CellCheckpointCommit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1406,12 +1429,14 @@ impl RemoteDatabase {
         self.core.index.retention_floor()
     }
 
+    /// Capture and protect one published cut that the caller can keep: a
+    /// standing-budget view takes its owner charge (`Capacity` when full).
     pub fn protected_published_cut(
         &self,
     ) -> Result<(IndexReadCut, super::native_index::IndexReadPin), LocalDbError> {
         self.ensure_healthy()?;
         let index = &self.core.index;
-        let cut = index.latest_cut();
+        let cut = index.latest_cut().map_err(LocalDbError::component)?;
         let pin = index
             .pin_cut(cut.clone())
             .map_err(LocalDbError::component)?;
@@ -1615,6 +1640,9 @@ impl RemoteDatabase {
                 checkpoint: None,
                 checkpoint_staging: None,
                 checkpoint_obsolete: None,
+                checkpoint_mode: CheckpointMode::Exact,
+                cell_checkpoint: None,
+                cell_checkpoint_obsolete: None,
             };
             persist_manifest(&path, &manifest)?;
             manifest
@@ -1622,6 +1650,12 @@ impl RemoteDatabase {
         if manifest.history_persistence != config.history_persistence {
             return Err(LocalDbError::new(
                 "authority manifest history persistence differs",
+            ));
+        }
+        // No fallback: a per-cell manifest never opens in `Exact` mode.
+        if manifest_checkpoint_mode(&manifest)? != config.checkpoint_mode {
+            return Err(LocalDbError::new(
+                "authority manifest checkpoint mode differs",
             ));
         }
         if !matches!(manifest.format, 2..=4)
@@ -1893,10 +1927,13 @@ impl RemoteDatabase {
         // One constant sparse-view quota for the serialized publisher: the
         // installed view and its replacement at max_pending_batches - 1
         // exclusions. No write reserves view quota, and no publication can then
-        // fail on view capacity after its WAL write. Replaced views still held
-        // by readers are not charged: extra memory <= (distinct replaced views
-        // still held by readers) x view_charge(max_pending_batches - 1), limited
-        // by the concurrent read limit and lasting one read (metric
+        // fail on view capacity after its WAL write. A cut that leaves one read
+        // call takes an owner charge from the view allowance instead (that
+        // reader API fails with Capacity when full). Views held inside one read
+        // stay uncharged, and no reader holds one while it waits for read
+        // admission: extra memory <= max_pending_reads x
+        // view_charge(max_pending_batches - 1), plus the transient and fixed
+        // holders listed at `StandingViewBudget` (metric
         // `index_reader_held_view_bytes`).
         let view_budget = index
             .reserve_standing_view_budget(config.max_pending_batches - 1)
@@ -2126,9 +2163,14 @@ impl RemoteDatabase {
         self.ensure_healthy()
     }
 
+    /// The caller can keep the cut: a standing-budget view takes its owner
+    /// charge (`Capacity` when full).
     pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
         self.ensure_healthy()?;
-        Ok(self.core.index.latest_cut())
+        self.core
+            .index
+            .latest_cut()
+            .map_err(LocalDbError::component)
     }
 
     /// Bounded index-only page. Values are fetched outside the authority lock
@@ -2292,12 +2334,13 @@ impl RemoteDatabase {
         // These private grouped fetch callers resolve the current committed cut
         // under the sole owner. Transfer its protection through physical read
         // completion, even if the aggregate caller exits early on an error.
+        // The references are resolved, so only the retention floor is pinned.
         self.ensure_healthy()?;
         let clock = ResolutionSample::start(sample);
         let pin = self
             .core
             .index
-            .pin_cut(IndexReadCut::Latest)
+            .pin_call_floor(IndexReadCut::Latest)
             .map_err(LocalDbError::component);
         if let Some(sample) = sample.as_ref() {
             sample.stage(ResolutionStage::PinPreparation, clock);
@@ -2366,7 +2409,7 @@ impl RemoteDatabase {
         let resolve_started = Instant::now();
         let clock = ResolutionSample::start(&sample);
         // One resolved cut for every key of the batch: no key sees a later publication.
-        let cut = self.core.index.latest_cut();
+        let cut = self.core.index.call_cut();
         if let Some(sample) = &sample {
             sample.stage(ResolutionStage::CutCapture, clock);
         }
@@ -3172,7 +3215,7 @@ fn load_checkpoint(
         config.index_shards,
     )
     .map_err(LocalDbError::component)?;
-    if restored.latest_cut() != image.cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At) {
+    if restored.call_cut() != image.cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At) {
         return Err(LocalDbError::new(
             "checkpoint index does not match exact published cut",
         ));
@@ -3891,6 +3934,8 @@ mod position_tests;
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(test)]
+mod legacy_fixture_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

@@ -144,6 +144,7 @@ impl Fixture {
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,
             live_nvme: None,
+            checkpoint_mode: CheckpointMode::Exact,
         };
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -630,7 +631,7 @@ fn full_window_in_flight_takes_no_view_quota_and_sparse_replacements_never_fail(
         if n == window as u64 / 2 {
             settle_publication(&db, &later);
             // A reader-held replaced view keeps only its floor pin.
-            reader_view = Some(db.core.index.latest_cut());
+            reader_view = Some(db.core.index.call_cut());
         }
     }
     settle_publication(&db, &later);
@@ -642,15 +643,12 @@ fn full_window_in_flight_takes_no_view_quota_and_sparse_replacements_never_fail(
     }
     assert!(!db.core.is_published(first));
     assert!(matches!(reader_view, Some(IndexReadCut::Sparse(_))));
-    assert!(matches!(
-        db.core.index.latest_cut(),
-        IndexReadCut::Sparse(_)
-    ));
+    assert!(matches!(db.core.index.call_cut(), IndexReadCut::Sparse(_)));
     assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
     assert!(db.core.ensure_healthy().is_ok());
     drop(held);
     db.drain().unwrap();
-    assert!(matches!(db.core.index.latest_cut(), IndexReadCut::At(_)));
+    assert!(matches!(db.core.index.call_cut(), IndexReadCut::At(_)));
     drop(reader_view);
     assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
     assert_eq!(value(&mut db, 1000), Some(vec![1; 32]));
@@ -658,6 +656,92 @@ fn full_window_in_flight_takes_no_view_quota_and_sparse_replacements_never_fail(
         value(&mut db, 1000 + window as u32 - 1),
         Some(vec![(window - 1) as u8; 32])
     );
+    drop(reservations);
+    db.shutdown().unwrap();
+}
+
+/// Public cuts retained across successive sparse publications take owner
+/// charges from the index view allowance. When it is full, `published_cut`
+/// fails with the index capacity error while writes keep publishing, and
+/// dropping the cuts releases each charge exactly once.
+#[test]
+fn retained_published_cuts_are_charged_and_only_the_reader_fails_when_full() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let transient = |db: &RemoteDatabase| db.core.index.stats().transient_metadata_bytes;
+    // Every sparse view of this publisher has max_pending_batches - 1
+    // exclusion capacity, so one owner charge equals one such reservation.
+    // Fill the allowance, then free room for exactly three owner charges.
+    let max_excluded = db.core.config.max_pending_batches - 1;
+    let mut reservations = Vec::new();
+    loop {
+        match db.core.index.reserve_publication_view(max_excluded) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(super::super::native_index::NativeIndexError::Capacity) => break,
+            Err(error) => panic!("unexpected reservation failure: {error}"),
+        }
+    }
+    assert!(reservations.len() >= 3);
+    let full = transient(&db);
+    reservations.truncate(reservations.len() - 3);
+    let base = transient(&db);
+    let view = (full - base) / 3;
+    let held_connection = Arc::clone(&db.core.clients[0].client);
+    let held = held_connection.lock();
+    let first = db
+        .submit(fixture.operation(0, 2000), vec![put(2000, 1)])
+        .unwrap();
+    let mut later = Vec::new();
+    let mut write = |db: &mut RemoteDatabase, n: u64| {
+        let owner = 1 + (n % 4) as u32;
+        let version = db
+            .submit(
+                fixture.operation(owner, 2000 + n),
+                vec![put(2000 + n as u32, n as u8)],
+            )
+            .unwrap();
+        later.push(version.sequence);
+        settle_publication(db, &later);
+    };
+    let mut cuts = Vec::new();
+    for n in 1..=3 {
+        write(&mut db, n);
+        let cut = db.published_cut().unwrap();
+        assert!(matches!(cut, IndexReadCut::Sparse(_)));
+        cuts.push(cut);
+        assert_eq!(transient(&db), base + cuts.len() * view);
+        assert_eq!(db.core.index.stats().reader_held_view_bytes, 0);
+    }
+    write(&mut db, 4);
+    let error = db.published_cut().unwrap_err();
+    assert!(error.message().contains("capacity exceeded"), "{error}");
+    assert_eq!(error.uncertain_version, None);
+    // Writes keep publishing after the reader-side failure.
+    for n in 5..=8 {
+        write(&mut db, n);
+    }
+    for &sequence in &later {
+        assert!(db.core.is_published(BatchVersion {
+            epoch: db.epoch(),
+            sequence,
+        }));
+    }
+    assert!(!db.core.is_published(first));
+    assert!(db.core.ensure_healthy().is_ok());
+    assert_eq!(transient(&db), base + 3 * view);
+    // A clone keeps the shared charge; the last reference releases it once.
+    let clone = cuts[0].clone();
+    drop(cuts.remove(0));
+    assert_eq!(transient(&db), base + 3 * view);
+    drop(clone);
+    assert_eq!(transient(&db), base + 2 * view);
+    drop(cuts);
+    assert_eq!(transient(&db), base);
+    drop(held);
+    db.drain().unwrap();
+    assert!(matches!(db.core.index.call_cut(), IndexReadCut::At(_)));
+    assert_eq!(value(&mut db, 2000), Some(vec![1; 32]));
+    assert_eq!(value(&mut db, 2008), Some(vec![8; 32]));
     drop(reservations);
     db.shutdown().unwrap();
 }

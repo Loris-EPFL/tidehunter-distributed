@@ -180,6 +180,7 @@ impl Fixture {
                     tier,
                 )
             }),
+            checkpoint_mode: CheckpointMode::Exact,
         };
         if let Some(live) = &mut config.live_nvme {
             live.export_mode = export_mode;
