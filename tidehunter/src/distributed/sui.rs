@@ -1014,6 +1014,7 @@ impl Db {
                 read_finish
             );
             remote.profile.visit(&mut set);
+            remote.db.visit_cell_metrics(&mut set);
             remote.db.visit_write_metrics(|snapshot| {
                 let checkpoint = snapshot.checkpoint_diagnostics;
                 set(
@@ -1314,6 +1315,7 @@ impl Db {
                 read_finish
             );
             remote.profile.visit(&mut set);
+            remote.db.try_visit_cell_metrics(&mut set);
             remote.db.try_visit_write_metrics(|snapshot| {
                 let checkpoint = snapshot.checkpoint_diagnostics;
                 set(

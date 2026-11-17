@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import statistics
 from pathlib import Path
 
 import analyze
@@ -56,6 +57,23 @@ RESULTS += AUTHORITY_COLUMNS
 OWNER_TRACE_COLUMNS = ('owner_trace_scope', 'owner_trace_captured_events',
                        'owner_trace_covered_seconds', 'owner_trace_observed_events_per_second',
                        'owner_trace_truncated', 'owner_trace_buffer_overruns')
+# Option C counters (checkpoint option C spec §11.4): measurement-window deltas of
+# the coordinator `cell_*` counters between the two read observations.
+OPTION_C_COLUMNS = ('option_c_source', 'cell_maintenance_cpu_s', 'cell_rewritten_bytes',
+                    'cell_index_write_bytes', 'cell_frames', 'cell_buffered_cells',
+                    'cell_streamed_cells', 'cell_conservative_fallbacks', 'cell_encoder_invocations',
+                    'cell_duplicate_encodes', 'cell_root_payload_cell_encodes', 'cell_snapshots',
+                    'cell_admission_blocked_ms', 'cell_range_imbalance', 'cell_queue_wait_mean_us',
+                    'cell_cpu_ns_per_emitted_byte', 'cell_segment_dead_bytes', 'cell_lag_l_f_batches')
+RESULTS += OPTION_C_COLUMNS
+ATTRIBUTION_ARMS = ('exact', 'exact_encode_once', 'per_cell')
+ATTRIBUTION_RUN_FIELDS = ('arm', 'run', 'checkpoint_mode', 'status', 'measurement_seconds',
+                          'checkpoints', 'transactions', 'successful_calls', 'calls_per_second',
+                          'checkpoints_per_second', 'mean_inflight_calls', *OPTION_C_COLUMNS,
+                          'cell_cpu_us_per_checkpoint')
+ATTRIBUTION_RATIOS = ('cell_maintenance_cpu_s', 'cell_rewritten_bytes', 'cell_encoder_invocations',
+                      'cell_cpu_us_per_checkpoint', 'calls_per_second')
+ATTRIBUTION_LATENCY_FIELDS = ('arm', 'run', 'population', 'count', 'p50_us', 'p99_us', 'p999_us')
 RESULTS += OWNER_TRACE_COLUMNS
 STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
 STAGE_FIELDS = ('case_id', 'stage_pair', 'mean_us', 'p50_us', 'share', 'calls_with_pair', 'cond_mean_us', 'cond_p50_us', 'cond_p99_us')
@@ -276,6 +294,75 @@ def owner_trace_columns(artifact):
     return columns
 
 
+def option_c_window(boundary):
+    """Validated measurement-window deltas of the option C counters and the end
+    levels, or None. Both boundaries must carry the same counter set; a reset,
+    saturated or non-integer counter rejects the whole window."""
+    if (not isinstance(boundary, dict) or boundary.get('scope') != 'measurement_boundary'
+            or boundary.get('measurement_attempted') is not True or boundary.get('measurement_drained') is not True):
+        return None
+    blocks = [boundary.get(name) for name in ('start', 'end')]
+    if any(not isinstance(block, dict) for block in blocks):
+        return None
+    start, end = (block.get('option_c') for block in blocks)
+    if any(not isinstance(block, dict) or block.get('available') is not True for block in (start, end)):
+        return None
+    first, last, levels = start.get('counters'), end.get('counters'), end.get('levels')
+    if not all(isinstance(value, dict) for value in (first, last, levels)) or set(first) != set(last):
+        return None
+    deltas = {}
+    for name, a in first.items():
+        b = last[name]
+        if type(a) is not int or type(b) is not int or a < 0 or b < a or b >= 2**64 - 1:
+            return None
+        deltas[name] = b - a
+    if any(type(value) is not int or value < 0 for value in levels.values()):
+        return None
+    return deltas, levels
+
+
+def option_c_values(deltas, levels):
+    """Attribution values from a validated window. Exact checkpoint frames and
+    per-cell frames are summed: one arm has only one of them. A missing counter
+    leaves its value unavailable; nothing is estimated."""
+    values = dict.fromkeys(OPTION_C_COLUMNS[1:])
+
+    def total(*names):
+        found = [deltas.get(name) for name in names]
+        return None if any(value is None for value in found) else sum(found)
+
+    frames = total('cell_frames', 'cell_exact_buffered_cells', 'cell_exact_streamed_cells')
+    rewritten = total('cell_blake2b_bytes', 'cell_exact_blake2b_bytes')
+    invocations = total('cell_encoder_invocations', 'cell_exact_encoder_invocations')
+    cpu = deltas.get('cell_maintenance_cpu_ns') if levels.get('cell_gauge_thread_cpu_available') == 1 else None
+    blocked = [name for name in deltas if name.startswith('cell_admission_blocked_') and name.endswith('_ns')]
+    values.update(
+        cell_maintenance_cpu_s=cpu / 1e9 if cpu is not None else None,
+        cell_rewritten_bytes=rewritten,
+        cell_index_write_bytes=deltas.get('cell_logical_index_write_bytes'),
+        cell_frames=frames,
+        cell_buffered_cells=total('cell_buffered_cells', 'cell_exact_buffered_cells'),
+        cell_streamed_cells=total('cell_streamed_cells', 'cell_exact_streamed_cells'),
+        cell_conservative_fallbacks=total('cell_conservative_fallbacks', 'cell_exact_conservative_fallbacks'),
+        cell_encoder_invocations=invocations,
+        cell_duplicate_encodes=invocations - frames if invocations is not None and frames is not None else None,
+        cell_root_payload_cell_encodes=deltas.get('cell_root_payload_cell_encodes'),
+        cell_snapshots=total('cell_root_commits', 'cell_exact_checkpoints'),
+        cell_admission_blocked_ms=sum(deltas[name] for name in blocked) / 1e6 if blocked else None,
+        cell_segment_dead_bytes=levels.get('cell_gauge_segment_dead_bytes'),
+        cell_lag_l_f_batches=levels.get('cell_gauge_lag_l_f_batches'))
+    dequeued, waited = deltas.get('cell_dequeued'), deltas.get('cell_queue_wait_ns')
+    if dequeued and waited is not None:
+        values['cell_queue_wait_mean_us'] = waited / dequeued / 1000
+    if cpu is not None and rewritten:
+        values['cell_cpu_ns_per_emitted_byte'] = cpu / rewritten
+    workers = levels.get('cell_gauge_workers')
+    captured = [deltas.get(f'cell_w{worker}_captured') for worker in range(workers or 0)]
+    if captured and all(value is not None for value in captured) and sum(captured):
+        values['cell_range_imbalance'] = max(captured) * len(captured) / sum(captured)
+    return values
+
+
 def result_row(case, export):
     j = case['job']; op = operation(j)
     directory = export / 'cases' / case['case_id'] / 'result'
@@ -319,6 +406,9 @@ def result_row(case, export):
         row.update(calls_ge_5ms=len(slow), time_ge_5ms_share=sum(slow) / sum(good) if sum(good) else None)
     boundary = load(directory / 'measurement-read-evidence.json')
     row.update(authority_columns(boundary, load(directory / 'write-diagnostics.json')))
+    window = option_c_window(boundary)
+    if window is not None:
+        row.update(option_c_source='measurement-read-evidence.json', **option_c_values(*window))
     counters = (boundary.get('live_nvmeof') or {}).get('counters') or {}
     puts = sum(sample['operation'] == 'put' and sample['outcome'] in ('ok', 'success') for sample in samples)
     written, frames = nonnegative(counters.get('completed_write_bytes')), nonnegative(counters.get('leased_frames'))
@@ -535,6 +625,120 @@ def stage_rows(case):
     return rows
 
 
+def streaming_switch(directory):
+    """The run's recorded `force_streaming_cell_encoder` (None when absent)."""
+    summary = load(Path(directory) / 'summary.json') or {}
+    configuration = (summary.get('backend') or {}).get('configuration') or {}
+    return configuration.get('force_streaming_cell_encoder')
+
+
+def replay_run(arm, directory):
+    """One local replay run: its matching identity, attribution row and API
+    latency rows. Pre-option-C binaries record no checkpoint mode (Exact) and no
+    option C counters; their counter columns stay unavailable."""
+    directory = Path(directory)
+    summary = load(directory / 'summary.json')
+    if not summary:
+        raise ValueError(f'{directory}: summary.json missing')
+    phase = summary.get('phase_counts') or {}
+    profile, counts = phase.get('profile') or {}, phase.get('counts') or {}
+    configuration = (summary.get('backend') or {}).get('configuration') or {}
+    identity, client = profile.get('case_identity') or {}, configuration.get('client') or {}
+    key = json.dumps({'scope': identity.get('scope'), 'fixture_sha256': identity.get('fixture_sha256'),
+                      'repetitions': identity.get('repetitions'), 'concurrency': identity.get('N'),
+                      'durability_tier': configuration.get('durability_tier'),
+                      'owner_count': configuration.get('owner_count'),
+                      'history_persistence': configuration.get('history_persistence'),
+                      'replay_limits': client.get('replay_limits'),
+                      'max_index_bytes': client.get('max_index_bytes')}, sort_keys=True)
+    row = dict.fromkeys(ATTRIBUTION_RUN_FIELDS)
+    row.update(arm=arm, run=str(directory), checkpoint_mode=configuration.get('checkpoint_mode') or 'exact',
+               status=summary.get('status'),
+               measurement_seconds=nonnegative(profile.get('measurement_elapsed_seconds')),
+               checkpoints=nonnegative(counts.get('checkpoints')),
+               transactions=nonnegative(counts.get('transactions')),
+               successful_calls=nonnegative(profile.get('successful_calls')),
+               calls_per_second=nonnegative(profile.get('api_calls_per_second')),
+               checkpoints_per_second=nonnegative(profile.get('checkpoints_per_second')),
+               mean_inflight_calls=nonnegative(profile.get('mean_in_flight_api_calls')))
+    window = option_c_window(load(directory / 'measurement-read-evidence.json'))
+    if window is not None:
+        row.update(option_c_source='measurement-read-evidence.json', **option_c_values(*window))
+    if row['cell_maintenance_cpu_s'] is not None and row['checkpoints']:
+        row['cell_cpu_us_per_checkpoint'] = row['cell_maintenance_cpu_s'] * 1e6 / row['checkpoints']
+    latency = []
+    for population, entry in sorted((profile.get('latency') or {}).items()):
+        api = (entry or {}).get('api') or {}
+        if not (population.startswith('operation:') and population.endswith(':success')):
+            continue
+        quantile = {name: nonnegative(api.get(name + '_ns')) for name in ('p50', 'p99', 'p999')}
+        latency.append(dict(arm=arm, run=str(directory), population=population, count=nonnegative(api.get('count')),
+                            **{name + '_us': value / 1000 if value is not None else None
+                               for name, value in quantile.items()}))
+    return key, row, latency
+
+
+def option_c_attribution(arms, output):
+    """Matched local replay attribution of Exact, encode-only Exact and PerCell
+    (spec §11.4). `arms` maps an arm name to its repeated run directories. Every
+    run must have the same workload identity, and each arm its checkpoint mode;
+    otherwise nothing is compared. Medians use completed runs only; a ratio is
+    reported only where both medians exist. No speedup is inferred."""
+    if not arms or set(arms) - set(ATTRIBUTION_ARMS) or 'exact' not in arms:
+        raise ValueError(f'attribution arms must include exact and be among {ATTRIBUTION_ARMS}')
+    output = Path(output); output.mkdir(parents=True, exist_ok=True)
+    rows, latency, keys = [], [], set()
+    for arm in ATTRIBUTION_ARMS:
+        for directory in arms.get(arm, ()):
+            key, row, populations = replay_run(arm, directory)
+            expected = 'per_cell' if arm == 'per_cell' else 'exact'
+            if row['checkpoint_mode'] != expected:
+                raise ValueError(f'{directory}: arm {arm} needs checkpoint_mode {expected}, got {row["checkpoint_mode"]}')
+            # The two Exact arms differ only in the measurement-only encoder
+            # switch. A pre-option-C binary (no counters, no switch) always
+            # streams, so it may stand for `exact` without recording it.
+            streaming = streaming_switch(directory)
+            if arm == 'exact_encode_once' and streaming:
+                raise ValueError(f'{directory}: arm exact_encode_once needs force_streaming_cell_encoder false')
+            if arm == 'exact' and row['option_c_source'] is not None and streaming is not True:
+                raise ValueError(f'{directory}: arm exact needs force_streaming_cell_encoder true')
+            keys.add(key); rows.append(row); latency.extend(populations)
+    if len(keys) != 1:
+        raise ValueError('replay runs are not matched: ' + ' | '.join(sorted(keys)))
+    numeric = [name for name in ATTRIBUTION_RUN_FIELDS
+               if name not in ('arm', 'run', 'checkpoint_mode', 'status', 'option_c_source')]
+    summary = []
+    for arm in ATTRIBUTION_ARMS:
+        members = [row for row in rows if row['arm'] == arm]
+        if not members:
+            continue
+        completed = [row for row in members if row['status'] == 'completed']
+        entry = dict(arm=arm, runs=len(members), completed_runs=len(completed))
+        for name in numeric:
+            values = [row[name] for row in completed if row[name] is not None]
+            entry[name] = statistics.median(values) if values and len(values) == len(completed) else None
+        summary.append(entry)
+    reference = summary[0]
+    for entry in summary:
+        for name in ATTRIBUTION_RATIOS:
+            base, value = reference.get(name), entry.get(name)
+            entry[name + '_vs_exact'] = value / base if base and value is not None else None
+    summary_fields = ('arm', 'runs', 'completed_runs', *numeric, *(name + '_vs_exact' for name in ATTRIBUTION_RATIOS))
+    write_csv(output / 'option-c-attribution-runs.csv', ATTRIBUTION_RUN_FIELDS, rows)
+    write_csv(output / 'option-c-attribution.csv', summary_fields, summary)
+    write_csv(output / 'option-c-latency.csv', ATTRIBUTION_LATENCY_FIELDS, latency)
+    lines = ['# Option C matched replay attribution', '',
+             'Workload identity (identical for every run): `' + next(iter(keys)) + '`', '',
+             'Maintenance CPU is the summed thread CPU of the cell flushers, their scheduler, the snapshot actor and the Exact checkpoint threads over the measurement window (`/proc` schedstat). '
+             'Rewritten bytes are framed cell bytes written by flushes or Exact checkpoints. Duplicate encodes are canonical encoder invocations beyond one per frame (the streaming path encodes twice). '
+             'A lower CPU per emitted byte with more rewritten bytes is not a total saving. Unavailable values come from binaries without option C counters and are never estimated.', '']
+    leased_ab._table(lines, 'Per arm (median of completed runs)', summary_fields, summary)
+    leased_ab._table(lines, 'Runs', ATTRIBUTION_RUN_FIELDS, rows)
+    leased_ab._table(lines, 'API latency by operation', ATTRIBUTION_LATENCY_FIELDS, latency)
+    (output / 'option-c-attribution.md').write_text('\n'.join(lines))
+    return summary
+
+
 def generate(export=None, report=None, output=None, matrix=None, settings_only=False):
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     source = Path(matrix) if matrix else Path(export) / 'matrix.json'
@@ -625,9 +829,22 @@ def main(argv=None):
         parser.add_argument('--' + name)
     parser.add_argument('--output', required=True)
     parser.add_argument('--settings-only', action='store_true')
+    parser.add_argument('--option-c-attribution', action='append', metavar='ARM=DIR[,DIR...]',
+                        help='matched local replay runs per arm (exact, exact_encode_once, per_cell)')
     args = parser.parse_args(argv)
+    if args.option_c_attribution:
+        arms = {}
+        for item in args.option_c_attribution:
+            arm, _, directories = item.partition('=')
+            arms.setdefault(arm, []).extend(path for path in directories.split(',') if path)
+        try:
+            option_c_attribution(arms, args.output)
+        except (ValueError, KeyError) as error:
+            parser.exit(1, str(error) + '\n')
+        return
     if (args.settings_only and not args.matrix) or (not args.settings_only and (not args.export or not args.report)):
         parser.error('settings-only needs --matrix; results need --export and --report')
+    del args.option_c_attribution
     try:
         generate(**vars(args))
     except (ValueError, KeyError) as error:

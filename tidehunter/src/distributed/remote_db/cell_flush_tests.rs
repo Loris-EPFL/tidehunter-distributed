@@ -6,9 +6,11 @@
 //! so most tests check scheduling and capture lifetimes, not frame content;
 //! one test runs the pool over the production `IndexStoreWriter`.
 
+use super::super::cell_metrics::CellGauges;
 use super::*;
 use crate::distributed::native_index::{IndexReadCut, IndexStore, IndexStoreFileId};
 use crate::distributed::native_publication::NativePendingSink;
+use crate::distributed::remote_db::CheckpointMode;
 use crate::distributed::types::{
     BatchId, MemberChecksum, PayloadDigest, PhysicalValueAddress, RecordDescriptor, RecordKind,
     ValueRecordReference,
@@ -46,7 +48,10 @@ struct Fixture {
 impl Fixture {
     fn new(shards: usize) -> Self {
         let shape = shape();
-        let index = Arc::new(NativeIndex::with_shards(&shape, DATABASE, BUDGET, shards).unwrap());
+        let index = Arc::new(
+            NativeIndex::with_mode(&shape, DATABASE, BUDGET, shards, CheckpointMode::PerCell)
+                .unwrap(),
+        );
         Self {
             shape,
             index,
@@ -295,6 +300,7 @@ fn start(
         Arc::clone(hooks),
         policy,
         workers,
+        CellMetrics::new(workers),
         |worker| {
             Ok(TestStore {
                 worker,
@@ -469,6 +475,7 @@ fn pressure_target_is_covered_under_fair_service_without_arrivals() {
         Arc::clone(&fixture.index),
         Arc::clone(&hooks),
         FlushPolicy::default(),
+        CellMetrics::new(workers),
         |worker| {
             Ok(TestStore {
                 worker,
@@ -542,10 +549,14 @@ fn index_store_writers_flush_real_segments_through_the_pool() {
     assert!(scan.deleted.is_empty());
     let hooks = Arc::new(TestHooks::default());
     let workers = flushers(&fixture.index);
+    let metrics = CellMetrics::new(workers);
+    // Profile-on: every encoder times its phases.
+    metrics.set_profiling(true);
     let pool = CellFlushPool::start(
         Arc::clone(&fixture.index),
         Arc::clone(&hooks),
         FlushPolicy::default(),
+        Arc::clone(&metrics),
         |worker| IndexStoreWriter::new(&store, u16::try_from(worker).unwrap(), 1 << 20),
     )
     .unwrap();
@@ -579,6 +590,81 @@ fn index_store_writers_flush_real_segments_through_the_pool() {
     }
     let sweep = store.collect_garbage(&[], &fixture.index).unwrap();
     assert!(sweep.deleted.is_empty() && !sweep.more);
+    assert_pool_counters(&metrics, &store, &fixture, reachable.len());
+}
+
+/// The option C counters of the real-segment run agree with the index, the
+/// store files and each other (spec §11.4): 70 cells of 2 keys each, every
+/// cell captured, buffered once and installed once.
+fn assert_pool_counters(
+    metrics: &Arc<CellMetrics>,
+    store: &IndexStore,
+    fixture: &Fixture,
+    segments: usize,
+) {
+    let snapshot = metrics.snapshot(CellGauges {
+        published: Some(fixture.index.published_prefix()),
+        segments: Some(store.space(&[], &fixture.index)),
+        ..CellGauges::default()
+    });
+    let events = snapshot.worker_totals();
+    let files = snapshot.store_totals();
+    let ranges = snapshot.range_totals();
+    assert_eq!((events.captured, events.installed), (70, 70));
+    assert_eq!((events.stale, events.restored, events.deferred), (0, 0, 0));
+    assert_eq!(events.dequeued, ranges.dispatched());
+    assert_eq!(events.captured_versions, 140);
+    assert_eq!(events.captured_rows, 140);
+    assert_eq!(events.residual_versions, 0);
+    assert_eq!(events.appends, 70);
+    // The thread CPU clock measured every append.
+    assert!(events.append_cpu_ns > 0);
+    assert_eq!(files.profiled_cells, 70);
+    assert!(files.encode_cpu_ns > 0 && files.crc_cpu_ns > 0 && files.blake2b_cpu_ns > 0);
+    assert_eq!(
+        (
+            files.streamed_crc_pass_cpu_ns,
+            files.streamed_hash_pass_cpu_ns
+        ),
+        (0, 0)
+    );
+    assert_eq!(events.seals, files.groups_sealed);
+    assert_eq!(events.capture_holds, events.captured + events.clean);
+    assert_eq!((files.frames, files.emitted_rows), (70, 140));
+    assert_eq!(files.emitted_versions, 140);
+    // 1 MiB scratch: every small cell is encoded once, none streams.
+    assert_eq!((files.buffered_cells, files.streamed_cells), (70, 0));
+    assert_eq!(files.encoder_invocations, 70);
+    assert_eq!(files.references_encoded, 140);
+    assert_eq!(files.buffered_bytes, files.frame_bytes);
+    assert_eq!(files.sealed_bytes, files.frame_bytes);
+    assert_eq!(files.segments_created, segments as u64);
+    assert_eq!(files.file_syncs, files.groups_sealed);
+    assert_eq!(files.directory_syncs, files.groups_sealed);
+    assert_eq!(files.mappings, files.groups_sealed);
+    assert!(files.scratch_capacity_peak <= 1 << 20);
+    let space = snapshot.gauges.segments.unwrap();
+    assert_eq!(space.segments, segments as u64);
+    assert_eq!(space.sealed_bytes, files.sealed_bytes);
+    // Every frame is a live base and every segment is pinned by its bases.
+    assert_eq!(space.live_bytes, space.sealed_bytes);
+    assert_eq!((space.gc_pending_bytes, space.writing_segments), (0, 0));
+    if snapshot.thread_cpu_available {
+        assert!(snapshot.worker_thread_totals().cpu_ns > 0);
+        assert!(snapshot.scheduler_thread.cpu_ns > 0);
+    }
+    let mut names = HashMap::new();
+    snapshot.visit(|name, value| assert!(names.insert(name, value).is_none(), "{name}"));
+    assert_eq!(names["cell_blake2b_bytes"], files.frame_bytes);
+    assert_eq!(names["cell_crc_bytes"], files.frame_bytes - 8 * 70);
+    assert_eq!(names["cell_encode_bytes"], files.frame_bytes);
+    assert_eq!(names["cell_root_payload_cell_encodes"], 0);
+    assert_eq!(names["cell_gauge_queue_depth"], 0);
+    assert_eq!(names["cell_gauge_in_flight"], 0);
+    assert_eq!(names["cell_gauge_dirty_cells"], 0);
+    assert_eq!(names["cell_gauge_segment_dead_bytes"], 0);
+    assert_eq!(names["cell_gauge_published_sequence"], 70);
+    assert_eq!(names["cell_scheduler_targets_covered"], 1);
 }
 
 #[test]

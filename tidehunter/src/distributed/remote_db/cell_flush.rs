@@ -15,11 +15,12 @@
 //!
 //! # Queues and wake
 //!
-//! - Job queue per worker: `sync_channel(FLUSH_QUEUE)` of cell identities.
-//!   Owner: the scheduler holds every sender and only uses `try_send`. Full:
-//!   the cell's queued mark is cleared and its dirty state stays in the index,
-//!   which is the source of truth, so a later pass sends it again. Shutdown:
-//!   the scheduler drops the senders; a draining worker finishes the queued
+//! - Job queue per worker: `sync_channel(FLUSH_QUEUE)` of cell identities
+//!   with their send time (queue age, spec §11.4). Owner: the scheduler
+//!   holds every sender and only uses `try_send`. Full: the cell's queued
+//!   mark is cleared and its dirty state stays in the index, which is the
+//!   source of truth, so a later pass sends it again. Shutdown: the
+//!   scheduler drops the senders; a draining worker finishes the queued
 //!   cells and its last group, a cancelled one unqueues them.
 //! - Scheduler wake: one coalesced reason word under a mutex (capacity one;
 //!   repeated wakes merge). The scheduler checks it before it parks and waits
@@ -58,11 +59,12 @@
     )
 )]
 
+use super::cell_metrics::{CellMetrics, PassGauges, SelectionReason, StoreSnapshot, thread_cpu_ns};
 use crate::cell::CellId;
 use crate::distributed::native_index::{
     CELL_FLIGHTS_PER_FLUSHER, CellCaptureOutcome, CellDirty, CellFlushResult, CellInstall,
-    CellRetired, CellSkip, IndexStoreWriter, IndexWriter, NativeIndex, NativeIndexError,
-    NewCellBase, PrefixCut, PreparedCell, cell_flushers,
+    CellRetired, CellSkip, IndexStoreWriter, IndexStoreWriterStats, IndexWriter, NativeIndex,
+    NativeIndexError, NewCellBase, PrefixCut, PreparedCell, cell_flushers,
 };
 use crate::distributed::types::BatchVersion;
 use crate::key_shape::KeySpace;
@@ -70,12 +72,14 @@ use parking_lot::{Condvar, Mutex};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 type CellKey = (KeySpace, CellId);
+/// A queued cell and when the scheduler sent it.
+type Job = (CellKey, Instant);
 
 /// Capacity of each worker's job queue (spec §6.2).
 pub(crate) const FLUSH_QUEUE: usize = 32;
@@ -103,6 +107,15 @@ pub(crate) trait CellStore: Send {
     /// directory sync), map it read-only, and push exactly one base per
     /// append, in append order. No output after zero appends.
     fn seal(&mut self, bases: &mut Vec<NewCellBase>) -> Result<(), NativeIndexError>;
+
+    /// Cumulative store and encoder counters (spec §11.4). Read by the
+    /// owning worker after each append and seal.
+    fn stats(&self) -> IndexStoreWriterStats {
+        IndexStoreWriterStats::default()
+    }
+
+    /// Arm per-phase encoder timing for the next appends (profile-on only).
+    fn set_profile(&mut self, _on: bool) {}
 }
 
 /// The production store: one worker-private segment stream per flusher. The
@@ -115,6 +128,14 @@ impl CellStore for IndexStoreWriter {
 
     fn seal(&mut self, bases: &mut Vec<NewCellBase>) -> Result<(), NativeIndexError> {
         IndexStoreWriter::seal(self, bases)
+    }
+
+    fn stats(&self) -> IndexStoreWriterStats {
+        IndexStoreWriter::stats(self)
+    }
+
+    fn set_profile(&mut self, on: bool) {
+        IndexStoreWriter::set_profile(self, on);
     }
 }
 
@@ -301,12 +322,12 @@ impl fmt::Display for FlushError {
 
 impl std::error::Error for FlushError {}
 
-/// Aggregate counters (spec §11.4 subset).
+/// Pool totals of the [`CellMetrics`] counters this pool records.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FlushStats {
     pub passes: u64,
     pub dispatched: u64,
-    /// Passes that found a worker queue full.
+    /// Sends that found a worker queue full.
     pub queue_full: u64,
     /// Cells returned to the scheduler because no flush allowance was free.
     pub deferred: u64,
@@ -315,23 +336,6 @@ pub(crate) struct FlushStats {
     pub installed: u64,
     pub stale: u64,
     pub restored: u64,
-}
-
-// Statistics only: Relaxed everywhere.
-#[derive(Default)]
-struct Counters {
-    dispatched: AtomicU64,
-    queue_full: AtomicU64,
-    deferred: AtomicU64,
-    captured: AtomicU64,
-    clean: AtomicU64,
-    installed: AtomicU64,
-    stale: AtomicU64,
-    restored: AtomicU64,
-}
-
-fn bump(counter: &AtomicU64, by: usize) {
-    counter.fetch_add(by as u64, Ordering::Relaxed);
 }
 
 struct Progress {
@@ -358,10 +362,12 @@ struct Shared<H> {
     /// Set before the scheduler is told to stop. Release/Acquire: a worker
     /// that observes the closed queue or the reopened store gate sees it.
     cancel: AtomicBool,
-    /// Mirror of `progress.failure.is_some()` for step-boundary checks. Set
-    /// with Release after the failure is stored; read with Acquire.
+    /// Claimed by the first failure (`swap`, AcqRel) before the core is failed
+    /// and `progress.failure` is stored; read with Acquire at step boundaries.
     failed: AtomicBool,
-    counters: Counters,
+    /// Option C counters: this pool writes the worker, store, range and
+    /// scheduler blocks, each from its one owning thread.
+    metrics: Arc<CellMetrics>,
 }
 
 impl<H: FlushHooks> Shared<H> {
@@ -390,20 +396,20 @@ impl<H: FlushHooks> Shared<H> {
     }
 
     /// Record the first failure, wake every waiter and stop the scheduler.
+    ///
+    /// The first caller fails the core (`hooks.fail`, no lock held) before it
+    /// stores `progress.failure`, so a waiter that observes the failure for
+    /// any reason (this notify, another notify, a timeout or a spurious wake)
+    /// never sees a healthy core. Workers read `failed` only to stop, so it
+    /// turning true before `progress.failure` is stored is harmless.
     fn fail(&self, error: FlushError) {
-        let first = {
-            let mut progress = self.progress.lock();
-            let first = progress.failure.is_none();
-            if first {
-                progress.failure = Some(error.clone());
-                self.failed.store(true, Ordering::Release);
-            }
-            first
-        };
-        self.progress_changed.notify_all();
-        if first {
+        // AcqRel: exactly one caller claims the failure; later callers only
+        // re-notify.
+        if !self.failed.swap(true, Ordering::AcqRel) {
             self.hooks.fail(&error);
+            self.progress.lock().failure = Some(error);
         }
+        self.progress_changed.notify_all();
         self.wake(WAKE_STOP);
     }
 }
@@ -481,7 +487,7 @@ fn classify(
 
 struct Scheduler<H: FlushHooks> {
     shared: Arc<Shared<H>>,
-    senders: Vec<SyncSender<CellKey>>,
+    senders: Vec<SyncSender<Job>>,
     ranges: Vec<Range<usize>>,
     /// Rotating first shard of each range: ties start at a different shard
     /// every pass.
@@ -517,7 +523,8 @@ impl<H: FlushHooks> Scheduler<H> {
         index.take_cell_dirty_signal();
         let published = index.published_prefix();
         let pressure = shared.hooks.replay_pressure();
-        if self.target.is_none() {
+        let started = self.target.is_none();
+        if started {
             let (requested, covered) = {
                 let progress = shared.progress.lock();
                 (progress.requested, progress.covered)
@@ -531,6 +538,10 @@ impl<H: FlushHooks> Scheduler<H> {
             };
         }
         let target = self.target;
+        let started = started && target.is_some();
+        let mut oldest_uncovered: Option<BatchVersion> = None;
+        let mut oldest_dirty_since: Option<Instant> = None;
+        let mut dirty_cells = 0u64;
         let now = shared.hooks.now();
         // A cell, queued or in flight included, still misses a mutation at or
         // below the target. Mutations at or below a published prefix are all
@@ -541,13 +552,21 @@ impl<H: FlushHooks> Scheduler<H> {
             let range = self.ranges[worker].clone();
             let shards = range.len();
             self.candidates.clear();
+            let (mut scanned, mut dirty_in_range) = (0usize, 0usize);
             for step in 0..shards {
                 let shard = range.start + (self.cursors[worker] + step) % shards;
                 index.shard_dirty_cells(shard, &mut self.cells);
+                scanned += self.cells.len();
                 for (key, dirty) in self.cells.drain(..) {
                     let Some(oldest) = dirty.oldest_uncovered else {
                         continue;
                     };
+                    dirty_in_range += 1;
+                    oldest_uncovered = Some(oldest_uncovered.map_or(oldest, |o| o.min(oldest)));
+                    if let Some(since) = dirty.dirty_since {
+                        oldest_dirty_since =
+                            Some(oldest_dirty_since.map_or(since, |o| o.min(since)));
+                    }
                     missing |= target.is_some_and(|target| target.contains(oldest));
                     // Only a mutation inside L can be captured.
                     if dirty.queued || dirty.in_flight || !published.contains(oldest) {
@@ -575,13 +594,19 @@ impl<H: FlushHooks> Scheduler<H> {
                     self.candidates.truncate(FLUSH_QUEUE);
                 }
             }
+            shared
+                .metrics
+                .range(worker)
+                .scanned(scanned, dirty_in_range);
+            dirty_cells += dirty_in_range as u64;
             self.cursors[worker] = (self.cursors[worker] + 1) % shards;
             self.candidates.sort_unstable_by_key(Candidate::rank);
-            if !self.dispatch(worker) {
+            if !self.dispatch(worker, target) {
                 return false;
             }
         }
         let mut progress = shared.progress.lock();
+        let covered_now = target.is_some() && !missing;
         if let Some(target) = target
             && !missing
         {
@@ -589,28 +614,50 @@ impl<H: FlushHooks> Scheduler<H> {
             progress.covered = progress.covered.max(target);
         }
         progress.passes += 1;
+        let covered = progress.covered;
         drop(progress);
         shared.progress_changed.notify_all();
+        shared.metrics.scheduler_pass(
+            PassGauges {
+                target: self.target,
+                covered: Some(covered),
+                oldest_uncovered,
+                oldest_dirty_since,
+                dirty_cells,
+            },
+            started,
+            covered_now,
+        );
         true
     }
 
     /// Send the sorted candidates to `worker` until its queue is full.
-    fn dispatch(&mut self, worker: usize) -> bool {
+    fn dispatch(&mut self, worker: usize, target: Option<PrefixCut>) -> bool {
         let index = &*self.shared.index;
-        let counters = &self.shared.counters;
-        for Candidate { key, .. } in self.candidates.drain(..) {
+        let range = self.shared.metrics.range(worker);
+        for Candidate {
+            key, class, oldest, ..
+        } in self.candidates.drain(..)
+        {
             if !index.try_queue_cell(key.0, &key.1) {
                 continue;
             }
-            match self.senders[worker].try_send(key) {
-                Ok(()) => bump(&counters.dispatched, 1),
-                Err(TrySendError::Full(key)) => {
+            match self.senders[worker].try_send((key, Instant::now())) {
+                Ok(()) => range.selected(match class {
+                    Class::Prefix if target.is_some_and(|target| target.contains(oldest)) => {
+                        SelectionReason::Pressure
+                    }
+                    Class::Prefix => SelectionReason::Lagging,
+                    Class::Aged => SelectionReason::Aged,
+                    Class::Size => SelectionReason::Size,
+                }),
+                Err(TrySendError::Full((key, _))) => {
                     // The dirty state stays; a later pass sends it again.
                     index.unqueue_cell(key.0, &key.1);
-                    bump(&counters.queue_full, 1);
+                    range.queue_full();
                     break;
                 }
-                Err(TrySendError::Disconnected(key)) => {
+                Err(TrySendError::Disconnected((key, _))) => {
                     index.unqueue_cell(key.0, &key.1);
                     self.shared.fail(FlushError::Disconnected { worker });
                     return false;
@@ -655,7 +702,7 @@ struct Worker<H: FlushHooks, S> {
     id: usize,
     range: Range<usize>,
     shared: Arc<Shared<H>>,
-    jobs: Receiver<CellKey>,
+    jobs: Receiver<Job>,
     store: S,
     flights: Flights<H>,
     group_bytes: u64,
@@ -664,6 +711,9 @@ struct Worker<H: FlushHooks, S> {
     bases: Vec<NewCellBase>,
     retired: Vec<CellRetired>,
     discarded: Vec<NewCellBase>,
+    /// Store counters present when this worker started; the store's own
+    /// cumulative counters are published on top of them.
+    store_base: StoreSnapshot,
 }
 
 impl<H: FlushHooks, S: CellStore> Worker<H, S> {
@@ -671,9 +721,10 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
         id: usize,
         range: Range<usize>,
         shared: Arc<Shared<H>>,
-        jobs: Receiver<CellKey>,
+        jobs: Receiver<Job>,
         store: S,
     ) -> Self {
+        let store_base = shared.metrics.store(id).base();
         Self {
             id,
             range,
@@ -691,6 +742,7 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
             bases: Vec::with_capacity(GROUP_CELLS),
             retired: Vec::with_capacity(GROUP_CELLS),
             discarded: Vec::with_capacity(GROUP_CELLS),
+            store_base,
         }
     }
 
@@ -735,6 +787,8 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
                     }
                 }
             };
+            let (job, sent) = job;
+            self.shared.metrics.worker(self.id).dequeued(sent.elapsed());
             if self.shared.failed() || self.shared.cancelled() {
                 self.shared.index.unqueue_cell(job.0, &job.1);
                 continue;
@@ -770,35 +824,63 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
                 Err(NativeIndexError::Capacity) => break,
                 Err(error) => return Err(self.error(FlushStage::Reserve, error)),
             };
+            let requested = Instant::now();
+            let mut held = requested;
             let outcome = {
                 let mut writer = index.writer();
-                shared.hooks.with_publisher(&mut writer, |writer| {
+                let outcome = shared.hooks.with_publisher(&mut writer, |writer| {
+                    held = Instant::now();
                     // `L` under publication serialization (spec §5.2).
                     let target = writer.published_prefix();
                     writer.capture_cell(keyspace, &cell, target, permit)
-                })
+                });
+                shared
+                    .metrics
+                    .worker(self.id)
+                    .capture_hold(held - requested, held.elapsed());
+                outcome
             };
             match outcome.map_err(|error| self.error(FlushStage::Capture, error))? {
                 CellCaptureOutcome::Captured(capture) => {
+                    let captured = capture.totals();
                     let prepared = capture
                         .prepare()
                         .map_err(|error| self.error(FlushStage::Prepare, error))?;
+                    shared.metrics.worker(self.id).captured(
+                        captured.versions,
+                        captured.rows,
+                        prepared.residual_totals().versions,
+                    );
                     // Held in `Flights` before the store runs: an error or a
                     // panic in `append` fails the core before the capture
                     // drops.
                     self.flights.prepared.push(prepared);
-                    bump(&shared.counters.captured, 1);
                     // In bounds: the cell was pushed just above.
                     let last = self.flights.prepared.len() - 1;
+                    self.store.set_profile(shared.metrics.profiling());
+                    let cpu_start = thread_cpu_ns();
+                    let append_start = Instant::now();
                     let bytes = self
                         .store
                         .append(&self.flights.prepared[last])
                         .map_err(|error| self.error(FlushStage::Append, error))?;
+                    let wall = append_start.elapsed();
+                    let cpu = cpu_start
+                        .zip(thread_cpu_ns())
+                        .map_or(0, |(start, end)| end.saturating_sub(start));
+                    shared.metrics.worker(self.id).appended(wall, cpu);
+                    self.publish_store_stats();
                     self.group_bytes = self.group_bytes.saturating_add(bytes);
                     return Ok(());
                 }
                 CellCaptureOutcome::Clean { .. } => {
-                    bump(&shared.counters.clean, 1);
+                    // Defensive: the scheduler queues a cell only when its
+                    // oldest uncovered version lies in the published prefix,
+                    // which never shrinks, and only this queued capture can
+                    // remove that version. The real-process crash matrix
+                    // therefore has no cut here; the pure cell model
+                    // (`cell_model.rs`) covers a clean advance after capture.
+                    shared.metrics.worker(self.id).clean();
                     return Ok(());
                 }
                 CellCaptureOutcome::Skipped {
@@ -826,8 +908,16 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
         // No allowance now: an install by any worker wakes the scheduler,
         // which sends the cell again.
         index.unqueue_cell(keyspace, &cell);
-        bump(&shared.counters.deferred, 1);
+        shared.metrics.worker(self.id).deferred();
         Ok(())
+    }
+
+    /// Publish the store's cumulative counters (one writer per worker).
+    fn publish_store_stats(&self) {
+        self.shared
+            .metrics
+            .store(self.id)
+            .publish(&self.store_base, &self.store.stats());
     }
 
     /// Seal the open group, install its results and restore stale ones.
@@ -836,9 +926,14 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
             return Ok(());
         }
         self.bases.clear();
-        self.store
-            .seal(&mut self.bases)
-            .map_err(|error| self.error(FlushStage::Seal, error))?;
+        let seal_start = Instant::now();
+        let sealed = self.store.seal(&mut self.bases);
+        self.shared
+            .metrics
+            .worker(self.id)
+            .sealed(seal_start.elapsed());
+        self.publish_store_stats();
+        sealed.map_err(|error| self.error(FlushStage::Seal, error))?;
         if self.bases.len() != self.flights.prepared.len() {
             return Err(self.error(
                 FlushStage::Seal,
@@ -874,11 +969,20 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
             discarded,
             ..
         } = self;
+        let requested = Instant::now();
+        let mut held = requested;
+        let mut hold = Duration::ZERO;
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("cell_install_before");
         let rejected = {
             let mut writer = shared.index.writer();
             shared.hooks.with_publisher(&mut writer, |writer| {
+                held = Instant::now();
                 // `pop` leaves uninstalled results in place on a rejection.
-                while let Some(result) = flights.results.pop() {
+                let rejected = loop {
+                    let Some(result) = flights.results.pop() else {
+                        break None;
+                    };
                     match writer.install_cell(result) {
                         CellInstall::Installed { retired: old, .. } => retired.push(old),
                         CellInstall::Stale {
@@ -888,12 +992,17 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
                             discarded.push(base);
                             flights.stale.push(prepared);
                         }
-                        CellInstall::Rejected { error, result } => return Some((error, result)),
+                        CellInstall::Rejected { error, result } => break Some((error, result)),
                     }
-                }
-                None
+                };
+                hold = held.elapsed();
+                rejected
             })
         };
+        let wait = held - requested;
+        // The install hold (writer -> publisher) is released.
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("cell_install_after");
         if let Some((error, result)) = rejected {
             let failure = self.error(stage, error);
             self.shared.fail(failure.clone());
@@ -910,13 +1019,15 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
         // Freed outside the guards; then the memory is visible to Admission.
         self.retired.clear();
         self.discarded.clear();
-        let counters = &self.shared.counters;
-        if stage == FlushStage::Restore {
-            bump(&counters.restored, count);
+        let (installed, stale, restored) = if stage == FlushStage::Restore {
+            (0, 0, count)
         } else {
-            bump(&counters.installed, count - stale);
-            bump(&counters.stale, stale);
-        }
+            (count - stale, stale, 0)
+        };
+        self.shared
+            .metrics
+            .worker(self.id)
+            .installed(installed, stale, restored, wait, hold);
         self.shared.hooks.regrant();
         self.shared.wake(WAKE_PROGRESS);
         Ok(())
@@ -936,7 +1047,8 @@ impl<H: FlushHooks, S: CellStore> Worker<H, S> {
         if !self.flights.results.is_empty() {
             self.install_results(FlushStage::Restore)?;
         }
-        for (keyspace, cell) in self.jobs.iter() {
+        for ((keyspace, cell), sent) in self.jobs.iter() {
+            self.shared.metrics.worker(self.id).dequeued(sent.elapsed());
             self.shared.index.unqueue_cell(keyspace, &cell);
         }
         Ok(())
@@ -953,15 +1065,18 @@ pub(crate) struct CellFlushPool<H: FlushHooks> {
 
 impl<H: FlushHooks> CellFlushPool<H> {
     /// Start `cell_flushers(N)` workers, each with the store `stores(w)`
-    /// (stream id `w`), and the scheduler.
+    /// (stream id `w`), and the scheduler. `metrics` must be sized for
+    /// `cell_flushers(N)` workers; the pool records its worker, store, range
+    /// and scheduler counters and its threads' CPU there.
     pub(crate) fn start<S: CellStore + 'static>(
         index: Arc<NativeIndex>,
         hooks: H,
         policy: FlushPolicy,
+        metrics: Arc<CellMetrics>,
         stores: impl FnMut(usize) -> Result<S, NativeIndexError>,
     ) -> Result<Self, FlushError> {
         let workers = flushers(&index);
-        Self::start_with(index, hooks, policy, workers, stores)
+        Self::start_with(index, hooks, policy, workers, metrics, stores)
     }
 
     fn start_with<S: CellStore + 'static>(
@@ -969,10 +1084,20 @@ impl<H: FlushHooks> CellFlushPool<H> {
         hooks: H,
         policy: FlushPolicy,
         workers: usize,
+        metrics: Arc<CellMetrics>,
         mut stores: impl FnMut(usize) -> Result<S, NativeIndexError>,
     ) -> Result<Self, FlushError> {
         let shards = index.shard_count();
         debug_assert!((1..=shards).contains(&workers));
+        if metrics.workers() != workers {
+            return Err(FlushError::Step {
+                worker: 0,
+                stage: FlushStage::OpenStore,
+                cause: Arc::new(NativeIndexError::Invalid(
+                    "cell metrics sized for another flusher count",
+                )),
+            });
+        }
         let mut opened = Vec::with_capacity(workers);
         for worker in 0..workers {
             opened.push(stores(worker).map_err(|cause| FlushError::Step {
@@ -997,7 +1122,7 @@ impl<H: FlushHooks> CellFlushPool<H> {
             progress_changed: Condvar::new(),
             cancel: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            counters: Counters::default(),
+            metrics,
         });
         // On an early return the pool's drop cancels and joins what started.
         let mut pool = Self {
@@ -1019,6 +1144,7 @@ impl<H: FlushHooks> CellFlushPool<H> {
                         shared: Arc::clone(&worker_shared),
                         role: FlushRole::Worker(id),
                     };
+                    let _cpu = worker_shared.metrics.enter_worker(id);
                     let mut worker = Worker::new(id, worker_range, worker_shared, jobs, store);
                     if let Err(error) = worker.run() {
                         worker.shared.fail(error);
@@ -1048,6 +1174,7 @@ impl<H: FlushHooks> CellFlushPool<H> {
                     shared: Arc::clone(&scheduler.shared),
                     role: FlushRole::Scheduler,
                 };
+                let _cpu = scheduler.shared.metrics.enter_scheduler();
                 scheduler.run();
                 // No pass runs after this: `covered` is final, so waiters
                 // of an uncovered target return `Stopped`.
@@ -1122,18 +1249,18 @@ impl<H: FlushHooks> CellFlushPool<H> {
     }
 
     pub(crate) fn stats(&self) -> FlushStats {
-        let counters = &self.shared.counters;
-        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let metrics = &self.shared.metrics;
+        let (workers, ranges) = (metrics.worker_totals(), metrics.range_totals());
         FlushStats {
             passes: self.shared.progress.lock().passes,
-            dispatched: load(&counters.dispatched),
-            queue_full: load(&counters.queue_full),
-            deferred: load(&counters.deferred),
-            captured: load(&counters.captured),
-            clean: load(&counters.clean),
-            installed: load(&counters.installed),
-            stale: load(&counters.stale),
-            restored: load(&counters.restored),
+            dispatched: ranges.dispatched(),
+            queue_full: ranges.queue_full,
+            deferred: workers.deferred,
+            captured: workers.captured,
+            clean: workers.clean,
+            installed: workers.installed,
+            stale: workers.stale,
+            restored: workers.restored,
         }
     }
 

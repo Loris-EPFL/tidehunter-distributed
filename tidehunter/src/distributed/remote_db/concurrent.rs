@@ -7,7 +7,7 @@
 #[allow(clippy::wildcard_imports)]
 // Private implementation shares its parent's internal types.
 use super::*;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Default)]
 struct CheckpointBudget {
@@ -43,7 +43,7 @@ struct WriteBudget {
 }
 /// One FIFO grant covers the complete invocation window. Partitions are
 /// ascending and unique; each entry is (endpoint index, batches, records).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::distributed::remote_db) struct WriteGrant {
     pub requests: usize,
     pub bytes: usize,
@@ -124,6 +124,9 @@ pub(in crate::distributed::remote_db) struct WriteCredit {
     admission: Arc<Admission>,
     charge: CreditCharge,
     committed: bool,
+    /// When a queued grant started waiting (the blocked path only; a direct
+    /// grant reads no clock).
+    blocked_since: Option<Instant>,
 }
 
 enum CreditCharge {
@@ -146,6 +149,11 @@ impl WriteCredit {
     pub(in crate::distributed::remote_db) fn mark_allocated(&mut self) {
         self.committed = true;
     }
+
+    /// How long this grant waited in the FIFO, if it was not granted directly.
+    pub(in crate::distributed::remote_db) fn blocked_for(&self) -> Option<Duration> {
+        self.blocked_since.map(|since| since.elapsed())
+    }
 }
 
 impl Drop for WriteCredit {
@@ -162,6 +170,45 @@ struct AdmissionWaiter {
     grant: WriteGrant,
     thread: thread::Thread,
     state: AtomicU8,
+    /// Cell-directory charge when this waiter was last woken to re-estimate
+    /// its index reservation (`usize::MAX`: never). Read and written only
+    /// under the budget mutex, so Relaxed suffices: the mutex orders it.
+    directory: AtomicUsize,
+}
+
+impl AdmissionWaiter {
+    fn new(grant: WriteGrant, directory: usize) -> Self {
+        Self {
+            grant,
+            thread: thread::current(),
+            state: AtomicU8::new(WAITER_QUEUED),
+            directory: AtomicUsize::new(directory),
+        }
+    }
+}
+
+/// Lowers a queued grant's index reservation once the cells it counted as
+/// new exist. The estimate charges a directory entry for every cell that
+/// did not exist when it was taken; publications admitted meanwhile can
+/// create those cells, and directory entries are never released, so a stale
+/// estimate can exceed every reachable free budget while the batch itself
+/// fits. Called by the blocked caller with no lock held.
+pub(in crate::distributed::remote_db) trait IndexReestimate {
+    /// A fresh total index charge, if strictly below `current`. It must stay
+    /// an upper bound of the publication charge, as the first estimate is.
+    fn propose(&mut self, current: usize) -> Option<usize>;
+    /// The last proposal replaced the queued grant: the caller's per-batch
+    /// charges must now sum to it.
+    fn accept(&mut self);
+}
+
+/// No re-estimation: the grant keeps its first index reservation.
+impl IndexReestimate for () {
+    fn propose(&mut self, _current: usize) -> Option<usize> {
+        None
+    }
+
+    fn accept(&mut self) {}
 }
 
 /// One node per live blocked call. There is no independent producer of nodes:
@@ -264,6 +311,11 @@ impl Admission {
     #[cfg(test)]
     pub(in crate::distributed::remote_db) fn queued_waiters(&self) -> usize {
         self.budget.lock().waiters.len()
+    }
+
+    /// Index bytes granted and not yet published (option C gauge).
+    pub(in crate::distributed::remote_db) fn admitted_index_bytes(&self) -> usize {
+        self.budget.lock().index_bytes
     }
 
     /// Every charged dimension, copied under the budget mutex.
@@ -482,11 +534,7 @@ impl Admission {
             .is_none_or(|n| n > max_identities)
         {
             "identity"
-        } else if budget
-            .index_bytes
-            .checked_add(grant.index_bytes)
-            .is_none_or(|n| self.index.check_capacity(n).is_err())
-        {
+        } else if self.index_blocked(budget, grant) {
             "index"
         } else {
             return None;
@@ -503,6 +551,15 @@ impl Admission {
                 .map_or(usize::MAX, |limits| limits.max_encoded_bytes),
             incoming_encoded_bytes: Some(grant.replay_bytes),
         })
+    }
+
+    /// The grant's index reservation does not fit beside the resident charge
+    /// and the reservations already granted.
+    fn index_blocked(&self, budget: &WriteBudget, grant: &WriteGrant) -> bool {
+        budget
+            .index_bytes
+            .checked_add(grant.index_bytes)
+            .is_none_or(|n| self.index.check_capacity(n).is_err())
     }
 
     /// Lower the identity (checkpoint receipt metadata) bound for a test,
@@ -584,8 +641,13 @@ impl Admission {
         Self::charge_grant(budget, &WriteGrant::request(bytes));
     }
 
+    /// Grant the FIFO prefix that fits. Returns the waiters to unpark: every
+    /// granted one, plus a head blocked on index bytes once the cell
+    /// directory has grown since it was last woken, so it re-estimates
+    /// ([`IndexReestimate`]). Only publications create cells and each one
+    /// returns its credit through here, so a stale head is always woken.
     fn grant_waiters(&self, budget: &mut WriteBudget) -> SmallVec<[Arc<AdmissionWaiter>; 4]> {
-        let mut granted = SmallVec::new();
+        let mut wake = SmallVec::new();
         // Each grant consumes a request slot, so at most max_requests can fit.
         for _ in 0..self.max_requests {
             if budget.closed
@@ -603,13 +665,23 @@ impl Admission {
             // Release publishes the exact reservation before unpark. The caller
             // checks with Acquire, including when unpark precedes its first park.
             waiter.state.store(WAITER_GRANTED, Ordering::Release);
-            granted.push(waiter);
+            wake.push(waiter);
+        }
+        if !budget.closed
+            && let Some(head) = budget.waiters.front()
+            && self.index_blocked(budget, &head.grant)
+        {
+            let directory = self.index.directory_bytes();
+            // Relaxed: `head.directory` is only accessed under this mutex.
+            if head.directory.swap(directory, Ordering::Relaxed) != directory {
+                wake.push(Arc::clone(head));
+            }
         }
         debug_assert!(budget.waiters.len() <= budget.live_waiters);
         if budget.closed || budget.requests == 0 {
             self.drained.notify_all();
         }
-        granted
+        wake
     }
 
     fn enqueue_grant<'a>(
@@ -617,11 +689,7 @@ impl Admission {
         budget: &mut WriteBudget,
         grant: WriteGrant,
     ) -> WaitingReservation<'a> {
-        let waiter = Arc::new(AdmissionWaiter {
-            grant,
-            thread: thread::current(),
-            state: AtomicU8::new(WAITER_QUEUED),
-        });
+        let waiter = Arc::new(AdmissionWaiter::new(grant, usize::MAX));
         budget.live_waiters += 1;
         budget.waiters.push_back(waiter.clone());
         debug_assert!(budget.waiters.len() <= budget.live_waiters);
@@ -646,12 +714,28 @@ impl Admission {
         self.reserve_grant(WriteGrant::request(bytes), true, healthy, |_| Ok(()))
     }
 
+    /// [`Self::reserve_reestimated`] with a fixed index reservation.
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn reserve_grant(
         self: &Arc<Self>,
         grant: WriteGrant,
         block: bool,
         healthy: impl Fn() -> Result<(), LocalDbError>,
         checkpoint: impl Fn(CheckpointPressure) -> Result<(), LocalDbError>,
+    ) -> Result<WriteCredit, LocalDbError> {
+        self.reserve_reestimated(grant, block, healthy, checkpoint, &mut ())
+    }
+
+    /// Reserve `grant` in FIFO order, blocking up to the timeout when `block`.
+    /// While it waits on index bytes, `reestimate` may lower its index
+    /// reservation in place ([`IndexReestimate`]).
+    pub(in crate::distributed::remote_db) fn reserve_reestimated(
+        self: &Arc<Self>,
+        grant: WriteGrant,
+        block: bool,
+        healthy: impl Fn() -> Result<(), LocalDbError>,
+        checkpoint: impl Fn(CheckpointPressure) -> Result<(), LocalDbError>,
+        reestimate: &mut impl IndexReestimate,
     ) -> Result<WriteCredit, LocalDbError> {
         if grant.bytes > self.max_bytes {
             return Err(LocalDbError::new("write exceeds admission byte budget"));
@@ -695,6 +779,7 @@ impl Admission {
                 admission: self.clone(),
                 charge: CreditCharge::Direct(grant),
                 committed: false,
+                blocked_since: None,
             });
         }
         if !block {
@@ -704,6 +789,7 @@ impl Admission {
         }
         let mut waiting = self.enqueue_grant(&mut budget, grant);
         drop(budget);
+        let blocked_since = Instant::now();
         // Deadline bounds this predicate loop, including spurious unparks.
         loop {
             match waiting.waiter.state.load(Ordering::Acquire) {
@@ -719,6 +805,7 @@ impl Admission {
                         admission: self.clone(),
                         charge: CreditCharge::Queued(Arc::clone(&waiting.waiter)),
                         committed: false,
+                        blocked_since: Some(blocked_since),
                     });
                 }
                 WAITER_CLOSED => return Err(self.closed_error()),
@@ -730,10 +817,20 @@ impl Admission {
                     if Instant::now() >= deadline {
                         return Err(LocalDbError::new("write admission deadline expired"));
                     }
-                    let pressure = {
+                    let (pressure, index_blocked) = {
                         let budget = self.budget.lock();
-                        self.checkpoint_pressure_for(&budget, &waiting.waiter.grant)
+                        let grant = &waiting.waiter.grant;
+                        (
+                            self.checkpoint_pressure_for(&budget, grant),
+                            self.index_blocked(&budget, grant),
+                        )
                     };
+                    // A strictly lower reservation replaces the node, which
+                    // may then be granted: recheck its state. Bounded by the
+                    // strict decrease.
+                    if index_blocked && self.lower_index_reservation(&mut waiting, reestimate) {
+                        continue;
+                    }
                     if let Some(pressure) = pressure {
                         // No Admission/identity/key/owner/publication lock
                         // survives into checkpoint request or the capacity park.
@@ -743,6 +840,48 @@ impl Admission {
                 }
             }
         }
+    }
+
+    /// Replace a queued grant whose index reservation went stale with the
+    /// caller's fresh, strictly lower estimate, in the same FIFO position.
+    /// True if replaced. Called with no lock held.
+    fn lower_index_reservation(
+        &self,
+        waiting: &mut WaitingReservation<'_>,
+        reestimate: &mut impl IndexReestimate,
+    ) -> bool {
+        // Read before the estimate: a cell created after this read grows the
+        // directory again, and grant_waiters wakes the head once more.
+        let directory = self.index.directory_bytes();
+        let Some(index_bytes) = reestimate.propose(waiting.waiter.grant.index_bytes) else {
+            return false;
+        };
+        let mut budget = self.budget.lock();
+        // A node is in the queue exactly while it is unclaimed and owns no
+        // charge; a granted node keeps the grant it was charged with.
+        let Some(position) = budget
+            .waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(waiter, &waiting.waiter))
+        else {
+            return false;
+        };
+        let replacement = Arc::new(AdmissionWaiter::new(
+            WriteGrant {
+                index_bytes,
+                ..waiting.waiter.grant.clone()
+            },
+            directory,
+        ));
+        budget.waiters[position] = Arc::clone(&replacement);
+        waiting.waiter = replacement;
+        let wake = self.grant_waiters(&mut budget);
+        drop(budget);
+        // Before the grant can be claimed and released: the caller's charges
+        // match the queued grant from here on.
+        reestimate.accept();
+        wake_granted(wake);
+        true
     }
 
     pub(in crate::distributed::remote_db) fn wait_until(
@@ -1298,6 +1437,17 @@ impl ConcurrentRemoteDatabase {
         self.database.core.pipeline_stats()
     }
 
+    /// Visit the option C counters and gauges (`cell_*`, spec §11.4). Local
+    /// only. Reads `/proc` for the maintenance threads and walks the index
+    /// for segment space: call at measurement boundaries, not per request.
+    pub fn visit_cell_metrics(&self, set: impl FnMut(&'static str, u64)) {
+        super::cell_checkpoint::metrics_snapshot(&self.database.core, true).visit(set);
+    }
+    /// [`Self::visit_cell_metrics`] without the gauges, which take the
+    /// Admission mutex and index shard locks.
+    pub fn try_visit_cell_metrics(&self, set: impl FnMut(&'static str, u64)) {
+        super::cell_checkpoint::metrics_snapshot(&self.database.core, false).visit(set);
+    }
     /// Visit one local-only snapshot of write owner, checkpoint, and cache metrics.
     /// This performs no diagnostic RPC and does not enable sampled profiling.
     pub fn visit_write_metrics(&self, visit: impl FnOnce(WriteMetricsSnapshot)) {

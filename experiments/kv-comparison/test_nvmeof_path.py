@@ -25,6 +25,57 @@ def authority_diagnostics():
         'stages': authority_evidence()['deltas']['coordinator']['counters']}}
 
 
+def option_c_evidence(end_counters, levels=None, start_counters=None):
+    start_counters = start_counters or dict.fromkeys(end_counters, 0)
+    levels = {'cell_gauge_workers': 2, 'cell_gauge_thread_cpu_available': 1} if levels is None else levels
+    return {'scope': 'measurement_boundary', 'measurement_attempted': True, 'measurement_drained': True,
+            'start': {'option_c': {'available': True, 'counters': start_counters, 'levels': {}}},
+            'end': {'option_c': {'available': True, 'counters': end_counters, 'levels': levels}}}
+
+
+def per_cell_counters():
+    return {'cell_frames': 10, 'cell_exact_buffered_cells': 0, 'cell_exact_streamed_cells': 0,
+            'cell_blake2b_bytes': 4000, 'cell_exact_blake2b_bytes': 0,
+            'cell_encoder_invocations': 10, 'cell_exact_encoder_invocations': 0,
+            'cell_buffered_cells': 10, 'cell_streamed_cells': 0,
+            'cell_conservative_fallbacks': 0, 'cell_exact_conservative_fallbacks': 0,
+            'cell_maintenance_cpu_ns': 2_000_000, 'cell_logical_index_write_bytes': 5000,
+            'cell_root_payload_cell_encodes': 0, 'cell_root_commits': 2, 'cell_exact_checkpoints': 0,
+            'cell_admission_blocked_replay_tail_ns': 3_000_000, 'cell_admission_blocked_replay_tail': 1,
+            'cell_dequeued': 10, 'cell_queue_wait_ns': 50_000, 'cell_w0_captured': 8, 'cell_w1_captured': 2}
+
+
+def exact_counters(streamed):
+    return {'cell_frames': 0, 'cell_exact_buffered_cells': 10 - streamed, 'cell_exact_streamed_cells': streamed,
+            'cell_blake2b_bytes': 0, 'cell_exact_blake2b_bytes': 8000,
+            'cell_encoder_invocations': 0, 'cell_exact_encoder_invocations': 10 + streamed,
+            'cell_buffered_cells': 0, 'cell_streamed_cells': 0, 'cell_conservative_fallbacks': 0,
+            'cell_exact_conservative_fallbacks': 0, 'cell_maintenance_cpu_ns': 8_000_000,
+            'cell_logical_index_write_bytes': 8000, 'cell_root_payload_cell_encodes': 0,
+            'cell_root_commits': 0, 'cell_exact_checkpoints': 4}
+
+
+def write_replay_run(directory, mode, counters=None, checkpoints=100, status='completed', repetitions=4096,
+                     streaming=None):
+    directory.mkdir(parents=True)
+    configuration = {'durability_tier': 'synchronous', 'owner_count': 2, 'history_persistence': 'wal_replay',
+                     'client': {'replay_limits': {'max_batches': 4096}, 'max_index_bytes': 1 << 29}}
+    if mode is not None:
+        configuration['checkpoint_mode'] = mode
+    if streaming is not None:
+        configuration['force_streaming_cell_encoder'] = streaming
+    profile = {'case_identity': {'scope': 'perpetual', 'fixture_sha256': 'f' * 64, 'repetitions': repetitions, 'N': 16},
+               'measurement_elapsed_seconds': 10.0, 'successful_calls': 1000, 'api_calls_per_second': 100.0,
+               'checkpoints_per_second': checkpoints / 10, 'mean_in_flight_api_calls': 4.0,
+               'latency': {'operation:commit:success': {'api': {'count': 300, 'p50_ns': 1000, 'p99_ns': 9000, 'p999_ns': 20000}},
+                           'commit:success:db0:phase1': {'api': {'count': 300, 'p50_ns': 1, 'p99_ns': 1, 'p999_ns': 1}}}}
+    summary = {'status': status, 'backend': {'configuration': configuration},
+               'phase_counts': {'profile': profile, 'counts': {'checkpoints': checkpoints, 'transactions': 50}}}
+    (directory / 'summary.json').write_text(json.dumps(summary))
+    if counters is not None:
+        (directory / 'measurement-read-evidence.json').write_text(json.dumps(option_c_evidence(counters)))
+
+
 class NvmeofPathTests(unittest.TestCase):
     def test_authority_columns_prefer_validated_read_boundaries_and_reach_csv(self):
         directory = self.add('tidehunter_nvme_rdma', group='G32W')
@@ -42,6 +93,109 @@ class NvmeofPathTests(unittest.TestCase):
             exported = next(csv.DictReader(stream))
         self.assertEqual(float(exported['authority_prepare_us_per_put']), 8)
         self.assertEqual(exported['authority_interval_scope'], 'measurement_start_to_drained_end_counter_delta')
+
+    def test_option_c_window_derives_attribution_and_reaches_csv(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G32W')
+        levels = {'cell_gauge_workers': 2, 'cell_gauge_thread_cpu_available': 1,
+                  'cell_gauge_segment_dead_bytes': 128, 'cell_gauge_lag_l_f_batches': 7}
+        (directory / 'measurement-read-evidence.json').write_text(
+            json.dumps(option_c_evidence(per_cell_counters(), levels)))
+        row = analysis.result_row(self.cases[0], self.export)
+        self.assertEqual(row['option_c_source'], 'measurement-read-evidence.json')
+        self.assertEqual(row['cell_maintenance_cpu_s'], 0.002)
+        self.assertEqual((row['cell_rewritten_bytes'], row['cell_frames']), (4000, 10))
+        self.assertEqual((row['cell_duplicate_encodes'], row['cell_root_payload_cell_encodes']), (0, 0))
+        self.assertEqual((row['cell_snapshots'], row['cell_admission_blocked_ms']), (2, 3))
+        self.assertEqual(row['cell_queue_wait_mean_us'], 5)
+        self.assertEqual(row['cell_cpu_ns_per_emitted_byte'], 500)
+        self.assertEqual(row['cell_range_imbalance'], 1.6)
+        self.assertEqual((row['cell_segment_dead_bytes'], row['cell_lag_l_f_batches']), (128, 7))
+        self.generate()
+        with (self.output / 'puts.csv').open() as stream:
+            exported = next(csv.DictReader(stream))
+        self.assertEqual(int(exported['cell_rewritten_bytes']), 4000)
+
+    def test_option_c_window_rejects_bad_boundaries_and_never_estimates(self):
+        good = option_c_evidence(per_cell_counters())
+        self.assertIsNotNone(analysis.option_c_window(good))
+        for path, value in ((('end', 'option_c', 'counters', 'cell_frames'), -1),
+                            (('start', 'option_c', 'counters', 'cell_frames'), 11),
+                            (('end', 'option_c', 'counters', 'cell_frames'), 2**64 - 1),
+                            (('end', 'option_c', 'counters', 'cell_frames'), 10.0),
+                            (('end', 'option_c', 'counters', 'cell_extra'), 1),
+                            (('end', 'option_c', 'available'), False),
+                            (('end', 'option_c', 'levels', 'cell_gauge_workers'), True),
+                            (('measurement_drained',), False), (('scope',), 'lifetime')):
+            evidence = copy.deepcopy(good)
+            target = evidence
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            self.assertIsNone(analysis.option_c_window(evidence), path)
+        # Without thread CPU or a counter, the dependent values stay unavailable.
+        counters = per_cell_counters(); del counters['cell_exact_blake2b_bytes']
+        values = analysis.option_c_values(counters, {'cell_gauge_thread_cpu_available': 0})
+        self.assertIsNone(values['cell_maintenance_cpu_s'])
+        self.assertIsNone(values['cell_rewritten_bytes'])
+        self.assertIsNone(values['cell_cpu_ns_per_emitted_byte'])
+        self.assertIsNone(values['cell_range_imbalance'])
+
+    def test_option_c_attribution_matches_arms_and_reports_ratios(self):
+        runs = {'exact': [], 'exact_encode_once': [], 'per_cell': []}
+        for repetition in range(2):
+            for arm, mode, counters, streaming in (('exact', None, exact_counters(10), True),
+                                                   ('exact_encode_once', 'exact', exact_counters(0), False),
+                                                   ('per_cell', 'per_cell', per_cell_counters(), None)):
+                directory = self.root / arm / str(repetition)
+                write_replay_run(directory, mode, counters, streaming=streaming)
+                runs[arm].append(str(directory))
+        summary = analysis.option_c_attribution(runs, self.output)
+        by_arm = {entry['arm']: entry for entry in summary}
+        self.assertEqual([entry['arm'] for entry in summary], list(analysis.ATTRIBUTION_ARMS))
+        self.assertEqual(by_arm['exact']['cell_duplicate_encodes'], 10)
+        self.assertEqual(by_arm['exact_encode_once']['cell_duplicate_encodes'], 0)
+        self.assertEqual(by_arm['per_cell']['cell_maintenance_cpu_s_vs_exact'], 0.25)
+        self.assertEqual(by_arm['per_cell']['cell_rewritten_bytes_vs_exact'], 0.5)
+        self.assertEqual(by_arm['per_cell']['cell_cpu_us_per_checkpoint'], 20)
+        self.assertEqual(by_arm['exact']['completed_runs'], 2)
+        with (self.output / 'option-c-latency.csv').open() as stream:
+            latency = list(csv.DictReader(stream))
+        self.assertEqual({row['population'] for row in latency}, {'operation:commit:success'})
+        self.assertEqual(float(latency[0]['p99_us']), 9)
+        self.assertTrue((self.output / 'option-c-attribution.md').is_file())
+        # A pre-option-C Exact run has no counters: unavailable, not zero.
+        legacy = self.root / 'legacy'
+        write_replay_run(legacy, None)
+        summary = analysis.option_c_attribution({'exact': [str(legacy)], 'per_cell': runs['per_cell']},
+                                                self.root / 'legacy-output')
+        self.assertIsNone(summary[0]['cell_maintenance_cpu_s'])
+        self.assertIsNone(summary[1]['cell_maintenance_cpu_s_vs_exact'])
+
+    def test_option_c_attribution_refuses_unmatched_runs(self):
+        write_replay_run(self.root / 'exact', None, exact_counters(10), streaming=True)
+        write_replay_run(self.root / 'cell', 'per_cell', per_cell_counters(), repetitions=1024)
+        with self.assertRaisesRegex(ValueError, 'not matched'):
+            analysis.option_c_attribution({'exact': [str(self.root / 'exact')],
+                                           'per_cell': [str(self.root / 'cell')]}, self.output)
+        write_replay_run(self.root / 'wrong', 'exact', per_cell_counters())
+        with self.assertRaisesRegex(ValueError, 'checkpoint_mode per_cell'):
+            analysis.option_c_attribution({'exact': [str(self.root / 'exact')],
+                                           'per_cell': [str(self.root / 'wrong')]}, self.output)
+        # The Exact arms are told apart by the recorded encoder switch.
+        write_replay_run(self.root / 'once', 'exact', exact_counters(0), streaming=True)
+        with self.assertRaisesRegex(ValueError, 'exact_encode_once needs force_streaming_cell_encoder false'):
+            analysis.option_c_attribution({'exact': [str(self.root / 'exact')],
+                                           'exact_encode_once': [str(self.root / 'once')]}, self.output)
+        write_replay_run(self.root / 'unswitched', 'exact', exact_counters(0))
+        with self.assertRaisesRegex(ValueError, 'arm exact needs force_streaming_cell_encoder true'):
+            analysis.option_c_attribution({'exact': [str(self.root / 'unswitched')]}, self.output)
+        with self.assertRaises(ValueError):
+            analysis.option_c_attribution({'per_cell': [str(self.root / 'cell')]}, self.output)
+        with self.assertRaises(SystemExit) as exit_status:
+            analysis.main(['--output', str(self.output), '--option-c-attribution',
+                           'exact=' + str(self.root / 'exact'), '--option-c-attribution',
+                           'per_cell=' + str(self.root / 'cell')])
+        self.assertEqual(exit_status.exception.code, 1)
 
     def test_authority_boundaries_reject_missing_reset_mismatched_and_saturated_counters(self):
         for path, value in (

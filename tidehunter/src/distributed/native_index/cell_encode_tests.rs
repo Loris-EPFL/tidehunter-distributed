@@ -1469,7 +1469,15 @@ fn persisted_images_are_identical_for_buffered_and_streamed_cells() {
             floor.clone(),
             limit,
         ));
-        super::open(&dir.join("image.index"), &shape, DATABASE, 1 << 20, 1).unwrap();
+        super::open(
+            &dir.join("image.index"),
+            &shape,
+            DATABASE,
+            1 << 20,
+            1,
+            CheckpointMode::Exact,
+        )
+        .unwrap();
     }
     let (streamed, buffered) = (images.pop().unwrap(), images.pop().unwrap());
     assert_eq!(buffered.0, streamed.0, "root bytes");
@@ -1526,7 +1534,15 @@ fn persisted_images_are_identical_for_buffered_and_streamed_cells() {
             floor.clone(),
             limit,
         ));
-        super::open(&dir.join("image.index"), &shape, DATABASE, 1 << 20, 1).unwrap();
+        super::open(
+            &dir.join("image.index"),
+            &shape,
+            DATABASE,
+            1 << 20,
+            1,
+            CheckpointMode::Exact,
+        )
+        .unwrap();
     }
     let (streamed, buffered) = (images.pop().unwrap(), images.pop().unwrap());
     assert_eq!(buffered.0, streamed.0, "second root bytes");

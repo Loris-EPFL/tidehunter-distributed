@@ -4,14 +4,10 @@
 //! generation-tagged credit token that returns replay-tail and identity
 //! credits exactly once.
 //!
-//! `Exact` is the only active mode. `PerCell` is rejected by
-//! [`RemoteDatabaseConfig::validate`] until the per-cell stages pass their
-//! joint gate, and a format-5 manifest never opens in `Exact` mode. No code
-//! here writes or reads a file.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "option C contract, wired by the per-cell stages")
-)]
+//! `Exact` is the default. `PerCell` is opt-in and, until the migration stage
+//! lands, accepted by [`RemoteDatabaseConfig::validate`] only in WAL-replay
+//! history mode; `remote_db::cell_checkpoint` runs it. A format-5 manifest
+//! never opens in `Exact` mode. No code here writes or reads a file.
 
 use super::write_core::core::CheckpointCredits;
 use super::*;
@@ -27,7 +23,7 @@ pub enum CheckpointMode {
     #[default]
     Exact,
     /// Per-cell flushes with metadata-only roots: index root 5, checkpoint
-    /// metadata 4, authority manifest 5. Inactive in this revision.
+    /// metadata 4, authority manifest 5. Opt-in; see the module documentation.
     PerCell,
 }
 
@@ -83,12 +79,13 @@ pub(super) struct CellCheckpointCommit {
 }
 
 impl CellCheckpointCommit {
-    /// Same output names as the exact checkpoint staging reservation.
+    /// Wrapper name: the exact checkpoint metadata name of this generation.
     pub(super) fn metadata_name(&self) -> String {
         format!("checkpoint-{}-{}.metadata", self.epoch, self.generation)
     }
+    /// The immutable format-5 root name the root persistence writes.
     pub(super) fn root_name(&self) -> String {
-        format!("index-{}-{}.snapshot", self.epoch, self.generation)
+        crate::distributed::native_index::cell_root_name(self.epoch, self.generation)
     }
 }
 

@@ -46,7 +46,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use typenum::U32;
 
+mod cell_checkpoint;
 mod cell_flush;
+mod cell_metrics;
+mod cell_migration;
 mod cell_recovery;
 mod checkpoint_contract;
 mod checkpoint_lifecycle;
@@ -438,10 +441,18 @@ pub struct RemoteDatabaseConfig {
     /// Select direct live owner-WAL NVMe-oF before opening or recovering.
     #[serde(default)]
     pub live_nvme: Option<super::tcp::LiveClientConfig>,
-    /// The database's one checkpoint protocol. Only `Exact` is active; absent
-    /// means `Exact`, so existing configuration documents are unchanged.
+    /// The database's one checkpoint protocol. Absent means `Exact`, so
+    /// existing configuration documents are unchanged. `PerCell` (independent
+    /// cell flushes, metadata-only roots) is explicit opt-in.
     #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
     pub checkpoint_mode: CheckpointMode,
+    /// Measurement only, never set by production configurations: Exact
+    /// checkpoint images encode every cell with the legacy streaming encoder
+    /// (the pre-option-C double pass) instead of encoding once. The bytes
+    /// written are identical; only the encoding work differs. It separates
+    /// the Exact and encode-once Exact arms of the replay attribution.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_streaming_cell_encoder: bool,
 }
 
 fn default_max_pending_reads() -> usize {
@@ -591,11 +602,6 @@ impl RemoteDatabaseConfig {
         {
             return Err(LocalDbError::new(
                 "index_shards must be a power of two in 1..=MAX_INDEX_SHARDS",
-            ));
-        }
-        if !self.checkpoint_mode.is_exact() {
-            return Err(LocalDbError::new(
-                "checkpoint_mode per_cell is inactive in this revision",
             ));
         }
         if let Some(live) = &self.live_nvme {
@@ -1587,13 +1593,35 @@ impl RemoteDatabase {
         } else {
             transport_pool
         };
-        let mut index = NativeIndex::with_shards(
+        // The checkpoint mode fixes whether index cells carry per-cell flush
+        // state (and its charge); a migrating open loads the exact snapshot
+        // into a `PerCell` index.
+        let mut index = NativeIndex::with_mode(
             shape,
             config.storage.database,
             config.max_index_bytes,
             config.index_shards,
+            config.checkpoint_mode,
         )
         .map_err(LocalDbError::component)?;
+        // Option C spec §6.2: a per-cell budget below a conservative upper
+        // bound of one legal batch's charge (maximum operations and key bytes
+        // the batch limits allow, all into new cells) is rejected here, before
+        // any effect, rather than at its first admission. Exact keeps its
+        // write-time rejection unchanged.
+        if !config.checkpoint_mode.is_exact() {
+            let limits = config.storage.batch_limits;
+            let largest = index
+                .largest_batch_charge(limits)
+                .ok_or_else(|| LocalDbError::new("largest batch index charge overflow"))?;
+            if largest > config.max_index_bytes {
+                return Err(LocalDbError::new(format!(
+                    "max_index_bytes {} cannot hold one largest batch: a batch within \
+                     {} operations and {} encoded bytes charges up to {largest} index bytes",
+                    config.max_index_bytes, limits.max_operations, limits.max_encoded_bytes
+                )));
+            }
+        }
         let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
         let shape = KeyShape::from_yaml(&shape_yaml).map_err(LocalDbError::component)?;
         match fs::create_dir(path) {
@@ -1621,7 +1649,12 @@ impl RemoteDatabase {
                 }
             }
             let manifest = AuthorityManifest {
-                format: 4,
+                // A new per-cell database starts at format 5 with no commit.
+                format: if config.checkpoint_mode.is_exact() {
+                    4
+                } else {
+                    checkpoint_contract::PER_CELL_MANIFEST_FORMAT
+                },
                 storage: config.storage.clone(),
                 history_persistence: config.history_persistence,
                 endpoints: config.endpoints.clone(),
@@ -1640,7 +1673,7 @@ impl RemoteDatabase {
                 checkpoint: None,
                 checkpoint_staging: None,
                 checkpoint_obsolete: None,
-                checkpoint_mode: CheckpointMode::Exact,
+                checkpoint_mode: config.checkpoint_mode,
                 cell_checkpoint: None,
                 cell_checkpoint_obsolete: None,
             };
@@ -1652,13 +1685,23 @@ impl RemoteDatabase {
                 "authority manifest history persistence differs",
             ));
         }
-        // No fallback: a per-cell manifest never opens in `Exact` mode.
-        if manifest_checkpoint_mode(&manifest)? != config.checkpoint_mode {
+        // No fallback: a per-cell manifest never opens in `Exact` mode. The
+        // one-way migration opens an exact manifest with a `PerCell`
+        // configuration: it recovers exactly, then adopts format 5.
+        let manifest_mode = manifest_checkpoint_mode(&manifest)?;
+        let migrating = manifest_mode.is_exact() && !config.checkpoint_mode.is_exact();
+        if manifest_mode != config.checkpoint_mode && !migrating {
             return Err(LocalDbError::new(
                 "authority manifest checkpoint mode differs",
             ));
         }
-        if !matches!(manifest.format, 2..=4)
+        let formats = if manifest_mode.is_exact() {
+            2..=4
+        } else {
+            checkpoint_contract::PER_CELL_MANIFEST_FORMAT
+                ..=checkpoint_contract::PER_CELL_MANIFEST_FORMAT
+        };
+        if !formats.contains(&manifest.format)
             || manifest.storage != config.storage
             || manifest.endpoints != config.endpoints
             || manifest.shape_yaml != shape_yaml
@@ -1877,50 +1920,75 @@ impl RemoteDatabase {
         let mut recent_ids = HashMap::with_capacity(retry_window);
         let mut latest = None;
         let mut cursors = HashMap::new();
-        if let Some(checkpoint) = &manifest.checkpoint {
-            load_checkpoint(
+        let mut cell_open = None;
+        let committed_complete;
+        if manifest_mode.is_exact() {
+            if let Some(checkpoint) = &manifest.checkpoint {
+                load_checkpoint(
+                    &path,
+                    checkpoint,
+                    &manifest,
+                    &config,
+                    &shape,
+                    &mut clients,
+                    &histories,
+                    epoch,
+                    &mut index,
+                    &mut receipt_history,
+                    &mut latest,
+                    &mut cursors,
+                    &mut positions,
+                    &mut recent,
+                    &mut recent_ids,
+                    &mut recovery_stats,
+                )?;
+            }
+            committed_complete = positions
+                .iter()
+                .filter_map(|(key, position)| position.complete.then_some(*key))
+                .collect();
+            let replay_started = Instant::now();
+            replay_history(
+                &mut clients,
+                &histories,
+                epoch,
+                &config,
+                recorded_replay_limits,
+                &shape,
+                &mut index,
+                &mut known,
+                &receipt_history,
+                &recent_ids,
+                &mut latest,
+                &cursors,
+                &mut positions,
+                &mut recovery_stats,
+                #[cfg(test)]
+                interruption,
+            )?;
+            recovery_stats.tail_replay_ns = elapsed(replay_started);
+        } else {
+            // Mixed-cut recovery from the adopted format-5 root; it also
+            // removes unadopted root/wrapper outputs and orphan segments.
+            let recovered = cell_checkpoint::recover(
                 &path,
-                checkpoint,
-                &manifest,
+                &mut manifest,
                 &config,
                 &shape,
                 &mut clients,
                 &histories,
                 epoch,
-                &mut index,
-                &mut receipt_history,
-                &mut latest,
-                &mut cursors,
-                &mut positions,
-                &mut recent,
-                &mut recent_ids,
                 &mut recovery_stats,
             )?;
+            index = recovered.index;
+            known = recovered.known;
+            latest = recovered.latest;
+            positions = recovered.positions;
+            recent = recovered.recent;
+            receipt_history = recovered.receipt_history;
+            committed_complete = recovered.committed_complete;
+            cell_open = Some(recovered.open);
         }
-        let committed_complete = positions
-            .iter()
-            .filter_map(|(key, position)| position.complete.then_some(*key))
-            .collect();
-        let replay_started = Instant::now();
-        replay_history(
-            &mut clients,
-            &histories,
-            epoch,
-            &config,
-            recorded_replay_limits,
-            &shape,
-            &mut index,
-            &mut known,
-            &receipt_history,
-            &recent_ids,
-            &mut latest,
-            &cursors,
-            &mut positions,
-            &mut recovery_stats,
-            #[cfg(test)]
-            interruption,
-        )?;
-        recovery_stats.tail_replay_ns = elapsed(replay_started);
         // Current checkpoint/proofs and the complete tail have now validated.
         // Resolve only durably named cleanup intents before allowing more work.
         cleanup_checkpoint_artifacts(&path, &mut manifest, false)?;
@@ -2011,7 +2079,11 @@ impl RemoteDatabase {
         manifest.epochs.last_mut().unwrap().active = true;
         // Old suffixes validated against their original durable bound. Only a
         // fully recovered, not-yet-serving epoch may activate a larger bound.
-        manifest.format = 4;
+        manifest.format = if manifest_mode.is_exact() {
+            4
+        } else {
+            checkpoint_contract::PER_CELL_MANIFEST_FORMAT
+        };
         manifest.replay_limits = config.replay_limits;
         persist_manifest(&path, &manifest)?;
         let partition_indexes = config
@@ -2023,6 +2095,10 @@ impl RemoteDatabase {
         let checkpoint_diagnostics =
             (config.write_profile_limit != 0).then(|| VecDeque::with_capacity(128));
         let reads = Arc::new(reads);
+        // Measurement-only encoder switch; set before any checkpoint runs.
+        index
+            .writer()
+            .set_force_streaming_cell_encoder(config.force_streaming_cell_encoder);
         let operational_sampler =
             OperationalReadIoSampler::dormant(config.clone(), shape.clone(), tls_config);
         let core = write_core::core::WriteCore::new(write_core::core::OpenState {
@@ -2088,6 +2164,32 @@ impl RemoteDatabase {
         });
         completion.bind(&core);
         let database = Self { core, _lock: lock };
+        // The flusher pool starts before any serving handle exists; a failure
+        // drops the database, whose shutdown joins what started.
+        if migrating {
+            // Before any per-cell flush: the first root is exactly the old
+            // exact cut. The runtime starts with the adopted root installed
+            // before the handle exists; a failure drops the database.
+            let adoption = cell_migration::adopt_exact(&database.core)?;
+            let (store, _orphans) = super::native_index::IndexStore::open(
+                &database.core.path,
+                database.core.epoch,
+                &[adoption.root.root().files.as_slice()],
+            )
+            .map_err(LocalDbError::component)?;
+            cell_checkpoint::start(
+                &database.core,
+                cell_checkpoint::CellOpen::without_root(store),
+            )?;
+            cell_checkpoint::install_adopted(
+                &database.core,
+                &adoption.commit,
+                &adoption.root,
+                adoption.ledger,
+            )?;
+        } else if let Some(open) = cell_open {
+            cell_checkpoint::start(&database.core, open)?;
+        }
         // A successful recovery establishes a new baseline before admitting
         // another bounded tail, including after repeated crash/reopen cycles.
         if database.core.publisher.lock().checkpoint_tail_batches != 0 {
@@ -3198,12 +3300,13 @@ fn load_checkpoint(
             "committed checkpoint index digest differs",
         ));
     }
-    let restored = NativeIndex::open_snapshot_with_shards(
+    let restored = NativeIndex::open_snapshot_with_mode(
         &index_path,
         shape,
         config.storage.database,
         config.max_index_bytes,
         config.index_shards,
+        config.checkpoint_mode,
     )
     .map_err(LocalDbError::component)?;
     if restored.latest_cut() != image.cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At) {

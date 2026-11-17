@@ -399,6 +399,11 @@ impl WriteCore {
             .release_publication(index_bytes, slots, &partitions, aborted_replay)?;
         self.stats.lock().database.published_batches += published_count;
         result?;
+        // Writer and publisher are dropped: hint the flusher scheduler. The
+        // index dirty signal stays the source of truth if the hint coalesces.
+        if published_count != 0 {
+            self.wake_cell_flush(super::super::cell_flush::WakeReason::Dirty);
+        }
         self.request_checkpoint()
     }
 

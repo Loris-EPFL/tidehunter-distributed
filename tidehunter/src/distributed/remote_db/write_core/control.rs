@@ -120,6 +120,8 @@ impl WriteCore {
             expected_connections: self.clients.len(),
             ..WriteProfileSnapshot::default()
         };
+        // Per-phase cell encoder timing follows the opt-in write profile.
+        self.cell_metrics.set_profiling(limit != 0);
         for worker in &self.clients {
             worker.arm_profile(limit)?;
         }
@@ -130,6 +132,7 @@ impl WriteCore {
         &self,
     ) -> Result<(), LocalDbError> {
         self.drain()?;
+        self.cell_metrics.set_profiling(false);
         if self.write_profile.lock().limit_per_connection == 0 {
             return Ok(());
         }
@@ -308,6 +311,13 @@ impl WriteCore {
             }
         }
         self.stats.lock().shutdown.seal_ns = elapsed(started);
+        // Sealing ends this authority epoch's owner streams: a lifecycle
+        // event for per-cell flights (any still in flight install as stale).
+        if result.is_ok()
+            && let Some(runtime) = self.cell.get()
+        {
+            runtime.advance_lifecycle(self);
+        }
         if result.is_ok() {
             result = after_seal(self);
         }
@@ -323,6 +333,14 @@ impl WriteCore {
             Vec::new()
         };
         let started = Instant::now();
+        // Per-cell flushers stop before the checkpoint and owner workers are
+        // joined: the final root (if any) was committed above, so captures are
+        // restored, and a checkpoint still waiting on cell coverage is released.
+        if let Some(runtime) = self.cell.get()
+            && let Err(error) = runtime.stop()
+        {
+            combine_error(&mut result, error);
+        }
         // A checkpoint may own worker senders: take its handle under publisher,
         // then join outside that mutex while controls can still be serviced.
         let checkpoint = self.publisher.lock().background_checkpoint.take();

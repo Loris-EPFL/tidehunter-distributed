@@ -186,6 +186,16 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub before_publish: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub before_release: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub fail_publication: Option<u64>,
+    /// Per-cell checkpoint: interrupt after this step (fail-stop).
+    pub cell_interruption: Option<super::super::cell_checkpoint::CellStep>,
+    /// Per-cell checkpoint: one-shot pause after this step.
+    pub cell_pause: Option<(
+        super::super::cell_checkpoint::CellStep,
+        mpsc::SyncSender<()>,
+        mpsc::Receiver<()>,
+    )>,
+    /// Per-cell checkpoint: commit the next root even if F and H are unchanged.
+    pub force_cell_root: bool,
 }
 
 /// Lock order for the final engine: identity → ascending key shards → owner
@@ -229,11 +239,22 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub(super) sequencer: Sequencer,
     pub(super) dependencies: DependencyRegistry,
     pub(super) identities: IdentityTable,
+    /// Per-cell checkpoint runtime (flusher pool, index store, retirement
+    /// ledger). Set once at the end of a `PerCell` open; unset in `Exact`.
+    pub cell: OnceLock<super::super::cell_checkpoint::CellRuntime>,
+    /// Option C counters (spec §11.4), in both modes: the Exact checkpoint
+    /// thread records its image encode and CPU here; in `PerCell` the flusher
+    /// pool, the snapshot actor, Admission stalls and recovery record too.
+    /// Sized for `cell_flushers(N)` workers, the pool size.
+    pub cell_metrics: Arc<super::super::cell_metrics::CellMetrics>,
 }
 
 impl WriteCore {
     pub(in crate::distributed::remote_db) fn new(open: OpenState) -> Arc<Self> {
         let parallelism = crate::parallelism::available();
+        let cell_metrics = super::super::cell_metrics::CellMetrics::new(
+            crate::distributed::native_index::cell_flushers(open.index.shard_count()),
+        );
         let admission = concurrent::Admission::for_open(&open);
         let hash = RandomState::new();
         let identities = IdentityTable::new(parallelism, hash.clone());
@@ -306,6 +327,8 @@ impl WriteCore {
             sequencer: Sequencer::new(capacity),
             dependencies: DependencyRegistry::new(parallelism, hash),
             identities,
+            cell: OnceLock::new(),
+            cell_metrics,
             publisher: Mutex::new(open.publisher),
         })
     }
@@ -599,6 +622,17 @@ impl WriteCore {
     #[cfg(test)]
     pub(in crate::distributed::remote_db) fn take_retirement_preflight_busy(&self) -> bool {
         std::mem::take(&mut self.test_hooks.lock().retire_preflight_busy_once)
+    }
+
+    /// Coalesced flusher hint, sent with no serving guard held. A no-op in
+    /// `Exact` mode.
+    pub(in crate::distributed::remote_db) fn wake_cell_flush(
+        &self,
+        reason: super::super::cell_flush::WakeReason,
+    ) {
+        if let Some(runtime) = self.cell.get() {
+            runtime.wake(reason);
+        }
     }
 
     pub(in crate::distributed::remote_db) fn request_checkpoint(

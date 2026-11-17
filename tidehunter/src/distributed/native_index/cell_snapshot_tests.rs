@@ -192,9 +192,20 @@ fn fixture(dir: &Path) -> NativeIndex {
     index
 }
 
+fn per_cell_index() -> NativeIndex {
+    NativeIndex::with_mode(&shape(), DATABASE, BUDGET, SHARDS, CheckpointMode::PerCell).unwrap()
+}
+
 fn reopen(dir: &Path, name: &str) -> NativeIndex {
-    NativeIndex::open_snapshot_with_shards(&dir.join(name), &shape(), DATABASE, BUDGET, SHARDS)
-        .unwrap()
+    NativeIndex::open_snapshot_with_mode(
+        &dir.join(name),
+        &shape(),
+        DATABASE,
+        BUDGET,
+        SHARDS,
+        CheckpointMode::PerCell,
+    )
+    .unwrap()
 }
 
 fn container() -> IndexStoreFileId {
@@ -645,7 +656,7 @@ fn capture_persist_load_round_trip() {
 fn capture_is_sliced_preallocated_and_handles_newer_bases() {
     let temp = tempdir::TempDir::new("cell-root-slices").unwrap();
     let dir = temp.path();
-    let index = NativeIndex::with_shards(&shape(), DATABASE, BUDGET, SHARDS).unwrap();
+    let index = per_cell_index();
     let keys: Vec<[u8; 2]> = (0..70u8).map(|first| [first, 1]).collect();
     let ops: Vec<(&[u8], bool)> = keys.iter().map(|key| (key.as_slice(), true)).collect();
     publish(&index, 1, &ops);
@@ -763,7 +774,7 @@ fn capture_is_sliced_preallocated_and_handles_newer_bases() {
 fn empty_directory_root_uses_its_target() {
     let temp = tempdir::TempDir::new("cell-root-empty").unwrap();
     let dir = temp.path();
-    let index = NativeIndex::with_shards(&shape(), DATABASE, BUDGET, SHARDS).unwrap();
+    let index = per_cell_index();
     let prepared = capture(&index, dir, 1, None);
     let root = prepared.root();
     assert!(root.cells.is_empty() && root.files.is_empty());

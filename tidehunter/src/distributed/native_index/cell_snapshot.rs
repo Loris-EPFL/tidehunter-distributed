@@ -560,10 +560,17 @@ impl NativeIndex {
         // The frame checks below rely on the structural rules (one file per
         // id, ranges within sealed lengths and disjoint, cuts ordered).
         root.check(database, schema_digest(shape)?)?;
-        if root.cells.len() > max_metadata_bytes / CELL_CHARGE {
+        if root.cells.len() > max_metadata_bytes / PER_CELL_CHARGE {
             return Err(NativeIndexError::Capacity);
         }
-        let mut index = Self::with_shards(shape, database, max_metadata_bytes, shards)?;
+        // A per-cell root is adopted only by a `PerCell` database.
+        let mut index = Self::with_mode(
+            shape,
+            database,
+            max_metadata_bytes,
+            shards,
+            CheckpointMode::PerCell,
+        )?;
         let mut mapped = Vec::with_capacity(root.files.len());
         for file in &root.files {
             let bytes = map(file)?;
@@ -574,7 +581,7 @@ impl NativeIndex {
         }
         for cell in &root.cells {
             check_cell_identity(index.descriptor(cell.keyspace)?, &cell.cell)?;
-            let charge = cell_directory_charge(&cell.cell);
+            let charge = cell_directory_charge(index.mode, &cell.cell);
             index.check_capacity(charge)?;
             add(&index.accounting.directory, charge);
             let base = match &cell.base {
@@ -597,12 +604,13 @@ impl NativeIndex {
             let identity = (cell.keyspace, cell.cell.clone());
             index.writer.get_mut().cell_order.push(identity.clone());
             let shard = index.shard_index(identity.0, &identity.1);
+            let flush = index.new_cell_flush(cell.coverage);
             // The directory is strictly ordered (checked): no duplicate.
             index.shards[shard].get_mut().insert(
                 identity,
                 CellIndex {
                     base,
-                    flush: CellFlushState::new(cell.coverage),
+                    flush,
                     ..Default::default()
                 },
             );
@@ -669,12 +677,64 @@ impl IndexWriter<'_> {
             descriptors: Vec::new(),
         }
     }
+
+    /// Step 1 of a root capture at an explicit complete prefix `target`
+    /// at or below the published prefix `L`. Exact -> per-cell migration
+    /// (spec §10.3 step 2) uses the adopted exact cut as `T`: every
+    /// reference through it is in a legacy base and every replayed suffix
+    /// reference is above it, so each cell clean-advances to `T` without a
+    /// flush. A cell inserted after `target` has only mutations above it.
+    pub(crate) fn begin_cell_root_capture_at(
+        &self,
+        target: PrefixCut,
+    ) -> Result<CellRootCapture, NativeIndexError> {
+        if target > self.index.published_prefix() {
+            return Err(NativeIndexError::UnpublishedCut);
+        }
+        Ok(CellRootCapture {
+            retention: Arc::clone(&self.index.retention),
+            target,
+            end: self.state.cell_order.len(),
+            descriptors: Vec::new(),
+        })
+    }
+
+    /// Make this index a per-cell index (spec §10.3 step 3): exact capture is
+    /// refused from now on, as for an index loaded from a format-5 root.
+    /// Refused while an exact capture or install is in progress or an exact
+    /// generation is sealed. Idempotent.
+    pub(crate) fn adopt_per_cell(&mut self) -> Result<(), NativeIndexError> {
+        let state = &mut *self.state;
+        if state.sealed_count != 0 || state.capture.is_some() || state.installation.is_some() {
+            return Err(NativeIndexError::Invalid(
+                "exact capture is in progress during per-cell adoption",
+            ));
+        }
+        state.cells.active = true;
+        Ok(())
+    }
 }
 
 impl CellRootCapture {
     /// `T`, the directory-capture target.
     pub(crate) fn target(&self) -> PrefixCut {
         self.target
+    }
+
+    /// `F` of the complete capture, as [`Self::finish`] computes it: the
+    /// minimum exported coverage, or `T` for an empty directory. Call
+    /// without serving locks after the last slice, before `finish`, to begin
+    /// the root-floor lease (`H <= F`). O(captured cells).
+    pub(crate) fn replay_floor(&self) -> Result<PrefixCut, NativeIndexError> {
+        if self.descriptors.len() != self.end {
+            return Err(NativeIndexError::Invalid("root capture incomplete"));
+        }
+        Ok(self
+            .descriptors
+            .iter()
+            .fold(self.target, |floor, descriptor| {
+                floor.min(descriptor.coverage)
+            }))
     }
 
     /// Reserve the descriptor buffer for the whole boundary. Call without

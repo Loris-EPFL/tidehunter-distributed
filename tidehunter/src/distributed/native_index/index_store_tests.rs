@@ -110,7 +110,8 @@ fn publish(index: &NativeIndex, sequence: u64) {
 
 /// An index with `batches` published batches over every cell.
 fn index(batches: u64) -> NativeIndex {
-    let index = NativeIndex::with_shards(&shape(), DATABASE, 16 << 20, 4).unwrap();
+    let index =
+        NativeIndex::with_mode(&shape(), DATABASE, 16 << 20, 4, CheckpointMode::PerCell).unwrap();
     for sequence in 1..=batches {
         publish(&index, sequence);
     }

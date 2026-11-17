@@ -61,7 +61,7 @@ use super::shards::{CellKey, add, sub};
 use super::*;
 use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 type References = Overlay<ValueRecordReference>;
 
@@ -116,6 +116,109 @@ impl SourceTotals {
     }
 }
 
+/// Compact [`SourceTotals`] of a cell's active overlay, kept in the cell
+/// (spec §9.1): narrow counters, and a `min` that is meaningful only when
+/// `versions != 0`. 40 B instead of 56 B; [`Self::widen`] gives the exact
+/// [`SourceTotals`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CellTotals {
+    versions: u32,
+    rows: u32,
+    charge: usize,
+    upper: usize,
+    min: BatchVersion,
+}
+
+// The versions of a cell are charged against the resident budget (at most
+// `MAX_IMAGE_BYTES / 2`), `VERSION_CHARGE` or more each, so `u32` counts
+// them, and its rows (at most one per version), without overflow.
+const _: () = assert!(MAX_IMAGE_BYTES / 2 / VERSION_CHARGE <= u32::MAX as usize);
+
+impl Default for CellTotals {
+    fn default() -> Self {
+        Self {
+            versions: 0,
+            rows: 0,
+            charge: 0,
+            upper: 0,
+            min: BatchVersion {
+                epoch: 0,
+                sequence: 0,
+            },
+        }
+    }
+}
+
+impl CellTotals {
+    /// The arithmetic of [`SourceTotals::record`].
+    fn record(&mut self, key_len: usize, batch: BatchVersion, new_row: bool) {
+        self.min = if self.versions == 0 {
+            batch
+        } else {
+            self.min.min(batch)
+        };
+        self.versions += 1;
+        self.charge += VERSION_CHARGE + key_len;
+        self.upper = self.upper.saturating_add(REFERENCE_BYTES);
+        if new_row {
+            self.rows += 1;
+            self.upper = self.upper.saturating_add(12 + key_len);
+        }
+    }
+
+    fn widen(self) -> SourceTotals {
+        SourceTotals {
+            versions: self.versions as usize,
+            rows: self.rows as usize,
+            charge: self.charge,
+            upper: self.upper,
+            min: (self.versions != 0).then_some(self.min),
+        }
+    }
+}
+
+/// When the oldest unrepresented published reference of a source arrived:
+/// nanoseconds since the index's cell epoch plus one, or [`NO_STAMP`].
+/// `epoch + (stamp - 1) ns` is exactly the recorded `Instant` on clocks with
+/// nanosecond resolution; 63 bits span 292 years, after which stamps
+/// saturate.
+type Stamp = u64;
+const NO_STAMP: Stamp = 0;
+const STAMP_BITS: u64 = (1 << 63) - 1;
+/// The `queued` bit of [`CellFlushState::marks`], above the stamp bits.
+const QUEUED: u64 = 1 << 63;
+
+fn stamp(epoch: Instant, at: Instant) -> Stamp {
+    let nanos = u64::try_from(at.saturating_duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
+    nanos.min(STAMP_BITS - 1) + 1
+}
+
+fn stamp_instant(epoch: Instant, stamp: Stamp) -> Option<Instant> {
+    (stamp != NO_STAMP).then(|| epoch + Duration::from_nanos(stamp - 1))
+}
+
+/// The earlier of two stamps; [`NO_STAMP`] is absent, not earliest.
+fn earliest(a: Stamp, b: Stamp) -> Stamp {
+    match (a, b) {
+        (NO_STAMP, other) | (other, NO_STAMP) => other,
+        _ => a.min(b),
+    }
+}
+
+/// Published references a completed flush left above its target, with their
+/// totals. Rare (only after a flush that left post-target references), so a
+/// cell without one pays a pointer. Boxed outside every serving lock.
+struct Carry {
+    references: Arc<References>,
+    totals: SourceTotals,
+}
+
+impl Carry {
+    fn boxed(references: Option<Arc<References>>, totals: SourceTotals) -> Option<Box<Self>> {
+        references.map(|references| Box::new(Self { references, totals }))
+    }
+}
+
 /// The one in-progress flush of a cell. Lives in the permit's preallocated
 /// envelope, so capture allocates nothing under the serving locks.
 pub(super) struct CellFlight {
@@ -123,10 +226,10 @@ pub(super) struct CellFlight {
     lifecycle: u64,
     base_token: u64,
     target: PrefixCut,
-    carry: Option<Arc<References>>,
+    carry: Option<Box<Carry>>,
     active: Arc<References>,
     totals: SourceTotals,
-    dirty_since: Option<Instant>,
+    dirty_since: Stamp,
 }
 
 impl CellFlight {
@@ -139,36 +242,29 @@ impl CellFlight {
             carry: None,
             active: Arc::new(References::new()),
             totals: SourceTotals::default(),
-            dirty_since: None,
+            dirty_since: NO_STAMP,
         }
     }
 }
 
-/// Per-cell option C metadata, held in the cell under its shard lock. In
-/// Exact mode only the active totals change.
+/// Per-cell option C metadata, boxed in the cell and changed under its shard
+/// lock. Only a `PerCell` index allocates it; Exact cells hold none. The
+/// layout is kept small (96 B on 64-bit targets): the rare carry is boxed,
+/// the base floor `H_i` is read from the base's file, the active totals are
+/// compact and the dirty time shares one word with the queued mark.
 pub(super) struct CellFlushState {
-    carry: Option<Arc<References>>,
+    carry: Option<Box<Carry>>,
     flight: Option<Box<CellFlight>>,
-    active: SourceTotals,
-    carry_totals: SourceTotals,
+    active: CellTotals,
     /// `D_i`: the base holds every retained reference of this cell through
     /// this complete prefix.
     coverage: PrefixCut,
     /// Changes on every base replacement by [`IndexWriter::install_cell`].
     base_token: u64,
-    /// `H_i` of a base installed here; a base that was never replaced here
-    /// reports the floor of its legacy container.
-    base_floor: Option<MutationVersion>,
-    /// When the oldest unrepresented published reference arrived.
-    dirty_since: Option<Instant>,
-    /// The scheduler holds a queued descriptor for this cell.
-    queued: bool,
-}
-
-impl Default for CellFlushState {
-    fn default() -> Self {
-        Self::new(PrefixCut::BeforeAll)
-    }
+    /// Bit 63 ([`QUEUED`]): the scheduler holds a queued descriptor for this
+    /// cell. Low 63 bits: the [`Stamp`] of the oldest unrepresented published
+    /// reference outside the flight.
+    marks: u64,
 }
 
 impl CellFlushState {
@@ -179,31 +275,63 @@ impl CellFlushState {
         Self {
             carry: None,
             flight: None,
-            active: SourceTotals::default(),
-            carry_totals: SourceTotals::default(),
+            active: CellTotals::default(),
             coverage,
             base_token: 0,
-            base_floor: None,
-            dirty_since: None,
-            queued: false,
+            marks: NO_STAMP,
         }
+    }
+
+    fn queued(&self) -> bool {
+        self.marks & QUEUED != 0
+    }
+
+    fn set_queued(&mut self, queued: bool) {
+        self.marks = if queued {
+            self.marks | QUEUED
+        } else {
+            self.marks & !QUEUED
+        };
+    }
+
+    fn dirty_since(&self) -> Stamp {
+        self.marks & STAMP_BITS
+    }
+
+    fn set_dirty_since(&mut self, stamp: Stamp) {
+        self.marks = (self.marks & QUEUED) | stamp;
+    }
+
+    fn carry_totals(&self) -> SourceTotals {
+        self.carry
+            .as_ref()
+            .map_or_else(SourceTotals::default, |carry| carry.totals)
     }
 
     /// Frozen read sources: carry, captured carry, captured active.
     pub(super) fn sources(&self) -> [Option<&References>; 3] {
         let flight = self.flight.as_deref();
         [
-            self.carry.as_deref(),
-            flight.and_then(|flight| flight.carry.as_deref()),
+            self.carry.as_deref().map(|carry| &*carry.references),
+            flight
+                .and_then(|flight| flight.carry.as_deref())
+                .map(|carry| &*carry.references),
             flight.map(|flight| &*flight.active),
         ]
     }
 
-    /// Record one reference promoted into the active overlay.
-    pub(super) fn record_active(&mut self, key_len: usize, batch: BatchVersion, new_row: bool) {
+    /// Record one reference promoted into the active overlay. `epoch` is the
+    /// index's cell epoch; the clock is read only when the cell was clean.
+    pub(super) fn record_active(
+        &mut self,
+        key_len: usize,
+        batch: BatchVersion,
+        new_row: bool,
+        epoch: Instant,
+    ) {
         self.active.record(key_len, batch, new_row);
-        if self.dirty_since.is_none() {
-            self.dirty_since = Some(Instant::now());
+        if self.dirty_since() == NO_STAMP {
+            self.set_dirty_since(stamp(epoch, Instant::now()));
         }
     }
 
@@ -215,15 +343,15 @@ impl CellFlushState {
     /// their totals stay. Cost: one pass over the remaining references of
     /// this cell, under the shard lock the install already holds.
     pub(super) fn recount_after_exact_install(&mut self, overlay: &References) {
-        let mut active = SourceTotals::default();
+        let mut active = CellTotals::default();
         for (key, values) in overlay {
             for (n, reference) in values.iter().enumerate() {
                 active.record(key.len(), reference.batch_version, n == 0);
             }
         }
         self.active = active;
-        if active.versions == 0 && self.carry_totals.versions == 0 {
-            self.dirty_since = None;
+        if active.versions == 0 && self.carry_totals().versions == 0 {
+            self.set_dirty_since(NO_STAMP);
         }
     }
 
@@ -232,7 +360,7 @@ impl CellFlushState {
         let flight = self.flight.as_ref().map(|flight| flight.totals);
         flight
             .into_iter()
-            .chain([self.active, self.carry_totals])
+            .chain([self.active.widen(), self.carry_totals()])
             .fold(SourceTotals::default(), SourceTotals::combine)
             .min
     }
@@ -411,8 +539,7 @@ impl CellCapture {
         )?;
         Ok(PreparedCell {
             capture: self,
-            residual,
-            residual_totals,
+            residual: Carry::boxed(residual, residual_totals),
         })
     }
 
@@ -432,16 +559,18 @@ impl CellCapture {
         };
         Ok(CellFlushResult {
             capture: self,
-            kind: ResultKind::Restore { carry, totals },
+            kind: ResultKind::Restore {
+                carry: Carry::boxed(carry, totals),
+            },
         })
     }
 }
 
 /// A capture with its residual. The residual coexists with the captured
-/// sources until installation; the permit covers it.
+/// sources until installation; the permit covers it. It is boxed here,
+/// outside every serving lock, as the cell's future carry.
 pub(crate) struct PreparedCell {
-    residual: Option<Arc<References>>,
-    residual_totals: SourceTotals,
+    residual: Option<Box<Carry>>,
     capture: CellCapture,
 }
 
@@ -454,8 +583,11 @@ impl PreparedCell {
         self.capture.target
     }
 
+    /// An empty residual has no references and zero totals.
     pub(crate) fn residual_totals(&self) -> SourceTotals {
-        self.residual_totals
+        self.residual
+            .as_ref()
+            .map_or_else(SourceTotals::default, |residual| residual.totals)
     }
 
     pub(crate) fn encode_source(&self) -> CellEncodeSource<'_> {
@@ -475,7 +607,6 @@ impl PreparedCell {
             kind: ResultKind::Flushed {
                 base: base.0,
                 residual: self.residual,
-                residual_totals: self.residual_totals,
             },
             capture: self.capture,
         }
@@ -506,12 +637,10 @@ impl NewCellBase {
 enum ResultKind {
     Flushed {
         base: Option<SortedBlock>,
-        residual: Option<Arc<References>>,
-        residual_totals: SourceTotals,
+        residual: Option<Box<Carry>>,
     },
     Restore {
-        carry: Option<Arc<References>>,
-        totals: SourceTotals,
+        carry: Option<Box<Carry>>,
     },
 }
 
@@ -530,6 +659,7 @@ impl CellFlushResult {
 /// guard: their memory is freed before the permit is returned.
 pub(crate) struct CellRetired {
     _flight: Option<Box<CellFlight>>,
+    _carry: Option<Box<Carry>>,
     _base: Option<SortedBlock>,
     _capture: CellCapture,
 }
@@ -700,49 +830,61 @@ impl NativeIndex {
         }
     }
 
-    /// Scheduler metadata of one cell, under its shard read lock.
+    /// Scheduler metadata of one cell, under its shard read lock. `None` for
+    /// an unknown cell, and for every cell of an Exact index (no flush state).
     pub(crate) fn cell_dirty(&self, keyspace: KeySpace, cell: &CellId) -> Option<CellDirty> {
         let identity = (keyspace, cell.clone());
         self.shard_for(&identity)
             .read()
-            .get(&identity)
-            .map(|cell| dirty(&cell.flush))
+            .get(&identity)?
+            .flush
+            .as_deref()
+            .map(|flush| dirty(flush, self.cell_epoch))
     }
 
     /// Scheduler metadata of every cell of one shard, under one read lock.
-    /// `output` is cleared first; reserve it outside the lock.
+    /// `output` is cleared first; reserve it outside the lock. Empty for an
+    /// Exact index.
     pub(crate) fn shard_dirty_cells(&self, shard: usize, output: &mut Vec<(CellKey, CellDirty)>) {
         output.clear();
         let Some(shard) = self.shards.get(shard) else {
             return;
         };
-        output.extend(
-            shard
-                .read()
-                .iter()
-                .map(|(identity, cell)| (identity.clone(), dirty(&cell.flush))),
-        );
+        output.extend(shard.read().iter().filter_map(|(identity, cell)| {
+            let flush = cell.flush.as_deref()?;
+            Some((identity.clone(), dirty(flush, self.cell_epoch)))
+        }));
     }
 
     /// Mark a queued descriptor for a cell. False when one is queued, a
-    /// flight exists, or the cell is unknown: a cell has at most one queued
-    /// descriptor or flight. Capture clears the mark.
+    /// flight exists, the cell is unknown or the index is Exact: a cell has
+    /// at most one queued descriptor or flight. Capture clears the mark.
     pub(crate) fn try_queue_cell(&self, keyspace: KeySpace, cell: &CellId) -> bool {
         let identity = (keyspace, cell.clone());
         let mut shard = self.shard_for(&identity).write();
-        let Some(cell) = shard.get_mut(&identity) else {
+        let Some(flush) = shard
+            .get_mut(&identity)
+            .and_then(|cell| cell.flush.as_deref_mut())
+        else {
             return false;
         };
-        let queued = !cell.flush.queued && cell.flush.flight.is_none();
-        cell.flush.queued |= queued;
+        let queued = !flush.queued() && flush.flight.is_none();
+        if queued {
+            flush.set_queued(true);
+        }
         queued
     }
 
     /// Clear a queued mark whose descriptor was dropped before capture.
     pub(crate) fn unqueue_cell(&self, keyspace: KeySpace, cell: &CellId) {
         let identity = (keyspace, cell.clone());
-        if let Some(cell) = self.shard_for(&identity).write().get_mut(&identity) {
-            cell.flush.queued = false;
+        if let Some(flush) = self
+            .shard_for(&identity)
+            .write()
+            .get_mut(&identity)
+            .and_then(|cell| cell.flush.as_deref_mut())
+        {
+            flush.set_queued(false);
         }
     }
 
@@ -754,22 +896,20 @@ impl NativeIndex {
     }
 }
 
-fn dirty(state: &CellFlushState) -> CellDirty {
-    let pending = state.active.combine(state.carry_totals);
+fn dirty(state: &CellFlushState, epoch: Instant) -> CellDirty {
+    let pending = state.active.widen().combine(state.carry_totals());
+    let flight_since = state
+        .flight
+        .as_ref()
+        .map_or(NO_STAMP, |flight| flight.dirty_since);
     CellDirty {
         coverage: state.coverage,
         oldest_uncovered: state.oldest_uncovered(),
         versions: pending.versions,
         upper: pending.upper,
-        dirty_since: state
-            .flight
-            .as_ref()
-            .and_then(|flight| flight.dirty_since)
-            .into_iter()
-            .chain(state.dirty_since)
-            .min(),
+        dirty_since: stamp_instant(epoch, earliest(flight_since, state.dirty_since())),
         in_flight: state.flight.is_some(),
-        queued: state.queued,
+        queued: state.queued(),
     }
 }
 
@@ -822,7 +962,8 @@ impl IndexWriter<'_> {
             return Err(NativeIndexError::Invalid("foreign cell flush permit"));
         }
         index.check_prefix_published(target)?;
-        if state.generation != 0
+        if index.mode == CheckpointMode::Exact
+            || state.generation != 0
             || state.sealed_count != 0
             || state.capture.is_some()
             || state.installation.is_some()
@@ -838,20 +979,27 @@ impl IndexWriter<'_> {
         let source = shard
             .get_mut(&identity)
             .ok_or(NativeIndexError::Invalid("unknown index cell"))?;
-        if source.flush.flight.is_some() {
+        // A PerCell index gives every cell its flush state at creation.
+        let flush = source
+            .flush
+            .as_deref_mut()
+            .ok_or(NativeIndexError::Invalid(
+                "per-cell index cell lacks flush state",
+            ))?;
+        if flush.flight.is_some() {
             return Ok(CellCaptureOutcome::Skipped {
                 reason: CellSkip::InFlight,
                 permit,
             });
         }
-        let totals = source.flush.active.combine(source.flush.carry_totals);
+        let totals = flush.active.widen().combine(flush.carry_totals());
         if totals.min.is_none_or(|batch| !target.contains(batch)) {
             // The descriptor is consumed by a clean advance or a capture. A
             // skip returns it to the worker, so the mark stays.
-            source.flush.queued = false;
-            source.flush.coverage = source.flush.coverage.max(target);
+            flush.set_queued(false);
+            flush.coverage = flush.coverage.max(target);
             return Ok(CellCaptureOutcome::Clean {
-                coverage: source.flush.coverage,
+                coverage: flush.coverage,
                 permit,
             });
         }
@@ -875,20 +1023,24 @@ impl IndexWriter<'_> {
         // O(1): the active overlay moves into the preallocated Arc and the
         // cell continues with the envelope's empty map.
         std::mem::swap(envelope, &mut source.overlay);
-        source.flush.queued = false;
+        flush.set_queued(false);
         state.cells.next_flight += 1;
         flight.id = state.cells.next_flight;
         flight.lifecycle = state.cells.lifecycle;
-        flight.base_token = source.flush.base_token;
+        flight.base_token = flush.base_token;
         flight.target = target;
-        flight.carry = source.flush.carry.take();
+        // The carry box moves into the flight; nothing is freed here.
+        flight.carry = flush.carry.take();
         flight.totals = totals;
-        flight.dirty_since = source.flush.dirty_since.take();
-        source.flush.active = SourceTotals::default();
-        source.flush.carry_totals = SourceTotals::default();
+        flight.dirty_since = flush.dirty_since();
+        flush.set_dirty_since(NO_STAMP);
+        flush.active = CellTotals::default();
         let capture = CellCapture {
             base: source.base.clone(),
-            carry: flight.carry.clone(),
+            carry: flight
+                .carry
+                .as_ref()
+                .map(|carry| Arc::clone(&carry.references)),
             active: Arc::clone(&flight.active),
             identity,
             flight: flight.id,
@@ -899,7 +1051,7 @@ impl IndexWriter<'_> {
             totals,
             permit,
         };
-        source.flush.flight = Some(flight);
+        flush.flight = Some(flight);
         drop(shard);
         state.cells.flights += 1;
         state.cells.active = true;
@@ -938,46 +1090,47 @@ impl IndexWriter<'_> {
                 result,
             };
         };
-        let matches = cell.flush.base_token == capture.base_token
-            && cell.flush.flight.as_ref().is_some_and(|flight| {
-                flight.id == capture.flight
-                    && flight.lifecycle == capture.lifecycle
-                    && flight.base_token == capture.base_token
-                    && flight.target == capture.target
-                    && Arc::ptr_eq(&flight.active, &capture.active)
-                    && same_arc(flight.carry.as_ref(), capture.carry.as_ref())
-            });
-        if !matches {
+        // Without flush state the cell has no flight, so no token matches.
+        let matches = cell.flush.as_deref().is_some_and(|flush| {
+            flush.base_token == capture.base_token
+                && flush.flight.as_ref().is_some_and(|flight| {
+                    flight.id == capture.flight
+                        && flight.lifecycle == capture.lifecycle
+                        && flight.base_token == capture.base_token
+                        && flight.target == capture.target
+                        && Arc::ptr_eq(&flight.active, &capture.active)
+                        && same_arc(
+                            flight.carry.as_ref().map(|carry| &carry.references),
+                            capture.carry.as_ref(),
+                        )
+                })
+        });
+        let (true, Some(flush)) = (matches, cell.flush.as_deref_mut()) else {
             drop(shard);
             return CellInstall::Rejected {
                 error: NativeIndexError::Invalid("cell flush token"),
                 result,
             };
-        }
+        };
         let accounting = &index.accounting;
         let CellFlushResult { kind, capture } = result;
-        let (carry, carry_totals, base) = match kind {
-            ResultKind::Flushed {
-                base,
-                residual,
-                residual_totals,
-            } => {
+        let (carry, base) = match kind {
+            ResultKind::Flushed { base, residual } => {
                 if capture.lifecycle != state.cells.lifecycle {
                     drop(shard);
                     return CellInstall::Stale {
-                        prepared: PreparedCell {
-                            residual,
-                            residual_totals,
-                            capture,
-                        },
+                        prepared: PreparedCell { residual, capture },
                         discarded: NewCellBase(base),
                     };
                 }
-                (residual, residual_totals, Some(base))
+                (residual, Some(base))
             }
-            ResultKind::Restore { carry, totals } => (carry, totals, None),
+            ResultKind::Restore { carry } => (carry, None),
         };
-        let flight = cell.flush.flight.take();
+        let carry_totals = carry
+            .as_ref()
+            .map_or_else(SourceTotals::default, |carry| carry.totals);
+        let flight = flush.flight.take();
         // Remove the captured references and add the carry: a subset of them
         // (residual) or all of them (restore). Scalar totals; no rescan.
         sub(&accounting.overlay, capture.totals.charge);
@@ -1004,29 +1157,28 @@ impl IndexWriter<'_> {
             }
             retired_base = std::mem::replace(&mut cell.base, base);
             // Equality-only token; 2^64 installs of one cell cannot occur.
-            cell.flush.base_token = cell.flush.base_token.wrapping_add(1);
-            cell.flush.base_floor = position(&capture.floor);
+            flush.base_token = flush.base_token.wrapping_add(1);
             // Every reference through the target was published before the
             // capture, so it is in the new base; later ones are newer.
-            cell.flush.coverage = cell.flush.coverage.max(capture.target);
+            flush.coverage = flush.coverage.max(capture.target);
         }
         if carry.is_some() {
-            cell.flush.dirty_since = flight
+            let flight_since = flight
                 .as_ref()
-                .and_then(|flight| flight.dirty_since)
-                .into_iter()
-                .chain(cell.flush.dirty_since)
-                .min();
+                .map_or(NO_STAMP, |flight| flight.dirty_since);
+            flush.set_dirty_since(earliest(flight_since, flush.dirty_since()));
         }
-        cell.flush.carry = carry;
-        cell.flush.carry_totals = carry_totals;
-        let coverage = cell.flush.coverage;
+        // The cell's carry moved into the flight at capture, so this replaces
+        // nothing; any replaced box is still freed outside the guard.
+        let retired_carry = std::mem::replace(&mut flush.carry, carry);
+        let coverage = flush.coverage;
         drop(shard);
         state.cells.flights -= 1;
         CellInstall::Installed {
             coverage,
             retired: CellRetired {
                 _flight: flight,
+                _carry: retired_carry,
                 _base: retired_base,
                 _capture: capture,
             },
@@ -1059,22 +1211,25 @@ impl IndexWriter<'_> {
             let cell = shard
                 .get_mut(identity)
                 .ok_or(NativeIndexError::Invalid("directory cell exists"))?;
-            cell.flush.advance_clean(target);
+            let flush = cell.flush.as_deref_mut().ok_or(NativeIndexError::Invalid(
+                "per-cell root capture of an Exact index",
+            ))?;
+            flush.advance_clean(target);
             let base = match &cell.base {
+                // `H_i` is the floor recorded with the base's file: a legacy
+                // container's floor, or the capture floor `H` with which the
+                // index store wrote a per-cell frame. A base without a file
+                // cannot enter a root.
                 Some(block) => Some(RootCellFrame {
                     block: block.clone(),
                     frame_cut: frame_cut(&block.cut)?,
-                    frame_floor: if cell.flush.base_token == 0 {
-                        block.file.as_ref().and_then(|file| position(&file.floor))
-                    } else {
-                        cell.flush.base_floor
-                    },
+                    frame_floor: block.file.as_ref().and_then(|file| position(&file.floor)),
                 }),
                 None => None,
             };
             output.push(RootCellDescriptor {
                 identity: identity.clone(),
-                coverage: cell.flush.coverage.min(target),
+                coverage: flush.coverage.min(target),
                 base,
             });
         }

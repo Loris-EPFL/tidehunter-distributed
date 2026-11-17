@@ -38,14 +38,20 @@ pub(super) fn profile(index: usize) -> LeasedCase {
 }
 
 pub(super) fn boundaries(case: &Case) -> Vec<&'static str> {
-    if case.leased.is_none() {
-        return BOUNDARIES.to_vec();
+    let boundaries = if case.leased.is_none() {
+        BOUNDARIES.to_vec()
+    } else {
+        let mut boundaries = LEASED_BOUNDARIES.to_vec();
+        if case.flush_probe() {
+            boundaries.extend_from_slice(FLUSH_BOUNDARIES);
+        }
+        boundaries
+    };
+    if case.per_cell {
+        per_cell_cuts(&boundaries)
+    } else {
+        boundaries
     }
-    let mut boundaries = LEASED_BOUNDARIES.to_vec();
-    if case.flush_probe() {
-        boundaries.extend_from_slice(FLUSH_BOUNDARIES);
-    }
-    boundaries
 }
 
 pub(super) fn configure(config: &mut RemoteDatabaseConfig, profile: LeasedCase) {

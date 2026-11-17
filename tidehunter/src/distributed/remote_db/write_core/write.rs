@@ -9,9 +9,10 @@ use super::owner_queue::OwnerQueue;
 use super::publisher::AbortedAllocation;
 use super::sequencer::{Resolution, SlotPublication};
 use crate::distributed::codec::ValidatedMutations;
+use crate::distributed::native_index::NativeIndex;
 use crate::distributed::native_publication::UnboundNativePublicationRouting;
 use crate::distributed::reference_directory::ReferenceDirectory;
-use crate::distributed::remote_db::concurrent::{WriteCredit, WriteGrant};
+use crate::distributed::remote_db::concurrent::{IndexReestimate, WriteCredit, WriteGrant};
 use crate::distributed::types::{BatchId, BatchVersion};
 use crate::distributed::write_timeline::WriteBlockStage;
 use smallvec::SmallVec;
@@ -46,6 +47,47 @@ struct Planned<'a> {
     identity: Option<IdentityEntry>,
     allocation: Option<Allocation>,
     publication: Option<SlotPublication>,
+}
+
+/// Re-estimates the index charge of a segment's fresh plans while their
+/// grant waits on index bytes ([`IndexReestimate`]): a cell another batch
+/// created since planning is no longer charged as new.
+struct SegmentReestimate<'s, 'p> {
+    index: &'s NativeIndex,
+    plans: &'s mut [Planned<'p>],
+    /// Per-plan charges of the last proposal, in plan order.
+    proposed: SmallVec<[usize; 4]>,
+}
+
+impl IndexReestimate for SegmentReestimate<'_, '_> {
+    fn propose(&mut self, current: usize) -> Option<usize> {
+        self.proposed.clear();
+        let mut total = 0usize;
+        for plan in self.plans.iter() {
+            // The grant charges fresh plans only (enqueue_segment). Cells are
+            // never removed, so a later estimate never exceeds an earlier one;
+            // `min` keeps every charge monotone regardless.
+            let charge = match (&plan.identity, &plan.routing) {
+                (None, Some(routing)) => self
+                    .index
+                    .estimated_routed_bytes(routing.operations())
+                    .ok()?
+                    .min(plan.metadata_charge),
+                _ => plan.metadata_charge,
+            };
+            if plan.identity.is_none() {
+                total = total.checked_add(charge)?;
+            }
+            self.proposed.push(charge);
+        }
+        (total < current).then_some(total)
+    }
+
+    fn accept(&mut self) {
+        for (plan, charge) in self.plans.iter_mut().zip(&self.proposed) {
+            plan.metadata_charge = *charge;
+        }
+    }
 }
 
 /// Caller ownership, not a reply channel. Drop releases only generations this
@@ -475,12 +517,30 @@ impl WriteCore {
                     .event(sample, WriteTimelineStage::AdmissionWaitStarted);
             }
             let block_started = self.write_timeline.block_started();
-            let credit = self.admission.reserve_grant(
+            // First checkpoint-bound dimension that blocked this grant; set
+            // only on the blocked path.
+            let blocked_on = std::cell::Cell::new(None);
+            let credit = self.admission.reserve_reestimated(
                 grant,
                 block,
                 || self.ensure_writable(),
-                |pressure| self.admission_pressure(pressure),
+                |pressure| {
+                    if blocked_on.get().is_none() {
+                        blocked_on.set(Some(pressure.reason));
+                    }
+                    self.admission_pressure(pressure)
+                },
+                &mut SegmentReestimate {
+                    index: &self.index,
+                    plans: &mut *plans,
+                    proposed: SmallVec::new(),
+                },
             )?;
+            if let Some(waited) = credit.blocked_for() {
+                // After the grant, outside the Admission mutex.
+                self.cell_metrics
+                    .admission_blocked(blocked_dimension(blocked_on.get()), waited);
+            }
             self.write_timeline.block_finished(
                 WriteBlockStage::AdmissionCredit,
                 block_started,
@@ -856,6 +916,9 @@ impl WriteCore {
             self.write_timeline
                 .checkpoint_pressure(self.epoch, generation, pressure);
         }
+        // A checkpoint-bound grant is blocked: drain cells to a fixed target
+        // (per-cell mode) and request the root that returns the credits.
+        self.wake_cell_flush(super::super::cell_flush::WakeReason::AdmissionBlocked);
         self.request_checkpoint()
     }
 
@@ -985,4 +1048,17 @@ pub(in crate::distributed::remote_db) fn copy_error(error: &LocalDbError) -> Loc
     let mut copy = LocalDbError::new(error.message());
     copy.uncertain_version = error.uncertain_version;
     copy
+}
+
+/// The option C counter of a blocked grant, from the first
+/// `CheckpointPressure::reason` it reported (`None`: request, byte, slot or
+/// partition credit, which no checkpoint returns).
+fn blocked_dimension(reason: Option<&'static str>) -> super::super::cell_metrics::BlockedDimension {
+    use super::super::cell_metrics::BlockedDimension;
+    match reason {
+        Some("tail_batches" | "tail_bytes") => BlockedDimension::ReplayTail,
+        Some("identity") => BlockedDimension::Identities,
+        Some("index") => BlockedDimension::IndexBytes,
+        _ => BlockedDimension::Other,
+    }
 }

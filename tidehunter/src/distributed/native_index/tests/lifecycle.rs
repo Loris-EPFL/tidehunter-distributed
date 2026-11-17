@@ -175,7 +175,8 @@ fn checkpoints_reuse_unchanged_cell_ranges_and_clean_roots_write_no_container() 
 fn disk_history_larger_than_resident_budget_stays_queryable_and_reload_is_bounded() {
     let temp = tempdir::TempDir::new("index-pageable-history").unwrap();
     let log = log(&temp.path().join("wal"));
-    let budget = cell_directory_charge(&CellId::Integer(0)) + 2 * (VERSION_CHARGE + A.len());
+    let budget = cell_directory_charge(CheckpointMode::Exact, &CellId::Integer(0))
+        + 2 * (VERSION_CHARGE + A.len());
     let index = NativeIndex::new(&shape(), DATABASE, budget).unwrap();
     let mut root = temp.path().join("unused.index");
     for sequence in 0..12 {

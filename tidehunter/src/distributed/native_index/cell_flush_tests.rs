@@ -28,7 +28,7 @@ fn shape() -> KeyShape {
 }
 
 fn index(shards: usize, budget: usize) -> NativeIndex {
-    NativeIndex::with_shards(&shape(), DATABASE, budget, shards).unwrap()
+    NativeIndex::with_mode(&shape(), DATABASE, budget, shards, CheckpointMode::PerCell).unwrap()
 }
 
 fn batch(sequence: u64) -> BatchVersion {
@@ -857,6 +857,89 @@ fn exact_and_per_cell_checkpoints_are_exclusive() {
         per_cell.writer().begin_capture(IndexReadCut::Latest),
         Err(NativeIndexError::Invalid(_))
     ));
+}
+
+/// Exact cells hold no flush state and keep the pre-option-C charge byte for
+/// byte; a `PerCell` index charges and allocates the compact boxed state.
+/// Promotion in Exact mode records no per-cell totals and no flush hint, and
+/// every per-cell entry point declines or refuses.
+#[test]
+fn exact_cells_have_no_flush_state_and_keep_their_charge() {
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(CELL_CHARGE, 552, "pre-option-C Exact cell charge");
+        assert_eq!(std::mem::size_of::<CellFlushState>(), 96);
+        assert_eq!(PER_CELL_CHARGE, 552 + 8 + 96);
+    }
+    let key = vec![1, 1];
+    let exact = NativeIndex::with_shards(&shape(), DATABASE, BUDGET, 8).unwrap();
+    let per_cell = index(8, BUDGET);
+    let cell = cell_of(&exact, &key);
+    for index in [&exact, &per_cell] {
+        publish(index, 1, &[(key.clone(), true)]);
+        assert_eq!(index.stats().cells, 1);
+    }
+    // Same reference charge; only the directory charge of the cell differs.
+    assert_eq!(
+        exact.charged_metadata_bytes() + PER_CELL_CHARGE - CELL_CHARGE,
+        per_cell.charged_metadata_bytes()
+    );
+    let shard = exact.shard_index(KS, &cell);
+    assert!(
+        exact.shards[shard].read()[&(KS, cell.clone())]
+            .flush
+            .is_none()
+    );
+    assert!(!exact.take_cell_dirty_signal());
+    assert!(per_cell.take_cell_dirty_signal());
+    assert_eq!(exact.cell_dirty(KS, &cell), None);
+    assert_eq!(per_cell.cell_dirty(KS, &cell).unwrap().versions, 1);
+    let mut dirty = Vec::with_capacity(1);
+    exact.shard_dirty_cells(shard, &mut dirty);
+    assert!(dirty.is_empty());
+    assert!(!exact.try_queue_cell(KS, &cell));
+    let permit = exact.reserve_cell_flush(0).unwrap();
+    assert!(matches!(
+        exact
+            .writer()
+            .capture_cell(KS, &cell, through(1), permit)
+            .unwrap(),
+        CellCaptureOutcome::Skipped {
+            reason: CellSkip::ExactMode,
+            ..
+        }
+    ));
+    let mut output = Vec::with_capacity(ROOT_DESCRIPTOR_SLICE);
+    assert!(matches!(
+        exact
+            .writer()
+            .capture_cell_descriptors(0..1, through(1), &mut output),
+        Err(NativeIndexError::Invalid(_))
+    ));
+    assert_eq!(read(&exact, &key, IndexReadCut::Latest), Some(1));
+}
+
+/// The packed dirty stamp reproduces the recorded `Instant` exactly, keeps
+/// the queued mark independent, and orders like the instants it encodes.
+#[test]
+fn dirty_stamps_round_trip_and_pack_the_queued_mark() {
+    let epoch = Instant::now();
+    let later = epoch + std::time::Duration::from_nanos(1_234_567_891);
+    assert_eq!(stamp_instant(epoch, NO_STAMP), None);
+    assert_eq!(stamp_instant(epoch, stamp(epoch, epoch)), Some(epoch));
+    assert_eq!(stamp_instant(epoch, stamp(epoch, later)), Some(later));
+    assert_eq!(earliest(NO_STAMP, 5), 5);
+    assert_eq!(earliest(7, NO_STAMP), 7);
+    assert_eq!(earliest(7, 5), 5);
+    let mut state = CellFlushState::new(PrefixCut::BeforeAll);
+    state.set_queued(true);
+    assert!(state.queued());
+    assert_eq!(state.dirty_since(), NO_STAMP);
+    state.set_dirty_since(stamp(epoch, later));
+    assert!(state.queued());
+    state.set_queued(false);
+    assert_eq!(stamp_instant(epoch, state.dirty_since()), Some(later));
+    assert!(!state.queued());
 }
 
 #[test]

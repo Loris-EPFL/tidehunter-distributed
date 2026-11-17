@@ -102,10 +102,7 @@ impl Fixture {
             storage: LocalInventoryConfig {
                 database: [71; 16],
                 partitions: (0..owner_count as u32).collect(),
-                batch_limits: BatchLimits {
-                    max_operations: 4,
-                    max_encoded_bytes: 2048,
-                },
+                batch_limits: FIXTURE_BATCH_LIMITS,
                 group_limits: GroupLimits {
                     max_batches: group_max_batches,
                     max_encoded_bytes: 4088,
@@ -145,6 +142,7 @@ impl Fixture {
             write_profile_limit: 0,
             live_nvme: None,
             checkpoint_mode: CheckpointMode::Exact,
+            force_streaming_cell_encoder: false,
         };
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2026,4 +2024,330 @@ fn synchronous_append_preserves_other_correlated_completions() {
     };
     assert_eq!(first_receipts[0].appended().version(), first.version());
     authority.shutdown().unwrap();
+}
+
+/// The measurement-only `force_streaming_cell_encoder` switch: a real Exact
+/// checkpoint of the same writes streams every non-empty cell (two canonical
+/// passes each) instead of encoding it once, and persists byte-identical
+/// index files.
+#[test]
+fn forced_streaming_exact_checkpoint_streams_every_cell_with_identical_bytes() {
+    let run = |force: bool| {
+        // `max_admitted_batches` 256: identity pressure starts a background
+        // checkpoint at half of it, so 64 writes never do. With 128, the 64th
+        // grant reached that threshold, and the publisher of the 63rd write
+        // (which requests a checkpoint after waking its caller) could start one
+        // before the 64th was published. The flush then re-encoded that
+        // cell in a second checkpoint: 16 or 17 cells, and different files,
+        // depending on the race.
+        let fixture = Fixture::new_with_config(
+            256,
+            KeyShape::new_single(4, 1, KeyType::uniform(16)),
+            2,
+            |config| config.force_streaming_cell_encoder = force,
+        );
+        assert_eq!(fixture.config.checkpoint_mode, CheckpointMode::Exact);
+        let db = fixture.open();
+        // Sequential writes with fixed operation ids: identical versions and
+        // owner WAL addresses in both runs. Keys spread over the 16 cells,
+        // two versions each.
+        for n in 0..64u32 {
+            let mut operation = [0u8; 16];
+            operation[..4].copy_from_slice(&n.to_be_bytes());
+            let key = ((n % 32) << 27).to_be_bytes();
+            db.write_batch(
+                operation,
+                vec![Mutation::Put {
+                    keyspace: KeySpace(0),
+                    key: key.to_vec().into(),
+                    value: vec![n as u8; 32].into(),
+                }],
+            )
+            .unwrap();
+        }
+        db.flush_index().unwrap();
+        let mut counters = HashMap::new();
+        super::cell_checkpoint::metrics_snapshot(&db.core, false).visit(|name, value| {
+            counters.insert(name, value);
+        });
+        let root = fixture.temp.path().join("authority");
+        let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
+        let commit = manifest
+            .checkpoint
+            .expect("flush adopted an Exact checkpoint");
+        let files: Vec<(String, Vec<u8>)> = std::iter::once(commit.index_name())
+            .chain(commit.index_files.iter().cloned())
+            .map(|name| {
+                let bytes = fs::read(root.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect();
+        db.shutdown().unwrap();
+        (counters, files)
+    };
+    let (once, once_files) = run(false);
+    let (streamed, streamed_files) = run(true);
+    let cells = once["cell_exact_buffered_cells"];
+    // One checkpoint of the 16 written cells: none empty, none re-encoded.
+    assert_eq!(cells, 16);
+    assert_eq!(once["cell_exact_empty_cells"], 0);
+    assert_eq!(streamed["cell_exact_empty_cells"], 0);
+    assert_eq!(once["cell_exact_streamed_cells"], 0);
+    assert_eq!(once["cell_exact_encoder_invocations"], cells);
+    assert_eq!(streamed["cell_exact_buffered_cells"], 0);
+    assert_eq!(streamed["cell_exact_streamed_cells"], cells);
+    assert_eq!(streamed["cell_exact_encoder_invocations"], 2 * cells);
+    for counters in [&once, &streamed] {
+        // Exactly one Exact checkpoint per run: the flush's own.
+        assert_eq!(counters["cell_exact_checkpoints"], 1);
+        assert!(counters["cell_exact_persist_ns"] > 0);
+    }
+    assert!(
+        once_files.len() >= 2,
+        "root and at least one cell container"
+    );
+    assert_eq!(once_files, streamed_files);
+}
+
+/// One put into each of four distinct cells of a 16-cell key space.
+fn four_cell_batch(value: u8) -> Vec<Mutation> {
+    (0..4u32)
+        .map(|cell| Mutation::Put {
+            keyspace: KeySpace(0),
+            key: (cell << 28).to_be_bytes().to_vec().into(),
+            value: vec![value; 32].into(),
+        })
+        .collect()
+}
+
+fn empty_index(shape: &KeyShape, mode: CheckpointMode) -> super::super::native_index::NativeIndex {
+    super::super::native_index::NativeIndex::with_mode(
+        shape,
+        [71; 16],
+        1 << 20,
+        super::super::native_index::DEFAULT_INDEX_SHARDS,
+        mode,
+    )
+    .unwrap()
+}
+
+/// Index charge of `mutations` as one batch on an empty index.
+fn new_cells_charge(
+    shape: &KeyShape,
+    mode: CheckpointMode,
+    mutations: Vec<Mutation>,
+    limits: BatchLimits,
+) -> usize {
+    let batch = crate::distributed::codec::CompleteBatch::new(
+        shape,
+        BatchId {
+            database: [71; 16],
+            operation: [1; 16],
+        },
+        BatchVersion {
+            epoch: 1,
+            sequence: 1,
+        },
+        mutations,
+        limits,
+    )
+    .unwrap();
+    empty_index(shape, mode)
+        .estimated_batch_bytes(&batch)
+        .unwrap()
+}
+
+/// The fixture's batch limits ([`Fixture::new_with_root`]).
+const FIXTURE_BATCH_LIMITS: BatchLimits = BatchLimits {
+    max_operations: 4,
+    max_encoded_bytes: 2048,
+};
+
+/// The index charge `S` of [`four_cell_batch`] into four new cells.
+fn four_new_cells_charge(shape: &KeyShape, mode: CheckpointMode) -> usize {
+    new_cells_charge(shape, mode, four_cell_batch(0), FIXTURE_BATCH_LIMITS)
+}
+
+/// A queued grant's index reservation charges a directory entry for every
+/// cell that did not exist when its batch was planned. Once an earlier batch
+/// creates those cells, the stale reservation never fits again: directory
+/// entries are never released, so no flush or checkpoint frees what it
+/// counts twice. The blocked head re-estimates when the directory grows and
+/// is granted; its credit is returned exactly.
+#[test]
+fn queued_index_reservation_is_reestimated_when_its_cells_appear() {
+    let shape = KeyShape::new_single(4, 1, KeyType::uniform(16));
+    for mode in [CheckpointMode::Exact, CheckpointMode::PerCell] {
+        // S = 4(v + c), v the reference and c the (larger) cell charge.
+        // At 3S/2:
+        // - two stale grants (2S) do not fit, so the second one queues;
+        // - after the first publishes, its cells (4c) and references (4v)
+        //   plus the second's fresh estimate (4v) fit: 4c + 8v <= 6c + 6v;
+        // - the stale estimate never fits, even with every reference
+        //   flushed: 4c + S = 8c + 4v > 6c + 6v.
+        let stale = four_new_cells_charge(&shape, mode);
+        let fixture = Fixture::new_with_config(128, shape.clone(), 2, |config| {
+            config.checkpoint_mode = mode;
+            config.max_index_bytes = stale * 3 / 2;
+            // Keeps the standing sparse-view budget well inside the limit.
+            config.max_pending_batches = 4;
+        });
+        let mut db = fixture.open();
+        let (entered, entering) = mpsc::sync_channel(1);
+        let (resume, resuming) = mpsc::sync_channel(1);
+        db.core.test_hooks.lock().after_grant = Some((entered, resuming));
+        let (first, second) = thread::scope(|scope| {
+            let db = &db;
+            // Granted with its stale S, then paused before allocation.
+            let first = scope.spawn(|| db.write_batch(fixture.operation(0, 1), four_cell_batch(1)));
+            let paused = entering.recv_timeout(Duration::from_secs(10)).is_ok();
+            // Planned while the cells are still absent: S too, so it queues.
+            let second =
+                scope.spawn(|| db.write_batch(fixture.operation(0, 2), four_cell_batch(2)));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let queued = loop {
+                if db.core.admission.queued_waiters() == 1 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::yield_now();
+            };
+            // Always release the gate before checking assertions.
+            resume.send(()).unwrap();
+            assert!(
+                paused && queued,
+                "{mode:?}: paused {paused}, queued {queued}"
+            );
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(first < second, "{mode:?}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(
+            db.core.admission.wait_charges(deadline, |charges| {
+                charges.requests == 0 && charges.slots == 0 && charges.index_bytes == 0
+            }),
+            "{mode:?}: {:?}",
+            db.core.admission.charges()
+        );
+        for cell in 0..4u32 {
+            assert_eq!(value(&mut db, cell << 28), Some(vec![2; 32]), "{mode:?}");
+        }
+        db.shutdown().unwrap();
+    }
+}
+
+/// Option C spec §6.2: a per-cell index budget that cannot hold one largest
+/// batch (every operation into a new cell) is rejected at open, before any
+/// effect. Exact keeps rejecting such a batch at admission only.
+#[test]
+fn per_cell_open_rejects_index_budget_below_one_largest_batch() {
+    let shape = KeyShape::new_single(4, 1, KeyType::uniform(16));
+    let largest = empty_index(&shape, CheckpointMode::PerCell)
+        .largest_batch_charge(FIXTURE_BATCH_LIMITS)
+        .unwrap();
+    // For this shape and these limits, four operations into four new cells
+    // reach the (conservative) bound.
+    assert_eq!(
+        largest,
+        four_new_cells_charge(&shape, CheckpointMode::PerCell)
+    );
+    let fixture = Fixture::new_with_config(128, shape.clone(), 2, |config| {
+        config.checkpoint_mode = CheckpointMode::PerCell;
+        config.max_pending_batches = 4;
+    });
+    let db = open_at_smallest_per_cell_budget(&fixture, largest);
+    db.shutdown().unwrap();
+}
+
+/// Opens `fixture` with `max_index_bytes` one below `largest`, which must be
+/// rejected before any effect, then at `largest`, which must open.
+fn open_at_smallest_per_cell_budget(fixture: &Fixture, largest: usize) -> RemoteDatabase {
+    let authority = fixture.temp.path().join("authority");
+    let open = |max_index_bytes: usize| {
+        let mut config = fixture.config.clone();
+        config.max_index_bytes = max_index_bytes;
+        RemoteDatabase::open(&authority, &fixture.shape, config, metrics())
+    };
+    let error = open(largest - 1)
+        .err()
+        .expect("a per-cell budget below one largest batch must not open");
+    assert!(
+        error.to_string().contains("cannot hold one largest batch"),
+        "{error}"
+    );
+    assert!(!authority.exists(), "rejected before any effect");
+    open(largest).unwrap()
+}
+
+/// Option C spec §6.2 with variable-length keys: the open-time bound counts
+/// every key byte a legal batch can carry, not a fixed key length. For this
+/// single variable-key shape the bound is reached, and at the smallest budget
+/// open accepts, a batch of the maximum operation count with maximum-length
+/// keys, each into a new cell, is admitted and published.
+#[test]
+fn per_cell_open_budget_admits_a_largest_batch_of_maximum_length_keys() {
+    use crate::db::MAX_KEY_LEN;
+    use crate::distributed::codec::{HEADER_LEN, MIN_MEMBER_LEN};
+    use crate::distributed::group::{CompleteGroup, GROUP_HEADER_LEN};
+    use crate::key_shape::{KeyIndexing, KeyShapeBuilder, KeySpaceConfig};
+    let mut builder = KeyShapeBuilder::new();
+    // One cell per first key byte.
+    builder.add_key_space_config_indexing(
+        "variable",
+        KeyIndexing::variable_length(),
+        1,
+        KeyType::prefix_uniform(1, 0),
+        KeySpaceConfig::new(),
+    );
+    let shape = builder.build();
+    // Four deletes of maximum-length keys fill the encoded limit exactly.
+    let limits = BatchLimits {
+        max_operations: 4,
+        max_encoded_bytes: HEADER_LEN + 4 * (MIN_MEMBER_LEN + MAX_KEY_LEN),
+    };
+    let batch: Vec<Mutation> = (0..4u8)
+        .map(|cell| Mutation::Delete {
+            keyspace: KeySpace(0),
+            key: vec![cell; MAX_KEY_LEN].into(),
+        })
+        .collect();
+    let largest = empty_index(&shape, CheckpointMode::PerCell)
+        .largest_batch_charge(limits)
+        .unwrap();
+    // For this shape the bound is reached: this batch charges all of it.
+    assert_eq!(
+        new_cells_charge(&shape, CheckpointMode::PerCell, batch.clone(), limits),
+        largest
+    );
+    let group =
+        GROUP_HEADER_LEN + CompleteGroup::encoded_member_len(limits.max_encoded_bytes).unwrap();
+    let fragment = (group as u64 + 8).next_multiple_of(4096);
+    let fixture = Fixture::new_with_config(128, shape, 2, |config| {
+        config.checkpoint_mode = CheckpointMode::PerCell;
+        config.storage.batch_limits = limits;
+        config.storage.group_limits = GroupLimits {
+            max_batches: 2,
+            max_encoded_bytes: group,
+        };
+        config.storage.fragment_bytes = fragment;
+        config.storage.wal_file_bytes = 4 * fragment;
+        // Caller credit holds the encoded batch twice plus its routing keys.
+        config.max_pending_bytes = 16 << 20;
+        config.max_pending_batches = 4;
+    });
+    let db = open_at_smallest_per_cell_budget(&fixture, largest);
+    db.write_batch(fixture.operation(0, 1), batch).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        db.core.admission.wait_charges(deadline, |charges| {
+            charges.requests == 0 && charges.slots == 0 && charges.index_bytes == 0
+        }),
+        "{:?}",
+        db.core.admission.charges()
+    );
+    db.shutdown().unwrap();
 }

@@ -42,6 +42,8 @@ pub(crate) struct PreparedIndexImage {
     lease: CaptureLease,
     /// Payload scratch limit of the one encoder that persists this image.
     scratch_limit: usize,
+    /// Per-phase encoder CPU timing (measurement profiles only).
+    profile: bool,
 }
 
 pub(crate) struct PersistedIndexImage {
@@ -49,12 +51,7 @@ pub(crate) struct PersistedIndexImage {
     pub(super) cut: IndexReadCut,
     pub(super) lease: CaptureLease,
     pub(crate) metadata: IndexImageMetadata,
-    // The checkpoint diagnostic stage exports these counters; until it reads
-    // them, only tests do. The expectation fails once a reader exists.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "exported by the checkpoint metrics stage")
-    )]
+    /// Encoder counters of this persist, exported by the option C metrics.
     pub(crate) encode_stats: CellEncodeStats,
 }
 
@@ -85,7 +82,14 @@ impl PreparedIndexImage {
             cut,
             lease,
             scratch_limit,
+            profile: false,
         }
+    }
+
+    /// Time the encode, CRC and BLAKE2b phases of every cell this persist
+    /// writes (`CellMetrics::set_profiling`). The bytes are unchanged.
+    pub(crate) fn set_profile(&mut self, on: bool) {
+        self.profile = on;
     }
 
     /// Reserve the generation-specific container even if persistence later
@@ -150,6 +154,7 @@ impl PreparedIndexImage {
         // This thread's only payload scratch; it grows outside serving locks
         // to at most `scratch_limit` and is reused for every cell.
         let mut encoder = CellEncoder::new(self.scratch_limit);
+        encoder.set_profile(self.profile);
         {
             // One fixed buffer combines tiny cells into shared writes. Headers
             // are computed before append, so no per-cell seek/flush is needed.
@@ -411,6 +416,7 @@ pub(super) fn open(
     database: [u8; 16],
     max_metadata_bytes: usize,
     shards: usize,
+    mode: CheckpointMode,
 ) -> Result<NativeIndex, NativeIndexError> {
     let mapped = map_file(&File::open(path)?, Some(MAX_IMAGE_BYTES as u64))?;
     let payload = frame_payload(&mapped)?;
@@ -438,13 +444,14 @@ pub(super) fn open(
     let parent = path
         .parent()
         .ok_or(NativeIndexError::Invalid("image has no parent"))?;
-    let mut index = NativeIndex::with_shards(shape, database, max_metadata_bytes, shards)?;
+    let mut index = NativeIndex::with_mode(shape, database, max_metadata_bytes, shards, mode)?;
     let mut containers: HashMap<String, Container> = HashMap::new();
     for _ in 0..count {
         let keyspace = KeySpace(cursor.u8()?);
         let cell_id = decode_cell(&mut cursor)?;
-        index.check_capacity(cell_directory_charge(&cell_id))?;
-        super::shards::add(&index.accounting.directory, cell_directory_charge(&cell_id));
+        let charge = cell_directory_charge(index.mode, &cell_id);
+        index.check_capacity(charge)?;
+        super::shards::add(&index.accounting.directory, charge);
         let name_length = cursor.u16()? as usize;
         let name = std::str::from_utf8(cursor.take(name_length)?)
             .map_err(|_| NativeIndexError::Invalid("cell file name encoding"))?;
@@ -504,12 +511,16 @@ pub(super) fn open(
             .push((keyspace, cell_id.clone()));
         let identity = (keyspace, cell_id);
         let shard = index.shard_index(identity.0, &identity.1);
+        // Exact-image cells carry no flush state in an Exact index; a
+        // migrating `PerCell` index gives them coverage `BeforeAll`.
+        let flush = index.new_cell_flush(PrefixCut::BeforeAll);
         if index.shards[shard]
             .get_mut()
             .insert(
                 identity,
                 CellIndex {
                     base: Some(block),
+                    flush,
                     ..Default::default()
                 },
             )
@@ -906,7 +917,7 @@ const _: () = assert!(CELL_SCRATCH_CEILING <= MAX_IMAGE_BYTES - 8);
 /// `S = min(8 MiB, M / (4 P), MAX_IMAGE_BYTES - 8)`, with `M` the resident
 /// index budget and `P` the encoder count. All `P` scratches together stay at
 /// or below `M / 4`. A cell above `S` streams; it is never rejected.
-pub(super) fn cell_scratch_limit(max_metadata_bytes: usize, encoders: usize) -> usize {
+pub(crate) fn cell_scratch_limit(max_metadata_bytes: usize, encoders: usize) -> usize {
     (max_metadata_bytes / encoders.max(1).saturating_mul(4)).min(CELL_SCRATCH_CEILING)
 }
 
@@ -936,6 +947,75 @@ pub(crate) struct CellEncodeStats {
     pub moved_bytes: u64,
     /// Largest payload scratch capacity. Never above the scratch limit.
     pub scratch_capacity: u64,
+    /// Profile-on only ([`CellEncoder::set_profile`]): cells timed, and the
+    /// calling thread's CPU time per phase (`CLOCK_THREAD_CPUTIME_ID`).
+    /// Buffered path: size bound plus canonical encoding into the scratch
+    /// (`encode`), CRC32 of the payload, BLAKE2b-32 of header and payload,
+    /// copy into the writer. Streaming path: its count plus encode+CRC pass,
+    /// and its encode+BLAKE2b+write pass (phases interleave per row, so they
+    /// are timed per pass). Time spent inside the frame writer's `choose`
+    /// (for example sealing an earlier group) is excluded.
+    pub profiled_cells: u64,
+    pub encode_cpu_ns: u64,
+    pub crc_cpu_ns: u64,
+    pub blake2b_cpu_ns: u64,
+    pub write_cpu_ns: u64,
+    pub streamed_crc_pass_cpu_ns: u64,
+    pub streamed_hash_pass_cpu_ns: u64,
+}
+
+/// CPU time consumed by the calling thread (`CLOCK_THREAD_CPUTIME_ID`).
+/// `None` if the clock fails, which Linux does not do for this clock.
+pub(crate) fn thread_cpu_ns() -> Option<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, exclusively borrowed stack timespec that
+    // outlives the call, and the clock id is a constant; the return code is
+    // checked before `now` is read.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    if result != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(now.tv_sec).ok()?;
+    let fraction = u64::try_from(now.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(fraction)
+}
+
+/// Thread-CPU stopwatch for encoder phases. Off, it reads no clock and every
+/// split is zero, so an unprofiled encoder pays one branch per phase.
+struct Lap {
+    last: Option<u64>,
+}
+
+impl Lap {
+    fn new(on: bool) -> Self {
+        Self {
+            last: if on { thread_cpu_ns() } else { None },
+        }
+    }
+
+    /// CPU time since the last split or restart.
+    fn split(&mut self) -> u64 {
+        let Some(last) = self.last else {
+            return 0;
+        };
+        let now = thread_cpu_ns().unwrap_or(last);
+        self.last = Some(now);
+        now.saturating_sub(last)
+    }
+
+    /// Start a new phase, dropping the time since the last split.
+    fn restart(&mut self) {
+        if self.last.is_some() {
+            self.last = thread_cpu_ns();
+        }
+    }
+
+    fn on(&self) -> bool {
+        self.last.is_some()
+    }
 }
 
 /// One encoder's reused payload and reference scratch. A cell whose
@@ -947,6 +1027,8 @@ pub(super) struct CellEncoder {
     reference: Vec<u8>,
     limit: usize,
     stats: CellEncodeStats,
+    /// Time the phases of every cell ([`CellEncodeStats::profiled_cells`]).
+    profile: bool,
 }
 
 impl CellEncoder {
@@ -956,16 +1038,15 @@ impl CellEncoder {
             reference: Vec::with_capacity(REFERENCE_BYTES),
             limit: limit.min(CELL_SCRATCH_CEILING),
             stats: CellEncodeStats::default(),
+            profile: false,
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "per-worker encoder counters, exported by the metrics stage"
-        )
-    )]
+    /// Turn per-phase CPU timing on or off (measurement profiles only).
+    pub(super) fn set_profile(&mut self, on: bool) {
+        self.profile = on;
+    }
+
     pub(super) fn stats(&self) -> CellEncodeStats {
         self.stats
     }
@@ -1032,6 +1113,7 @@ impl CellEncoder {
         choose: impl FnOnce(u64) -> Result<(&'w mut W, u64), NativeIndexError>,
     ) -> Result<Option<CellFrame>, NativeIndexError> {
         self.stats.row_passes += 1;
+        let mut lap = Lap::new(self.profile);
         let (offset, count, bytes, digest, summary) = if let Some((rows, upper)) =
             buffered_bound(sources, self.limit)
         {
@@ -1040,8 +1122,17 @@ impl CellEncoder {
                 self.stats.empty_cells += 1;
                 return Ok(None);
             };
+            let encode_ns = lap.split();
             let (writer, offset) = choose(framed_len(summary.length)?)?;
-            let (bytes, digest) = write_frame(&self.payload, offset, writer)?;
+            lap.restart();
+            let (bytes, digest, phases) = write_frame(&self.payload, offset, writer, &mut lap)?;
+            self.stats.crc_cpu_ns += phases[0];
+            self.stats.blake2b_cpu_ns += phases[1];
+            self.stats.write_cpu_ns += phases[2];
+            if lap.on() {
+                self.stats.profiled_cells += 1;
+                self.stats.encode_cpu_ns += encode_ns;
+            }
             self.stats.buffered_cells += 1;
             self.stats.encode_passes += 1;
             self.stats.buffered_bytes += bytes;
@@ -1053,8 +1144,20 @@ impl CellEncoder {
                 self.stats.empty_cells += 1;
                 return Ok(None);
             }
-            let (offset, bytes, digest, summary) =
-                stream_cell(sources, count, cut, floor, choose, &mut self.reference)?;
+            let (offset, bytes, digest, summary, passes) = stream_cell(
+                sources,
+                count,
+                cut,
+                floor,
+                choose,
+                &mut self.reference,
+                &mut lap,
+            )?;
+            self.stats.streamed_crc_pass_cpu_ns += passes[0];
+            self.stats.streamed_hash_pass_cpu_ns += passes[1];
+            if lap.on() {
+                self.stats.profiled_cells += 1;
+            }
             self.stats.streamed_cells += 1;
             self.stats.encode_passes += 2;
             self.stats.row_passes += 4;
@@ -1229,12 +1332,14 @@ fn framed_len(payload: usize) -> Result<u64, NativeIndexError> {
 }
 
 /// Write the CRC frame of a final payload. CRC32 covers the payload; the
-/// BLAKE2b-32 digest covers the final header, then the payload.
+/// BLAKE2b-32 digest covers the final header, then the payload. Returns the
+/// CPU time of the CRC, BLAKE2b and write phases (zero when `lap` is off).
 fn write_frame(
     payload: &[u8],
     offset: u64,
     writer: &mut impl Write,
-) -> Result<(u64, [u8; 32]), NativeIndexError> {
+    lap: &mut Lap,
+) -> Result<(u64, [u8; 32], [u64; 3]), NativeIndexError> {
     let length = u32::try_from(payload.len()).map_err(|_| NativeIndexError::Capacity)?;
     let bytes = u64::from(length) + 8;
     offset
@@ -1243,15 +1348,22 @@ fn write_frame(
     let mut header = [0u8; 8];
     header[..4].copy_from_slice(&length.to_be_bytes());
     header[4..].copy_from_slice(&crc32fast::hash(payload).to_be_bytes());
+    let crc_ns = lap.split();
     let mut hash = blake2b_simd::Params::new().hash_length(32).to_state();
     hash.update(&header);
     hash.update(payload);
-    writer.write_all(&header)?;
-    writer.write_all(payload)?;
     let mut digest = [0; 32];
     digest.copy_from_slice(hash.finalize().as_bytes());
-    Ok((bytes, digest))
+    let blake2b_ns = lap.split();
+    writer.write_all(&header)?;
+    writer.write_all(payload)?;
+    let write_ns = lap.split();
+    Ok((bytes, digest, [crc_ns, blake2b_ns, write_ns]))
 }
+
+/// Offset, framed bytes, digest, payload summary and the CPU time of the
+/// encode+CRC and encode+BLAKE2b+write passes.
+type StreamedFrame = (u64, u64, [u8; 32], PayloadSummary, [u64; 2]);
 
 /// Exact streaming fallback for a cell with `count` retained rows: one
 /// encoding computes the CRC, a second one hashes and writes. It holds no
@@ -1263,15 +1375,19 @@ fn stream_cell<'w, W: Write + 'w, const N: usize>(
     floor: &IndexReadCut,
     choose: impl FnOnce(u64) -> Result<(&'w mut W, u64), NativeIndexError>,
     reference_bytes: &mut Vec<u8>,
-) -> Result<(u64, u64, [u8; 32], PayloadSummary), NativeIndexError> {
+    lap: &mut Lap,
+) -> Result<StreamedFrame, NativeIndexError> {
     let mut crc = crc32fast::Hasher::new();
     let summary = encode_cell_payload(sources, count, cut, floor, reference_bytes, |bytes| {
         crc.update(bytes);
         Ok(())
     })?;
+    // Count, bound and encode+CRC pass, before the writer runs.
+    let crc_pass_ns = lap.split();
     let length = u32::try_from(summary.length).map_err(|_| NativeIndexError::Capacity)?;
     let bytes = u64::from(length) + 8;
     let (writer, offset) = choose(bytes)?;
+    lap.restart();
     offset
         .checked_add(bytes)
         .ok_or(NativeIndexError::Capacity)?;
@@ -1289,7 +1405,7 @@ fn stream_cell<'w, W: Write + 'w, const N: usize>(
     debug_assert_eq!(emitted, summary, "immutable captured cell serialization");
     let mut digest = [0; 32];
     digest.copy_from_slice(hash.finalize().as_bytes());
-    Ok((offset, bytes, digest, summary))
+    Ok((offset, bytes, digest, summary, [crc_pass_ns, lap.split()]))
 }
 
 #[cfg(test)]

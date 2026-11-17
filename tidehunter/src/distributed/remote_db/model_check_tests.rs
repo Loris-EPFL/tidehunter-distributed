@@ -16,6 +16,9 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::Barrier;
 
+/// Option C per-cell event model and crash matrix (spec §11.3).
+#[path = "cell_model.rs"]
+mod cell_model;
 #[path = "model_check_concurrent.rs"]
 mod concurrent_model;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -44,6 +47,62 @@ const BOUNDARIES: &[&str] = &[
     "checkpoint_install_before",
     "checkpoint_install_after",
 ];
+/// PerCell commit, apply and GC cuts of the real path (C5a failpoints in
+/// `cell_checkpoint.rs`), after the flush-path cuts of the flusher pool
+/// (`remote_db/cell_flush.rs`, `native_index/index_store.rs`). They fire in
+/// the final `flush_index` (its drain to `L`) after the gate. A flusher clean
+/// advance has no cut: the scheduler never queues a cell it could find clean
+/// (see `CellCaptureOutcome::Clean` in `cell_flush.rs`).
+const CELL_BOUNDARIES: &[&str] = &[
+    "cell_segment_create_after",
+    "cell_frame_write_after",
+    "cell_group_flush_after",
+    "cell_segment_fsync_after",
+    "cell_segment_dirsync_after",
+    "cell_install_before",
+    "cell_install_after",
+    "cell_drain_after",
+    "cell_capture_after",
+    "cell_root_slice_after",
+    "cell_owner_proof_before",
+    "cell_owner_proof_after",
+    "cell_staging_before",
+    "cell_staging_after",
+    "cell_root_persist_before",
+    "cell_root_dirsync_after",
+    "cell_wrapper_persist_before",
+    "cell_wrapper_dirsync_after",
+    "cell_manifest_persist_before",
+    "cell_manifest_dirsync_after",
+    "cell_apply_history_after",
+    "cell_apply_authority_after",
+    "cell_apply_ledger_after",
+    "cell_identity_remove_after",
+    "cell_credit_return_after",
+    "cell_gc_unlink_after",
+    "cell_gc_dirsync_after",
+    "cell_gc_sweep_before",
+    "cell_gc_sweep_after",
+];
+/// PerCell reopen cuts, each with the write-stage cut that leaves the state
+/// it needs (an unadopted root for the metadata orphan deletions).
+const CELL_RESTART_BOUNDARIES: &[(&str, &str)] = &[
+    ("cell_orphan_scan_before", "cell_manifest_dirsync_after"),
+    ("cell_orphan_scan_after", "cell_root_dirsync_after"),
+    ("cell_orphan_delete_after", "cell_wrapper_persist_before"),
+    ("cell_orphan_dirsync_after", "cell_manifest_persist_before"),
+];
+
+/// The cuts of a PerCell case: the exact checkpoint cuts do not exist there,
+/// so they are replaced by the PerCell commit, apply and GC cuts.
+fn per_cell_cuts(exact: &[&'static str]) -> Vec<&'static str> {
+    exact
+        .iter()
+        .copied()
+        .filter(|name| !name.starts_with("checkpoint_"))
+        .chain(CELL_BOUNDARIES.iter().copied())
+        .collect()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Case {
@@ -58,6 +117,22 @@ struct Case {
     concurrent: bool,
     #[serde(default)]
     native: bool,
+    /// `CheckpointMode::PerCell`, in either history mode.
+    #[serde(default)]
+    per_cell: bool,
+    /// Coordinator index budget of the reopens only; `None` keeps the write
+    /// stage's 16 MiB. A budget below the replayed suffix's charge makes the
+    /// reopen flush cells offline during mixed-cut replay. The write stage
+    /// keeps its budget, so whether it commits a root never depends on
+    /// checkpoint pressure timing.
+    #[serde(default)]
+    reopen_max_index_bytes: Option<usize>,
+    /// A reopen cut: the first reopen crashes here, the next one recovers.
+    #[serde(default)]
+    restart_boundary: String,
+    /// Crash the second reopen at the same cut too.
+    #[serde(default)]
+    restart_again: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -79,6 +154,10 @@ impl Case {
             leased: None,
             concurrent: false,
             native: false,
+            per_cell: false,
+            restart_boundary: String::new(),
+            restart_again: false,
+            reopen_max_index_bytes: None,
         }
     }
     fn value_bytes(&self) -> usize {
@@ -447,6 +526,9 @@ fn write_child(directory: &Path, case: &Case) {
             config.storage.wal_file_bytes = 2048;
             config.max_index_bytes = 16 * 1024 * 1024;
             config.read_cache_bytes = 0;
+            if case.per_cell {
+                config.checkpoint_mode = CheckpointMode::PerCell;
+            }
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             if let Some(profile) = case.leased {
                 leased::configure(config, profile);
@@ -645,7 +727,9 @@ fn write_child(directory: &Path, case: &Case) {
     std::process::exit(0);
 }
 
-fn recover_child(directory: &Path) {
+/// `crash`: arm the reopen cut of `case.restart_boundary` (its own trace
+/// file per stage) and exit with `CRASH_EXIT` there; exit 0 if open returns.
+fn recover_child(directory: &Path, crash: Option<&str>) {
     let restart: Restart =
         serde_json::from_slice(&fs::read(directory.join("restart.json")).unwrap()).unwrap();
     let case: Case =
@@ -682,13 +766,35 @@ fn recover_child(directory: &Path) {
         }));
         nodes.push(node);
     }
+    if let Some(stage) = crash {
+        // Reopen cuts fire inside `RemoteDatabase::open`; the gate is opened
+        // before it, after the arm step's fixed acknowledged prefix.
+        write_model::arm(
+            &directory.join(format!("{stage}-boundaries.txt")),
+            case.restart_boundary.clone(),
+            7,
+        );
+        for _ in 1..7 {
+            write_model::acknowledged();
+        }
+        write_model::open_gate();
+    }
+    // The reopens may run with a smaller index budget than the write stage.
+    let mut config = restart.config.clone();
+    if let Some(bytes) = case.reopen_max_index_bytes {
+        config.max_index_bytes = bytes;
+    }
     let db = RemoteDatabase::open(
         &restart.root.join("authority"),
         &restart.shape,
-        restart.config.clone(),
+        config.clone(),
         recovery_metrics(),
     )
     .unwrap();
+    if crash.is_some() {
+        // The reopen cut was not reached; the parent reports it.
+        std::process::exit(0);
+    }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     let (db, recovery_pins) = {
         let mut db = db;
@@ -700,7 +806,7 @@ fn recover_child(directory: &Path) {
         };
         (db, pins)
     };
-    let readers = Readers::new(&restart.config, &restart.shape, db.epoch());
+    let readers = Readers::new(&config, &restart.shape, db.epoch());
     let db = ConcurrentRemoteDatabase::new(db).unwrap();
     let values = snapshot(&db, &readers);
     // Retry every externally acknowledged identity after a real owner restart.
@@ -761,7 +867,8 @@ fn write_model_child() {
         serde_json::from_slice(&fs::read(directory.join("case.json")).unwrap()).unwrap();
     match std::env::var("TH_MODEL_CHILD_STAGE").unwrap().as_str() {
         "write" => write_child(&directory, &case),
-        "recover" => recover_child(&directory),
+        "recover" => recover_child(&directory, None),
+        stage @ ("recover_crash" | "recover_crash_again") => recover_child(&directory, Some(stage)),
         other => panic!("unknown model stage {other}"),
     }
 }
@@ -994,6 +1101,29 @@ fn run_case(case: &Case) {
             1
         );
     }
+    for (stage, run) in [
+        ("recover_crash", !case.restart_boundary.is_empty()),
+        ("recover_crash_again", case.restart_again),
+    ] {
+        if !run {
+            continue;
+        }
+        let crashed = child(&directory, stage);
+        assert_eq!(
+            crashed.status.code(),
+            Some(write_model::CRASH_EXIT),
+            "reopen cut not reached {case:?} stage={stage} artifacts={}\n{}\n{}",
+            directory.display(),
+            String::from_utf8_lossy(&crashed.stdout),
+            String::from_utf8_lossy(&crashed.stderr)
+        );
+        let trace = fs::read_to_string(directory.join(format!("{stage}-boundaries.txt"))).unwrap();
+        assert_eq!(
+            trace.lines().last(),
+            Some(case.restart_boundary.as_str()),
+            "wrong reopen cut {case:?}"
+        );
+    }
     let recover = child(&directory, "recover");
     assert!(
         recover.status.success(),
@@ -1052,6 +1182,73 @@ fn write_model_seeded_crashes() {
         });
     }
 }
+
+/// The PerCell real path in actual processes (spec §11.3): every flush,
+/// commit, apply and GC cut after an acknowledged WAL tail written by eight
+/// concurrent callers with 1/8/32-key batches and duplicate identities, in
+/// both tiers and owner counts 1/2/4/16, in WAL-replay and then in
+/// receipt-history mode; then each reopen cut, crashing the first reopen
+/// (and the second, for the orphan scan) before a final reopen; last, a
+/// reopen whose index budget forces an offline cell flush during mixed-cut
+/// replay, crashed inside it. The unchanged sequential oracle and retry
+/// check run after every cut.
+#[test]
+fn write_model_per_cell_crashes() {
+    let case = |index: usize, boundary: &str| Case {
+        boundary: boundary.into(),
+        concurrent: true,
+        native: index % 2 == 1,
+        per_cell: true,
+        gate_waves: 1 + index % 2,
+        ..Case::rpc(
+            0xce11 + index as u64,
+            [1, 2, 4, 16][index % 4],
+            index.is_multiple_of(3),
+        )
+    };
+    run_case(&case(0, ""));
+    for (index, boundary) in CELL_BOUNDARIES.iter().enumerate() {
+        run_case(&case(index + 1, boundary));
+    }
+    for (index, (restart, boundary)) in CELL_RESTART_BOUNDARIES.iter().enumerate() {
+        run_case(&Case {
+            restart_boundary: (*restart).into(),
+            restart_again: *restart == "cell_orphan_scan_before",
+            ..case(index + CELL_BOUNDARIES.len() + 1, boundary)
+        });
+    }
+    // Receipt history: proofs through U extend the synced through-F chains.
+    let first = CELL_BOUNDARIES.len() + CELL_RESTART_BOUNDARIES.len() + 1;
+    for (index, boundary) in std::iter::once(&"").chain(CELL_BOUNDARIES).enumerate() {
+        run_case(&Case {
+            on_disk_history: true,
+            ..case(first + index, boundary)
+        });
+    }
+    // The write stage keeps its 16 MiB budget and adopts no root before the
+    // crash, so the reopen replays every batch with no cell base; the reopen
+    // budget cannot hold that overlay. The reopen cut asserts that the
+    // offline flush is reached; the final reopen then completes under it.
+    for (offset, on_disk_history) in [(0, false), (1, true)] {
+        run_case(&Case {
+            restart_boundary: "cell_offline_flush_after".into(),
+            reopen_max_index_bytes: Some(OFFLINE_FLUSH_INDEX_BYTES),
+            on_disk_history,
+            ..case(
+                first + CELL_BOUNDARIES.len() + 1 + offset,
+                "cell_drain_after",
+            )
+        });
+    }
+}
+
+/// Reopen index budget of the offline-flush cases (measured on their two
+/// deterministic histories): after an offline flush the reopen still charges
+/// 25,612 B resident, and its largest replayed batch charges 24,632 B, so
+/// 48 KiB fails after flushing and 56 KiB completes; 64 KiB still reaches
+/// the offline flush and 80 KiB no longer does. 60 KiB sits inside that
+/// window.
+const OFFLINE_FLUSH_INDEX_BYTES: usize = 60 * 1024;
 
 fn env_number(name: &str, default: u64) -> u64 {
     std::env::var(name).map_or(default, |value| value.parse().unwrap())

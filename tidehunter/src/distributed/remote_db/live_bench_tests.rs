@@ -181,6 +181,7 @@ impl Fixture {
                 )
             }),
             checkpoint_mode: CheckpointMode::Exact,
+            force_streaming_cell_encoder: false,
         };
         if let Some(live) = &mut config.live_nvme {
             live.export_mode = export_mode;

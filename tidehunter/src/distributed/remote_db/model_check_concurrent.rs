@@ -92,6 +92,12 @@ fn write_model_concurrent_thousand_schedules() {
     let native_filter = selection("TH_MODEL_NATIVE", 2);
     let seed = env_number("TH_MODEL_SEED", 0xc011);
     let schedules = schedule_range();
+    let per_cell = per_cell_selection();
+    let boundaries = if per_cell {
+        per_cell_cuts(BOUNDARIES)
+    } else {
+        BOUNDARIES.to_vec()
+    };
     for owners in 1..=16 {
         if owner_filter != 0 && owner_filter != owners as u64 {
             continue;
@@ -105,17 +111,28 @@ fn write_model_concurrent_thousand_schedules() {
                     continue;
                 }
                 for schedule in schedules.clone() {
-                    let boundary = schedule as usize % (BOUNDARIES.len() + 1);
+                    let boundary = schedule as usize % (boundaries.len() + 1);
                     run_case(&Case {
                         boundary: boundary
                             .checked_sub(1)
-                            .map_or_else(String::new, |index| BOUNDARIES[index].into()),
+                            .map_or_else(String::new, |index| boundaries[index].into()),
                         on_disk_history: schedule % 2 != 0,
+                        per_cell,
                         ..case(seed.wrapping_add(schedule), owners, hot, native)
                     });
                 }
             }
         }
+    }
+}
+
+/// TH_MODEL_PER_CELL=1 selects the option C commit path and its cuts, in both
+/// history modes; its reopen cuts run in `write_model_per_cell_crashes`.
+fn per_cell_selection() -> bool {
+    match env_number("TH_MODEL_PER_CELL", 0) {
+        0 => false,
+        1 => true,
+        other => panic!("TH_MODEL_PER_CELL must be 0 or 1, got {other}"),
     }
 }
 
@@ -130,6 +147,7 @@ fn write_model_concurrent_leased_thousand_schedules() {
     let profile_filter = selection("TH_MODEL_LEASED", 8);
     let seed = env_number("TH_MODEL_SEED", 0xc011);
     let schedules = schedule_range();
+    let per_cell = per_cell_selection();
     assert!(
         profile_filter == 8 || native_filter == 2 || u64::from(profile_filter < 4) == native_filter,
         "TH_MODEL_NATIVE conflicts with TH_MODEL_LEASED"
@@ -152,6 +170,7 @@ fn write_model_concurrent_leased_thousand_schedules() {
                 for schedule in schedules.clone() {
                     let case = Case {
                         leased: Some(leased::profile(profile)),
+                        per_cell,
                         ..case(seed.wrapping_add(schedule), owners, hot, false)
                     };
                     let boundaries = leased::boundaries(&case);

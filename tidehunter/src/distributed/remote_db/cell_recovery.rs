@@ -375,7 +375,9 @@ pub(super) fn replay_mixed_cuts<S: ReplayStream>(
             offline_flush(&index, flusher, prefix, &mut dirty, &mut stats)?;
             index.check_capacity(charge).map_err(|error| {
                 LocalDbError::new(format!(
-                    "recovery batch {version:?} exceeds the index budget after offline flushing: {error}"
+                    "recovery batch {version:?} exceeds the index budget after offline flushing: \
+                     {error} (charge {charge} B, resident {} B)",
+                    index.charged_metadata_bytes()
                 ))
             })?;
         }

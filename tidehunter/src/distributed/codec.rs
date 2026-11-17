@@ -29,7 +29,9 @@ pub const FORMAT_VERSION: u16 = 3;
 const DIGEST_OFFSET: usize = 8 + 2 + 2 + 32 + 16 + 4;
 pub(crate) const HEADER_LEN: usize = DIGEST_OFFSET + 32;
 const MEMBER_HEADER_LEN: usize = 4 + 4;
-const MIN_MEMBER_LEN: usize = MEMBER_HEADER_LEN + 2;
+/// Smallest member: its header plus the native entry of a delete of an empty
+/// key. Every member is at least this plus its key (`WalEntry::len`).
+pub(crate) const MIN_MEMBER_LEN: usize = MEMBER_HEADER_LEN + 2;
 const NATIVE_FRAME_MAX_EXCLUSIVE: usize = 1 << 30;
 const NATIVE_CRC_HEADER_LEN: usize = 8;
 const NATIVE_BATCH_MAX_EXCLUSIVE: u32 = 1_000_000;
@@ -53,6 +55,24 @@ impl BatchLimits {
             return Err(CodecError::InvalidLimits);
         }
         Ok(())
+    }
+
+    /// Upper bound of the operations of a legal batch: every member encodes
+    /// at least `MIN_MEMBER_LEN` bytes after the batch header.
+    pub(crate) fn max_members(self) -> usize {
+        (self.max_operations as usize)
+            .min(self.max_encoded_bytes.saturating_sub(HEADER_LEN) / MIN_MEMBER_LEN)
+    }
+
+    /// Upper bound of the total key bytes of a legal batch of exactly
+    /// `members` operations: each key is at most `MAX_KEY_LEN`, and each
+    /// encodes inside its member beside at least `MIN_MEMBER_LEN` other bytes.
+    pub(crate) fn max_key_bytes(self, members: usize) -> usize {
+        members.saturating_mul(MAX_KEY_LEN).min(
+            self.max_encoded_bytes
+                .saturating_sub(HEADER_LEN)
+                .saturating_sub(members.saturating_mul(MIN_MEMBER_LEN)),
+        )
     }
 }
 

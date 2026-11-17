@@ -11,17 +11,37 @@
 //! The rare operations (checkpoint floor selection, sparse-view reservation)
 //! use the `cold` mutex and may lock every pin shard.
 //!
+//! # Floor owners
+//!
+//! At most one lease owns the in-progress floor (`Bounds::preparing`) at a
+//! time:
+//!
+//! * [`CaptureLease`]: the exact global checkpoint (`Cold::active`).
+//! * [`RootFloorLease`]: the per-cell metadata root (option C spec §5.2,
+//!   §7.2 step 4, §9.2 step 1; `Cold::root_floor`). It selects
+//!   `H_new = max(H, min(requested, F, lowest pin or sparse-view floor))`,
+//!   so `H_new <= F` and no pinned reader becomes invalid, and makes it the
+//!   committed floor only when the adopting manifest is durable. Cell flush
+//!   captures read the committed floor, never the in-progress one: a flight
+//!   captured at the old floor over-retains after `H` advances, and a frame
+//!   floor never exceeds the `H` of a root that can reference it. Cell
+//!   flights therefore never hold or advance the floor themselves.
+//!
 //! # Why a pin and a floor change never race
 //!
 //! A pin validates against `bounds` and inserts itself while holding its pin
-//! shard's mutex. Floor selection (`capture_lease`) holds `cold`, then locks
-//! every pin shard in ascending order, computes the minimum pin, publishes the
-//! new `bounds`, and only then unlocks them. For any pin shard either the
-//! reader's critical section ran before the selection took that shard (the
-//! selection sees the pin and clamps the floor below it) or after it released
-//! the shard (the reader's mutex acquire happens after the `bounds` store, so
-//! it validates against the new bounds and fails instead of registering below
-//! the floor).
+//! shard's mutex. Floor selection ([`RetentionState::select_floor`]) holds
+//! `cold`, then locks every pin shard in ascending order, computes the
+//! minimum pin, publishes the new `bounds`, and only then unlocks them. For
+//! any pin shard either the reader's critical section ran before the
+//! selection took that shard (the selection sees the pin and clamps the floor
+//! below it) or after it released the shard (the reader's mutex acquire
+//! happens after the `bounds` store, so it validates against the new bounds
+//! and fails instead of registering below the floor).
+//!
+//! Lock order: `cold` -> pin shards ascending. Callers may hold the writer
+//! and the option-D publisher (spec §2.2: writer -> publisher -> one index
+//! shard -> `cold` -> pin shards); nothing here takes them.
 
 use super::*;
 use arc_swap::ArcSwap;
@@ -90,7 +110,11 @@ struct Cold {
     uncharged_view_bytes: usize,
     /// Sparse views pin their stable floor like a reader pin.
     view_pins: BTreeMap<Option<MutationVersion>, usize>,
+    /// The exact [`CaptureLease`] owns `Bounds::preparing`.
     active: bool,
+    /// The per-cell [`RootFloorLease`] owns `Bounds::preparing`. Exclusive
+    /// with `active`: both leases restore `preparing` on drop.
+    root_floor: bool,
     /// Option C cell flush permits: residual bytes and outstanding flights.
     /// An allowance independent of the capture and view allowances.
     cell_bytes: usize,
@@ -177,6 +201,46 @@ impl RetentionState {
         let _cold = self.cold.lock();
         let preparing = self.bounds.load().preparing.clone();
         self.bounds.store(Arc::new(Bounds { floor, preparing }));
+    }
+
+    /// Select an in-progress floor and publish it as `Bounds::preparing`.
+    /// The caller holds `cold` (passed in) and owns `preparing`.
+    ///
+    /// Lock every pin shard in ascending index (see module documentation),
+    /// clamp `proposed` below the lowest reader pin and sparse-view floor,
+    /// raise the result to at least `at_least`, publish it, and only then
+    /// release the shards. A pre-genesis pin clamps to `BeforeAll`. The guards
+    /// live in a fixed array: nothing allocates under the locks.
+    fn select_floor(
+        &self,
+        cold: &Cold,
+        proposed: IndexReadCut,
+        at_least: &IndexReadCut,
+    ) -> IndexReadCut {
+        let pin_guards: [_; PIN_SHARDS] =
+            std::array::from_fn(|shard| self.pin_shards[shard].0.lock());
+        let lowest_pin = pin_guards
+            .iter()
+            .filter_map(|pins| pins.first_key_value().map(|(pin, _)| *pin))
+            .chain(cold.view_pins.first_key_value().map(|(pin, _)| *pin))
+            .min();
+        let clamped = lowest_pin
+            .filter(|pin| *pin < position(&proposed))
+            .map_or(proposed, |pin| {
+                pin.map_or(IndexReadCut::BeforeAll, IndexReadCut::At)
+            });
+        let floor = if position(&clamped) < position(at_least) {
+            at_least.clone()
+        } else {
+            clamped
+        };
+        let committed = self.bounds.load().floor.clone();
+        self.bounds.store(Arc::new(Bounds {
+            floor: committed,
+            preparing: Some(floor.clone()),
+        }));
+        drop(pin_guards);
+        floor
     }
 
     fn pin(
@@ -330,6 +394,56 @@ impl Drop for CaptureLease {
         }));
         cold.transient_bytes = 0;
         cold.active = false;
+    }
+}
+
+/// The one per-cell root-floor lease (module documentation; spec §5.2, §7.2
+/// step 4). It reserves `H_new` as the in-progress floor from root capture
+/// until the manifest adopting the root is durable
+/// ([`NativeIndex::install_root_floor`]) or the root is abandoned (drop: the
+/// committed floor is unchanged). It holds no byte charge.
+#[derive(Debug)]
+pub(crate) struct RootFloorLease {
+    retention: Arc<RetentionState>,
+    /// The committed floor when the lease began.
+    previous: IndexReadCut,
+    /// `H_new`: scalar, at least `previous`, at most the root's `F`.
+    floor: IndexReadCut,
+    /// True until installation: the lease owns `Cold::root_floor` and
+    /// `Bounds::preparing`.
+    owns: bool,
+}
+
+impl RootFloorLease {
+    /// `H_new`, the root's history floor (`None` = `BeforeAll`).
+    pub(crate) fn floor(&self) -> Option<MutationVersion> {
+        position(&self.floor)
+    }
+
+    /// The committed floor when the lease began.
+    pub(crate) fn previous(&self) -> Option<MutationVersion> {
+        position(&self.previous)
+    }
+
+    /// True if installing this lease raises the committed floor.
+    pub(crate) fn advances(&self) -> bool {
+        self.floor() > self.previous()
+    }
+}
+
+impl Drop for RootFloorLease {
+    fn drop(&mut self) {
+        if !self.owns {
+            return;
+        }
+        // Abandoned root: keep the committed floor, release the reservation.
+        let mut cold = self.retention.cold.lock();
+        let floor = self.retention.bounds.load().floor.clone();
+        self.retention.bounds.store(Arc::new(Bounds {
+            floor,
+            preparing: None,
+        }));
+        cold.root_floor = false;
     }
 }
 
@@ -582,7 +696,7 @@ impl NativeIndex {
         {
             return Err(NativeIndexError::Invalid("nonmonotonic retention floor"));
         }
-        if cold.active {
+        if cold.active || cold.root_floor {
             return Err(NativeIndexError::CheckpointInProgress);
         }
         // Historical mapped bytes do not enter either budget. Capture duplicates
@@ -591,36 +705,97 @@ impl NativeIndex {
         if transient_bytes > self.max_metadata_bytes {
             return Err(NativeIndexError::Capacity);
         }
-        // Lock every pin shard in ascending index (see module documentation),
-        // select the floor from the pins, publish the in-progress floor, and
-        // only then release them. A pre-genesis pin clamps to BeforeAll and
-        // prevents any advancement.
-        let pin_guards: Vec<_> = retention
-            .pin_shards
-            .iter()
-            .map(|shard| shard.0.lock())
-            .collect();
-        let lowest_pin = pin_guards
-            .iter()
-            .filter_map(|pins| pins.first_key_value().map(|(pin, _)| *pin))
-            .chain(cold.view_pins.first_key_value().map(|(pin, _)| *pin))
-            .min();
-        let floor = lowest_pin
-            .filter(|pin| *pin < position(&floor))
-            .map_or(floor, |pin| {
-                pin.map_or(IndexReadCut::BeforeAll, IndexReadCut::At)
-            });
+        let floor = retention.select_floor(&cold, floor, &IndexReadCut::BeforeAll);
         cold.transient_bytes = transient_bytes;
         cold.active = true;
-        retention.bounds.store(Arc::new(Bounds {
-            floor: bounds.floor.clone(),
-            preparing: Some(floor.clone()),
-        }));
-        drop(pin_guards);
         Ok(CaptureLease {
             retention: Arc::clone(retention),
             floor,
         })
+    }
+
+    /// Begin the per-cell root-floor lease of one metadata root (spec §7.2
+    /// step 4): `H_new = max(H, min(requested, F, lowest pin or sparse-view
+    /// floor))`, where `H` is the committed floor and `F = cap` the root's
+    /// replay floor. `H_new` becomes the in-progress floor, so no new pin can
+    /// register below it; an existing pin never becomes invalid. A pin below
+    /// `requested` clamps silently, as for the exact capture. `requested`
+    /// must be scalar (`BeforeAll` or `At`); `cap` must be published and at
+    /// or above `H`. One lease at a time, exclusive with the exact capture.
+    /// Takes `cold` and the pin shards only: callable with or without the
+    /// writer and publisher held.
+    pub(crate) fn begin_root_floor(
+        &self,
+        requested: IndexReadCut,
+        cap: PrefixCut,
+    ) -> Result<RootFloorLease, NativeIndexError> {
+        if matches!(requested, IndexReadCut::Latest | IndexReadCut::Sparse(_)) {
+            return Err(NativeIndexError::Invalid(
+                "root history floor must be a scalar cut",
+            ));
+        }
+        if let PrefixCut::Through(batch) = cap {
+            // The watermark compares batches: the operation is irrelevant.
+            self.check_published(&IndexReadCut::At(MutationVersion {
+                batch,
+                operation_index: 0,
+            }))?;
+        }
+        let cap = cap.index_cut();
+        let retention = &self.retention;
+        let mut cold = retention.cold.lock();
+        if cold.active || cold.root_floor {
+            return Err(NativeIndexError::CheckpointInProgress);
+        }
+        let previous = retention.bounds.load().floor.clone();
+        if position(&previous) > position(&cap) {
+            return Err(NativeIndexError::Invalid(
+                "committed history floor above the replay floor",
+            ));
+        }
+        let proposed = if position(&requested) < position(&cap) {
+            requested
+        } else {
+            cap
+        };
+        let floor = retention.select_floor(&cold, proposed, &previous);
+        cold.root_floor = true;
+        Ok(RootFloorLease {
+            retention: Arc::clone(retention),
+            previous,
+            floor,
+            owns: true,
+        })
+    }
+
+    /// Commit a root-floor lease once the manifest adopting its root is
+    /// durable (spec §9.2 step 1): the committed floor becomes `H_new` and
+    /// the in-progress floor is cleared. Later cell captures encode at the
+    /// new floor; flights captured before keep the old one and over-retain.
+    /// A foreign or stale lease is refused and dropped (which restores the
+    /// in-progress floor); the committed floor is then unchanged.
+    pub(crate) fn install_root_floor(
+        &self,
+        mut lease: RootFloorLease,
+    ) -> Result<(), NativeIndexError> {
+        if !Arc::ptr_eq(&lease.retention, &self.retention) {
+            return Err(NativeIndexError::Invalid("foreign root floor lease"));
+        }
+        let mut cold = self.retention.cold.lock();
+        let committed = self.retention.bounds.load().floor.clone();
+        if !lease.owns || !cold.root_floor || position(&committed) != lease.previous() {
+            // Release `cold` before the lease's drop takes it.
+            drop(cold);
+            return Err(NativeIndexError::Invalid("stale root floor lease"));
+        }
+        // Monotonic: `floor >= previous == committed` by construction.
+        self.retention.bounds.store(Arc::new(Bounds {
+            floor: lease.floor.clone(),
+            preparing: None,
+        }));
+        cold.root_floor = false;
+        lease.owns = false;
+        Ok(())
     }
 
     pub(super) fn transient_bytes(&self) -> usize {
@@ -654,6 +829,10 @@ impl NativeIndex {
             .saturating_sub(installed)
     }
 }
+
+#[cfg(test)]
+#[path = "root_floor_tests.rs"]
+mod root_floor_tests;
 
 #[cfg(test)]
 mod tests {

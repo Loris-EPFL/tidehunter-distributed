@@ -44,7 +44,7 @@ pub(super) struct BackgroundCheckpoint {
     thread: Option<JoinHandle<()>>,
     // Publisher-owned until capture consumes it. A post-capture request is
     // transferred atomically to one successor before this job is removed.
-    requested_floor: Option<IndexReadCut>,
+    pub(super) requested_floor: Option<IndexReadCut>,
 }
 
 impl Drop for BackgroundCheckpoint {
@@ -101,8 +101,8 @@ fn core_start_checkpoint_with_floor(
             merge_checkpoint_floor(background.requested_floor.take(), floor)?;
         return Ok(());
     }
-    if floor.is_none() && *state.checkpoint_tail_batches == 0 && state.manifest.checkpoint.is_some()
-    {
+    let committed = state.manifest.checkpoint.is_some() || state.manifest.cell_checkpoint.is_some();
+    if floor.is_none() && *state.checkpoint_tail_batches == 0 && committed {
         return Ok(());
     }
     core_launch_checkpoint(core, state, floor)
@@ -129,12 +129,15 @@ fn merge_checkpoint_floor(
     })
 }
 
-fn core_launch_checkpoint(
+pub(super) fn core_launch_checkpoint(
     core: &Arc<WriteCore>,
     state: PublisherCheckpoint<'_>,
     floor: Option<IndexReadCut>,
 ) -> Result<(), LocalDbError> {
-    if state.manifest.checkpoint_staging.is_some() || state.manifest.checkpoint_obsolete.is_some() {
+    if state.manifest.checkpoint_staging.is_some()
+        || state.manifest.checkpoint_obsolete.is_some()
+        || state.manifest.cell_checkpoint_obsolete.is_some()
+    {
         return Err(LocalDbError::new(
             "checkpoint cleanup must complete before another installation",
         ));
@@ -150,6 +153,11 @@ fn core_launch_checkpoint(
     let thread = thread::Builder::new()
         .name("value-wal-checkpoint".to_owned())
         .spawn(move || {
+            // One thread per generation: in PerCell it is the snapshot
+            // (metadata) actor, in Exact the whole thread CPU is that
+            // checkpoint's maintenance CPU.
+            let snapshot_cpu = (!worker_core.config.checkpoint_mode.is_exact())
+                .then(|| worker_core.cell_metrics.enter_snapshot());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 core_run_checkpoint(&worker_core, generation)
             }))
@@ -166,6 +174,12 @@ fn core_launch_checkpoint(
                 // Fail-stop first, then drop a partial capture and its retention
                 // lease. Healthy progress never reaches this cancellation path.
                 worker_core.index.writer().abort_capture();
+            }
+            // Account this thread's CPU before its completion is visible, so
+            // a caller that observed the checkpoint also sees its CPU.
+            match snapshot_cpu {
+                Some(guard) => drop(guard),
+                None => worker_core.cell_metrics.exact_checkpoint_thread_exiting(),
             }
             // Pair completion and notification with the waiter's predicate mutex.
             {
@@ -386,6 +400,7 @@ fn core_capture_checkpoint(
         staging_manifest: state.manifest.clone(),
         history,
         timeline: Arc::clone(&core.write_timeline),
+        cell_metrics: Arc::clone(&core.cell_metrics),
         diagnostics_enabled,
         #[cfg(test)]
         hooks,
@@ -394,6 +409,11 @@ fn core_capture_checkpoint(
 }
 
 fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), LocalDbError> {
+    // Per-cell mode: the same actor commits a metadata-only root instead of a
+    // global image (spec §9.1); there is never a second checkpoint writer.
+    if !core.config.checkpoint_mode.is_exact() {
+        return super::cell_checkpoint::run_checkpoint(core, generation);
+    }
     let started = Instant::now();
     core.stats.lock().write.checkpoint_count += 1;
     core.write_timeline
@@ -771,6 +791,8 @@ struct CheckpointPersistence {
     staging_manifest: AuthorityManifest,
     history: Option<ReceiptHistory>,
     timeline: Arc<WriteTimeline>,
+    /// Records the Exact image encode counters and persist time.
+    cell_metrics: Arc<super::cell_metrics::CellMetrics>,
     diagnostics_enabled: bool,
     #[cfg(test)]
     hooks: super::write_core::core::CheckpointTestHooks,
@@ -778,7 +800,7 @@ struct CheckpointPersistence {
 
 fn persist_checkpoint(
     capture: CapturingCheckpoint,
-    prepared: PreparedIndexImage,
+    mut prepared: PreparedIndexImage,
     persistence: CheckpointPersistence,
 ) -> Result<CompletedCheckpoint, LocalDbError> {
     let CapturingCheckpoint {
@@ -803,6 +825,7 @@ fn persist_checkpoint(
         mut staging_manifest,
         mut history,
         timeline,
+        cell_metrics,
         diagnostics_enabled,
         #[cfg(test)]
         hooks,
@@ -1106,9 +1129,12 @@ fn persist_checkpoint(
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_image_before");
+    let persist_started = Instant::now();
+    prepared.set_profile(cell_metrics.profiling());
     let persisted = prepared
         .persist(&path.join(commit.index_name()))
         .map_err(LocalDbError::component)?;
+    cell_metrics.exact_checkpoint(&persisted.encode_stats, persist_started.elapsed());
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_image_after");
     let index_persist_ns = phase_started.map(elapsed);

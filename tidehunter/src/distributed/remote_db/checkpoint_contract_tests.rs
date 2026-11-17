@@ -12,7 +12,7 @@ fn through(epoch: u64, sequence: u64) -> PrefixCut {
 }
 
 #[test]
-fn checkpoint_mode_defaults_to_exact_and_per_cell_is_inactive() {
+fn checkpoint_mode_defaults_to_exact_and_per_cell_is_explicit_opt_in() {
     let fixture = Fixture::new();
     let mut serialized = serde_json::to_value(&fixture.config).unwrap();
     assert!(serialized.get("checkpoint_mode").is_none());
@@ -26,13 +26,8 @@ fn checkpoint_mode_defaults_to_exact_and_per_cell_is_inactive() {
         serde_json::to_value(&per_cell).unwrap()["checkpoint_mode"],
         "per_cell"
     );
-    assert!(
-        per_cell
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("checkpoint_mode per_cell is inactive")
-    );
+    // PerCell is accepted only when named explicitly; absent stays Exact.
+    per_cell.validate().unwrap();
     assert_eq!(
         serde_yaml::from_str::<CheckpointMode>("exact").unwrap(),
         CheckpointMode::Exact
@@ -144,17 +139,24 @@ fn manifest_checkpoint_tags_never_mix_and_per_cell_never_opens_as_exact() {
 }
 
 #[test]
-fn cell_commit_uses_the_exact_staging_names() {
+fn cell_commit_names_the_format_5_root_and_the_exact_wrapper() {
     let commit = cell_commit(7);
     assert_eq!(commit.metadata_name(), "checkpoint-3-7.metadata");
-    assert_eq!(commit.root_name(), "index-3-7.snapshot");
+    assert_eq!(commit.root_name(), "index-root-3-7.cellroot");
+    // The per-cell staging reservation names the root and its staging file;
+    // the wrapper and its staging file come from the exact convention.
     let staged = CheckpointFiles {
         epoch: 3,
         generation: 7,
-        index_files: Vec::new(),
+        index_files: vec![
+            commit.root_name(),
+            crate::distributed::native_index::cell_root_staging_name(&commit.root_name()),
+        ],
     }
     .names();
     assert!(staged.contains(&commit.metadata_name()) && staged.contains(&commit.root_name()));
+    assert!(staged.contains(&".index-root-3-7.cellroot.pending".to_owned()));
+    assert!(staged.contains(&".checkpoint-3-7.metadata.pending".to_owned()));
 }
 
 fn header(wrapper: &CheckpointImageV4) -> CellRootHeader {

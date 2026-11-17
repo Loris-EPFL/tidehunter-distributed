@@ -17,8 +17,9 @@
 //! A single publication watermark, advanced after every shard apply, makes a
 //! batch visible atomically. See `shards` for the model and its argument.
 
-use super::codec::CompleteBatch;
+use super::codec::{BatchLimits, CompleteBatch};
 use super::index_reference::LogicalValueId;
+use super::remote_db::CheckpointMode;
 use super::shard_lock::ShardRwLock;
 use super::types::{
     BatchId, BatchVersion, MemberChecksum, MutationVersion, PayloadDigest, PhysicalValueAddress,
@@ -52,14 +53,21 @@ mod retention;
 mod shards;
 mod snapshot;
 mod writer;
-pub(crate) use cell_contract::cell_flushers;
 pub(crate) use cell_contract::{CellRoot, CellRootHeader, PrefixCut};
+pub(crate) use cell_contract::{IndexStoreFileId, RootFile};
+pub(crate) use cell_contract::{MAX_CELL_FLUSHERS, cell_flushers};
 #[cfg(test)]
-pub(crate) use cell_contract::{IndexStoreFileId, MemberReplay, RootCell, RootCellBase, RootFile};
+pub(crate) use cell_contract::{MemberReplay, RootCell, RootCellBase};
 use cell_flush::{CellEncodeSource, CellFlushState, ROOT_DESCRIPTOR_SLICE, RootCellDescriptor};
-#[cfg(test)]
-pub(crate) use index_store::IndexStore;
-pub(crate) use index_store::IndexStoreWriter;
+// The per-cell checkpoint actor (remote_db::cell_checkpoint) captures,
+// persists and loads format-5 roots and owns the index store.
+pub(crate) use cell_snapshot::{
+    CellRootParams, PreparedCellRoot, cell_root_name, cell_root_staging_name, map_root_file,
+    parse_cell_root_name, read_cell_root,
+};
+pub(crate) use index_store::{IndexStore, IndexStoreWriter};
+pub(crate) use index_store::{IndexStoreSpace, IndexStoreWriterStats};
+pub(crate) use snapshot::cell_scratch_limit;
 // The crate-visible option C flush API used by the flusher pool and the
 // mixed-cut recovery (remote_db).
 pub(crate) use cell_flush::{
@@ -68,13 +76,15 @@ pub(crate) use cell_flush::{
 };
 pub use retention::IndexReadPin;
 use retention::{CaptureLease, RetentionState, position, view_charge};
-pub(crate) use retention::{PublicationViewReservation, StandingViewBudget};
+pub(crate) use retention::{PublicationViewReservation, RootFloorLease, StandingViewBudget};
 use shards::{Accounting, Cells, PublicationHistogram};
 pub use shards::{
     DEFAULT_INDEX_SHARDS, IndexShardLoad, IndexShardStats, MAX_INDEX_SHARDS,
     PUBLICATION_HISTOGRAM_BUCKETS,
 };
-pub(crate) use snapshot::{PersistedIndexImage, PreparedIndexImage};
+pub(crate) use snapshot::{
+    CellEncodeStats, PersistedIndexImage, PreparedIndexImage, thread_cpu_ns,
+};
 pub use writer::IndexWriter;
 use writer::WriterState;
 
@@ -83,11 +93,30 @@ const FORMAT: u16 = 4;
 const REFERENCE_BYTES: usize = 134;
 const MAX_IMAGE_BYTES: usize = 1 << 30;
 const VERSION_CHARGE: usize = std::mem::size_of::<ValueRecordReference>() + 32;
-const CELL_CHARGE: usize = std::mem::size_of::<CellIndex>() + 256;
+/// The flush slot of [`CellIndex`]: one pointer, `None` in Exact mode.
+const FLUSH_SLOT_BYTES: usize = std::mem::size_of::<Option<Box<CellFlushState>>>();
+/// Charge of one Exact cell: the pre-option-C charge, byte for byte (552 B on
+/// 64-bit targets). An Exact cell holds no flush state, and its empty flush
+/// slot is counted inside the 256 B map-entry allowance, so Exact capacity,
+/// admission and the checkpoint thresholds derived from them are unchanged.
+/// It is also the least charge of any cell: count bounds divide by it.
+const CELL_CHARGE: usize = std::mem::size_of::<CellIndex>() - FLUSH_SLOT_BYTES + 256;
+/// Charge of one `PerCell` cell: also the flush slot and its boxed
+/// [`CellFlushState`].
+const PER_CELL_CHARGE: usize =
+    CELL_CHARGE + FLUSH_SLOT_BYTES + std::mem::size_of::<CellFlushState>();
+/// Bytes of the boxed per-cell option C flush state of a `PerCell` cell
+/// (spec §11.4 asks for it; part of `PER_CELL_CHARGE`).
+pub(crate) const CELL_FLUSH_STATE_BYTES: usize = std::mem::size_of::<CellFlushState>();
 
-fn cell_directory_charge(cell: &CellId) -> usize {
+/// Charge of one cell directory entry of an index in `mode`.
+fn cell_directory_charge(mode: CheckpointMode, cell: &CellId) -> usize {
+    let charge = match mode {
+        CheckpointMode::Exact => CELL_CHARGE,
+        CheckpointMode::PerCell => PER_CELL_CHARGE,
+    };
     // The append-only capture directory owns a second cell identity.
-    CELL_CHARGE + 2 * cell.len()
+    charge + 2 * cell.len()
 }
 
 /// `At` includes that exact mutation. `BeforeAll` is the empty checkpoint;
@@ -236,8 +265,10 @@ struct CellIndex {
     sealed: Option<std::sync::Arc<Overlay<ValueRecordReference>>>,
     generation: u64,
     base: Option<SortedBlock>,
-    /// Option C: carry, flight, coverage and dirty totals. See `cell_flush`.
-    flush: CellFlushState,
+    /// Option C carry, flight, coverage and dirty totals (see `cell_flush`).
+    /// Allocated at cell creation in a `PerCell` index only; `None` in an
+    /// Exact index, whose cells keep their pre-option-C size and charge.
+    flush: Option<Box<CellFlushState>>,
 }
 
 /// One database's native-routed cells with typed logical versions and locations.
@@ -263,6 +294,10 @@ pub struct NativeIndex {
     retention: std::sync::Arc<RetentionState>,
     /// Set by promotion: a coalesced cell-flush maintenance hint.
     cell_dirty: std::sync::atomic::AtomicBool,
+    /// Checkpoint protocol, fixed at open: whether cells carry flush state.
+    mode: CheckpointMode,
+    /// Origin of the cells' compact dirty timestamps.
+    cell_epoch: std::time::Instant,
 }
 
 /// Digest of the exact durable CRC-framed image, usable by its manifest owner.
@@ -476,14 +511,33 @@ impl NativeIndex {
         Self::with_shards(shape, database, max_metadata_bytes, DEFAULT_INDEX_SHARDS)
     }
 
-    /// Build an index of `shards` independent shards. `shards` must be a power
-    /// of two in `1..=MAX_INDEX_SHARDS`. The shard count and hash are never
-    /// persisted, so any count can open any snapshot.
+    /// Build an Exact index of `shards` independent shards. `shards` must be
+    /// a power of two in `1..=MAX_INDEX_SHARDS`. The shard count and hash are
+    /// never persisted, so any count can open any snapshot.
     pub fn with_shards(
         shape: &KeyShape,
         database: [u8; 16],
         max_metadata_bytes: usize,
         shards: usize,
+    ) -> Result<Self, NativeIndexError> {
+        Self::with_mode(
+            shape,
+            database,
+            max_metadata_bytes,
+            shards,
+            CheckpointMode::Exact,
+        )
+    }
+
+    /// [`Self::with_shards`] for the checkpoint protocol `mode`, fixed for the
+    /// index's lifetime: a `PerCell` index gives every cell its flush state
+    /// at creation and charges it; an Exact index never allocates one.
+    pub(crate) fn with_mode(
+        shape: &KeyShape,
+        database: [u8; 16],
+        max_metadata_bytes: usize,
+        shards: usize,
+        mode: CheckpointMode,
     ) -> Result<Self, NativeIndexError> {
         let shard_mask = shards::checked_mask(shards).ok_or(NativeIndexError::Invalid(
             "index shard count must be a power of two in 1..=4096",
@@ -511,7 +565,15 @@ impl NativeIndex {
             publication_shards: PublicationHistogram::default(),
             retention: RetentionState::new(),
             cell_dirty: std::sync::atomic::AtomicBool::new(false),
+            mode,
+            cell_epoch: std::time::Instant::now(),
         })
+    }
+
+    /// Flush state of a cell created now with `coverage`: boxed in a
+    /// `PerCell` index, absent in an Exact one.
+    fn new_cell_flush(&self, coverage: cell_contract::PrefixCut) -> Option<Box<CellFlushState>> {
+        (self.mode == CheckpointMode::PerCell).then(|| Box::new(CellFlushState::new(coverage)))
     }
 
     /// Owner admission must include previously admitted outstanding reservations
@@ -539,7 +601,7 @@ impl NativeIndex {
                 let cell_charge = if self.contains_cell(mutation.keyspace(), &cell) {
                     0
                 } else {
-                    cell_directory_charge(&cell)
+                    cell_directory_charge(self.mode, &cell)
                 };
                 total
                     .checked_add(VERSION_CHARGE + reduced.len() + cell_charge)
@@ -561,11 +623,54 @@ impl NativeIndex {
                         + if self.contains_cell(operation.ks(), operation.cell_id()) {
                             0
                         } else {
-                            cell_directory_charge(operation.cell_id())
+                            cell_directory_charge(self.mode, operation.cell_id())
                         },
                 )
                 .ok_or(NativeIndexError::Capacity)
         })
+    }
+
+    /// A conservative upper bound of the admission charge a batch legal under
+    /// `limits` can reserve: of what [`Self::estimated_routed_bytes`] charges
+    /// on an empty index, where every operation references a cell that does
+    /// not exist yet. Option C spec §6.2: a budget below it is rejected at
+    /// open, so once open succeeds every legal batch fits an empty index.
+    ///
+    /// An operation charges `VERSION_CHARGE`, one cell entry and its reduced
+    /// key. A fixed-size reduced key (`Fixed`, `Reduction`, `Hash`) counts its
+    /// size in the per-operation part `x`; a `VariableLength` reduced key is
+    /// the whole key, bounded by [`BatchLimits::max_key_bytes`]. A batch of
+    /// `m` operations therefore charges at most `x·m + max_key_bytes(m)`.
+    /// One more operation adds `x` and removes at most `MIN_MEMBER_LEN` key
+    /// bytes, and `x > MIN_MEMBER_LEN` (asserted below), so the bound grows
+    /// with `m` and its maximum is at [`BatchLimits::max_members`].
+    ///
+    /// It need not be attainable, so open may reject a budget that every
+    /// legal batch would in fact fit: `max_members` ignores the encoded bytes
+    /// of fixed-size keys, and a mixed schema pairs the costliest fixed-key
+    /// `x` with variable-key bytes. The tests reach it only for their two
+    /// shapes (four fixed-key puts; four maximum-length variable-key deletes
+    /// filling the encoded limit).
+    /// `None` on overflow.
+    pub(crate) fn largest_batch_charge(&self, limits: BatchLimits) -> Option<usize> {
+        const _: () = assert!(VERSION_CHARGE > super::codec::MIN_MEMBER_LEN);
+        let mut per_operation = 0usize;
+        let mut variable_keys = false;
+        // A destroyed key space takes no writes.
+        for ks in self.shape.iter_ks().filter(|ks| !ks.destroyed()) {
+            let fixed_key = ks.index_key_size();
+            variable_keys |= fixed_key.is_none();
+            // Every cell id of a key type has one length (`CellId::len`).
+            let cell = cell_directory_charge(self.mode, &ks.first_cell());
+            per_operation = per_operation.max(VERSION_CHARGE + fixed_key.unwrap_or(0) + cell);
+        }
+        let members = limits.max_members();
+        let key_bytes = if variable_keys {
+            limits.max_key_bytes(members)
+        } else {
+            0
+        };
+        per_operation.checked_mul(members)?.checked_add(key_bytes)
     }
 
     pub fn retained_metadata_bytes(&self) -> usize {
@@ -575,6 +680,22 @@ impl NativeIndex {
     /// Resident charge used by checkpoint admission, without directory scans.
     pub(crate) fn charged_metadata_bytes(&self) -> usize {
         self.resident_bytes()
+    }
+
+    /// Transient charge (captures, residuals, views, cell flush permits),
+    /// without directory scans. Option C gauge.
+    pub(crate) fn transient_metadata_bytes(&self) -> usize {
+        self.transient_bytes()
+    }
+
+    /// Charge of the cell directory. Cells are never removed, so it only
+    /// grows: Admission uses a change to re-estimate a queued reservation.
+    pub(crate) fn directory_bytes(&self) -> usize {
+        // Relaxed: a counter compared for change; ordering comes from the
+        // shard locks taken by the re-estimate itself.
+        self.accounting
+            .directory
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn resident_bytes(&self) -> usize {
@@ -804,7 +925,7 @@ impl NativeIndex {
         let mut retained = self.accounting.overlay();
         for shard in self.shards.iter_mut() {
             for ((_, cell_id), cell) in shard.get_mut().iter() {
-                directory += cell_directory_charge(cell_id);
+                directory += cell_directory_charge(self.mode, cell_id);
                 versions += cell
                     .overlays()
                     .into_iter()
@@ -896,8 +1017,8 @@ impl NativeIndex {
         )
     }
 
-    /// Open a snapshot into `shards` shards. The snapshot records no shard map:
-    /// cells are placed by hash while loading.
+    /// Open a snapshot into an Exact index of `shards` shards. The snapshot
+    /// records no shard map: cells are placed by hash while loading.
     pub fn open_snapshot_with_shards(
         path: &Path,
         shape: &KeyShape,
@@ -905,7 +1026,27 @@ impl NativeIndex {
         max_metadata_bytes: usize,
         shards: usize,
     ) -> Result<Self, NativeIndexError> {
-        snapshot::open(path, shape, database, max_metadata_bytes, shards)
+        Self::open_snapshot_with_mode(
+            path,
+            shape,
+            database,
+            max_metadata_bytes,
+            shards,
+            CheckpointMode::Exact,
+        )
+    }
+
+    /// [`Self::open_snapshot_with_shards`] for the checkpoint protocol `mode`.
+    /// An Exact snapshot opens in `PerCell` mode when a database migrates.
+    pub(crate) fn open_snapshot_with_mode(
+        path: &Path,
+        shape: &KeyShape,
+        database: [u8; 16],
+        max_metadata_bytes: usize,
+        shards: usize,
+        mode: CheckpointMode,
+    ) -> Result<Self, NativeIndexError> {
+        snapshot::open(path, shape, database, max_metadata_bytes, shards, mode)
     }
 
     fn descriptor(&self, keyspace: KeySpace) -> Result<&KeySpaceDesc, NativeIndexError> {
@@ -1029,7 +1170,10 @@ impl CellIndex {
     /// the option C carry and flight sources. Versions are distinct across
     /// sources; readers merge them by logical version under the shard lock.
     fn overlays(&self) -> [Option<&Overlay<ValueRecordReference>>; 5] {
-        let [carry, flight_carry, flight_active] = self.flush.sources();
+        let [carry, flight_carry, flight_active] = self
+            .flush
+            .as_deref()
+            .map_or([None; 3], CellFlushState::sources);
         [
             Some(&self.overlay),
             self.sealed.as_deref(),

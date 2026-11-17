@@ -131,6 +131,16 @@ struct Options {
     replay_limits: Option<ReplayLimits>,
     #[serde(default)]
     owner_append_occupancy: Option<usize>,
+    /// The database's checkpoint protocol (spec §10.3); absent keeps the
+    /// engine default (`exact`). Validated by the engine at open.
+    #[serde(default)]
+    checkpoint_mode: Option<tidehunter::distributed::remote_db::CheckpointMode>,
+    /// Measurement only: Exact images encode every cell with the legacy
+    /// streaming encoder (`RemoteDatabaseConfig::force_streaming_cell_encoder`).
+    /// Separates the `exact` (true) and `exact_encode_once` (absent or false)
+    /// arms of the option C attribution. Absent keeps the engine default.
+    #[serde(default)]
+    force_streaming_cell_encoder: Option<bool>,
     #[serde(default)]
     external_remote_config: Option<tidehunter::distributed::remote_db::RemoteDatabaseConfig>,
     #[serde(default)]
@@ -682,21 +692,42 @@ const COORDINATOR_INTERVAL_COUNTERS: [&str; 30] = [
     "write_checkpoint_diagnostic_index_prepare_count",
 ];
 
+/// Option C counters (checkpoint option C spec §11.4) are every coordinator
+/// metric named `cell_*`.
+fn is_option_c_metric(name: &str) -> bool {
+    name.starts_with("cell_")
+}
+
+/// Option C levels: gauges (`cell_gauge_*`) and lifetime maxima (names
+/// holding `_max` or `peak`). Everything else is a cumulative counter whose
+/// measurement window is its end value minus its start value.
+fn is_option_c_level(name: &str) -> bool {
+    name.starts_with("cell_gauge_") || name.contains("_max") || name.contains("peak")
+}
+
 fn coordinator_counter_snapshot(db: &sui::Db) -> BTreeMap<&'static str, u64> {
     let mut counters = BTreeMap::new();
     db.visit_timing_metrics(|name, value| {
-        if COORDINATOR_INTERVAL_COUNTERS.contains(&name) {
+        if COORDINATOR_INTERVAL_COUNTERS.contains(&name)
+            || (is_option_c_metric(name) && !is_option_c_level(name))
+        {
             counters.insert(name, value);
         }
     });
     counters
 }
+/// Fixed coordinator counters plus every option C counter of the baseline.
+/// A counter missing at the end, or one that decreased, is an error.
 fn coordinator_interval_delta(
     baseline: &BTreeMap<&'static str, u64>,
     end: &BTreeMap<&'static str, u64>,
 ) -> Result<BTreeMap<&'static str, u64>, String> {
     let mut deltas = BTreeMap::new();
-    for key in COORDINATOR_INTERVAL_COUNTERS {
+    let option_c = baseline
+        .keys()
+        .copied()
+        .filter(|name| is_option_c_metric(name));
+    for key in COORDINATOR_INTERVAL_COUNTERS.into_iter().chain(option_c) {
         let start = baseline
             .get(key)
             .ok_or_else(|| format!("coordinator interval baseline missing {key}"))?;
@@ -709,6 +740,30 @@ fn coordinator_interval_delta(
         deltas.insert(key, delta);
     }
     Ok(deltas)
+}
+
+/// Option C counters and levels at one measurement boundary. The runner
+/// keeps the start and end observations; a window is end minus start for
+/// counters, while levels are read at each boundary.
+fn option_c_observation(db: &sui::Db) -> serde_json::Value {
+    let mut counters = BTreeMap::new();
+    let mut levels = BTreeMap::new();
+    db.visit_timing_metrics(|name, value| {
+        if !is_option_c_metric(name) {
+            return;
+        }
+        if is_option_c_level(name) {
+            levels.insert(name, value);
+        } else {
+            counters.insert(name, value);
+        }
+    });
+    serde_json::json!({
+        "available": !counters.is_empty(),
+        "scope": "coordinator option C counters (cell flushers, scheduler, snapshot actor, Exact checkpoints, Admission, recovery); cumulative since open",
+        "counters": counters,
+        "levels": levels
+    })
 }
 
 pub struct TidehunterBackend {
@@ -1143,6 +1198,12 @@ async fn open_with_shape(
     if let Some(occupancy) = options.owner_append_occupancy {
         remote_config.owner_append_occupancy = occupancy;
     }
+    if let Some(mode) = options.checkpoint_mode {
+        remote_config.checkpoint_mode = mode;
+    }
+    if let Some(force) = options.force_streaming_cell_encoder {
+        remote_config.force_streaming_cell_encoder = force;
+    }
     // Top-level diagnostics are armed only after warm-up; never consume samples
     // in startup qualification, preload or warm-up via open-time configuration.
     remote_config.write_profile_limit = 0;
@@ -1194,6 +1255,7 @@ async fn open_with_shape(
     let mut effective_configuration = serde_json::json!({
         "backend": selected_backend,
         "history_persistence": remote_config.history_persistence,
+        "checkpoint_mode": remote_config.checkpoint_mode,
         "live_queue_geometry": remote_config.live_nvme.as_ref().map(|live| live.queue_geometry),
         "live_export_mode": remote_config.live_nvme.as_ref().map(|live| live.export_mode),
         "transport": transport.label(),
@@ -1263,6 +1325,9 @@ async fn open_with_shape(
         },
         "coordinator_path": coordinator_path
     });
+    // Outside the literal: one more key exceeds `json!`'s macro recursion limit.
+    effective_configuration["force_streaming_cell_encoder"] =
+        serde_json::json!(remote_config.force_streaming_cell_encoder);
     effective_configuration["client"]["lifecycle_timeout_ms"] = serde_json::json!(
         remote_config
             .timeout
@@ -1658,10 +1723,11 @@ impl KvBackend for TidehunterBackend {
                 }
             });
         }
+        let option_c = option_c_observation(db);
         let Some(monitor) = db.read_evidence_monitor() else {
             return Ok(
                 serde_json::json!({"available": true, "coordinator": coordinator,
-                "nvmeof": nvmeof, "live_nvmeof": live_nvmeof,
+                "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "option_c": option_c,
                 "owner_executor": {"available": false, "error": "read evidence monitor unavailable"}}),
             );
         };
@@ -1671,7 +1737,7 @@ impl KvBackend for TidehunterBackend {
         };
         Ok(
             serde_json::json!({"available": true, "coordinator": coordinator,
-            "owner_executor": owners,
+            "owner_executor": owners, "option_c": option_c,
             "nvmeof": nvmeof, "live_nvmeof": live_nvmeof}),
         )
     }
@@ -3286,6 +3352,94 @@ mod tests {
         let mut reset = end;
         reset.insert(COORDINATOR_INTERVAL_COUNTERS[0], 9);
         assert!(coordinator_interval_delta(&baseline, &reset).is_err());
+    }
+
+    #[test]
+    fn option_c_counters_join_the_interval_and_levels_stay_out() {
+        for (name, level) in [
+            ("cell_captured", false),
+            ("cell_w3_frame_bytes", false),
+            ("cell_root_payload_cell_encodes", false),
+            ("cell_maintenance_cpu_ns", false),
+            ("cell_queue_wait_max_ns", true),
+            ("cell_w0_install_hold_max_ns", true),
+            ("cell_scratch_capacity_peak", true),
+            ("cell_recovery_peak_resident_bytes", true),
+            ("cell_gauge_queue_depth", true),
+            ("cell_gauge_lag_l_f_batches", true),
+        ] {
+            assert!(is_option_c_metric(name));
+            assert_eq!(is_option_c_level(name), level, "{name}");
+        }
+        assert!(!is_option_c_metric("write_checkpoint_ns"));
+        let fixed = |value| {
+            COORDINATOR_INTERVAL_COUNTERS
+                .into_iter()
+                .map(move |key| (key, value))
+        };
+        let baseline: BTreeMap<_, _> = fixed(10)
+            .chain([("cell_captured", 4), ("cell_exact_checkpoints", 1)])
+            .collect();
+        let end: BTreeMap<_, _> = fixed(15)
+            .chain([("cell_captured", 74), ("cell_exact_checkpoints", 1)])
+            .collect();
+        let delta = coordinator_interval_delta(&baseline, &end).unwrap();
+        assert_eq!(delta.len(), COORDINATOR_INTERVAL_COUNTERS.len() + 2);
+        assert_eq!(delta["cell_captured"], 70);
+        assert_eq!(delta["cell_exact_checkpoints"], 0);
+        let mut missing = end.clone();
+        missing.remove("cell_captured");
+        assert!(coordinator_interval_delta(&baseline, &missing).is_err());
+        let mut reset = end;
+        reset.insert("cell_captured", 3);
+        assert!(coordinator_interval_delta(&baseline, &reset).is_err());
+    }
+
+    #[test]
+    fn checkpoint_mode_option_is_typed_and_optional() {
+        let base = serde_json::json!({"path": "/tmp/unused", "transport": {"kind": "tcp"}});
+        assert!(parse_options(&base).unwrap().checkpoint_mode.is_none());
+        for (text, mode) in [
+            (
+                "exact",
+                tidehunter::distributed::remote_db::CheckpointMode::Exact,
+            ),
+            (
+                "per_cell",
+                tidehunter::distributed::remote_db::CheckpointMode::PerCell,
+            ),
+        ] {
+            let mut options = base.clone();
+            options["checkpoint_mode"] = serde_json::json!(text);
+            assert_eq!(parse_options(&options).unwrap().checkpoint_mode, Some(mode));
+        }
+        let mut options = base;
+        options["checkpoint_mode"] = serde_json::json!("percell");
+        assert!(parse_options(&options).is_err());
+    }
+
+    #[test]
+    fn force_streaming_cell_encoder_option_is_typed_and_optional() {
+        let base = serde_json::json!({"path": "/tmp/unused", "transport": {"kind": "tcp"}});
+        assert!(
+            parse_options(&base)
+                .unwrap()
+                .force_streaming_cell_encoder
+                .is_none()
+        );
+        for force in [false, true] {
+            let mut options = base.clone();
+            options["force_streaming_cell_encoder"] = serde_json::json!(force);
+            assert_eq!(
+                parse_options(&options)
+                    .unwrap()
+                    .force_streaming_cell_encoder,
+                Some(force)
+            );
+        }
+        let mut options = base;
+        options["force_streaming_cell_encoder"] = serde_json::json!("yes");
+        assert!(parse_options(&options).is_err());
     }
 
     #[cfg(not(feature = "fabric"))]

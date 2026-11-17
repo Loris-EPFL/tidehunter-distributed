@@ -91,15 +91,13 @@ impl IndexWriter<'_> {
                 return Err(NativeIndexError::Invalid("fixture base differs from root"));
             }
             if let std::collections::hash_map::Entry::Vacant(slot) = shard.entry(identity) {
-                index.check_capacity(cell_directory_charge(&entry.cell))?;
-                super::shards::add(
-                    &index.accounting.directory,
-                    cell_directory_charge(&entry.cell),
-                );
+                let charge = cell_directory_charge(index.mode, &entry.cell);
+                index.check_capacity(charge)?;
+                super::shards::add(&index.accounting.directory, charge);
                 state.cell_order.push(slot.key().clone());
                 slot.insert(CellIndex {
                     generation: state.generation,
-                    flush: CellFlushState::new(entry.coverage),
+                    flush: index.new_cell_flush(entry.coverage),
                     ..Default::default()
                 });
             }

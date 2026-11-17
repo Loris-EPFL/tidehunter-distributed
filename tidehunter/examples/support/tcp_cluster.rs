@@ -268,6 +268,7 @@ pub fn prepare_external_case_with_durability(
         write_profile_limit: 0,
         index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
         checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
+        force_streaming_cell_encoder: false,
     };
     fs::write(
         directory.join("remote.yaml"),
@@ -1052,6 +1053,7 @@ impl LoopbackCluster {
             write_profile_limit: 0,
             index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
             checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
+            force_streaming_cell_encoder: false,
         };
         // TLS configuration contains only paths, but it must not be presented as
         // a persistent usable credential bundle after the private tempdir closes.

@@ -58,6 +58,9 @@ pub(super) struct WriterState {
     pub cells: CellDirectory,
     /// Reused by `promote_committed` so a promotion allocates nothing.
     scratch: Vec<(usize, CellKey)>,
+    /// Measurement only (`RemoteDatabaseConfig::force_streaming_cell_encoder`):
+    /// Exact images encode every cell with the legacy streaming path.
+    force_streaming: bool,
 }
 
 /// Exclusive publication/maintenance access. Dereferences to the index so every
@@ -71,6 +74,15 @@ impl Deref for IndexWriter<'_> {
     type Target = NativeIndex;
     fn deref(&self) -> &NativeIndex {
         self.index
+    }
+}
+
+impl IndexWriter<'_> {
+    /// Measurement only: make Exact images use the legacy streaming cell
+    /// encoder (scratch limit 0, so every non-empty cell streams). The bytes
+    /// written are identical; only the encoding work differs. Set at open.
+    pub(crate) fn set_force_streaming_cell_encoder(&mut self, on: bool) {
+        self.state.force_streaming = on;
     }
 }
 
@@ -115,17 +127,15 @@ impl NativePendingSink for IndexWriter<'_> {
         // One shard lock for the whole staged entry; no other shard is touched.
         let mut shard = index.shard_for(&identity).write();
         if !shard.contains_key(&identity) {
-            index.check_capacity(cell_directory_charge(&identity.1))?;
-            add(
-                &index.accounting.directory,
-                cell_directory_charge(&identity.1),
-            );
+            let charge = cell_directory_charge(index.mode, &identity.1);
+            index.check_capacity(charge)?;
+            add(&index.accounting.directory, charge);
             state.cell_order.push(identity.clone());
             shard.insert(
                 identity.clone(),
                 CellIndex {
                     generation: state.generation,
-                    flush: CellFlushState::new(state.cells.floor),
+                    flush: index.new_cell_flush(state.cells.floor),
                     ..Default::default()
                 },
             );
@@ -228,9 +238,16 @@ impl IndexWriter<'_> {
                     add(&index.accounting.overlay, charge);
                     add(&index.accounting.retained_versions, 1);
                     // Scalar dirty metadata of this cell; the totals mirror
-                    // the accounting adds above (spec §9.1).
-                    cell.flush
-                        .record_active(key_len, reference.batch_version, new_row);
+                    // the accounting adds above (spec §9.1). Exact cells
+                    // keep none.
+                    if let Some(flush) = cell.flush.as_deref_mut() {
+                        flush.record_active(
+                            key_len,
+                            reference.batch_version,
+                            new_row,
+                            index.cell_epoch,
+                        );
+                    }
                     state.latest = Some(state.latest.map_or(reference.mutation_version(), |v| {
                         v.max(reference.mutation_version())
                     }));
@@ -241,10 +258,10 @@ impl IndexWriter<'_> {
             at += run;
         }
         index.publication_shards.record(shards_touched);
-        if promoted != 0 {
+        if promoted != 0 && index.mode == CheckpointMode::PerCell {
             // Release: a flush scheduler that observes the hint with Acquire
             // then rereads cell metadata under shard locks; the hint carries
-            // no data itself.
+            // no data itself. An Exact index has no flush scheduler.
             index
                 .cell_dirty
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -510,11 +527,16 @@ impl IndexWriter<'_> {
             state.capture = Some(capture);
             return None;
         }
-        // One encoder share of the payload scratch allowance (spec §3.1).
-        let scratch_limit = super::snapshot::cell_scratch_limit(
-            index.max_metadata_bytes,
-            cell_flushers(index.shards.len()),
-        );
+        // One encoder share of the payload scratch allowance (spec §3.1), or
+        // none when the measurement switch forces the streaming encoder.
+        let scratch_limit = if state.force_streaming {
+            0
+        } else {
+            super::snapshot::cell_scratch_limit(
+                index.max_metadata_bytes,
+                cell_flushers(index.shards.len()),
+            )
+        };
         Some(PreparedIndexImage::new(
             index.database,
             capture.schema,
@@ -636,7 +658,9 @@ impl IndexWriter<'_> {
                 !values.is_empty()
             });
             cell.merge_overlay(sealed);
-            cell.flush.recount_after_exact_install(&cell.overlay);
+            if let Some(flush) = cell.flush.as_deref_mut() {
+                flush.recount_after_exact_install(&cell.overlay);
+            }
             if let Some(base) = &captured.base {
                 add(&accounting.retained_bytes, base.retained_bytes);
                 add(&accounting.retained_versions, base.retained_versions);

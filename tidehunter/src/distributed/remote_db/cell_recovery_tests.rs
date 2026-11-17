@@ -228,7 +228,8 @@ struct Tamper {
 /// cut; the state is then set to the loader's (watermark at `F`).
 fn loaded(history: &History, root: &CellRoot, budget: usize, tamper: Tamper) -> NativeIndex {
     let shape = shape();
-    let index = NativeIndex::with_shards(&shape, DATABASE, budget, 8).unwrap();
+    let index =
+        NativeIndex::with_mode(&shape, DATABASE, budget, 8, CheckpointMode::PerCell).unwrap();
     let frames: HashMap<CellId, BatchVersion> = root
         .cells
         .iter()

@@ -29,17 +29,10 @@
 //! Lock: [`IndexStore`]'s catalog mutex is a leaf lock on cold paths (segment
 //! creation, seal, mapping, GC). No I/O runs under it, and it is never taken
 //! while the index writer, the publisher or an index shard is held.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "option C store; opened, given to the flusher pool and swept by the per-cell commit stage"
-    )
-)]
 
 use super::cell_contract::{IndexStoreFileId, RootFile};
 use super::cell_flush::{NewCellBase, PreparedCell};
-use super::snapshot::{CellEncoder, CellFile, CellFrame, map_file};
+use super::snapshot::{CellEncodeStats, CellEncoder, CellFile, CellFrame, map_file};
 use super::*;
 use minibytes::BytesOwner;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,6 +40,7 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 /// Most cell results in one ready group (spec §4.3).
 pub(crate) const GROUP_CELLS: usize = 32;
@@ -135,6 +129,51 @@ pub(crate) struct GcSweep {
     pub deleted: Vec<IndexStoreFileId>,
     /// More segments may be eligible: the sweep reached its limit.
     pub more: bool,
+}
+
+/// Cumulative counters of one [`IndexStoreWriter`] (spec §11.4). Its owning
+/// flusher reads them after each append and seal; no other thread does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IndexStoreWriterStats {
+    /// Counters of the writer's encoder.
+    pub encode: CellEncodeStats,
+    /// Appended frames (cells with a retained row) and their framed bytes,
+    /// eight-byte headers included.
+    pub frames: u64,
+    pub frame_bytes: u64,
+    /// Rows and retained versions of the appended frames.
+    pub rows: u64,
+    pub versions: u64,
+    /// Segments created with `create_new`.
+    pub segments_created: u64,
+    /// Groups made durable, and the bytes of their segments.
+    pub groups_sealed: u64,
+    pub sealed_bytes: u64,
+    /// One file sync and one directory sync per sealed segment, and their
+    /// summed wall time.
+    pub file_syncs: u64,
+    pub directory_syncs: u64,
+    pub sync_ns: u64,
+    /// Read-only mappings of sealed segments.
+    pub mappings: u64,
+}
+
+/// Space of the sealed segments of one store (spec §10.1, §11.4), sampled at
+/// a measurement boundary by [`IndexStore::space`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IndexStoreSpace {
+    /// Sealed segments in the catalog (`Retiring` ones included) and their
+    /// bytes.
+    pub segments: u64,
+    pub sealed_bytes: u64,
+    /// Frame bytes that live bases of the index reference in those segments.
+    /// The rest of `sealed_bytes` is dead space inside the segments.
+    pub live_bytes: u64,
+    /// Bytes of sealed segments that no retained root, live base or
+    /// in-memory pin references: the next GC sweep may delete them.
+    pub gc_pending_bytes: u64,
+    /// Segments a writer created and has not sealed.
+    pub writing_segments: u64,
 }
 
 impl IndexStore {
@@ -378,6 +417,59 @@ impl IndexStore {
             .collect()
     }
 
+    /// Sealed-segment space against the live bases of `index` and the file
+    /// tables of `retained_roots` (the GC predicate of
+    /// [`Self::collect_garbage`]). One index shard read lock at a time, then
+    /// the catalog lock, never both: O(cells), for measurement boundaries,
+    /// not for a write path.
+    pub(crate) fn space(
+        &self,
+        retained_roots: &[&[RootFile]],
+        index: &NativeIndex,
+    ) -> IndexStoreSpace {
+        let mut live: BTreeMap<IndexStoreFileId, u64> = BTreeMap::new();
+        for shard in index.shards.iter() {
+            let cells = shard.read();
+            for file in cells
+                .values()
+                .filter_map(|cell| cell.base.as_ref())
+                .filter_map(|block| block.file.as_ref())
+            {
+                let Some(id) = file
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(IndexStoreFileId::parse_canonical)
+                    .filter(|id| matches!(id, IndexStoreFileId::Segment { .. }))
+                else {
+                    continue;
+                };
+                let bytes = live.entry(id).or_default();
+                *bytes = bytes.saturating_add(file.bytes);
+            }
+        }
+        let rooted: BTreeSet<IndexStoreFileId> = retained_roots
+            .iter()
+            .flat_map(|root| root.iter().map(|file| file.id))
+            .collect();
+        let mut space = IndexStoreSpace::default();
+        let catalog = self.catalog.lock();
+        for (id, entry) in &catalog.files {
+            if entry.state == FileState::Writing {
+                space.writing_segments += 1;
+                continue;
+            }
+            space.segments += 1;
+            space.sealed_bytes = space.sealed_bytes.saturating_add(entry.sealed_len);
+            let live_bytes = live.get(id).copied().unwrap_or(0);
+            space.live_bytes = space.live_bytes.saturating_add(live_bytes);
+            if live_bytes == 0 && entry.pin.strong_count() == 0 && !rooted.contains(id) {
+                space.gc_pending_bytes = space.gc_pending_bytes.saturating_add(entry.sealed_len);
+            }
+        }
+        space
+    }
+
     fn claim_stream(&self, stream_id: u16) -> Result<(), NativeIndexError> {
         let mut catalog = self.catalog.lock();
         let stream = catalog.streams.entry(stream_id).or_insert(StreamState {
@@ -523,6 +615,9 @@ struct StreamOutput {
     /// precede `slots` in append order.
     ready: Vec<Option<SortedBlock>>,
     failed: bool,
+    /// Counters except the encoder's. Work done before a failure stays
+    /// counted.
+    stats: IndexStoreWriterStats,
 }
 
 impl StreamOutput {
@@ -555,7 +650,13 @@ impl StreamOutput {
         }
         let open = match &mut self.open {
             Some(open) => open,
-            empty => empty.insert(self.store.create_segment(self.stream)?),
+            empty => {
+                let segment = self.store.create_segment(self.stream)?;
+                self.stats.segments_created += 1;
+                #[cfg(test)]
+                crate::failpoints::write_model::boundary("cell_segment_create_after");
+                empty.insert(segment)
+            }
         };
         self.promised = Some(framed_len);
         let offset = open.file.written;
@@ -580,7 +681,17 @@ impl StreamOutput {
         {
             return Err(NativeIndexError::Invalid("index frame length"));
         }
+        self.stats.frames += 1;
+        self.stats.frame_bytes = self.stats.frame_bytes.saturating_add(frame.bytes);
+        self.stats.rows = self.stats.rows.saturating_add(frame.count as u64);
+        self.stats.versions = self
+            .stats
+            .versions
+            .saturating_add(frame.retained_versions as u64);
         self.slots.push(Slot::Frame { frame, cut, floor });
+        // The frame's bytes are in the segment buffer (not yet flushed).
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("cell_frame_write_after");
         Ok(())
     }
 
@@ -618,13 +729,29 @@ impl StreamOutput {
             .buffer
             .into_inner()
             .map_err(|error| NativeIndexError::from(error.into_error()))?;
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("cell_group_flush_after");
+        let sync_started = Instant::now();
         file.sync_all()?;
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("cell_segment_fsync_after");
+        self.stats.file_syncs += 1;
         sync_directory(&self.store.directory)?;
+        #[cfg(test)]
+        crate::failpoints::write_model::boundary("cell_segment_dirsync_after");
+        self.stats.directory_syncs += 1;
+        self.stats.sync_ns = self
+            .stats
+            .sync_ns
+            .saturating_add(u64::try_from(sync_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         let map = map_file(&file, None)?;
+        self.stats.mappings += 1;
         if map.len() as u64 != sealed_len {
             return Err(NativeIndexError::Invalid("sealed index segment length"));
         }
         self.store.mark_sealed(id, sealed_len)?;
+        self.stats.groups_sealed += 1;
+        self.stats.sealed_bytes = self.stats.sealed_bytes.saturating_add(sealed_len);
         let map = Bytes::from_owner(PinnedMap { map, _pin: pin });
         for slot in self.slots.drain(..) {
             let Slot::Frame { frame, cut, floor } = slot else {
@@ -705,8 +832,22 @@ impl IndexStoreWriter {
                 slots: Vec::with_capacity(GROUP_CELLS),
                 ready: Vec::with_capacity(GROUP_CELLS),
                 failed: false,
+                stats: IndexStoreWriterStats::default(),
             },
         })
+    }
+
+    /// Arm or disarm per-phase CPU timing in this writer's encoder.
+    pub(crate) fn set_profile(&mut self, on: bool) {
+        self.encoder.set_profile(on);
+    }
+
+    /// Cumulative counters of this stream, encoder included.
+    pub(crate) fn stats(&self) -> IndexStoreWriterStats {
+        IndexStoreWriterStats {
+            encode: self.encoder.stats(),
+            ..self.output.stats
+        }
     }
 
     /// Encode `cell` once and buffer its frame in the open segment, creating
