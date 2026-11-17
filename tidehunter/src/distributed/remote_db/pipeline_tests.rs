@@ -144,6 +144,7 @@ impl Fixture {
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,
             live_nvme: None,
+            checkpoint_mode: CheckpointMode::Exact,
         };
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));

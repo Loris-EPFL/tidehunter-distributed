@@ -43,10 +43,13 @@ use std::ops::Bound;
 use std::path::Path;
 use typenum::U32;
 
+mod cell_contract;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
+use cell_contract::cell_flushers;
+pub(crate) use cell_contract::{CellRootHeader, PrefixCut};
 pub use retention::IndexReadPin;
 use retention::{CaptureLease, RetentionState, position, view_charge};
 pub(crate) use retention::{PublicationViewReservation, StandingViewBudget};
@@ -1487,6 +1490,7 @@ mod tests {
 
     mod containers;
     mod cursors;
+    mod legacy_fixtures;
     mod lifecycle;
     mod owners;
     mod sharding;

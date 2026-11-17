@@ -40,6 +40,8 @@ pub(crate) struct PreparedIndexImage {
     cells: Vec<FrozenCell>,
     cut: IndexReadCut,
     lease: CaptureLease,
+    /// Payload scratch limit of the one encoder that persists this image.
+    scratch_limit: usize,
 }
 
 pub(crate) struct PersistedIndexImage {
@@ -47,6 +49,13 @@ pub(crate) struct PersistedIndexImage {
     pub(super) cut: IndexReadCut,
     pub(super) lease: CaptureLease,
     pub(crate) metadata: IndexImageMetadata,
+    // The checkpoint diagnostic stage exports these counters; until it reads
+    // them, only tests do. The expectation fails once a reader exists.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "exported by the checkpoint metrics stage")
+    )]
+    pub(crate) encode_stats: CellEncodeStats,
 }
 
 impl PersistedIndexImage {
@@ -67,6 +76,7 @@ impl PreparedIndexImage {
         cells: Vec<FrozenCell>,
         cut: IndexReadCut,
         lease: CaptureLease,
+        scratch_limit: usize,
     ) -> Self {
         Self {
             database,
@@ -74,6 +84,7 @@ impl PreparedIndexImage {
             cells,
             cut,
             lease,
+            scratch_limit,
         }
     }
 
@@ -136,6 +147,9 @@ impl PreparedIndexImage {
         after_create();
         let mut written = Vec::new();
         let mut reused_mappings = HashMap::new();
+        // This thread's only payload scratch; it grows outside serving locks
+        // to at most `scratch_limit` and is reused for every cell.
+        let mut encoder = CellEncoder::new(self.scratch_limit);
         {
             // One fixed buffer combines tiny cells into shared writes. Headers
             // are computed before append, so no per-cell seek/flush is needed.
@@ -143,29 +157,20 @@ impl PreparedIndexImage {
                 .as_mut()
                 .map(|file| BufWriter::with_capacity(16 * 1024, file));
             let mut offset = 0u64;
-            let mut reference_bytes = if writer.is_some() {
-                Vec::with_capacity(REFERENCE_BYTES)
-            } else {
-                Vec::new()
-            };
             for (number, cell) in self.cells.iter_mut().enumerate() {
                 if !reusable(cell, parent, &self.cut, &self.lease.floor) {
-                    if !has_rows(cell, &self.cut, &self.lease.floor) {
-                        cell.base = None;
-                        continue;
-                    }
-                    let writer = writer
-                        .as_mut()
-                        .ok_or(NativeIndexError::Invalid("missing index container"))?;
-                    let encoded = append_cell(
+                    let Some(encoded) = encoder.append(
                         cell,
-                        writer,
+                        writer.as_mut(),
                         &container_path,
                         offset,
                         &self.cut,
                         &self.lease.floor,
-                        &mut reference_bytes,
-                    )?;
+                    )?
+                    else {
+                        cell.base = None;
+                        continue;
+                    };
                     offset = offset
                         .checked_add(encoded.file.bytes)
                         .ok_or(NativeIndexError::Capacity)?;
@@ -272,6 +277,7 @@ impl PreparedIndexImage {
             cut: self.cut,
             lease: self.lease,
             metadata,
+            encode_stats: encoder.stats,
         })
     }
 }
@@ -769,21 +775,284 @@ fn encode_cell_payload(
     })
 }
 
-fn append_cell(
-    cell: &FrozenCell,
-    writer: &mut impl Write,
-    path: &Path,
+/// Payload scratch ceiling of one encoder, independent of the index budget:
+/// 8 MiB, which is below the payload limit of one frame.
+const CELL_SCRATCH_CEILING: usize = 8 << 20;
+const _: () = assert!(CELL_SCRATCH_CEILING <= MAX_IMAGE_BYTES - 8);
+
+/// Payload scratch limit of one encoder (spec §3.1):
+/// `S = min(8 MiB, M / (4 P), MAX_IMAGE_BYTES - 8)`, with `M` the resident
+/// index budget and `P` the encoder count. All `P` scratches together stay at
+/// or below `M / 4`. A cell above `S` streams; it is never rejected.
+pub(super) fn cell_scratch_limit(max_metadata_bytes: usize, encoders: usize) -> usize {
+    (max_metadata_bytes / encoders.max(1).saturating_mul(4)).min(CELL_SCRATCH_CEILING)
+}
+
+/// Counters of one image persistence. Buffered cells are encoded once into the
+/// scratch; streamed cells use the exact three-pass fallback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CellEncodeStats {
+    pub buffered_cells: u64,
+    pub streamed_cells: u64,
+    /// Streamed cells whose final payload fits the scratch: their pre-encode
+    /// size bound was above the scratch limit, the payload was not.
+    pub conservative_fallbacks: u64,
+    /// Rewritten cells without a retained row. They get no frame.
+    pub empty_cells: u64,
+    /// Canonical payload encodings: one per buffered and two per streamed cell.
+    pub encode_passes: u64,
+    /// Merged base/overlay row traversals, including the streaming count pass
+    /// and both directory and row traversals of each streaming encoding.
+    pub row_passes: u64,
+    /// Reference encodings: once per retained version when buffered, twice
+    /// when streamed.
+    pub references_encoded: u64,
+    /// Framed bytes, header included, appended by each path.
+    pub buffered_bytes: u64,
+    pub streamed_bytes: u64,
+    /// Row-body bytes moved left over unused directory slots.
+    pub moved_bytes: u64,
+    /// Largest payload scratch capacity. Never above the scratch limit.
+    pub scratch_capacity: u64,
+}
+
+/// One encoder's reused payload and reference scratch. A cell whose
+/// conservative size bound fits `limit` is encoded once into `payload`; any
+/// other cell streams, so the scratch never grows above `limit`.
+struct CellEncoder {
+    payload: Vec<u8>,
+    reference: Vec<u8>,
+    limit: usize,
+    stats: CellEncodeStats,
+}
+
+impl CellEncoder {
+    fn new(limit: usize) -> Self {
+        Self {
+            payload: Vec::new(),
+            reference: Vec::with_capacity(REFERENCE_BYTES),
+            limit: limit.min(CELL_SCRATCH_CEILING),
+            stats: CellEncodeStats::default(),
+        }
+    }
+
+    /// Append the canonical frame of `cell` at `offset`. Returns `None`, and
+    /// writes nothing, when the cell retains no row. The path is chosen before
+    /// encoding: a buffered encode never overflows into a second encoding.
+    fn append<W: Write>(
+        &mut self,
+        cell: &FrozenCell,
+        writer: Option<&mut W>,
+        path: &Path,
+        offset: u64,
+        cut: &IndexReadCut,
+        floor: &IndexReadCut,
+    ) -> Result<Option<WrittenCell>, NativeIndexError> {
+        self.stats.row_passes += 1;
+        let (count, bytes, digest, summary) = if let Some((rows, upper)) =
+            buffered_bound(cell, self.limit)
+        {
+            let Some((count, summary)) = self.encode_buffered(cell, rows, upper, cut, floor)?
+            else {
+                self.stats.empty_cells += 1;
+                return Ok(None);
+            };
+            let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
+            let (bytes, digest) = write_frame(&self.payload, offset, writer)?;
+            self.stats.buffered_cells += 1;
+            self.stats.encode_passes += 1;
+            self.stats.buffered_bytes += bytes;
+            self.stats.references_encoded += summary.retained_versions as u64;
+            (count, bytes, digest, summary)
+        } else {
+            let count = Rows::new(cell)
+                .filter(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
+                .count();
+            if count == 0 {
+                self.stats.empty_cells += 1;
+                return Ok(None);
+            }
+            let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
+            let (bytes, digest, summary) =
+                stream_cell(cell, count, cut, floor, offset, writer, &mut self.reference)?;
+            self.stats.streamed_cells += 1;
+            self.stats.encode_passes += 2;
+            self.stats.row_passes += 4;
+            self.stats.streamed_bytes += bytes;
+            self.stats.references_encoded += 2 * summary.retained_versions as u64;
+            if summary.length <= self.limit {
+                self.stats.conservative_fallbacks += 1;
+            }
+            (count, bytes, digest, summary)
+        };
+        Ok(Some(WrittenCell {
+            file: CellFile {
+                path: path.to_owned(),
+                offset,
+                bytes,
+                digest,
+                floor: floor.clone(),
+            },
+            count,
+            retained_bytes: summary.retained_bytes,
+            retained_versions: summary.retained_versions,
+        }))
+    }
+
+    /// One merged-row traversal that encodes each retained reference once.
+    /// The payload is `[count][offsets][rows]`, and the offsets precede the
+    /// rows, so the directory is reserved for every candidate row, filled per
+    /// emitted row and compacted by at most one move of the row bodies.
+    /// Returns the emitted row count, or `None` when no row is retained.
+    fn encode_buffered(
+        &mut self,
+        cell: &FrozenCell,
+        candidates: usize,
+        upper: usize,
+        cut: &IndexReadCut,
+        floor: &IndexReadCut,
+    ) -> Result<Option<(usize, PayloadSummary)>, NativeIndexError> {
+        let payload = &mut self.payload;
+        payload.clear();
+        // `upper` bounds the provisional and the final length and is at most
+        // `limit`, so this is the only growth and the capacity stays bounded.
+        payload.reserve_exact(upper);
+        // Recorded before encoding, so a cell without rows is counted too.
+        self.stats.scratch_capacity = self.stats.scratch_capacity.max(payload.capacity() as u64);
+        let body = 4 + 4 * candidates;
+        payload.resize(body, 0);
+        let mut rows = 0usize;
+        let mut retained_bytes = 0usize;
+        let mut retained_versions = 0usize;
+        for (key, base, overlay) in Rows::new(cell) {
+            let mut versions = retained(base, overlay, cut, floor);
+            let Some(first) = versions.next() else {
+                continue;
+            };
+            let start = u32::try_from(payload.len()).map_err(|_| NativeIndexError::Capacity)?;
+            payload[4 + 4 * rows..8 + 4 * rows].copy_from_slice(&start.to_be_bytes());
+            payload.extend_from_slice(
+                &u32::try_from(key.len())
+                    .map_err(|_| NativeIndexError::Capacity)?
+                    .to_be_bytes(),
+            );
+            payload.extend_from_slice(key);
+            let count_at = payload.len();
+            payload.extend_from_slice(&[0; 4]);
+            let mut n = 0usize;
+            for reference in std::iter::once(first).chain(versions) {
+                encode_reference(&reference, payload);
+                n += 1;
+            }
+            payload[count_at..count_at + 4].copy_from_slice(
+                &u32::try_from(n)
+                    .map_err(|_| NativeIndexError::Capacity)?
+                    .to_be_bytes(),
+            );
+            retained_bytes += n * (VERSION_CHARGE + key.len());
+            retained_versions += n;
+            rows += 1;
+        }
+        if rows == 0 {
+            return Ok(None);
+        }
+        let gap = 4 * (candidates - rows);
+        if gap != 0 {
+            // Every used offset points into the row bodies, past `body`, and
+            // moves left by the same `gap`.
+            payload.copy_within(body.., body - gap);
+            payload.truncate(payload.len() - gap);
+            let shift = u32::try_from(gap).map_err(|_| NativeIndexError::Capacity)?;
+            for slot in payload[4..4 + 4 * rows].chunks_exact_mut(4) {
+                let offset = u32::from_be_bytes([slot[0], slot[1], slot[2], slot[3]]) - shift;
+                slot.copy_from_slice(&offset.to_be_bytes());
+            }
+            self.stats.moved_bytes += (payload.len() - (body - gap)) as u64;
+        }
+        payload[..4].copy_from_slice(
+            &u32::try_from(rows)
+                .map_err(|_| NativeIndexError::Capacity)?
+                .to_be_bytes(),
+        );
+        debug_assert!(payload.len() <= upper, "cell payload above its bound");
+        Ok(Some((
+            rows,
+            PayloadSummary {
+                length: payload.len(),
+                retained_bytes,
+                retained_versions,
+            },
+        )))
+    }
+}
+
+/// Conservative payload bound of `cell` as `(candidate rows, bound)`, or
+/// `None` when the bound exceeds `limit` or overflows. Every base and overlay
+/// row counts its directory slot, row prefix, key and all its versions. Equal
+/// keys, equal versions and discarded versions only reduce the output, so the
+/// bound covers the reserved directory plus row bodies and the final payload.
+/// The overlay walk stops at the limit and decodes no reference.
+fn buffered_bound(cell: &FrozenCell, limit: usize) -> Option<(usize, usize)> {
+    // A base payload is `[count][offsets][rows]` with one offset per row.
+    let mut upper = cell.base.as_ref().map_or(4, |base| base.bytes.len());
+    if upper > limit {
+        return None;
+    }
+    let candidates = cell
+        .base
+        .as_ref()
+        .map_or(0, |base| base.count)
+        .checked_add(cell.overlay.len())?;
+    for (key, versions) in cell.overlay.iter() {
+        upper = versions
+            .len()
+            .checked_mul(REFERENCE_BYTES)?
+            .checked_add(12 + key.len())?
+            .checked_add(upper)?;
+        if upper > limit {
+            return None;
+        }
+    }
+    Some((candidates, upper))
+}
+
+/// Write the CRC frame of a final payload. CRC32 covers the payload; the
+/// BLAKE2b-32 digest covers the final header, then the payload.
+fn write_frame(
+    payload: &[u8],
     offset: u64,
+    writer: &mut impl Write,
+) -> Result<(u64, [u8; 32]), NativeIndexError> {
+    let length = u32::try_from(payload.len()).map_err(|_| NativeIndexError::Capacity)?;
+    let bytes = u64::from(length) + 8;
+    offset
+        .checked_add(bytes)
+        .ok_or(NativeIndexError::Capacity)?;
+    let mut header = [0u8; 8];
+    header[..4].copy_from_slice(&length.to_be_bytes());
+    header[4..].copy_from_slice(&crc32fast::hash(payload).to_be_bytes());
+    let mut hash = blake2b_simd::Params::new().hash_length(32).to_state();
+    hash.update(&header);
+    hash.update(payload);
+    writer.write_all(&header)?;
+    writer.write_all(payload)?;
+    let mut digest = [0; 32];
+    digest.copy_from_slice(hash.finalize().as_bytes());
+    Ok((bytes, digest))
+}
+
+/// Exact streaming fallback for a cell with `count` retained rows: one
+/// encoding computes the CRC, a second one hashes and writes. It holds no
+/// payload in memory, so any accepted frame size is still possible.
+fn stream_cell(
+    cell: &FrozenCell,
+    count: usize,
     cut: &IndexReadCut,
     floor: &IndexReadCut,
+    offset: u64,
+    writer: &mut impl Write,
     reference_bytes: &mut Vec<u8>,
-) -> Result<WrittenCell, NativeIndexError> {
-    let count = Rows::new(cell)
-        .filter(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
-        .count();
-    if count == 0 {
-        return Err(NativeIndexError::Invalid("empty cell append"));
-    }
+) -> Result<(u64, [u8; 32], PayloadSummary), NativeIndexError> {
     let mut crc = crc32fast::Hasher::new();
     let summary = encode_cell_payload(cell, count, cut, floor, reference_bytes, |bytes| {
         crc.update(bytes);
@@ -808,16 +1077,9 @@ fn append_cell(
     debug_assert_eq!(emitted, summary, "immutable captured cell serialization");
     let mut digest = [0; 32];
     digest.copy_from_slice(hash.finalize().as_bytes());
-    Ok(WrittenCell {
-        file: CellFile {
-            path: path.to_owned(),
-            offset,
-            bytes,
-            digest,
-            floor: floor.clone(),
-        },
-        count,
-        retained_bytes: summary.retained_bytes,
-        retained_versions: summary.retained_versions,
-    })
+    Ok((bytes, digest, summary))
 }
+
+#[cfg(test)]
+#[path = "cell_encode_tests.rs"]
+mod cell_encode_tests;
