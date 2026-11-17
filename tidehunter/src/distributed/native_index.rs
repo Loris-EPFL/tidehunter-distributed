@@ -95,6 +95,10 @@ pub struct SparseIndexView {
     charge: usize,
     /// Bytes owned by the standing budget, not by `charge`; zero otherwise.
     uncharged: usize,
+    /// Set once, under the retention `cold` lock, when a cut of this view
+    /// leaves one read call: then `uncharged` bytes are charged to the view
+    /// allowance until the last reference drops.
+    owner_charged: std::sync::atomic::AtomicBool,
 }
 
 impl PartialEq for SparseIndexView {
@@ -109,8 +113,12 @@ impl Eq for SparseIndexView {}
 
 impl Drop for SparseIndexView {
     fn drop(&mut self) {
-        self.retention
-            .release_view(self.floor, self.charge, self.uncharged);
+        self.retention.release_view(
+            self.floor,
+            self.charge,
+            self.uncharged,
+            *self.owner_charged.get_mut(),
+        );
     }
 }
 
@@ -194,8 +202,10 @@ pub struct NativeIndexStats {
     /// Frozen capture plus sparse views and their reservations. Capture and view
     /// allowances are independently bounded, so the sum can reach twice the budget.
     pub transient_metadata_bytes: usize,
-    /// Replaced standing-budget sparse views still held by readers. Not part of
-    /// either budget; bounded by the concurrent reads and lasting one read.
+    /// Standing-budget sparse views held inside one read only (replaced,
+    /// without an owner charge). Not part of either budget; at most
+    /// `max_pending_reads` views from admitted reads plus the transient and
+    /// fixed holders listed at `StandingViewBudget`.
     pub reader_held_view_bytes: usize,
 }
 
@@ -560,9 +570,11 @@ impl NativeIndex {
     /// Resolve `Latest` to the current publication watermark; any other cut
     /// passes through. Resolve once per read or batch, then use the explicit
     /// cut for every lookup and for the pin, so they all see the same cut.
-    pub fn resolve_cut(&self, cut: IndexReadCut) -> IndexReadCut {
+    /// No owner charge: hold the result only inside one read (see
+    /// `StandingViewBudget`).
+    pub(crate) fn resolve_cut(&self, cut: IndexReadCut) -> IndexReadCut {
         if matches!(cut, IndexReadCut::Latest) {
-            self.latest_cut()
+            self.call_cut()
         } else {
             cut
         }
@@ -600,7 +612,20 @@ impl NativeIndex {
     }
 
     /// The publication watermark: the newest cut that is entirely applied.
-    pub fn latest_cut(&self) -> IndexReadCut {
+    /// The caller can keep it, so a standing-budget view takes its owner
+    /// charge first.
+    ///
+    /// # Errors
+    /// `Capacity` when the view allowance cannot hold the owner charge.
+    pub fn latest_cut(&self) -> Result<IndexReadCut, NativeIndexError> {
+        let cut = self.call_cut();
+        self.charge_owned_cut(&cut)?;
+        Ok(cut)
+    }
+
+    /// The publication watermark without an owner charge. Only for a cut
+    /// held inside one read (see `StandingViewBudget`).
+    pub(crate) fn call_cut(&self) -> IndexReadCut {
         IndexReadCut::clone(&**self.published.load())
     }
 
@@ -649,8 +674,9 @@ impl NativeIndex {
         cut: IndexReadCut,
     ) -> Result<Vec<(Bytes, ValueRecordReference)>, NativeIndexError> {
         // The pin holds the cut for the whole traversal: a checkpoint installed
-        // meanwhile cannot advance the retention floor past it.
-        let pin = self.pin_cut(cut)?;
+        // meanwhile cannot advance the retention floor past it. It ends with
+        // this call, so it takes no owner charge.
+        let pin = self.pin_call_cut(cut)?;
         let mut cursor = self.scan_cursor(keyspace, after_reduced, reverse, pin.cut())?;
         let mut output = Vec::with_capacity(limit.min(4096));
         while output.len() < limit {
@@ -683,7 +709,7 @@ impl NativeIndex {
         cut: IndexReadCut,
     ) -> Result<Vec<(Bytes, ValueRecordReference)>, NativeIndexError> {
         // See `scan`: hold the cut pinned until the traversal ends.
-        let pin = self.pin_cut(cut)?;
+        let pin = self.pin_call_cut(cut)?;
         let mut cursor = self.scan_cursor_impl(keyspace, after, reverse, pin.cut(), true)?;
         let mut rows = Vec::with_capacity(limit.min(256));
         while rows.len() < limit.min(256) {
@@ -2107,7 +2133,7 @@ mod tests {
             Some(b"recreated".as_slice())
         );
         let empty = NativeIndex::open_snapshot(&empty, &shape(), DATABASE, BUDGET).unwrap();
-        assert_eq!(empty.latest_cut(), IndexReadCut::BeforeAll);
+        assert_eq!(empty.call_cut(), IndexReadCut::BeforeAll);
         assert_eq!(empty.stats().retained_versions, 0);
     }
 

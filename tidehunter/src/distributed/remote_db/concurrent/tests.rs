@@ -2071,3 +2071,259 @@ fn all_invalid_writes_release_budget_and_keep_owner_healthy() {
     db.ensure_healthy().unwrap();
     db.shutdown().unwrap();
 }
+
+/// Readers blocked on read admission hold no sparse view: after its lookup a
+/// point read pins only the retention floor. Each reader resolves a different
+/// view that is then replaced, yet the reader-held bytes stay within
+/// `max_pending_reads` views (here none), and every read completes once
+/// admission is free.
+#[test]
+fn readers_waiting_for_admission_hold_no_sparse_view() {
+    const READERS: u32 = 8;
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    fixture.config.max_pending_reads = 1;
+    let original = fixture.open();
+    original
+        .write_batch(fixture.operation(1, 100), vec![put(0, 1)])
+        .unwrap();
+    for reader in 0..READERS {
+        original
+            .write_batch(
+                fixture.operation(1 + reader % 4, 101 + u64::from(reader)),
+                vec![put(10 + reader, 10 + reader as u8)],
+            )
+            .unwrap();
+    }
+    let held_connection = original.core.clients[0].client.clone();
+    let held = held_connection.lock();
+    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
+    // An unresolved write on owner 0 makes every later publication sparse.
+    let blocked = {
+        let db = db.clone();
+        let operation = fixture.operation(0, 200);
+        thread::spawn(move || db.write_batch(operation, vec![put(50, 50)]))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while db.database.core.clients[0].queue.snapshot().2.len() != 1 {
+        assert!(Instant::now() < deadline, "blocked write never queued");
+        thread::yield_now();
+    }
+    let mut published = 0u64;
+    let mut publish = |db: &ConcurrentRemoteDatabase| {
+        published += 1;
+        let key = 60 + published as u32;
+        db.write_batch(
+            fixture.operation(1 + key % 4, 300 + published),
+            vec![put(key, 7)],
+        )
+        .unwrap();
+    };
+    publish(&db);
+    assert!(matches!(db.index.call_cut(), IndexReadCut::Sparse(_)));
+    // One replaced, uncharged view held inside a read measures one view.
+    let probe = db.index.call_cut();
+    publish(&db);
+    let view = db.index_stats().reader_held_view_bytes;
+    assert!(view > 0);
+    drop(probe);
+    assert_eq!(db.index_stats().reader_held_view_bytes, 0);
+    // Sample every resolution: a reader's pin stage is recorded after its
+    // pin returns, when its resolved view is already dropped.
+    db.set_read_profile_limit(64);
+    let monitor = db.read_profile_monitor();
+    let pinned = || {
+        monitor
+            .coordinator_resolution_snapshot()
+            .pin_preparation
+            .count
+    };
+    // The one admitted read keeps the only read credit until it is finished.
+    let pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
+    let (results, received) = mpsc::channel();
+    let mut readers = Vec::new();
+    for reader in 0..READERS {
+        let before = pinned();
+        let (db_reader, results) = (db.clone(), results.clone());
+        readers.push(thread::spawn(move || {
+            let key = 10 + reader;
+            results
+                .send((key, db_reader.get(KeySpace(0), &key.to_be_bytes())))
+                .unwrap();
+        }));
+        // The reader resolved the current view and pinned its floor; it now
+        // waits for admission, and the next publication replaces that view.
+        while pinned() == before {
+            assert!(Instant::now() < deadline, "reader {reader} never resolved");
+            thread::yield_now();
+        }
+        publish(&db);
+    }
+    // Every reader is past its lookup, so none holds a view any more; the
+    // admitted read holds only a floor pin as well.
+    let held_bytes = db.index_stats().reader_held_view_bytes;
+    assert!(held_bytes <= db.config.max_pending_reads * view);
+    assert_eq!(held_bytes, 0, "waiting and admitted reads hold no view");
+    assert!(
+        matches!(received.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "readers must still wait for admission"
+    );
+    assert_eq!(
+        db.finish_ready_get(pending.wait())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[1; 32]
+    );
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    drop(results);
+    let mut values: Vec<_> = received
+        .iter()
+        .map(|(key, value)| (key, value.unwrap().unwrap().to_vec()))
+        .collect();
+    values.sort_unstable_by_key(|(key, _)| *key);
+    let expected: Vec<_> = (0..READERS)
+        .map(|reader| (10 + reader, vec![10 + reader as u8; 32]))
+        .collect();
+    assert_eq!(values, expected);
+    assert_eq!(db.index_stats().reader_held_view_bytes, 0);
+    drop(held);
+    blocked.join().unwrap().unwrap();
+    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
+}
+
+/// A Sui `multi_get` of more than one window takes no owner charge: with the
+/// view allowance exhausted by reservations and a retained checkpoint cut, it
+/// still succeeds, and every window reads the one sparse cut (the held batch
+/// stays invisible, the later batch is visible).
+#[test]
+fn sui_multi_window_get_succeeds_with_view_budget_exhausted() {
+    use crate::distributed::sui::{Checkpoint, Db};
+    const KEYS: u32 = 260;
+    let mut fixture = Fixture::new();
+    // No cache: every window fetches its misses under the shared floor pin.
+    fixture.config.read_cache_bytes = 0;
+    let path = fixture.temp.path().join("authority");
+    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let ks = db.ks("root");
+    let partition = |sequence: u64| {
+        let mut operation = [0; 16];
+        operation[..8].copy_from_slice(&1u64.to_le_bytes());
+        operation[8..].copy_from_slice(&sequence.to_le_bytes());
+        fixture
+            .config
+            .inventory(1)
+            .partition_for(BatchId {
+                database: fixture.config.storage.database,
+                operation,
+            })
+            .unwrap()
+    };
+    // Public Sui commits use one operation per commit, from zero.
+    let per_commit = fixture.config.storage.batch_limits.max_operations;
+    let mut commits = 0u64;
+    for first in (0..KEYS).step_by(per_commit as usize) {
+        let mut batch = db.write_batch();
+        for key in first..(first + per_commit).min(KEYS) {
+            batch.write(ks, key.to_be_bytes().to_vec(), vec![1; 32]);
+        }
+        batch.commit().unwrap();
+        commits += 1;
+    }
+    // The held commit routes to partition(prefix); the two later commits must
+    // route elsewhere so they publish around it.
+    let prefix = (commits..commits + 64)
+        .find(|sequence| {
+            partition(*sequence) != partition(*sequence + 1)
+                && partition(*sequence) != partition(*sequence + 2)
+        })
+        .unwrap();
+    for _ in commits..prefix {
+        db.insert(ks, 0u32.to_be_bytes().to_vec(), vec![1; 32])
+            .unwrap();
+    }
+    let connection = db
+        .remote_for_test()
+        .io_clients
+        .iter()
+        .find(|(node, _)| *node == partition(prefix))
+        .unwrap()
+        .1
+        .clone();
+    let held = connection.client.lock();
+    let (progress, events) = mpsc::sync_channel(64);
+    db.remote_for_test()
+        .database
+        .core
+        .test_hooks
+        .lock()
+        .concurrent_progress = Some(progress);
+    let (first_reply, first_received) = mpsc::channel();
+    let first_db = db.clone();
+    let first = thread::spawn(move || {
+        let mut batch = first_db.write_batch();
+        batch.write(ks, 1u32.to_be_bytes().to_vec(), vec![7; 32]);
+        first_reply.send(batch.commit()).unwrap();
+    });
+    wait_event(&events, |stats| stats.concurrent_admitted == prefix + 1).unwrap();
+    let mut later = db.write_batch();
+    later.write(ks, 2u32.to_be_bytes().to_vec(), vec![8; 32]);
+    later.commit().unwrap();
+    let remote = db.remote_for_test();
+    assert!(matches!(remote.index.call_cut(), IndexReadCut::Sparse(_)));
+    // Exhaust the view allowance: reservations, then one retained checkpoint
+    // cut of the sparse view takes the last owner charge.
+    let max_excluded = fixture.config.max_pending_batches - 1;
+    let mut reservations = Vec::new();
+    loop {
+        match remote.index.reserve_publication_view(max_excluded) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(super::super::super::native_index::NativeIndexError::Capacity) => break,
+            Err(error) => panic!("unexpected reservation failure: {error}"),
+        }
+    }
+    reservations.pop();
+    let checkpoint = db.checkpoint();
+    assert!(matches!(checkpoint, Checkpoint::Remote(_, Ok(_))));
+    assert!(remote.index.reserve_publication_view(max_excluded).is_err());
+    // A newer sparse view has no owner charge yet: a charged cut of it would
+    // now fail with `Capacity`.
+    let mut newest = db.write_batch();
+    newest.write(ks, 3u32.to_be_bytes().to_vec(), vec![9; 32]);
+    newest.commit().unwrap();
+    assert!(matches!(remote.index.call_cut(), IndexReadCut::Sparse(_)));
+    assert!(remote.published_cut().is_err());
+    let charged = remote.index_stats().transient_metadata_bytes;
+    let keys: Vec<_> = (0..KEYS).map(|key| key.to_be_bytes().to_vec()).collect();
+    let values = db.multi_get(ks, &keys);
+    assert_eq!(values.len(), keys.len());
+    for (key, value) in (0..KEYS).zip(values) {
+        let expected = match key {
+            2 => 8,
+            3 => 9,
+            _ => 1,
+        };
+        assert_eq!(
+            value.unwrap().unwrap().as_ref(),
+            &[expected; 32],
+            "key {key}"
+        );
+    }
+    assert_eq!(remote.index_stats().transient_metadata_bytes, charged);
+    assert_eq!(remote.index_stats().reader_held_view_bytes, 0);
+    drop(checkpoint);
+    drop(reservations);
+    drop(held);
+    first_received
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    first.join().unwrap();
+    assert_eq!(
+        db.get(ks, &1u32.to_be_bytes()).unwrap().unwrap().as_ref(),
+        &[7; 32]
+    );
+    db.wait_for_background_threads_to_finish().unwrap();
+}

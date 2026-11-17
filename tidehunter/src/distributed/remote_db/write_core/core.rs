@@ -1183,7 +1183,7 @@ mod tests {
             "no slot passes the unresolved floor"
         );
         assert_eq!(core.retained_slots(), 5);
-        match core.index.latest_cut() {
+        match core.index.call_cut() {
             IndexReadCut::Sparse(view) => {
                 let (upper, floor, excluded) = view.parts();
                 assert_eq!(
@@ -1222,7 +1222,7 @@ mod tests {
         drop(held);
         database.drain().unwrap();
         assert_eq!(core.published_next(), 5);
-        assert!(!matches!(core.index.latest_cut(), IndexReadCut::Sparse(_)));
+        assert!(!matches!(core.index.call_cut(), IndexReadCut::Sparse(_)));
         for sequence in [0, 1, 2, 4] {
             assert!(core.is_published(version(sequence)));
         }

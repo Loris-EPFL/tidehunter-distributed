@@ -1429,12 +1429,14 @@ impl RemoteDatabase {
         self.core.index.retention_floor()
     }
 
+    /// Capture and protect one published cut that the caller can keep: a
+    /// standing-budget view takes its owner charge (`Capacity` when full).
     pub fn protected_published_cut(
         &self,
     ) -> Result<(IndexReadCut, super::native_index::IndexReadPin), LocalDbError> {
         self.ensure_healthy()?;
         let index = &self.core.index;
-        let cut = index.latest_cut();
+        let cut = index.latest_cut().map_err(LocalDbError::component)?;
         let pin = index
             .pin_cut(cut.clone())
             .map_err(LocalDbError::component)?;
@@ -1925,10 +1927,13 @@ impl RemoteDatabase {
         // One constant sparse-view quota for the serialized publisher: the
         // installed view and its replacement at max_pending_batches - 1
         // exclusions. No write reserves view quota, and no publication can then
-        // fail on view capacity after its WAL write. Replaced views still held
-        // by readers are not charged: extra memory <= (distinct replaced views
-        // still held by readers) x view_charge(max_pending_batches - 1), limited
-        // by the concurrent read limit and lasting one read (metric
+        // fail on view capacity after its WAL write. A cut that leaves one read
+        // call takes an owner charge from the view allowance instead (that
+        // reader API fails with Capacity when full). Views held inside one read
+        // stay uncharged, and no reader holds one while it waits for read
+        // admission: extra memory <= max_pending_reads x
+        // view_charge(max_pending_batches - 1), plus the transient and fixed
+        // holders listed at `StandingViewBudget` (metric
         // `index_reader_held_view_bytes`).
         let view_budget = index
             .reserve_standing_view_budget(config.max_pending_batches - 1)
@@ -2158,9 +2163,14 @@ impl RemoteDatabase {
         self.ensure_healthy()
     }
 
+    /// The caller can keep the cut: a standing-budget view takes its owner
+    /// charge (`Capacity` when full).
     pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
         self.ensure_healthy()?;
-        Ok(self.core.index.latest_cut())
+        self.core
+            .index
+            .latest_cut()
+            .map_err(LocalDbError::component)
     }
 
     /// Bounded index-only page. Values are fetched outside the authority lock
@@ -2324,12 +2334,13 @@ impl RemoteDatabase {
         // These private grouped fetch callers resolve the current committed cut
         // under the sole owner. Transfer its protection through physical read
         // completion, even if the aggregate caller exits early on an error.
+        // The references are resolved, so only the retention floor is pinned.
         self.ensure_healthy()?;
         let clock = ResolutionSample::start(sample);
         let pin = self
             .core
             .index
-            .pin_cut(IndexReadCut::Latest)
+            .pin_call_floor(IndexReadCut::Latest)
             .map_err(LocalDbError::component);
         if let Some(sample) = sample.as_ref() {
             sample.stage(ResolutionStage::PinPreparation, clock);
@@ -2398,7 +2409,7 @@ impl RemoteDatabase {
         let resolve_started = Instant::now();
         let clock = ResolutionSample::start(&sample);
         // One resolved cut for every key of the batch: no key sees a later publication.
-        let cut = self.core.index.latest_cut();
+        let cut = self.core.index.call_cut();
         if let Some(sample) = &sample {
             sample.stage(ResolutionStage::CutCapture, clock);
         }
@@ -3204,7 +3215,7 @@ fn load_checkpoint(
         config.index_shards,
     )
     .map_err(LocalDbError::component)?;
-    if restored.latest_cut() != image.cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At) {
+    if restored.call_cut() != image.cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At) {
         return Err(LocalDbError::new(
             "checkpoint index does not match exact published cut",
         ));

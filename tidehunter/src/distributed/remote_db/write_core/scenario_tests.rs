@@ -143,7 +143,7 @@ fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
     assert_eq!(independent, version(&core, 2));
     assert!(core.is_published(independent));
     assert_eq!(core.published_next(), 0);
-    assert!(matches!(core.index.latest_cut(), IndexReadCut::Sparse(_)));
+    assert!(matches!(core.index.call_cut(), IndexReadCut::Sparse(_)));
     assert_eq!(value(&mut db, 9), Some(vec![9; 32]));
     assert_eq!(value(&mut db, 1), None);
     // The allocated head has neither resolved nor released: no slot returns.
@@ -167,7 +167,7 @@ fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
     assert_eq!(core.sequencer.resolution(1), Some(Resolution::Published));
     assert_eq!(core.published_next(), 3);
     assert_eq!(core.sequencer.reuse_next(), 3);
-    assert!(!matches!(core.index.latest_cut(), IndexReadCut::Sparse(_)));
+    assert!(!matches!(core.index.call_cut(), IndexReadCut::Sparse(_)));
     assert!(core.publisher.lock().dependents.is_empty());
     assert!(
         core.identities

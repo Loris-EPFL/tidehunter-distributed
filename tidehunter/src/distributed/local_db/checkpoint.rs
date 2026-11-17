@@ -85,7 +85,7 @@ impl LocalRoot {
             config.max_index_bytes,
         )
         .map_err(LocalDbError::component)?;
-        if index.latest_cut()
+        if index.call_cut()
             != root
                 .latest
                 .map_or(IndexReadCut::BeforeAll, IndexReadCut::At)

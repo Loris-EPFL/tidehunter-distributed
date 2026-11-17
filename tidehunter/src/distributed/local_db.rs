@@ -240,7 +240,7 @@ impl LocalDatabase {
                 ));
                 index
                     .writer()
-                    .flush_and_unload(&name, index.latest_cut())
+                    .flush_and_unload(&name, index.call_cut())
                     .map_err(LocalDbError::component)?;
             }
             index

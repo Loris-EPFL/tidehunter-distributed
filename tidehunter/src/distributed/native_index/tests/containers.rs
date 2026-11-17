@@ -273,7 +273,7 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
     let compacted_root = temp.path().join("compacted.index");
     let capture = index
         .writer()
-        .prepare_compacted_image(IndexReadCut::Latest, index.latest_cut())
+        .prepare_compacted_image(IndexReadCut::Latest, index.call_cut())
         .unwrap();
     let persisted = capture.persist(&compacted_root).unwrap();
     assert_eq!(persisted.files().len(), 1);

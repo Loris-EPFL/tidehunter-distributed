@@ -321,8 +321,10 @@ impl IndexWriter<'_> {
                 "publication view exceeds standing budget",
             ));
         }
-        // The budget owns this view's bytes at the full worst-case size. The
-        // actual size is reported while the view is live (reader-held metric).
+        // The budget owns this view's bytes at the full worst-case size. This
+        // actual size is the owner charge when a cut of the view leaves one
+        // read call, and counts as reader-held while one read holds it after
+        // its replacement.
         let uncharged = if excluded.is_empty() {
             0
         } else {
@@ -372,6 +374,7 @@ impl IndexWriter<'_> {
                 retention: Arc::clone(&index.retention),
                 charge,
                 uncharged,
+                owner_charged: std::sync::atomic::AtomicBool::new(false),
             }))
         };
         // The watermark store: all entries of the round are already applied.

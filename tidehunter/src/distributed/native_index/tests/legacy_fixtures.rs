@@ -104,8 +104,8 @@ fn exact_mode_reads_the_frozen_root_4_bytes() {
         BUDGET,
     )
     .unwrap();
-    assert_eq!(reopened.latest_cut(), index.latest_cut());
-    assert_eq!(reopened.latest_cut(), cut(2, 1));
+    assert_eq!(reopened.call_cut(), index.call_cut());
+    assert_eq!(reopened.call_cut(), cut(2, 1));
     assert_eq!(reopened.reachable_files(), index.reachable_files());
     for read_cut in [IndexReadCut::Latest, cut(0, 5), cut(0, 6), cut(1, 1)] {
         for (keyspace, key) in KEYS {

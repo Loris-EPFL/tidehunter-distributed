@@ -4294,10 +4294,11 @@ impl RemoteDatabase {
             };
             let pin = if reference.is_some() && cached.is_none() {
                 let clock = ResolutionSample::start(&sample);
+                // The lookup is done: only the retention floor is pinned.
                 let pin = self
                     .core
                     .index
-                    .pin_cut(cut)
+                    .pin_call_floor(cut)
                     .map_err(LocalDbError::component);
                 if let Some(sample) = &sample {
                     sample.stage(ResolutionStage::PinPreparation, clock);
