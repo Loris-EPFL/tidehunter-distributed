@@ -772,7 +772,15 @@ mod live_fencing {
         tier: DurabilityTier,
         mode: LiveExportMode,
     ) -> (NodeConfig, Arc<StorageNode>) {
-        let mut config = config(&root.join("node"));
+        open_live_with(root, tier, mode, config(&root.join("node")))
+    }
+
+    fn open_live_with(
+        root: &std::path::Path,
+        tier: DurabilityTier,
+        mode: LiveExportMode,
+        mut config: NodeConfig,
+    ) -> (NodeConfig, Arc<StorageNode>) {
         // A complete 4 KiB live group stays below the native fragment trigger.
         config.partition.fragment_bytes = 16 * 1024;
         config.partition.wal_file_bytes = 32 * 1024;
@@ -808,6 +816,57 @@ mod live_fencing {
             inventory.fence_to(1).unwrap();
         }
         (config, node)
+    }
+
+    /// Lease the first live extent and return its whole WAL file.
+    fn leased_wal_file(node: &StorageNode) -> (fs::File, u64) {
+        let Response::LiveLeased(leased) =
+            extent_exchange(node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected lease")
+        };
+        let segment = &leased.extent.segment;
+        (fs::File::open(&segment.path).unwrap(), segment.bytes)
+    }
+
+    #[test]
+    fn default_owner_grants_prewritten_files_without_unwritten_extents() {
+        let temp = tempdir::TempDir::new("default-owner-prewrite").unwrap();
+        // An owner launch that omits the key gets the default.
+        let mut value = serde_yaml::to_value(config(&temp.path().join("node"))).unwrap();
+        value.as_mapping_mut().unwrap().remove("wal_prewrite");
+        let default = serde_yaml::from_value(value).unwrap();
+        let (config, node) = open_live_with(
+            temp.path(),
+            DurabilityTier::Synchronous,
+            LiveExportMode::OnDemand,
+            default,
+        );
+        assert!(config.wal_prewrite);
+        let (file, bytes) = leased_wal_file(&node);
+        crate::wal::fiemap::assert_written_extents(&file, bytes);
+        assert!(node.wal_prewrite_stats().0 >= bytes);
+    }
+
+    #[test]
+    fn explicit_false_owner_grants_files_with_unwritten_extents() {
+        let temp = tempdir::TempDir::new("explicit-false-owner-prewrite").unwrap();
+        let mut explicit = config(&temp.path().join("node"));
+        explicit.wal_prewrite = false;
+        let (_, node) = open_live_with(
+            temp.path(),
+            DurabilityTier::Synchronous,
+            LiveExportMode::OnDemand,
+            explicit,
+        );
+        let (file, bytes) = leased_wal_file(&node);
+        assert!(
+            crate::wal::fiemap::extents(&file, bytes)
+                .iter()
+                .any(|&(_, _, unwritten)| unwritten),
+            "an opted-out owner must keep fallocated extents unwritten"
+        );
+        assert_eq!(node.wal_prewrite_stats(), (0, 0, 0));
     }
 
     #[test]

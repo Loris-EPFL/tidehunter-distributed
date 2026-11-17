@@ -68,6 +68,8 @@ REVIEWED_SPEC = {
     'max_cases': 2000, 'offered_rates': [1000, 10000, 50000],
     'offered_seconds': 8, 'case_deadline_seconds': 600, 'hard_deadline_seconds': FLEET_SECONDS,
     'export_reserve_seconds': 900,
+    # Reviewed with the earlier synchronous matrix default; explicit since native became default.
+    'durability_tier': 'synchronous',
     'diagnostics': {'write_profile_limit': 256, 'read_profile_limit': 256, 'write_timeline_limit': 8192,
                     'valkey_profile_limit': 256},
 }

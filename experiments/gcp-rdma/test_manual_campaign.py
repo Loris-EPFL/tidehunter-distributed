@@ -1943,6 +1943,25 @@ class ReviewedKvMatrixRegressionTests(unittest.TestCase):
                     self.assertNotIn('live_leased_sync', spec)
                     self.assertNotIn('live_leased_flush_min_frame_bytes', spec)
 
+    def test_reviewed_standard_specs_keep_their_synchronous_matrices(self):
+        # Digests of the generated matrices before native became the matrix default.
+        campaign = manual.workflow_input.cloud_campaign
+        for spec, count, digest, relies_on_spec_tier in (
+                (manual.REVIEWED_SPEC, 652, 'f48f60156261589c539ca030d535d80cba8a0d987df30184d597a419f82adb9d', True),
+                # Contract arms name every Tidehunter tier, so it never used the spec default.
+                (manual.REVIEWED_CONTRACT_SPEC, 156, '32cda41becb0128f3d7f50cf02a4ffc4c9c9650ce9e708226516d862e1cca8e2',
+                 False)):
+            with self.subTest(shapes=spec.get('shapes')):
+                self.assertEqual(spec['durability_tier'], 'synchronous')
+                jobs = campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
+                self.assertEqual(len(jobs), count)
+                self.assertEqual(hashlib.sha256(json.dumps(
+                    jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest(), digest)
+                unpinned = campaign.make_matrix({k: v for k, v in spec.items()
+                                                 if k not in ('suite', 'durability_tier')})
+                # Without the explicit tier, the standard spec would plan the native default.
+                self.assertEqual(jobs != unpinned, relies_on_spec_tier)
+
 
 if __name__ == '__main__':
     unittest.main()

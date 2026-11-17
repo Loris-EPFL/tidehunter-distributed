@@ -35,13 +35,15 @@ NVME_BACKENDS = {"tidehunter_nvme_tcp", "tidehunter_nvme_rdma"}
 for name in NVME_BACKENDS:
     TRANSPORTS[name] = transport_for_case("tidehunter_tcp")
 MIX_FIELDS = ("read", "put", "delete", "missing_read", "get_many", "put_batch")
-# Owner acknowledgement tier of every Tidehunter case. `synchronous` waits for the covering WAL
-# barrier and matches native `value_wal_barrier` and Valkey `appendfsync always`; `native` acks after
-# the page-cache write and matches only native `page_cache`. Tiers are never mixed in a comparison.
+# Owner acknowledgement tier of every Tidehunter case. `native` (the default: the native Tidehunter
+# contract) acks after the page-cache write and matches only native `page_cache`; `synchronous`
+# (the stricter option) waits for the covering WAL barrier and matches native `value_wal_barrier`
+# and Valkey `appendfsync always`. Tiers are never mixed in a comparison.
 DURABILITY_TIERS = ("native", "synchronous")
-# Tier given to jobs of a newly generated matrix. A job record without a tier predates tiers and
-# ran the engine default, which is native.
-DEFAULT_DURABILITY_TIER = "synchronous"
+# Tier of a job, or of a generated standard matrix, that does not name one. Historical reviewed
+# specs that were generated with the earlier synchronous default name `durability_tier:
+# "synchronous"` explicitly, so their matrices are unchanged.
+DEFAULT_DURABILITY_TIER = "native"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
 M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put", "nvmeof_p9_write_engine")
@@ -56,7 +58,7 @@ def durability_tier(job):
     """Planned tier of a Tidehunter case; other backends have no owner tier."""
     if job["backend"] not in TRANSPORTS:
         return None
-    tier = job.get("durability_tier", "native")
+    tier = job.get("durability_tier", DEFAULT_DURABILITY_TIER)
     if tier not in DURABILITY_TIERS:
         raise ValueError("invalid durability_tier")
     return tier
@@ -222,15 +224,16 @@ def mix(**values):
 
 
 def make_matrix(spec, *, _allow_live_nvme=False):
-    """Every Tidehunter job carries its tier; jobs planned without one default to synchronous."""
+    """Every Tidehunter job carries its tier: its own, else the spec's `durability_tier`, else native."""
     if spec.get("mode") == "focused":
         if spec.get("direct_control_arm") is not True:
             raise ValueError("focused campaign requires the reviewed direct control arm")
         return make_focused_matrix(spec.get("selection"))
     jobs = _make_matrix(spec, _allow_live_nvme=_allow_live_nvme)
+    spec_tier = spec.get("durability_tier", DEFAULT_DURABILITY_TIER)
     for job in jobs:
         if job["backend"] in TRANSPORTS:
-            job["durability_tier"] = job.get("durability_tier", DEFAULT_DURABILITY_TIER)
+            job["durability_tier"] = job.get("durability_tier", spec_tier)
             durability_tier(job)
     return jobs
 
@@ -240,7 +243,7 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     required = {"schema_version", "seed", "repeats", "value_sizes", "backends",
                 "keys", "max_cases", "offered_rates", "offered_seconds",
                 "case_deadline_seconds", "hard_deadline_seconds", "export_reserve_seconds"}
-    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode", "spdk_comparison", "valkey_reproduction_profiles", "native_durability_cohort", "shapes", "arms"}:
+    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode", "spdk_comparison", "valkey_reproduction_profiles", "native_durability_cohort", "shapes", "arms", "durability_tier"}:
         raise ValueError("cloud matrix requires its explicit schema")
     if spec["schema_version"] != 1 or isinstance(spec["seed"], bool) or not isinstance(spec["seed"], int):
         raise ValueError("invalid cloud schema/seed")
@@ -259,6 +262,8 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
         raise ValueError("spdk_comparison must be a boolean")
     if type(spec.get("native_durability_cohort", False)) is not bool:
         raise ValueError("native_durability_cohort must be a boolean")
+    if spec.get("durability_tier", DEFAULT_DURABILITY_TIER) not in DURABILITY_TIERS:
+        raise ValueError("invalid spec durability_tier")
     if spec.get("native_durability_cohort") and spec.get("mode") != "standard-with-live-nvmeof":
         raise ValueError("native durability cohort requires the matched live and sealed campaign")
     if spec.get("spdk_comparison") and (spec.get("mode") != "standard-with-live-nvmeof"
@@ -542,7 +547,8 @@ def _contract_core_matrix(spec, sources):
             shapes.append({**copy.deepcopy(source), "profile": "write-sustained",
                            "measurement_operations": 200000})
         backend = source["backend"]
-        default = "synchronous" if backend in TRANSPORTS else (
+        # A Tidehunter source already carries the spec's tier (make_matrix stamped it).
+        default = source["durability_tier"] if backend in TRANSPORTS else (
             "value_wal_barrier" if backend == "native" else "synced")
         arms = spec.get("arms", {}).get(backend, [default])
         for shape in shapes:
