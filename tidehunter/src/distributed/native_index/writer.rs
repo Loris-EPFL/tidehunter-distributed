@@ -9,8 +9,9 @@
 //!
 //! The writer applies entries to shards one shard at a time, in ascending shard
 //! index, holding at most one shard lock. Applying never changes what readers
-//! see: only [`IndexWriter::publish_latest`] and
-//! [`IndexWriter::install_reserved_live_view`] move the visible cut (see the
+//! see: only [`IndexWriter::publish_latest`],
+//! [`IndexWriter::install_reserved_live_view`] and
+//! [`IndexWriter::install_standing_live_view`] move the visible cut (see the
 //! module documentation of `shards`).
 
 use super::shards::{CellKey, add, sub};
@@ -292,6 +293,56 @@ impl IndexWriter<'_> {
                 "publication view exceeds reservation",
             ));
         }
+        self.install_view(
+            upper,
+            stable_floor,
+            excluded,
+            charge,
+            0,
+            Some(&mut reservation),
+        )
+    }
+
+    /// Install a live view under the publisher's standing budget. No view
+    /// quota is taken here, so after validation (programming errors only) the
+    /// install cannot fail on view capacity once its batches are durable.
+    pub(crate) fn install_standing_live_view(
+        &mut self,
+        upper: MutationVersion,
+        stable_floor: IndexReadCut,
+        excluded: Vec<BatchVersion>,
+        budget: &StandingViewBudget,
+    ) -> Result<(), NativeIndexError> {
+        if !budget.belongs_to(&self.index.retention) {
+            return Err(NativeIndexError::Invalid("foreign standing view budget"));
+        }
+        if !excluded.is_empty() && excluded.capacity() > budget.max_excluded() {
+            return Err(NativeIndexError::Invalid(
+                "publication view exceeds standing budget",
+            ));
+        }
+        // The budget owns this view's bytes at the full worst-case size. This
+        // actual size is the owner charge when a cut of the view leaves one
+        // read call, and counts as reader-held while one read holds it after
+        // its replacement.
+        let uncharged = if excluded.is_empty() {
+            0
+        } else {
+            view_charge(excluded.capacity())?
+        };
+        self.install_view(upper, stable_floor, excluded, 0, uncharged, None)
+    }
+
+    fn install_view(
+        &mut self,
+        upper: MutationVersion,
+        stable_floor: IndexReadCut,
+        excluded: Vec<BatchVersion>,
+        charge: usize,
+        uncharged: usize,
+        reservation: Option<&mut PublicationViewReservation>,
+    ) -> Result<(), NativeIndexError> {
+        let index = self.index;
         let latest = self.state.latest;
         if matches!(stable_floor, IndexReadCut::Latest | IndexReadCut::Sparse(_))
             || position(&stable_floor).is_some_and(|floor| floor > upper)
@@ -304,7 +355,13 @@ impl IndexWriter<'_> {
         {
             return Err(NativeIndexError::Invalid("invalid sparse publication view"));
         }
-        index.register_live_view(&stable_floor, charge, &mut reservation)?;
+        index.register_live_view(
+            &stable_floor,
+            charge,
+            uncharged,
+            reservation,
+            !excluded.is_empty(),
+        )?;
         let cut = if excluded.is_empty() {
             // The view covers exactly `upper`: a newer promoted-but-unpublished
             // batch (version above `upper`) must stay invisible.
@@ -316,6 +373,8 @@ impl IndexWriter<'_> {
                 excluded,
                 retention: Arc::clone(&index.retention),
                 charge,
+                uncharged,
+                owner_charged: std::sync::atomic::AtomicBool::new(false),
             }))
         };
         // The watermark store: all entries of the round are already applied.
@@ -429,12 +488,18 @@ impl IndexWriter<'_> {
             state.capture = Some(capture);
             return None;
         }
+        // One encoder share of the payload scratch allowance (spec §3.1).
+        let scratch_limit = super::snapshot::cell_scratch_limit(
+            index.max_metadata_bytes,
+            cell_flushers(index.shards.len()),
+        );
         Some(PreparedIndexImage::new(
             index.database,
             capture.schema,
             capture.cells,
             capture.cut,
             capture.lease,
+            scratch_limit,
         ))
     }
 

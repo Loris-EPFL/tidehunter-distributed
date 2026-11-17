@@ -54,21 +54,8 @@ def main():
     # attributing previous cache-hit advantages to preparation/read-ahead work.
     tcp = ["--backend", "tcp", "--tcp-pipeline", "true", "--tcp-read-cache-bytes", "0"]
     configs = [("previous-tcp", "baseline", tcp)]
-    for label, workers, pages in [
-        ("serial-control-tcp", 1, 1),
-        ("parallel-preparation-tcp", 2, 1),
-        ("prefetch-tcp", 1, 2),
-        ("combined-tcp", 2, 2),
-    ]:
-        configs.append(
-            (
-                label,
-                "candidate",
-                tcp
-                + ["--tcp-preparation-workers", str(workers)]
-                + ["--tcp-scan-prefetch-pages", str(pages)],
-            )
-        )
+    for label, pages in [("serial-control-tcp", 1), ("prefetch-tcp", 2)]:
+        configs.append((label, "candidate", tcp + ["--tcp-scan-prefetch-pages", str(pages)]))
     configs.extend(
         [
             ("previous-native", "baseline", ["--backend", "native-sync"]),

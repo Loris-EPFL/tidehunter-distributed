@@ -183,7 +183,7 @@ pub(super) fn prepare(input: &Path, output: &Path) -> BackendResult<()> {
     prepared.preload_batch_max_members =
         preload_batch_limit(&shape, &prepared, config.storage.batch_limits)?;
     fs::create_dir_all(&options.path)?;
-    let mut db = RemoteDatabase::open(&coordinator, &shape, config, metrics())?;
+    let db = RemoteDatabase::open(&coordinator, &shape, config, metrics())?;
     prepared.source_epoch = db.epoch();
     let mut start = 0;
     while start < prepared.keys {

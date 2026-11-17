@@ -230,7 +230,7 @@ fn main() -> Result<()> {
     )?;
     cluster.config.read_cache_bytes = 32 * MIB;
     let coordinator = root.join("coordinator");
-    let mut db = RemoteDatabase::open(&coordinator, &shape, cluster.config.clone(), metrics())?;
+    let db = RemoteDatabase::open(&coordinator, &shape, cluster.config.clone(), metrics())?;
     let source_epoch = db.epoch();
     let inventory = StaticInventory {
         database: namespace,

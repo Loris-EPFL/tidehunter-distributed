@@ -7,11 +7,11 @@
 //!
 //! This is not `LargeTable` integration: native cache generations, promotion,
 //! persisted index formats, checkpoint cuts and replay still require adaptation.
-//! Call this inside `PublicationTracker::publish_ready`; any failure after durable
-//! authority requires recovery, even if dropping the transaction hides all staged
-//! entries. It must never become a definite abort of that durable batch.
+//! Call inside the enclosing engine's ordered publication critical section. Any
+//! failure after durable authority requires recovery, even if dropping the
+//! transaction hides all staged entries; it cannot abort that durable batch.
 
-use super::codec::{BatchLimits, CodecError, CompleteBatch, Mutation};
+use super::codec::{BatchLimits, CodecError, CompleteBatch, Mutation, ValidatedMutations};
 use super::storage::{DurableBatch, PartitionLog, StorageError};
 use super::types::{BatchId, BatchVersion, PayloadDigest, ValueRecordReference};
 use crate::batch::PendingOp;
@@ -55,6 +55,123 @@ pub struct PreparedNativePublication {
     operations: Vec<(PendingOp, ValueRecordReference)>,
 }
 
+/// Version-free routing for an immutable validated input. Borrowing the exact
+/// mutation slice prevents caller changes between preflight and encoding.
+pub(crate) struct UnboundNativePublicationRouting<'a> {
+    shape: &'a KeyShape,
+    mutations: &'a [Mutation],
+    operations: Vec<PendingOp>,
+}
+
+impl<'a> UnboundNativePublicationRouting<'a> {
+    pub(crate) fn prepare(
+        shape: &'a KeyShape,
+        validated: &ValidatedMutations<'a>,
+    ) -> Result<Self, NativePublicationError> {
+        Self::from_mutations(shape, validated.mutations())
+    }
+
+    fn from_mutations(
+        shape: &'a KeyShape,
+        mutations: &'a [Mutation],
+    ) -> Result<Self, NativePublicationError> {
+        let mut operations = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            operations.push(route_mutation(shape, mutation)?);
+        }
+        Ok(Self {
+            shape,
+            mutations,
+            operations,
+        })
+    }
+
+    pub(crate) fn operations(&self) -> &[PendingOp] {
+        &self.operations
+    }
+
+    pub(crate) fn owned_bytes(&self, shape: &KeyShape) -> Option<usize> {
+        routing_owned_bytes(&self.operations, self.operations.capacity(), shape)
+    }
+
+    pub(crate) fn bind(
+        mut self,
+        batch: &CompleteBatch,
+    ) -> Result<NativePublicationRouting, NativePublicationError> {
+        // Count and ordered mutation equality bind the preallocation token to
+        // the actual canonical batch. A reordered, substituted or truncated
+        // batch can never reuse trusted routing merely because its size fits.
+        if !std::ptr::eq(self.mutations, batch.mutations()) && self.mutations != batch.mutations() {
+            return Err(NativePublicationError::ReceiptMismatch);
+        }
+        if !std::ptr::eq(self.mutations, batch.mutations()) {
+            // Caller slices may be tiny views of arbitrarily large allocations.
+            // Rebase only borrowed reduction/LRU handles onto the encoded batch;
+            // retain already computed hashes and cells. No values are copied,
+            // and neither routing hashes nor canonical checksums are recomputed.
+            for (operation, mutation) in self.operations.iter_mut().zip(batch.mutations()) {
+                let (ks, reduced_key, lru_update) = match operation {
+                    PendingOp::Insert {
+                        ks,
+                        reduced_key,
+                        lru_update,
+                        ..
+                    } => (*ks, reduced_key, Some(lru_update)),
+                    PendingOp::Remove {
+                        ks, reduced_key, ..
+                    } => (*ks, reduced_key, None),
+                };
+                let shape = self.shape.ks(ks);
+                if !matches!(shape.key_indexing(), KeyIndexing::Hash) {
+                    *reduced_key = shape.reduced_key_bytes(mutation.key().clone());
+                }
+                if let Some(Some((key, value))) = lru_update {
+                    let Mutation::Put {
+                        key: canonical_key,
+                        value: canonical_value,
+                        ..
+                    } = mutation
+                    else {
+                        return Err(NativePublicationError::ReceiptMismatch);
+                    };
+                    *key = canonical_key.clone();
+                    *value = canonical_value.clone();
+                }
+            }
+        }
+        Ok(NativePublicationRouting {
+            id: batch.id(),
+            version: batch.version(),
+            digest: batch.digest(),
+            operations: self.operations,
+        })
+    }
+}
+
+fn routing_owned_bytes(
+    operations: &[PendingOp],
+    capacity: usize,
+    shape: &KeyShape,
+) -> Option<usize> {
+    operations.iter().try_fold(
+        capacity.checked_mul(std::mem::size_of::<PendingOp>())?,
+        |bytes, operation| {
+            let extra = match operation.cell_id() {
+                CellId::Bytes(prefix) if prefix.spilled() => prefix.capacity(),
+                _ => 0,
+            };
+            let bytes = bytes.checked_add(extra)?;
+            if matches!(shape.ks(operation.ks()).key_indexing(), KeyIndexing::Hash) {
+                bytes
+                    .checked_add(operation.reduced_key().len())?
+                    .checked_add(super::codec::ROUTING_HASH_OWNER_BYTES)
+            } else {
+                Some(bytes)
+            }
+        },
+    )
+}
+
 /// Routing retained from local preflight through durable publication. Values
 /// still belong to the canonical batch; this token never establishes durability.
 pub(crate) struct NativePublicationRouting {
@@ -67,46 +184,22 @@ pub(crate) struct NativePublicationRouting {
 impl NativePublicationRouting {
     /// Only authority-local batches already constructed/decoded with this shape.
     /// Untrusted bytes must pass CompleteBatch::decode before reaching here.
+    #[cfg(test)]
     pub(crate) fn prepare(
         shape: &KeyShape,
         batch: &CompleteBatch,
     ) -> Result<Self, NativePublicationError> {
-        let mut operations = Vec::with_capacity(batch.mutations().len());
-        for mutation in batch.mutations() {
-            operations.push(route_mutation(shape, mutation)?);
-        }
-        Ok(Self {
-            id: batch.id(),
-            version: batch.version(),
-            digest: batch.digest(),
-            operations,
-        })
+        UnboundNativePublicationRouting::from_mutations(shape, batch.mutations())?.bind(batch)
     }
 
+    #[cfg(test)]
     pub(crate) fn operations(&self) -> &[PendingOp] {
         &self.operations
     }
 
+    #[cfg(test)]
     pub(crate) fn owned_bytes(&self, shape: &KeyShape) -> Option<usize> {
-        self.operations.iter().try_fold(
-            self.operations
-                .capacity()
-                .checked_mul(std::mem::size_of::<PendingOp>())?,
-            |bytes, operation| {
-                let extra = match operation.cell_id() {
-                    CellId::Bytes(prefix) if prefix.spilled() => prefix.capacity(),
-                    _ => 0,
-                };
-                let bytes = bytes.checked_add(extra)?;
-                if matches!(shape.ks(operation.ks()).key_indexing(), KeyIndexing::Hash) {
-                    bytes
-                        .checked_add(operation.reduced_key().len())?
-                        .checked_add(super::codec::ROUTING_HASH_OWNER_BYTES)
-                } else {
-                    Some(bytes)
-                }
-            },
-        )
+        routing_owned_bytes(&self.operations, self.operations.capacity(), shape)
     }
 
     pub(crate) fn publish_authenticated<S: NativePendingSink>(
@@ -350,7 +443,7 @@ mod tests {
     use super::*;
     use crate::distributed::codec::BatchLimits;
     use crate::distributed::group::{CompleteGroup, GroupLimits};
-    use crate::distributed::publication::PublicationTracker;
+    use crate::distributed::local_db::publication::PublicationTracker;
     use crate::distributed::storage::{PartitionConfig, StaticInventory};
     use crate::distributed::types::RequestAuthority;
     use crate::index::pending_table::CommittedChange;
@@ -616,6 +709,54 @@ mod tests {
             PreparedNativePublication::prepare(&first, &super::tests::batch(1), receipt),
             Err(NativePublicationError::ReceiptMismatch)
         ));
+    }
+
+    #[test]
+    fn unbound_routing_rejects_count_order_and_value_mismatches() {
+        let shape = shape();
+        let expected = batch(0);
+        let validated = CompleteBatch::validated_mutations(
+            &shape,
+            expected.mutations(),
+            BatchLimits {
+                max_operations: 100,
+                max_encoded_bytes: 64 * 1024,
+            },
+        )
+        .unwrap();
+        let routing = UnboundNativePublicationRouting::prepare(&shape, &validated).unwrap();
+        assert_eq!(routing.operations().len(), expected.mutations().len());
+        assert!(routing.owned_bytes(&shape).is_some());
+        assert!(routing.bind(&expected).is_ok());
+        let mut variants = Vec::with_capacity(3);
+        variants.push(expected.mutations()[..expected.mutations().len() - 1].to_vec());
+        let mut reordered = expected.mutations().to_vec();
+        reordered.swap(0, 1);
+        variants.push(reordered);
+        let mut replaced = expected.mutations().to_vec();
+        let Mutation::Put { value, .. } = &mut replaced[0] else {
+            panic!("fixture starts with a put");
+        };
+        *value = Bytes::from_static(b"changed payload");
+        variants.push(replaced);
+        for mutations in variants {
+            let other = CompleteBatch::new(
+                &shape,
+                expected.id(),
+                expected.version(),
+                mutations,
+                BatchLimits {
+                    max_operations: 100,
+                    max_encoded_bytes: 64 * 1024,
+                },
+            )
+            .unwrap();
+            let routing = UnboundNativePublicationRouting::prepare(&shape, &validated).unwrap();
+            assert!(matches!(
+                routing.bind(&other),
+                Err(NativePublicationError::ReceiptMismatch)
+            ));
+        }
     }
 
     #[test]

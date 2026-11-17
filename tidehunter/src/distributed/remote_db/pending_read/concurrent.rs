@@ -16,6 +16,23 @@ enum GetResolution {
     },
 }
 
+/// Where a resolved window gets its retention pin when it has misses.
+enum WindowPin<'a> {
+    /// One window: pin the floor of its own cut after the lookups.
+    Cut(IndexReadCut),
+    /// One window of a multi-window read: share the read's floor pin.
+    Floor(Option<&'a IndexReadPin>),
+}
+
+/// Every key of a multi-window read resolved at one cut
+/// ([`ConcurrentRemoteDatabase::resolve_published_keys`]).
+pub(crate) struct ResolvedKeys {
+    /// One entry per key, in key order.
+    pub(crate) references: Vec<Result<Option<ValueRecordReference>, LocalDbError>>,
+    /// Floor pin of the cut; `None` when no key has a live reference.
+    pub(crate) pin: Option<IndexReadPin>,
+}
+
 impl ConcurrentRemoteDatabase {
     pub fn set_read_profile_limit(&self, limit: u64) {
         self.reads
@@ -87,6 +104,8 @@ impl ConcurrentRemoteDatabase {
         if let Some(trace) = trace {
             trace.event("index_resolution_finished");
         }
+        // The miss pin holds only the retention floor (`pin_call_floor`), so
+        // waiting for admission below keeps no sparse view alive.
         let (reference, pin) = match resolution {
             GetResolution::Ready(value) => return Ok(value),
             GetResolution::Miss { reference, pin } => (reference, pin),
@@ -195,7 +214,7 @@ impl ConcurrentRemoteDatabase {
         if let Some(trace) = trace {
             trace.event("index_resolution_started");
         }
-        let mut sample = self
+        let sample = self
             .reads
             .state
             .coordinator_diagnostics
@@ -205,36 +224,147 @@ impl ConcurrentRemoteDatabase {
             return Err(LocalDbError::new("read batch exceeds 256 keys"));
         }
         let started = self.read_profile_enabled().then(Instant::now);
+        // Resolve the cut once and use it for validation, every lookup and
+        // the pin; no lock or guard is held across the batch.
+        let cut = self.index.resolve_cut(cut);
+        let references = self.lookup_references(ks, keys, &cut, &sample)?;
+        self.fetch_references(
+            ks,
+            keys,
+            references,
+            WindowPin::Cut(cut),
+            sample,
+            started,
+            trace,
+            offset,
+        )
+    }
+
+    /// Resolve every key of a read with more than one window at one
+    /// published cut, without an owner charge. Lookups never wait for read
+    /// admission, and the view is dropped before any window waits: only a
+    /// floor pin remains (see `StandingViewBudget`). The result holds one
+    /// reference per key, so its memory is bounded by the caller's key count.
+    pub(crate) fn resolve_published_keys<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+    ) -> Result<ResolvedKeys, LocalDbError> {
+        self.ensure_healthy()?;
+        let cut = self.index.call_cut();
+        let references = self.lookup_references(ks, keys, &cut, &None)?;
+        // Even a window answered from the cache keeps the floor pin: the view
+        // must be gone before the first window can wait for admission.
+        let pin = if references
+            .iter()
+            .any(|reference| matches!(reference, Ok(Some(_))))
+        {
+            Some(
+                self.index
+                    .pin_call_floor(cut)
+                    .map_err(LocalDbError::component)?,
+            )
+        } else {
+            None
+        };
+        self.ensure_healthy()?;
+        Ok(ResolvedKeys { references, pin })
+    }
+
+    /// Fetch one window (at most 256 keys) of [`Self::resolve_published_keys`].
+    /// `references` are that window's entries, in key order.
+    pub(crate) fn fetch_resolved_window<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        references: Vec<Result<Option<ValueRecordReference>, LocalDbError>>,
+        pin: Option<&IndexReadPin>,
+        trace: Option<&ReadTraceCallGuard>,
+        offset: usize,
+    ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
+        if let Some(trace) = trace {
+            trace.event("index_resolution_started");
+        }
+        let sample = self
+            .reads
+            .state
+            .coordinator_diagnostics
+            .select(true, keys.len());
+        self.ensure_healthy()?;
+        if keys.len() > 256 {
+            return Err(LocalDbError::new("read batch exceeds 256 keys"));
+        }
+        if references.len() != keys.len() {
+            return Err(LocalDbError::new(
+                "resolved read window does not match its keys",
+            ));
+        }
+        let started = self.read_profile_enabled().then(Instant::now);
+        self.fetch_references(
+            ks,
+            keys,
+            references,
+            WindowPin::Floor(pin),
+            sample,
+            started,
+            trace,
+            offset,
+        )
+    }
+
+    /// Validate `cut` and look every key up at it. Never waits for read
+    /// admission. One entry per key: memory is bounded by the caller's keys.
+    fn lookup_references<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        cut: &IndexReadCut,
+        sample: &Option<ResolutionSample<'_>>,
+    ) -> Result<Vec<Result<Option<ValueRecordReference>, LocalDbError>>, LocalDbError> {
+        let clock = ResolutionSample::start(sample);
+        let validation = self
+            .index
+            .validate_cut(cut.clone())
+            .map_err(LocalDbError::component);
+        if let Some(sample) = sample {
+            sample.stage(ResolutionStage::CutValidation, clock);
+        }
+        validation?;
+        Ok(keys
+            .iter()
+            .map(|key| {
+                let clock = ResolutionSample::start(sample);
+                let result = self
+                    .index
+                    .get(ks, key.as_ref(), cut.clone())
+                    .map_err(LocalDbError::component);
+                if let Some(sample) = sample {
+                    sample.stage(ResolutionStage::IndexLookup, clock);
+                }
+                result
+            })
+            .collect())
+    }
+
+    /// Cache lookups, routing, the retention pin, admission and the remote
+    /// reads of one resolved window.
+    // Window, pin source and diagnostics belong to distinct concerns.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_references<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        references: Vec<Result<Option<ValueRecordReference>, LocalDbError>>,
+        window_pin: WindowPin<'_>,
+        mut sample: Option<ResolutionSample<'_>>,
+        started: Option<Instant>,
+        trace: Option<&ReadTraceCallGuard>,
+        offset: usize,
+    ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
         let mut values = vec![None; keys.len()];
         let mut missing = Vec::new();
         let mut groups = vec![Vec::new(); self.partition_indexes.len()];
-        let (references, pin) = {
-            // Resolve the cut once and use it for validation, every lookup and
-            // the pin; no lock or guard is held across the batch.
-            let cut = self.index.resolve_cut(cut);
-            let clock = ResolutionSample::start(&sample);
-            let validation = self
-                .index
-                .validate_cut(cut.clone())
-                .map_err(LocalDbError::component);
-            if let Some(sample) = &sample {
-                sample.stage(ResolutionStage::CutValidation, clock);
-            }
-            validation?;
-            let references = keys
-                .iter()
-                .map(|key| {
-                    let clock = ResolutionSample::start(&sample);
-                    let result = self
-                        .index
-                        .get(ks, key.as_ref(), cut.clone())
-                        .map_err(LocalDbError::component);
-                    if let Some(sample) = &sample {
-                        sample.stage(ResolutionStage::IndexLookup, clock);
-                    }
-                    result
-                })
-                .collect::<Vec<_>>();
+        let pin = {
             // Keep lookup order, including duplicate references, and route and
             // allocate per 32-member chunk.
             for (chunk_index, chunk) in references.chunks(32).enumerate() {
@@ -294,17 +424,27 @@ impl ConcurrentRemoteDatabase {
                     }
                 }
             }
-            let pin = if missing.is_empty() {
+            if missing.is_empty() {
                 None
             } else {
                 let clock = ResolutionSample::start(&sample);
-                let pin = self.index.pin_cut(cut).map_err(LocalDbError::component);
+                // Every lookup is done: the batch, its admission waits and
+                // its flights need only the retention floor, not the view.
+                let pin = match window_pin {
+                    WindowPin::Cut(cut) => self
+                        .index
+                        .pin_call_floor(cut)
+                        .map_err(LocalDbError::component),
+                    WindowPin::Floor(Some(pin)) => Ok(pin.clone()),
+                    WindowPin::Floor(None) => Err(LocalDbError::new(
+                        "resolved read window has live references but no pin",
+                    )),
+                };
                 if let Some(sample) = &sample {
                     sample.stage(ResolutionStage::PinPreparation, clock);
                 }
                 Some(pin?)
-            };
-            (references, pin)
+            }
         };
         if let Some(trace) = trace {
             trace.event("index_resolution_finished");
@@ -341,7 +481,7 @@ impl ConcurrentRemoteDatabase {
                 let result = batch.finish_one();
                 self.value_read_ns
                     .fetch_add(elapsed(started), Ordering::Relaxed);
-                result.inspect_err(|_| self.poison())?;
+                result.inspect_err(|error| self.poison(error))?;
             }
         }
         if let Some(sample) = &sample {
@@ -375,7 +515,7 @@ impl ConcurrentRemoteDatabase {
                     key.as_ref(),
                     mutation.expect("every live reference was resolved"),
                 )
-                .inspect_err(|_| self.poison()),
+                .inspect_err(|error| self.poison(error)),
             })
             .collect();
         if let Some(sample) = &sample {
@@ -455,7 +595,12 @@ impl ConcurrentRemoteDatabase {
                             sample.member(MemberOutcome::RemoteMiss);
                         }
                         let clock = ResolutionSample::start(&sample);
-                        let pin = self.index.pin_cut(cut).map_err(LocalDbError::component);
+                        // The lookup is done: the miss needs only the
+                        // retention floor while it waits and while in flight.
+                        let pin = self
+                            .index
+                            .pin_call_floor(cut)
+                            .map_err(LocalDbError::component);
                         if let Some(sample) = &sample {
                             sample.stage(ResolutionStage::PinPreparation, clock);
                         }
@@ -567,7 +712,7 @@ impl ConcurrentRemoteDatabase {
                 key.len(),
                 false,
                 ReadContext {
-                    deadline: Instant::now() + self.reads.timeout,
+                    deadline: Instant::now() + self.reads.timeout(),
                     pin: Some(pin),
                     trace,
                 },
@@ -608,7 +753,7 @@ impl ConcurrentRemoteDatabase {
                 let (values, _) = completed
                     .result
                     .expect("resolved read has completion")
-                    .inspect_err(|_| self.poison())?;
+                    .inspect_err(|error| self.poison(error))?;
                 self.complete_concurrent_get(reference, ks, &key, values)
             }
             _ => Err(LocalDbError::new("read is not a detached completion")),
@@ -626,10 +771,9 @@ impl ConcurrentRemoteDatabase {
     ) -> Result<Option<Bytes>, LocalDbError> {
         self.ensure_healthy()?;
         if values.len() != 1 || matches!(values.first(), Some(Mutation::Delete { .. })) {
-            self.poison();
-            return Err(LocalDbError::new(
-                "live point reference returned an invalid record",
-            ));
+            let error = LocalDbError::new("live point reference returned an invalid record");
+            self.poison(&error);
+            return Err(error);
         }
         let mutation = values.pop().unwrap();
         let prepared = self.cache.prepare_verified(reference, &mutation);
@@ -701,16 +845,15 @@ impl ConcurrentRemoteDatabase {
         self.value_read_ns
             .fetch_add(completed.wait_ns, Ordering::Relaxed);
         self.ensure_healthy()?;
-        let mutation = completed.result.inspect_err(|_| self.poison())?;
+        let mutation = completed.result.inspect_err(|error| self.poison(error))?;
         if matches!(mutation, Mutation::Delete { .. })
             || mutation.keyspace() != ks
             || completed.reference.descriptor.keyspace != ks.0
             || self.shape.ks(ks).reduce_key(mutation.key()).as_ref() != reduced_key
         {
-            self.poison();
-            return Err(LocalDbError::new(
-                "scan member does not match its live index reference",
-            ));
+            let error = LocalDbError::new("scan member does not match its live index reference");
+            self.poison(&error);
+            return Err(error);
         }
         self.ensure_healthy()?;
         Ok(mutation)

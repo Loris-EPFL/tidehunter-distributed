@@ -1574,7 +1574,7 @@ class CapsuleAndExportTests(unittest.TestCase):
         case = "0000-case"
         root = Path(config["fleet"]["data_root"]) / "cells" / case
         launch = {"ready_file": str(root / "node-0/ready"), "stop_file": str(root / "node-0/stop"),
-            "node": {"root": str(root / "node-0/storage")}, "listen": "10.0.0.2:9400",
+            "node": {"root": str(root / "node-0/storage"), "wal_prewrite": True}, "listen": "10.0.0.2:9400",
             "tls": {"transport": {"kind": "tcp"}, "ca": str(root / "node-0/tls/ca.der"),
                     "cert": str(root / "node-0/tls/tidehunter-node-0.der"), "key": str(root / "node-0/tls/tidehunter-node-0.pk8")}}
         controller.validate_launch(config, launch, case, 0)
@@ -1603,7 +1603,7 @@ class CapsuleAndExportTests(unittest.TestCase):
         case = "0000-case"
         root = Path(config["fleet"]["data_root"]) / "cells" / case
         launch = {"ready_file": str(root / "node-0/ready"), "stop_file": str(root / "node-0/stop"),
-            "node": {"root": str(root / "node-0/storage"),
+            "node": {"root": str(root / "node-0/storage"), "wal_prewrite": True,
                      "live_target": controller.live_target_for_owner(config, case, 0, "tcp",
                          "nqn.2014-08.org.nvmexpress:uuid:12345678-1234-4234-8234-123456789abc")},
             "listen": "10.0.0.2:9400",

@@ -191,7 +191,7 @@ fn readers_never_take_the_writer_mutex() {
         for key in &keys {
             assert_eq!(read_sequence(&worker, key, IndexReadCut::Latest), Some(1));
         }
-        let cut = worker.latest_cut();
+        let cut = worker.call_cut();
         let _pin = worker.pin_cut(cut.clone()).unwrap();
         worker.validate_cut(cut).unwrap();
         assert!(worker.stats().cells >= 2);
@@ -222,7 +222,7 @@ fn atomic_batch_spanning_shards_is_never_partially_visible_to_a_cut_reader() {
                 while !done.load(AtomicOrdering::Acquire) {
                     // One cut, then every key at that cut: a batch is entirely
                     // inside it or entirely outside it.
-                    let cut = index.latest_cut();
+                    let cut = index.call_cut();
                     let versions: Vec<_> = keys
                         .iter()
                         .map(|key| read_sequence(&index, key, cut.clone()))
@@ -256,7 +256,7 @@ fn partially_applied_batch_is_invisible_at_the_watermark_until_publication() {
     let index = Arc::new(NativeIndex::with_shards(&shape(), DATABASE, BUDGET, 8).unwrap());
     let keys = keys_spanning_shards(&index, 16, 3);
     publish_batch(&index, 1, &keys);
-    let before = index.latest_cut();
+    let before = index.call_cut();
 
     // Stage batch 2 first, then block its apply at the highest shard. Apply
     // order is ascending shard index, so lower shards are applied by the time
@@ -329,7 +329,7 @@ fn partially_applied_batch_is_invisible_at_the_watermark_until_publication() {
     ));
 
     // Every reader of the watermark still sees one consistent snapshot.
-    assert_eq!(index.latest_cut(), before);
+    assert_eq!(index.call_cut(), before);
     for key in &keys {
         if shard_of_key(&index, key) != highest {
             assert_eq!(
@@ -648,7 +648,7 @@ fn any_shard_count_opens_any_snapshot() {
             .collect();
         assert_eq!(actual, expected, "{shards} shards");
         assert_eq!(reopened.stats().cells, index.stats().cells);
-        assert_eq!(reopened.latest_cut(), index.latest_cut());
+        assert_eq!(reopened.call_cut(), index.call_cut());
     }
 }
 
@@ -681,7 +681,7 @@ fn empty_exclusion_view_publishes_upper_not_the_newest_promoted_batch() {
         .writer()
         .install_live_view(upper, IndexReadCut::At(upper), vec![])
         .unwrap();
-    assert_eq!(index.latest_cut(), IndexReadCut::At(upper));
+    assert_eq!(index.call_cut(), IndexReadCut::At(upper));
     for key in &keys {
         assert_eq!(read_sequence(&index, key, IndexReadCut::Latest), Some(1));
         assert!(matches!(

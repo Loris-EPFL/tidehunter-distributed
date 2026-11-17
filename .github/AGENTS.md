@@ -38,10 +38,7 @@ root `AGENTS.md` or the containing project's working rules.
 - A GitHub environment name alone does not configure required reviewers. Document
   the account-side approval setting; never imply that committing YAML enables it.
 - Do not add API-key review bots for subscription-backed Codex review. The native
-  GitHub integration is configured in Codex settings, outside workflow YAML. The
-  owner-approved Claude second reviewer (`claude-review.yaml`, secret
-  `ANTHROPIC_API_KEY`) is separate: it comments only, never approves or pushes,
-  and replies to Codex reviews at most twice per head commit.
+  GitHub integration is configured in Codex settings, outside workflow YAML.
 - Pin external actions/dependency sources. Scope caches to their actual toolchain,
   lockfile and provider inputs; a cache hit is not proof of current binary identity.
 - Prefer the connected AWS MCP for interactive AWS operations. If it is
