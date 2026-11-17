@@ -677,7 +677,8 @@ read_diagnostics!(
     admission_retry_paused,
     admission_retry_config,
     admission_retry_mixed,
-    // Live lane inbox pressure: inbox-full events, deepest inbox, deepest
+    // Live lane inbox pressure: inbox-full events, deepest inbox (an upper
+    // bound on occupancy; see `LiveLane` in `drive_live_reads`), deepest
     // actor-side overflow queue, and time requests spent in that queue.
     live_lane_full,
     live_lane_depth_max,
@@ -1963,7 +1964,18 @@ fn drive_live_reads(
 ) {
     /// A lane's inbox as seen by the actor. `pending` holds requests the full
     /// inbox did not accept; it is bounded by `max_requests` because every
-    /// request holds a global flight credit. Depth counts inbox entries.
+    /// request holds a global flight credit. The inbox channel itself holds
+    /// at most `max_requests` entries.
+    ///
+    /// `depth` counts requests offered and not yet taken in by the worker.
+    /// It is a diagnostic upper bound on inbox occupancy, not the occupancy.
+    /// The actor counts before `try_send` and the worker uncounts after its
+    /// receive, so a recorded depth may include the request the worker has
+    /// received but not yet uncounted, and the request it receives between
+    /// the actor's count and its send. The recorded maximum can therefore
+    /// exceed `max_requests` by up to two while the worker is receiving.
+    /// An exiting worker sets `live_lane::LANE_CLOSED` in `depth`; from then
+    /// on the actor fails each request itself instead of sending it.
     struct LiveLane {
         sender: mpsc::SyncSender<LiveLaneCommand>,
         depth: Arc<AtomicUsize>,
@@ -1973,7 +1985,18 @@ fn drive_live_reads(
     /// Hand `request` to the lane without blocking; false if the inbox is full.
     fn offer(lane: &mut LiveLane, request: Request, state: &State, node: usize) -> Option<Request> {
         // Count before sending so the worker's decrement cannot underflow.
-        let depth = lane.depth.fetch_add(1, Ordering::Relaxed) + 1;
+        // Relaxed: the count and the worker's close are read-modify-writes of
+        // one atomic, so their modification order alone decides who completes
+        // a racing request (see `live_lane::LANE_CLOSED`); the channel
+        // publishes the request itself.
+        let previous = lane.depth.fetch_add(1, Ordering::Relaxed);
+        if previous & live_lane::LANE_CLOSED != 0 {
+            // The worker is exiting and takes nothing more: fail it here.
+            lane.depth.fetch_sub(1, Ordering::Relaxed);
+            request.complete_nvme(Err(LocalDbError::new("read authority is poisoned")));
+            return None;
+        }
+        let depth = previous + 1;
         match lane.sender.try_send(LiveLaneCommand::Request(request)) {
             Ok(()) => {
                 // Interrupt a worker sleeping on its CQ so it admits this at once.
@@ -4728,12 +4751,11 @@ mod live_worker_tests {
         db.shutdown().unwrap();
     }
 
-    #[test]
-    fn full_lane_inbox_never_blocks_the_actor() {
-        let mut fixture = Fixture::new();
-        fixture.config.read_lanes = Some(1);
-        fixture.config.read_cache_bytes = 0;
-        let db = fixture.open();
+    /// At least five references on one owner, each in its own flight.
+    fn one_owner_references(
+        fixture: &Fixture,
+        db: &RemoteDatabase,
+    ) -> (usize, Vec<ValueRecordReference>) {
         // A batch holds at most four operations; two batches put eight members
         // on one owner.
         for batch in 0u32..2 {
@@ -4759,35 +4781,65 @@ mod live_worker_tests {
             .take(6)
             .collect();
         assert!(same_owner.len() >= 5, "need distinct flights on one lane");
+        (node, same_owner)
+    }
+
+    /// A live read actor for `node` whose single lane has a two-entry inbox.
+    /// Its worker parks at the unlocked top of its loop, after its first idle
+    /// receive and before it takes a lane mutex or drains the inbox, until
+    /// `resume` is sent. A parked worker receives nothing.
+    struct PausedLiveActor {
+        sender: mpsc::SyncSender<ReadCommand>,
+        parked: mpsc::Receiver<()>,
+        resume: mpsc::SyncSender<()>,
+        client: Arc<Mutex<Client>>,
+        actor: JoinHandle<()>,
+    }
+
+    fn paused_live_actor(db: &RemoteDatabase, node: usize) -> PausedLiveActor {
         let lanes = db.core.reads.lanes.read()[node].clone();
         let base = lanes[0].index;
         let client = lanes[0].client.clone();
         let (sender, receiver) = mpsc::sync_channel(db.core.reads.max_requests + 1);
+        db.core.reads.sender.lock()[node] = sender.clone();
+        // Replacing the sender stops the fixture's own reactor for this node.
+        // Join it so it cannot take the worker pause hook installed below.
+        let fixture_reactor = db.core.reads.thread.lock().remove(node);
+        fixture_reactor.join().unwrap();
         let state = db.core.reads.state.clone();
         let epoch = db.core.reads.epoch;
-        // A lane inbox of two entries, and a worker stuck behind the client lock.
-        let held = client.lock();
+        let (entered, parked) = mpsc::sync_channel(1);
+        let (resume, resumed) = mpsc::sync_channel(1);
+        *db.core.reads.state.reactor_pause[node].lock() = Some((entered, resumed));
         let actor =
             thread::spawn(move || drive_live_reads(state, receiver, lanes, node, base, epoch, 2));
-        db.core.reads.sender.lock()[node] = sender.clone();
-        let pending: Vec<_> = same_owner
-            .iter()
-            .map(|reference| {
-                db.core
-                    .reads
-                    .submit(node, vec![*reference], 0, false, None)
-                    .unwrap()
-            })
-            .collect();
-        let diagnostics = &db.core.reads.state.diagnostics;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while diagnostics.live_lane_full.load(Ordering::Relaxed) == 0 {
-            assert!(Instant::now() < deadline, "the lane inbox never filled");
-            thread::yield_now();
+        PausedLiveActor {
+            sender,
+            parked,
+            resume,
+            client,
+            actor,
         }
-        // The actor still serves its own channel while one lane is full.
+    }
+
+    fn submit_one(
+        db: &RemoteDatabase,
+        node: usize,
+        reference: &ValueRecordReference,
+    ) -> ReadRequest {
+        db.core
+            .reads
+            .submit(node, vec![*reference], 0, false, None)
+            .unwrap()
+    }
+
+    /// Wait until the actor takes a wake sent now. The actor takes commands in
+    /// order and retries its overflow queue at the top of each loop, so after
+    /// this returns it has handled every earlier command.
+    fn actor_takes_wake(db: &RemoteDatabase, node: usize, sender: &mpsc::SyncSender<ReadCommand>) {
         db.core.reads.state.wake_pending[node].store(true, Ordering::Release);
         assert!(sender.try_send(ReadCommand::Wake).is_ok());
+        let deadline = Instant::now() + db.core.config.timeout;
         while db.core.reads.state.wake_pending[node].load(Ordering::Acquire) {
             assert!(
                 Instant::now() < deadline,
@@ -4795,17 +4847,104 @@ mod live_worker_tests {
             );
             thread::yield_now();
         }
-        assert!(diagnostics.live_lane_pending_max.load(Ordering::Relaxed) >= 1);
-        assert!(diagnostics.live_lane_depth_max.load(Ordering::Relaxed) <= 2);
-        drop(held);
+    }
+
+    #[test]
+    fn full_lane_inbox_never_blocks_the_actor() {
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = Some(1);
+        fixture.config.read_cache_bytes = 0;
+        let db = fixture.open();
+        let (node, same_owner) = one_owner_references(&fixture, &db);
+        // Once the worker is parked the inbox depth counter equals the inbox
+        // occupancy. While the worker is still taking requests the counter
+        // may run up to two above the inbox capacity: see `LiveLane`.
+        let paused = paused_live_actor(&db, node);
+        let mut pending = vec![submit_one(&db, node, &same_owner[0])];
+        // The worker parks after taking the first request, or after its idle
+        // wait if that request arrives later; it takes nothing while parked.
+        paused.parked.recv_timeout(db.core.config.timeout).unwrap();
+        pending.extend(
+            same_owner[1..]
+                .iter()
+                .map(|reference| submit_one(&db, node, reference)),
+        );
+        // The actor has offered every request above, and found the lane full,
+        // before it takes this wake: a full lane does not block the actor.
+        actor_takes_wake(&db, node, &paused.sender);
+        let diagnostics = &db.core.reads.state.diagnostics;
+        assert!(diagnostics.live_lane_full.load(Ordering::Relaxed) >= 1);
+        // The inbox held exactly its capacity. The parked worker holds at
+        // most the first request, so the actor queued every other request
+        // beyond the two inbox entries.
+        assert_eq!(diagnostics.live_lane_depth_max.load(Ordering::Relaxed), 2);
+        assert!(
+            diagnostics.live_lane_pending_max.load(Ordering::Relaxed)
+                >= same_owner.len() as u64 - 3
+        );
+        paused.resume.send(()).unwrap();
         // Unconfigured live clients fail every request; none may be lost.
         for request in pending {
             assert!(request.finish().is_err());
         }
         assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
-        drop(sender);
+        drop(paused.sender);
         db.core.reads.sender.lock().clear();
-        actor.join().unwrap();
+        paused.actor.join().unwrap();
+        drop(db);
+    }
+
+    #[test]
+    fn poisoned_live_worker_fails_inbox_requests_promptly() {
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = Some(1);
+        fixture.config.read_cache_bytes = 0;
+        let db = fixture.open();
+        let (node, same_owner) = one_owner_references(&fixture, &db);
+        let paused = paused_live_actor(&db, node);
+        // With nothing submitted the worker parks after its idle wait, holding
+        // no request; the inbox is empty.
+        paused.parked.recv_timeout(db.core.config.timeout).unwrap();
+        let mut pending: VecDeque<_> = same_owner
+            .iter()
+            .map(|reference| submit_one(&db, node, reference))
+            .collect();
+        // Requests 0 and 1 fill the inbox; the actor queues the rest.
+        actor_takes_wake(&db, node, &paused.sender);
+        db.core.reads.state.poison();
+        // Resumed, the worker drains the inbox, failing 0 and 1 as poisoned,
+        // then blocks on the held client mutex without receiving.
+        let held = paused.client.lock();
+        paused.resume.send(()).unwrap();
+        for _ in 0..2 {
+            assert!(pending.pop_front().unwrap().finish().is_err());
+        }
+        // The first wake may be taken by a loop that retried the overflow
+        // queue before that drain; the loop taking the second one retried it
+        // after, so the inbox again holds two requests the worker never takes.
+        actor_takes_wake(&db, node, &paused.sender);
+        actor_takes_wake(&db, node, &paused.sender);
+        let started = Instant::now();
+        // The worker now sees the poison and exits with a full inbox.
+        drop(held);
+        for request in pending {
+            let error = request
+                .finish()
+                .err()
+                .expect("a poisoned live read must fail");
+            assert!(
+                error.to_string().contains("poisoned")
+                    || error.to_string().contains("live read worker stopped"),
+                "{error}"
+            );
+        }
+        // A request left in the inbox would only fail at its deadline, one
+        // configured timeout after submission.
+        assert!(started.elapsed() < db.core.config.timeout / 2);
+        assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
+        drop(paused.sender);
+        db.core.reads.sender.lock().clear();
+        paused.actor.join().unwrap();
         drop(db);
     }
 }
