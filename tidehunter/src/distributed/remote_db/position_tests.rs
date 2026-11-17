@@ -39,7 +39,7 @@ fn paused_position_allows_adoption_prelease_and_two_extent_switches() {
             let mut receipts = vec![first];
             for n in 1..=10 {
                 let pending = worker
-                    .append(1, vec![fixture.batch(n)])
+                    .enqueue(1, vec![fixture.batch(n)])
                     .map_err(|e| e.to_string())?;
                 let result = pending
                     .recv_timeout(Duration::from_secs(5))

@@ -82,16 +82,41 @@ class ConfigTests(unittest.TestCase):
                              5 * repeats)
             self.assertFalse(any('resident_reads' in job or 'owner_read_cache_bytes' in job for job in jobs))
 
-    def test_every_tidehunter_job_carries_a_tier_defaulting_to_synchronous(self):
+    def test_every_tidehunter_job_carries_a_tier_and_historical_specs_keep_synchronous(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-nvmeof-campaign.json')
         spec['mode'] = 'nvmeof-focused'
         spec['backends'] = ['native', 'tidehunter_tcp', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma']
-        jobs = ci.cloud_campaign.make_matrix(spec)
-        tidehunter = [job for job in jobs if job['backend'] in ci.cloud_campaign.TRANSPORTS]
-        self.assertTrue(tidehunter)
-        self.assertTrue(all(job['durability_tier'] == 'synchronous' for job in tidehunter))
-        # Comparators and native have their own durability contract and get no owner tier.
-        self.assertTrue(all('durability_tier' not in job for job in jobs if job not in tidehunter))
+        self.assertEqual(spec['durability_tier'], 'synchronous')
+        for spec_tier, expected in (('synchronous', 'synchronous'), (None, 'native'), ('native', 'native')):
+            planned = {key: value for key, value in spec.items() if key != 'durability_tier'}
+            if spec_tier is not None:
+                planned['durability_tier'] = spec_tier
+            with self.subTest(spec_tier=spec_tier):
+                jobs = ci.cloud_campaign.make_matrix(planned)
+                tidehunter = [job for job in jobs if job['backend'] in ci.cloud_campaign.TRANSPORTS]
+                self.assertTrue(tidehunter)
+                # A spec that names no tier plans the native default.
+                self.assertTrue(all(job['durability_tier'] == expected for job in tidehunter))
+                # Comparators and native have their own durability contract and get no owner tier.
+                self.assertTrue(all('durability_tier' not in job for job in jobs if job not in tidehunter))
+        with self.assertRaisesRegex(ValueError, 'spec durability_tier'):
+            ci.cloud_campaign.make_matrix(spec | {'durability_tier': 'sync'})
+
+    def test_new_job_without_a_tier_plans_native_and_older_selections_keep_theirs(self):
+        campaign = ci.cloud_campaign
+        self.assertEqual(campaign.DEFAULT_DURABILITY_TIER, 'native')
+        self.assertEqual(campaign.durability_tier({'backend': 'tidehunter_tcp'}), 'native')
+        self.assertEqual(campaign.durability_tier({'backend': 'tidehunter_tcp', 'durability_tier': 'synchronous'}),
+                         'synchronous')
+        self.assertIsNone(campaign.durability_tier({'backend': 'valkey_tcp'}))
+        # Older reviewed selections still plan the tiers they were reviewed with.
+        for selection, tiers in (('recommended', {'synchronous'}), ('nvmeof_m3_t1', {'synchronous'}),
+                                 ('nvmeof_p9_small_put', {'synchronous'}),
+                                 ('nvmeof_p9_write_engine', {'synchronous', 'native'})):
+            planned = {campaign.durability_tier(job) for job in campaign.make_focused_matrix(selection)
+                       if job['backend'] in campaign.TRANSPORTS}
+            with self.subTest(selection=selection):
+                self.assertEqual(planned, tiers)
 
     def test_run_config_records_the_planned_tier_and_rejects_a_conflicting_option(self):
         job = {'backend': 'tidehunter_tcp', 'case_id': 'c', 'repeat': 0, 'keys': 1024, 'value_size': 256,

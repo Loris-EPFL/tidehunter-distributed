@@ -422,9 +422,13 @@ class LocalMode:
         archive.unlink()
         launch_path = guest / "launch.yaml"
         launch = yaml.safe_load(launch_path.read_text())
-        if self.config.get("wal_prewrite", False):
-            launch["node"]["wal_prewrite"] = True
-            launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
+        # Always an explicit boolean: the case's choice (off when unset), or
+        # the local override. validate_launch rejects an override that
+        # contradicts a reviewed case that pins owner_wal_prewrite.
+        self.cloud.bind_owner_wal_prewrite(self.cloud.case_owner_job(self.config, case), launch)
+        if "wal_prewrite" in self.config:
+            launch["node"]["wal_prewrite"] = self.config["wal_prewrite"]
+        launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
         self.cloud.validate_launch(self.config, launch, case, index)
         live = launch.get("node", {}).get("live_target")
         daemon = None
@@ -572,6 +576,9 @@ def main(argv=None):
     parser.add_argument("--total-timeout", type=int, default=5400)
     parser.add_argument("--case-id", action="append", default=[])
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--wal-prewrite", action=argparse.BooleanOptionalAction, default=None,
+                        help="override owner WAL prewrite; default is each case's owner_wal_prewrite "
+                             "(off when the case does not set it)")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         raise SystemExit("run through the documented privileged Docker/nsenter host-root wrapper")
@@ -633,6 +640,8 @@ def main(argv=None):
                   "binary_blake2b512": hashlib.file_digest(staged_binary.open("rb"), "blake2b").hexdigest(),
                   "source_revision": source, "repository_root": str(Path(__file__).resolve().parents[2]),
                   "fdb_library_dir": str(runtime / "lib"), "deadline_utc": deadline.isoformat(), "spec": campaign_spec}
+        if args.wal_prewrite is not None:
+            config["wal_prewrite"] = args.wal_prewrite
         objects = fixture / "objects"
         objects.mkdir(mode=0o700)
         mode = LocalMode(fixture, config, args.runtime)

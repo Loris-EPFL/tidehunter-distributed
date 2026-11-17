@@ -315,10 +315,7 @@ write_background_checkpoint_suffix_batches
 write_durable_receipt_publication_blocked_ns
 write_durable_receipt_publication_blocked_batches
 write_append_requests
-write_direct_appends
-write_durable_batches
 write_concurrent_admitted
-write_concurrent_completed
 ```
 
 These values use the same stage-seconds/count families but

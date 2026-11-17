@@ -50,9 +50,10 @@ def run(args):
          "route": "kernel NVMe/TCP; four colocated owners; one host/shared filesystem; no RDMA"})
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
+    # Owners prewrite by default, so the gating file pass opts out explicitly.
     sys.argv = [str(local_multiowner_check.__file__), "--binary", str(args.binary.resolve(strict=True)),
                 "--libs", str(args.state / "libs"), "--owners", "4",
-                "--output", str(args.state / "proof")]
+                "--output", str(args.state / "proof"), "--no-wal-prewrite"]
     result = 1
     # sudo already runs this wrapper in the hosted runner's host namespace.
     # The local development Docker image is not installed on hosted runners.
