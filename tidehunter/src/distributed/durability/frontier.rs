@@ -166,12 +166,15 @@ pub struct FrontierStats {
     pub fsync_bytes: u64,
     pub fsync_batches: u64,
     pub max_batches_per_fsync: u64,
-    /// Acknowledgement waits that actually blocked, with total blocked time.
+    /// Acknowledgement waits that blocked on the condition variable, with their total
+    /// time from the call to the return. A wait that finds its condition already true (or
+    /// the frontier failed or stopped) without parking is not counted.
     pub appended_waits: u64,
     pub appended_wait_ns: u64,
     pub synced_waits: u64,
     pub synced_wait_ns: u64,
-    /// Explicit flush requests, the subset that blocked, and their blocked time.
+    /// Explicit flush requests, the subset whose wait blocked on the condition variable
+    /// (same rule as above), and their blocked time.
     pub flush_requests: u64,
     pub flush_waits: u64,
     pub flush_wait_ns: u64,
@@ -506,7 +509,7 @@ impl Frontier {
     }
 
     /// Wait for the position returned by [`Frontier::request_sync`] to be synced and
-    /// return the synced frontier. Counted as a flush wait.
+    /// return the synced frontier. Counted as a flush wait if it blocks.
     pub fn wait_flush(&self, target: u64, deadline: Option<Instant>) -> Result<u64, FrontierError> {
         if self.synced() < target {
             self.wait(target, deadline, WaitKind::Flush)?;
@@ -526,7 +529,8 @@ impl Frontier {
             st.demand_end = target;
             self.syncer_cv.notify_one();
         }
-        #[cfg(test)]
+        // Whether this call parked on its condition variable. Only such calls are counted:
+        // the lock-free fast path and the re-check under the lock both return unparked.
         let mut parked = false;
         let outcome = loop {
             let reached = match kind {
@@ -546,14 +550,16 @@ impl Frontier {
             if stopped {
                 break Err(FrontierError::Stopped);
             }
-            // Test barrier. The waiter holds the state lock from here until the park below
-            // releases it, so a test that sees this count under the lock knows the waiter is
-            // parked or past its park, and is in the slow path, which always counts the wait.
-            #[cfg(test)]
-            if kind == WaitKind::Flush && !parked {
+            // First park of this call. The waiter holds the state lock from here until the
+            // park below releases it. A test that sees the barrier count under the lock
+            // therefore knows the waiter is parked or past its park, so it will be counted.
+            if !parked {
                 parked = true;
-                st.parked_flush_waits += 1;
-                self.parked_cv.notify_all();
+                #[cfg(test)]
+                if kind == WaitKind::Flush {
+                    st.parked_flush_waits += 1;
+                    self.parked_cv.notify_all();
+                }
             }
             match deadline {
                 None => condvar.wait(&mut st),
@@ -573,6 +579,9 @@ impl Frontier {
                 }
             }
         };
+        if !parked {
+            return outcome;
+        }
         let blocked = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let counters = &mut st.counters;
         match kind {
@@ -596,10 +605,10 @@ impl Frontier {
     /// Test barrier: block until `count` flush waits have parked at least once, or until
     /// `deadline`; returns whether the count was reached.
     ///
-    /// `flush_waits` counts only waits that missed the lock-free check in
-    /// [`Frontier::wait_flush`]. A test that releases an fsync while a flusher may still be
-    /// before that check races the flusher: the flusher can find the target synced and not
-    /// wait at all. Releasing the fsync only after this barrier returns removes that race.
+    /// `flush_waits` counts only waits that park. A test that releases an fsync while a
+    /// flusher may still be before its park races the flusher: the flusher can find the
+    /// target synced and not wait at all. Releasing the fsync only after this barrier
+    /// returns removes that race.
     #[cfg(test)]
     pub(super) fn wait_parked_flush_waits(&self, count: u64, deadline: Instant) -> bool {
         let mut st = self.state.lock();

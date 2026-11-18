@@ -309,6 +309,44 @@ fn flush_of_a_synced_owner_returns_without_waiting() {
 }
 
 #[test]
+fn only_waits_that_park_are_counted() {
+    let f = Frontier::with_config(lazy(0, 8)).unwrap();
+    // Already reached: every kind returns from its lock-free check.
+    assert_eq!(f.wait_appended(0, soon()), Ok(()));
+    assert_eq!(f.wait_synced(0, soon()), Ok(()));
+    assert_eq!(f.wait_flush(0, soon()), Ok(0));
+
+    // Not reached: the wait parks until its deadline and is counted.
+    assert_eq!(
+        f.wait_appended(10, Some(Instant::now() + SETTLE)),
+        Err(FrontierError::Timeout)
+    );
+
+    // Not reached, but the frontier already failed: the locked path returns before it
+    // parks, so these calls did not block and are not counted.
+    f.complete(0, 10, 1).unwrap();
+    f.fail("test failure");
+    assert_eq!(f.wait_appended(20, soon()), Err(FrontierError::Failed));
+    assert_eq!(f.wait_synced(10, soon()), Err(FrontierError::Failed));
+    assert_eq!(f.wait_flush(10, soon()), Err(FrontierError::Failed));
+
+    let stats = f.stats();
+    assert_eq!(
+        (stats.appended_waits, stats.synced_waits, stats.flush_waits),
+        (1, 0, 0)
+    );
+    assert!(stats.appended_wait_ns > 0);
+    assert_eq!(
+        (
+            stats.synced_wait_ns,
+            stats.flush_wait_ns,
+            stats.flush_wait_max_ns
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
 fn one_fsync_covers_everything_completed_meanwhile() {
     let f = Frontier::with_config(lazy(0, 8)).unwrap();
     let stall = stalled(&f);
