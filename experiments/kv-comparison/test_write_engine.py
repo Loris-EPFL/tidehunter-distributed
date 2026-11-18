@@ -21,18 +21,21 @@ class WriteEngineTests(unittest.TestCase):
         selection = "nvmeof_p13_write_engine"
         legacy = campaign.make_focused_matrix(SELECTION)
         jobs = campaign.make_focused_matrix(selection)
-        self.assertEqual(len({job["case_id"] for job in jobs}), 38)
+        self.assertEqual(len({job["case_id"] for job in jobs}), 50)
         for arm, prewrite in (("file", False), ("prewritten", True)):
             spec = {"mode": "focused", "selection": selection, "owner_hosts": 2, "arms": [arm]}
             selected = controller.controller_matrix(spec)
             self.assertEqual(selected, [job for job in jobs if job["arm"] == arm])
-            self.assertEqual(len(selected), 19)
+            self.assertEqual(len(selected), 25)
+            self.assertTrue(all("checkpoint_pipeline_depth" not in job for job in selected[:-6]))
+            self.assertEqual([(job["checkpoint_pipeline_depth"], job["durability_tier"]) for job in selected[-6:]],
+                             [(depth, tier) for depth in (2, 4, 8) for tier in ("synchronous", "native")])
             puts = [job for job in selected if job["case_kind"] == "remote_put"]
             self.assertEqual(len(puts), 8)
             self.assertEqual({(job["concurrency"], job["durability_tier"]) for job in puts},
                              {(c, t) for c in (8, 16, 32, 64) for t in ("synchronous", "native")})
             replay = [job for job in selected if job["case_kind"] == "mainnet_replay"]
-            self.assertEqual(len(replay), 10)
+            self.assertEqual(len(replay), 16)
             self.assertEqual({(job["concurrency"], job["durability_tier"]) for job in replay},
                              {(n, t) for n in (4, 8, 16, 32, 64) for t in ("synchronous", "native")})
             self.assertEqual(sum(job["case_kind"] == "live_read" for job in selected), 1)
@@ -52,15 +55,35 @@ class WriteEngineTests(unittest.TestCase):
                 if job in replay:
                     n = job["concurrency"]
                     deadline, estimate = {4: (1000, 480), 8: (800, 240)}.get(n, (600, 120))
+                    depth = job.get("checkpoint_pipeline_depth")
                     expected["measurement_sizing"] = dict(
                         source["measurement_sizing"], case_deadline_seconds=deadline, expected_case_seconds=estimate)
                     profile = (source["profile"] if n == 16
                                else f"G35S-mainnet-perpetual-c{n}-separate-o2")
+                    if depth is not None:
+                        expected["checkpoint_pipeline_depth"] = depth
+                        profile = f"G35S-mainnet-perpetual-c16-k{depth}-separate-o2"
                     self.assertEqual(job["profile"], profile)
                     options = {"path": "/tmp/perpetual-db",
                                "external_remote_config": {"storage": {"database": [7] * 16}}}
                     config = campaign.make_run_config(job, Path("/tmp/replay-case"), options, "a" * 40, deadline)
                     self.assertEqual(config["execution"]["concurrency"], n)
+                    if depth is None:
+                        self.assertNotIn("checkpoint_pipeline_depth", config["workload"])
+                    else:
+                        self.assertEqual(n, 16)
+                        self.assertEqual(config["workload"]["checkpoint_pipeline_depth"], depth)
+                        summary = {"status": "completed", "phase_counts": {
+                            "scope": "archive-derivable node KV subset, node databases: perpetual",
+                            "counts": {name: 4096 * count for name, count in
+                                       campaign.PERPETUAL_REPLAY_PER_REPETITION.items()},
+                            "unknown_outcomes": 0, "unresolved_workers": 0,
+                            "profile": {"functional_qualification": True, "case_identity": {"K": depth},
+                                        "pipeline": {"checkpoint_pipeline_depth": depth}}}}
+                        campaign.admit_replay_summary(config, summary)
+                        summary["phase_counts"]["profile"]["case_identity"]["K"] = 1
+                        with self.assertRaisesRegex(ValueError, "pipeline depth differs"):
+                            campaign.admit_replay_summary(config, summary)
                     self.assertGreaterEqual(config["execution"]["queue_capacity"], n)
                     self.assertEqual(config["limits"]["deadline_seconds"], deadline)
                     owner_seconds = controller.tide_owner_service_seconds(
@@ -72,7 +95,7 @@ class WriteEngineTests(unittest.TestCase):
     def test_p13_sample_archive_bound_is_separate_from_p9(self):
         selection = "nvmeof_p13_write_engine"
         self.assertNotIn(SELECTION, campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES)
-        expected = 7_928_827_904
+        expected = 11_703_701_504
         with patch.dict(campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES, {selection: expected - 1}):
             with self.assertRaisesRegex(ValueError, "drop cells, not measurement seconds"):
                 campaign._write_engine_matrix(selection)

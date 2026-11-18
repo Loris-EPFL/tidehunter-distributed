@@ -20,8 +20,8 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 87)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 87)
+        self.assertEqual(len(self.jobs), 99)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 99)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
                          {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:

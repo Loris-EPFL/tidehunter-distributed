@@ -176,7 +176,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         manual._reviewed_jobs({**spec, 'machine_type': 'z4m-highmem-16'})
                 jobs = manual._reviewed_jobs(spec)
-                expected_fleet_count = {'nvmeof_p9_write_engine': 9, 'nvmeof_p13_write_engine': 19}.get(selection, expected_count)
+                expected_fleet_count = {'nvmeof_p9_write_engine': 9, 'nvmeof_p13_write_engine': 25}.get(selection, expected_count)
                 self.assertEqual(len(jobs), expected_fleet_count)
                 self.assertEqual(spec['max_cases'], expected_count)
                 self.assertEqual(spec['owner_hosts'], workflow_input.cloud_campaign.selection_owner_hosts(selection))

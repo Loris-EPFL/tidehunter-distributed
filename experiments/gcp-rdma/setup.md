@@ -386,7 +386,7 @@ the workload hard deadline, parent and child expiry, and VM DELETE/self-stop
 deadline together. The sealed spec and GO must bind this window. A shorter
 window also reduces the permitted non-compute surcharge; quote it again.
 Existing six-hour specs and their rounding are unchanged.
-The exact `nvmeof_p13_write_engine` review pins a 4.5-hour window. Fractional
+The exact `nvmeof_p13_write_engine` review pins a 5.5-hour window. Fractional
 windows are not accepted for selections without an explicit reviewed value.
 
 Sealing from a separate worktree is supported. Set every copied seal stage's

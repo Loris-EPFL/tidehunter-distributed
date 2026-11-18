@@ -138,7 +138,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
     'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
-    'nvmeof_p13_write_engine': '74ddb54e350f37257cc7aa233f70037a27be45d345fcedab2745c92c39fb5d50',
+    'nvmeof_p13_write_engine': '674cd71e117824550abb4624747e462b739cb9535912b5a6415782e186e03d18',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -243,14 +243,14 @@ REVIEWED_SPECS["nvmeof_p9_write_engine"] = {
 }
 REVIEWED_SPECS["nvmeof_p13_write_engine"] = {
     **copy.deepcopy(REVIEWED_SPECS["nvmeof_p9_write_engine"]),
-    "selection": "nvmeof_p13_write_engine", "job_count": 38, "max_cases": 38,
-    "reservation_hours": 4.5, "hard_deadline_seconds": 16200,
+    "selection": "nvmeof_p13_write_engine", "job_count": 50, "max_cases": 50,
+    "reservation_hours": 5.5, "hard_deadline_seconds": 19800,
     "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p13_write_engine"],
 }
 SELECTED_MATRIX_SHA256 = {
     "nvmeof_p13_write_engine": {
-        "file": "af3dee556893ea7e17624d326a3c1a9282fb70b7fc3b82f11e98b62852e3499a",
-        "prewritten": "98977ae5a91848ad44e85eac3631dd7dbd6d45d207faa4cc8dd47044f7eea30b",
+        "file": "fd9a0184200cb938a0a81407aaf3a7a38aa5956bd73b10337bf3e2521c9d490c",
+        "prewritten": "2080413ba4e1fb6202fc6d4510d45dfbc141678ca4d6ebbc75be33c2047eb43d",
     },
 }
 
