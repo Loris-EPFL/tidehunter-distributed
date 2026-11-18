@@ -800,7 +800,7 @@ impl PartitionLog {
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
                 #[cfg(feature = "experimental-nvmeof")]
-                live_root_end: 0,
+                live_root_end: physical_end,
                 writer: None,
                 wal_root: Some(root.clone()),
                 references: reference_writer,
@@ -1074,6 +1074,10 @@ impl PartitionLog {
             let mut state = log.state.lock();
             state.appended_end = physical_end;
             state.durable_end = physical_end;
+            #[cfg(feature = "experimental-nvmeof")]
+            {
+                state.live_root_end = physical_end;
+            }
         }
         log.durable_frontier.store(physical_end, Ordering::Release);
         log.recovery_hole = recovery_hole;

@@ -252,6 +252,73 @@ fn syncer_installs_live_root_on_fragment_crossing() {
     assert_eq!(live_root_end(&path), 8192);
 }
 
+/// An abrupt crash after one synced live append, then the owner operations of
+/// a recovery open on the recovered sealed log: per-receipt recovery barriers
+/// (`RecoverLiveMetadata`, checkpoint proof), flush, the fence/retire root
+/// catch-up and durable-progress status. Recovery leaves no unsynced data and
+/// no root debt, so none of them may need a live tail. A second recovery
+/// proves these operations leave the stream recoverable.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn recovered_live_log_serves_recovery_barriers_after_abrupt_crash() {
+    use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        for mode in [HistoryPersistence::WalReplay, HistoryPersistence::OnDisk] {
+            let temp = tempdir::TempDir::new("live-abrupt-recovery").unwrap();
+            let mut config = live_config();
+            config.fragment_bytes = 64 * 1024;
+            config.wal_file_bytes = 128 * 1024;
+            let path = temp.path().join("stream");
+            let log =
+                PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+            log.set_history_persistence(mode).unwrap();
+            log.attach_frontier(&DurabilityConfig::with_tier(tier))
+                .unwrap();
+            let appended = append_live_fixture(&log, &config, 0);
+            log.sync_for_frontier().unwrap();
+            // Abrupt: no flush, fence or shutdown barrier runs before the drop.
+            drop(log);
+            let mut durable_state = None;
+            // Each pass drops the recovered handle without shutdown: a second
+            // abrupt crash after the post-recovery barriers.
+            for _ in 0..2 {
+                let recovered =
+                    PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(()))
+                        .unwrap();
+                // Recovery itself leaves a root covering the recovered end.
+                assert_eq!(live_root_end(&path), 4096);
+                let receipts = recovered.receipt_page(0, 16).unwrap();
+                assert_eq!(receipts, vec![appended]);
+                assert_eq!(
+                    recovered.persist_through(appended).unwrap(),
+                    DurableBatch(appended)
+                );
+                assert_eq!(
+                    recovered.persist_many(&receipts).unwrap(),
+                    vec![DurableBatch(appended)]
+                );
+                assert_eq!(recovered.persist_appended().unwrap(), 4096);
+                recovered.persist_live_root().unwrap();
+                // The recovered handle owes no root: the barriers install none.
+                assert_eq!(recovered.stats().live_frontier_installs, 0);
+                let progress = recovered.durable_progress();
+                assert_eq!((progress.appended_end, progress.synced_end), (4096, 4096));
+                assert_eq!(recovered.lookup(appended.id()).unwrap(), Some(appended));
+                assert_eq!(
+                    recovered.read_batch(appended).unwrap().encoded(),
+                    batch(&config, 0).encoded()
+                );
+                let state = (
+                    read_metadata::<LiveFrontier>(&path.join(LIVE_FRONTIER)).unwrap(),
+                    read_metadata::<SealedEnd>(&path.join(SEAL)).unwrap(),
+                );
+                assert_eq!(state.1.physical_end, 4096);
+                assert_eq!(*durable_state.get_or_insert_with(|| state.clone()), state);
+            }
+        }
+    }
+}
+
 /// With a lagging root, recovery scans forward and stops at the first invalid
 /// frame beyond it (a torn tail), keeping every valid frame before it.
 #[cfg(feature = "experimental-nvmeof")]

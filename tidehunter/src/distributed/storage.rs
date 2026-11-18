@@ -427,8 +427,10 @@ struct State {
     last_live_complete: Option<([u8; 16], usize, usize)>,
     #[cfg(feature = "experimental-nvmeof")]
     live_tail: Option<LiveFrontierTail>,
-    /// End covered by the last live-frontier root this handle installed. Zero
-    /// after open, so the first barrier or fragment crossing installs a root.
+    /// End below which this handle owes no live-frontier root. Zero after
+    /// create, so the first barrier or fragment crossing installs a root. After
+    /// recovery it is the recovered end: recovery leaves that end described by
+    /// its own durable roots and seal, and a sealed handle has no live tail.
     #[cfg(feature = "experimental-nvmeof")]
     live_root_end: u64,
     // Writer drops before the directory lock. The experimental feature strictly
@@ -1676,7 +1678,7 @@ impl PartitionLog {
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
                 #[cfg(feature = "experimental-nvmeof")]
-                live_root_end: 0,
+                live_root_end: physical_end,
                 writer: None,
                 wal_root: None,
                 references: reference_writer,
