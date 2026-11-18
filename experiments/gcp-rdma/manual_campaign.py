@@ -138,6 +138,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
     'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
+    'nvmeof_p13_write_engine': 'fecd37a8ae5139daf2ff1adf92a507a5f22c492a61fe8dd422dd41281715f5b7',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -239,6 +240,18 @@ REVIEWED_SPECS["nvmeof_p9_write_engine"] = {
     "selection": "nvmeof_p9_write_engine", "owner_hosts": 2, "job_count": 18, "max_cases": 18, "repeats": 1,
     "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p9_write_engine"],
     "case_deadline_seconds": 600, "arms": ["file"],
+}
+REVIEWED_SPECS["nvmeof_p13_write_engine"] = {
+    **copy.deepcopy(REVIEWED_SPECS["nvmeof_p9_write_engine"]),
+    "selection": "nvmeof_p13_write_engine", "job_count": 22, "max_cases": 22,
+    "reservation_hours": 3, "hard_deadline_seconds": 10800,
+    "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p13_write_engine"],
+}
+SELECTED_MATRIX_SHA256 = {
+    "nvmeof_p13_write_engine": {
+        "file": "f67708737e501985f11ccbfcfcd7e7c191e18dbda8ecc4fe8611916862b11301",
+        "prewritten": "abbd468292ed945e553a5a28aed7da51ca016ba6a6eaa1e919cf8e30f3128e4e",
+    },
 }
 
 
@@ -369,7 +382,10 @@ def reviewed_window_spec(spec):
 
 
 def _reviewed_jobs(spec):
-    spec = reviewed_window_spec(spec)
+    # P13 pins the reservation as part of its exact review; historical
+    # selections retain the legacy variable-window normalization.
+    if not isinstance(spec, dict) or spec.get("selection") != "nvmeof_p13_write_engine":
+        spec = reviewed_window_spec(spec)
     if isinstance(spec, dict) and 'machine_type' in spec:
         if spec['machine_type'] not in MACHINE_RATE_NANODOLLARS:
             raise ValueError('unreviewed machine type')
@@ -390,7 +406,7 @@ def _reviewed_jobs(spec):
     if isinstance(spec, dict) and spec.get('selection') in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
         reviewed = m3_spec(spec.get('owner_hosts'))
     selected_arms = None
-    if reviewed is not None and spec.get("selection") == "nvmeof_p9_write_engine":
+    if reviewed is not None and spec.get("selection") in workflow_input.cloud_campaign.WRITE_ENGINE_SELECTIONS:
         selected_arms = spec.get("arms")
         if selected_arms not in (["file"], ["prewritten"]):
             raise ValueError("write-engine fleets require exactly one file or prewritten arm")
@@ -410,6 +426,9 @@ def _reviewed_jobs(spec):
         raise ValueError('focused selection and reviewed owner layout disagree')
     if selected_arms is not None:
         jobs = [job for job in jobs if job["arm"] in selected_arms]
+        selected_digests = SELECTED_MATRIX_SHA256.get(spec["selection"])
+        if selected_digests is not None and _digest(_json(jobs)) != selected_digests[selected_arms[0]]:
+            raise ValueError('selected arm differs from the reviewed matrix')
     return jobs
 
 

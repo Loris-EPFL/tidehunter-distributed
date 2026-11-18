@@ -153,7 +153,7 @@ def controller_matrix(spec):
         jobs = cloud_campaign.make_focused_matrix(spec["selection"])
         if spec["selection"] in cloud_campaign.M3_SELECTIONS and "owner_hosts" in spec:
             jobs = [job for job in jobs if cloud_campaign.job_owner_hosts(job) == spec["owner_hosts"]]
-        if spec["selection"] == "nvmeof_p9_write_engine":
+        if spec["selection"] in cloud_campaign.WRITE_ENGINE_SELECTIONS:
             arms = spec.get("arms", ["file"])
             if arms not in (["file"], ["prewritten"]):
                 raise SafetyError("write-engine fleets require exactly one file or prewritten arm")

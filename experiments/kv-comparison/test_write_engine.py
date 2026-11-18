@@ -17,6 +17,34 @@ SELECTION = "nvmeof_p9_write_engine"
 
 
 class WriteEngineTests(unittest.TestCase):
+    def test_p13_keeps_controls_and_put_workload_shape(self):
+        selection = "nvmeof_p13_write_engine"
+        legacy = campaign.make_focused_matrix(SELECTION)
+        jobs = campaign.make_focused_matrix(selection)
+        self.assertEqual(len(jobs), 22)
+        for arm, prewrite in (("file", False), ("prewritten", True)):
+            spec = {"mode": "focused", "selection": selection, "owner_hosts": 2, "arms": [arm]}
+            selected = controller.controller_matrix(spec)
+            self.assertEqual(selected, [job for job in jobs if job["arm"] == arm])
+            self.assertEqual(len(selected), 11)
+            puts = [job for job in selected if job["case_kind"] == "remote_put"]
+            self.assertEqual(len(puts), 8)
+            self.assertEqual({(job["concurrency"], job["durability_tier"]) for job in puts},
+                             {(c, t) for c in (8, 16, 32, 64) for t in ("synchronous", "native")})
+            for job in selected:
+                self.assertIs(job["owner_wal_prewrite"], prewrite)
+                self.assertEqual(campaign.job_owner_hosts(job), 2)
+                if job in puts:
+                    self.assertEqual(job["value_size"], 512)
+                source_c = {8: 16, 32: 64}.get(job["concurrency"], job["concurrency"])
+                source = next(j for j in legacy if j["arm"] == arm and j["case_kind"] == job["case_kind"]
+                              and j["durability_tier"] == job["durability_tier"] and j["concurrency"] == source_c)
+                expected = dict(source, case_id=job["case_id"], selection=selection,
+                                concurrency=job["concurrency"], profile=job["profile"])
+                self.assertEqual(job, expected)
+            for kind, count in (("live_read", 1), ("mainnet_replay", 2)):
+                self.assertEqual(sum(job["case_kind"] == kind for job in selected), count)
+
     def test_exact_arms_and_cells(self):
         jobs = campaign.make_focused_matrix(SELECTION)
         self.assertEqual(len(jobs), 18)
