@@ -1263,7 +1263,7 @@ pub async fn run(config: ReplayConfig, output: &Path) -> BackendResult<()> {
     .await
 }
 
-async fn run_prepared<B: ReplayBackend + ?Sized>(
+pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
     config: ReplayConfig,
     output: &Path,
     trace: Trace,
@@ -1385,6 +1385,13 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     let mut metrics = metrics;
     metrics["replay_contract"] = capability;
     metrics["physical"] = serde_json::json!({"before_measurement":physical_before,"after_measurement":physical_after,"including_preload":backend.physical_counts()});
+    metrics["write_amplification"] = write_amplification(
+        &m,
+        &prepared,
+        &physical_before,
+        &physical_after,
+        result.is_ok(),
+    );
     metrics["final_verification"] = final_verification;
     metrics["functional_qualification"] =
         serde_json::json!(result.is_ok() && unresolved_workers == 0);
@@ -1419,7 +1426,7 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         )?;
     }
     metrics["topology"] = info.topology.clone();
-    metrics["case_identity"] = serde_json::json!({"scope":trace.scope(),"fixture_sha256":config.workload.manifest_sha256,"source":trace.manifest["source"],"repeat_domain":std::str::from_utf8(crate::mainnet_trace::DOMAIN)?,"repeat_version":1,"repetitions":prepared.len(),"N":config.execution.concurrency,"W":1,"table_mapping":trace.tables,"device_counters":"unmeasured"});
+    metrics["case_identity"] = serde_json::json!({"scope":trace.scope(),"fixture_sha256":config.workload.manifest_sha256,"source":trace.manifest["source"],"repeat_domain":std::str::from_utf8(crate::mainnet_trace::DOMAIN)?,"repeat_version":1,"repetitions":prepared.len(),"N":config.execution.concurrency,"W":1,"table_mapping":trace.tables,"device_counters":device_counters_scope()});
     let unknown_outcomes = m
         .calls
         .iter()
@@ -1439,6 +1446,143 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
     reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":trace.scope(),"config":config,"binary":resources["binary"],"trace_manifest":trace.manifest,"profile":metrics}))?;
     result
+}
+
+/// Where replay device bytes come from. Owner block devices are outside this client
+/// process; the campaign controller snapshots them at the measurement gates when the job
+/// requests `device_counters`, exactly as for the put cases.
+fn device_counters_scope() -> serde_json::Value {
+    serde_json::json!({"collector":"campaign controller","artifact":"device_counters.json","window":"block-device snapshots at the measurement.ready and measurement.complete gates; whole device, including background writes","payload":"write_amplification.payload"})
+}
+
+/// Payload of the successful commits inside the measurement window. `value_bytes` is the
+/// denominator of the put cases' `wal_bytes_per_payload` (successful puts times value
+/// size); `key_value_bytes` adds the logical key bytes the store encodes with each value.
+#[derive(Default, Serialize)]
+struct CommittedPayload {
+    commits: u64,
+    rows: u64,
+    value_bytes: u64,
+    key_bytes: u64,
+    key_value_bytes: u64,
+}
+
+fn committed_payload(m: &Measurements, prepared: &[Prepared]) -> BackendResult<CommittedPayload> {
+    let mut payload = CommittedPayload::default();
+    for (sample, id) in &m.calls {
+        if sample.operation != "commit" || sample.outcome != "success" {
+            continue;
+        }
+        let phase = id.batch_phase.ok_or("commit sample lacks a batch phase")?;
+        let batch = prepared
+            .get(usize::try_from(id.repetition)?)
+            .and_then(|p| p.batches.iter().find(|batch| batch.phase == phase))
+            .ok_or("commit sample has no prepared batch")?;
+        ensure(
+            batch.entries.len() as u64 == sample.logical_keys,
+            "commit sample members differ from its prepared batch",
+        )?;
+        let key_bytes = batch
+            .entries
+            .iter()
+            .map(|r| r.key.len() as u64)
+            .sum::<u64>();
+        payload.commits += 1;
+        payload.rows += sample.logical_keys;
+        payload.value_bytes += sample.bytes;
+        payload.key_bytes += key_bytes;
+        payload.key_value_bytes += key_bytes + sample.bytes;
+    }
+    Ok(payload)
+}
+
+/// Measurement-boundary delta of the coordinator's live leased-write counters, summed over
+/// node databases: the counter the put cases divide by payload (`completed_write_bytes`,
+/// whole aligned NVMe-oF frames), plus write operations and leased frames.
+fn live_write_delta(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<[u64; 3], String> {
+    const FIELDS: [&str; 3] = [
+        "completed_write_bytes",
+        "completed_write_ops",
+        "leased_frames",
+    ];
+    // `physical_counts` returns one observation, or `{"databases": {id: observation}}`.
+    fn snapshots(value: &serde_json::Value) -> Vec<(&str, &serde_json::Value)> {
+        match value
+            .get("databases")
+            .and_then(serde_json::Value::as_object)
+        {
+            Some(databases) => databases
+                .iter()
+                .map(|(id, db)| (id.as_str(), &db["live_nvmeof"]))
+                .collect(),
+            None => vec![("", &value["live_nvmeof"])],
+        }
+    }
+    let (start, end) = (snapshots(before), snapshots(after));
+    if start.len() != end.len() || start.iter().zip(&end).any(|(a, b)| a.0 != b.0) {
+        return Err("node database population differs between measurement boundaries".into());
+    }
+    let mut total = [0u64; 3];
+    for ((_, a), (_, b)) in start.iter().zip(&end) {
+        for (slot, field) in total.iter_mut().zip(FIELDS) {
+            let (Some(first), Some(last)) = (
+                a.get(field).and_then(serde_json::Value::as_u64),
+                b.get(field).and_then(serde_json::Value::as_u64),
+            ) else {
+                return Err(format!(
+                    "live NVMe-oF counter {field} unavailable; owner-RPC and non-TideHunter routes expose no leased-write bytes"
+                ));
+            };
+            // u64::MAX is the saturated-counter sentinel, as in the measurement read evidence.
+            if first == u64::MAX || last == u64::MAX {
+                return Err(format!("live NVMe-oF counter {field} saturated"));
+            }
+            *slot = last
+                .checked_sub(first)
+                .and_then(|delta| slot.checked_add(delta))
+                .ok_or_else(|| format!("live NVMe-oF counter {field} decreased or overflowed"))?;
+        }
+    }
+    Ok(total)
+}
+
+fn per_payload_byte(bytes: u64, payload: u64) -> Option<f64> {
+    (payload > 0).then(|| bytes as f64 / payload as f64)
+}
+
+/// Replay counterpart of the put cases' write amplification: payload of the successful
+/// measurement-window commits and logical WAL bytes over the same boundaries. Device
+/// bytes per payload use the controller's `device_counters.json` with this payload.
+fn write_amplification(
+    m: &Measurements,
+    prepared: &[Prepared],
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    drained: bool,
+) -> serde_json::Value {
+    let payload = match committed_payload(m, prepared) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return serde_json::json!({"available":false,"error":error.to_string(),"device":device_counters_scope()});
+        }
+    };
+    let logical_wal = if !drained {
+        serde_json::json!({"available":false,"error":"measurement did not complete and drain successfully"})
+    } else {
+        match live_write_delta(before, after) {
+            Ok([bytes, write_ops, leased_frames]) => serde_json::json!({
+                "available":true,"counter":"live_nvmeof.completed_write_bytes","bytes":bytes,
+                "write_ops":write_ops,"leased_frames":leased_frames,
+                "bytes_per_value_byte":per_payload_byte(bytes, payload.value_bytes),
+                "bytes_per_key_value_byte":per_payload_byte(bytes, payload.key_value_bytes)}),
+            Err(error) => serde_json::json!({"available":false,"error":error}),
+        }
+    };
+    serde_json::json!({"available":true,"scope":"successful measurement-window commits; logical WAL is the gate-boundary delta of the coordinator live leased-write counters, not physical device bytes",
+        "payload":payload,"logical_wal":logical_wal,"device":device_counters_scope()})
 }
 /// Backend durability evidence plus the tier the backend confirmed from owner receipts,
 /// in the field the campaign admits (`confirmed_by_backend_receipt`), as the runner records it.
@@ -1634,7 +1778,7 @@ fn profile(
         "put_members_per_second":m.counts.put_members as f64/seconds,"transactions_per_second":m.counts.transactions as f64/seconds,"checkpoints_per_second":m.counts.checkpoints as f64/seconds,
         "value_bytes_per_second":m.calls.iter().filter(|(s,_)|s.outcome=="success").map(|(s,_)|s.bytes).sum::<u64>() as f64/seconds,
         "mean_in_flight_api_calls":api_sum as f64/(seconds*1e9),"verification_ns":verification,"dependency_wait_ns":m.dependency_wait_ns,"complete_one_second_api_rate_buckets":buckets,
-        "latency":latency,"tables":tables,"topology":"one process; three node DBs on one local filesystem; no network; source caches not modeled","device_counters":"unmeasured"})
+        "latency":latency,"tables":tables,"topology":"one process; three node DBs on one local filesystem; no network; source caches not modeled","device_counters":device_counters_scope()})
 }
 
 #[cfg(test)]

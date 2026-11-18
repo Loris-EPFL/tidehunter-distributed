@@ -48,6 +48,11 @@ THREAD_CPU_COLUMNS = tuple(
     'coordinator_other_busiest_thread', 'owner_other_busiest_thread')
 RESULTS += (*THREAD_CPU_COLUMNS, 'wal_bytes_per_payload', 'puts_per_frame',
             'native_logical_wal_bytes_per_payload')
+# Replay rows reuse wal_bytes_per_payload and device_write_payload_ratio with payload =
+# successful committed value bytes; these add the key+value denominator and both payloads.
+REPLAY_AMPLIFICATION_COLUMNS = ('replay_committed_value_bytes', 'replay_committed_key_value_bytes',
+                                'wal_bytes_per_key_value', 'device_write_per_key_value')
+RESULTS += REPLAY_AMPLIFICATION_COLUMNS
 AUTHORITY_COUNTERS = ('write_authority_prepare_ns', 'write_authority_admit_ns',
                       'write_authority_windows', 'write_authority_batches')
 AUTHORITY_COLUMNS = ('authority_prepare_us_per_put', 'authority_admit_us_per_put',
@@ -276,6 +281,40 @@ def owner_trace_columns(artifact):
     return columns
 
 
+def device_write_bytes(devices):
+    """Whole-device bytes written between the controller snapshots (512-byte sectors)."""
+    before, after = devices.get('before'), devices.get('after')
+    if before is None or after is None:
+        return None
+    a = list(find_values(after, 'write_sectors')); b = list(find_values(before, 'write_sectors'))
+    if not a or len(a) != len(b):
+        return None
+    delta = nonnegative(sum(a) - sum(b))
+    return None if delta is None else 512 * delta
+
+
+def replay_amplification_columns(summary, counters, device_bytes):
+    """Replay forms of the put WAL and device ratios over the same gate windows.
+
+    Payload is the replay's successful measurement-window committed value bytes (the put
+    denominator is successful puts times value_size); key+value bytes are a second denominator.
+    """
+    columns = dict.fromkeys(('wal_bytes_per_payload', 'device_write_payload_ratio', *REPLAY_AMPLIFICATION_COLUMNS))
+    profile = (summary.get('phase_counts') or {}).get('profile') or {}
+    payload = (profile.get('write_amplification') or {}).get('payload') or {}
+    values, pairs = payload.get('value_bytes'), payload.get('key_value_bytes')
+    if type(values) is not int or type(pairs) is not int or not 0 < values <= pairs:
+        return columns
+    columns.update(replay_committed_value_bytes=values, replay_committed_key_value_bytes=pairs)
+    written = counters.get('completed_write_bytes')
+    if type(written) is int and written >= 0:
+        columns.update(wal_bytes_per_payload=written / values, wal_bytes_per_key_value=written / pairs)
+    if device_bytes is not None:
+        columns.update(device_write_payload_ratio=device_bytes / values,
+                       device_write_per_key_value=device_bytes / pairs)
+    return columns
+
+
 def result_row(case, export):
     j = case['job']; op = operation(j)
     directory = export / 'cases' / case['case_id'] / 'result'
@@ -369,13 +408,11 @@ def result_row(case, export):
     elif j['group'] == 'G18M':
         row['cache_label'] = 'cache case'
     devices = load(directory / 'device_counters.json') or load(directory.parent / 'device_counters.json')
-    before, after = devices.get('before'), devices.get('after')
-    if before is not None and after is not None and good and j.get('value_size'):
-        a = list(find_values(after, 'write_sectors')); b = list(find_values(before, 'write_sectors'))
-        if a and len(a) == len(b):
-            delta = nonnegative(sum(a) - sum(b))
-            if delta is not None:
-                row['device_write_payload_ratio'] = 512 * delta / (len(good) * j['value_size'] * (j.get('batch_size', 32) if op == 'put_batch' else 1))
+    device_bytes = device_write_bytes(devices)
+    if device_bytes is not None and good and j.get('value_size'):
+        row['device_write_payload_ratio'] = device_bytes / (len(good) * j['value_size'] * (j.get('batch_size', 32) if op == 'put_batch' else 1))
+    if j.get('case_kind') == 'mainnet_replay':
+        row.update(replay_amplification_columns(load(directory / 'summary.json'), counters, device_bytes))
     history = load(directory / 'owner-history-maintenance.json') or load(directory.parent / 'owner-history-maintenance.json')
     if not history:
         history = [load(path) for path in sorted((directory.parent / 'owner-durability').glob('*.history-maintenance.json'))]
@@ -590,6 +627,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
                   'Owner trace columns describe only the primary owner (owner-ftrace.json), not a fleet aggregate. Captured events and covered seconds use validated mono trace_coverage timestamps; observed events/s is captured event_count divided by duration_ns, never by case elapsed time. Zero duration or missing/invalid coverage leaves the rate unavailable. This observed event rate is not read IOPS: event types include non-read work, and truncation or buffer overruns can omit events. Truncation and buffer overruns are reported independently; partial captures remain diagnostic. CPU columns retain their separate full sampling window.', ''])
     lines.extend(['Thread CPU columns use /proc/PID/task/*/stat at one-second intervals around the measurement gate. One logical CPU is 100%; max and mean are across per-thread window-average utilization in each class, not across machines or sampling peaks. Coordinator and owner columns are separate; owner means are weighted by thread count. The other-thread name identifies its busiest thread. Linux comm truncation is accounted for; missing, churning or incomplete classes remain unavailable. Start/stop includes boundary RPC overlap and the final partial interval.', '',
                   'wal_bytes_per_payload uses live completed_write_bytes (aligned NVMe-oF frames) divided by measured successful scalar puts times value_size; puts_per_frame uses that put count divided by leased_frames. Native logical_wal_bytes_per_payload uses the gate-boundary delta of native wal_written_bytes_type counters, including background WAL records but excluding preload/warmup. Neither is physical SSD write amplification. Device/payload ratios still cover the whole device observation window; F8 disables ext4 lazy initialization, but the remaining background-write scope must still be checked.', ''])
+    lines.extend(['Replay rows (`replays` table) use the same two counters over the same gate windows. Payload is the successful measurement-window committed value bytes from summary.json phase_counts.profile.write_amplification.payload: wal_bytes_per_payload and device_write_payload_ratio divide by value bytes, wal_bytes_per_key_value and device_write_per_key_value by key+value bytes. The coordinator writes one aligned complete-batch frame per commit; the device window also includes owner adoption, index and background writes.', ''])
     lines.extend(['Authority preparation/admission columns are exclusive coordinator wall elapsed time per attempted input batch (called per put for scalar F8), not CPU time, device time or latency quantiles. They divide the nanosecond counter deltas by write_authority_batches and 1000; batches_per_window divides batches by write_authority_windows. Missing counters, invalid/reset/saturated boundaries and zero denominators remain unavailable. The validated measurement-read-evidence.json start/end/deltas.coordinator counters take precedence; write-profile intervals are a fallback only when read observations contain no authority counters. authority_interval_source and authority_interval_scope identify the selected population/window; no intervals are added together.', ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
     tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G30W', 'G31W', 'G31H', 'G31S', 'G31X', 'G32W', 'G32H', 'G32S', 'G32N') and r['operation'] in ('put', 'put_batch')]
@@ -598,6 +636,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
     tables['reads'] += [r for r in rows if r['group'].startswith('G24') and r['operation'] in ('read', 'get_many')]
     tables['reads'] += [r for r in rows if r['group'] in ('G33R', 'G33M') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']
+    tables['replays'] = [r for r in rows if planned[r['case_id']].get('case_kind') == 'mainnet_replay']
     write_csv(output / 'stalls.csv', STALL_FIELDS,
               [row for case in cases for row in stall_rows(case, export)])
     write_csv(output / 'stages.csv', STAGE_FIELDS,

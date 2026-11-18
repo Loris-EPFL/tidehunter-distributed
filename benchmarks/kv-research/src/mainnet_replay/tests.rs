@@ -723,3 +723,115 @@ fn all_node_database_subsets_preserve_source_phases() {
         prepare(&selected, 2).unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_replay_records_committed_payload_and_device_counter_scope() {
+    let root = temp("amplification");
+    let mut cfg = config(&root);
+    cfg.workload.node_databases = Some(vec![0]);
+    cfg.execution.concurrency = 4;
+    let selected = cfg.validate().unwrap();
+    run(cfg, &root.join("result")).await.unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("result/summary.json")).unwrap()).unwrap();
+    let profile = &summary["phase_counts"]["profile"];
+    let amplification = &profile["write_amplification"];
+    // Perpetual manifest batches (phases 2, 6, 7): 654 rows, 500,324 value and 23,832 key
+    // bytes per repetition. Repeated keys keep their source length.
+    let values = selected
+        .batches
+        .iter()
+        .flat_map(|b| &b.entries)
+        .map(|r| r.value.len() as u64)
+        .sum::<u64>();
+    let keys = selected
+        .batches
+        .iter()
+        .flat_map(|b| &b.entries)
+        .map(|r| r.key.len() as u64)
+        .sum::<u64>();
+    assert_eq!((values, keys), (500_324, 23_832));
+    assert_eq!(amplification["available"], true);
+    assert_eq!(
+        amplification["payload"],
+        serde_json::json!({"commits":6,"rows":1308,"value_bytes":2*values,"key_bytes":2*keys,"key_value_bytes":2*(values+keys)})
+    );
+    assert_eq!(profile["logical_key_bytes"], 2 * keys);
+    // The raw rows reproduce the value-byte denominator independently.
+    let rows = std::fs::read_to_string(root.join("result/samples.csv")).unwrap();
+    let mut lines = rows.lines();
+    let header: Vec<_> = lines.next().unwrap().split(',').collect();
+    let column = |name: &str| header.iter().position(|c| *c == name).unwrap();
+    let (operation, outcome, bytes, members) = (
+        column("operation"),
+        column("outcome"),
+        column("bytes"),
+        column("members"),
+    );
+    let (mut commits, mut committed_bytes, mut committed_rows) = (0u64, 0u64, 0u64);
+    for line in lines {
+        let fields: Vec<_> = line.split(',').collect();
+        if fields[operation] == "commit" && fields[outcome] == "success" {
+            commits += 1;
+            committed_bytes += fields[bytes].parse::<u64>().unwrap();
+            committed_rows += fields[members].parse::<u64>().unwrap();
+        }
+    }
+    assert_eq!(
+        (commits, committed_bytes, committed_rows),
+        (6, 2 * values, 1308)
+    );
+    // The native engine exposes no live leased-write counter; no ratio is fabricated.
+    assert_eq!(amplification["logical_wal"]["available"], false);
+    assert!(
+        amplification["logical_wal"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("completed_write_bytes unavailable"),
+        "{amplification}"
+    );
+    for scope in [
+        &amplification["device"],
+        &profile["device_counters"],
+        &profile["case_identity"]["device_counters"],
+    ] {
+        assert_eq!(scope["artifact"], "device_counters.json");
+        assert_eq!(scope["payload"], "write_amplification.payload");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_write_delta_sums_databases_and_rejects_unusable_counters() {
+    let live = |bytes: u64, ops: u64, frames: u64| serde_json::json!({"completed_write_bytes":bytes,"completed_write_ops":ops,"leased_frames":frames});
+    let single = |bytes, ops, frames| serde_json::json!({"live_nvmeof": live(bytes, ops, frames)});
+    assert_eq!(
+        live_write_delta(&single(4096, 1, 1), &single(16384, 4, 3)),
+        Ok([12288, 3, 2])
+    );
+    let databases = |a: serde_json::Value, b: serde_json::Value| serde_json::json!({"databases":{"0":{"live_nvmeof":a},"1":{"live_nvmeof":b}}});
+    assert_eq!(
+        live_write_delta(
+            &databases(live(0, 0, 0), live(8192, 2, 2)),
+            &databases(live(4096, 1, 1), live(16384, 4, 3)),
+        ),
+        Ok([12288, 3, 2])
+    );
+    assert!(
+        live_write_delta(
+            &databases(live(0, 0, 0), live(0, 0, 0)),
+            &single(4096, 1, 1)
+        )
+        .is_err()
+    );
+    assert!(live_write_delta(&single(8192, 2, 2), &single(4096, 2, 2)).is_err());
+    assert!(live_write_delta(&single(0, 0, 0), &single(u64::MAX, 2, 2)).is_err());
+    assert!(
+        live_write_delta(
+            &serde_json::json!({"live_nvmeof":null}),
+            &single(4096, 1, 1)
+        )
+        .is_err()
+    );
+    assert!(live_write_delta(&serde_json::Value::Null, &serde_json::Value::Null).is_err());
+}
