@@ -698,6 +698,43 @@ fn config_defaults_to_native_and_parses_from_yaml() {
     assert!(serde_yaml::from_str::<DurabilityConfig>("unknown: 1").is_err());
 }
 
+#[test]
+fn durable_cut_config_defaults_to_extended_durable_prefix() {
+    use super::{CutRecovery, DurableCutConfig, NativeRecovery};
+    let default = DurableCutConfig::default();
+    assert_eq!(
+        (
+            default.recovery,
+            default.cut,
+            default.lag_ms,
+            default.lag_bytes
+        ),
+        (
+            NativeRecovery::DurablePrefix,
+            CutRecovery::Extend,
+            1000,
+            64 * 1024 * 1024
+        )
+    );
+    assert!(default.is_default() && default.validate().is_ok());
+    let empty: DurableCutConfig = serde_yaml::from_str("{}").unwrap();
+    assert_eq!(empty, default);
+    let parsed: DurableCutConfig =
+        serde_yaml::from_str("recovery: per_owner\ncut: strict\nlag_ms: 5\nlag_bytes: 7\n")
+            .unwrap();
+    assert_eq!(
+        (parsed.recovery, parsed.cut, parsed.lag_ms, parsed.lag_bytes),
+        (NativeRecovery::PerOwner, CutRecovery::Strict, 5, 7)
+    );
+    assert!(!parsed.is_default());
+    for invalid in ["lag_ms: 0", "lag_bytes: 0", "lag_ms: 3600001"] {
+        let config: DurableCutConfig = serde_yaml::from_str(invalid).unwrap();
+        assert!(config.validate().is_err(), "{invalid}");
+    }
+    assert!(serde_yaml::from_str::<DurableCutConfig>("cut: loose").is_err());
+    assert!(serde_yaml::from_str::<DurableCutConfig>("unknown: 1").is_err());
+}
+
 /// Threads write, complete out of order, and acknowledge under both tiers while a
 /// checkpoint reader samples the synced frontier. The simulated device updates its durable
 /// end inside the fsync callback, before the frontier publishes it.

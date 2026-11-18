@@ -1444,6 +1444,10 @@ impl ConcurrentRemoteDatabase {
     pub fn flush_durable(&self) -> Result<(), LocalDbError> {
         self.database.core.flush_durable()
     }
+    /// Durable-cut progress of this epoch; `enabled` is false when untracked.
+    pub fn durable_cut_stats(&self) -> super::DurableCutStats {
+        self.database.core.durable_cut_stats()
+    }
     /// Request advisory mapped-WAL eviction on every owner at a quiescent boundary.
     /// The owner control handler visits all retained source epochs, not just the
     /// current writer epoch. Callers must exclude concurrent reads and writes.

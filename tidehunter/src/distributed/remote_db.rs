@@ -12,6 +12,7 @@
 //! native-routed index references and bounded in-flight complete batches.
 
 use super::codec::{CompleteBatch, Mutation};
+use super::durability::{DurabilityTier, DurableCutConfig};
 use super::local_db::{LocalCheckpoint, LocalDbError, LocalDbStats};
 use super::local_inventory::LocalInventoryConfig;
 use super::native_index::{IndexReadCut, NativeIndex};
@@ -62,6 +63,8 @@ use coordinator_profile::{
     CoordinatorResolutionDiagnostics, MemberOutcome, ResolutionSample, ResolutionStage,
 };
 pub use coordinator_profile::{CoordinatorResolutionSnapshot, CoordinatorResolutionStage};
+mod durable_cut;
+pub use durable_cut::{DurableCutStats, RecoveredCut};
 mod pending_read;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use pending_read::ReadTraceChild;
@@ -440,6 +443,10 @@ pub struct RemoteDatabaseConfig {
     /// means `Exact`, so existing configuration documents are unchanged.
     #[serde(default, skip_serializing_if = "CheckpointMode::is_exact")]
     pub checkpoint_mode: CheckpointMode,
+    /// Native-tier recovery and the durable cut. Absent means the default
+    /// (durable prefix, extended at recovery), so documents are unchanged.
+    #[serde(default, skip_serializing_if = "DurableCutConfig::is_default")]
+    pub durable_cut: DurableCutConfig,
 }
 
 fn default_max_pending_reads() -> usize {
@@ -484,8 +491,11 @@ impl RemoteDatabaseConfig {
     const APPEND_CONTROL_CONNECTIONS: usize = 1;
     /// The optional operational sampler owns one additional session per owner.
     const OPERATIONAL_CONNECTIONS: usize = 1;
-    pub const NON_READ_CONNECTIONS: usize =
-        Self::APPEND_CONTROL_CONNECTIONS + Self::OPERATIONAL_CONNECTIONS;
+    /// The durable-cut poller owns one plain session per owner.
+    const DURABLE_PROGRESS_CONNECTIONS: usize = 1;
+    pub const NON_READ_CONNECTIONS: usize = Self::APPEND_CONTROL_CONNECTIONS
+        + Self::OPERATIONAL_CONNECTIONS
+        + Self::DURABLE_PROGRESS_CONNECTIONS;
     /// Budget two complete coordinator session sets so a reopen can overlap
     /// old sessions until their owner permits observe EOF. Auto configs use
     /// the cap, not the preparing host's CPU count.
@@ -596,6 +606,7 @@ impl RemoteDatabaseConfig {
                 "checkpoint_mode per_cell is inactive in this revision",
             ));
         }
+        self.durable_cut.validate().map_err(LocalDbError::new)?;
         if let Some(live) = &self.live_nvme {
             live.validate().map_err(LocalDbError::new)?;
             if let Some(read_lanes) = self.read_lanes {
@@ -940,6 +951,18 @@ pub struct RecoveryStats {
     /// not sums. Absent for TCP and for reused transports with no new endpoint.
     #[cfg(feature = "experimental-fabric")]
     pub fabric_open_worker: Option<tidehunter_fabric::OpenProfile>,
+    /// Tail batches above the durable cut that recovery did not publish.
+    pub cut_discarded_batches: u64,
+    /// Tail batches above the persisted cut kept by `CutRecovery::Extend`.
+    pub cut_extended_batches: u64,
+    /// Missing sequences `CutRecovery::Extend` skipped as never written, because
+    /// they lay below the owner-continuity bound.
+    pub cut_skipped_versions: u64,
+    /// The owner-continuity bound of an Extend recovery (exclusive sequence);
+    /// `u64::MAX` when every owner was continuous.
+    pub cut_continuity_bound: Option<u64>,
+    /// The bound this open decided for the previously tracked epoch.
+    pub recovered_cut: Option<RecoveredCut>,
 }
 impl RecoveryStats {
     fn add_connection(&mut self, profile: super::tcp::ClientConnectProfile) {
@@ -989,6 +1012,9 @@ enum OpenInterruption {
     AfterReadSetup,
     #[cfg(test)]
     DuringReplay,
+    /// After the durable-cut record is persisted, before the epoch activates.
+    #[cfg(test)]
+    AfterCutRecord,
 }
 
 /// Test-only open hook over a read-only config clone and the read-lane clients.
@@ -1821,7 +1847,7 @@ impl RemoteDatabase {
         let fence_count = clients.len();
         #[cfg(any(test, feature = "test-utils"))]
         let fence_count = fail_after_fences.unwrap_or(clients.len());
-        let histories = endpoint_map(&mut clients[..fence_count], |node, client| {
+        let fenced = endpoint_map(&mut clients[..fence_count], |node, client| {
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
             let _ = node;
             let status = client.fence_to(epoch).map_err(LocalDbError::component)?;
@@ -1844,13 +1870,25 @@ impl RemoteDatabase {
                         .map_err(LocalDbError::component)?,
                 });
             }
-            Ok(status
-                .epochs
-                .into_iter()
-                .filter(|e| e.epoch < epoch)
-                .map(|e| e.epoch)
-                .collect::<Vec<_>>())
+            Ok((
+                status
+                    .epochs
+                    .into_iter()
+                    .filter(|e| e.epoch < epoch)
+                    .map(|e| e.epoch)
+                    .collect::<Vec<_>>(),
+                (
+                    status.durability_tier,
+                    durable_cut::OwnerFence {
+                        partition: config.endpoints[node].partition,
+                        boot_id: status.boot_id,
+                        recovery_clean: status.recovery_clean,
+                    },
+                ),
+            ))
         })?;
+        let (histories, owners): (Vec<_>, Vec<_>) = fenced.into_iter().unzip();
+        let (tiers, owner_fences): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
         #[cfg(any(test, feature = "test-utils"))]
         if fail_after_fences.is_some() {
             return Err(LocalDbError::new(
@@ -1901,6 +1939,13 @@ impl RemoteDatabase {
             .iter()
             .filter_map(|(key, position)| position.complete.then_some(*key))
             .collect();
+        let mut cut_plan = durable_cut::RecoveryPlan::new(
+            durable_cut::CutRecord::load(&path, config.storage.database, epoch)?,
+            config.storage.database,
+            &config.durable_cut,
+            latest.map(|cut| cut.batch),
+            &owner_fences,
+        );
         let replay_started = Instant::now();
         replay_history(
             &mut clients,
@@ -1916,10 +1961,26 @@ impl RemoteDatabase {
             &mut latest,
             &cursors,
             &mut positions,
+            &mut cut_plan,
             &mut recovery_stats,
             #[cfg(test)]
             interruption,
         )?;
+        recovery_stats.cut_discarded_batches = cut_plan.discarded;
+        recovery_stats.cut_extended_batches = cut_plan.extended;
+        recovery_stats.cut_skipped_versions = cut_plan.skipped;
+        recovery_stats.cut_continuity_bound = cut_plan.continuity_bound;
+        // Version B tracks this epoch only when every owner acknowledges at
+        // the page cache (Native) and recovery replays the WAL. Synchronous
+        // owners are per-batch durable and never truncated; the on-disk
+        // receipt history proves complete old-epoch prefixes, which a
+        // truncated owner stream cannot.
+        let tracked = config.durable_cut.recovery
+            == super::durability::NativeRecovery::DurablePrefix
+            && config.history_persistence == HistoryPersistence::WalReplay
+            && tiers.iter().all(|tier| *tier == DurabilityTier::Native);
+        let (cut_record, recovered_cut) = cut_plan.finish(epoch, tracked, &owner_fences);
+        recovery_stats.recovered_cut = recovered_cut;
         recovery_stats.tail_replay_ns = elapsed(replay_started);
         // Current checkpoint/proofs and the complete tail have now validated.
         // Resolve only durably named cleanup intents before allowing more work.
@@ -2011,6 +2072,15 @@ impl RemoteDatabase {
         if matches!(interruption, Some(OpenInterruption::AfterReadSetup)) {
             return Err(LocalDbError::new("injected interruption after read setup"));
         }
+        // The truncation decided above and the tracked epoch are durable before
+        // any caller can observe this epoch: a discarded batch never returns.
+        if let Some(record) = &cut_record {
+            durable_cut::persist_open_record(&path, record)?;
+        }
+        #[cfg(test)]
+        if matches!(interruption, Some(OpenInterruption::AfterCutRecord)) {
+            return Err(LocalDbError::new("injected interruption after cut record"));
+        }
         manifest.epochs.last_mut().unwrap().active = true;
         // Old suffixes validated against their original durable bound. Only a
         // fully recovered, not-yet-serving epoch may activate a larger bound.
@@ -2026,6 +2096,47 @@ impl RemoteDatabase {
         let checkpoint_diagnostics =
             (config.write_profile_limit != 0).then(|| VecDeque::with_capacity(128));
         let reads = Arc::new(reads);
+        let durable_cut = match cut_record.filter(|_| tracked) {
+            Some(record) => Some(durable_cut::DurableCut::start(
+                path.clone(),
+                epoch,
+                config.durable_cut,
+                record,
+                config
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| {
+                        let mut tls = config.tls.clone();
+                        tls.server_name = endpoint.server_name.clone();
+                        let address = endpoint.address.clone();
+                        let client_config = tls_config.clone();
+                        let timeout = config.timeout;
+                        // Owners register with the epoch-1 inventory, as in `transports`.
+                        let expected = config.partition_config(1, endpoint.partition);
+                        let shape = shape.clone();
+                        durable_cut::PollTarget {
+                            partition: endpoint.partition,
+                            // The owner requires a Status handshake on every new
+                            // session, and Status flushes the owner's logs. The
+                            // first session therefore opens in `start`, before
+                            // this epoch can append; a reconnect after a failed
+                            // poll costs one extra owner sync.
+                            connect: Box::new(move || {
+                                Client::connect_shared(
+                                    &address,
+                                    &tls,
+                                    client_config.clone(),
+                                    timeout,
+                                    expected.clone(),
+                                    &shape,
+                                )
+                            }),
+                        }
+                    })
+                    .collect(),
+            )?),
+            None => None,
+        };
         let operational_sampler =
             OperationalReadIoSampler::dormant(config.clone(), shape.clone(), tls_config);
         let core = write_core::core::WriteCore::new(write_core::core::OpenState {
@@ -2043,6 +2154,7 @@ impl RemoteDatabase {
             inventory: config.inventory(epoch),
             config,
             operational_sampler,
+            durable_cut,
             shape,
             path,
             epoch,
@@ -2530,6 +2642,10 @@ impl RemoteDatabase {
     pub fn recovery_stats(&self) -> RecoveryStats {
         self.core.stats.lock().recovery
     }
+    /// Durable-cut progress of this epoch; `enabled` is false when untracked.
+    pub fn durable_cut_stats(&self) -> DurableCutStats {
+        self.core.durable_cut_stats()
+    }
     pub fn authority_write_stats(&self) -> AuthorityWriteStats {
         self.core.authority_write_stats()
     }
@@ -2858,6 +2974,7 @@ fn replay_history(
     latest: &mut Option<MutationVersion>,
     cursors: &HashMap<(usize, u64), (usize, usize)>,
     positions: &mut BTreeMap<(u32, u64), StreamPosition>,
+    cut: &mut durable_cut::RecoveryPlan,
     stats: &mut RecoveryStats,
     #[cfg(test)] interruption: Option<OpenInterruption>,
 ) -> Result<(), LocalDbError> {
@@ -2931,55 +3048,60 @@ fn replay_history(
         }
         while let Some(Reverse((version, node))) = ready.pop() {
             let (batch, durable) = pages[node].batches.pop_front().unwrap();
-            if previous.is_some_and(|old| old >= version)
-                || known.contains_key(&batch.id())
-                || recent_ids.contains_key(&batch.id())
-                || receipt_history
-                    .as_ref()
-                    .map(|history| history.lookup(batch.id()))
-                    .transpose()?
-                    .flatten()
-                    .is_some()
-            {
-                return Err(LocalDbError::new(
-                    "duplicate authoritative identity or logical version",
-                ));
-            }
-            previous = Some(version);
-            index
-                .check_capacity(
-                    index
-                        .estimated_batch_bytes(&batch)
-                        .map_err(LocalDbError::component)?,
+            // A batch above the durable cut is not published: not indexed, not
+            // a retry identity, not a version floor. It precedes the duplicate
+            // check because a later epoch may hold its retried identity.
+            if cut.keep(version) {
+                if previous.is_some_and(|old| old >= version)
+                    || known.contains_key(&batch.id())
+                    || recent_ids.contains_key(&batch.id())
+                    || receipt_history
+                        .as_ref()
+                        .map(|history| history.lookup(batch.id()))
+                        .transpose()?
+                        .flatten()
+                        .is_some()
+                {
+                    return Err(LocalDbError::new(
+                        "duplicate authoritative identity or logical version",
+                    ));
+                }
+                previous = Some(version);
+                index
+                    .check_capacity(
+                        index
+                            .estimated_batch_bytes(&batch)
+                            .map_err(LocalDbError::component)?,
+                    )
+                    .map_err(LocalDbError::component)?;
+                PreparedNativePublication::prepare_authenticated(
+                    shape,
+                    config.storage.batch_limits,
+                    &batch,
+                    durable,
                 )
+                .map_err(LocalDbError::component)?
+                .publish(&mut index)
                 .map_err(LocalDbError::component)?;
-            PreparedNativePublication::prepare_authenticated(
-                shape,
-                config.storage.batch_limits,
-                &batch,
-                durable,
-            )
-            .map_err(LocalDbError::component)?
-            .publish(&mut index)
-            .map_err(LocalDbError::component)?;
-            index.promote_committed().map_err(LocalDbError::component)?;
-            // Replay is the only publisher: make the replayed prefix visible.
-            index.publish_latest();
-            *latest = batch.mutation_version(batch.mutations().len() - 1);
-            known.insert(batch.id(), durable.appended());
-            stats.tail_batches += 1;
-            stats.tail_bytes += batch.encoded().len() as u64;
-            #[cfg(test)]
-            if matches!(interruption, Some(OpenInterruption::DuringReplay)) {
-                return Err(LocalDbError::new("injected interruption during WAL replay"));
-            }
-            if !replay
-                && (stats.tail_batches > replay_limits.max_batches as u64
-                    || stats.tail_bytes > replay_limits.max_encoded_bytes as u64)
-            {
-                return Err(LocalDbError::new(
-                    "retained tail exceeds committed admission bound",
-                ));
+                index.promote_committed().map_err(LocalDbError::component)?;
+                // Replay is the only publisher: make the replayed prefix visible.
+                index.publish_latest();
+                *latest = batch.mutation_version(batch.mutations().len() - 1);
+                known.insert(batch.id(), durable.appended());
+                stats.tail_batches += 1;
+                stats.tail_bytes += batch.encoded().len() as u64;
+                #[cfg(test)]
+                if matches!(interruption, Some(OpenInterruption::DuringReplay)) {
+                    return Err(LocalDbError::new("injected interruption during WAL replay"));
+                }
+                if !replay
+                    && (stats.tail_batches > replay_limits.max_batches as u64
+                        || stats.tail_bytes > replay_limits.max_encoded_bytes as u64)
+                {
+                    return Err(LocalDbError::new(
+                        "retained tail exceeds committed admission bound",
+                    ));
+                }
             }
             drop(batch);
             if pages[node].batches.is_empty() && pages[node].next.is_some() {
@@ -3934,6 +4056,8 @@ mod position_tests;
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(test)]
+mod durable_cut_tests;
 #[cfg(test)]
 mod legacy_fixture_tests;
 #[cfg(test)]

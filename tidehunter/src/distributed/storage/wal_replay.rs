@@ -781,7 +781,7 @@ impl PartitionLog {
             })
             .collect::<Vec<_>>();
         wal.retire_files(&retired)?;
-        let log = Self {
+        let mut log = Self {
             state: Mutex::new(State {
                 #[cfg(feature = "experimental-nvmeof")]
                 pending_live: None,
@@ -804,6 +804,7 @@ impl PartitionLog {
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
+                progress: ProgressTail::default(),
                 namespace_synced_file: None,
                 poison: None,
                 sealed: true,
@@ -828,6 +829,8 @@ impl PartitionLog {
             live_read_pins: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "experimental-nvmeof")]
             live_stream: live,
+            // Set after the scan below.
+            recovery_hole: false,
             #[cfg(test)]
             before_authority_load: Mutex::new(None),
             #[cfg(test)]
@@ -872,6 +875,11 @@ impl PartitionLog {
             });
         let mut last_tail = None;
         let mut file = None;
+        // Continuity evidence: a scan that ends early (lost, torn or invalid frame, or
+        // a lost skip marker) with a valid frame later left a hole below the recovered
+        // tail. Unwritten space at the tail is not a hole.
+        let mut gap = false;
+        let mut recovery_hole = false;
         // Live streams stop globally at an invalid tail. Ordinary owner-RPC
         // streams scan fragments independently, including after a lost skip.
         // In both cases only present WAL files bound the uncheckpointed suffix.
@@ -898,6 +906,7 @@ impl PartitionLog {
                     if cursor < strict_end {
                         return Err(error);
                     }
+                    gap = true;
                     if live {
                         break;
                     }
@@ -909,8 +918,12 @@ impl PartitionLog {
                 match current_file.and_then(|file| log.decode_group_from_file(file, cursor)) {
                     Ok(decoded) => decoded,
                     Err(error) if cursor < strict_end => return Err(error),
-                    Err(_) if live => break,
+                    Err(_) if live => {
+                        gap = true;
+                        break;
+                    }
                     Err(_) => {
+                        gap = true;
                         cursor = fragment_end;
                         continue;
                     }
@@ -925,6 +938,7 @@ impl PartitionLog {
                         "invalid live recovery frame geometry",
                     ));
                 }
+                gap = true;
                 break;
             }
             if let Some(frontier) = &frontier {
@@ -962,6 +976,7 @@ impl PartitionLog {
             )?;
             if duplicate {
                 if cursor >= strict_end && live {
+                    gap = true;
                     break;
                 }
                 return Err(StorageError::Invalid(
@@ -993,6 +1008,9 @@ impl PartitionLog {
                     )
                 })
                 .collect();
+            // Owner-RPC streams scan fragments independently: a group adopted after an
+            // early fragment end lies above a hole.
+            recovery_hole |= gap;
             log.state.lock().references.publish_group(metadata)?;
             physical_end = physical_end.max(decoded.frame_end);
             cursor = decoded
@@ -1000,6 +1018,23 @@ impl PartitionLog {
                 .checked_add(7)
                 .ok_or(StorageError::Capacity)?
                 & !7;
+        }
+        // A live scan stops at its first defect; probe the first frame of every later
+        // fragment (bounded by the scan end) for a valid frame above it.
+        let mut probe = (cursor / expected.fragment_bytes + 1) * expected.fragment_bytes;
+        while live && gap && !recovery_hole && probe < scan_end {
+            let file_start = probe / expected.wal_file_bytes * expected.wal_file_bytes;
+            if root.retired.binary_search(&file_start).is_err()
+                && let Ok(current) = log.replay_file(&mut file, probe)
+                && log
+                    .frame_header(current, probe)
+                    .is_ok_and(|header| header != [0; 8] && header != [0xff; 8])
+            {
+                recovery_hole = log.decode_group_from_file(current, probe).is_ok();
+            }
+            probe = probe
+                .checked_add(expected.fragment_bytes)
+                .ok_or(StorageError::Capacity)?;
         }
         if cursor < strict_end {
             return Err(StorageError::Invalid("corrupt durable WAL frame"));
@@ -1039,6 +1074,7 @@ impl PartitionLog {
             state.durable_end = physical_end;
         }
         log.durable_frontier.store(physical_end, Ordering::Release);
+        log.recovery_hole = recovery_hole;
         Ok(log)
     }
 }

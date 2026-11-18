@@ -175,6 +175,17 @@ struct Restart {
     operations: Vec<[u8; 16]>,
 }
 
+/// The owner tier of a case is Synchronous unless it is a native case or a
+/// leased Native case (as `write_child` configures it).
+fn synchronous(case: &Case) -> bool {
+    !case.native && case.leased.is_none_or(|profile| profile.synchronous)
+}
+
+/// Version B tracks Native owners with WAL replay under the default config.
+fn durable_prefix(case: &Case) -> bool {
+    !synchronous(case) && !case.on_disk_history
+}
+
 fn key_bytes(key: usize) -> [u8; 4] {
     // Spread the small domain across native cells and index shards.
     ((key as u32) << 26).to_be_bytes()
@@ -465,8 +476,7 @@ fn write_child(directory: &Path, case: &Case) {
     } else {
         HistoryPersistence::WalReplay
     });
-    let synchronous = !case.native && case.leased.is_none_or(|profile| profile.synchronous);
-    let fixture = if synchronous {
+    let fixture = if synchronous(case) {
         fixture.synchronous()
     } else {
         fixture
@@ -666,7 +676,7 @@ fn recover_child(directory: &Path) {
         node.set_history_persistence(restart.config.history_persistence)
             .unwrap();
         node.set_durability(super::super::durability::DurabilityConfig::with_tier(
-            if !case.native && case.leased.is_none_or(|profile| profile.synchronous) {
+            if synchronous(&case) {
                 super::super::durability::DurabilityTier::Synchronous
             } else {
                 super::super::durability::DurabilityTier::Native
@@ -687,6 +697,28 @@ fn recover_child(directory: &Path) {
         &restart.shape,
         restart.config.clone(),
         recovery_metrics(),
+    )
+    .unwrap();
+    // Durable-prefix recovery must run exactly for Native owners with WAL
+    // replay, and may discard only batches that no caller saw acknowledged
+    // (checked against the history by the parent).
+    let recovery = db.recovery_stats();
+    assert_eq!(
+        recovery.recovered_cut.is_some(),
+        durable_prefix(&case),
+        "durable-prefix recovery selection {case:?}"
+    );
+    // Owner continuity: when every owner kept its boot and recovered without a
+    // hole, a missing version was never written, so Extend discards nothing.
+    if recovery.cut_continuity_bound == Some(u64::MAX) {
+        assert_eq!(
+            recovery.cut_discarded_batches, 0,
+            "continuous owners lost no batch {case:?}"
+        );
+    }
+    fs::write(
+        directory.join("cut-discarded.json"),
+        serde_json::to_vec(&recovery.cut_discarded_batches).unwrap(),
     )
     .unwrap();
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1013,6 +1045,20 @@ fn run_case(case: &Case) {
     assert!(
         acknowledged.len() >= case.gate_acks(),
         "gate has no acknowledged WAL tail"
+    );
+    // Prefix oracle: a discarded tail batch is never an acknowledged one. The
+    // linearizability search below also requires every acknowledged write.
+    let discarded: u64 =
+        serde_json::from_slice(&fs::read(directory.join("cut-discarded.json")).unwrap()).unwrap();
+    let pending = calls
+        .iter()
+        .filter(|call| call.end.is_none() && matches!(call.action, Action::Write { .. }))
+        .count() as u64;
+    assert!(
+        discarded <= pending,
+        "durable cut discarded {discarded} batches but only {pending} writes were pending \
+         {case:?} artifacts={}",
+        directory.display()
     );
     let sizes: &[usize] = if case.concurrent {
         &[1, 8, 32]

@@ -1151,6 +1151,40 @@ fn leased_recovery_crosses_skip_and_retains_fatal_root_corruption() {
     }
 }
 
+/// Owner continuity on the live path: a scan stopped by a damaged frame reports a
+/// hole when a later fragment still starts with a valid frame.
+#[test]
+fn leased_recovery_reports_a_hole_only_below_a_later_valid_frame() {
+    for damaged in [false, true] {
+        let (temp, config, log) = fixture();
+        let first = log.lease_live_extent(authority(&config)).unwrap().0;
+        for n in 0..2 {
+            let (_, frame) = encoded(&config, vec![batch(&config, n)]);
+            write(&first, n * 4096, &frame);
+        }
+        skip(&first, 8192);
+        log.adopt_live_extent(authority(&config), first.token, 8192, true)
+            .unwrap();
+        let second = log.lease_live_extent(authority(&config)).unwrap().0;
+        let (_, frame) = encoded(&config, vec![batch(&config, 2)]);
+        write(&second, second.start, &frame);
+        if damaged {
+            // Unsynced (no persistence barrier ran), so recovery tolerates it.
+            write(&first, 4096 + 100, &[0x5a; 16]);
+        }
+        drop(log);
+        let recovered = PartitionLog::recover_live_sealed(
+            &temp.path().join("stream"),
+            &config,
+            metrics(),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(recovered.recovery_found_hole(), damaged);
+        assert_eq!(recovered.receipt_count(), if damaged { 1 } else { 3 });
+    }
+}
+
 #[test]
 fn leased_seal_adopts_and_persists_complete_frames_after_revocation() {
     let (temp, config, log) = fixture();

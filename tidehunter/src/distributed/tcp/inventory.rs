@@ -257,6 +257,8 @@ pub struct NodeInventory {
     history_diagnostics: bool,
     history_persistence: crate::distributed::storage::HistoryPersistence,
     history_failure_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+    // Kernel boot of this owner process, read once at open.
+    boot_id: [u8; 16],
     // Partition handles each retain this root lock as well.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
@@ -748,6 +750,7 @@ impl NodeInventory {
             history_diagnostics: false,
             history_persistence,
             history_failure_notifier: None,
+            boot_id: super::durable_progress::read_boot_id()?,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_leases,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -882,6 +885,13 @@ impl NodeInventory {
             live_nvmeof: self.live_export_mode.is_some() && !self.live_shutdown,
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
             live_nvmeof: false,
+            // The control owner holds the tier; it sets this field in its replies.
+            durability_tier: super::super::durability::DurabilityTier::default(),
+            boot_id: self.boot_id,
+            // Every log this process recovered stays in `logs` (a live fence
+            // replaces the old handle with its recovery), so this covers every
+            // recovery since start.
+            recovery_clean: !self.logs.values().any(|log| log.recovery_found_hole()),
         })
     }
     /// Fence an exclusively owned inventory. A live inventory needs its target
@@ -2043,6 +2053,32 @@ impl NodeInventory {
                 .ok_or_else(|| TcpError::new("checkpoint stream absent")),
             EpochState::Abandoned => Ok(None),
             EpochState::Preparing => Err(TcpError::new("checkpoint epoch incomplete")),
+        }
+    }
+
+    /// Kernel boot id read when this owner opened.
+    pub(super) fn boot_id(&self) -> [u8; 16] {
+        self.boot_id
+    }
+
+    /// Log of stream `epoch` for a durable-progress poll under `authority_epoch`.
+    /// `None`: the epoch exists but holds no log handle, an empty stream.
+    pub(super) fn durable_progress_log(
+        &self,
+        authority_epoch: u64,
+        epoch: u64,
+    ) -> Result<Option<Arc<super::super::storage::PartitionLog>>, TcpError> {
+        self.active(authority_epoch)?;
+        let record = self
+            .manifest
+            .epochs
+            .iter()
+            .find(|entry| entry.epoch == epoch)
+            .ok_or_else(|| TcpError::new("durable progress epoch absent"))?;
+        match record.state {
+            EpochState::Active | EpochState::Sealed => Ok(self.logs.get(&epoch).cloned()),
+            EpochState::Abandoned => Err(TcpError::new("durable progress epoch abandoned")),
+            EpochState::Preparing => Err(TcpError::new("durable progress epoch incomplete")),
         }
     }
 

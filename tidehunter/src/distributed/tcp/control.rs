@@ -12,6 +12,8 @@
 
 use super::super::durability::frontier::{Frontier, Syncer, flush_all};
 use super::super::durability::{DurabilityConfig, DurabilityTier};
+use super::super::storage::LogDurableProgress;
+use super::durable_progress::{self, HubSender, PollIdentity, Wake};
 use super::*;
 use parking_lot::Condvar;
 use std::collections::VecDeque;
@@ -126,6 +128,12 @@ struct Shared {
     // Waiting is bounded by the tickets ahead, which always progress.
     order: Mutex<u64>,
     order_cv: Condvar,
+    // Parked durable-progress polls. Log syncers notify it after each sync.
+    progress: HubSender,
+    // Test-only cap of a poll's wait (ms), default `DURABLE_PROGRESS_MAX_WAIT`.
+    // A long cap lets a test tell a wake from a deadline reply without a clock.
+    #[cfg(test)]
+    progress_cap_ms: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     before_ack: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     #[cfg(test)]
@@ -269,8 +277,14 @@ impl Shared {
             .attach_frontier(&durability.config)
             .map_err(TcpError::component)?;
         let worker = log.clone();
+        let progress = self.progress.clone();
         let syncer = Syncer::spawn("value-wal-syncer", frontier.clone(), move |_end| {
-            worker.sync_for_frontier()
+            let result = worker.sync_for_frontier();
+            // After the publication, so a woken poll sees this sync. A WAL I/O failure
+            // has already failed the frontier (`PartitionLog::persist_scope`); any other
+            // failure fails it after this call and a parked nudge sees it at its deadline.
+            progress.advanced();
+            result
         })?;
         slots.push(SyncerSlot {
             log: log.clone(),
@@ -384,9 +398,13 @@ pub(super) struct ControlOwner {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
     flush_thread: Option<JoinHandle<()>>,
+    // Declared last: drops after `Drop::drop` joined the workers, then answers every
+    // parked poll and joins the hub thread.
+    _progress: durable_progress::Hub,
 }
 impl ControlOwner {
     pub(super) fn start(context: Arc<ControlContext>) -> Result<Self, TcpError> {
+        let progress = durable_progress::Hub::start()?;
         let (flush, receiver) = mpsc::sync_channel(FLUSH_QUEUE);
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -402,6 +420,11 @@ impl ControlOwner {
             ready: Condvar::new(),
             context,
             flush,
+            progress: progress.sender(),
+            #[cfg(test)]
+            progress_cap_ms: std::sync::atomic::AtomicU64::new(
+                super::DURABLE_PROGRESS_MAX_WAIT.as_millis() as u64,
+            ),
             synchronous: AtomicBool::new(
                 DurabilityConfig::default().tier == DurabilityTier::Synchronous,
             ),
@@ -469,6 +492,7 @@ impl ControlOwner {
             shared,
             threads,
             flush_thread: Some(flush_thread),
+            _progress: progress,
         })
     }
 
@@ -719,15 +743,29 @@ impl StorageNode {
     pub(crate) fn log_for_test(&self, epoch: u64) -> Arc<super::super::storage::PartitionLog> {
         self.inventory.lock().active(epoch).unwrap()
     }
+
+    /// Test hook: cap of a durable-progress wait for requests submitted from now on.
+    #[cfg(test)]
+    pub(crate) fn set_durable_progress_cap_for_test(&self, cap: Duration) {
+        // Relaxed: read by the next poll; tests order it before the submission.
+        self.control.shared.progress_cap_ms.store(
+            u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// Requests that move data through one log's WAL. They overlap each other; the
 /// log's own state lock orders them. Everything else is an exclusive control.
 // Seal/fence are exclusive barriers: they wait for active stream operations,
 // including an unlocked close scan. Direct storage callers use `sealing`.
+// A durable-progress poll overlaps writes like a position proof: it takes no
+// append ticket and no flush barrier, and leaves its slot before it parks.
 pub(super) fn is_stream_request(request: &Request) -> bool {
     match request {
-        Request::Append { .. } | Request::CheckpointPosition { .. } => true,
+        Request::Append { .. }
+        | Request::CheckpointPosition { .. }
+        | Request::DurableProgress { .. } => true,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         Request::ReserveLiveGroup { .. }
         | Request::CompleteLiveGroup { .. }
@@ -1065,6 +1103,68 @@ fn run(shared: &Shared) {
                 }
                 continue;
             }
+            Request::DurableProgress {
+                authority_epoch,
+                epoch,
+                after,
+                max_wait_ms,
+                sync,
+            } => {
+                let poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    durable_progress_poll(shared, authority_epoch, epoch, after, max_wait_ms, sync)
+                }))
+                .unwrap_or_else(|_| {
+                    shared.context.poison_readers();
+                    Err(TcpError::new(
+                        "durable progress poll panicked; outcome unknown; reopen authority",
+                    ))
+                });
+                match poll {
+                    Ok(DurablePoll::Park {
+                        identity,
+                        log,
+                        wake,
+                        deadline,
+                    }) => {
+                        // The hub bounds parked polls itself. The control admission
+                        // ends here, so a parked poll never holds a control slot or
+                        // delays the quiescence check of a live target shutdown.
+                        release(shared, charge);
+                        shared.progress.park(Box::new(durable_progress::Waiter {
+                            id,
+                            completed,
+                            profile,
+                            measured,
+                            began,
+                            identity,
+                            log,
+                            wake,
+                            deadline,
+                        }));
+                    }
+                    Ok(DurablePoll::Ready(report)) => complete(
+                        shared,
+                        id,
+                        charge,
+                        completed,
+                        Ok(Response::DurableProgress(report)),
+                        profile,
+                        measured,
+                        began,
+                    ),
+                    Err(error) => complete(
+                        shared,
+                        id,
+                        charge,
+                        completed,
+                        Err(error),
+                        profile,
+                        measured,
+                        began,
+                    ),
+                }
+                continue;
+            }
             request => request,
         };
 
@@ -1122,6 +1222,12 @@ fn run(shared: &Shared) {
             );
             continue;
         }
+        // Parked polls belong to the authority or stream this control may end. The
+        // hub drops them (and their log references) before it runs: a live fence
+        // requires the old log to have no other strong handle.
+        if matches!(&request, Request::Fence { .. } | Request::Seal { .. }) {
+            shared.progress.retire_parked();
+        }
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             shared.context.handle_profiled_draining(
                 request,
@@ -1140,10 +1246,98 @@ fn run(shared: &Shared) {
             profile.control_execution_ns =
                 began.map_or(0, elapsed_ns).saturating_sub(barrier_wait_ns);
         }
+        // The tier lives here, not in the inventory that builds the status.
+        let response = response.map(|response| match response {
+            Response::Status(mut status) => {
+                status.durability_tier = shared.durability.lock().config.tier;
+                Response::Status(status)
+            }
+            response => response,
+        });
         complete(
             shared, id, charge, completed, response, profile, measured, began,
         );
     }
+}
+
+/// The outcome of a validated durable-progress poll.
+enum DurablePoll {
+    Ready(durable_progress::DurableProgressReport),
+    Park {
+        identity: PollIdentity,
+        log: std::sync::Weak<super::super::storage::PartitionLog>,
+        wake: Wake,
+        deadline: Instant,
+    },
+}
+
+/// Validate a poll and answer it now when its condition holds or its wait is zero.
+/// A nudge (`sync`) adopts leased frames and asks the log syncer to cover everything
+/// appended now; it never syncs on this worker.
+fn durable_progress_poll(
+    shared: &Shared,
+    authority_epoch: u64,
+    epoch: u64,
+    after: u64,
+    max_wait_ms: u32,
+    sync: bool,
+) -> Result<DurablePoll, TcpError> {
+    #[cfg(not(test))]
+    let wait = durable_progress::capped_wait(max_wait_ms);
+    #[cfg(test)]
+    let wait = Duration::from_millis(u64::from(max_wait_ms)).min(Duration::from_millis(
+        // Relaxed: see `progress_cap_ms`.
+        shared.progress_cap_ms.load(Ordering::Relaxed),
+    ));
+    let deadline = Instant::now() + wait;
+    let (identity, log) = {
+        // A lookup only: the guard drops before any adoption or sync below.
+        let inventory = shared.context.inventory.lock();
+        let identity = PollIdentity {
+            database: shared.context.partition.inventory.database,
+            partition: shared.context.partition.partition,
+            authority_epoch,
+            epoch,
+            boot_id: inventory.boot_id(),
+        };
+        (
+            identity,
+            inventory.durable_progress_log(authority_epoch, epoch)?,
+        )
+    };
+    let Some(log) = log else {
+        return Ok(DurablePoll::Ready(
+            identity.report(LogDurableProgress::default()),
+        ));
+    };
+    let wake = if sync {
+        #[cfg(feature = "experimental-nvmeof")]
+        log.self_adopt_live_extent().map_err(TcpError::component)?;
+        let progress = log.durable_progress();
+        // Lag implies an append, which starts the frontier and fixes the tier anyway;
+        // an idle log must not start a frontier here.
+        let target = if progress.appended_end > progress.synced_end {
+            shared
+                .frontier_for(&log)?
+                .request_sync()
+                .map_err(TcpError::component)?
+        } else {
+            progress.appended_end
+        };
+        Wake::Synced(target)
+    } else {
+        Wake::Generation(after)
+    };
+    let progress = log.durable_progress();
+    if wake.ready(&progress) || Instant::now() >= deadline {
+        return Ok(DurablePoll::Ready(identity.report(progress)));
+    }
+    Ok(DurablePoll::Park {
+        identity,
+        log: Arc::downgrade(&log),
+        wake,
+        deadline,
+    })
 }
 
 fn wire_receipts(receipts: &[AppendedBatch]) -> Vec<Receipt> {
@@ -1538,14 +1732,10 @@ fn complete(
     charge: usize,
     completed: mpsc::SyncSender<reactor::WorkCompletion>,
     response: Result<Response, TcpError>,
-    mut profile: ConnectionProfile,
+    profile: ConnectionProfile,
     measured: bool,
     began: Option<Instant>,
 ) {
-    profile.handler_ns = began.map_or(0, elapsed_ns);
-    if measured {
-        profile.control_execution_samples = 1;
-    }
     // Retire the admission before publishing the reply. The reply is the last
     // effect of an admitted command, so a thread that holds it (or is ordered
     // after its receiver, e.g. by a session join) must see the owner quiescent:
@@ -1557,11 +1747,31 @@ fn complete(
     // write, and the covering sync for Synchronous) precedes this call; only
     // delivery of the already computed reply follows the release. Releasing
     // first admits at most one extra in-transit completion per worker and the
-    // flusher beyond `MAX_COMMANDS`, so admission stays bounded.
-    {
-        let mut queue = shared.queue.lock();
-        queue.requests -= 1;
-        queue.bytes -= charge;
+    // flusher beyond `MAX_COMMANDS`, so admission stays bounded. Parked
+    // durable-progress polls add at most the progress hub's waiter bound.
+    release(shared, charge);
+    deliver(id, completed, response, profile, measured, began);
+}
+
+/// Retire one admitted command's request and byte credits.
+fn release(shared: &Shared, charge: usize) {
+    let mut queue = shared.queue.lock();
+    queue.requests -= 1;
+    queue.bytes -= charge;
+}
+
+/// Publish a command's reply to its session. The admission must already be retired.
+pub(super) fn deliver(
+    id: u64,
+    completed: mpsc::SyncSender<reactor::WorkCompletion>,
+    response: Result<Response, TcpError>,
+    mut profile: ConnectionProfile,
+    measured: bool,
+    began: Option<Instant>,
+) {
+    profile.handler_ns = began.map_or(0, elapsed_ns);
+    if measured {
+        profile.control_execution_samples = 1;
     }
     let _ = completed.try_send(reactor::WorkCompletion {
         id,
@@ -3038,6 +3248,10 @@ impl ControlContext {
             Request::Read { .. } | Request::ReadProfiled { .. } => {
                 Err(TcpError::new("read sent to the log control owner"))
             }
+            // The long-poll needs the control owner's progress hub.
+            Request::DurableProgress { .. } => Err(TcpError::new(
+                "durable progress poll bypassed the log control owner",
+            )),
             Request::Recover {
                 epoch,
                 cursor,

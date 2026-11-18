@@ -3884,6 +3884,7 @@ fn request_kind_code(request: &Request) -> u64 {
         Request::CheckpointPosition { .. } => 18,
         Request::ReplayWal { .. } => 19,
         Request::RetireWalFiles { .. } => 20,
+        Request::DurableProgress { .. } => 44,
         #[cfg(feature = "experimental-nvmeof")]
         Request::ValidateRecordReferences { .. } => 21,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

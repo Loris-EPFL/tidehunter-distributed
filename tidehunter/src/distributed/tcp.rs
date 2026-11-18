@@ -27,6 +27,8 @@ pub use owner_transport::OwnerTransportStats;
 #[cfg(feature = "experimental-fabric")]
 pub use tidehunter_fabric::ProviderInfo;
 mod control;
+mod durable_progress;
+pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
 mod inventory;
 mod live_client;
 mod payload;
@@ -101,7 +103,8 @@ pub use inventory::SealedOwnerExport;
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
 /// 25 gives production requests and replies feature-stable tags before NVMe-oF and test-only variants.
 /// 26 adds controller-lifetime pins for non-permanent live exports.
-const PROTOCOL: u32 = 26;
+/// 27 adds DurableProgress and the owner durability tier in NodeStatus.
+const PROTOCOL: u32 = 27;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -378,6 +381,13 @@ pub struct NodeStatus {
     pub polling: PollingPolicy,
     /// The owner is configured for direct live NVMe-oF WAL access.
     pub live_nvmeof: bool,
+    /// The owner's write durability tier now; the default tier before configuration.
+    pub durability_tier: super::durability::DurabilityTier,
+    /// Kernel boot id (`/proc/sys/kernel/random/boot_id`) read when the owner opened.
+    pub boot_id: [u8; 16],
+    /// False when a WAL recovery this owner process ran found a lost or damaged
+    /// frame with a valid frame after it (a hole below the recovered tail).
+    pub recovery_clean: bool,
 }
 pub struct RecoveryPage {
     pub batches: Vec<(CompleteBatch, DurableBatch)>,
@@ -640,6 +650,15 @@ enum Request {
         epoch: u64,
         files: Vec<u64>,
     },
+    /// Owner durable progress of stream `epoch` for the coordinator's durable cut.
+    /// A long-poll: see `DurableProgressReport` for the reply contract.
+    DurableProgress {
+        authority_epoch: u64,
+        epoch: u64,
+        after: u64,
+        max_wait_ms: u32,
+        sync: bool,
+    },
     #[cfg(feature = "experimental-nvmeof")]
     ValidateRecordReferences {
         epoch: u64,
@@ -781,6 +800,10 @@ impl Request {
             | Self::OwnerTimelineArm { .. }
             | Self::OwnerTimelineFetch { .. }
             | Self::CheckpointPosition { .. } => false,
+            // A long-poll parks for its capped wait on top of the data-path SLA.
+            Self::DurableProgress { max_wait_ms, .. } => {
+                return data_timeout.saturating_add(durable_progress::capped_wait(*max_wait_ms));
+            }
             #[cfg(feature = "experimental-nvmeof")]
             Self::ValidateRecordReferences { .. } => false,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -918,6 +941,7 @@ enum Response {
         incomplete: u64,
         more: bool,
     },
+    DurableProgress(DurableProgressReport),
     #[cfg(feature = "experimental-nvmeof")]
     ValidatedRecordReferences(Vec<ValidatedRecordLocation>),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

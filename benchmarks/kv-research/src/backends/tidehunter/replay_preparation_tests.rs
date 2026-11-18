@@ -53,15 +53,16 @@ fn absent_replay_preparation_inputs_preserve_every_synthetic_output_byte() {
     // Captured from the pre-extension 3bbd706 CLI using this exact trusted-TCP
     // input. No paths, identities, fields or bytes are normalized by this check.
     // The launch hash is re-pinned for the uniform overlap budget (explicit
-    // 2 lanes plus 2 controls, doubled, now needs 8 connections) and for the
-    // explicit legacy line `wal_prewrite: false` (the owner default is now on),
-    // which is its only other change.
+    // 2 lanes plus 3 non-read sessions per owner, namely append control, the
+    // operational sampler and the durable-cut poller, doubled: 10 connections)
+    // and for the explicit legacy line `wal_prewrite: false` (the owner default
+    // is now on), which is its only other change.
     // The remote hashes are re-pinned for the removed coordinator preparation
     // pool: the only difference is the deleted `preparation_workers: 8` field.
     let expected = [
         ("durability.json", "389117a6498def40a97d89ca4fa7ed4a116597a762532440e391ebddc3d1dd2b155fd923f57db426aa1de4becd585f59767614b7d7bddb4ee58376453035487a"),
         ("external_owner_read_config.json", "1cdb078424efc8a57b42df8f41b193f87d8f5e4efc4fbdc15819bac2bfa919bbb956b58f220a0a60741625016003b163b7d4fda5cd7ea9755069516292da6571"),
-        ("node-0/launch.yaml", "e4127bd8a76477180cb2656a6b78949a1c39324cd3c16d851d22d594fbf83f68df11e02d5c3660ffe503be7d3d93cd8958be7be5e56944bff0b5429be367c6f7"),
+        ("node-0/launch.yaml", "c2ab26c74b15917cdd562f0d3411acd0698717c30051e0324decb34dfc2bb1c5cd9ccfed64b56e744960138defa468983651849c2cc0a4000f4d372be9fc8ce2"),
         ("owner_transports.json", "5c3f7f89d4ec1232155e1e5899765fb285a47198b950f7c9b174c8151bb6d1403c17c839ac9a2ab7b943d62f28c2f8423dd1ca792ebe6c087916156ee3ca54f7"),
         ("remote.json", "4852ecb72a28976ff3aa70c5095dd793eacb24842fcf8daab92e8706b6bd52bbe6b7e4e54ad769a70b84d629905ef68ff92d1e1c88dade300cae55da8b289516"),
         ("remote.yaml", "a0cbd90461ccac4fbf9ebe40dc88a8fc83ad87d55ce2a489e0ad8bd6edd524ec6234c6478abc6e1a8c1860cf66fc0bdd00ff99842d3943791be9fa41161a15f8"),
@@ -111,7 +112,7 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
     let root = temp();
     let input = root.join("input.json");
     let mut config = synthetic_input();
-    for (name, lanes, expected) in [("auto", None, 132), ("explicit", Some(100), 204)] {
+    for (name, lanes, expected) in [("auto", None, 134), ("explicit", Some(100), 206)] {
         if let Some(lanes) = lanes {
             config["read_lanes"] = serde_json::json!(lanes);
         } else {
@@ -125,7 +126,8 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
         assert_eq!(launch["limits"]["max_connections"].as_u64(), Some(expected));
         assert_eq!(
             expected,
-            2 * (lanes.unwrap_or(RemoteDatabaseConfig::MAX_AUTO_READ_LANES as u64) + 2)
+            2 * (lanes.unwrap_or(RemoteDatabaseConfig::MAX_AUTO_READ_LANES as u64)
+                + RemoteDatabaseConfig::NON_READ_CONNECTIONS as u64)
         );
     }
     config["read_lanes"] = serde_json::json!(127);
@@ -135,7 +137,7 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
         .unwrap_err()
         .to_string();
     assert!(error.contains("read_lanes=127"));
-    assert!(error.contains("require 258 connections"));
+    assert!(error.contains("require 260 connections"));
     assert!(error.contains("ceiling 256"));
     assert!(!rejected.exists());
     fs::remove_dir_all(root).unwrap();
