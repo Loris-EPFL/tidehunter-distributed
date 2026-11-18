@@ -794,7 +794,23 @@ fn fabric_tcp_native_mode_mismatch_with_tls_fails_closed() {
 }
 #[test]
 fn fence_while_read_pending_is_rechecked_before_reply() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Mapped);
+    // The read below is held across `fence_to(2)`, a lifecycle operation
+    // (seal, manifest and new-epoch creation: tens of fsyncs) that the client
+    // grants LIFECYCLE_TIMEOUT. Every bound spanning the fence uses that
+    // budget: the server's `io_timeout`, the read deadline and the hook's wait
+    // for release. A data budget would assert fence latency, which is not under
+    // test. Liveness after release stays bounded by `collect`.
+    let server = Running::with_limits(
+        Transport::Tcp,
+        WalMemberReadPolicy::Mapped,
+        default_read_bytes(),
+        default_device_reads(),
+        TcpLimits {
+            io_timeout: LIFECYCLE_TIMEOUT,
+            max_frame_bytes: 2 * 1024 * 1024,
+            ..TcpLimits::default()
+        },
+    );
     let mut client = server.client();
     let (_, references) = server.data(&mut client);
     let (entered, entries) = mpsc::sync_channel(1);
@@ -802,16 +818,13 @@ fn fence_while_read_pending_is_rechecked_before_reply() {
     let released = Mutex::new(released);
     *server.node.read_hook.lock() = Some(Arc::new(move |_| {
         entered.send(()).unwrap();
-        released
-            .lock()
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
+        released.lock().recv_timeout(LIFECYCLE_TIMEOUT).unwrap();
     }));
     client
         .submit_read(
             1,
             vec![references[0]],
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + LIFECYCLE_TIMEOUT,
             false,
         )
         .unwrap()
@@ -1532,7 +1545,9 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
         default_read_bytes(),
         default_device_reads(),
         TcpLimits {
-            io_timeout: Duration::from_secs(3),
+            // The server bounds each read by `io_timeout`, and the slow read
+            // below is held across the fenced pass's lifecycle fence. See there.
+            io_timeout: LIFECYCLE_TIMEOUT,
             ..TcpLimits::default()
         },
         |config| {
@@ -1546,6 +1561,18 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
         .unwrap();
     let mut client = server.client();
     client.fence_to(1).unwrap();
+    let log = server.node.inventory.lock().active(1).unwrap();
+    // With OnDisk history and `max_batches = 1`, a covering barrier that leaves
+    // a batch pending starts an `authority-history` thread that moves it from
+    // the resident pending window into cold history (and re-caches it after
+    // adoption). That thread runs after the receipt (on the native tier even
+    // its barrier does, in `value-wal-syncer`). Left running, it can drain
+    // record 1 or hold the authority lock during the residency checks below or
+    // while the reactor plans the warm read; and a still-pending batch 0 makes
+    // the next append wait for that spill's fsyncs inside its data deadline.
+    // After each append, make every appended byte durable and join the spill
+    // its barrier started: with nothing left to persist, no barrier and so no
+    // spill can start again before the fence.
     let batches = [batch(&server.config, 1, 0), batch(&server.config, 1, 1)];
     let references: Vec<_> = batches
         .iter()
@@ -1554,18 +1581,20 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
                 .append_many(1, std::slice::from_ref(batch))
                 .unwrap()
                 .remove(0);
+            log.persist_appended().unwrap();
+            log.wait_history().unwrap();
             batch
                 .record_reference(receipt.appended().address(), 0)
                 .unwrap()
         })
         .collect();
+    log.evict_authority_cache();
+    // Re-warm only record 1: the blocking loader caches history authority.
     assert_eq!(
         client.read_record(1, &references[1]).unwrap(),
         batches[1].mutations()[0]
     );
     let before = client.read_io_stats().unwrap();
-    let log = server.node.inventory.lock().active(1).unwrap();
-    log.evict_authority_cache();
     assert!(log.try_plan_record_read(&references[0]).unwrap().is_none());
     assert!(log.try_plan_record_read(&references[1]).unwrap().is_some());
     let (entered, release) = log.pause_next_authority_load();
@@ -1573,7 +1602,13 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
         .submit_read(
             1,
             vec![references[0]],
-            Instant::now() + Duration::from_secs(2),
+            // This read is held across the fenced pass's lifecycle fence
+            // (seal, manifest and new-epoch creation: tens of fsyncs). The
+            // client grants that fence LIFECYCLE_TIMEOUT, so the read spanning
+            // it gets the same budget here and on the server (`io_timeout`);
+            // a data-read budget would assert fence latency, which is not
+            // under test. Its liveness after release stays bounded by `collect`.
+            Instant::now() + LIFECYCLE_TIMEOUT,
             false,
         )
         .unwrap()

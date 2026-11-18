@@ -380,10 +380,10 @@ fn bounded_server_pool_overlaps_members_preserves_order_and_rechecks_fences() {
         *node.read_hook.lock() = Some(Arc::new(move |reference| {
             entered.send(reference.batch_version.sequence).unwrap();
             if reference.batch_version.sequence == 0 {
-                released
-                    .lock()
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap();
+                // Held across the fenced pass's `fence_to(2)`, a lifecycle
+                // operation (tens of fsyncs) that clients grant
+                // LIFECYCLE_TIMEOUT; a data budget would assert fence latency.
+                released.lock().recv_timeout(LIFECYCLE_TIMEOUT).unwrap();
             }
         }));
         let limits = TcpLimits {

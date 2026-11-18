@@ -1046,6 +1046,10 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
         assert_eq!(node.read_admission.stats().inflight_requests, 1);
         if fenced {
             node.inventory.lock().fence_to(2).unwrap();
+            // Fencing persists metadata (tens of fsyncs). As in the other
+            // recheck tests here, start the synthetic request deadline after
+            // it: this pass tests authority rejection, not fence latency.
+            pending.get_mut(&1).unwrap().deadline = Instant::now() + Duration::from_secs(2);
         }
         if expired {
             pending.get_mut(&1).unwrap().deadline = Instant::now();
