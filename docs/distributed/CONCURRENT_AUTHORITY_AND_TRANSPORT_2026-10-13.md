@@ -548,6 +548,32 @@ connection across the idle interval and then verify the stored record. The
 existing partial-frame, expired-request, peer-failure and shutdown regressions
 remain active.
 
+### Session close reasons (2026-11-17)
+
+Before this change, neither side sent TLS `close_notify`. A coordinator therefore
+reported every owner-side close as `truncated TLS session`. That included an
+owner request deadline expiring: under fsync contention, a first `ResolveLiveRecords`
+that creates a writable export can run 13 synced target-journal saves past the
+owner's 10 s data deadline. Owners also logged every coordinator disconnect the
+same way. The close contract is now:
+
+* An owner that ends a TCP or TLS-over-TCP session first sends one unsolicited
+  `Response::Error` with reserved response ID 0. It names the cause, for example
+  `owner request deadline expired: request 6 (kind 29) was still executing after
+  10.0s (owner deadline 10s)`. The kind codes are those of `owner_events.rs`. The
+  client fails with `owner closed the session: <reason>`, and the connection
+  is not reused.
+* Both sides send `close_notify` before closing a TLS session (`abort` and
+  `Drop`). A close at a frame boundary is reported as a peer close. Only a close
+  without `close_notify`, or a close inside a frame, is reported as truncation.
+* Both sends are nonblocking and best effort. If the socket buffer is full, the
+  peer sees only the close. Fabric sessions keep their existing close path,
+  because `abort` releases provider ownership without waiting for transmit
+  completions.
+
+Deadlines, retries and the request outcome are unchanged. A request whose
+deadline expired has an unknown outcome, and the error says so.
+
 ### Final rebuilt replay and retained evidence
 
 The final source, including the idle-session correction, was rebuilt before

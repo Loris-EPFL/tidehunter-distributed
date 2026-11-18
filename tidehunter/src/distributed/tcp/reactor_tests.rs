@@ -351,6 +351,13 @@ fn owner_session_deadlines_extend_fence_but_not_reads() {
             .contains("remote operation deadline expired"),
         "the owner's short deadline, not the five-second client deadline, must expire"
     );
+    // The owner names its expired deadline before closing the session.
+    let error = error.to_string();
+    assert!(
+        error.starts_with("owner closed the session: owner request deadline expired: request ")
+            && error.contains(" (kind 8) "),
+        "{error}"
+    );
 }
 
 #[test]

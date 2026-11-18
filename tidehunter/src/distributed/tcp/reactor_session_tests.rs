@@ -172,6 +172,63 @@ fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
     assert!(matches!(seal.body, Response::Sealed));
 }
 
+#[test]
+fn owner_deadline_close_names_the_expired_request_to_the_client() {
+    // The owner ends a TLS session whose accepted request outlives its
+    // `io_timeout`. The persist barrier holds the append until the client has
+    // its error, so the owner's deadline, never the client's, ends the call.
+    let io_timeout = Duration::from_millis(300);
+    let server = Running::with_limits(
+        Transport::Tcp,
+        WalMemberReadPolicy::Positional,
+        crate::distributed::tcp::default_read_bytes(),
+        crate::distributed::tcp::default_device_reads(),
+        crate::distributed::tcp::TcpLimits {
+            io_timeout,
+            max_frame_bytes: 2 * 1024 * 1024,
+            ..TcpLimits::default()
+        },
+    );
+    server
+        .node
+        .set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+            crate::distributed::durability::DurabilityTier::Synchronous,
+        ))
+        .unwrap();
+    let mut client = server.client();
+    client.timeout = Duration::from_secs(60);
+    client.fence_to(1).unwrap();
+    let log = server.node.inventory.lock().active(1).unwrap();
+    let (persist_entered, resume_persist) = log.pause_next_persist();
+    let batch = crate::distributed::tcp::tests::batch(&server.config, 1, 0);
+
+    let error = client.append_many(1, &[batch]).unwrap_err().to_string();
+    persist_entered
+        .try_recv()
+        .expect("the append was held at its persist barrier");
+    assert!(
+        error.starts_with("owner closed the session: owner request deadline expired: request "),
+        "{error}"
+    );
+    assert!(
+        error.contains("(kind 7) was still executing after "),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("(owner deadline {io_timeout:?})")),
+        "{error}"
+    );
+    resume_persist.send(()).unwrap();
+    assert!(
+        client
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("connection requires replacement"),
+        "a session the owner closed must not be reused"
+    );
+}
+
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn session_and_node_use_the_same_stream_class_for_every_wal_request() {

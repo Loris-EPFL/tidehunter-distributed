@@ -153,8 +153,19 @@ fn work_profiles_disable_reset_and_preserve_live_frames() {
 
 fn send_tls_plaintext(pair: &mut Pair, bytes: &[u8]) {
     pair.peer.writer().write_all(bytes).unwrap();
+    deliver_peer_tls(pair);
+}
+/// The peer writes `bytes`, then ends its TLS stream with close_notify.
+fn close_after_tls_plaintext(pair: &mut Pair, bytes: &[u8]) {
+    pair.peer.writer().write_all(bytes).unwrap();
+    pair.peer.send_close_notify();
+    deliver_peer_tls(pair);
+}
+fn deliver_peer_tls(pair: &mut Pair) {
     let mut encrypted = Vec::new();
-    pair.peer.write_tls(&mut encrypted).unwrap();
+    while pair.peer.wants_write() {
+        pair.peer.write_tls(&mut encrypted).unwrap();
+    }
     let mut encrypted = Cursor::new(encrypted);
     while encrypted.position() < encrypted.get_ref().len() as u64 {
         let conn = pair.session.conn.as_mut().unwrap();
@@ -163,6 +174,102 @@ fn send_tls_plaintext(pair: &mut Pair, bytes: &[u8]) {
         pair.session.plaintext_pending = state.plaintext_bytes_to_read();
         pair.session.peer_closed = state.peer_has_closed();
     }
+}
+/// Decrypts everything the session wrote to its socket until the socket closed.
+/// Returns the plaintext and whether the stream ended with close_notify.
+fn ciphertext_seen_by_peer(
+    control_peer: &mut TcpStream,
+    peer: &mut rustls::Connection,
+) -> (Vec<u8>, bool) {
+    let mut ciphertext = Vec::new();
+    control_peer.read_to_end(&mut ciphertext).unwrap();
+    let mut ciphertext = Cursor::new(ciphertext);
+    let mut closed = false;
+    while ciphertext.position() < ciphertext.get_ref().len() as u64 {
+        assert_ne!(peer.read_tls(&mut ciphertext).unwrap(), 0);
+        closed |= peer.process_new_packets().unwrap().peer_has_closed();
+    }
+    let mut plaintext = Vec::new();
+    match peer.reader().read_to_end(&mut plaintext) {
+        // Ok(0) after close_notify; WouldBlock if the stream did not close.
+        Ok(_) => {}
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+    }
+    (plaintext, closed)
+}
+
+#[test]
+fn close_notice_reaches_the_peer_before_tls_close_notify() {
+    let mut pair = pair();
+    let reason = "owner request deadline expired: request 7 (kind 29) was still executing";
+    pair.session.send_close_notice(reason, 8192);
+    pair.session.abort();
+    let (plaintext, closed) = ciphertext_seen_by_peer(&mut pair._control_peer, &mut pair.peer);
+    assert!(closed, "abort must end the TLS stream with close_notify");
+    let len = u32::from_be_bytes(plaintext[..4].try_into().unwrap()) as usize;
+    assert_eq!(
+        plaintext.len(),
+        4 + len,
+        "exactly one notice frame precedes the close"
+    );
+    let notice: Envelope<Response> = pair.session.decode(&plaintext[4..], 8192).unwrap();
+    assert_eq!(notice.id, 0, "the notice uses the ID no request can have");
+    assert!(matches!(notice.body, Response::Error(message) if message == reason));
+}
+
+#[test]
+fn dropped_tls_session_ends_with_close_notify() {
+    let Pair {
+        session,
+        mut peer,
+        _control_peer: mut control_peer,
+        ..
+    } = pair();
+    drop(session);
+    let (plaintext, closed) = ciphertext_seen_by_peer(&mut control_peer, &mut peer);
+    assert!(plaintext.is_empty());
+    assert!(
+        closed,
+        "a client going away must not look like a truncated session"
+    );
+}
+
+#[test]
+fn peer_close_is_clean_only_at_a_frame_boundary() {
+    let frame = encode_frame(
+        &Envelope {
+            protocol: PROTOCOL,
+            id: 1,
+            body: Response::Error("last reply".to_owned()),
+        },
+        8192,
+    )
+    .unwrap();
+
+    let mut whole = pair();
+    close_after_tls_plaintext(&mut whole, &frame);
+    let (bytes, len) = whole.session.receive(8192).unwrap().unwrap();
+    assert_eq!(&bytes[..len], &frame[4..]);
+    assert!(whole.session.peer_finished());
+    assert_eq!(
+        whole.session.receive(8192).unwrap_err().to_string(),
+        "peer closed the session (TLS close_notify)"
+    );
+
+    let mut cut = pair();
+    close_after_tls_plaintext(&mut cut, &frame[..frame.len() - 1]);
+    let error = loop {
+        match cut.session.receive(8192) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("a frame cut by the close was delivered"),
+            Err(error) => break error,
+        }
+    };
+    assert!(!cut.session.peer_finished());
+    assert_eq!(
+        error.to_string(),
+        "truncated transport frame: peer closed the session inside a frame"
+    );
 }
 #[test]
 fn output_only_turn_preserves_buffered_unread_tls_plaintext() {
@@ -396,6 +503,8 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
             ServerPending {
                 partition: 0,
                 deadline: Instant::now() + Duration::from_secs(2),
+                kind: 8,
+                timeout: Duration::from_secs(2),
                 charge,
                 epoch: Some(1),
                 read_generation: None,
@@ -794,6 +903,8 @@ fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending>
         ServerPending {
             partition: 0,
             deadline: Instant::now() + Duration::from_secs(2),
+            kind: 8,
+            timeout: Duration::from_secs(2),
             charge: 4096,
             epoch: Some(1),
             read_generation: None,
