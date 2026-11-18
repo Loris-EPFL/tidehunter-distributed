@@ -162,6 +162,17 @@ def controller_matrix(spec):
     return cloud_campaign.make_matrix(spec)
 
 
+def tide_owner_service_seconds(spec, job, owner_count, remaining):
+    """Bound the owner lifetime without ending service before a replay client."""
+    if "sealed_dataset" in job:
+        return int(remaining)
+    deadline = spec["case_deadline_seconds"]
+    if job.get("case_kind") == "mainnet_replay":
+        deadline = max(deadline, job["measurement_sizing"]["case_deadline_seconds"])
+    headroom = 300 + (90 * owner_count if job.get("owner_topology") == "colocated" else 0)
+    return min(int(remaining), max(deadline, 600 if job["keys"] > 65536 else 0) + headroom)
+
+
 def apply_case_namespace(config, job, prefix):
     """Give each synthetic case its own key namespace. Hybrid puts share their dataset's
     keys, and replay keys come from the pinned mainnet fixture, whose typed config has no
@@ -3831,10 +3842,7 @@ class Controller:
             # Mark before send; even an unknown response must be cleaned up.
             with self.sequence_lock:
                 self.active_tide[2].append(index)
-            service_seconds = (int(self.remaining()) if "sealed_dataset" in job else
-                min(int(self.remaining()), max(self.config["spec"]["case_deadline_seconds"],
-                    600 if job["keys"] > 65536 else 0) + 300
-                    + (90 * owner_count if job.get("owner_topology") == "colocated" else 0)))
+            service_seconds = tide_owner_service_seconds(self.config["spec"], job, owner_count, self.remaining())
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
                 "sha256": digest(archive), "files": list(files), "timeout": service_seconds,
                 "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
@@ -5722,6 +5730,18 @@ class Controller:
         try:
             self.bootstrap()
             jobs = controller_matrix(self.config["spec"])
+            archive_limit = cloud_campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES.get(
+                self.config["spec"].get("selection"))
+            if archive_limit is not None:
+                # Keep space for raw results, case checkpoints and the final archive.
+                # The monitoring archive can also be copied into the final archive.
+                free = shutil.disk_usage(self.root).free
+                required = 3 * archive_limit + 2 * monitor_module(self.config).MAX_BYTES
+                dump(self.root / "archive-staging.json",
+                     {"available_bytes": free, "required_bytes": required, "path": str(self.root)})
+                if free < required:
+                    raise InfrastructureError(
+                        f"archive staging on {self.root} needs {required} bytes; {free} available")
             dump(self.root / "matrix.json", {"schema_version": 1, "spec": self.config["spec"], "jobs": jobs})
             if platform_module(self.config):
                 persist_json(self.clients, self.config, self.config["prefix"] + "/results/matrix.json",

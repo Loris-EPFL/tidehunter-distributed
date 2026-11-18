@@ -138,7 +138,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
     'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
-    'nvmeof_p13_write_engine': 'fecd37a8ae5139daf2ff1adf92a507a5f22c492a61fe8dd422dd41281715f5b7',
+    'nvmeof_p13_write_engine': '74ddb54e350f37257cc7aa233f70037a27be45d345fcedab2745c92c39fb5d50',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -243,14 +243,14 @@ REVIEWED_SPECS["nvmeof_p9_write_engine"] = {
 }
 REVIEWED_SPECS["nvmeof_p13_write_engine"] = {
     **copy.deepcopy(REVIEWED_SPECS["nvmeof_p9_write_engine"]),
-    "selection": "nvmeof_p13_write_engine", "job_count": 22, "max_cases": 22,
-    "reservation_hours": 3, "hard_deadline_seconds": 10800,
+    "selection": "nvmeof_p13_write_engine", "job_count": 38, "max_cases": 38,
+    "reservation_hours": 4.5, "hard_deadline_seconds": 16200,
     "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p13_write_engine"],
 }
 SELECTED_MATRIX_SHA256 = {
     "nvmeof_p13_write_engine": {
-        "file": "f67708737e501985f11ccbfcfcd7e7c191e18dbda8ecc4fe8611916862b11301",
-        "prewritten": "abbd468292ed945e553a5a28aed7da51ca016ba6a6eaa1e919cf8e30f3128e4e",
+        "file": "af3dee556893ea7e17624d326a3c1a9282fb70b7fc3b82f11e98b62852e3499a",
+        "prewritten": "98977ae5a91848ad44e85eac3631dd7dbd6d45d207faa4cc8dd47044f7eea30b",
     },
 }
 
@@ -354,6 +354,10 @@ def _record(path, state, phase):
 
 def reservation_seconds(spec):
     hours = spec.get('reservation_hours', 6)
+    reviewed_hours = REVIEWED_SPECS.get(spec.get('selection'), {}).get('reservation_hours')
+    # Only explicitly reviewed durations may use a fractional hour.
+    if type(reviewed_hours) is float and type(hours) is float and hours == reviewed_hours:
+        return int(hours * 3600)
     if type(hours) is not int or not 2 <= hours <= 6:
         raise ValueError('reservation_hours must be an integer from 2 to 6')
     return hours * 3600
@@ -1443,7 +1447,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
               'children': {}, 'phase': 'initial', 'cleanup_verified': False,
               'budget': {'ceiling_cents': ceiling, 'compute_cents': compute,
                          'non_compute_quote_cents': surcharge_cents, 'weekly_limit_cents': weekly_limit,
-                         'reservation_hours': duration // 3600},
+                         'reservation_hours': spec.get('reservation_hours', 6)},
               'reservation': {'cents': ceiling, 'region': 'us-central1',
                               'instances': host_count,
                               'vcpus': int(config['machine_type'].rsplit('-', 1)[-1]) * host_count,

@@ -21,29 +21,61 @@ class WriteEngineTests(unittest.TestCase):
         selection = "nvmeof_p13_write_engine"
         legacy = campaign.make_focused_matrix(SELECTION)
         jobs = campaign.make_focused_matrix(selection)
-        self.assertEqual(len(jobs), 22)
+        self.assertEqual(len({job["case_id"] for job in jobs}), 38)
         for arm, prewrite in (("file", False), ("prewritten", True)):
             spec = {"mode": "focused", "selection": selection, "owner_hosts": 2, "arms": [arm]}
             selected = controller.controller_matrix(spec)
             self.assertEqual(selected, [job for job in jobs if job["arm"] == arm])
-            self.assertEqual(len(selected), 11)
+            self.assertEqual(len(selected), 19)
             puts = [job for job in selected if job["case_kind"] == "remote_put"]
             self.assertEqual(len(puts), 8)
             self.assertEqual({(job["concurrency"], job["durability_tier"]) for job in puts},
                              {(c, t) for c in (8, 16, 32, 64) for t in ("synchronous", "native")})
+            replay = [job for job in selected if job["case_kind"] == "mainnet_replay"]
+            self.assertEqual(len(replay), 10)
+            self.assertEqual({(job["concurrency"], job["durability_tier"]) for job in replay},
+                             {(n, t) for n in (4, 8, 16, 32, 64) for t in ("synchronous", "native")})
+            self.assertEqual(sum(job["case_kind"] == "live_read" for job in selected), 1)
             for job in selected:
                 self.assertIs(job["owner_wal_prewrite"], prewrite)
                 self.assertEqual(campaign.job_owner_hosts(job), 2)
                 if job in puts:
                     self.assertEqual(job["value_size"], 512)
-                source_c = {8: 16, 32: 64}.get(job["concurrency"], job["concurrency"])
+                if job in replay:
+                    source_c = 16
+                else:
+                    source_c = {8: 16, 32: 64}.get(job["concurrency"], job["concurrency"])
                 source = next(j for j in legacy if j["arm"] == arm and j["case_kind"] == job["case_kind"]
                               and j["durability_tier"] == job["durability_tier"] and j["concurrency"] == source_c)
                 expected = dict(source, case_id=job["case_id"], selection=selection,
                                 concurrency=job["concurrency"], profile=job["profile"])
+                if job in replay:
+                    n = job["concurrency"]
+                    deadline, estimate = {4: (1000, 480), 8: (800, 240)}.get(n, (600, 120))
+                    expected["measurement_sizing"] = dict(
+                        source["measurement_sizing"], case_deadline_seconds=deadline, expected_case_seconds=estimate)
+                    profile = (source["profile"] if n == 16
+                               else f"G35S-mainnet-perpetual-c{n}-separate-o2")
+                    self.assertEqual(job["profile"], profile)
+                    options = {"path": "/tmp/perpetual-db",
+                               "external_remote_config": {"storage": {"database": [7] * 16}}}
+                    config = campaign.make_run_config(job, Path("/tmp/replay-case"), options, "a" * 40, deadline)
+                    self.assertEqual(config["execution"]["concurrency"], n)
+                    self.assertGreaterEqual(config["execution"]["queue_capacity"], n)
+                    self.assertEqual(config["limits"]["deadline_seconds"], deadline)
+                    owner_seconds = controller.tide_owner_service_seconds(
+                        {"case_deadline_seconds": 600}, job, owner_count=2, remaining=1800)
+                    self.assertEqual(owner_seconds, deadline + 300)
+                    self.assertEqual(runner.planned_timing_rows(config)["measurement"], 4096 * 510)
                 self.assertEqual(job, expected)
-            for kind, count in (("live_read", 1), ("mainnet_replay", 2)):
-                self.assertEqual(sum(job["case_kind"] == kind for job in selected), count)
+
+    def test_p13_sample_archive_bound_is_separate_from_p9(self):
+        selection = "nvmeof_p13_write_engine"
+        self.assertNotIn(SELECTION, campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES)
+        expected = 7_928_827_904
+        with patch.dict(campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES, {selection: expected - 1}):
+            with self.assertRaisesRegex(ValueError, "drop cells, not measurement seconds"):
+                campaign._write_engine_matrix(selection)
 
     def test_exact_arms_and_cells(self):
         jobs = campaign.make_focused_matrix(SELECTION)

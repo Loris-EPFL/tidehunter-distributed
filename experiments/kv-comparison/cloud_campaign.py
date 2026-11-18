@@ -46,6 +46,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 DEFAULT_DURABILITY_TIER = "native"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
+WRITE_ENGINE_ARCHIVE_LIMIT_BYTES = {"nvmeof_p13_write_engine": 8_721_710_695}
 WRITE_ENGINE_SELECTIONS = ("nvmeof_p9_write_engine", "nvmeof_p13_write_engine")
 M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put", *WRITE_ENGINE_SELECTIONS)
 M3_OWNER_ADMISSION_TIMEOUT_SECONDS = 95
@@ -805,7 +806,7 @@ FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
 FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
 FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 18
-FOCUSED_COUNTS["nvmeof_p13_write_engine"] = 22
+FOCUSED_COUNTS["nvmeof_p13_write_engine"] = 38
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -862,7 +863,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_m3_t2_5": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_p9_small_put": {"G34W": 7},
     "nvmeof_p9_write_engine": {"G35W": 12, "G35R": 2, "G35S": 4},
-    "nvmeof_p13_write_engine": {"G35W": 16, "G35R": 2, "G35S": 4},
+    "nvmeof_p13_write_engine": {"G35W": 16, "G35R": 2, "G35S": 20},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -2141,11 +2142,25 @@ def _nvmeof_p9_write_engine():
     return _write_engine_matrix("nvmeof_p9_write_engine")
 
 
+def _clone_write_engine_replay(result, selection, source, common, concurrency, profile):
+    deadline, expected = {4: (1000, 480), 8: (800, 240)}.get(concurrency, (600, 120))
+    for tier in ("synchronous", "native"):
+        _clone_job(result, selection, source, "G35S", profile=profile,
+                   case_kind="mainnet_replay", concurrency=concurrency, durability_tier=tier,
+                   replay_node_db_id=0, repetitions=4096, minimum_measurement_seconds=15,
+                   mix=mix(read=50, put=50),
+                   measurement_operations=4096 * (507 + 3), warmup_operations=0,
+                   measurement_sizing={"case_deadline_seconds": deadline,
+                                       "expected_case_seconds": expected,
+                                       "expected_archive_bytes": 600 * 1024**2},
+                   **common)
+
+
 def _write_engine_matrix(selection):
-    """One fleet per backing arm, with identical read and replay controls."""
+    """One fleet per backing arm with matched put, read and replay cases."""
     result = []
     puts = [job for job in _nvmeof_p9_small_put() if job["repeat"] == 0 and job["value_size"] == 512]
-    replay_source = puts[0]
+    replay_source = {key: value for key, value in puts[0].items() if key != "diagnostics"}
     if selection == "nvmeof_p13_write_engine":
         c16, c64, _ = puts
         puts = [dict(c16, concurrency=8), c16, dict(c64, concurrency=32), c64]
@@ -2177,21 +2192,17 @@ def _write_engine_matrix(selection):
             clean = {key: value for key, value in source.items() if key != "diagnostics"}
             _clone_job(result, selection, clean, "G35R",
                        profile="G35R-read-c16-separate-o2", **common)
-        for tier in ("synchronous", "native"):
-            source = {key: value for key, value in replay_source.items() if key != "diagnostics"}
-            _clone_job(result, selection, source, "G35S",
-                       profile="G35S-mainnet-perpetual-separate-o2",
-                       case_kind="mainnet_replay", concurrency=16, durability_tier=tier,
-                       replay_node_db_id=0, repetitions=4096, minimum_measurement_seconds=15,
-                       mix=mix(read=50, put=50),
-                       measurement_operations=4096 * (507 + 3), warmup_operations=0,
-                       measurement_sizing={"case_deadline_seconds": 600,
-                                           "expected_case_seconds": 120,
-                                           "expected_archive_bytes": 600 * 1024**2},
-                       **common)
+        _clone_write_engine_replay(result, selection, replay_source, common,
+                                   16, "G35S-mainnet-perpetual-separate-o2")
+        if selection == "nvmeof_p13_write_engine":
+            for concurrency in (4, 8, 32, 64):
+                _clone_write_engine_replay(result, selection, replay_source, common, concurrency,
+                                           f"G35S-mainnet-perpetual-c{concurrency}-separate-o2")
+        limit = WRITE_ENGINE_ARCHIVE_LIMIT_BYTES.get(selection, 3_000_000_000)
         if sum(job["measurement_sizing"]["expected_archive_bytes"]
-               for job in result if job["arm"] == arm) > 3_000_000_000:
-            raise ValueError("M3 sample archive exceeds3GB; drop cells, not measurement seconds")
+               for job in result if job["arm"] == arm) > limit:
+            bound = "3GB" if limit == 3_000_000_000 else f"{limit} bytes"
+            raise ValueError(f"M3 sample archive exceeds{bound}; drop cells, not measurement seconds")
     return result
 
 
@@ -2904,7 +2915,7 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
                          "manifest_sha256": hashlib.sha256(fixture.read_bytes()).hexdigest(),
                          "node_databases": [0], "repetitions": 4096,
                          "minimum_measurement_seconds": 15},
-            "execution": {"mode": "closed_loop", "concurrency": 16, "client_shards": 1,
+            "execution": {"mode": "closed_loop", "concurrency": job["concurrency"], "client_shards": 1,
                           "queue_capacity": 128, "request_timeout_ms": 10000,
                           "offered_ops_per_second": None},
             "measurement_gate": {"ready_file": str(case_root / "measurement.ready"),
