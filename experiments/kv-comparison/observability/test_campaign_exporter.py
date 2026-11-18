@@ -407,6 +407,26 @@ class CaseIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete live"):
             campaign.measurement_read_metrics(evidence, {})
 
+    def test_live_counter_sets_match_the_rust_delta_and_peak_fixture(self):
+        # kv-research pins the same fixture to its exported delta/peak lists and to the
+        # serialized LiveNvmeStats fields, so either side changing alone fails CI.
+        fixture = json.loads((Path(__file__).parent / "live_nvmeof_counter_fields.json").read_text())
+        self.assertEqual(set(fixture["delta"]), campaign.live_nvmeof_allowed_counters())
+        self.assertLessEqual(campaign.live_nvmeof_expected_counters(), set(fixture["delta"]))
+        self.assertEqual(set(fixture["peak"]), set(campaign.LIVE_NVMEOF_PEAKS))
+        self.assertFalse(set(fixture["delta"]) & set(fixture["peak"]))
+        # A complete Rust delta is admitted, and each field lands in its unit family.
+        counters = {field: 1 for field in fixture["delta"]}
+        text = campaign.measurement_read_metrics(
+            {"scope": "measurement_boundary", "deltas": {"available": False},
+             "live_nvmeof": {"available": True, "counters": counters}}, {})
+        for name in ("leased_frame_batches", "write_submit_calls", "owner_drains", "owner_drain_batches",
+                     "owner_drain_stop_empty", "owner_drain_stop_allocated", "owner_drain_stop_fence",
+                     "owner_drain_stop_limit", "owner_drain_stop_credit", "leased_submit_ready_left",
+                     "leased_submit_ready_left_batches", "leased_submit_ready_left_full",
+                     "leased_submit_ready_left_full_batches", "leased_deferred_submits"):
+            self.assertIn(f'kv_live_nvmeof_events{{scope="measurement_boundary",counter="{name}"}} 1', text)
+
     def test_new_transport_observations_do_not_require_cq_timing(self):
         evidence = read_diagnostics()
         counters = evidence["profile"]["counters"]
