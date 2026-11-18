@@ -95,9 +95,13 @@ fn retiring_read_grant_keeps_idle_controller_export_across_file_rollover() {
     assert_eq!(next_file.extent.segment.file_index, 1);
     owner
         .node
-        .inventory
-        .lock()
-        .reap_idle_live_segments(1)
+        .with_lifecycle(|inventory, slot| {
+            crate::distributed::tcp::NodeInventory::reap_idle_live_segments(
+                inventory,
+                slot.as_mut().unwrap(),
+                1,
+            )
+        })
         .unwrap();
     let segment = &first.extent.segment;
     let file = LiveFileIdentity {
@@ -110,13 +114,7 @@ fn retiring_read_grant_keeps_idle_controller_export_across_file_rollover() {
     let exported = || {
         owner
             .node
-            .inventory
-            .lock()
-            .live_target
-            .as_ref()
-            .unwrap()
-            .binding_for_file(&file)
-            .is_some()
+            .with_live_target(|target| target.binding_for_file(&file).is_some())
     };
     assert!(
         exported(),

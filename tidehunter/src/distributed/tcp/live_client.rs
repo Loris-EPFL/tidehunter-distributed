@@ -3094,7 +3094,7 @@ pub(crate) mod leased_tests {
                 configfs,
             )
             .unwrap();
-            node.inventory.lock().live_target = Some(target);
+            node.install_live_target(target).unwrap();
             let tls = TlsFiles {
                 transport: Transport::TcpTrusted,
                 ca: PathBuf::new(),
@@ -5794,7 +5794,7 @@ impl super::StorageNode {
         &self,
         target: crate::distributed::nvmeof::live_target::LiveTargetManager,
     ) {
-        self.inventory.lock().live_target = Some(target);
+        self.install_live_target(target).unwrap();
     }
 }
 

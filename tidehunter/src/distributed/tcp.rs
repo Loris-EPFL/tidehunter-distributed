@@ -996,7 +996,8 @@ impl StorageNode {
             Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
         let inventory = NodeInventory::open(config, metrics)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let live_nvme_selected = inventory.live_target.is_some();
+        let live_nvme_selected = inventory.live_export_mode.is_some();
+        let lifecycle = inventory.lifecycle.clone();
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
         let append_shape = inventory.shape.clone();
@@ -1011,6 +1012,7 @@ impl StorageNode {
         let control_context = Arc::new(control::ControlContext {
             partition,
             inventory: inventory.clone(),
+            lifecycle,
             readers: readers.clone(),
             terminal: terminal.clone(),
             poison_pending: Arc::new(AtomicBool::new(false)),
@@ -1062,6 +1064,9 @@ impl StorageNode {
         if self.control_context.poison_pending.load(Ordering::Acquire) {
             return Err(TcpError::new("reader authority is poison-pending"));
         }
+        // The gate orders status after any lifecycle step in progress: those
+        // steps release the inventory across their syncs.
+        let _lifecycle = self.control_context.lifecycle.lock();
         self.inventory.lock().status()
     }
     /// Final owner-process shutdown, after serving sessions have stopped.
@@ -1100,6 +1105,9 @@ impl StorageNode {
     /// Enable local maintenance diagnostics for current and later epochs.
     /// This does not change the wire protocol or enable per-write clocks.
     pub fn set_history_maintenance_diagnostics(&self, enabled: bool) {
+        // The gate orders this against log creation, which captures the
+        // setting under the inventory and applies it to the unpublished log.
+        let _lifecycle = self.control_context.lifecycle.lock();
         self.inventory
             .lock()
             .set_history_maintenance_diagnostics(enabled);
@@ -1110,7 +1118,8 @@ impl StorageNode {
         &self,
         mode: super::storage::HistoryPersistence,
     ) -> Result<(), TcpError> {
-        self.inventory.lock().set_history_persistence(mode)
+        let _lifecycle = self.control_context.lifecycle.lock();
+        NodeInventory::switch_history_persistence(&mut self.inventory.lock(), mode)
     }
 
     /// Cumulative local snapshots, paired with epoch, without an RPC.
@@ -1182,15 +1191,52 @@ impl StorageNode {
         config: super::nvmeof::LiveTargetConfig,
         configfs: std::path::PathBuf,
     ) -> Result<(), TcpError> {
-        let mut inventory = self.inventory.lock();
-        if inventory.live_target.is_some() {
-            return Err(TcpError::new("live target fixture already installed"));
-        }
-        inventory.live_target = Some(
+        self.install_live_target(
             super::nvmeof::live_target::LiveTargetManager::open_fixture(config, configfs)
                 .map_err(TcpError::component)?,
-        );
+        )
+    }
+    /// Install a live target manager after open: the gate owns the manager and
+    /// the inventory records its immutable export mode.
+    #[cfg(all(
+        any(test, feature = "test-utils"),
+        feature = "experimental-nvmeof",
+        target_os = "linux"
+    ))]
+    pub(crate) fn install_live_target(
+        &self,
+        target: super::nvmeof::live_target::LiveTargetManager,
+    ) -> Result<(), TcpError> {
+        let mut slot = self.control_context.lifecycle.lock();
+        let mut inventory = self.inventory.lock();
+        if slot.is_some() || inventory.live_export_mode.is_some() {
+            return Err(TcpError::new("live target fixture already installed"));
+        }
+        inventory.live_export_mode = Some(target.export_mode());
+        *slot = Some(target);
         Ok(())
+    }
+    /// Test access to the installed live target, taken through the gate.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn with_live_target<R>(
+        &self,
+        f: impl FnOnce(&mut super::nvmeof::live_target::LiveTargetManager) -> R,
+    ) -> R {
+        let mut slot = self.control_context.lifecycle.lock();
+        f(slot.as_mut().expect("live target installed"))
+    }
+    /// Test access to a gated lifecycle step: the gate, then the inventory.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn with_lifecycle<R>(
+        &self,
+        f: impl FnOnce(
+            &mut parking_lot::MutexGuard<'_, NodeInventory>,
+            &mut inventory::LifecycleSlot,
+        ) -> R,
+    ) -> R {
+        let mut slot = self.control_context.lifecycle.lock();
+        let mut inventory = self.inventory.lock();
+        f(&mut inventory, &mut slot)
     }
     pub(super) fn reader_authority_valid(&self, epoch: u64, generation: Option<u64>) -> bool {
         if self.control_context.poison_pending.load(Ordering::Acquire) {
