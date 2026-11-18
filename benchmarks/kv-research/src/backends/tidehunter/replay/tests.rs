@@ -237,7 +237,7 @@ fn fixture(
             endpoints:config.endpoints.iter().map(|e|(e.partition,e.address.clone())).collect(),owners:1,
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
             effective_configuration:serde_json::json!({"fixture_route":live.unwrap_or("owner_rpc"),"remote":config,"owner_read":owner_read}),operational_read_io:None,
-            read_evidence_written:false,coordinator_interval_baseline:std::sync::Mutex::new(None),
+            read_evidence_written:false,owner_sample_gate:Default::default(),coordinator_interval_baseline:std::sync::Mutex::new(None),
             #[cfg(all(feature="nvmeof",target_os="linux"))]
             live_write_profile:std::sync::Mutex::new(None),
         });

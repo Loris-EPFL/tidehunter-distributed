@@ -103,7 +103,8 @@ pub use inventory::SealedOwnerExport;
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
 /// 25 gives production requests and replies feature-stable tags before NVMe-oF and test-only variants.
 /// 26 adds controller-lifetime pins for non-permanent live exports.
-/// 27 adds DurableProgress and the owner durability tier in NodeStatus.
+/// 27 adds DurableProgress, the owner durability tier in NodeStatus, and PartitionStats
+/// (feature-stable tags after DurableProgress in both Request and Response).
 const PROTOCOL: u32 = 27;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
@@ -659,6 +660,9 @@ enum Request {
         max_wait_ms: u32,
         sync: bool,
     },
+    /// Complete owner persistence counters without changing the fixed
+    /// `StatsDetailed` encoding.
+    PartitionStats,
     #[cfg(feature = "experimental-nvmeof")]
     ValidateRecordReferences {
         epoch: u64,
@@ -795,6 +799,7 @@ impl Request {
             | Self::ReadIoStats
             | Self::Stats
             | Self::StatsDetailed
+            | Self::PartitionStats
             | Self::ConnectionProfile { .. }
             | Self::OperationalReadIoStats
             | Self::OwnerTimelineArm { .. }
@@ -851,6 +856,7 @@ impl Request {
         match self {
             Self::Stats
             | Self::StatsDetailed
+            | Self::PartitionStats
             | Self::ReadIoStats
             | Self::OperationalReadIoStats
             | Self::ConnectionProfile { .. }
@@ -942,6 +948,8 @@ enum Response {
         more: bool,
     },
     DurableProgress(DurableProgressReport),
+    /// Boxed so ordinary responses do not grow.
+    PartitionStats(Box<PartitionStats>),
     #[cfg(feature = "experimental-nvmeof")]
     ValidatedRecordReferences(Vec<ValidatedRecordLocation>),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -2824,28 +2832,12 @@ impl Client {
             response => self.wrong_variant("Seal", &response, "Sealed"),
         }
     }
+    /// Complete owner persistence counters. Uses the boxed tail variant so the
+    /// fixed `StatsDetailed` encoding stays unchanged.
     pub fn stats(&mut self) -> Result<PartitionStats, TcpError> {
-        match self.request(Request::StatsDetailed)? {
-            Response::StatsDetailed {
-                groups,
-                barriers,
-                namespace_syncs,
-                inventory_witnesses,
-                live_frontier_file_syncs,
-                live_frontier_namespace_syncs,
-                records,
-                metadata,
-            } => Ok(PartitionStats {
-                appended_groups: groups,
-                persistence_barriers: barriers,
-                namespace_syncs,
-                inventory_witnesses,
-                live_frontier_file_syncs,
-                live_frontier_namespace_syncs,
-                registered_records: records,
-                reference_metadata_bytes: metadata,
-            }),
-            response => self.wrong_variant("StatsDetailed", &response, "StatsDetailed"),
+        match self.request(Request::PartitionStats)? {
+            Response::PartitionStats(stats) => Ok(*stats),
+            response => self.wrong_variant("PartitionStats", &response, "PartitionStats"),
         }
     }
 }

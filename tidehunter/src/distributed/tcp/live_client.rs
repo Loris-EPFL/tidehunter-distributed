@@ -486,6 +486,7 @@ fn record_write_io(
             .completed_write_bytes
             .saturating_sub(before.completed_write_bytes),
     );
+    counters.record_write_submit_calls(after.submit_calls.saturating_sub(before.submit_calls));
     let submissions = after.submissions.saturating_sub(before.submissions);
     if submissions != 0 {
         counters.record_timing(
@@ -722,6 +723,13 @@ impl super::Client {
 
     pub(crate) fn live_nvme_configured(&self) -> bool {
         self.live_config.is_some()
+    }
+
+    /// This client's live counters, when a benchmark or service registered them.
+    pub(crate) fn live_counters(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeCounters>> {
+        self.live_counters.as_ref()
     }
 
     pub(crate) fn record_live_write_error(&mut self) {
@@ -2530,7 +2538,8 @@ impl super::Client {
             current.acknowledged = flight.prefix;
             if flight.frame_len != 0 {
                 if let Some(counters) = &self.live_counters {
-                    counters.record_leased_frame(flight.frame_len as u64);
+                    counters
+                        .record_leased_frame(flight.frame_len as u64, flight.receipts.len() as u64);
                 }
                 if let Some(timeline) = timeline {
                     timeline.live_group_event(flight.sample, Stage::LiveReceiptsValidated);

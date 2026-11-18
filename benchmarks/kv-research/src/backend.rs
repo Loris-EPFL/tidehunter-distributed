@@ -247,6 +247,11 @@ pub trait KvBackend: Send + Sync + 'static {
         Err(unsupported("client operation profiling"))
     }
 
+    /// The runner opens the measurement window after its drained start boundary
+    /// and closes it after the measurement phase drained, before the end
+    /// boundary. Backends must not sample owners while it is open.
+    fn set_measurement_window(&self, _open: bool) {}
+
     /// Observe read counters outside timed API calls. Unsupported backends report absence.
     fn read_observation(&self) -> BackendResult<serde_json::Value> {
         Ok(

@@ -180,13 +180,12 @@ impl ClientWorker {
                             queued.push_back(WorkerItem::Control(control.command));
                             continue;
                         }
-                        let before = controls
-                            .front()
-                            .map_or(snapshot, |control| control.before_owner_seq);
+                        let control = controls.front().map(|control| control.before_owner_seq);
                         match take_ready_group(
                             &client,
                             &worker_queue,
-                            before,
+                            control.unwrap_or(snapshot),
+                            control.is_some(),
                             &policy,
                             &worker_accounting,
                             &completion,
@@ -415,6 +414,9 @@ impl ClientWorker {
                             queued.is_empty(),
                         ) {
                             Ok(crate::distributed::tcp::LeasedSubmit::Submitted(id)) => {
+                                if let Some(counters) = client.live_counters() {
+                                    counters.record_deferred_submit();
+                                }
                                 leased_replies.push_back((id, members));
                                 if position.is_none() {
                                     continue;
@@ -484,9 +486,61 @@ impl ClientWorker {
                         && let Some(WorkerItem::Append(epoch, _, _)) = queued.front()
                     {
                         let epoch = *epoch;
+                        if client.live_leased_mode()
+                            && !crate::distributed::storage::baseline_write_path()
+                        {
+                            // Last-moment merge: take groups that became READY
+                            // after this turn's drain. Re-poll first, as at the
+                            // top of the turn: the fresh allocation snapshot and
+                            // every control sent before it are captured
+                            // together, so a newer entry can never pass a
+                            // control. An empty or ALLOCATED head ends it at
+                            // once; a lone batch is never held back.
+                            let (fresh, closed) = receiver.poll(
+                                &worker_queue,
+                                queue_capacity.saturating_sub(queued.len() + controls.len()),
+                                |ordered| {
+                                    if !matches!(ordered.command, Command::QueueReady) {
+                                        controls.push_back(ordered);
+                                    }
+                                },
+                            );
+                            disconnected |= closed;
+                            let control = controls.front().map(|control| control.before_owner_seq);
+                            for _ in 0..queue_capacity {
+                                match take_ready_group(
+                                    &client,
+                                    &worker_queue,
+                                    control.unwrap_or(fresh),
+                                    control.is_some(),
+                                    &policy,
+                                    &worker_accounting,
+                                    &completion,
+                                ) {
+                                    Ok(GroupDrain::Ready(group)) => {
+                                        trace_worker_dequeue(&write_timeline, partition, &group);
+                                        queued.push_back(group);
+                                    }
+                                    Ok(GroupDrain::Empty | GroupDrain::CreditBlocked) => break,
+                                    Err(error) => {
+                                        record_first_failure(
+                                            &first_failure,
+                                            Some(partition),
+                                            None,
+                                            "owner_queue",
+                                            &error,
+                                        );
+                                        failure.store(true, std::sync::atomic::Ordering::Release);
+                                        completion.failed(partition, &[], error);
+                                        break 'worker;
+                                    }
+                                }
+                            }
+                        }
                         let budget = client.live_group_budget();
                         let mut take = 0usize;
                         let mut count = 0usize;
+                        let mut frame_full = false;
                         let mut payload = crate::distributed::tcp::LiveGroupBudget::EMPTY_PAYLOAD;
                         for command in &queued {
                             let WorkerItem::Append(command_epoch, batches, _) = command else {
@@ -522,7 +576,10 @@ impl ClientWorker {
                                     }
                                     break;
                                 }
-                                None => break,
+                                None => {
+                                    frame_full = true;
+                                    break;
+                                }
                             }
                         }
                         if take != 0 {
@@ -549,6 +606,16 @@ impl ClientWorker {
                             }
                             let first = members[0].0;
                             if leased {
+                                // Same evidence bound in every arm: READY
+                                // entries before the first ordered control.
+                                let left = write_core::worker_group::ready_left(
+                                    &worker_queue,
+                                    controls
+                                        .front()
+                                        .map_or(u64::MAX, |control| control.before_owner_seq),
+                                    &policy,
+                                    &queued,
+                                );
                                 match client.submit_leased_group(
                                     epoch,
                                     merged,
@@ -557,6 +624,9 @@ impl ClientWorker {
                                     queued.is_empty(),
                                 ) {
                                     Ok(crate::distributed::tcp::LeasedSubmit::Submitted(id)) => {
+                                        if let Some(counters) = client.live_counters() {
+                                            counters.record_submit_ready_left(left, frame_full);
+                                        }
                                         leased_replies.push_back((id, members));
                                     }
                                     Ok(crate::distributed::tcp::LeasedSubmit::Deferred(

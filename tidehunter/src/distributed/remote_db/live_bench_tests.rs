@@ -1716,3 +1716,567 @@ fn small_put_multiowner_workstation() {
         db.shutdown().unwrap();
     }
 }
+
+/// Block-device and process write counters of the scratch filesystem. These
+/// include other processes on the same filesystem: rows record an idle window
+/// and report background-corrected device bytes next to the raw ones.
+struct DiskProbe {
+    partition: String,
+    device: String,
+    journal: Option<PathBuf>,
+}
+impl DiskProbe {
+    fn new(base: &Path) -> Self {
+        let source = command(
+            "findmnt",
+            &["-n", "-o", "SOURCE", "-T", base.to_str().unwrap()],
+        );
+        let partition = Path::new(&source)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let parent = command("lsblk", &["-n", "-o", "PKNAME", &source]);
+        let device = if parent.is_empty() {
+            partition.clone()
+        } else {
+            parent
+        };
+        let journal = fs::read_dir("/proc/fs/jbd2").ok().and_then(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&format!("{partition}-")))
+                })
+                .map(|entry| entry.path().join("info"))
+        });
+        Self {
+            partition,
+            device,
+            journal,
+        }
+    }
+    /// Write requests, written bytes and flushes of the partition/device, jbd2
+    /// transactions, and this process's storage write bytes.
+    fn sample(&self) -> [u64; 6] {
+        let stats = fs::read_to_string("/proc/diskstats").unwrap();
+        let fields = |name: &str| -> Vec<u64> {
+            stats
+                .lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                .find(|fields| fields.get(2) == Some(&name))
+                .unwrap()[3..]
+                .iter()
+                .map(|value| value.parse().unwrap())
+                .collect()
+        };
+        let partition = fields(&self.partition);
+        let device = fields(&self.device);
+        let transactions = self.journal.as_ref().map_or(0, |path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        });
+        let io = fs::read_to_string("/proc/self/io").unwrap();
+        let process = |name: &str| -> u64 {
+            io.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        [
+            partition[4],
+            partition[6] * 512,
+            device.get(15).copied().unwrap_or(0),
+            transactions,
+            process("write_bytes:"),
+            process("cancelled_write_bytes:"),
+        ]
+    }
+}
+fn disk_delta(after: [u64; 6], before: [u64; 6]) -> Value {
+    json!({
+        "device_write_requests": after[0] - before[0],
+        "device_write_bytes": after[1] - before[1],
+        "device_flushes": after[2] - before[2],
+        "journal_transactions": after[3] - before[3],
+        "process_write_bytes": after[4] - before[4],
+        "process_cancelled_write_bytes": after[5] - before[5],
+    })
+}
+/// Storage write bytes of live threads, keyed by thread name and id. A thread
+/// that exits between samples moves its bytes into the process-only remainder.
+fn thread_writes() -> std::collections::BTreeMap<(String, u64), u64> {
+    fs::read_dir("/proc/self/task")
+        .unwrap()
+        .take(4096)
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let tid = path.file_name()?.to_str()?.parse().ok()?;
+            let name = fs::read_to_string(path.join("comm"))
+                .ok()?
+                .trim()
+                .to_owned();
+            let io = fs::read_to_string(path.join("io")).ok()?;
+            let bytes = io
+                .lines()
+                .find_map(|line| line.strip_prefix("write_bytes:"))?
+                .trim()
+                .parse()
+                .ok()?;
+            Some(((name, tid), bytes))
+        })
+        .collect()
+}
+fn thread_delta(
+    after: &std::collections::BTreeMap<(String, u64), u64>,
+    before: &std::collections::BTreeMap<(String, u64), u64>,
+) -> Value {
+    let mut by_name = std::collections::BTreeMap::<String, u64>::new();
+    for ((name, tid), bytes) in after {
+        let delta = bytes - before.get(&(name.clone(), *tid)).copied().unwrap_or(0);
+        if delta != 0 {
+            *by_name.entry(name.clone()).or_default() += delta;
+        }
+    }
+    json!(by_name)
+}
+fn owner_delta(
+    after: &[(PartitionStats, u64, u64)],
+    before: &[(PartitionStats, u64, u64)],
+) -> Value {
+    let sum = |field: fn(&(PartitionStats, u64, u64)) -> u64| -> u64 {
+        after
+            .iter()
+            .zip(before)
+            .map(|(a, b)| field(a) - field(b))
+            .sum()
+    };
+    json!({
+        "persistence_barriers": sum(|s| s.0.persistence_barriers),
+        "wal_file_syncs": sum(|s| s.0.wal_file_syncs),
+        "namespace_syncs": sum(|s| s.0.namespace_syncs),
+        "inventory_witnesses": sum(|s| s.0.inventory_witnesses),
+        "live_frontier_requests": sum(|s| s.0.live_frontier_requests),
+        "live_frontier_installs": sum(|s| s.0.live_frontier_installs),
+        "live_frontier_bytes": sum(|s| s.0.live_frontier_bytes),
+        "live_frontier_deferred": sum(|s| s.0.live_frontier_deferred),
+        "read_persist_requests": sum(|s| s.0.read_persist_requests),
+        "cold_grant_syncs": sum(|s| s.0.cold_grant_syncs),
+        "live_frontier_file_syncs": sum(|s| s.0.live_frontier_file_syncs),
+        "live_frontier_namespace_syncs": sum(|s| s.0.live_frontier_namespace_syncs),
+        "frontier_syncer_runs": sum(|s| s.1),
+        "frontier_sync_requests": sum(|s| s.2),
+    })
+}
+fn owner_sample(nodes: &[Arc<StorageNode>]) -> Vec<(PartitionStats, u64, u64)> {
+    nodes
+        .iter()
+        .map(|node| {
+            let log = node.log_for_test(1);
+            let frontier = log.frontier().map(|frontier| frontier.stats());
+            (
+                log.stats(),
+                frontier.map_or(0, |stats| stats.fsync_calls),
+                frontier.map_or(0, |stats| stats.flush_requests),
+            )
+        })
+        .collect()
+}
+fn pipeline_delta(after: PipelineStats, before: PipelineStats) -> Value {
+    json!({
+        "owner_drains": after.owner_drains - before.owner_drains,
+        "owner_drain_batches": after.owner_drain_batches - before.owner_drain_batches,
+        "owner_drain_stop_empty": after.owner_drain_stop_empty - before.owner_drain_stop_empty,
+        "owner_drain_stop_allocated": after.owner_drain_stop_allocated - before.owner_drain_stop_allocated,
+        "owner_drain_stop_fence": after.owner_drain_stop_fence - before.owner_drain_stop_fence,
+        "owner_drain_stop_limit": after.owner_drain_stop_limit - before.owner_drain_stop_limit,
+        "owner_drain_stop_credit": after.owner_drain_stop_credit - before.owner_drain_stop_credit,
+    })
+}
+
+/// One attribution case: two owners like the G35 fleet shape, leased writes to
+/// buffered local WAL files (`C-buf`) or the owner RPC route (`rpc`).
+#[allow(clippy::too_many_lines)]
+fn overhead_case(
+    probe: &DiskProbe,
+    arm: &str,
+    tier: DurabilityTier,
+    writers: usize,
+    calls: usize,
+    repetition: usize,
+    idle: Duration,
+) -> Value {
+    // `C-buf-pre` pre-writes (zero-fills and syncs) each WAL file before grant.
+    // A `-base` suffix selects the pre-change write path in this process.
+    let base = arm.ends_with("-base");
+    let arm_kind = arm.trim_end_matches("-base");
+    crate::distributed::storage::BASELINE_WRITE_PATH.store(base, Ordering::Relaxed);
+    let leased = arm_kind.starts_with("C-buf");
+    let prewrite = arm_kind == "C-buf-pre";
+    let mut fixture = super::pipeline_tests::Fixture::new_with_root(
+        tempdir::TempDir::new_in(CACHE, "write-overhead").unwrap(),
+        2,
+        calls + 8192,
+        KeyShape::new_single(32, 1, KeyType::uniform(1)),
+        32,
+        |config| {
+            config.max_pending_batches = 128;
+            config.max_pending_bytes = 64 * MIB;
+            config.max_index_bytes = 512 * MIB;
+            config.max_admitted_batches = calls + 8192;
+            config.owner_append_occupancy = 8;
+            config.read_cache_bytes = 0;
+            config.storage.batch_limits.max_operations = 32;
+            config.storage.batch_limits.max_encoded_bytes = 3 * MIB;
+            config.storage.group_limits.max_encoded_bytes = 4 * MIB - 8;
+            config.storage.fragment_bytes = 128 * MIB as u64;
+            config.storage.wal_file_bytes = 256 * MIB as u64;
+            config.storage.max_reference_metadata_bytes = 64 * MIB;
+            config.replay_limits = ReplayLimits {
+                max_batches: 4096,
+                max_encoded_bytes: 256 * MIB,
+            };
+            if leased {
+                let mut live = live_config(LiveWriteMode::Leased, tier);
+                live.leased_write_window = None;
+                live.leased_sync = LeasedSync::GroupFlush;
+                live.leased_flush_min_frame_bytes = 65536;
+                live.max_inflight_bytes = 16 * MIB;
+                config.live_nvme = Some(live);
+            }
+        },
+        |mut config| {
+            config.wal_prewrite = prewrite;
+            StorageNode::open(config, metrics()).unwrap()
+        },
+    );
+    if tier == DurabilityTier::Synchronous {
+        fixture = fixture.synchronous();
+    }
+    if leased {
+        for (owner, node) in fixture.nodes.iter().enumerate() {
+            let root = fixture.temp.path().join(format!("target-{owner}"));
+            let state_dir = root.join("state");
+            let configfs = root.join("configfs");
+            fs::create_dir_all(&state_dir).unwrap();
+            for name in ["hosts", "ports", "subsystems"] {
+                fs::create_dir_all(configfs.join(name)).unwrap();
+            }
+            node.bench_install_live_target(
+                LiveTargetManager::open_fixture(
+                    LiveTargetConfig {
+                        address: "127.0.0.1".into(),
+                        service: 4420 + owner as u16 * 2,
+                        transport: NvmeofTransport::Tcp,
+                        host_nqn: "nqn.2026-01.test:p11-bench".into(),
+                        port_id: 42 + owner as u16 * 2,
+                        state_dir,
+                        commissioning_port_id: 43 + owner as u16 * 2,
+                        commissioning_service: 4421 + owner as u16 * 2,
+                        spdk: None,
+                        export_mode: Default::default(),
+                    },
+                    configfs,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    let original = fixture.open();
+    let live = LiveNvmeMetrics::new();
+    if leased {
+        for worker in &original.core.clients {
+            let mut client = worker.client.lock();
+            client.bench_local_live_fixture(true);
+            client.set_live_metrics(live.clone()).unwrap();
+        }
+    }
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    let value: Bytes = vec![0x5a; 512].into();
+    let warmup = 4096;
+    write_phase(&db, writers, 0, warmup, &value);
+    // Background writes of other processes on the shared filesystem.
+    let idle_before = probe.sample();
+    thread::sleep(idle);
+    let idle_after = probe.sample();
+    let live_before = live.snapshot().counts;
+    let owners_before = owner_sample(&fixture.nodes);
+    let pipeline_before = db.pipeline_stats();
+    let threads_before = thread_writes();
+    let prewrite_bytes = || -> u64 {
+        fixture
+            .nodes
+            .iter()
+            .map(|node| {
+                node.log_for_test(1)
+                    .live_file_preparation_stats()
+                    .live_file_prewrite_bytes
+            })
+            .sum()
+    };
+    let prewrite_before = prewrite_bytes();
+    let disk_before = probe.sample();
+    let (samples, elapsed) = write_phase(&db, writers, warmup, calls, &value);
+    let disk_end = probe.sample();
+    let live_end = live.snapshot().counts;
+    let owners_end = owner_sample(&fixture.nodes);
+    let pipeline_end = db.pipeline_stats();
+    // Deferred background persistence and journal work after the API window.
+    thread::sleep(idle);
+    let disk_tail = probe.sample();
+    let threads_tail = thread_writes();
+    let owners_tail = owner_sample(&fixture.nodes);
+    let prewrite_in_window = prewrite_bytes() - prewrite_before;
+    // Second background sample after the case settled: the correction uses the
+    // lower of the two idle rates so a burst from another process cannot
+    // erase this case's own device bytes.
+    let settle_before = probe.sample();
+    thread::sleep(idle);
+    let settle_after = probe.sample();
+    let mut sorted = samples.clone();
+    sorted.sort_unstable();
+    let quantile =
+        |p: usize, scale: usize| sorted[(p * sorted.len()).div_ceil(scale) - 1] as f64 / 1000.0;
+    let payload = (calls * 512) as f64;
+    let idle_rate = ((idle_after[1] - idle_before[1]) as f64)
+        .min((settle_after[1] - settle_before[1]) as f64)
+        / idle.as_secs_f64();
+    let window = disk_delta(disk_end, disk_before);
+    let total = disk_delta(disk_tail, disk_before);
+    let live_delta = delta(live_end, live_before);
+    let wal = live_delta["completed_write_bytes"].as_u64().unwrap() as f64;
+    let corrected = |raw: &Value, seconds: f64| {
+        raw["device_write_bytes"].as_u64().unwrap() as f64 - idle_rate * seconds
+    };
+    let window_seconds = elapsed.as_secs_f64();
+    let total_seconds = window_seconds + idle.as_secs_f64();
+    let device_window = corrected(&window, window_seconds);
+    let device_total = corrected(&total, total_seconds);
+    let frames = live_delta["leased_frames"].as_u64().unwrap();
+    let ratio = |numerator: &str, denominator: &str| {
+        let d = live_delta[denominator].as_u64().unwrap();
+        if d == 0 {
+            Value::Null
+        } else {
+            json!(live_delta[numerator].as_u64().unwrap() as f64 / d as f64)
+        }
+    };
+    let row = json!({
+        "arm": arm, "tier": tier.to_string(), "writers": writers, "repetition": repetition,
+        "loadavg": fs::read_to_string("/proc/loadavg").unwrap().trim(),
+        "scope": "loaded laptop: rates and latencies indicative only",
+        "calls": calls, "value_bytes": 512, "owners": 2,
+        "elapsed_seconds": window_seconds, "puts_per_second": calls as f64 / window_seconds,
+        "p50_us": quantile(50, 100), "p99_us": quantile(99, 100), "p999_us": quantile(999, 1000),
+        "mean_api_inflight": samples.iter().map(|n| *n as f64).sum::<f64>() / elapsed.as_nanos() as f64,
+        "payload_bytes": calls * 512,
+        "wal_per_payload": wal / payload,
+        "device_per_payload_window": device_window / payload,
+        "device_per_payload_with_tail": device_total / payload,
+        // Physically the device cannot write less than the WAL bytes of the
+        // case: a lower corrected value means background noise was removed
+        // from it, so the device columns of this row are invalid.
+        "device_valid": device_total >= wal,
+        "residual_per_payload_with_tail": (device_total - wal) / payload,
+        "process_write_per_payload": window["process_write_bytes"].as_u64().unwrap() as f64 / payload,
+        "idle_device_bytes_per_second": idle_rate,
+        "batches_per_frame": ratio("leased_frame_batches", "leased_frames"),
+        "frames_per_submit_call": if frames == 0 { Value::Null } else { ratio("leased_frames", "write_submit_calls") },
+        "disk_window": window, "disk_with_tail": total,
+        "owner_window": owner_delta(&owners_end, &owners_before),
+        "owner_with_tail": owner_delta(&owners_tail, &owners_before),
+        "pipeline": pipeline_delta(pipeline_end, pipeline_before),
+        "live": live_delta,
+        "prewrite_bytes_with_tail": prewrite_in_window,
+        "thread_write_bytes_with_tail": thread_delta(&threads_tail, &threads_before),
+    });
+    println!(
+        "write_overhead {}",
+        json!({
+            "arm": arm, "tier": row["tier"], "writers": writers, "rep": repetition,
+            "puts_per_second": row["puts_per_second"], "p50_us": row["p50_us"], "p99_us": row["p99_us"],
+            "wal": row["wal_per_payload"], "device": row["device_per_payload_with_tail"],
+            "installs": row["owner_with_tail"]["live_frontier_installs"],
+        })
+    );
+    db.shutdown().unwrap();
+    row
+}
+
+#[test]
+#[ignore = "explicit release-only workstation write-overhead attribution; shared filesystem"]
+fn write_overhead_attribution() {
+    assert!(
+        !cfg!(debug_assertions),
+        "run this ignored measurement with --release"
+    );
+    let tiers = selection(
+        "TH_OVERHEAD_TIERS",
+        "synchronous,native",
+        &["native", "synchronous"],
+    );
+    let writers = selection("TH_OVERHEAD_WRITERS", "16,64,256", &["16", "64", "256"]);
+    let arms = selection(
+        "TH_OVERHEAD_ARMS",
+        "C-buf-base,C-buf,C-buf-pre-base,C-buf-pre",
+        &["C-buf", "C-buf-pre", "C-buf-base", "C-buf-pre-base", "rpc"],
+    );
+    let setting = |name: &str, default: usize| {
+        std::env::var(name)
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(default)
+    };
+    let sync_calls = setting("TH_OVERHEAD_SYNC_CALLS", 8192);
+    let native_calls = setting("TH_OVERHEAD_NATIVE_CALLS", 65536);
+    let repetitions = setting("TH_OVERHEAD_REPETITIONS", 3);
+    let idle = Duration::from_millis(setting("TH_OVERHEAD_IDLE_MS", 2000) as u64);
+    assert!(
+        [sync_calls, native_calls]
+            .iter()
+            .all(|calls| (1024..=1 << 20).contains(calls))
+            && (1..=20).contains(&repetitions)
+    );
+    let label = std::env::var("TH_OVERHEAD_LABEL").unwrap_or_else(|_| "run".into());
+    let output = PathBuf::from(OUTPUT).join(format!("overhead-{label}-{}", std::process::id()));
+    fs::create_dir_all(&output).unwrap();
+    fs::create_dir_all(CACHE).unwrap();
+    let probe = DiskProbe::new(Path::new(CACHE));
+    let environment = environment(Path::new(CACHE));
+    let mut rows = Vec::new();
+    for repetition in 1..=repetitions {
+        for tier in [DurabilityTier::Synchronous, DurabilityTier::Native]
+            .into_iter()
+            .filter(|tier| tiers.contains(&tier.to_string()))
+        {
+            let mut order: Vec<_> = writers
+                .iter()
+                .map(|n| n.parse::<usize>().unwrap())
+                .collect();
+            if repetition % 2 == 0 {
+                order.reverse();
+            }
+            for &writer_count in &order {
+                for arm in &arms {
+                    rows.push(overhead_case(
+                        &probe,
+                        arm,
+                        tier,
+                        writer_count,
+                        if tier == DurabilityTier::Synchronous {
+                            sync_calls
+                        } else {
+                            native_calls
+                        },
+                        repetition,
+                        idle,
+                    ));
+                    fs::write(
+                        output.join("results.json"),
+                        serde_json::to_vec_pretty(
+                            &json!({"environment": environment, "rows": rows}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+    println!("write_overhead output: {}", output.display());
+}
+
+/// Owner rule for packing: a lone READY batch with an empty owner queue is
+/// submitted at once, alone in its padded frame. The write completes with no
+/// other caller, and exactly one frame carrying one batch was released.
+#[test]
+fn lone_batch_with_empty_queue_is_submitted_without_waiting() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let mut fixture = super::pipeline_tests::Fixture::new_with_root(
+            tempdir::TempDir::new("lone-batch").unwrap(),
+            1,
+            64,
+            KeyShape::new_single(32, 1, KeyType::uniform(1)),
+            32,
+            |config| {
+                config.storage.batch_limits.max_encoded_bytes = 128 * 1024;
+                config.storage.group_limits.max_encoded_bytes = 2 * MIB;
+                config.storage.fragment_bytes = 8 * MIB as u64;
+                config.storage.wal_file_bytes = 16 * MIB as u64;
+                let mut live = live_config(LiveWriteMode::Leased, tier);
+                live.leased_write_window = None;
+                live.leased_sync = LeasedSync::GroupFlush;
+                live.leased_flush_min_frame_bytes = 65536;
+                live.max_inflight_bytes = 16 * MIB;
+                config.live_nvme = Some(live);
+                config.max_pending_bytes = 64 * MIB;
+                // Reads must reach the owner path, not a coordinator cache.
+                config.read_cache_bytes = 0;
+            },
+            |config| StorageNode::open(config, metrics()).unwrap(),
+        );
+        if tier == DurabilityTier::Synchronous {
+            fixture = fixture.synchronous();
+        }
+        let root = fixture.temp.path().join("target");
+        fs::create_dir_all(root.join("state")).unwrap();
+        for name in ["hosts", "ports", "subsystems"] {
+            fs::create_dir_all(root.join("configfs").join(name)).unwrap();
+        }
+        fixture.nodes[0].bench_install_live_target(
+            LiveTargetManager::open_fixture(
+                LiveTargetConfig {
+                    address: "127.0.0.1".into(),
+                    service: 4420,
+                    transport: NvmeofTransport::Tcp,
+                    host_nqn: "nqn.2026-01.test:p11-bench".into(),
+                    port_id: 42,
+                    state_dir: root.join("state"),
+                    commissioning_port_id: 43,
+                    commissioning_service: 4421,
+                    spdk: None,
+                    export_mode: Default::default(),
+                },
+                root.join("configfs"),
+            )
+            .unwrap(),
+        );
+        let original = fixture.open();
+        let live = LiveNvmeMetrics::new();
+        for worker in &original.core.clients {
+            let mut client = worker.client.lock();
+            client.bench_local_live_fixture(true);
+            client.set_live_metrics(live.clone()).unwrap();
+        }
+        let db = ConcurrentRemoteDatabase::new(original).unwrap();
+        let value: Bytes = vec![0x5a; 512].into();
+        db.write_batch(operation(0), vec![put(0, &value)]).unwrap();
+        let counts = live.snapshot().counts;
+        assert_eq!(counts.leased_frames, 1, "{tier}");
+        assert_eq!(counts.leased_frame_batches, 1, "{tier}");
+        assert_eq!(counts.leased_deferred_submits, 0, "{tier}");
+        assert_eq!(
+            counts.fua_writes,
+            u64::from(tier == DurabilityTier::Synchronous),
+            "{tier}"
+        );
+        // Immediate read of the newest batch. With no per-adoption sync, a
+        // synchronous owner read of it persists on demand before serving.
+        assert_eq!(
+            db.get(KeySpace(0), &key(0)).unwrap(),
+            Some(value.clone()),
+            "{tier}"
+        );
+        db.shutdown().unwrap();
+    }
+}

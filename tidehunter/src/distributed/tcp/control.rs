@@ -316,7 +316,14 @@ impl Shared {
         report
             .into_synced()
             .map(|_| ())
-            .map_err(|error| TcpError::new(format!("log frontier flush failed: {error}")))
+            .map_err(|error| TcpError::new(format!("log frontier flush failed: {error}")))?;
+        // An explicit flush also catches up a live root the syncer deferred.
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        for log in &logs {
+            log.persist_live_root()
+                .map_err(|error| TcpError::new(format!("live root flush failed: {error}")))?;
+        }
+        Ok(())
     }
 
     /// Called only by an exclusive, validated live fence after target revocation.
@@ -346,7 +353,11 @@ impl Shared {
                 .map(|index| slots.swap_remove(index))
         };
         if let Some(SyncerSlot { log, syncer }) = slot {
-            let result = syncer.shutdown();
+            let result = syncer.shutdown().map_err(|error| error.to_string());
+            // Fence and retirement also catch up a deferred live root.
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let result =
+                result.and_then(|()| log.persist_live_root().map_err(|error| error.to_string()));
             drop(log);
             result.map_err(|error| {
                 self.context.poison_readers();
@@ -697,6 +708,19 @@ impl Drop for ControlOwner {
         {
             self.shared.context.poison_readers();
         }
+        // Shutdown drains each syncer, then catches up a deferred live root.
+        // The registry lock is released before any join or file sync.
+        let syncers = std::mem::take(&mut *self.shared.syncers.lock());
+        for SyncerSlot { log, syncer } in syncers {
+            let drained = syncer.shutdown().is_ok();
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let drained = drained && log.persist_live_root().is_ok();
+            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+            let _ = log;
+            if !drained {
+                self.shared.context.poison_readers();
+            }
+        }
     }
 }
 
@@ -1037,9 +1061,17 @@ fn run(shared: &Shared) {
                     {
                         shared.trigger_file_preparation(&log);
                     }
-                    // Native keeps its fragment-boundary/on-demand policy;
-                    // only synchronous adoption requests a per-prefix root sync.
-                    if adoption && (tier == DurabilityTier::Synchronous || closes_extent) {
+                    // Neither tier requests a per-frame sync on adoption.
+                    // Synchronous frames are already FUA- or flush-covered
+                    // before acknowledgement; synchronous owner reads of a
+                    // newer batch persist on demand. Extent close requests the
+                    // fragment-boundary sync (and root install) in both tiers.
+                    // The test-only baseline arm restores the pre-change
+                    // per-adoption synchronous sync request for measurement.
+                    let baseline = tier == DurabilityTier::Synchronous
+                        && crate::distributed::storage::baseline_write_path();
+                    if adoption && (closes_extent || baseline) {
+                        log.note_live_frontier_request();
                         frontier.request_sync().map_err(TcpError::component)?;
                     }
                     Ok(reply)
@@ -3297,6 +3329,9 @@ impl ControlContext {
                     metadata: stats.reference_metadata_bytes,
                 })
             }
+            Request::PartitionStats => Ok(Response::PartitionStats(Box::new(
+                self.inventory.lock().stats()?,
+            ))),
             Request::Stats => {
                 let stats = self.inventory.lock().stats()?;
                 Ok(Response::Stats {

@@ -1032,6 +1032,15 @@ pub struct PipelineStats {
     pub concurrent_pending_peak: usize,
     pub concurrent_queued_peak: usize,
     pub concurrent_queue_bytes_peak: usize,
+    /// Owner-worker drains that took a batch or stopped at a nonempty head,
+    /// the batches they took, and why each stopped.
+    pub owner_drains: u64,
+    pub owner_drain_batches: u64,
+    pub owner_drain_stop_empty: u64,
+    pub owner_drain_stop_allocated: u64,
+    pub owner_drain_stop_fence: u64,
+    pub owner_drain_stop_limit: u64,
+    pub owner_drain_stop_credit: u64,
 }
 
 /// Monotonic diagnostic spans. Background checkpoint lifetimes overlap foreground
@@ -2826,6 +2835,13 @@ impl RemoteDatabase {
             total.inventory_witnesses += stats.inventory_witnesses;
             total.live_frontier_file_syncs += stats.live_frontier_file_syncs;
             total.live_frontier_namespace_syncs += stats.live_frontier_namespace_syncs;
+            total.wal_file_syncs += stats.wal_file_syncs;
+            total.live_frontier_requests += stats.live_frontier_requests;
+            total.live_frontier_installs += stats.live_frontier_installs;
+            total.live_frontier_bytes += stats.live_frontier_bytes;
+            total.live_frontier_deferred += stats.live_frontier_deferred;
+            total.read_persist_requests += stats.read_persist_requests;
+            total.cold_grant_syncs += stats.cold_grant_syncs;
             total.registered_records += stats.registered_records;
             total.reference_metadata_bytes += stats.reference_metadata_bytes;
         }

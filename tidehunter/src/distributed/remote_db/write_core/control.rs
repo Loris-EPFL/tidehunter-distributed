@@ -2,6 +2,7 @@ use super::super::{
     AuthorityWriteStats, CheckpointDiagnosticSummary, LocalDbError, LocalDbStats, PipelineStats,
     WriteProfileSnapshot, elapsed, failure_context, receive, transports,
 };
+use super::completion::DrainStop;
 use super::core::WriteCore;
 use std::collections::VecDeque;
 use std::sync::{Arc, atomic::Ordering};
@@ -93,6 +94,18 @@ impl WriteCore {
             .iter()
             .map(|worker| worker.accounting.formed.load(Ordering::Relaxed))
             .sum();
+        for worker in &self.clients {
+            let accounting = &worker.accounting;
+            let stop =
+                |reason: DrainStop| accounting.drain_stops[reason as usize].load(Ordering::Relaxed);
+            stats.owner_drains += accounting.drains.load(Ordering::Relaxed);
+            stats.owner_drain_batches += accounting.drain_batches.load(Ordering::Relaxed);
+            stats.owner_drain_stop_empty += stop(DrainStop::Empty);
+            stats.owner_drain_stop_allocated += stop(DrainStop::Allocated);
+            stats.owner_drain_stop_fence += stop(DrainStop::Fence);
+            stats.owner_drain_stop_limit += stop(DrainStop::Limit);
+            stats.owner_drain_stop_credit += stop(DrainStop::Credit);
+        }
         stats
     }
 

@@ -274,6 +274,7 @@ pub async fn run<B: KvBackend>(
         }
         if fatal_reason.is_none() {
             measurement_attempted = true;
+            backend.set_measurement_window(true);
             reporter.set_phase("measurement");
             let phase_result = if config.execution.mode == ExecutionMode::Interference {
                 let (result, phase_result) = run_interference_phase(
@@ -310,6 +311,8 @@ pub async fn run<B: KvBackend>(
                 )
                 .await
             };
+            // Close before the end boundary, also when the phase failed.
+            backend.set_measurement_window(false);
             measurement_drained = phase_result.is_ok();
             if let Err(error) = phase_result {
                 failed = true;
@@ -1101,6 +1104,20 @@ pub(crate) fn measurement_read_evidence(
                 "grant_misses",
                 "grant_evictions",
                 "copy_bytes_avoided",
+                "leased_frame_batches",
+                "write_submit_calls",
+                "owner_drains",
+                "owner_drain_batches",
+                "owner_drain_stop_empty",
+                "owner_drain_stop_allocated",
+                "owner_drain_stop_fence",
+                "owner_drain_stop_limit",
+                "owner_drain_stop_credit",
+                "leased_submit_ready_left",
+                "leased_submit_ready_left_batches",
+                "leased_submit_ready_left_full",
+                "leased_submit_ready_left_full_batches",
+                "leased_deferred_submits",
                 "reserve_exchanges",
                 "complete_exchanges",
                 "lease_exchanges",
@@ -6999,6 +7016,20 @@ mod tests {
             "grant_misses",
             "grant_evictions",
             "copy_bytes_avoided",
+            "leased_frame_batches",
+            "write_submit_calls",
+            "owner_drains",
+            "owner_drain_batches",
+            "owner_drain_stop_empty",
+            "owner_drain_stop_allocated",
+            "owner_drain_stop_fence",
+            "owner_drain_stop_limit",
+            "owner_drain_stop_credit",
+            "leased_submit_ready_left",
+            "leased_submit_ready_left_batches",
+            "leased_submit_ready_left_full",
+            "leased_submit_ready_left_full_batches",
+            "leased_deferred_submits",
             "reserve_exchanges",
             "complete_exchanges",
             "lease_exchanges",

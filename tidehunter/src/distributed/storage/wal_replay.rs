@@ -799,6 +799,8 @@ impl PartitionLog {
                 last_live_complete: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                live_root_end: 0,
                 writer: None,
                 wal_root: Some(root.clone()),
                 references: reference_writer,

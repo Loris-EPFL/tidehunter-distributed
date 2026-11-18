@@ -711,7 +711,31 @@ fn coordinator_interval_delta(
     Ok(deltas)
 }
 
+/// Owner persistence counters are sampled only at drained measurement
+/// boundaries: each sample is an owner control that fences the append stream
+/// and runs a flush barrier, so a sample inside the window would perturb it.
+#[derive(Default)]
+struct OwnerSampleGate {
+    measuring: std::sync::atomic::AtomicBool,
+}
+
+impl OwnerSampleGate {
+    fn set_measuring(&self, open: bool) {
+        // SeqCst: the runner's boundary calls are sequential; no data rides on it.
+        self.measuring
+            .store(open, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn sample<T>(&self, sample: impl FnOnce() -> T) -> Result<T, String> {
+        if self.measuring.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("owner sample refused inside the measurement window".to_owned());
+        }
+        Ok(sample())
+    }
+}
+
 pub struct TidehunterBackend {
+    owner_sample_gate: OwnerSampleGate,
     db: Option<std::sync::Arc<sui::Db>>,
     keyspace: tidehunter::key_shape::KeySpace,
     cluster: std::sync::Mutex<Option<tcp_cluster::LoopbackCluster>>,
@@ -1416,6 +1440,7 @@ async fn open_with_shape(
         effective_configuration,
         operational_read_io,
         read_evidence_written: false,
+        owner_sample_gate: OwnerSampleGate::default(),
         coordinator_interval_baseline: std::sync::Mutex::new(None),
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         live_write_profile: std::sync::Mutex::new(None),
@@ -1607,6 +1632,10 @@ impl KvBackend for TidehunterBackend {
         )
     }
 
+    fn set_measurement_window(&self, open: bool) {
+        self.owner_sample_gate.set_measuring(open);
+    }
+
     fn read_observation(&self) -> BackendResult<serde_json::Value> {
         let db = self.db.as_ref().ok_or("backend is shutting down")?;
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
@@ -1658,10 +1687,34 @@ impl KvBackend for TidehunterBackend {
                 }
             });
         }
+        let owner_storage = match self
+            .owner_sample_gate
+            .sample(|| db.owner_storage_stats())
+            .and_then(|stats| stats.map_err(|error| format!("{error:?}")))
+        {
+            Ok(Some(stats)) => serde_json::json!({
+                "available": true,
+                "persistence_barriers": stats.persistence_barriers,
+                "wal_file_syncs": stats.wal_file_syncs,
+                "namespace_syncs": stats.namespace_syncs,
+                "inventory_witnesses": stats.inventory_witnesses,
+                "live_frontier_requests": stats.live_frontier_requests,
+                "live_frontier_installs": stats.live_frontier_installs,
+                "live_frontier_bytes": stats.live_frontier_bytes,
+                "live_frontier_deferred": stats.live_frontier_deferred,
+                "read_persist_requests": stats.read_persist_requests,
+                "cold_grant_syncs": stats.cold_grant_syncs,
+                "live_frontier_file_syncs": stats.live_frontier_file_syncs,
+                "live_frontier_namespace_syncs": stats.live_frontier_namespace_syncs,
+                "scope": "summed over owners; latest epoch handle; cumulative",
+            }),
+            Ok(None) => serde_json::json!({"available": false, "reason": "native backend"}),
+            Err(error) => serde_json::json!({"available": false, "error": error}),
+        };
         let Some(monitor) = db.read_evidence_monitor() else {
             return Ok(
                 serde_json::json!({"available": true, "coordinator": coordinator,
-                "nvmeof": nvmeof, "live_nvmeof": live_nvmeof,
+                "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "owner_storage": owner_storage,
                 "owner_executor": {"available": false, "error": "read evidence monitor unavailable"}}),
             );
         };
@@ -1672,7 +1725,7 @@ impl KvBackend for TidehunterBackend {
         Ok(
             serde_json::json!({"available": true, "coordinator": coordinator,
             "owner_executor": owners,
-            "nvmeof": nvmeof, "live_nvmeof": live_nvmeof}),
+            "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "owner_storage": owner_storage}),
         )
     }
 
@@ -2350,6 +2403,20 @@ impl Drop for TidehunterBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner storage samples run only at drained boundaries: inside the
+    /// measurement window the gate refuses without calling the owner.
+    #[test]
+    fn owner_sample_never_runs_inside_the_measurement_window() {
+        let gate = OwnerSampleGate::default();
+        assert_eq!(gate.sample(|| 1), Ok(1));
+        gate.set_measuring(true);
+        let mut called = false;
+        assert!(gate.sample(|| called = true).is_err());
+        assert!(!called);
+        gate.set_measuring(false);
+        assert_eq!(gate.sample(|| 2), Ok(2));
+    }
 
     #[test]
     fn owner_read_configuration_rejects_retired_value_cache_and_grants() {

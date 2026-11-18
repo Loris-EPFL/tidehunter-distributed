@@ -2237,15 +2237,10 @@ mod live_fencing {
             assert_eq!(reply.adoption.receipt_count, 1);
             assert_eq!(reply.adoption.token, leased.extent.token);
             assert!(reply.next.is_none());
-            if tier == DurabilityTier::Synchronous {
-                entered.recv_timeout(Duration::from_secs(5)).unwrap();
-                assert_eq!(log.frontier().unwrap().stats().flush_requests, 1);
-                assert_eq!(log.synced_frontier(), 0);
-                resume.send(()).unwrap();
-            } else {
-                assert_eq!(log.frontier().unwrap().stats().flush_requests, 0);
-                assert_eq!(log.stats().persistence_barriers, 0);
-            }
+            // Neither tier requests a sync per adoption: synchronous frames are
+            // FUA- or flush-covered before acknowledgement.
+            assert_eq!(log.frontier().unwrap().stats().flush_requests, 0);
+            assert_eq!(log.stats().persistence_barriers, 0);
             let mut skip = [0; 4096];
             skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
             fs::OpenOptions::new()
@@ -2270,12 +2265,11 @@ mod live_fencing {
             let next = closed.next.unwrap();
             assert_eq!(next.extent.start, leased.extent.end);
             assert_eq!(next.tier, tier);
-            if tier == DurabilityTier::Native {
-                entered.recv_timeout(Duration::from_secs(5)).unwrap();
-                assert_eq!(log.frontier().unwrap().stats().flush_requests, 1);
-                assert_eq!(log.synced_frontier(), 0);
-                resume.send(()).unwrap();
-            }
+            // Extent close requests the fragment-boundary sync in both tiers.
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(log.frontier().unwrap().stats().flush_requests, 1);
+            assert_eq!(log.synced_frontier(), 0);
+            resume.send(()).unwrap();
             drop(log);
             shutdown(&node, 1);
         }
