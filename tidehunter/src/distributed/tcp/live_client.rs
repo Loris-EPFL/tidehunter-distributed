@@ -5729,6 +5729,13 @@ impl super::Client {
     pub(crate) fn leased_test_release_held(&mut self) {
         self.live_writer.as_mut().unwrap().io.release_held();
     }
+    /// Write CQEs the queue has reaped, held ones included. Published
+    /// counters advance only when a completion is delivered.
+    pub(crate) fn leased_test_reaped_writes(&self) -> u64 {
+        self.live_writer
+            .as_ref()
+            .map_or(0, |writer| writer.io.stats().completed_write_ops)
+    }
     pub(crate) fn leased_test_fail_flight(&mut self, id: u64, result: i32) {
         self.live_writer
             .as_mut()
