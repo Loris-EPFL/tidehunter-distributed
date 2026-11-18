@@ -81,6 +81,9 @@ class FioFailure(RuntimeError):
 
 def core_workload_failure(result, manifest, status, gate_released, completion_observed):
     """Describe the first recorded unsuccessful sample, not a later drain error."""
+    qualification_failure = manifest.get("run", {}).get("qualification_failure")
+    if qualification_failure:
+        return "core workload qualification failed: " + str(qualification_failure)
     if manifest["status"] == "failed":
         with (result / "samples.csv").open(newline="") as samples:
             for row in csv.DictReader(samples):
@@ -781,6 +784,10 @@ def read_only_snapshot(request):
 
 class DeadlineError(InfrastructureError):
     pass
+
+
+class CampaignTimeLimit(DeadlineError):
+    """Normal scheduling exhaustion, not an infrastructure failure."""
 
 
 def utc():
@@ -3147,6 +3154,16 @@ class Controller:
             raise DeadlineError("absolute deadline/export reserve reached")
         return remaining
 
+    def client_runtime_seconds(self, limit, *, minimum=1):
+        try:
+            available = self.remaining()
+        except DeadlineError as exc:
+            raise CampaignTimeLimit("campaign time limit reached") from exc
+        seconds = min(limit, int(available))
+        if seconds < minimum:
+            raise CampaignTimeLimit("campaign time limit reached")
+        return seconds
+
     def guard(self, *, terminating=False, starting=False):
         if self.local_mode is not None:
             return self.local_mode.guard()
@@ -4928,7 +4945,9 @@ class Controller:
             client_deadline = (job["measurement_sizing"]["case_deadline_seconds"]
                                if job.get("selection") in cloud_campaign.M3_SELECTIONS
                                else self.config["spec"]["case_deadline_seconds"])
-            seconds = min(client_deadline, int(self.remaining()))
+            minimum_deadline = (job["interference"]["duration_seconds"] + 1
+                                if job.get("case_kind") == "interference" else 1)
+            seconds = self.client_runtime_seconds(client_deadline, minimum=minimum_deadline)
             config = cloud_campaign.make_run_config(job, directory, options, self.config["source_revision"], seconds)
             apply_case_namespace(config, job, self.config["prefix"])
             if backend == "native" and "sealed_dataset" in job:
@@ -4982,7 +5001,8 @@ class Controller:
                         "preload_recipe": shared["prepared"]["preload_recipe"],
                         "preload_batch_max_members": shared["prepared"]["preload_batch_max_members"],
                         "database": shared["prepared"]["database"]}
-            config["limits"]["deadline_seconds"] = min(config["limits"]["deadline_seconds"], int(self.remaining()))
+            config["limits"]["deadline_seconds"] = self.client_runtime_seconds(
+                config["limits"]["deadline_seconds"], minimum=minimum_deadline)
             (dump_compact if backend in cloud_campaign.NVME_BACKENDS else dump)(directory / "config.json", config)
             try:
                 admission_timeout = min(120 if backend in cloud_campaign.NVME_BACKENDS else 30, self.remaining())
@@ -5009,7 +5029,8 @@ class Controller:
                         case=job["case_id"], timeout=60)
                 except Exception as exc:
                     receipt["live_block_trace_start"] = {"available": False, "reason": repr(exc)}
-            seconds = min(config["limits"]["deadline_seconds"] + 30, int(self.remaining()))
+            seconds = self.client_runtime_seconds(
+                config["limits"]["deadline_seconds"] + 30, minimum=minimum_deadline)
             self.guard()
             # Record possible ownership before the systemd request: a timeout
             # may have started the service despite losing the response.
@@ -5302,6 +5323,8 @@ class Controller:
                         + "; ".join(window_qualification["reasons"])]))
             core_error = core_workload_failure(directory / "result", manifest, status, gate_released, completion_observed)
             if core_error is not None:
+                if manifest.get("run", {}).get("qualification_failure"):
+                    raise InfrastructureError(core_error)
                 raise RuntimeError(core_error)
             if qualification_error is not None:
                 raise RuntimeError(qualification_error)
@@ -5366,9 +5389,10 @@ class Controller:
             if primary and primary not in str(exc):
                 receipt["secondary_error"] = type(exc).__name__ + ": " + str(exc)
                 failure = (InfrastructureError(primary + "; secondary failure: " + str(exc))
-                           if isinstance(exc, (SafetyError, InfrastructureError, OSError, subprocess.TimeoutExpired))
+                           if failed_manifest.get("run", {}).get("qualification_failure")
+                           or isinstance(exc, (SafetyError, InfrastructureError, OSError, subprocess.TimeoutExpired))
                            else RuntimeError(primary))
-                receipt["error"] = "RuntimeError: " + primary
+                receipt["error"] = type(failure).__name__ + ": " + primary
             else:
                 failure = exc
                 receipt["error"] = type(exc).__name__ + ": " + str(exc)
@@ -5576,7 +5600,7 @@ class Controller:
             receipt["artifacts_sha256"] = {name: digest(directory / "result" / name)
                 for name in RAW_FILES if (directory / "result" / name).is_file()}
             if failure:
-                receipt["status"] = "failed"
+                receipt["status"] = "not_started" if isinstance(failure, CampaignTimeLimit) and not started else "failed"
                 receipt.setdefault("error", type(failure).__name__ + ": " + str(failure))
             receipt["monitoring"] = {"attempted": self.monitoring_attempted,
                 "host_case_scope": "selection begins at premeasurement gate; retained until next gate selection (may include cleanup/next preload)",
@@ -5694,6 +5718,7 @@ class Controller:
         case_finalization_error = None
         export_error = None
         report = {"complete": False}
+        time_limit_reached = False
         try:
             self.bootstrap()
             jobs = controller_matrix(self.config["spec"])
@@ -5719,7 +5744,7 @@ class Controller:
                     raise InfrastructureError("trace capability probe teardown unconfirmed")
             active_block = None
             for position, job in enumerate(jobs):
-                self.remaining()
+                self.client_runtime_seconds(self.config["spec"]["case_deadline_seconds"])
                 if not self.monitoring_complete:
                     raise InfrastructureError("monitoring failed; refusing the next benchmark case")
                 backend = job["backend"]
@@ -5757,6 +5782,11 @@ class Controller:
                         if not case_failed:
                             raise
                         case_finalization_error = type(exc).__name__ + ": " + str(exc)
+        except CampaignTimeLimit:
+            time_limit_reached = True
+            self.persist("campaign-outcome.json", {"outcome": "campaign time limit reached"})
+            if case_finalization_error:
+                error = "case finalization: " + case_finalization_error
         except BaseException as exc:
             error = type(exc).__name__ + ": " + str(exc)
             if case_finalization_error:
@@ -5785,7 +5815,7 @@ class Controller:
                 if self.root_owned:
                     name = "lifecycle-owner.json" if termination.get("external_lifecycle_owner") else "termination-request.json"
                     dump(self.root / name, termination)
-        if error or export_error or not report.get("complete"):
+        if error or export_error or (not report.get("complete") and not time_limit_reached):
             raise InfrastructureError(json.dumps({"controller_error": error, "export_error": export_error,
                                                   "complete": report.get("complete", False)}))
         return report
