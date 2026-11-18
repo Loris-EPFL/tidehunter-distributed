@@ -12,6 +12,10 @@ pub(in crate::distributed::remote_db) struct WorkerPolicy {
     pub max_pending_batches: usize,
     pub append_occupancy: usize,
     pub append_bytes: AppendByteBudget,
+    /// `RemoteDatabaseConfig::leased_submit_redrain`; only leased live writes
+    /// have the pre-submit re-drain.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub leased_submit_redrain: bool,
 }
 
 impl WorkerPolicy {
@@ -19,6 +23,7 @@ impl WorkerPolicy {
         storage: PartitionConfig,
         max_pending_batches: usize,
         append_occupancy: usize,
+        leased_submit_redrain: bool,
     ) -> Result<Self, LocalDbError> {
         let largest_charge = storage
             .group_limits
@@ -31,11 +36,15 @@ impl WorkerPolicy {
             largest_charge,
         )
         .map_err(LocalDbError::new)?;
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        let _ = leased_submit_redrain;
         Ok(Self {
             storage,
             max_pending_batches,
             append_occupancy,
             append_bytes,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            leased_submit_redrain,
         })
     }
 }

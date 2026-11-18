@@ -63,6 +63,16 @@ observed peak. The workstation fixture accepts `TH_TAIL_LEASED_WINDOW=none`
 or an integer; absent means none. Owner event `*_end` marks span exit,
 including failure, and does not by itself prove success.
 
+Before each leased frame submission, the owner worker polls its owner queue
+again and merges groups that became READY after the drain at the top of its
+turn (pre-submit re-drain). `RemoteDatabaseConfig::leased_submit_redrain`
+(`external_remote_config.leased_submit_redrain`; absent means `true`) selects
+it. `false` keeps only the top-of-turn drain and changes nothing else; it is
+an A/B control and is valid only with `live_nvme.write_mode: leased`. It is a
+runtime setting, not part of the authority manifest. Effective configuration
+reports it as `client.leased_submit_redrain`. Unknown keys inside
+`external_remote_config` are ignored, so check that value for every case.
+
 
 ### Security parity and the trusted TCP mode
 

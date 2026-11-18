@@ -487,6 +487,7 @@ impl ClientWorker {
                     {
                         let epoch = *epoch;
                         if client.live_leased_mode()
+                            && policy.leased_submit_redrain
                             && !crate::distributed::storage::baseline_write_path()
                         {
                             // Last-moment merge: take groups that became READY
@@ -495,7 +496,8 @@ impl ClientWorker {
                             // every control sent before it are captured
                             // together, so a newer entry can never pass a
                             // control. An empty or ALLOCATED head ends it at
-                            // once; a lone batch is never held back.
+                            // once; a lone batch is never held back. Disabled,
+                            // the frame carries only the top-of-turn drain.
                             let (fresh, closed) = receiver.poll(
                                 &worker_queue,
                                 queue_capacity.saturating_sub(queued.len() + controls.len()),

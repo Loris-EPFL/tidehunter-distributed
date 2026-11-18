@@ -1276,6 +1276,7 @@ async fn open_with_shape(
             "replay_limits": remote_config.replay_limits,
             "owner_append_occupancy": remote_config.owner_append_occupancy,
             "pipelined_writes": remote_config.pipelined_writes,
+            "leased_submit_redrain": remote_config.leased_submit_redrain,
             "read_cache_bytes": remote_config.read_cache_bytes,
             "read_memory_allowance_bytes": remote_config.read_memory_allowance_bytes,
             "scan_prefetch_pages": remote_config.scan_prefetch_pages,

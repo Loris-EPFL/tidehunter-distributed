@@ -162,6 +162,7 @@ impl Fixture {
             replay_limits,
             owner_append_occupancy: 16,
             pipelined_writes: true,
+            leased_submit_redrain: true,
             read_cache_bytes: 0,
             read_memory_allowance_bytes: 128 * MIB,
             scan_prefetch_pages: 1,
@@ -364,6 +365,50 @@ fn pin_read_lanes_defaults_off_and_validates_queue_count() {
     fixture.config.validate().unwrap();
     fixture.config.read_lanes = Some(2);
     assert!(fixture.config.validate().is_err());
+}
+
+#[test]
+fn leased_submit_redrain_defaults_on_and_is_valid_off_only_for_leased_writes() {
+    let base = tempdir::TempDir::new("leased-submit-redrain").unwrap();
+    let mut fixture = Fixture::new(base.path(), "config", DurabilityTier::Synchronous, "A");
+    // Absent means on, and on is not serialized: documents are unchanged.
+    let serialized = serde_json::to_value(&fixture.config).unwrap();
+    assert!(serialized.get("leased_submit_redrain").is_none());
+    let legacy: RemoteDatabaseConfig = serde_json::from_value(serialized.clone()).unwrap();
+    assert!(legacy.leased_submit_redrain);
+    let mut off = serialized;
+    off["leased_submit_redrain"] = false.into();
+    let off: RemoteDatabaseConfig = serde_json::from_value(off).unwrap();
+    assert!(!off.leased_submit_redrain);
+    assert_eq!(
+        serde_json::to_value(&off).unwrap()["leased_submit_redrain"],
+        false
+    );
+    fixture.config.leased_submit_redrain = false;
+    for live_nvme in [
+        None,
+        Some(live_config(
+            LiveWriteMode::Reserved,
+            DurabilityTier::Synchronous,
+        )),
+    ] {
+        fixture.config.live_nvme = live_nvme;
+        assert!(
+            fixture
+                .config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("leased_submit_redrain=false requires live_nvme.write_mode=leased")
+        );
+    }
+    fixture.config.live_nvme = Some(live_config(
+        LiveWriteMode::Leased,
+        DurabilityTier::Synchronous,
+    ));
+    fixture.config.validate().unwrap();
+    fixture.config.leased_submit_redrain = true;
+    fixture.config.validate().unwrap();
 }
 
 #[test]
