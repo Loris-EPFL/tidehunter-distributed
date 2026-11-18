@@ -301,7 +301,12 @@ pub enum PollingPolicy {
 /// The 3 s allowance adds about 30% to the measured 2.308668 s contended fsync.
 /// This is not a completion bound for sealing arbitrarily many retained files
 /// or revoking many exports. Larger explicitly configured timeouts still apply.
-/// Data requests, including read/write grants and position proofs, do not use it.
+/// A live export creation (13 target-registry saves, 26 fsyncs, plus the
+/// commissioning connection) is a lifecycle operation, so every request that
+/// may create one inline also uses it: a group reservation, a lease, live
+/// record resolution, prelease, and an adoption that leases the next extent.
+/// `StorageNode::live_inline_export_stats` counts how often each one did.
+/// Other data requests, including position proofs, do not use it.
 pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(34_500);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -750,9 +755,10 @@ enum Request {
     ReadRamProbe,
 }
 impl Request {
-    /// Startup/recovery negotiation and durable epoch/retirement maintenance
-    /// have a different contract from data-path control messages. In particular,
-    /// a grant, adoption or position proof must not extend its caller's data SLA.
+    /// Startup/recovery negotiation, durable epoch/retirement maintenance and
+    /// live export creation have a different contract from data-path control
+    /// messages. A position proof must not extend its caller's data SLA. Client
+    /// and owner both derive their deadline from this method.
     fn timeout(&self, data_timeout: Duration) -> Duration {
         let lifecycle = match self {
             Self::Checkpoint { .. }
@@ -781,7 +787,17 @@ impl Request {
             Self::RecoverLiveMetadata { .. }
             | Self::ShutdownLiveTarget { .. }
             | Self::OpenLiveExports { .. }
-            | Self::ReplayLiveWal { .. } => true,
+            | Self::ReplayLiveWal { .. }
+            | Self::ResolveLiveRecords { .. }
+            | Self::PreleaseLiveExtent { .. }
+            // Write grants that create an export inline when no preparation
+            // published their file: the first lease after open or a fence (a
+            // fence revokes every export), and a group reservation in a new
+            // file. The grant itself is memory work and stays short.
+            | Self::LeaseLiveExtent { .. }
+            | Self::ReserveLiveGroup { .. } => true,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Self::AdoptLiveExtent { lease_next, .. } => *lease_next,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Self::RegisterNvmeofExport { .. }
             | Self::ReleaseNvmeofExport { .. }
@@ -790,13 +806,8 @@ impl Request {
             | Self::ReleaseLiveEpochPin { .. }
             | Self::AcquireLiveExportPin { .. }
             | Self::ReleaseLiveExportPin { .. }
-            | Self::ReserveLiveGroup { .. }
             | Self::CompleteLiveGroup { .. }
-            | Self::ResolveLiveRecords { .. }
-            | Self::LiveTargetStats
-            | Self::LeaseLiveExtent { .. }
-            | Self::AdoptLiveExtent { .. }
-            | Self::PreleaseLiveExtent { .. } => false,
+            | Self::LiveTargetStats => false,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
             Self::ReadEvidence { evict, .. } => *evict,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -962,6 +973,32 @@ pub struct ValidatedRecordLocation {
 #[cfg(test)]
 type ReadHook = Arc<dyn Fn(&ValueRecordReference) + Send + Sync>;
 
+/// Live exports created inline by an owner request, while its caller waited,
+/// by request kind. A grant (reserve, lease) pays for one only when no
+/// preparation published its file first. Each count is one export creation
+/// with its target-registry syncs (see `LIFECYCLE_TIMEOUT`). Exports of
+/// background preparation and of `OpenLiveExports` are not counted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct LiveInlineExportStats {
+    /// `ReserveLiveGroup` (kind 27): a group reservation in a file without a
+    /// binding, the first of an epoch or after a file rollover.
+    pub reserve: u64,
+    /// `LeaseLiveExtent` (kind 33): a lease without a current extent, the first
+    /// after open or after a fence.
+    pub lease: u64,
+    /// `AdoptLiveExtent { lease_next: true }` (kind 34): rollover preparation.
+    pub rollover: u64,
+    /// `PreleaseLiveExtent` (kind 36): background lease-ahead.
+    pub prelease: u64,
+    /// `ResolveLiveRecords` (kind 29): the first resolution of a file without
+    /// a binding.
+    pub resolve: u64,
+    /// `RecoverLiveMetadata`: a recovery page over a file without a binding.
+    pub recover: u64,
+    /// `ReplayLiveWal`: a history page over a file without a binding.
+    pub replay: u64,
+}
+
 /// One partition's durable epoch authority. Writes/fences serialize at the node;
 /// read requests retain Arc log handles and perform disk I/O outside this mutex.
 pub struct StorageNode {
@@ -1099,6 +1136,21 @@ impl StorageNode {
         {
             // These builds cannot prepare or grant external NVMe-oF WAL files.
             (0, 0, 0)
+        }
+    }
+
+    /// Owner-process count of live exports that a request created inline, by
+    /// request kind, including epochs replaced by fencing. Not part of the
+    /// wire protocol.
+    pub fn live_inline_export_stats(&self) -> LiveInlineExportStats {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            self.inventory.lock().inline_exports
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            // These builds have no live target, so no request can export.
+            LiveInlineExportStats::default()
         }
     }
 

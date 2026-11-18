@@ -11,6 +11,17 @@ use crate::distributed::nvmeof::{
 use std::os::unix::fs::FileExt;
 
 fn close_next(client: &mut Client, lease: &LiveLeased, frame: &[u8]) -> LiveLeased {
+    close_extent(client, lease, frame, true).unwrap()
+}
+
+/// Write `frame` and a skip marker into the epoch-1 extent `lease`, close it,
+/// and return the next extent when `lease_next` asks the owner for one.
+fn close_extent(
+    client: &mut Client,
+    lease: &LiveLeased,
+    frame: &[u8],
+    lease_next: bool,
+) -> Option<LiveLeased> {
     let file = fs::OpenOptions::new()
         .write(true)
         .open(&lease.extent.segment.path)
@@ -23,17 +34,410 @@ fn close_next(client: &mut Client, lease: &LiveLeased, frame: &[u8]) -> LiveLeas
     skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
     file.write_all_at(&skip, offset + frame.len() as u64)
         .unwrap();
-    client
+    let next = client
         .adopt_live_extent(
             1,
             lease.extent.token,
             lease.extent.start + frame.len() as u64,
             true,
-            true,
+            lease_next,
         )
         .unwrap()
-        .next
+        .next;
+    assert_eq!(next.is_some(), lease_next);
+    next
+}
+
+/// Stops and joins a second owner listener, also when a test fails.
+struct ExtraListener {
+    stop: Arc<AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ExtraListener {
+    fn drop(&mut self) {
+        // Release wakes the server's shutdown checks; no state travels with it.
+        self.stop.store(true, Ordering::Release);
+        if let Some(server) = self.server.take() {
+            let joined = server.join();
+            assert!(joined.is_ok() || thread::panicking());
+        }
+    }
+}
+
+/// (namespaces exposed so far, namespaces owned now) of the owner's target.
+fn namespaces(owner: &leased_tests::Fixture) -> (u64, u64) {
+    let stats = owner
+        .node
+        .with_live_target(|target| target.stats().unwrap());
+    (stats.namespaces_exposed, stats.owned_namespace_count)
+}
+
+/// Client and owner data deadline of the request held past it.
+const HELD_DATA_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Runs `request` on a second listener and client whose data deadline is
+/// `HELD_DATA_TIMEOUT`, so fixture setup (10 s deadline) cannot trip it. The
+/// first target-registry save of the export the request creates waits behind a
+/// barrier until both data deadlines have passed, then proceeds. Returns the
+/// response after checking that the request created exactly one export and
+/// that the same session serves the next request.
+fn hold_export_past_data_deadline(
+    owner: &leased_tests::Fixture,
+    shape: &crate::key_shape::KeyShape,
+    request: Request,
+) -> Response {
+    assert_eq!(request.timeout(HELD_DATA_TIMEOUT), LIFECYCLE_TIMEOUT);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let _extra = ExtraListener {
+        stop: stop.clone(),
+        server: Some({
+            let node = owner.node.clone();
+            let tls = owner.tls.clone();
+            let limits = TcpLimits {
+                io_timeout: HELD_DATA_TIMEOUT,
+                ..TcpLimits::default()
+            };
+            thread::spawn(move || node.serve(listener, tls, limits, stop).unwrap())
+        }),
+    };
+    let mut client = Client::connect(
+        &endpoint,
+        &owner.tls,
+        HELD_DATA_TIMEOUT,
+        owner.config.partition.clone(),
+        shape,
+    )
+    .unwrap();
+    let exposed = || namespaces(owner).0;
+    let exposed_before = exposed();
+    let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+    let (release, released) = std::sync::mpsc::sync_channel::<()>(1);
+    let mut armed = true;
+    owner.node.with_live_target(|target| {
+        target.set_save_hook(Box::new(move |step| {
+            if armed && step == crate::distributed::nvmeof::live_target::SaveStep::Prepared {
+                armed = false;
+                entered_tx.send(()).map_err(io::Error::other)?;
+                // `release` drops on test unwind, so this cannot hang.
+                released.recv().map_err(io::Error::other)?;
+            }
+            Ok(())
+        }));
+    });
+    assert!(
+        client
+            .submit_control(&request, Instant::now() + request.timeout(client.timeout))
+            .unwrap()
+    );
+    let bound = Instant::now() + LIFECYCLE_TIMEOUT;
+    while entered.try_recv().is_err() {
+        client.progress_reads().unwrap();
+        assert!(
+            Instant::now() < bound,
+            "export did not reach its first save"
+        );
+        std::thread::yield_now();
+    }
+    // The owner accepted the request before its worker entered the save, and
+    // the client submitted it earlier still: both data deadlines have passed
+    // when this hold ends. The owner checks the deadline again before it sends
+    // the response, so the data class always closed the session here.
+    let held = Instant::now();
+    while held.elapsed() <= HELD_DATA_TIMEOUT {
+        client.progress_reads().unwrap();
+        assert!(client.take_control().is_none());
+        std::thread::yield_now();
+    }
+    release.send(()).unwrap();
+    let response = loop {
+        client.progress_reads().unwrap();
+        if let Some(response) = client.take_control() {
+            break response.unwrap();
+        }
+        assert!(Instant::now() < bound, "export creation did not finish");
+        std::thread::yield_now();
+    };
+    assert_eq!(exposed(), exposed_before + 1, "request created no export");
+    // The same session serves the next request; Stats does no disk I/O.
+    client.stats().unwrap();
+    response
+}
+
+/// Every request that can create a live export inline uses the lifecycle
+/// deadline class; an adoption without `lease_next` and a group completion stay
+/// data requests.
+fn assert_export_deadline_classes(descriptor: LiveGroupDescriptor) {
+    let token = [1; 16];
+    let adopt = |lease_next| Request::AdoptLiveExtent {
+        epoch: 1,
+        token,
+        through: 0,
+        close: true,
+        lease_next,
+    };
+    for (label, request, lifecycle) in [
+        (
+            "resolve",
+            Request::ResolveLiveRecords {
+                authority_epoch: 1,
+                references: Vec::new(),
+            },
+            true,
+        ),
+        (
+            "prelease",
+            Request::PreleaseLiveExtent {
+                epoch: 1,
+                after: token,
+            },
+            true,
+        ),
+        ("adopt and lease next", adopt(true), true),
+        ("lease", Request::LeaseLiveExtent { epoch: 1 }, true),
+        (
+            "reserve",
+            Request::ReserveLiveGroup {
+                epoch: 1,
+                descriptor,
+            },
+            true,
+        ),
+        ("adopt", adopt(false), false),
+        (
+            "complete",
+            Request::CompleteLiveGroup { epoch: 1, token },
+            false,
+        ),
+    ] {
+        let expected = if lifecycle {
+            LIFECYCLE_TIMEOUT
+        } else {
+            HELD_DATA_TIMEOUT
+        };
+        assert_eq!(request.timeout(HELD_DATA_TIMEOUT), expected, "{label}");
+    }
+}
+
+/// A live record resolution that creates an export is a lifecycle operation.
+/// Its registry syncs, held past the client and owner data deadline, must not
+/// expire the request or close the session.
+#[test]
+fn export_creation_held_past_the_data_deadline_keeps_the_session() {
+    let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
+    owner
+        .node
+        .set_history_persistence(crate::distributed::storage::HistoryPersistence::WalReplay)
+        .unwrap();
+    let mut writer = owner.writer();
+    let first = writer.lease_live_extent(1).unwrap();
+    let batch = owner.batch(0);
+    let group = CompleteGroup::new_live(
+        &writer.shape,
+        vec![batch.clone()],
+        owner.config.partition.batch_limits,
+        owner.config.partition.group_limits,
+    )
+    .unwrap();
+    let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+    assert_export_deadline_classes(descriptor);
+    let next = close_next(&mut writer, &first, &frame);
+    close_next(&mut writer, &next, &[]);
+    let receipt = owner
+        .node
+        .inventory
+        .lock()
+        .active(1)
         .unwrap()
+        .receipt_page(0, 1)
+        .unwrap()[0];
+    let reference = batch.record_reference(receipt.address(), 0).unwrap();
+    // The fence revokes every export, so the resolution must create one.
+    writer.fence_to(2).unwrap();
+    let before = owner.node.live_inline_export_stats();
+    let response = hold_export_past_data_deadline(
+        &owner,
+        &writer.shape,
+        Request::ResolveLiveRecords {
+            authority_epoch: 2,
+            references: vec![reference],
+        },
+    );
+    let locations = match response {
+        Response::LiveRecords(locations) => locations,
+        other => panic!("unexpected resolution response: {}", other.as_ref()),
+    };
+    assert_eq!(locations.entries.len(), 1);
+    assert_eq!(locations.entries[0].reference, reference);
+    assert_eq!(
+        owner.node.live_inline_export_stats(),
+        LiveInlineExportStats {
+            resolve: before.resolve + 1,
+            ..before
+        }
+    );
+}
+
+/// The first lease after a fence creates its file's export inline (the fence
+/// revoked every export). Held past the data deadline, it still completes on
+/// the same session.
+#[test]
+fn first_lease_after_a_fence_held_past_the_data_deadline_keeps_the_session() {
+    let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
+    let mut writer = owner.writer();
+    let first = writer.lease_live_extent(1).unwrap();
+    close_next(&mut writer, &first, &[]);
+    writer.fence_to(2).unwrap();
+    assert_eq!(namespaces(&owner).1, 0, "the fence left an export behind");
+    let before = owner.node.live_inline_export_stats();
+    let response = hold_export_past_data_deadline(
+        &owner,
+        &writer.shape,
+        Request::LeaseLiveExtent { epoch: 2 },
+    );
+    let leased = match response {
+        Response::LiveLeased(leased) => leased,
+        other => panic!("unexpected lease response: {}", other.as_ref()),
+    };
+    assert_eq!(leased.extent.segment.epoch, 2);
+    assert!(!leased.binding.readonly);
+    assert_eq!(
+        owner.node.live_inline_export_stats(),
+        LiveInlineExportStats {
+            lease: before.lease + 1,
+            ..before
+        }
+    );
+}
+
+/// Each request kind counts exactly the exports it created inline, and a grant
+/// into a file that already has a binding counts nothing. Geometry: two
+/// 16 KiB extents per 32 KiB WAL file, so every second extent opens a file.
+#[test]
+fn inline_export_counts_follow_the_request_that_created_the_export() {
+    let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
+    owner
+        .node
+        .set_history_persistence(crate::distributed::storage::HistoryPersistence::WalReplay)
+        .unwrap();
+    let mut writer = owner.writer();
+    let exposed = || namespaces(&owner).0;
+    let exposed_before = exposed();
+    assert_eq!(
+        owner.node.live_inline_export_stats(),
+        LiveInlineExportStats::default()
+    );
+    let file = |lease: &LiveLeased| lease.extent.segment.file_index;
+
+    // Kind 33: the first lease of the epoch exports file 0.
+    let e0 = writer.lease_live_extent(1).unwrap();
+    let batch = owner.batch(0);
+    let group = CompleteGroup::new_live(
+        &writer.shape,
+        vec![batch.clone()],
+        owner.config.partition.batch_limits,
+        owner.config.partition.group_limits,
+    )
+    .unwrap();
+    let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+    // Kind 34 into the bound file 0: no export.
+    let e1 = close_extent(&mut writer, &e0, &frame, true).unwrap();
+    assert_eq!(file(&e1), file(&e0));
+    // Kind 36 opens file 1.
+    let Response::LiveLeased(e2) = writer
+        .request(Request::PreleaseLiveExtent {
+            epoch: 1,
+            after: e1.extent.token,
+        })
+        .unwrap()
+    else {
+        panic!("expected preleased extent")
+    };
+    assert_eq!(file(&e2), file(&e1) + 1);
+    close_extent(&mut writer, &e1, &[], false);
+    // Kind 34 into the bound file 1: no export; the next one opens file 2.
+    let e3 = close_next(&mut writer, &e2, &[]);
+    assert_eq!(file(&e3), file(&e2));
+    let e4 = close_next(&mut writer, &e3, &[]);
+    assert_eq!(file(&e4), file(&e3) + 1);
+    assert_eq!(
+        owner.node.live_inline_export_stats(),
+        LiveInlineExportStats {
+            lease: 1,
+            rollover: 1,
+            prelease: 1,
+            ..LiveInlineExportStats::default()
+        }
+    );
+
+    // Kind 29 after a fence (which revokes every export) re-exports file 0.
+    let receipt = owner
+        .node
+        .inventory
+        .lock()
+        .active(1)
+        .unwrap()
+        .receipt_page(0, 1)
+        .unwrap()[0];
+    let reference = batch.record_reference(receipt.address(), 0).unwrap();
+    writer.fence_to(2).unwrap();
+    let Response::LiveRecords(locations) = writer
+        .request(Request::ResolveLiveRecords {
+            authority_epoch: 2,
+            references: vec![reference],
+        })
+        .unwrap()
+    else {
+        panic!("expected live record locations")
+    };
+    assert_eq!(locations.entries.len(), 1);
+
+    // Kind 27: the first reservation of epoch 2 exports its file; a second
+    // reservation in the same file does not.
+    let mut reserve = |sequence| {
+        let group = CompleteGroup::new_live(
+            &writer.shape,
+            vec![tests::batch(&owner.config, 2, sequence)],
+            owner.config.partition.batch_limits,
+            owner.config.partition.group_limits,
+        )
+        .unwrap();
+        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let LiveReserveResponse::Reserved(reserved) =
+            writer.reserve_live_group(2, descriptor).unwrap()
+        else {
+            panic!("expected a new reservation")
+        };
+        let reservation = &reserved.reservation;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&reservation.segment.path)
+            .unwrap()
+            .write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
+            .unwrap();
+        writer.complete_live_group(2, reservation.token).unwrap();
+        reservation.segment.file_index
+    };
+    let first_file = reserve(0);
+    assert_eq!(reserve(1), first_file);
+
+    let stats = owner.node.live_inline_export_stats();
+    assert_eq!(
+        stats,
+        LiveInlineExportStats {
+            reserve: 1,
+            lease: 1,
+            rollover: 1,
+            prelease: 1,
+            resolve: 1,
+            recover: 0,
+            replay: 0,
+        }
+    );
+    // Every export in this sequence was created inline by a request.
+    assert_eq!(exposed() - exposed_before, 5);
 }
 
 #[test]

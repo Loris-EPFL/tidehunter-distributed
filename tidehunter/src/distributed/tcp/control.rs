@@ -1664,11 +1664,14 @@ impl ControlContext {
             self.readers.write().invalidate();
         }
     }
+    /// `kind` names the request (resolve, recovery or replay) that counts an
+    /// export created inline here.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn publish_live_leases(
         &self,
         epoch: u64,
         leases: Vec<super::super::nvmeof::live_storage::LiveRecordLease>,
+        kind: super::inventory::InlineExport,
     ) -> Result<PublishedLiveLeases, TcpError> {
         let metadata: Vec<_> = leases
             .iter()
@@ -1700,9 +1703,13 @@ impl ControlContext {
         let mut locations = Vec::with_capacity(metadata.len());
         for (segment, offset, len) in metadata {
             let binding = match inventory.live_segment_writable(epoch, &segment) {
-                Ok(writable) => {
-                    NodeInventory::publish_live_segment(&mut inventory, target, &segment, writable)
-                }
+                Ok(writable) => NodeInventory::publish_live_segment(
+                    &mut inventory,
+                    target,
+                    &segment,
+                    writable,
+                    kind,
+                ),
                 Err(error) => Err(error),
             };
             match binding {
@@ -1991,12 +1998,15 @@ impl ControlContext {
         // Optional preparation timed out; a later grant publishes the file.
     }
 
+    /// `kind` names the request (lease, prelease or rollover) that counts an
+    /// export created inline here.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn lease_live_published(
         &self,
         epoch: u64,
         tier: DurabilityTier,
         after: Option<[u8; 16]>,
+        kind: super::inventory::InlineExport,
     ) -> Result<LiveLeased, TcpError> {
         #[cfg(test)]
         let lookup_started = Instant::now();
@@ -2045,10 +2055,24 @@ impl ControlContext {
                 .live_export_mode
                 .is_some_and(|mode| mode.files_per_subsystem().is_some())
             {
-                NodeInventory::publish_permanent_segment(&mut inventory, target, &extent.segment)
-                    .map(|(binding, _created)| binding)
+                let (binding, created) = NodeInventory::publish_permanent_segment(
+                    &mut inventory,
+                    target,
+                    &extent.segment,
+                )?;
+                if created {
+                    // Background preparation had not published this file yet.
+                    inventory.record_inline_export(kind);
+                }
+                Ok(binding)
             } else {
-                NodeInventory::publish_live_segment(&mut inventory, target, &extent.segment, true)
+                NodeInventory::publish_live_segment(
+                    &mut inventory,
+                    target,
+                    &extent.segment,
+                    true,
+                    kind,
+                )
             }
         })();
         #[cfg(test)]
@@ -2094,10 +2118,15 @@ impl ControlContext {
         }
         match request {
             Request::LeaseLiveExtent { epoch } => self
-                .lease_live_published(epoch, tier, None)
+                .lease_live_published(epoch, tier, None, super::inventory::InlineExport::Lease)
                 .map(Response::LiveLeased),
             Request::PreleaseLiveExtent { epoch, after } => self
-                .lease_live_published(epoch, tier, Some(after))
+                .lease_live_published(
+                    epoch,
+                    tier,
+                    Some(after),
+                    super::inventory::InlineExport::Prelease,
+                )
                 .map(Response::LiveLeased),
             Request::AdoptLiveExtent {
                 epoch,
@@ -2122,7 +2151,12 @@ impl ControlContext {
                         TcpError::component(error)
                     })?;
                 let next = if lease_next {
-                    Some(self.lease_live_published(epoch, tier, None)?)
+                    Some(self.lease_live_published(
+                        epoch,
+                        tier,
+                        None,
+                        super::inventory::InlineExport::Rollover,
+                    )?)
                 } else {
                     None
                 };
@@ -2340,6 +2374,7 @@ impl ControlContext {
                                 target,
                                 &reservation.segment,
                                 true,
+                                super::inventory::InlineExport::Reserve,
                             )
                         })();
                         drop(inventory);
@@ -2414,7 +2449,11 @@ impl ControlContext {
                             .map_err(TcpError::component)?,
                     );
                 }
-                let (token, locations) = self.publish_live_leases(authority_epoch, plans)?;
+                let (token, locations) = self.publish_live_leases(
+                    authority_epoch,
+                    plans,
+                    super::inventory::InlineExport::Resolve,
+                )?;
                 let entries = references
                     .into_iter()
                     .zip(locations)
@@ -2480,7 +2519,11 @@ impl ControlContext {
                     }
                     (Vec::new(), Vec::new(), None)
                 };
-                let (token, locations) = self.publish_live_leases(authority_epoch, plans)?;
+                let (token, locations) = self.publish_live_leases(
+                    authority_epoch,
+                    plans,
+                    super::inventory::InlineExport::Recover,
+                )?;
                 let entries = receipts
                     .into_iter()
                     .zip(locations)
@@ -2558,7 +2601,11 @@ impl ControlContext {
                     }
                     (Vec::new(), Vec::new(), None)
                 };
-                let (token, locations) = self.publish_live_leases(authority_epoch, plans)?;
+                let (token, locations) = self.publish_live_leases(
+                    authority_epoch,
+                    plans,
+                    super::inventory::InlineExport::Replay,
+                )?;
                 let entries = receipts
                     .into_iter()
                     .zip(locations)

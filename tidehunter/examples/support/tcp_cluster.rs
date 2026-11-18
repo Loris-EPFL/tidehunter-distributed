@@ -642,6 +642,8 @@ pub fn maybe_run_storage_node() -> Result<bool> {
                 "wal_prewrite_ns": wal_prewrite_ns,
                 "wal_prewrite_files": wal_prewrite_files,
             },
+            // Exports a request created inline while its caller waited.
+            "inline_exports": node.live_inline_export_stats(),
             "serve_error": result.as_ref().err().map(ToString::to_string),
             "cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
         });

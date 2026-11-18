@@ -993,7 +993,12 @@ mod live_fencing {
         );
         let second = node
             .control_context
-            .lease_live_published(1, DurabilityTier::Native, Some(first.extent.token))
+            .lease_live_published(
+                1,
+                DurabilityTier::Native,
+                Some(first.extent.token),
+                inventory::InlineExport::Prelease,
+            )
             .unwrap();
         // Close both empty extents with their skip markers before crossing.
         for extent in [&first.extent, &second.extent] {
@@ -1018,7 +1023,12 @@ mod live_fencing {
         }
         let third = node
             .control_context
-            .lease_live_published(1, DurabilityTier::Native, None)
+            .lease_live_published(
+                1,
+                DurabilityTier::Native,
+                None,
+                inventory::InlineExport::Lease,
+            )
             .unwrap();
         assert_eq!(third.extent.segment.file_index, 1);
         assert_eq!(third.binding, binding);
@@ -1860,10 +1870,16 @@ mod live_fencing {
             node.with_lifecycle(|inventory, slot| {
                 let target = slot.as_mut().unwrap();
                 assert_eq!(
-                    NodeInventory::publish_live_segment(inventory, target, segment, true)
-                        .err()
-                        .unwrap()
-                        .to_string(),
+                    NodeInventory::publish_live_segment(
+                        inventory,
+                        target,
+                        segment,
+                        true,
+                        inventory::InlineExport::Lease,
+                    )
+                    .err()
+                    .unwrap()
+                    .to_string(),
                     "live segment identity or access changed"
                 );
                 assert_eq!(

@@ -1714,11 +1714,10 @@ impl super::Client {
             extent.lease.extent.token,
             extent.written_end,
         );
-        let deadline = Instant::now() + self.timeout;
         let result = if target == PendingTarget::Prelease {
-            self.submit_prelease_live_extent(epoch, token, deadline)
+            self.submit_prelease_live_extent(epoch, token)
         } else {
-            self.submit_adopt_live_extent(epoch, token, through, close, false, deadline)
+            self.submit_adopt_live_extent(epoch, token, through, close, false)
         };
         match result {
             Ok(true) => {

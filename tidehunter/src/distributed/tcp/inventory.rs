@@ -18,6 +18,19 @@ const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
 // independently of WAL history size. In-flight pages keep their separate pins.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
+/// The owner request that created a live export inline, while its caller
+/// waited; selects the `LiveInlineExportStats` field it counts in.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InlineExport {
+    Reserve,
+    Lease,
+    Rollover,
+    Prelease,
+    Resolve,
+    Recover,
+    Replay,
+}
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 enum EpochState {
     Preparing,
@@ -263,6 +276,10 @@ pub struct NodeInventory {
     retired_prewrite_ns: u64,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     retired_prewrite_files: u64,
+    // Changed only under this inventory's lock, when an export's binding is
+    // installed.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) inline_exports: LiveInlineExportStats,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_bindings: BTreeMap<
         (u64, u64),
@@ -748,6 +765,8 @@ impl NodeInventory {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             retired_prewrite_files: 0,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            inline_exports: LiveInlineExportStats::default(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_bindings: BTreeMap::new(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             idle_history_exports: std::collections::VecDeque::new(),
@@ -1171,15 +1190,33 @@ impl NodeInventory {
         result
     }
 
-    /// Return the binding of `segment`, exporting it if needed. The caller
-    /// holds the lifecycle gate; the export's journal syncs and configfs work
-    /// run with the inventory released, and the binding is installed after.
+    /// Count one export that `kind` created inline.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn record_inline_export(&mut self, kind: InlineExport) {
+        let stats = &mut self.inline_exports;
+        let count = match kind {
+            InlineExport::Reserve => &mut stats.reserve,
+            InlineExport::Lease => &mut stats.lease,
+            InlineExport::Rollover => &mut stats.rollover,
+            InlineExport::Prelease => &mut stats.prelease,
+            InlineExport::Resolve => &mut stats.resolve,
+            InlineExport::Recover => &mut stats.recover,
+            InlineExport::Replay => &mut stats.replay,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// Return the binding of `segment`, exporting it if needed and counting
+    /// the export for the request `kind`. The caller holds the lifecycle gate;
+    /// the export's journal syncs and configfs work run with the inventory
+    /// released, and the binding is installed after.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn publish_live_segment<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
         segment: &super::super::nvmeof::live_storage::LiveWalSegment,
         writable: bool,
+        kind: InlineExport,
     ) -> Result<super::super::nvmeof::live_target::LiveTargetBinding, TcpError> {
         let key = (segment.epoch, segment.file_index);
         if let Some((existing, binding, was_writable)) = inventory.live_bindings.get(&key) {
@@ -1202,6 +1239,7 @@ impl NodeInventory {
             })
             .map_err(TcpError::component)?;
         export_span.end_at(segment.file_index);
+        inventory.record_inline_export(kind);
         inventory
             .live_bindings
             .insert(key, (segment.clone(), binding.clone(), writable));
