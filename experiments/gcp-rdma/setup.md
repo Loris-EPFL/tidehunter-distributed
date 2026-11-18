@@ -386,8 +386,14 @@ the workload hard deadline, parent and child expiry, and VM DELETE/self-stop
 deadline together. The sealed spec and GO must bind this window. A shorter
 window also reduces the permitted non-compute surcharge; quote it again.
 Existing six-hour specs and their rounding are unchanged.
-The exact `nvmeof_p13_write_engine` review pins a 5.5-hour window. Fractional
-windows are not accepted for selections without an explicit reviewed value.
+The exact `nvmeof_p13_write_engine` review pins 5.5 hours.
+`nvmeof_p16_redrain_ab` pins 4.5 hours and one compact `z4m-highmem-16` fleet
+(one coordinator, two owners). Its reviewed order runs 18 clean 512 B leased-put
+cases in two reversed passes, then four c64 attribution cases. Keep all arms on
+the same fleet. No `arms` filter applies. The archive budget includes the
+attribution timelines; the scorecard excludes them. The owner start/stop proofs
+record device counters before WAL creation and after WAL deletion.
+Fractional windows are not accepted without an explicit reviewed value.
 
 Sealing from a separate worktree is supported. Set every copied seal stage's
 `REPO` (and make-go's `repo`) to that worktree, and `BASE` to a fresh attempt

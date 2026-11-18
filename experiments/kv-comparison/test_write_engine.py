@@ -100,6 +100,80 @@ class WriteEngineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "drop cells, not measurement seconds"):
                 campaign._write_engine_matrix(selection)
 
+    def test_p16_same_workload_reversed_order_and_diagnostic_isolation(self):
+        jobs = campaign.make_focused_matrix(campaign.REDRAIN_AB_SELECTION)
+        self.assertEqual(len({j["case_id"] for j in jobs}), 22)
+        self.assertEqual(len({j["profile"] for j in jobs}), 22)
+        baseline = {(j["durability_tier"], j["concurrency"]): j
+                    for j in campaign.make_focused_matrix("nvmeof_p13_write_engine")
+                    if j["group"] == "G35W" and j["arm"] == "prewritten"}
+        first, second, attribution = jobs[:9], jobs[9:18], jobs[18:]
+        def cell(job):
+            return job["durability_tier"], job["concurrency"], job["arm"]
+        expected = {(tier, c, arm) for tier in ("native", "synchronous") for c in (16, 64)
+                    for arm in ("B", "C")} | {("native", 64, "D")}
+        self.assertEqual({cell(j) for j in first}, expected)
+        self.assertEqual(list(map(cell, first)), list(map(cell, reversed(second))))
+        self.assertEqual({j["repeat"] for j in first}, {0})
+        self.assertEqual({j["repeat"] for j in second}, {1})
+        self.assertEqual({cell(j) for j in attribution}, {row for row in expected if row[1] == 64 and row[2] != "D"})
+        for job in jobs:
+            with self.subTest(case=job["case_id"]):
+                tier, c, arm = cell(job)
+                traced = job in attribution
+                self.assertEqual(job["group"], "G36T" if traced else "G36W")
+                self.assertTrue(job["case_id"].startswith(f"{job['group']}-{arm}-r"))
+                self.assertIn(f"-{arm}-", job["profile"])
+                self.assertNotIn("owner_trace", job)
+                omit = {"selection", "group", "profile", "arm", "repeat", "case_id", "remote_config_overrides"}
+                if traced:
+                    omit.update(("diagnostics", "measurement_sizing"))
+                self.assertEqual({k: v for k, v in job.items() if k not in omit},
+                                 {k: v for k, v in baseline[tier, c].items() if k not in omit})
+                options = {"external_remote_config": {"durable_cut": {"lag_ms": 1234},
+                                                       "live_nvme": {"write_mode": "leased"}}}
+                config = campaign.make_run_config(job, Path("/case"), options, "test")
+                expected = copy.deepcopy(options["external_remote_config"])
+                if arm == "C":
+                    expected["leased_submit_redrain"] = False
+                if arm == "D":
+                    expected["durable_cut"]["recovery"] = "per_owner"
+                self.assertEqual(config["backend"]["options"]["external_remote_config"], expected)
+                admission = campaign.make_owner_admission_config(config, 2)
+                self.assertEqual(admission["backend"]["options"]["external_remote_config"]["durable_cut"],
+                                 expected["durable_cut"])
+                self.assertIs(admission["backend"]["options"]["external_remote_config"].get("leased_submit_redrain", True),
+                              arm != "C")
+                self.assertNotIn("recovery", options["external_remote_config"]["durable_cut"])
+                self.assertNotIn("leased_submit_redrain", options["external_remote_config"])
+                self.assertEqual(config.get("diagnostics"), {"write_timeline_limit": 2048,
+                    "write_timeline_sample_every": 256} if traced else None)
+                self.assertNotIn("diagnostics", admission)
+                changed = {**job, "remote_config_overrides": {"leased_submit_redrain": True}}
+                with self.assertRaisesRegex(ValueError, "exact reviewed M3"):
+                    campaign.make_run_config(changed, Path("/case"), options, "test")
+                echo = {"configuration": {"client": {"leased_submit_redrain": arm != "C"}}}
+                campaign.admit_redrain_arm(job, echo)
+                for wrong in (arm == "C", None, int(arm != "C")):
+                    echo["configuration"]["client"]["leased_submit_redrain"] = wrong
+                    with self.assertRaisesRegex(ValueError, "differs from the reviewed arm"):
+                        campaign.admit_redrain_arm(job, echo)
+
+    def test_p16_device_snapshot_keeps_raw_counters_when_free_space_unavailable(self):
+        counters = {"owner_index": 1, "major": 259, "minor": 3, "write_sectors": 1048576}
+        with patch.object(controller, "media_device_snapshot", side_effect=lambda *_: dict(counters)):
+            with patch.object(controller.os, "statvfs", return_value=SimpleNamespace(f_bfree=100, f_frsize=4096)):
+                self.assertEqual(controller.owner_case_device_snapshot(Path("/case"), 1),
+                                 {**counters, "wal_fs_free_bytes": 409600})
+            with patch.object(controller.os, "statvfs", side_effect=OSError("unavailable")):
+                self.assertEqual(controller.owner_case_device_snapshot(Path("/case"), 1),
+                                 {**counters, "wal_fs_free_bytes": None, "wal_fs_free_error": "unavailable"})
+        with patch.object(controller, "media_device_snapshot", side_effect=ValueError("counters unavailable")), \
+                patch.object(controller.os, "statvfs", return_value=SimpleNamespace(f_bfree=100, f_frsize=4096)):
+            self.assertEqual(controller.owner_case_device_snapshot(Path("/case"), 1),
+                             {"owner_index": 1, "device_error": "ValueError: counters unavailable",
+                              "wal_fs_free_bytes": 409600})
+
     def test_exact_arms_and_cells(self):
         jobs = campaign.make_focused_matrix(SELECTION)
         self.assertEqual(len(jobs), 18)

@@ -54,6 +54,32 @@ class WriteEngineRegistryTests(unittest.TestCase):
             with self.subTest(window=window), self.assertRaises(ValueError):
                 manual._reviewed_jobs({**spec, **window})
 
+    def test_p16_requires_one_exact_ordered_matrix_and_quote(self):
+        campaign = workflow_input.cloud_campaign
+        selection = campaign.REDRAIN_AB_SELECTION
+        spec = workflow_input.specification("kv", "tidehunter_nvme_rdma", "focused", selection)
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual((spec["job_count"], spec["owner_hosts"], len(jobs)), (22, 2, 22))
+        self.assertNotIn("arms", spec)
+        self.assertEqual(manual.reservation_quote(spec, spec["machine_type"]), (16200, 4438, 5438))
+        fixed = (bootstrap.M3_PAIR_SECONDS + manual.PAIR_CLEANUP_SECONDS + manual.EXPORT_RESERVE_SECONDS
+                 + manual.PREPARATION_SECONDS + manual.CAMPAIGN_MARGIN_SECONDS)
+        admissions = len(jobs) * (campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS
+                                  + campaign.M3_OWNER_ADMISSION_MARGIN_SECONDS)
+        sizing = [job["measurement_sizing"] for job in jobs]
+        self.assertEqual(fixed + admissions + sum(cell["case_deadline_seconds"] for cell in sizing), 12736)
+        archive = sum(cell["expected_archive_bytes"] for cell in sizing)
+        self.assertEqual(archive, 3797942272)
+        self.assertEqual(campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES[selection], (archive * 11 + 9) // 10)
+        for change in ({"arms": ["B"]}, {"machine_type": "z4m-highmem-32"},
+                       {"reservation_hours": 5, "hard_deadline_seconds": 18000},
+                       {"hard_deadline_seconds": manual.FLEET_SECONDS}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                manual._reviewed_jobs({**spec, **change})
+        with patch.object(campaign, "make_focused_matrix", return_value=list(reversed(jobs))):
+            with self.assertRaisesRegex(ValueError, "focused matrix differs"):
+                manual._reviewed_jobs(spec)
+
     def test_reviewed_digest_and_arm_projection(self):
         selection = "nvmeof_p9_write_engine"
         jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
@@ -98,7 +124,8 @@ class WriteEngineRegistryTests(unittest.TestCase):
             self.assertLessEqual(archive_bytes, 3_000_000_000)
 
     def test_three_host_pair_has_m3_window(self):
-        for selection in workflow_input.cloud_campaign.WRITE_ENGINE_SELECTIONS:
+        for selection in (*workflow_input.cloud_campaign.WRITE_ENGINE_SELECTIONS,
+                          workflow_input.cloud_campaign.REDRAIN_AB_SELECTION):
             with self.subTest(selection=selection), patch.object(bootstrap, "_call") as call, \
                     patch.object(bootstrap.time, "time", return_value=100):
                 bootstrap._fleet_pair(Path("/package"), {"selection": selection}, 10000)

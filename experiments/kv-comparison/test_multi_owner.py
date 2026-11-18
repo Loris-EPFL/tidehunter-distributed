@@ -20,8 +20,8 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 99)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 99)
+        self.assertEqual(len(self.jobs), 121)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 121)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
                          {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:
@@ -154,8 +154,8 @@ class MultiOwnerTests(unittest.TestCase):
                 deadline = {4: 1000, 8: 800}.get(job["concurrency"], 600)
                 self.assertEqual(sizing["case_deadline_seconds"], deadline)
                 continue
-            if job["selection"] == "nvmeof_p9_small_put" or (
-                    job["selection"] in campaign.WRITE_ENGINE_SELECTIONS and job["case_kind"] == "remote_put"):
+            if job["case_kind"] == "remote_put" and job["selection"] in (
+                    "nvmeof_p9_small_put", *campaign.WRITE_ENGINE_SELECTIONS, campaign.REDRAIN_AB_SELECTION):
                 self.assertEqual(sizing["measurement_seconds"],
                                  job["measurement_operations"] / sizing["rate_calls_per_second"])
             else:

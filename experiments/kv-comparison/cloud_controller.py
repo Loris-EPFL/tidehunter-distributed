@@ -604,6 +604,22 @@ def media_device_snapshot(root, owner_index, diskstats):
                     (owner_index, major, minor, *matches[0])))
 
 
+def owner_case_device_snapshot(root, owner_index):
+    """Record the owner Local SSD before WAL creation or after WAL removal."""
+    try:
+        result = media_device_snapshot(root, owner_index, Path("/proc/diskstats").read_text())
+    except (OSError, ValueError, KeyError) as exc:
+        # Missing observational evidence cannot turn a proven owner teardown into a failure.
+        result = {"owner_index": owner_index, "device_error": f"{type(exc).__name__}: {exc}"}
+    try:
+        space = os.statvfs(root)
+        result["wal_fs_free_bytes"] = space.f_bfree * space.f_frsize
+    except OSError as exc:
+        result["wal_fs_free_bytes"] = None
+        result["wal_fs_free_error"] = str(exc)
+    return result
+
+
 def qualify_media_evidence(case_id, media, before, after, successful_reads, drained,
                            history_before=None, history_after=None, prewarm_verified=None, *, client=False):
     """Qualify matching device counters from a drained owner or client window."""
@@ -3027,6 +3043,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
         import yaml
         launch = yaml.safe_load((capsule_root / "launch.yaml").read_text())
         validate_launch(config, launch, case, index)
+        before_wal = (owner_case_device_snapshot(capsule_root, index)
+                      if config["spec"].get("selection") == cloud_campaign.REDRAIN_AB_SELECTION else None)
         if launch["node"].get("live_target") is not None:
             live_state = guarded(launch["node"]["live_target"]["state_dir"], capsule_root)
             live_state.mkdir(mode=0o700, exist_ok=False)
@@ -3060,6 +3078,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
                     raise SafetyError("storage readiness endpoint differs from typed launch")
                 result = {"ready": address, "launch_sha256": digest(capsule_root / "launch.yaml"), "unit": status}
                 result["durability_receipt"] = owner_durability_receipt(launch)
+                if before_wal is not None:
+                    result["case_device"] = before_wal
                 if shared_slice is not None:
                     result["owner_slice"] = {"name": shared_slice, "limits": owner_slice_limits(config, case)[1],
                                              "observed": unit_status(shared_slice)}
@@ -3122,6 +3142,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
         database = guarded(launch["node"]["root"], capsule_root, must_exist=True)
         shutil.rmtree(database)
         result["database_removed"] = str(database)
+        if config["spec"].get("selection") == cloud_campaign.REDRAIN_AB_SELECTION:
+            result["case_device"] = owner_case_device_snapshot(capsule_root, index)
         return result
     raise SafetyError("unsupported guest action")
 
@@ -3896,6 +3918,10 @@ class Controller:
                 timeout=min(cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, self.remaining()), env=environment(self.config))
         elapsed = self.clock() - began
         summary = json.loads((cell / "result/summary.json").read_text())
+        try:
+            cloud_campaign.admit_redrain_arm(job, summary.get("backend"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SafetyError("owner admission did not confirm its reviewed redrain arm") from exc
         evidence = json.loads((cell / "result/measurement-read-evidence.json").read_text())
         live = (evidence.get("end") or {}).get("live_nvmeof") or {}
         routes = live.get("routes", [])
@@ -5241,6 +5267,8 @@ class Controller:
                         or manifest.get("raw_samples_complete") is not True):
                     raise ValueError("terminal manifest/summary schema, backend, status or raw writer completeness differs")
                 analyze.admit_ack_contract(backend, summary["backend"], job.get("ack_contract", "synced"))
+                if manifest["status"] == "completed":
+                    cloud_campaign.admit_redrain_arm(job, summary["backend"])
                 cloud_campaign.admit_replay_summary(admitted, summary)
                 phase_windows = ({} if job.get("measurement_sizing", {}).get("minimum_phase_seconds") else None)
                 observed_counts = campaign.verify_timing_result(

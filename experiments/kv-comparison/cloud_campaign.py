@@ -46,9 +46,14 @@ DURABILITY_TIERS = ("native", "synchronous")
 DEFAULT_DURABILITY_TIER = "native"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
-WRITE_ENGINE_ARCHIVE_LIMIT_BYTES = {"nvmeof_p13_write_engine": 12_874_071_655}
+REDRAIN_AB_SELECTION = "nvmeof_p16_redrain_ab"
+WRITE_ENGINE_ARCHIVE_LIMIT_BYTES = {
+    "nvmeof_p13_write_engine": 12_874_071_655,
+    REDRAIN_AB_SELECTION: 4_177_736_500,
+}
 WRITE_ENGINE_SELECTIONS = ("nvmeof_p9_write_engine", "nvmeof_p13_write_engine")
-M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put", *WRITE_ENGINE_SELECTIONS)
+M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put",
+                 *WRITE_ENGINE_SELECTIONS, REDRAIN_AB_SELECTION)
 M3_OWNER_ADMISSION_TIMEOUT_SECONDS = 95
 M3_OWNER_ADMISSION_MARGIN_SECONDS = 5
 NVMEOF_PATH_SELECTIONS += M3_SELECTIONS
@@ -813,6 +818,7 @@ FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
 FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
 FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 18
 FOCUSED_COUNTS["nvmeof_p13_write_engine"] = 50
+FOCUSED_COUNTS[REDRAIN_AB_SELECTION] = 22
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -870,6 +876,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_p9_small_put": {"G34W": 7},
     "nvmeof_p9_write_engine": {"G35W": 12, "G35R": 2, "G35S": 4},
     "nvmeof_p13_write_engine": {"G35W": 16, "G35R": 2, "G35S": 32},
+    REDRAIN_AB_SELECTION: {"G36W": 18, "G36T": 4},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -883,7 +890,7 @@ _FOCUSED_GROUP_COUNTS = {
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
-        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2, 2)))[selection]
+        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2, 2, 2)))[selection]
     return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
 
 
@@ -1593,7 +1600,7 @@ def _clone_source(pool, group, backend, size=1024, concurrency=1, repeat=0, oper
     return matches[0]
 
 
-def _clone_job(result, selection, item, group, **overrides):
+def _clone_job(result, selection, item, group, *, case_label=None, **overrides):
     job = copy.deepcopy(item)
     job.update(selection=selection, group=group)
     if job["backend"] != "native":
@@ -1604,7 +1611,8 @@ def _clone_job(result, selection, item, group, **overrides):
     identity = hashlib.sha256(json.dumps(
         {key: value for key, value in job.items() if key != "case_id"},
         sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
-    job["case_id"] = f"{group}-r{job['repeat']}-{identity}"
+    prefix = f"{group}-{case_label}" if case_label is not None else group
+    job["case_id"] = f"{prefix}-r{job['repeat']}-{identity}"
     result.append(job)
     return job
 
@@ -2217,12 +2225,59 @@ def _write_engine_matrix(selection):
     return result
 
 
+def _nvmeof_p16_redrain_ab(jobs):
+    """Same-fleet 512 B leased puts, followed by separate attribution runs."""
+    sources = {(j["durability_tier"], j["concurrency"]): j
+               for j in jobs if j["selection"] == "nvmeof_p13_write_engine"
+               and j["group"] == "G35W" and j["arm"] == "prewritten"
+               and j["concurrency"] in (16, 64)}
+    first = [(tier, concurrency, arm) for concurrency in (16, 64)
+             for tier in ("native", "synchronous") for arm in ("B", "C")]
+    first.insert(first.index(("native", 64, "C")) + 1, ("native", 64, "D"))
+    overrides = {"B": {}, "C": {"remote_config_overrides": {"leased_submit_redrain": False}},
+                 "D": {"remote_config_overrides": {"durable_cut": {"recovery": "per_owner"}}}}
+    result = []
+
+    def add(group, tier, concurrency, arm, repeat, **extra):
+        _clone_job(result, REDRAIN_AB_SELECTION, sources[tier, concurrency], group, case_label=arm,
+                   arm=arm, repeat=repeat, profile=f"{group}-{arm}-{tier}-put-c{concurrency}-r{repeat}",
+                   **overrides[arm], **extra)
+
+    for repeat, order in enumerate((first, reversed(first))):
+        for tier, concurrency, arm in order:
+            add("G36W", tier, concurrency, arm, repeat)
+    donor = next(j for j in jobs if j["selection"] == "nvmeof_p9_small_put"
+                 and j["value_size"] == 512 and j["concurrency"] == 64 and j["repeat"] == 0)
+    for tier in ("native", "synchronous"):
+        sizing = dict(sources[tier, 64]["measurement_sizing"])
+        # The retained G34W coordinator timeline was at most 31,410,191 bytes.
+        # Raw live block traces stay in separate guest operation receipts.
+        sizing["expected_archive_bytes"] += 32 * 1024**2
+        sizing["archive_model"] = "256B per row + 8MiB ordinary evidence + 32MiB write timeline"
+        for arm in ("B", "C"):
+            add("G36T", tier, 64, arm, 0, measurement_sizing=sizing,
+                diagnostics=donor["diagnostics"], thread_cpu_sampling=donor["thread_cpu_sampling"])
+    estimate = sum(job["measurement_sizing"]["expected_archive_bytes"] for job in result)
+    if estimate > WRITE_ENGINE_ARCHIVE_LIMIT_BYTES[REDRAIN_AB_SELECTION]:
+        raise ValueError("P16 sample archive exceeds its reviewed byte limit")
+    return result
+
+
+def admit_redrain_arm(job, backend_info):
+    """Verify that the running binary, not just the config, selected the arm."""
+    if job.get("selection") == REDRAIN_AB_SELECTION:
+        actual = backend_info["configuration"]["client"].get("leased_submit_redrain")
+        if actual is not (job["arm"] != "C"):
+            raise ValueError("executed leased_submit_redrain differs from the reviewed arm")
+
+
 
 @functools.cache
 def _m3_cases():
     jobs = _nvmeof_m3_owners() + _nvmeof_p9_small_put()
     for selection in WRITE_ENGINE_SELECTIONS:
         jobs.extend(_write_engine_matrix(selection))
+    jobs.extend(_nvmeof_p16_redrain_ab(jobs))
     return {job["case_id"]: job for job in jobs}
 
 
@@ -2979,6 +3034,12 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         if protocol_key(selected) != protocol_key(expected):
             raise ValueError("runtime transport differs from research case provider/security")
         options["transport"] = selected
+    if job.get("selection") == REDRAIN_AB_SELECTION and "remote_config_overrides" in job:
+        # The exact focused job binds the override. Keep unrelated typed options.
+        remote = dict(options["external_remote_config"])
+        for key, value in job["remote_config_overrides"].items():
+            remote[key] = {**remote.get(key, {}), **value} if isinstance(value, dict) else value
+        options["external_remote_config"] = remote
     config = {"schema_version": 1, "backend": {"kind": "tidehunter" if job["backend"] in NVME_BACKENDS else runtime_backend(job["backend"]), "options": options},
         "seed": job.get("sealed_dataset", {}).get("seed", 1775 + job["repeat"]),
         "namespace": "cloud-" + hashlib.blake2b(job.get("sealed_dataset", job.get("read_tier", {})).get("data_id", job["case_id"]).encode(), digest_size=12).hexdigest(),
