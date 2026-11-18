@@ -1,7 +1,9 @@
 //! Owned, file-backed live nvmet namespaces.
 //!
-//! The caller serializes this manager with owner authority, holds the node lock,
-//! and retains WAL/read pins until revocation and initiator CQ retirement. The
+//! The caller serializes this manager under the owner's node lifecycle gate,
+//! never under the node inventory mutex: every registry save syncs a file and
+//! its directory. The caller retains WAL/read pins until revocation and
+//! initiator CQ retirement. The
 //! state directory and WAL paths must be protected from untrusted local users.
 //! The NVMe data plane assumes trusted, non-Byzantine initiators: namespace
 //! write protection can be changed by an authorized controller.
@@ -104,6 +106,21 @@ struct State {
     spdk_issued: Vec<[u8; 16]>,
 }
 
+/// A persistence step of the target state journal, for crash-cut tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SaveStep {
+    /// The pending registry is written and synced; the old one is current.
+    Prepared,
+    /// The new registry is renamed into place and its directory is synced.
+    Published,
+}
+
+/// Test hook run at each `SaveStep`. An error is returned from `save` as if
+/// the process died there; blocking pauses the save with the gate held.
+#[cfg(test)]
+pub(crate) type SaveHook = Box<dyn FnMut(SaveStep) -> io::Result<()> + Send>;
+
 /// Open only while holding the owner node lock, before opening any WAL.
 /// `open` removes all prior port links and synchronously disables/drains every
 /// registered namespace. Any uncertainty is an error, not permission to recover.
@@ -118,6 +135,8 @@ pub struct LiveTargetManager {
     stats: LiveTargetStats,
     commissioning: Option<LiveConnectionRegistry>,
     _lock: DbLock,
+    #[cfg(test)]
+    save_hook: std::sync::Mutex<Option<SaveHook>>,
 }
 
 fn invalid(s: &'static str) -> io::Error {
@@ -267,7 +286,14 @@ impl LiveTargetManager {
     /// Journal-only fixture: ordinary files do not prove kernel target I/O drain.
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn open_fixture(config: LiveTargetConfig, configfs: PathBuf) -> io::Result<Self> {
-        Self::open_inner(config, configfs, true, None)
+        Self::open_inner(
+            config,
+            configfs,
+            true,
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -276,7 +302,7 @@ impl LiveTargetManager {
         configfs: PathBuf,
         expected: LiveTargetIdentity,
     ) -> io::Result<Self> {
-        Self::open_inner(config, configfs, true, Some(expected))
+        Self::open_inner(config, configfs, true, Some(expected), None)
     }
 
     pub fn open(config: LiveTargetConfig) -> io::Result<Self> {
@@ -284,7 +310,14 @@ impl LiveTargetManager {
             check_configfs()?;
         }
         check_path(&config.state_dir, true)?;
-        Self::open_inner(config, PathBuf::from(CONFIGFS), false, None)
+        Self::open_inner(
+            config,
+            PathBuf::from(CONFIGFS),
+            false,
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
     /// Reopen an already registered node; absence or replacement is fatal.
     pub fn open_existing(
@@ -295,13 +328,23 @@ impl LiveTargetManager {
             check_configfs()?;
         }
         check_path(&config.state_dir, true)?;
-        Self::open_inner(config, PathBuf::from(CONFIGFS), false, Some(expected))
+        Self::open_inner(
+            config,
+            PathBuf::from(CONFIGFS),
+            false,
+            Some(expected),
+            #[cfg(test)]
+            None,
+        )
     }
+    /// `save_hook` (tests only) runs from the very first journal save, so
+    /// crash cuts cover the persistence steps of opening as well.
     fn open_inner(
         config: LiveTargetConfig,
         configfs: PathBuf,
         fixture: bool,
         expected: Option<LiveTargetIdentity>,
+        #[cfg(test)] save_hook: Option<SaveHook>,
     ) -> io::Result<Self> {
         validate_config(&config)?;
         let lock = DbLock::acquire(&config.state_dir, Duration::ZERO)
@@ -365,10 +408,21 @@ impl LiveTargetManager {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound && expected.is_none() => {
                 let path = config.state_dir.join("sealed");
-                fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&path)
-                    .map_err(|e| path_error("create sealed marker directory", &path, e))?;
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => {}
+                    // A first open that died before its first registry save
+                    // left this directory behind. No registry was durable, so
+                    // no export was ever exposed and no marker can be owed:
+                    // reuse the directory only if it is a real, empty one.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::AlreadyExists
+                            && fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+                            && fs::read_dir(&path)
+                                .is_ok_and(|mut entries| entries.next().is_none()) => {}
+                    Err(error) => {
+                        return Err(path_error("create sealed marker directory", &path, error));
+                    }
+                }
                 directory
                     .sync_all()
                     .map_err(|e| path_error("sync target state directory", &config.state_dir, e))?;
@@ -426,6 +480,8 @@ impl LiveTargetManager {
             },
             commissioning: None,
             _lock: lock,
+            #[cfg(test)]
+            save_hook: std::sync::Mutex::new(save_hook),
         };
         // Persist even an empty state before touching configfs. An old state is
         // cleaned first; old writable capabilities are never re-enabled.
@@ -459,6 +515,30 @@ impl LiveTargetManager {
             registry_id: self.state.registry_id,
         })
     }
+    /// Install a test hook that runs at every journal persistence step.
+    #[cfg(test)]
+    pub(crate) fn set_save_hook(&self, hook: SaveHook) {
+        *self
+            .save_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+    #[cfg(test)]
+    fn save_step(&self, step: SaveStep) -> io::Result<()> {
+        match self
+            .save_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(hook) => hook(step),
+            None => Ok(()),
+        }
+    }
+    /// Write-ahead journal record. When this returns, the new state is the
+    /// durable registry; callers perform the configfs effect it records only
+    /// afterwards, so every crash point recovers a registry that lists every
+    /// object that may exist.
     fn save(&self) -> io::Result<()> {
         let bytes =
             serde_json::to_vec(&self.state).map_err(|_| invalid("cannot encode target state"))?;
@@ -479,6 +559,8 @@ impl LiveTargetManager {
             .map_err(|e| path_error("write pending target registry", &temp, e))?;
         file.sync_all()
             .map_err(|e| path_error("sync pending target registry", &temp, e))?;
+        #[cfg(test)]
+        self.save_step(SaveStep::Prepared)?;
         let path = self.state.config.state_dir.join(STATE);
         fs::rename(&temp, &path).map_err(|e| path_error("publish target registry", &path, e))?;
         self.directory.sync_all().map_err(|e| {
@@ -487,7 +569,10 @@ impl LiveTargetManager {
                 &self.state.config.state_dir,
                 e,
             )
-        })
+        })?;
+        #[cfg(test)]
+        self.save_step(SaveStep::Published)?;
+        Ok(())
     }
     fn full(&self, relative: &Path) -> io::Result<PathBuf> {
         if relative.as_os_str().is_empty()
@@ -527,8 +612,15 @@ impl LiveTargetManager {
         });
         self.save()?;
         match kind {
-            Kind::Directory => fs::create_dir(&full)
-                .map_err(|e| path_error("create configfs directory", &full, e))?,
+            Kind::Directory => {
+                fs::create_dir(&full)
+                    .map_err(|e| path_error("create configfs directory", &full, e))?;
+                // configfs creates a directory's attributes with the directory.
+                // The fixture models that before any later crash point.
+                if self.fixture {
+                    self.fixture_attributes(path)?;
+                }
+            }
             Kind::Link => symlink(
                 self.full(destination.ok_or_else(|| invalid("missing link destination"))?)?,
                 &full,
@@ -542,9 +634,6 @@ impl LiveTargetManager {
             .ok_or_else(|| invalid("missing registration"))?
             .identity = Some(identity);
         self.save()?;
-        if self.fixture && kind == Kind::Directory {
-            self.fixture_attributes(path)?;
-        }
         Ok(())
     }
     fn verify_object(&self, object: &Object) -> io::Result<bool> {

@@ -145,6 +145,7 @@ impl Fixture {
             write_profile_limit: 0,
             live_nvme: None,
             checkpoint_mode: CheckpointMode::Exact,
+            durable_cut: Default::default(),
         };
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));

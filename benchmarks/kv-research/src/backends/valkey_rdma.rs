@@ -10,12 +10,12 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{CStr, CString, c_char, c_int, c_void},
-    io,
+    fmt, io,
     net::SocketAddr,
     ptr::NonNull,
     sync::{
         Arc, LazyLock, Mutex as StdMutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -151,6 +151,310 @@ impl Drop for CqScope {
     }
 }
 
+/// Scalar command issued through the pooled connections. Its name is the only command text a
+/// timeout diagnostic reports; key and value bytes never appear in an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScalarCommand {
+    Get,
+    Set,
+    Del,
+}
+
+impl ScalarCommand {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Set => "SET",
+            Self::Del => "DEL",
+        }
+    }
+
+    /// Operation label of the client profile sample.
+    fn sample_operation(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Set => "put",
+            Self::Del => "delete",
+        }
+    }
+
+    fn mutates(self) -> bool {
+        !matches!(self, Self::Get)
+    }
+
+    /// Wire arguments: the command name, then the operands unchanged.
+    fn args(self, operands: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut args = Vec::with_capacity(operands.len() + 1);
+        args.push(self.name().as_bytes().to_vec());
+        args.extend(operands.iter().map(|operand| operand.to_vec()));
+        args
+    }
+}
+
+/// Where one pooled request was when its outer deadline fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RequestStage {
+    /// Waiting for the pooled connection's lock: no worker exists and nothing was sent.
+    ConnectionLock,
+    /// Lock held; waiting for a blocking-pool thread.
+    BlockingQueue,
+    /// Worker running: checking the pooled connection and replacing it when broken.
+    ConnectionCheck,
+    /// Appending command bytes; some may already have reached the server.
+    Send,
+    /// Every command appended; waiting for or decoding replies.
+    Reply,
+    /// The worker returned successfully; the caller had not yet received its result. A worker
+    /// that failed keeps the stage it failed in, so a worker timeout names that stage.
+    WorkerFinished,
+    /// The caller received this connection's result (one owner of a multi-owner MGET).
+    Completed,
+}
+
+impl RequestStage {
+    const ALL: [Self; 7] = [
+        Self::ConnectionLock,
+        Self::BlockingQueue,
+        Self::ConnectionCheck,
+        Self::Send,
+        Self::Reply,
+        Self::WorkerFinished,
+        Self::Completed,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionLock => "connection_lock",
+            Self::BlockingQueue => "blocking_queue",
+            Self::ConnectionCheck => "connection_check",
+            Self::Send => "send",
+            Self::Reply => "reply",
+            Self::WorkerFinished => "worker_finished",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+/// Progress of one pooled request, kept only for its timeout diagnostic. The request's future
+/// and its blocking worker write it; the future's timeout handler reads it.
+///
+/// All accesses are `Relaxed`: the values only describe the request in an error message and
+/// publish no other data. The one conclusion drawn from a stage, that a mutation still in
+/// `ConnectionLock` was never sent, needs no cross-thread ordering: only the request's own
+/// future leaves that stage, on the same task and before it spawns the worker.
+struct RequestProgress {
+    connection: AtomicUsize,
+    stage: AtomicU8,
+}
+
+impl RequestProgress {
+    const UNASSIGNED: usize = usize::MAX;
+
+    fn new() -> Self {
+        Self {
+            connection: AtomicUsize::new(Self::UNASSIGNED),
+            stage: AtomicU8::new(RequestStage::ConnectionLock as u8),
+        }
+    }
+
+    fn assign(&self, connection: usize) {
+        self.connection.store(connection, Ordering::Relaxed);
+    }
+
+    fn enter(&self, stage: RequestStage) {
+        self.stage.store(stage as u8, Ordering::Relaxed);
+    }
+
+    fn stage(&self) -> RequestStage {
+        // Only `new` and `enter` store, always a discriminant of `RequestStage::ALL`.
+        RequestStage::ALL
+            .get(usize::from(self.stage.load(Ordering::Relaxed)))
+            .copied()
+            .unwrap_or(RequestStage::Completed)
+    }
+
+    /// Pool slot and stage, for a timeout message. The stage is read once and also returned, so
+    /// the text and any conclusion drawn from the stage agree.
+    fn describe(&self) -> (String, RequestStage) {
+        let stage = self.stage();
+        let text = match self.connection.load(Ordering::Relaxed) {
+            Self::UNASSIGNED => format!("connection unassigned, stage {}", stage.as_str()),
+            connection => format!("connection {connection}, stage {}", stage.as_str()),
+        };
+        (text, stage)
+    }
+}
+
+/// Per-owner progress of one MGET, indexed by owner.
+type MgetProgress = [RequestProgress; 5];
+
+const READ_ONLY_OUTCOME: &str = "read-only command; no mutation";
+
+/// What a timeout means for the command's effect.
+fn timeout_outcome(command: ScalarCommand, stage: RequestStage) -> &'static str {
+    match (command.mutates(), stage) {
+        (false, _) => READ_ONLY_OUTCOME,
+        (true, RequestStage::ConnectionLock) => {
+            "mutation not sent: the request never acquired its connection"
+        }
+        (true, _) => "mutation outcome may be unknown",
+    }
+}
+
+fn transport_name(rdma: bool) -> &'static str {
+    if rdma { "RDMA" } else { "TCP" }
+}
+
+/// Owner, pool slot, stage and effect of a timed-out scalar command; never key or value bytes.
+fn scalar_timeout_detail(
+    command: ScalarCommand,
+    owner: usize,
+    endpoint: &str,
+    progress: &RequestProgress,
+) -> String {
+    let (location, stage) = progress.describe();
+    format!(
+        "owner {owner} ({endpoint}), {location}; {}",
+        timeout_outcome(command, stage)
+    )
+}
+
+/// Timeout of one scalar command at its outer request deadline.
+fn scalar_timeout_error(
+    transport: &str,
+    command: ScalarCommand,
+    after: Duration,
+    owner: usize,
+    endpoint: &str,
+    progress: &RequestProgress,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "Valkey {transport} {} timed out after {} ms: {}",
+            command.name(),
+            after.as_millis(),
+            scalar_timeout_detail(command, owner, endpoint, progress),
+        ),
+    )
+}
+
+/// Context of a timeout that the blocking worker of a scalar command raised itself.
+fn scalar_worker_context(
+    transport: &str,
+    command: ScalarCommand,
+    after: Duration,
+    owner: usize,
+    endpoint: &str,
+    progress: &RequestProgress,
+) -> String {
+    format!(
+        "Valkey {transport} {} worker timed out (request deadline {} ms): {}",
+        command.name(),
+        after.as_millis(),
+        scalar_timeout_detail(command, owner, endpoint, progress),
+    )
+}
+
+/// One owner's share of an MGET, for its timeout message.
+struct MgetOwner<'a> {
+    owner: usize,
+    endpoint: &'a str,
+    /// Slot-grouped MGET commands pipelined to this owner.
+    commands: usize,
+    keys: usize,
+    progress: &'a RequestProgress,
+}
+
+impl MgetOwner<'_> {
+    /// Owner, pool slot, stage and counts; never key bytes.
+    fn detail(&self) -> String {
+        format!(
+            "owner {} ({}), {}, {} commands, {} keys",
+            self.owner,
+            self.endpoint,
+            self.progress.describe().0,
+            self.commands,
+            self.keys,
+        )
+    }
+}
+
+/// Timeout of an MGET at its outer request deadline, naming the key and command counts and,
+/// per owner, its pool slot and stage but no key bytes.
+fn mget_timeout_error<'a>(
+    transport: &str,
+    after: Duration,
+    keys: usize,
+    owners: impl IntoIterator<Item = MgetOwner<'a>>,
+) -> io::Error {
+    let mut commands = 0;
+    let mut detail = String::new();
+    for owner in owners {
+        commands += owner.commands;
+        detail.push_str("; ");
+        detail.push_str(&owner.detail());
+    }
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "Valkey {transport} MGET timed out after {} ms: {keys} keys, {commands} slot commands{detail}; {}",
+            after.as_millis(),
+            READ_ONLY_OUTCOME,
+        ),
+    )
+}
+
+/// Context of a timeout that one owner's blocking worker raised itself during an MGET.
+fn mget_worker_context(transport: &str, after: Duration, owner: &MgetOwner<'_>) -> String {
+    format!(
+        "Valkey {transport} MGET worker timed out (request deadline {} ms): {}; {}",
+        after.as_millis(),
+        owner.detail(),
+        READ_ONLY_OUTCOME,
+    )
+}
+
+/// A `TimedOut` error raised inside the blocking worker, carrying the request context the
+/// worker lacks. Display keeps the worker's own text; `source` is the worker's error.
+#[derive(Debug)]
+struct WorkerTimeout {
+    context: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl fmt::Display for WorkerTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; worker error: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for WorkerTimeout {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Adds `context` to a `TimedOut` worker error, keeping that kind and the worker error as text
+/// and source. Any other error is returned unchanged.
+fn with_worker_timeout_context(
+    error: Box<dyn std::error::Error + Send + Sync>,
+    context: impl FnOnce() -> String,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    if !is_timed_out(error.as_ref()) {
+        return error;
+    }
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        WorkerTimeout {
+            context: context(),
+            source: error,
+        },
+    )
+    .into()
+}
+
 fn measured_pipeline(
     connection: &mut Connection,
     commands: &[&[Vec<u8>]],
@@ -158,9 +462,10 @@ fn measured_pipeline(
     sample: Option<&SharedSample>,
     enqueued: Option<Instant>,
     started: Option<Instant>,
+    progress: Option<&RequestProgress>,
 ) -> BackendResult<Vec<Response>> {
     let Some(sample) = sample else {
-        return connection.pipeline(commands, deadline, None);
+        return connection.pipeline(commands, deadline, None, progress);
     };
     if let (Some(enqueued), Some(started)) = (enqueued, started) {
         update_sample(sample, |s| {
@@ -179,7 +484,7 @@ fn measured_pipeline(
     } else {
         None
     };
-    let result = connection.pipeline(commands, deadline, Some(&mut phases));
+    let result = connection.pipeline(commands, deadline, Some(&mut phases), progress);
     drop(scope);
     update_sample(sample, |s| {
         s.command_encode_ns = phases.command_encode_ns;
@@ -379,7 +684,7 @@ impl Connection {
         }
     }
     fn command(&mut self, args: &[Vec<u8>], deadline: Instant) -> BackendResult<Response> {
-        self.pipeline(&[args], deadline, None)?
+        self.pipeline(&[args], deadline, None, None)?
             .into_iter()
             .next()
             .ok_or_else(|| invalid("missing libvalkey reply"))
@@ -389,6 +694,7 @@ impl Connection {
         commands: &[&[Vec<u8>]],
         deadline: Instant,
         mut sample: Option<&mut ClientSample>,
+        progress: Option<&RequestProgress>,
     ) -> BackendResult<Vec<Response>> {
         if self.poisoned {
             return Err(invalid(
@@ -415,6 +721,9 @@ impl Connection {
             // From here bytes may reach the peer; until every reply is consumed, any error
             // leaves this connection unusable.
             self.poisoned = true;
+            if let Some(progress) = progress {
+                progress.enter(RequestStage::Send);
+            }
             // SAFETY: the exclusive context and all argument buffers remain
             // valid throughout this synchronous append; timed_out is writable.
             let result = unsafe {
@@ -434,6 +743,9 @@ impl Connection {
             if result != 0 {
                 return Err(self.error());
             }
+        }
+        if let Some(progress) = progress {
+            progress.enter(RequestStage::Reply);
         }
         let mut replies = Vec::with_capacity(commands.len());
         for _ in commands {
@@ -525,27 +837,58 @@ impl NodeCtx {
         enqueued: Option<Instant>,
         started: Option<Instant>,
     ) -> BackendResult<Vec<Response>> {
-        if let Err(error) = self.repair(connection, deadline) {
-            if is_timed_out(error.as_ref()) {
-                self.health
-                    .timeouts_before_send
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            return Err(error);
+        self.tracked_pipeline(
+            connection, commands, deadline, sample, enqueued, started, None,
+        )
+    }
+
+    /// [`Self::pipeline`] that also records the request's worker stages in `progress`.
+    #[allow(clippy::too_many_arguments)]
+    fn tracked_pipeline(
+        &self,
+        connection: &mut Connection,
+        commands: &[&[Vec<u8>]],
+        deadline: Instant,
+        sample: Option<&SharedSample>,
+        enqueued: Option<Instant>,
+        started: Option<Instant>,
+        progress: Option<&RequestProgress>,
+    ) -> BackendResult<Vec<Response>> {
+        if let Some(progress) = progress {
+            progress.enter(RequestStage::ConnectionCheck);
         }
-        let result = measured_pipeline(connection, commands, deadline, sample, enqueued, started);
-        if let Err(error) = &result {
-            // The connection was usable on entry, so poison here is new and bytes may have been sent.
-            let counter = if connection.poisoned {
-                Some(&self.health.connections_poisoned)
-            } else if is_timed_out(error.as_ref()) {
-                Some(&self.health.timeouts_before_send)
-            } else {
-                None
-            };
-            if let Some(counter) = counter {
-                counter.fetch_add(1, Ordering::Relaxed);
+        let result = match self.repair(connection, deadline) {
+            Err(error) => {
+                if is_timed_out(error.as_ref()) {
+                    self.health
+                        .timeouts_before_send
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error)
             }
+            Ok(()) => {
+                let result = measured_pipeline(
+                    connection, commands, deadline, sample, enqueued, started, progress,
+                );
+                if let Err(error) = &result {
+                    // The connection was usable on entry, so poison here is new and bytes may
+                    // have been sent.
+                    let counter = if connection.poisoned {
+                        Some(&self.health.connections_poisoned)
+                    } else if is_timed_out(error.as_ref()) {
+                        Some(&self.health.timeouts_before_send)
+                    } else {
+                        None
+                    };
+                    if let Some(counter) = counter {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                result
+            }
+        };
+        if let Some(progress) = progress.filter(|_| result.is_ok()) {
+            progress.enter(RequestStage::WorkerFinished);
         }
         result
     }
@@ -997,24 +1340,70 @@ impl ValkeyRdmaBackend {
         Some(sample)
     }
 
+    fn transport(&self) -> &'static str {
+        transport_name(self.rdma)
+    }
+
+    fn scalar_timeout(
+        &self,
+        owner: usize,
+        command: ScalarCommand,
+        progress: &RequestProgress,
+    ) -> io::Error {
+        scalar_timeout_error(
+            self.transport(),
+            command,
+            self.timeout,
+            owner,
+            &self.nodes[owner].ctx.endpoint,
+            progress,
+        )
+    }
+
+    /// Adds this request's context to a timeout its worker raised before the outer deadline
+    /// fired; other errors pass unchanged.
+    fn scalar_worker_timeout(
+        &self,
+        owner: usize,
+        command: ScalarCommand,
+        progress: &RequestProgress,
+        error: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        with_worker_timeout_context(error, || {
+            scalar_worker_context(
+                self.transport(),
+                command,
+                self.timeout,
+                owner,
+                &self.nodes[owner].ctx.endpoint,
+                progress,
+            )
+        })
+    }
+
     async fn execute_traced(
         &self,
         owner: usize,
-        args: Vec<Vec<u8>>,
+        command: ScalarCommand,
+        operands: &[&[u8]],
         id: u64,
-        operation: &'static str,
     ) -> BackendResult<Response> {
+        let args = command.args(operands);
+        let progress = Arc::new(RequestProgress::new());
         let deadline = Instant::now() + self.timeout;
         let node = &self.nodes[owner];
         let index = node.next.fetch_add(1, Ordering::Relaxed) % node.connections.len();
+        progress.assign(index);
         let conn = node.connections[index].clone();
         let ctx = Arc::clone(&node.ctx);
-        let sample = self.begin_client_sample(Some(id), operation, owner, index);
+        let sample = self.begin_client_sample(Some(id), command.sample_operation(), owner, index);
         let _outcome = SampleOutcome(sample.clone());
         let run_sample = sample.clone();
+        let run_progress = Arc::clone(&progress);
         let run = async move {
             let lock_start = run_sample.as_ref().map(|_| Instant::now());
             let mut guard = conn.lock_owned().await;
+            run_progress.enter(RequestStage::BlockingQueue);
             if let (Some(start), Some(sample)) = (lock_start, run_sample.as_ref()) {
                 update_sample(sample, |s| s.mutex_wait_ns = Some(elapsed_ns(start)));
             }
@@ -1022,13 +1411,14 @@ impl ValkeyRdmaBackend {
             let enqueued = run_sample.as_ref().map(|_| Instant::now());
             let (result, finished) = tokio::task::spawn_blocking(move || {
                 let started = worker_sample.as_ref().map(|_| Instant::now());
-                let result = ctx.pipeline(
+                let result = ctx.tracked_pipeline(
                     &mut guard,
                     &[&args],
                     deadline,
                     worker_sample.as_ref(),
                     enqueued,
                     started,
+                    Some(&*run_progress),
                 );
                 drop(guard);
                 if let Some(sample) = worker_sample.as_ref() {
@@ -1052,13 +1442,11 @@ impl ValkeyRdmaBackend {
         let result = timeout(self.timeout, run)
             .await
             .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Valkey RDMA request timed out; mutation outcome may be unknown",
-                )
-                .into()
+                self.scalar_timeout(owner, command, &progress).into()
             })
-            .and_then(|r| r);
+            .and_then(|r| {
+                r.map_err(|error| self.scalar_worker_timeout(owner, command, &progress, error))
+            });
         if let Some(sample) = sample {
             update_sample(&sample, |s| {
                 s.pipeline_outcome = Some(if result.is_ok() { "ok" } else { "error" })
@@ -1066,33 +1454,49 @@ impl ValkeyRdmaBackend {
         }
         result
     }
-    async fn execute(&self, owner: usize, args: Vec<Vec<u8>>) -> BackendResult<Response> {
+    async fn execute(
+        &self,
+        owner: usize,
+        command: ScalarCommand,
+        operands: &[&[u8]],
+    ) -> BackendResult<Response> {
+        let args = command.args(operands);
+        let progress = Arc::new(RequestProgress::new());
         let deadline = Instant::now() + self.timeout;
         let node = &self.nodes[owner];
         let index = node.next.fetch_add(1, Ordering::Relaxed) % node.connections.len();
+        progress.assign(index);
         let conn = node.connections[index].clone();
         let ctx = Arc::clone(&node.ctx);
+        let run_progress = Arc::clone(&progress);
         let run = async move {
             let guard = conn.lock_owned().await;
+            run_progress.enter(RequestStage::BlockingQueue);
             tokio::task::spawn_blocking(move || {
                 let mut guard = guard;
-                ctx.pipeline(&mut guard, &[&args], deadline, None, None, None)
-                    .and_then(|replies| {
-                        replies
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| invalid("missing libvalkey reply"))
-                    })
+                ctx.tracked_pipeline(
+                    &mut guard,
+                    &[&args],
+                    deadline,
+                    None,
+                    None,
+                    None,
+                    Some(&*run_progress),
+                )
+                .and_then(|replies| {
+                    replies
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| invalid("missing libvalkey reply"))
+                })
             })
             .await
             .map_err(|e| invalid(format!("RDMA command task failed: {e}")))?
         };
-        timeout(self.timeout, run).await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Valkey RDMA request timed out; mutation outcome may be unknown",
-            )
-        })?
+        timeout(self.timeout, run)
+            .await
+            .map_err(|_| self.scalar_timeout(owner, command, &progress))?
+            .map_err(|error| self.scalar_worker_timeout(owner, command, &progress, error))
     }
     async fn pipeline_group(
         &self,
@@ -1100,36 +1504,59 @@ impl ValkeyRdmaBackend {
         groups: Vec<SlotGroup>,
         deadline: Instant,
         id: Option<u64>,
+        progress: &Arc<MgetProgress>,
     ) -> BackendResult<Vec<(Vec<usize>, Response)>> {
         if groups.is_empty() {
             return Ok(Vec::new());
         }
         let node = &self.nodes[owner];
         let index = node.next.fetch_add(1, Ordering::Relaxed) % node.connections.len();
+        progress[owner].assign(index);
         let conn = node.connections[index].clone();
         let ctx = Arc::clone(&node.ctx);
         let sample = self.begin_client_sample(id, "get_many", owner, index);
         let _outcome = SampleOutcome(sample.clone());
         let lock_start = sample.as_ref().map(|_| Instant::now());
         let guard = conn.lock_owned().await;
+        progress[owner].enter(RequestStage::BlockingQueue);
         if let (Some(start), Some(sample)) = (lock_start, sample.as_ref()) {
             update_sample(sample, |s| s.mutex_wait_ns = Some(elapsed_ns(start)));
         }
         let worker_sample = sample.clone();
         let enqueued = sample.as_ref().map(|_| Instant::now());
+        let worker_progress = Arc::clone(progress);
         let joined = tokio::task::spawn_blocking(move || {
             let started = worker_sample.as_ref().map(|_| Instant::now());
             let (commands, positions): (Vec<_>, Vec<_>) = groups.into_iter().unzip();
             let mut guard = guard;
             let refs: Vec<_> = commands.iter().map(Vec::as_slice).collect();
-            let replies = ctx.pipeline(
-                &mut guard,
-                &refs,
-                deadline,
-                worker_sample.as_ref(),
-                enqueued,
-                started,
-            );
+            let replies = ctx
+                .tracked_pipeline(
+                    &mut guard,
+                    &refs,
+                    deadline,
+                    worker_sample.as_ref(),
+                    enqueued,
+                    started,
+                    Some(&worker_progress[owner]),
+                )
+                .map_err(|error| {
+                    // Read here, before the caller can see the error: this owner's slot and
+                    // failure stage, plus its command and key counts.
+                    with_worker_timeout_context(error, || {
+                        mget_worker_context(
+                            transport_name(ctx.rdma),
+                            Duration::from_millis(ctx.timeout_ms),
+                            &MgetOwner {
+                                owner,
+                                endpoint: &ctx.endpoint,
+                                commands: commands.len(),
+                                keys: positions.iter().map(Vec::len).sum(),
+                                progress: &worker_progress[owner],
+                            },
+                        )
+                    })
+                });
             let result = replies.and_then(|replies| {
                 if replies.len() != positions.len() {
                     return Err(invalid("pipeline response length mismatch"));
@@ -1145,6 +1572,7 @@ impl ValkeyRdmaBackend {
         })
         .await
         .map_err(|e| invalid(format!("libvalkey pipeline task failed: {e}")));
+        progress[owner].enter(RequestStage::Completed);
         let result = match joined {
             Ok((result, finished)) => {
                 if let (Some(sample), Some(finished)) = (sample.as_ref(), finished) {
@@ -1163,31 +1591,62 @@ impl ValkeyRdmaBackend {
         }
         result
     }
+    /// Key positions per hash slot, in slot order; standalone mode puts every key in slot 0.
+    fn slot_groups(&self, keys: &[Bytes]) -> BTreeMap<usize, Vec<usize>> {
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            let s = if self.cluster { slot(key) } else { 0 };
+            groups.entry(s).or_default().push(i);
+        }
+        groups
+    }
+
+    fn mget_timeout(&self, keys: &[Bytes], progress: &MgetProgress) -> io::Error {
+        // (MGET commands, keys) per owner, recomputed only on this error path.
+        let mut load = [(0_usize, 0_usize); 5];
+        for (s, indices) in self.slot_groups(keys) {
+            let owner = &mut load[self.slots[s]];
+            owner.0 += 1;
+            owner.1 += indices.len();
+        }
+        mget_timeout_error(
+            self.transport(),
+            self.timeout,
+            keys.len(),
+            load.iter()
+                .enumerate()
+                .filter(|(_, (commands, _))| *commands > 0)
+                .map(move |(owner, &(commands, owner_keys))| MgetOwner {
+                    owner,
+                    endpoint: &self.nodes[owner].ctx.endpoint,
+                    commands,
+                    keys: owner_keys,
+                    progress: &progress[owner],
+                }),
+        )
+    }
+
     async fn get_many_inner(
         &self,
         keys: &[Bytes],
         id: Option<u64>,
     ) -> BackendResult<Vec<Option<Bytes>>> {
+        let progress: Arc<MgetProgress> = Arc::new(std::array::from_fn(|_| RequestProgress::new()));
         let deadline = Instant::now() + self.timeout;
         timeout(self.timeout, async {
-            let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-            for (i, key) in keys.iter().enumerate() {
-                let s = if self.cluster { slot(key) } else { 0 };
-                groups.entry(s).or_default().push(i);
-            }
             let mut owners: [Vec<SlotGroup>; 5] = std::array::from_fn(|_| Vec::new());
-            for (s, indices) in groups {
+            for (s, indices) in self.slot_groups(keys) {
                 let mut args = vec![b"MGET".to_vec()];
                 args.extend(indices.iter().map(|&i| keys[i].to_vec()));
                 owners[self.slots[s]].push((args, indices));
             }
             let [a, b, c, d, e] = owners;
             let (a, b, c, d, e) = tokio::try_join!(
-                self.pipeline_group(0, a, deadline, id),
-                self.pipeline_group(1, b, deadline, id),
-                self.pipeline_group(2, c, deadline, id),
-                self.pipeline_group(3, d, deadline, id),
-                self.pipeline_group(4, e, deadline, id)
+                self.pipeline_group(0, a, deadline, id, &progress),
+                self.pipeline_group(1, b, deadline, id, &progress),
+                self.pipeline_group(2, c, deadline, id, &progress),
+                self.pipeline_group(3, d, deadline, id, &progress),
+                self.pipeline_group(4, e, deadline, id, &progress)
             )?;
             let mut output = vec![None; keys.len()];
             for (indices, response) in a.into_iter().chain(b).chain(c).chain(d).chain(e) {
@@ -1208,16 +1667,11 @@ impl ValkeyRdmaBackend {
             Ok(output)
         })
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Valkey MGET timed out"))?
+        .map_err(|_| self.mget_timeout(keys, &progress))?
     }
     pub async fn traced_get(&self, key: &[u8], id: u64) -> BackendResult<Option<Bytes>> {
         match self
-            .execute_traced(
-                self.slots[slot(key)],
-                vec![b"GET".to_vec(), key.to_vec()],
-                id,
-                "get",
-            )
+            .execute_traced(self.slots[slot(key)], ScalarCommand::Get, &[key], id)
             .await?
         {
             Response::Nil => Ok(None),
@@ -1230,9 +1684,9 @@ impl ValkeyRdmaBackend {
         match self
             .execute_traced(
                 self.slots[slot(&key)],
-                vec![b"SET".to_vec(), key.to_vec(), value.to_vec()],
+                ScalarCommand::Set,
+                &[&key[..], &value[..]],
                 id,
-                "put",
             )
             .await?
         {
@@ -1243,12 +1697,7 @@ impl ValkeyRdmaBackend {
 
     pub async fn traced_delete(&self, key: Bytes, id: u64) -> BackendResult<()> {
         match self
-            .execute_traced(
-                self.slots[slot(&key)],
-                vec![b"DEL".to_vec(), key.to_vec()],
-                id,
-                "delete",
-            )
+            .execute_traced(self.slots[slot(&key)], ScalarCommand::Del, &[&key[..]], id)
             .await?
         {
             Response::Integer(n) if n == 0 || n == 1 => Ok(()),
@@ -1309,7 +1758,7 @@ impl KvBackend for ValkeyRdmaBackend {
     }
     async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
         match self
-            .execute(self.slots[slot(key)], vec![b"GET".to_vec(), key.to_vec()])
+            .execute(self.slots[slot(key)], ScalarCommand::Get, &[key])
             .await?
         {
             Response::Nil => Ok(None),
@@ -1321,7 +1770,8 @@ impl KvBackend for ValkeyRdmaBackend {
         match self
             .execute(
                 self.slots[slot(&key)],
-                vec![b"SET".to_vec(), key.to_vec(), value.to_vec()],
+                ScalarCommand::Set,
+                &[&key[..], &value[..]],
             )
             .await?
         {
@@ -1331,7 +1781,7 @@ impl KvBackend for ValkeyRdmaBackend {
     }
     async fn delete(&self, key: Bytes) -> BackendResult<()> {
         match self
-            .execute(self.slots[slot(&key)], vec![b"DEL".to_vec(), key.to_vec()])
+            .execute(self.slots[slot(&key)], ScalarCommand::Del, &[&key[..]])
             .await?
         {
             Response::Integer(n) if n == 0 || n == 1 => Ok(()),
@@ -1504,6 +1954,339 @@ mod tests {
 
     fn count(counter: &AtomicU64) -> u64 {
         counter.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn request_stage_round_trips_through_progress() {
+        let progress = RequestProgress::new();
+        assert_eq!(progress.stage(), RequestStage::ConnectionLock);
+        for stage in RequestStage::ALL {
+            progress.enter(stage);
+            assert_eq!(progress.stage(), stage);
+        }
+    }
+
+    #[test]
+    fn scalar_timeout_reports_location_and_stage_and_mutation_uncertainty_only_for_mutations() {
+        let after = Duration::from_secs(5);
+        let progress = RequestProgress::new();
+        progress.assign(2);
+        progress.enter(RequestStage::Reply);
+        let get = scalar_timeout_error(
+            "RDMA",
+            ScalarCommand::Get,
+            after,
+            3,
+            "10.0.0.4:6379",
+            &progress,
+        );
+        assert_eq!(get.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            get.to_string(),
+            "Valkey RDMA GET timed out after 5000 ms: owner 3 (10.0.0.4:6379), connection 2, \
+             stage reply; read-only command; no mutation"
+        );
+        for command in [ScalarCommand::Set, ScalarCommand::Del] {
+            let error = scalar_timeout_error("RDMA", command, after, 3, "10.0.0.4:6379", &progress);
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Valkey RDMA {} timed out after 5000 ms: owner 3 (10.0.0.4:6379), \
+                     connection 2, stage reply; mutation outcome may be unknown",
+                    command.name()
+                )
+            );
+        }
+        // A mutation still waiting for its connection lock never had a worker to send it.
+        let waiting = RequestProgress::new();
+        assert_eq!(
+            scalar_timeout_error(
+                "TCP",
+                ScalarCommand::Set,
+                after,
+                0,
+                "127.0.0.1:6379",
+                &waiting
+            )
+            .to_string(),
+            "Valkey TCP SET timed out after 5000 ms: owner 0 (127.0.0.1:6379), connection \
+             unassigned, stage connection_lock; mutation not sent: the request never acquired \
+             its connection"
+        );
+        for stage in RequestStage::ALL {
+            assert_eq!(
+                timeout_outcome(ScalarCommand::Get, stage),
+                READ_ONLY_OUTCOME
+            );
+            for command in [ScalarCommand::Set, ScalarCommand::Del] {
+                let unknown = timeout_outcome(command, stage) == "mutation outcome may be unknown";
+                assert_eq!(unknown, stage != RequestStage::ConnectionLock, "{stage:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mget_timeout_reports_each_owner_and_no_mutation() {
+        let finished = RequestProgress::new();
+        finished.assign(1);
+        finished.enter(RequestStage::Completed);
+        let sending = RequestProgress::new();
+        sending.assign(3);
+        sending.enter(RequestStage::Send);
+        let error = mget_timeout_error(
+            "RDMA",
+            Duration::from_secs(5),
+            9,
+            [
+                MgetOwner {
+                    owner: 0,
+                    endpoint: "10.0.0.1:6379",
+                    commands: 2,
+                    keys: 4,
+                    progress: &finished,
+                },
+                MgetOwner {
+                    owner: 4,
+                    endpoint: "10.0.0.5:6379",
+                    commands: 3,
+                    keys: 5,
+                    progress: &sending,
+                },
+            ],
+        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "Valkey RDMA MGET timed out after 5000 ms: 9 keys, 5 slot commands; owner 0 \
+             (10.0.0.1:6379), connection 1, stage completed, 2 commands, 4 keys; owner 4 \
+             (10.0.0.5:6379), connection 3, stage send, 3 commands, 5 keys; read-only command; \
+             no mutation"
+        );
+    }
+
+    #[test]
+    fn connection_records_send_and_reply_stages_but_not_after_expiry() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer = std::thread::spawn(move || drop(listener.accept().unwrap().0));
+        let mut connection = Connection::connect(&address, 1000, false).unwrap();
+        peer.join().unwrap();
+        let command = vec![b"GET".to_vec(), b"key".to_vec()];
+        let progress = RequestProgress::new();
+        progress.enter(RequestStage::ConnectionCheck);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert!(
+            connection
+                .pipeline(&[&command], expired, None, Some(&progress))
+                .is_err()
+        );
+        assert_eq!(progress.stage(), RequestStage::ConnectionCheck);
+        // The peer has closed, so the reply read fails at once; the distant deadline is never
+        // reached and no timing decides the stage. Appending only buffers the command.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            connection
+                .pipeline(&[&command], deadline, None, Some(&progress))
+                .is_err()
+        );
+        assert_eq!(progress.stage(), RequestStage::Reply);
+    }
+
+    #[test]
+    fn worker_timeouts_keep_their_error_and_gain_the_request_context() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let backend = tcp_backend(&address, Duration::from_millis(50));
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let args = ScalarCommand::Get.args(&[&b"secret-key"[..]]);
+        // The real worker path: a worker that finds the deadline expired fails before sending.
+        let worker_timeout = |progress: &RequestProgress| {
+            let mut connection = backend.nodes[0].connections[1].try_lock().unwrap();
+            backend.nodes[0]
+                .ctx
+                .tracked_pipeline(
+                    &mut connection,
+                    &[&args],
+                    expired,
+                    None,
+                    None,
+                    None,
+                    Some(progress),
+                )
+                .unwrap_err()
+        };
+        let progress = RequestProgress::new();
+        progress.assign(1);
+        let worker_text = "Valkey pipeline timed out";
+        for (command, outcome) in [
+            (ScalarCommand::Get, READ_ONLY_OUTCOME),
+            (ScalarCommand::Set, "mutation outcome may be unknown"),
+            (ScalarCommand::Del, "mutation outcome may be unknown"),
+        ] {
+            let error =
+                backend.scalar_worker_timeout(0, command, &progress, worker_timeout(&progress));
+            // A failed worker keeps the stage it failed in.
+            assert_eq!(progress.stage(), RequestStage::ConnectionCheck);
+            assert!(is_timed_out(error.as_ref()), "{error}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Valkey TCP {} worker timed out (request deadline 50 ms): owner 0 \
+                     ({address}), connection 1, stage connection_check; {outcome}; worker \
+                     error: {worker_text}",
+                    command.name()
+                )
+            );
+            assert_eq!(error.source().unwrap().to_string(), worker_text);
+        }
+        let mget = with_worker_timeout_context(worker_timeout(&progress), || {
+            mget_worker_context(
+                "TCP",
+                backend.timeout,
+                &MgetOwner {
+                    owner: 0,
+                    endpoint: &address,
+                    commands: 1,
+                    keys: 2,
+                    progress: &progress,
+                },
+            )
+        });
+        assert!(is_timed_out(mget.as_ref()), "{mget}");
+        assert_eq!(
+            mget.to_string(),
+            format!(
+                "Valkey TCP MGET worker timed out (request deadline 50 ms): owner 0 ({address}), \
+                 connection 1, stage connection_check, 1 commands, 2 keys; read-only command; no \
+                 mutation; worker error: {worker_text}"
+            )
+        );
+        assert_eq!(mget.source().unwrap().to_string(), worker_text);
+        assert!(!mget.to_string().contains("secret"), "{mget}");
+        // Errors that are not timeouts pass through untouched.
+        let other = with_worker_timeout_context(invalid("missing libvalkey reply"), || {
+            panic!("context built for a non-timeout error")
+        });
+        assert!(!is_timed_out(other.as_ref()));
+        assert_eq!(other.to_string(), "missing libvalkey reply");
+        drop(listener);
+    }
+
+    fn tcp_backend(address: &str, timeout: Duration) -> ValkeyRdmaBackend {
+        let connections = (0..POOL_SIZE)
+            .map(|_| {
+                Arc::new(Mutex::new(
+                    Connection::connect(address, 1000, false).unwrap(),
+                ))
+            })
+            .collect();
+        ValkeyRdmaBackend {
+            nodes: vec![Node {
+                connections,
+                next: AtomicUsize::new(0),
+                ctx: Arc::new(tcp_ctx(address)),
+            }],
+            slots: vec![0; 16384],
+            cluster: false,
+            timeout,
+            rdma: false,
+            profile: ClientProfile::default(),
+            info: BackendInfo {
+                name: String::new(),
+                server_version: String::new(),
+                client_version: String::new(),
+                acknowledgement: String::new(),
+                consistency: String::new(),
+                replication_factor: 1,
+                measurement_boundary: String::new(),
+                get_many_strategy: String::new(),
+                batch_atomicity: BatchAtomicity::Unsupported,
+                topology: json!({}),
+                configuration: json!({}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn timeouts_waiting_for_a_connection_name_the_request_but_not_its_payload() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let backend = tcp_backend(&address, Duration::from_millis(50));
+        // Holding every pooled connection makes each request time out waiting for its lock,
+        // whatever the timer granularity: no worker can start.
+        let mut held = Vec::new();
+        for connection in &backend.nodes[0].connections {
+            held.push(connection.lock().await);
+        }
+        let key = Bytes::from(b"secret-key".to_vec());
+        let value = Bytes::from(b"secret-value".to_vec());
+        let location = |connection: usize| {
+            format!("owner 0 ({address}), connection {connection}, stage connection_lock")
+        };
+        let not_sent = "mutation not sent: the request never acquired its connection";
+
+        // Connections are taken round robin from 0.
+        let get = backend.get(&key).await.unwrap_err();
+        let put = backend.put(key.clone(), value.clone()).await.unwrap_err();
+        let delete = backend.delete(key.clone()).await.unwrap_err();
+        let traced = backend
+            .traced_put(key.clone(), value.clone(), 7)
+            .await
+            .unwrap_err();
+        let many = backend
+            .get_many(&[key.clone(), Bytes::from(b"secret-other".to_vec())])
+            .await
+            .unwrap_err();
+        let expected = [
+            (
+                &get,
+                format!(
+                    "Valkey TCP GET timed out after 50 ms: {}; read-only command; no mutation",
+                    location(0)
+                ),
+            ),
+            (
+                &put,
+                format!(
+                    "Valkey TCP SET timed out after 50 ms: {}; {not_sent}",
+                    location(1)
+                ),
+            ),
+            (
+                &delete,
+                format!(
+                    "Valkey TCP DEL timed out after 50 ms: {}; {not_sent}",
+                    location(2)
+                ),
+            ),
+            (
+                &traced,
+                format!(
+                    "Valkey TCP SET timed out after 50 ms: {}; {not_sent}",
+                    location(3)
+                ),
+            ),
+            (
+                &many,
+                format!(
+                    "Valkey TCP MGET timed out after 50 ms: 2 keys, 1 slot commands; {}, \
+                     1 commands, 2 keys; read-only command; no mutation",
+                    location(0)
+                ),
+            ),
+        ];
+        for (error, message) in expected {
+            assert!(is_timed_out(error.as_ref()), "{error}");
+            assert_eq!(error.to_string(), message);
+            assert!(!message.contains("secret"), "{message}");
+        }
+        drop(held);
+        drop(listener);
     }
 
     #[test]

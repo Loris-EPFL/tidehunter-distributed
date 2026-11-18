@@ -35,7 +35,8 @@ impl WriteCore {
 
     pub(in crate::distributed::remote_db) fn flush_durable(&self) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
-        self.wait_published_before(self.sequencer.next())?;
+        let next = self.sequencer.next();
+        self.wait_published_before(next)?;
         let mut owners: Vec<_> = self
             .clients
             .iter()
@@ -44,7 +45,20 @@ impl WriteCore {
         super::super::endpoint_map(&mut owners, |_, owner| {
             owner.control(|client| client.status().map(|_| ()))
         })?;
+        // Every sequence below `next` is now published and synced, or aborted:
+        // the explicit flush survives recovery only once the record says so.
+        if let Some(cut) = &self.durable_cut {
+            cut.certify(next)?;
+        }
         self.ensure_healthy()
+    }
+
+    pub(in crate::distributed::remote_db) fn durable_cut_stats(
+        &self,
+    ) -> super::super::DurableCutStats {
+        self.durable_cut
+            .as_ref()
+            .map_or_else(super::super::DurableCutStats::default, |cut| cut.stats())
     }
 
     pub(in crate::distributed::remote_db) fn database_stats(&self) -> LocalDbStats {
@@ -225,6 +239,11 @@ impl WriteCore {
             result = self.commit_checkpoint();
         }
         self.stats.lock().shutdown.checkpoint_ns = elapsed(started);
+        // After the checkpoint: its owner syncs end every parked poll, and the
+        // checkpoint then covers everything the cut covered.
+        if let Some(cut) = &self.durable_cut {
+            cut.stop();
+        }
         let started = Instant::now();
         let read_clients = if result.is_ok() && self.transport_pool.is_some() {
             self.reads.stop_with_clients()

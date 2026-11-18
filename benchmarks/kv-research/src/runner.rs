@@ -1565,7 +1565,8 @@ async fn check_one<F: Future<Output = BackendResult<Option<Bytes>>>>(
     let request_deadline = request_deadline(deadline, timeout_ms);
     let actual = timeout_at(TokioInstant::from_std(request_deadline), future)
         .await
-        .map_err(|_| invalid(&format!("{context} timed out")))??;
+        .map_err(|_| invalid(&format!("{context} timed out")))?
+        .map_err(|source| step_error(context, source))?;
     if actual.as_ref() != expected {
         return Err(invalid(&format!(
             "{context}: returned bytes differ from expected value"
@@ -1584,7 +1585,8 @@ async fn check_many<F: Future<Output = BackendResult<Vec<Option<Bytes>>>>>(
     let request_deadline = request_deadline(deadline, timeout_ms);
     let actual = timeout_at(TokioInstant::from_std(request_deadline), future)
         .await
-        .map_err(|_| invalid(&format!("{context} timed out")))??;
+        .map_err(|_| invalid(&format!("{context} timed out")))?
+        .map_err(|source| step_error(context, source))?;
     if actual.len() != expected.len()
         || actual
             .iter()
@@ -1596,6 +1598,36 @@ async fn check_many<F: Future<Output = BackendResult<Vec<Option<Bytes>>>>>(
         )));
     }
     Ok(())
+}
+
+/// Names the failed qualification step while keeping the backend error as `source()`,
+/// so cause-chain classification (for example `is_timed_out`) still reaches it.
+#[derive(Debug)]
+struct StepError {
+    context: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for StepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for StepError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn step_error(
+    context: &str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(StepError {
+        context: context.to_owned(),
+        source,
+    })
 }
 
 pub(crate) fn request_deadline(global: Instant, timeout_ms: u64) -> Instant {
@@ -4587,6 +4619,7 @@ mod tests {
         eviction_supported: bool,
         health_failure_at: Option<usize>,
         health_calls: AtomicUsize,
+        read_failure_at: Option<usize>,
     }
 
     impl MemoryBackend {
@@ -4611,6 +4644,7 @@ mod tests {
                 observation_calls: AtomicUsize::new(0),
                 health_failure_at: None,
                 health_calls: AtomicUsize::new(0),
+                read_failure_at: None,
             }
         }
 
@@ -4632,6 +4666,19 @@ mod tests {
             } else {
                 value
             }
+        }
+
+        /// Counts GET and MGET calls together; the selected call fails with a typed cause.
+        fn count_read(&self) -> BackendResult<()> {
+            let call = self.read_count.fetch_add(1, Ordering::Relaxed);
+            if self.read_failure_at == Some(call) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "injected backend read failure",
+                )
+                .into());
+            }
+            Ok(())
         }
     }
 
@@ -4772,7 +4819,7 @@ mod tests {
             if let Some(events) = &self.profile_events {
                 events.lock().unwrap().push("read");
             }
-            self.read_count.fetch_add(1, Ordering::Relaxed);
+            self.count_read()?;
             Ok(self
                 .data
                 .lock()
@@ -4801,7 +4848,7 @@ mod tests {
         }
 
         async fn get_many(&self, keys: &[Bytes]) -> BackendResult<Vec<Option<Bytes>>> {
-            self.read_count.fetch_add(1, Ordering::Relaxed);
+            self.count_read()?;
             let data = self
                 .data
                 .lock()
@@ -6294,6 +6341,71 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /// Qualification GET/MGET substeps in call order (the memory backend supports batches).
+    const QUALIFICATION_READ_STEPS: [&str; 5] = [
+        "qualification initial read",
+        "qualification overwritten read",
+        "qualification scalar ordered get_many",
+        "qualification ordered batch read",
+        "qualification delete verification",
+    ];
+
+    #[tokio::test]
+    async fn qualification_read_errors_name_substep_and_keep_typed_source() {
+        for (call, step) in QUALIFICATION_READ_STEPS.into_iter().enumerate() {
+            let mut backend = MemoryBackend::new(false, false);
+            backend.read_failure_at = Some(call);
+            let error = qualify(
+                &backend,
+                &[3; 16],
+                42,
+                Instant::now() + Duration::from_secs(3),
+                1000,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("{step}: injected backend read failure")
+            );
+            let source = error
+                .source()
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .expect("backend error must remain the source");
+            assert_eq!(source.kind(), std::io::ErrorKind::TimedOut);
+            assert!(is_timed_out(error.as_ref()));
+            assert_eq!(backend.read_count.load(Ordering::Relaxed), call + 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qualification_read_error_substep_is_retained_in_manifest() {
+        for (call, step) in QUALIFICATION_READ_STEPS.into_iter().enumerate() {
+            let directory = result_directory(&format!("qualification-read-{call}"));
+            let mut backend = MemoryBackend::new(false, false);
+            backend.read_failure_at = Some(call);
+            let result = run(
+                backend,
+                read_test_config(),
+                &directory,
+                prometheus::Registry::new(),
+            )
+            .await;
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("manifest.json")).unwrap())
+                    .unwrap();
+            std::fs::remove_dir_all(&directory).unwrap();
+            assert!(result.is_err());
+            let failure = manifest["run"]["qualification_failure"].as_str().unwrap();
+            assert!(
+                failure.contains(&format!(
+                    "pre-workload qualification failed: {step}: injected backend read failure"
+                )),
+                "{failure}"
+            );
+        }
     }
 
     #[test]

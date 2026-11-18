@@ -20,14 +20,15 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 49)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 49)
+        self.assertEqual(len(self.jobs), 71)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 71)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
                          {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:
             campaign.validate_focused_job(job)
             self.assertTrue(job['thread_cpu_sampling'])
-            self.assertIn(job['concurrency'], (16, 64, 256))
+            concurrencies = (8, 16, 32, 64) if job['selection'] == 'nvmeof_p13_write_engine' else (16, 64, 256)
+            self.assertIn(job['concurrency'], concurrencies)
             self.assertEqual(campaign.active_owner_count(job), job['owner_count'])
             self.assertEqual(campaign.job_owner_hosts(job),
                              1 if job['owner_topology'] == 'colocated' else job['owner_count'])
@@ -150,7 +151,7 @@ class MultiOwnerTests(unittest.TestCase):
                 self.assertEqual(sizing["case_deadline_seconds"], 600)
                 continue
             if job["selection"] == "nvmeof_p9_small_put" or (
-                    job["selection"] == "nvmeof_p9_write_engine" and job["case_kind"] == "remote_put"):
+                    job["selection"] in campaign.WRITE_ENGINE_SELECTIONS and job["case_kind"] == "remote_put"):
                 self.assertEqual(sizing["measurement_seconds"],
                                  job["measurement_operations"] / sizing["rate_calls_per_second"])
             else:
@@ -163,7 +164,7 @@ class MultiOwnerTests(unittest.TestCase):
             if job["mix"]["put"]:
                 self.assertLessEqual(4096 + job["warmup_operations"] + job["measurement_operations"], 1_000_000)
         for selection in campaign.M3_SELECTIONS:
-            arms = ("file", "prewritten") if selection == "nvmeof_p9_write_engine" else (None,)
+            arms = ("file", "prewritten") if selection in campaign.WRITE_ENGINE_SELECTIONS else (None,)
             for arm in arms:
                 self.assertLessEqual(sum(job["measurement_sizing"]["expected_archive_bytes"]
                                          for job in self.jobs if job["selection"] == selection

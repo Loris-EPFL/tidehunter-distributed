@@ -18,6 +18,19 @@ const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
 // independently of WAL history size. In-flight pages keep their separate pins.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
+/// The owner request that created a live export inline, while its caller
+/// waited; selects the `LiveInlineExportStats` field it counts in.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InlineExport {
+    Reserve,
+    Lease,
+    Rollover,
+    Prelease,
+    Resolve,
+    Recover,
+    Replay,
+}
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 enum EpochState {
     Preparing,
@@ -83,6 +96,155 @@ fn open_live_target_fixture(
     }
 }
 
+/// What the lifecycle gate owns: the live target registry when one is
+/// configured. Builds without the Linux NVMe-oF feature own nothing; the gate
+/// still serializes their epoch lifecycle.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(super) type LifecycleSlot = Option<super::super::nvmeof::live_target::LiveTargetManager>;
+#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+pub(super) type LifecycleSlot = ();
+
+/// The node lifecycle gate. It is the single writer of the node's durable
+/// lifecycle metadata: the epoch manifest, the set of logs, live bindings and
+/// pins, and the live target registry (state journal, configfs objects and
+/// sealed markers). It is held across their file and directory syncs, so
+/// their records reach disk in the order they were decided, and each effect
+/// that needs a durable record (a configfs object, an export, a revocation)
+/// runs only after that record's sync returned.
+///
+/// Lock order: `nvmeof_leases` → lifecycle gate → `NodeInventory` →
+/// `readers`. The inventory mutex is never held across a sync: holders of the
+/// gate release it for every I/O step (`InventoryAccess::released`) and
+/// retake it only to read or install state. The gate is never taken while the
+/// inventory is held. Foreground work (appends, live completions, position
+/// proofs, grant lookups) takes only the inventory, so it never waits for a
+/// sync. The file preparer only `try_lock`s the gate, because fence, seal and
+/// final shutdown join it while they hold the gate.
+pub(super) type LifecycleGate = Arc<Mutex<LifecycleSlot>>;
+
+/// Access to an inventory that a lifecycle step may release during I/O.
+pub(super) trait InventoryAccess: std::ops::DerefMut<Target = NodeInventory> {
+    /// Run `io` without the inventory mutex, then take it again.
+    fn released<R>(&mut self, io: impl FnOnce() -> R) -> R;
+}
+
+/// A shared inventory: release the mutex across the I/O. The caller holds the
+/// lifecycle gate, so between the two halves other threads can only read.
+impl InventoryAccess for parking_lot::MutexGuard<'_, NodeInventory> {
+    fn released<R>(&mut self, io: impl FnOnce() -> R) -> R {
+        parking_lot::MutexGuard::unlocked(self, io)
+    }
+}
+
+/// An exclusively owned inventory (opening, offline tools and tests): no
+/// other thread can observe it, so there is no lock to release.
+impl InventoryAccess for &mut NodeInventory {
+    fn released<R>(&mut self, io: impl FnOnce() -> R) -> R {
+        io()
+    }
+}
+
+/// The configured live target of a gated lifecycle step: `None` for a node
+/// without one. A live inventory reached without its gate content (an owned
+/// inventory, or a caller that skipped the gate) is refused, never skipped.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn live_target<'a>(
+    inventory: &NodeInventory,
+    slot: &'a mut LifecycleSlot,
+) -> Result<Option<&'a mut super::super::nvmeof::live_target::LiveTargetManager>, TcpError> {
+    match (inventory.live_export_mode.is_some(), slot.as_mut()) {
+        (false, None) => Ok(None),
+        (true, Some(target)) => Ok(Some(target)),
+        _ => Err(TcpError::new(
+            "live target lifecycle requires the node lifecycle gate",
+        )),
+    }
+}
+
+/// History settings that every new or recovered log of this node receives.
+/// Captured under the inventory and applied to a log that is not yet
+/// published, so the inventory can be released while the log is opened.
+struct LogSettings {
+    diagnostics: bool,
+    persistence: crate::distributed::storage::HistoryPersistence,
+    notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl LogSettings {
+    fn apply(&self, log: &PartitionLog) -> Result<(), TcpError> {
+        log.set_history_maintenance_diagnostics(self.diagnostics);
+        log.set_history_persistence(self.persistence)
+            .map_err(TcpError::component)?;
+        if let Some(notifier) = &self.notifier {
+            log.set_history_failure_notifier(notifier.clone());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+type LiveTarget = super::super::nvmeof::live_target::LiveTargetManager;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+type LiveBinding = (
+    super::super::nvmeof::live_storage::LiveWalSegment,
+    super::super::nvmeof::live_target::LiveTargetBinding,
+    bool,
+);
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn live_file(
+    segment: &super::super::nvmeof::live_storage::LiveWalSegment,
+) -> super::super::nvmeof::live_target::LiveFileIdentity {
+    super::super::nvmeof::live_target::LiveFileIdentity {
+        path: segment.path.clone(),
+        device: segment.device,
+        inode: segment.inode,
+        bytes: segment.bytes,
+        block_size: segment.block_size,
+    }
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn export_span(
+    segment: &super::super::nvmeof::live_storage::LiveWalSegment,
+) -> super::super::owner_events::OwnerEventSpan {
+    super::super::owner_events::OwnerEventSpan::new(
+        super::super::owner_events::OwnerEventKind::ExportStart,
+        super::super::owner_events::OwnerEventKind::ExportEnd,
+        segment.partition,
+        segment.file_index,
+        segment.inode,
+    )
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn revoke_span(
+    segment: &super::super::nvmeof::live_storage::LiveWalSegment,
+) -> super::super::owner_events::OwnerEventSpan {
+    super::super::owner_events::OwnerEventSpan::new(
+        super::super::owner_events::OwnerEventKind::RevokeStart,
+        super::super::owner_events::OwnerEventKind::RevokeEnd,
+        segment.partition,
+        segment.file_index,
+        segment.inode,
+    )
+}
+
+/// Revoke claimed bindings with one fence and one cleanup pass. Runs with the
+/// inventory released and the lifecycle gate held.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn revoke_bindings<'a>(
+    target: &mut LiveTarget,
+    claimed: impl Iterator<Item = &'a LiveBinding>,
+) -> Result<(), TcpError> {
+    let (spans, bindings): (Vec<_>, Vec<_>) = claimed
+        .map(|(segment, binding, _)| (revoke_span(segment), binding))
+        .unzip();
+    target.revoke_all(&bindings).map_err(TcpError::component)?;
+    drop(spans);
+    Ok(())
+}
+
 pub struct NodeInventory {
     pub(super) config: NodeConfig,
     pub(super) shape: KeyShape,
@@ -95,11 +257,18 @@ pub struct NodeInventory {
     history_diagnostics: bool,
     history_persistence: crate::distributed::storage::HistoryPersistence,
     history_failure_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+    // Kernel boot of this owner process, read once at open.
+    boot_id: [u8; 16],
     // Partition handles each retain this root lock as well.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
+    /// Export mode of the installed live target; `None` when no live target is
+    /// configured. Immutable after installation, so reading it needs no gate.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) live_target: Option<super::super::nvmeof::live_target::LiveTargetManager>,
+    pub(super) live_export_mode: Option<super::super::nvmeof::LiveExportMode>,
+    /// Cloned out at node open. Never locked by inventory methods: callers
+    /// take it before the inventory (see `LifecycleGate`).
+    pub(super) lifecycle: LifecycleGate,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_shutdown: bool,
     // Keep preparation costs when fencing replaces an active log with recovery.
@@ -109,6 +278,10 @@ pub struct NodeInventory {
     retired_prewrite_ns: u64,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     retired_prewrite_files: u64,
+    // Changed only under this inventory's lock, when an export's binding is
+    // installed.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) inline_exports: LiveInlineExportStats,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_bindings: BTreeMap<
         (u64, u64),
@@ -577,10 +750,15 @@ impl NodeInventory {
             history_diagnostics: false,
             history_persistence,
             history_failure_notifier: None,
+            boot_id: super::durable_progress::read_boot_id()?,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_leases,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            live_target,
+            live_export_mode: live_target.as_ref().map(|target| target.export_mode()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            lifecycle: Arc::new(Mutex::new(live_target)),
+            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+            lifecycle: Arc::new(Mutex::new(())),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_shutdown: false,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -589,6 +767,8 @@ impl NodeInventory {
             retired_prewrite_ns: 0,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             retired_prewrite_files: 0,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            inline_exports: LiveInlineExportStats::default(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_bindings: BTreeMap::new(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -609,15 +789,32 @@ impl NodeInventory {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn set_history_persistence(
         &mut self,
         mode: crate::distributed::storage::HistoryPersistence,
     ) -> Result<(), TcpError> {
-        for log in self.logs.values() {
-            log.set_history_persistence(mode)
-                .map_err(TcpError::component)?;
-        }
-        self.history_persistence = mode;
+        let mut inventory = self;
+        Self::switch_history_persistence(&mut inventory, mode)
+    }
+
+    /// Switch every retained log, then record the mode for later logs. The
+    /// switch can install or remove a WAL root and sync its directory, so it
+    /// runs with the inventory released. The caller holds the lifecycle gate
+    /// (or owns the inventory), which also orders it against log creation.
+    pub(super) fn switch_history_persistence<H: InventoryAccess>(
+        inventory: &mut H,
+        mode: crate::distributed::storage::HistoryPersistence,
+    ) -> Result<(), TcpError> {
+        let logs: Vec<_> = inventory.logs.values().cloned().collect();
+        inventory.released(|| {
+            for log in &logs {
+                log.set_history_persistence(mode)
+                    .map_err(TcpError::component)?;
+            }
+            Ok::<_, TcpError>(())
+        })?;
+        inventory.history_persistence = mode;
         Ok(())
     }
 
@@ -652,7 +849,7 @@ impl NodeInventory {
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn recoverable_status(&self) -> Result<NodeStatus, TcpError> {
-        if !self.healthy || self.live_target.is_none() || self.live_shutdown {
+        if !self.healthy || self.live_export_mode.is_none() || self.live_shutdown {
             return Err(TcpError::new("live owner requires restart"));
         }
         self.status_snapshot(false)
@@ -685,31 +882,42 @@ impl NodeInventory {
             recovery_page_batches: 1024,
             polling: PollingPolicy::Adaptive,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            live_nvmeof: self.live_target.is_some() && !self.live_shutdown,
+            live_nvmeof: self.live_export_mode.is_some() && !self.live_shutdown,
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
             live_nvmeof: false,
+            // The control owner holds the tier; it sets this field in its replies.
+            durability_tier: super::super::durability::DurabilityTier::default(),
+            boot_id: self.boot_id,
+            // Every log this process recovered stays in `logs` (a live fence
+            // replaces the old handle with its recovery), so this covers every
+            // recovery since start.
+            recovery_clean: !self.logs.values().any(|log| log.recovery_found_hole()),
         })
     }
+    /// Fence an exclusively owned inventory. A live inventory needs its target
+    /// registry: use `fence` with the lifecycle gate instead.
     pub fn fence_to(&mut self, epoch: u64) -> Result<NodeStatus, TcpError> {
-        self.fence_to_inner(epoch, false, |_| Ok(()))
+        let mut inventory = self;
+        Self::fence(
+            &mut inventory,
+            &mut LifecycleSlot::default(),
+            epoch,
+            false,
+            |_| Ok(()),
+        )
     }
+    /// Live recovery fence after a recoverable live failure. Same gate contract
+    /// as `fence`.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn fence_to_with_drain(
-        &mut self,
+    pub(super) fn fence_recoverable_live<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
         epoch: u64,
         drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<NodeStatus, TcpError> {
-        self.fence_to_inner(epoch, false, drain_log)
-    }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn fence_recoverable_live(
-        &mut self,
-        epoch: u64,
-        drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
-    ) -> Result<NodeStatus, TcpError> {
-        if !self.healthy
-            || self.live_target.is_none()
-            || !self
+        if !inventory.healthy
+            || inventory.live_export_mode.is_none()
+            || !inventory
                 .manifest
                 .epochs
                 .last()
@@ -719,31 +927,38 @@ impl NodeInventory {
                 "live recovery requires a strictly higher authority epoch",
             ));
         }
-        self.fence_to_inner(epoch, true, drain_log)
+        Self::fence(inventory, slot, epoch, true, drain_log)
     }
-    fn fence_to_inner(
-        &mut self,
+    /// Fence to `epoch`. The caller holds the lifecycle gate (`slot` is its
+    /// content) or owns the inventory exclusively. Every sync runs with the
+    /// inventory released; the gate keeps the manifest and log set single
+    /// writer, and `healthy` stays false until the new epoch is installed.
+    /// `drain_log` joins the control owner's workers of the old live log after
+    /// target revocation and before the log is scanned.
+    pub(super) fn fence<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
         epoch: u64,
         recovering: bool,
-        _drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
+        drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<NodeStatus, TcpError> {
         if !recovering {
-            self.ensure_healthy()?;
+            inventory.ensure_healthy()?;
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_shutdown {
+        if inventory.live_shutdown {
             return Err(TcpError::new("live target has shut down; reopen required"));
         }
-        if self
+        if inventory
             .manifest
             .epochs
             .last()
             .is_some_and(|e| e.epoch == epoch && e.state == EpochState::Active)
         {
-            return self.status();
+            return inventory.status();
         }
         if epoch == 0
-            || self
+            || inventory
                 .manifest
                 .epochs
                 .last()
@@ -753,29 +968,35 @@ impl NodeInventory {
                 "epoch already fenced/sealed; cannot reactivate",
             ));
         }
-        if self.manifest.epochs.len() == self.config.max_epochs {
+        if inventory.manifest.epochs.len() == inventory.config.max_epochs {
             return Err(TcpError::new("retained node epoch capacity reached"));
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_target.is_some() {
+        let target = live_target(inventory, slot)?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let live = target.is_some();
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Some(target) = target {
             // The new authority fences the prior coordinator before any old
             // allocation is scanned or its namespace-backed pins are dropped.
-            self.healthy = false;
+            inventory.healthy = false;
             {
-                let mut readers = self.readers.write();
+                let mut readers = inventory.readers.write();
                 readers.invalidate();
                 readers.logs.clear();
             }
-            self.revoke_live_targets()?;
-            self.fenced_export_pins.extend(
-                self.live_export_pins
+            Self::revoke_live_targets(inventory, target)?;
+            let inventory = &mut **inventory;
+            inventory.fenced_export_pins.extend(
+                inventory
+                    .live_export_pins
                     .iter()
                     .map(|(token, (epoch, _))| (*token, *epoch)),
             );
-            self.live_pins.clear();
-            self.live_export_pins.clear();
+            inventory.live_pins.clear();
+            inventory.live_export_pins.clear();
         }
-        if let Some(old) = self
+        if let Some(old) = inventory
             .manifest
             .epochs
             .last()
@@ -783,112 +1004,122 @@ impl NodeInventory {
             .copied()
         {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            if self.live_target.is_some() {
+            if live {
                 // Revocation and pin release above fence external writers/readers.
                 // Join the control owner's syncer too: both its slot and callback
                 // retain this log and its partition lock until the worker exits.
-                _drain_log(
-                    self.logs
-                        .get(&old.epoch)
-                        .ok_or_else(|| TcpError::new("active live stream missing"))?,
-                )?;
-                let previous = self
+                let draining = inventory
+                    .logs
+                    .get(&old.epoch)
+                    .cloned()
+                    .ok_or_else(|| TcpError::new("active live stream missing"))?;
+                inventory.released(|| drain_log(&draining))?;
+                drop(draining);
+                let previous = inventory
                     .logs
                     .remove(&old.epoch)
                     .ok_or_else(|| TcpError::new("active live stream missing"))?;
                 if Arc::strong_count(&previous) != 1 {
-                    self.logs.insert(old.epoch, previous);
+                    inventory.logs.insert(old.epoch, previous);
                     return Err(TcpError::new(
                         "old live stream still has outstanding handles; reopen required",
                     ));
                 }
                 let preparation = previous.live_file_preparation_stats();
-                self.retired_prewrite_bytes = self
+                inventory.retired_prewrite_bytes = inventory
                     .retired_prewrite_bytes
                     .saturating_add(preparation.live_file_prewrite_bytes);
-                self.retired_prewrite_ns = self
+                inventory.retired_prewrite_ns = inventory
                     .retired_prewrite_ns
                     .saturating_add(preparation.live_file_prewrite_ns);
-                self.retired_prewrite_files = self
+                inventory.retired_prewrite_files = inventory
                     .retired_prewrite_files
                     .saturating_add(preparation.live_file_prewrite_files);
                 drop(previous);
-                let path = epoch_path(&self.config.root, old.epoch);
-                let expected = partition_at(&self.config.partition, old.epoch);
+                let path = epoch_path(&inventory.config.root, old.epoch);
+                let expected = partition_at(&inventory.config.partition, old.epoch);
+                let metrics = inventory.metrics.clone();
+                let authority = inventory.lock.clone();
+                let settings = inventory.log_settings();
                 // All target capabilities were synchronously drained above.
                 // The core opens its own partition DbLock; no lock is bypassed.
-                let log = PartitionLog::recover_live_sealed(
-                    &path,
-                    &expected,
-                    self.metrics.clone(),
-                    || Ok(()),
-                )
-                .map_err(TcpError::component)?;
-                let log = Arc::new(log.retain_local_authority(self.lock.clone()));
-                log.set_history_maintenance_diagnostics(self.history_diagnostics);
-                log.set_history_persistence(self.history_persistence)
-                    .map_err(TcpError::component)?;
-                if let Some(notifier) = &self.history_failure_notifier {
-                    log.set_history_failure_notifier(notifier.clone());
-                }
-                self.logs.insert(old.epoch, log);
-                self.manifest.epochs.last_mut().unwrap().state = EpochState::Sealed;
-                persist(&self.config.root, &self.manifest)?;
-                self.healthy = true;
+                let log = inventory.released(|| {
+                    let log =
+                        PartitionLog::recover_live_sealed(&path, &expected, metrics, || Ok(()))
+                            .map_err(TcpError::component)?;
+                    let log = Arc::new(log.retain_local_authority(authority));
+                    settings.apply(&log)?;
+                    Ok::<_, TcpError>(log)
+                })?;
+                inventory.logs.insert(old.epoch, log);
+                inventory.manifest.epochs.last_mut().unwrap().state = EpochState::Sealed;
+                Self::persist_manifest(inventory)?;
+                inventory.healthy = true;
             } else {
-                self.seal(old.epoch)?;
+                Self::seal_epoch(inventory, slot, old.epoch, |_| Ok(()))?;
             }
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            self.seal(old.epoch)?;
+            Self::seal_epoch(inventory, slot, old.epoch, |_| Ok(()))?;
         }
-        self.healthy = false;
-        self.readers.write().invalidate();
-        self.manifest.epochs.push(Epoch {
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        let _ = &drain_log;
+        inventory.healthy = false;
+        inventory.readers.write().invalidate();
+        inventory.manifest.epochs.push(Epoch {
             epoch,
             state: EpochState::Preparing,
         });
-        persist(&self.config.root, &self.manifest)?;
+        Self::persist_manifest(inventory)?;
+        let path = epoch_path(&inventory.config.root, epoch);
+        let partition = partition_at(&inventory.config.partition, epoch);
+        let shape = inventory.shape.clone();
+        let metrics = inventory.metrics.clone();
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let log = if self.live_target.is_some() {
-            PartitionLog::create_live_with_prewrite(
-                &epoch_path(&self.config.root, epoch),
-                partition_at(&self.config.partition, epoch),
-                &self.shape,
-                self.metrics.clone(),
-                self.config.wal_prewrite,
-            )
-        } else {
-            PartitionLog::create(
-                &epoch_path(&self.config.root, epoch),
-                partition_at(&self.config.partition, epoch),
-                &self.shape,
-                self.metrics.clone(),
-            )
-        };
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let log = PartitionLog::create(
-            &epoch_path(&self.config.root, epoch),
-            partition_at(&self.config.partition, epoch),
-            &self.shape,
-            self.metrics.clone(),
-        );
-        let log = log.map_err(TcpError::component)?;
-        let log = Arc::new(log.retain_local_authority(self.lock.clone()));
-        log.set_history_maintenance_diagnostics(self.history_diagnostics);
-        log.set_history_persistence(self.history_persistence)
-            .map_err(TcpError::component)?;
-        if let Some(notifier) = &self.history_failure_notifier {
-            log.set_history_failure_notifier(notifier.clone());
-        }
-        self.manifest.epochs.last_mut().unwrap().state = EpochState::Active;
-        persist(&self.config.root, &self.manifest)?;
-        self.logs.insert(epoch, log);
-        self.readers.write().publish(epoch, &self.logs);
-        self.healthy = true;
+        let prewrite = inventory.config.wal_prewrite;
+        let authority = inventory.lock.clone();
+        let settings = inventory.log_settings();
+        let log = inventory.released(|| {
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let log = if live {
+                PartitionLog::create_live_with_prewrite(&path, partition, &shape, metrics, prewrite)
+            } else {
+                PartitionLog::create(&path, partition, &shape, metrics)
+            };
+            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+            let log = PartitionLog::create(&path, partition, &shape, metrics);
+            let log = Arc::new(
+                log.map_err(TcpError::component)?
+                    .retain_local_authority(authority),
+            );
+            settings.apply(&log)?;
+            Ok::<_, TcpError>(log)
+        })?;
+        inventory.manifest.epochs.last_mut().unwrap().state = EpochState::Active;
+        Self::persist_manifest(inventory)?;
+        let inventory = &mut **inventory;
+        inventory.logs.insert(epoch, log);
+        inventory.readers.write().publish(epoch, &inventory.logs);
+        inventory.healthy = true;
         if recovering {
-            self.terminal.store(false, Ordering::Release);
+            inventory.terminal.store(false, Ordering::Release);
         }
-        self.status()
+        inventory.status()
+    }
+    /// Install the manifest with the inventory released. Only lifecycle gate
+    /// holders change the manifest, so installs happen in decision order.
+    fn persist_manifest<H: InventoryAccess>(inventory: &mut H) -> Result<(), TcpError> {
+        let bytes = encode_metadata(&inventory.manifest).map_err(TcpError::component)?;
+        let root = inventory.config.root.clone();
+        inventory
+            .released(|| install_metadata(&root, MANIFEST, &bytes))
+            .map_err(TcpError::component)
+    }
+    fn log_settings(&self) -> LogSettings {
+        LogSettings {
+            diagnostics: self.history_diagnostics,
+            persistence: self.history_persistence,
+            notifier: self.history_failure_notifier.clone(),
+        }
     }
     pub(super) fn active(&self, epoch: u64) -> Result<Arc<PartitionLog>, TcpError> {
         self.ensure_healthy()?;
@@ -920,122 +1151,129 @@ impl NodeInventory {
             .map_err(TcpError::component)?)
     }
 
+    /// Revoke idle writable on-demand exports of `epoch`. The caller holds the
+    /// lifecycle gate; the claimed bindings leave `live_bindings` before the
+    /// inventory is released, so no pin can attach to a namespace that is
+    /// being revoked, and they return if the revocation fails.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn reap_idle_live_segments(&mut self, epoch: u64) -> Result<(), TcpError> {
-        let log = self.active(epoch)?;
+    pub(super) fn reap_idle_live_segments<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
+        epoch: u64,
+    ) -> Result<(), TcpError> {
         let mut revoke = Vec::new();
-        for (&key, (_, binding, writable)) in &self.live_bindings {
-            if key.0 == epoch
-                && *writable
-                && !binding.permanent
-                && !self.live_export_pins.values().any(|(_, file)| *file == key)
-                && !self.live_pins.values().any(|(_, leases)| {
-                    leases
-                        .iter()
-                        .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
-                })
-                && log
-                    .can_release_live_segment(key.1)
-                    .map_err(TcpError::component)?
-            {
-                revoke.push(key);
+        {
+            let inventory: &NodeInventory = inventory;
+            let log = inventory.active(epoch)?;
+            for (&key, (_, binding, writable)) in &inventory.live_bindings {
+                if key.0 == epoch
+                    && *writable
+                    && !binding.permanent
+                    && !inventory
+                        .live_export_pins
+                        .values()
+                        .any(|(_, file)| *file == key)
+                    && !inventory.live_pins.values().any(|(_, leases)| {
+                        leases
+                            .iter()
+                            .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
+                    })
+                    && log
+                        .can_release_live_segment(key.1)
+                        .map_err(TcpError::component)?
+                {
+                    revoke.push(key);
+                }
             }
         }
         if revoke.is_empty() {
             return Ok(());
         }
-        let mut spans = Vec::with_capacity(revoke.len());
-        let mut bindings = Vec::with_capacity(revoke.len());
-        for key in &revoke {
-            let (segment, binding, _) = self
-                .live_bindings
-                .get(key)
-                .ok_or_else(|| TcpError::new("live binding disappeared"))?;
-            spans.push(super::super::owner_events::OwnerEventSpan::new(
-                super::super::owner_events::OwnerEventKind::RevokeStart,
-                super::super::owner_events::OwnerEventKind::RevokeEnd,
-                segment.partition,
-                segment.file_index,
-                segment.inode,
-            ));
-            bindings.push(binding);
+        let claimed: Vec<_> = revoke
+            .iter()
+            .filter_map(|key| inventory.live_bindings.remove_entry(key))
+            .collect();
+        let result = inventory.released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
+        if result.is_err() {
+            inventory.live_bindings.extend(claimed);
         }
-        self.live_target
-            .as_mut()
-            .ok_or_else(|| TcpError::new("live target disappeared"))?
-            .revoke_all(&bindings)
-            .map_err(TcpError::component)?;
-        drop(spans);
-        for key in revoke {
-            self.live_bindings.remove(&key);
-        }
-        Ok(())
+        result
     }
 
+    /// Count one export that `kind` created inline.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn publish_live_segment(
-        &mut self,
+    pub(super) fn record_inline_export(&mut self, kind: InlineExport) {
+        let stats = &mut self.inline_exports;
+        let count = match kind {
+            InlineExport::Reserve => &mut stats.reserve,
+            InlineExport::Lease => &mut stats.lease,
+            InlineExport::Rollover => &mut stats.rollover,
+            InlineExport::Prelease => &mut stats.prelease,
+            InlineExport::Resolve => &mut stats.resolve,
+            InlineExport::Recover => &mut stats.recover,
+            InlineExport::Replay => &mut stats.replay,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// Return the binding of `segment`, exporting it if needed and counting
+    /// the export for the request `kind`. The caller holds the lifecycle gate;
+    /// the export's journal syncs and configfs work run with the inventory
+    /// released, and the binding is installed after.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn publish_live_segment<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
         segment: &super::super::nvmeof::live_storage::LiveWalSegment,
         writable: bool,
+        kind: InlineExport,
     ) -> Result<super::super::nvmeof::live_target::LiveTargetBinding, TcpError> {
-        use super::super::nvmeof::live_target::LiveFileIdentity;
         let key = (segment.epoch, segment.file_index);
-        if let Some((existing, binding, was_writable)) = self.live_bindings.get(&key) {
+        if let Some((existing, binding, was_writable)) = inventory.live_bindings.get(&key) {
             if existing != segment || (writable && !was_writable) {
                 return Err(TcpError::new("live segment identity or access changed"));
             }
-            self.idle_history_exports.retain(|idle| *idle != key);
-            return Ok(binding.clone());
+            let binding = binding.clone();
+            inventory.idle_history_exports.retain(|idle| *idle != key);
+            return Ok(binding);
         }
-        let target = self
-            .live_target
-            .as_mut()
-            .ok_or_else(|| TcpError::new("live target not configured"))?;
-        let file = LiveFileIdentity {
-            path: segment.path.clone(),
-            device: segment.device,
-            inode: segment.inode,
-            bytes: segment.bytes,
-            block_size: segment.block_size,
-        };
-        let export_span = super::super::owner_events::OwnerEventSpan::new(
-            super::super::owner_events::OwnerEventKind::ExportStart,
-            super::super::owner_events::OwnerEventKind::ExportEnd,
-            segment.partition,
-            segment.file_index,
-            segment.inode,
-        );
-        let binding = if writable {
-            target.export_writable(file)
-        } else {
-            target.export_readonly(file)
-        }
-        .map_err(TcpError::component)?;
+        let file = live_file(segment);
+        let export_span = export_span(segment);
+        let binding = inventory
+            .released(|| {
+                if writable {
+                    target.export_writable(file)
+                } else {
+                    target.export_readonly(file)
+                }
+            })
+            .map_err(TcpError::component)?;
         export_span.end_at(segment.file_index);
-        self.live_bindings
+        inventory.record_inline_export(kind);
+        inventory
+            .live_bindings
             .insert(key, (segment.clone(), binding.clone(), writable));
         Ok(binding)
     }
 
+    /// Same gate contract as `publish_live_segment`, for permanent exports.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn publish_permanent_segment(
-        &mut self,
+    pub(super) fn publish_permanent_segment<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
         segment: &super::super::nvmeof::live_storage::LiveWalSegment,
     ) -> Result<(super::super::nvmeof::live_target::LiveTargetBinding, bool), TcpError> {
-        use super::super::nvmeof::{live_storage::wal_export_name, live_target::LiveFileIdentity};
+        use super::super::nvmeof::live_storage::wal_export_name;
         let key = (segment.epoch, segment.file_index);
-        if let Some((existing, binding, writable)) = self.live_bindings.get(&key) {
+        if let Some((existing, binding, writable)) = inventory.live_bindings.get(&key) {
             if existing != segment || !writable {
                 return Err(TcpError::new("live segment identity or access changed"));
             }
             return Ok((binding.clone(), false));
         }
-        let target = self
-            .live_target
-            .as_mut()
-            .ok_or_else(|| TcpError::new("live target not configured"))?;
-        let files = target
-            .export_mode()
+        let files = inventory
+            .live_export_mode
+            .ok_or_else(|| TcpError::new("live target not configured"))?
             .files_per_subsystem()
             .ok_or_else(|| TcpError::new("permanent live export is not configured"))?;
         let name = wal_export_name(
@@ -1045,87 +1283,59 @@ impl NodeInventory {
             segment.epoch,
             segment.file_index,
         );
-        let export_span = super::super::owner_events::OwnerEventSpan::new(
-            super::super::owner_events::OwnerEventKind::ExportStart,
-            super::super::owner_events::OwnerEventKind::ExportEnd,
-            segment.partition,
-            segment.file_index,
-            segment.inode,
-        );
-        let binding = target
-            .export_permanent(
-                &name,
-                LiveFileIdentity {
-                    path: segment.path.clone(),
-                    device: segment.device,
-                    inode: segment.inode,
-                    bytes: segment.bytes,
-                    block_size: segment.block_size,
-                },
-            )
+        let file = live_file(segment);
+        let export_span = export_span(segment);
+        let binding = inventory
+            .released(|| target.export_permanent(&name, file))
             .map_err(TcpError::component)?;
         export_span.end_at(segment.file_index);
-        self.live_bindings
+        inventory
+            .live_bindings
             .insert(key, (segment.clone(), binding.clone(), true));
         Ok((binding, true))
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn revoke_live_targets(&mut self) -> Result<(), TcpError> {
-        let Some(target) = self.live_target.as_mut() else {
-            return Ok(());
-        };
-        let (spans, bindings): (Vec<_>, Vec<_>) = self
-            .live_bindings
-            .values()
-            .map(|(segment, binding, _)| {
-                let span = super::super::owner_events::OwnerEventSpan::new(
-                    super::super::owner_events::OwnerEventKind::RevokeStart,
-                    super::super::owner_events::OwnerEventKind::RevokeEnd,
-                    segment.partition,
-                    segment.file_index,
-                    segment.inode,
-                );
-                (span, binding)
-            })
-            .unzip();
-        target.revoke_all(&bindings).map_err(TcpError::component)?;
-        drop(spans);
-        self.live_bindings.clear();
-        self.idle_history_exports.clear();
-        Ok(())
+    fn revoke_live_targets<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
+    ) -> Result<(), TcpError> {
+        let claimed = std::mem::take(&mut inventory.live_bindings);
+        let idle = std::mem::take(&mut inventory.idle_history_exports);
+        let result = inventory.released(|| revoke_bindings(target, claimed.values()));
+        if result.is_err() {
+            inventory.live_bindings = claimed;
+            inventory.idle_history_exports = idle;
+        }
+        result
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn revoke_live_files(&mut self, epoch: u64, files: &[u64]) -> Result<(), TcpError> {
-        let Some(target) = self.live_target.as_mut() else {
-            return Ok(());
+    fn revoke_live_files<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
+        epoch: u64,
+        files: &[u64],
+    ) -> Result<(), TcpError> {
+        let bytes = inventory.config.partition.wal_file_bytes;
+        let retired = |(binding_epoch, file): &(u64, u64)| {
+            *binding_epoch == epoch && files.contains(&(file * bytes))
         };
-        let bytes = self.config.partition.wal_file_bytes;
-        let (spans, bindings): (Vec<_>, Vec<_>) = self
+        let keys: Vec<_> = inventory
             .live_bindings
+            .keys()
+            .copied()
+            .filter(&retired)
+            .collect();
+        let claimed: Vec<_> = keys
             .iter()
-            .filter(|((binding_epoch, file), _)| {
-                *binding_epoch == epoch && files.contains(&(file * bytes))
-            })
-            .map(|(_, (segment, binding, _))| {
-                let span = super::super::owner_events::OwnerEventSpan::new(
-                    super::super::owner_events::OwnerEventKind::RevokeStart,
-                    super::super::owner_events::OwnerEventKind::RevokeEnd,
-                    segment.partition,
-                    segment.file_index,
-                    segment.inode,
-                );
-                (span, binding)
-            })
-            .unzip();
-        target.revoke_all(&bindings).map_err(TcpError::component)?;
-        drop(spans);
-        self.live_bindings.retain(|(binding_epoch, file), _| {
-            *binding_epoch != epoch || !files.contains(&(file * bytes))
-        });
-        self.idle_history_exports.retain(|(binding_epoch, file)| {
-            *binding_epoch != epoch || !files.contains(&(file * bytes))
-        });
+            .filter_map(|key| inventory.live_bindings.remove_entry(key))
+            .collect();
+        let result = inventory.released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
+        if result.is_err() {
+            inventory.live_bindings.extend(claimed);
+            return result;
+        }
+        inventory.idle_history_exports.retain(|key| !retired(key));
         Ok(())
     }
 
@@ -1165,14 +1375,16 @@ impl NodeInventory {
         Ok(token)
     }
 
+    /// The caller holds the lifecycle gate; `target` is its content.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn release_live_export_pin(
-        &mut self,
+    pub(super) fn release_live_export_pin<H: InventoryAccess>(
+        inventory: &mut H,
+        target: Option<&mut LiveTarget>,
         epoch: u64,
         token: [u8; 16],
     ) -> Result<(), TcpError> {
-        let Some(&(authority, key)) = self.live_export_pins.get(&token) else {
-            return if self.fenced_export_pins.get(&token) == Some(&epoch) {
+        let Some(&(authority, key)) = inventory.live_export_pins.get(&token) else {
+            return if inventory.fenced_export_pins.get(&token) == Some(&epoch) {
                 Ok(())
             } else {
                 Err(TcpError::new("unknown live export pin"))
@@ -1183,24 +1395,32 @@ impl NodeInventory {
                 "export pin belongs to another authority epoch",
             ));
         }
-        self.release_live_bindings([key], Some(token))?;
-        self.live_export_pins.remove(&token);
+        Self::release_live_bindings(inventory, target, [key], Some(token))?;
+        inventory.live_export_pins.remove(&token);
         Ok(())
     }
 
+    /// The caller holds the lifecycle gate; `target` is its content.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn release_live_pin(&mut self, epoch: u64, token: [u8; 16]) -> Result<(), TcpError> {
-        let Some((owner, _)) = self.live_pins.get(&token) else {
+    pub(super) fn release_live_pin<H: InventoryAccess>(
+        inventory: &mut H,
+        target: Option<&mut LiveTarget>,
+        epoch: u64,
+        token: [u8; 16],
+    ) -> Result<(), TcpError> {
+        let Some((owner, _)) = inventory.live_pins.get(&token) else {
             return Ok(());
         };
         if *owner != epoch {
             return Err(TcpError::new("live pin belongs to another authority epoch"));
         }
-        let (authority, leases) = self
+        let (authority, leases) = inventory
             .live_pins
             .remove(&token)
             .ok_or_else(|| TcpError::new("live pin disappeared"))?;
-        let result = self.release_live_bindings(
+        let result = Self::release_live_bindings(
+            inventory,
+            target,
             leases
                 .iter()
                 .map(|lease| (lease.segment.epoch, lease.segment.file_index)),
@@ -1209,117 +1429,110 @@ impl NodeInventory {
         if result.is_err() {
             // A revoke can fail after a partial target change. Restore the
             // record leases, keeping their inode/read pins until a fence.
-            self.live_pins.insert(token, (authority, leases));
+            inventory.live_pins.insert(token, (authority, leases));
         }
         result
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn release_live_bindings(
-        &mut self,
+    fn release_live_bindings<H: InventoryAccess>(
+        inventory: &mut H,
+        mut target: Option<&mut LiveTarget>,
         keys: impl IntoIterator<Item = (u64, u64)>,
         export_token: Option<[u8; 16]>,
     ) -> Result<(), TcpError> {
         let mut revoke = std::collections::BTreeSet::new();
         let mut retain = std::collections::BTreeSet::new();
-        for key in keys {
-            let releasable = match self.live_bindings.get(&key) {
-                Some((_, binding, _)) if binding.permanent => false,
-                Some((_, _, false)) => self
-                    .live_target
-                    .as_ref()
-                    .is_none_or(|target| target.export_mode().files_per_subsystem().is_none()),
-                Some((_, _, true)) => self
-                    .logs
-                    .get(&key.0)
-                    .ok_or_else(|| TcpError::new("live segment stream absent"))?
-                    .can_release_live_segment(key.1)
-                    .map_err(TcpError::component)?,
-                None => false,
-            };
-            if !self.live_pins.values().any(|(_, leases)| {
-                leases
+        {
+            let inventory: &NodeInventory = inventory;
+            for key in keys {
+                let releasable = match inventory.live_bindings.get(&key) {
+                    Some((_, binding, _)) if binding.permanent => false,
+                    Some((_, _, false)) => inventory
+                        .live_export_mode
+                        .is_none_or(|mode| mode.files_per_subsystem().is_none()),
+                    Some((_, _, true)) => inventory
+                        .logs
+                        .get(&key.0)
+                        .ok_or_else(|| TcpError::new("live segment stream absent"))?
+                        .can_release_live_segment(key.1)
+                        .map_err(TcpError::component)?,
+                    None => false,
+                };
+                if !inventory.live_pins.values().any(|(_, leases)| {
+                    leases
+                        .iter()
+                        .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
+                }) && !inventory
+                    .live_export_pins
                     .iter()
-                    .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
-            }) && !self
-                .live_export_pins
-                .iter()
-                .any(|(other, (_, file))| Some(*other) != export_token && *file == key)
-            {
-                if releasable {
-                    revoke.insert(key);
-                } else if self
-                    .live_bindings
-                    .get(&key)
-                    .is_some_and(|(_, binding, writable)| !binding.permanent && !writable)
+                    .any(|(other, (_, file))| Some(*other) != export_token && *file == key)
                 {
-                    retain.insert(key);
+                    if releasable {
+                        revoke.insert(key);
+                    } else if inventory
+                        .live_bindings
+                        .get(&key)
+                        .is_some_and(|(_, binding, writable)| !binding.permanent && !writable)
+                    {
+                        retain.insert(key);
+                    }
                 }
             }
         }
         for key in revoke {
-            let (segment, binding, _) = self
+            let target = target
+                .as_deref_mut()
+                .ok_or_else(|| TcpError::new("live target disappeared"))?;
+            // Claim before releasing the inventory: no pin can attach to a
+            // binding whose namespace is being revoked.
+            let entry = inventory
                 .live_bindings
-                .get(&key)
+                .remove(&key)
                 .ok_or_else(|| TcpError::new("live binding disappeared"))?;
-            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
-                super::super::owner_events::OwnerEventKind::RevokeStart,
-                super::super::owner_events::OwnerEventKind::RevokeEnd,
-                segment.partition,
-                segment.file_index,
-                segment.inode,
-            );
-            let result = self
-                .live_target
-                .as_mut()
-                .ok_or_else(|| TcpError::new("live target disappeared"))?
-                .revoke(binding);
-            revoke_span.end_at(segment.file_index);
+            let revoke_span = revoke_span(&entry.0);
+            let result = inventory.released(|| target.revoke(&entry.1));
+            revoke_span.end_at(entry.0.file_index);
             if let Err(error) = result {
-                self.healthy = false;
+                inventory.live_bindings.insert(key, entry);
+                inventory.healthy = false;
                 return Err(TcpError::component(error));
             }
-            self.live_bindings.remove(&key);
         }
         for key in retain {
-            self.retain_idle_history_export(key)?;
+            Self::retain_idle_history_export(inventory, target.as_deref_mut(), key)?;
         }
         Ok(())
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn retain_idle_history_export(&mut self, key: (u64, u64)) -> Result<(), TcpError> {
-        self.idle_history_exports.retain(|idle| *idle != key);
-        if self.idle_history_exports.len() == MAX_IDLE_HISTORY_EXPORTS {
-            let oldest = *self
+    fn retain_idle_history_export<H: InventoryAccess>(
+        inventory: &mut H,
+        target: Option<&mut LiveTarget>,
+        key: (u64, u64),
+    ) -> Result<(), TcpError> {
+        inventory.idle_history_exports.retain(|idle| *idle != key);
+        if inventory.idle_history_exports.len() == MAX_IDLE_HISTORY_EXPORTS {
+            let oldest = *inventory
                 .idle_history_exports
                 .front()
                 .ok_or_else(|| TcpError::new("idle history queue disappeared"))?;
-            let (segment, binding, _) = self
+            let target = target.ok_or_else(|| TcpError::new("live target disappeared"))?;
+            let entry = inventory
                 .live_bindings
-                .get(&oldest)
+                .remove(&oldest)
                 .ok_or_else(|| TcpError::new("idle history binding disappeared"))?;
-            let revoke_span = super::super::owner_events::OwnerEventSpan::new(
-                super::super::owner_events::OwnerEventKind::RevokeStart,
-                super::super::owner_events::OwnerEventKind::RevokeEnd,
-                segment.partition,
-                segment.file_index,
-                segment.inode,
-            );
-            if let Err(error) = self
-                .live_target
-                .as_mut()
-                .ok_or_else(|| TcpError::new("live target disappeared"))?
-                .revoke(binding)
-            {
-                self.healthy = false;
+            inventory.idle_history_exports.pop_front();
+            let revoke_span = revoke_span(&entry.0);
+            if let Err(error) = inventory.released(|| target.revoke(&entry.1)) {
+                inventory.live_bindings.insert(oldest, entry);
+                inventory.idle_history_exports.push_front(oldest);
+                inventory.healthy = false;
                 return Err(TcpError::component(error));
             }
-            revoke_span.end_at(segment.file_index);
-            self.live_bindings.remove(&oldest);
-            self.idle_history_exports.pop_front();
+            revoke_span.end_at(entry.0.file_index);
         }
-        self.idle_history_exports.push_back(key);
+        inventory.idle_history_exports.push_back(key);
         Ok(())
     }
 
@@ -1341,58 +1554,80 @@ impl NodeInventory {
             .cloned()
             .ok_or_else(|| TcpError::new("sealed export source is absent"))
     }
+    /// Seal an exclusively owned inventory. A live inventory needs its target
+    /// registry: use `seal_epoch` with the lifecycle gate instead.
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
-        self.seal_draining(epoch, |_| Ok(()))
+        let mut inventory = self;
+        Self::seal_epoch(&mut inventory, &mut LifecycleSlot::default(), epoch, |_| {
+            Ok(())
+        })
     }
 
-    pub(super) fn seal_draining(
-        &mut self,
+    /// Seal `epoch`. Same gate contract as `fence`: revocation, drain, the
+    /// log seal and the manifest install all run with the inventory released.
+    pub(super) fn seal_epoch<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
         epoch: u64,
-        _drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
+        drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<(), TcpError> {
-        self.ensure_healthy()?;
+        inventory.ensure_healthy()?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if !self.live_pins.is_empty() || !self.live_export_pins.is_empty() {
+        if !inventory.live_pins.is_empty() || !inventory.live_export_pins.is_empty() {
             return Err(TcpError::new("live NVMe-oF pins must drain before sealing"));
         }
-        if self.manifest.epochs.iter().any(|e| {
+        if inventory.manifest.epochs.iter().any(|e| {
             e.epoch == epoch && matches!(e.state, EpochState::Sealed | EpochState::Abandoned)
         }) {
             return Ok(());
         }
-        let log = self.active(epoch)?;
-        self.healthy = false;
-        self.readers.write().invalidate();
+        let log = inventory.active(epoch)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_target.is_some() {
-            self.revoke_live_targets()?;
-            _drain_log(&log)?;
-            log.seal_live_epoch(RequestAuthority { epoch }, || Ok(()))
-                .map_err(TcpError::component)?;
+        let target = live_target(inventory, slot)?;
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        let _ = slot;
+        inventory.healthy = false;
+        inventory.readers.write().invalidate();
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Some(target) = target {
+            Self::revoke_live_targets(inventory, target)?;
+            inventory.released(|| {
+                drain_log(&log)?;
+                log.seal_live_epoch(RequestAuthority { epoch }, || Ok(()))
+                    .map_err(TcpError::component)
+            })?;
         } else {
-            log.seal_epoch(RequestAuthority { epoch })
+            inventory
+                .released(|| log.seal_epoch(RequestAuthority { epoch }))
                 .map_err(TcpError::component)?;
         }
         #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        log.seal_epoch(RequestAuthority { epoch })
-            .map_err(TcpError::component)?;
-        self.manifest.epochs.last_mut().unwrap().state = EpochState::Sealed;
-        persist(&self.config.root, &self.manifest)?;
-        self.healthy = true;
+        {
+            let _ = &drain_log;
+            inventory
+                .released(|| log.seal_epoch(RequestAuthority { epoch }))
+                .map_err(TcpError::component)?;
+        }
+        drop(log);
+        inventory.manifest.epochs.last_mut().unwrap().state = EpochState::Sealed;
+        Self::persist_manifest(inventory)?;
+        inventory.healthy = true;
         Ok(())
     }
+    /// The caller holds the lifecycle gate; `target` is its content.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn shutdown_live_target(
-        &mut self,
+    pub(super) fn shutdown_live_target<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
         epoch: u64,
     ) -> Result<super::super::nvmeof::LiveTargetStats, TcpError> {
-        self.ensure_healthy()?;
-        if !self.live_pins.is_empty() {
+        inventory.ensure_healthy()?;
+        if !inventory.live_pins.is_empty() {
             return Err(TcpError::new(
                 "live NVMe-oF pins must drain before shutdown",
             ));
         }
-        if !self
+        if !inventory
             .manifest
             .epochs
             .last()
@@ -1402,29 +1637,34 @@ impl NodeInventory {
                 "live target shutdown requires latest sealed authority",
             ));
         }
-        self.finish_target_shutdown()
+        Self::finish_target_shutdown(inventory, target)
     }
 
+    /// The caller holds the lifecycle gate; `slot` is its content.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) fn finish_live_target_shutdown(
-        &mut self,
+    pub(super) fn finish_live_target_shutdown<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
     ) -> Result<super::super::nvmeof::LiveTargetStats, TcpError> {
-        self.ensure_healthy()?;
-        if !self.live_pins.is_empty() {
+        inventory.ensure_healthy()?;
+        if !inventory.live_pins.is_empty() {
             return Err(TcpError::new(
                 "live NVMe-oF pins must drain before shutdown",
             ));
         }
-        if let Some(epoch) = self
+        if let Some(epoch) = inventory
             .manifest
             .epochs
             .last()
             .filter(|entry| entry.state == EpochState::Active)
             .map(|entry| entry.epoch)
         {
-            self.seal(epoch)?;
+            Self::seal_epoch(inventory, slot, epoch, |_| Ok(()))?;
         }
-        self.finish_target_shutdown()
+        let target = slot
+            .as_mut()
+            .ok_or_else(|| TcpError::new("live target not configured"))?;
+        Self::finish_target_shutdown(inventory, target)
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1442,30 +1682,30 @@ impl NodeInventory {
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn finish_target_shutdown(
-        &mut self,
+    fn finish_target_shutdown<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
     ) -> Result<super::super::nvmeof::LiveTargetStats, TcpError> {
-        let target = self
-            .live_target
-            .as_mut()
-            .ok_or_else(|| TcpError::new("live target not configured"))?;
-        if !self.live_shutdown
-            && let Err(error) = target.shutdown()
+        if !inventory.live_shutdown
+            && let Err(error) = inventory.released(|| target.shutdown())
         {
-            self.healthy = false;
+            inventory.healthy = false;
             return Err(TcpError::component(error));
         }
-        self.live_shutdown = true;
-        let stats = target.stats().map_err(|error| {
-            self.healthy = false;
-            TcpError::component(error)
-        })?;
+        inventory.live_shutdown = true;
+        let stats = match inventory.released(|| target.stats()) {
+            Ok(stats) => stats,
+            Err(error) => {
+                inventory.healthy = false;
+                return Err(TcpError::component(error));
+            }
+        };
         if stats.owned_namespace_count != 0 {
-            self.healthy = false;
+            inventory.healthy = false;
             return Err(TcpError::new("live target shutdown left owned namespaces"));
         }
-        self.live_bindings.clear();
-        self.idle_history_exports.clear();
+        inventory.live_bindings.clear();
+        inventory.idle_history_exports.clear();
         Ok(stats)
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1528,29 +1768,35 @@ impl NodeInventory {
             .map_err(TcpError::component)
     }
 
-    pub(super) fn retire_files(
-        &mut self,
+    /// The caller holds the lifecycle gate (`slot` is its content) or owns the
+    /// inventory exclusively.
+    pub(super) fn retire_files<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
         authority_epoch: u64,
         epoch: u64,
         prefix: usize,
         files: &[u64],
     ) -> Result<(), TcpError> {
-        self.require_history(false)?;
-        self.retire_files_inner(authority_epoch, epoch, Some(prefix), files)
+        inventory.require_history(false)?;
+        Self::retire_files_inner(inventory, slot, authority_epoch, epoch, Some(prefix), files)
     }
 
-    pub(super) fn retire_wal_files(
-        &mut self,
+    /// Same gate contract as `retire_files`.
+    pub(super) fn retire_wal_files<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
         authority_epoch: u64,
         epoch: u64,
         files: &[u64],
     ) -> Result<(), TcpError> {
-        self.require_history(true)?;
-        self.retire_files_inner(authority_epoch, epoch, None, files)
+        inventory.require_history(true)?;
+        Self::retire_files_inner(inventory, slot, authority_epoch, epoch, None, files)
     }
 
-    fn retire_files_inner(
-        &mut self,
+    fn retire_files_inner<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
         authority_epoch: u64,
         epoch: u64,
         prefix: Option<usize>,
@@ -1559,68 +1805,84 @@ impl NodeInventory {
         if files.len() > 256 {
             return Err(TcpError::new("retirement file count exceeds bound"));
         }
-        let log = self.retirement_log(authority_epoch, epoch)?;
+        let log = inventory.retirement_log(authority_epoch, epoch)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if !self.live_pins.is_empty() {
+        if !inventory.live_pins.is_empty() {
             return Err(TcpError::new(
                 "live NVMe-oF pins must drain before retirement",
             ));
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_export_pins.values().any(|(_, (source, file))| {
-            *source == epoch && files.contains(&(file * self.config.partition.wal_file_bytes))
-        }) {
+        if inventory
+            .live_export_pins
+            .values()
+            .any(|(_, (source, file))| {
+                *source == epoch
+                    && files.contains(&(file * inventory.config.partition.wal_file_bytes))
+            })
+        {
             return Err(TcpError::new(
                 "live connection pins must drain before retirement",
             ));
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Err(error) = self.revoke_live_files(epoch, files) {
-            self.healthy = false;
-            return Err(error);
-        }
+        let mut target = live_target(inventory, slot)?;
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        let _ = slot;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let retired_identities = if let Some(target) = self.live_target.as_ref() {
-            let root = epoch_path(&self.config.root, epoch);
-            let mut identities = Vec::new();
-            for offset in files {
-                let path = root.join(format!(
-                    "wal_{:016x}",
-                    offset / self.config.partition.wal_file_bytes
-                ));
-                if let Some(identity) = target.sealed_file(&path).map_err(TcpError::component)? {
-                    identities.push(identity);
-                }
+        let retired_identities = if let Some(target) = target.as_deref_mut() {
+            if let Err(error) = Self::revoke_live_files(inventory, target, epoch, files) {
+                inventory.healthy = false;
+                return Err(error);
             }
-            identities
+            let root = epoch_path(&inventory.config.root, epoch);
+            let bytes = inventory.config.partition.wal_file_bytes;
+            inventory.released(|| {
+                let mut identities = Vec::new();
+                for offset in files {
+                    let path = root.join(format!("wal_{:016x}", offset / bytes));
+                    if let Some(identity) =
+                        target.sealed_file(&path).map_err(TcpError::component)?
+                    {
+                        identities.push(identity);
+                    }
+                }
+                Ok::<_, TcpError>(identities)
+            })?
         } else {
             Vec::new()
         };
-        match prefix {
-            Some(prefix) => log.retire_files(prefix, files),
-            None => log.retire_wal_files(files),
-        }
-        .map_err(TcpError::component)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Some(target) = self.live_target.as_mut() {
-            for identity in retired_identities {
-                target
-                    .retire_deleted_file(&identity)
-                    .map_err(TcpError::component)?;
+        inventory.released(|| {
+            match prefix {
+                Some(prefix) => log.retire_files(prefix, files),
+                None => log.retire_wal_files(files),
             }
-        }
-        Ok(())
+            .map_err(TcpError::component)?;
+            // Each tombstone release syncs the WAL directory before its marker
+            // removal, so a crash cannot resurrect an untracked old file.
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            if let Some(target) = target {
+                for identity in &retired_identities {
+                    target
+                        .retire_deleted_file(identity)
+                        .map_err(TcpError::component)?;
+                }
+            }
+            Ok(())
+        })
     }
 
-    pub(super) fn checkpoint_proof(
-        &self,
+    /// Validate under the inventory, then persist and digest the prefix with
+    /// it released. The caller holds the lifecycle gate or owns the inventory.
+    pub(super) fn checkpoint_proof<H: InventoryAccess>(
+        inventory: &mut H,
         authority_epoch: u64,
         epoch: u64,
         prefix: usize,
     ) -> Result<checkpoint::CheckpointProof, TcpError> {
-        self.require_history(false)?;
-        self.active(authority_epoch)?;
-        let record = self
+        inventory.require_history(false)?;
+        inventory.active(authority_epoch)?;
+        let record = inventory
             .manifest
             .epochs
             .iter()
@@ -1628,55 +1890,65 @@ impl NodeInventory {
             .ok_or_else(|| TcpError::new("checkpoint epoch absent"))?;
         let log = match record.state {
             EpochState::Active | EpochState::Sealed => Some(
-                self.logs
+                inventory
+                    .logs
                     .get(&epoch)
+                    .cloned()
                     .ok_or_else(|| TcpError::new("checkpoint stream absent"))?,
             ),
             EpochState::Abandoned => None,
             EpochState::Preparing => return Err(TcpError::new("checkpoint epoch incomplete")),
         };
-        let retained = log.map_or(0, |log| log.receipt_count());
-        if prefix > retained {
-            return Err(TcpError::new("checkpoint prefix beyond retained history"));
-        }
-        if prefix != 0 {
-            let log = log.ok_or_else(|| TcpError::new("checkpoint stream absent"))?;
-            let last = log
-                .receipt_page(prefix - 1, 1)
-                .map_err(TcpError::component)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| TcpError::new("checkpoint receipt absent"))?;
-            // Capturing a receipt is not durability evidence. Persist precisely
-            // the captured prefix's last complete group before issuing proof.
-            log.persist_through(last).map_err(TcpError::component)?;
-        }
-        let database = self.config.partition.inventory.database;
-        let partition = self.config.partition.partition;
-        Ok(checkpoint::CheckpointProof {
-            database,
-            partition,
-            epoch,
-            prefix,
-            retained,
-            digest: match log {
-                Some(log) => log.checkpoint_prefix(prefix).map_err(TcpError::component)?,
-                None => checkpoint::prefix_digest(database, partition, epoch, std::iter::empty()),
-            },
+        let database = inventory.config.partition.inventory.database;
+        let partition = inventory.config.partition.partition;
+        inventory.released(|| {
+            let retained = log.as_ref().map_or(0, |log| log.receipt_count());
+            if prefix > retained {
+                return Err(TcpError::new("checkpoint prefix beyond retained history"));
+            }
+            if prefix != 0 {
+                let log = log
+                    .as_ref()
+                    .ok_or_else(|| TcpError::new("checkpoint stream absent"))?;
+                let last = log
+                    .receipt_page(prefix - 1, 1)
+                    .map_err(TcpError::component)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| TcpError::new("checkpoint receipt absent"))?;
+                // Capturing a receipt is not durability evidence. Persist precisely
+                // the captured prefix's last complete group before issuing proof.
+                log.persist_through(last).map_err(TcpError::component)?;
+            }
+            Ok(checkpoint::CheckpointProof {
+                database,
+                partition,
+                epoch,
+                prefix,
+                retained,
+                digest: match &log {
+                    Some(log) => log.checkpoint_prefix(prefix).map_err(TcpError::component)?,
+                    None => {
+                        checkpoint::prefix_digest(database, partition, epoch, std::iter::empty())
+                    }
+                },
+            })
         })
     }
 
-    pub(super) fn recovery_page(
-        &self,
+    /// Validate under the inventory, then read and persist with it released.
+    /// The caller holds the lifecycle gate or owns the inventory.
+    pub(super) fn recovery_page<H: InventoryAccess>(
+        inventory: &mut H,
         epoch: u64,
         cursor: usize,
         limit: usize,
         limits: TcpLimits,
     ) -> Result<Response, TcpError> {
-        self.require_history(false)?;
-        self.ensure_healthy()?;
+        inventory.require_history(false)?;
+        inventory.ensure_healthy()?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_target.is_some() {
+        if inventory.live_export_mode.is_some() {
             return Err(TcpError::new(
                 "live NVMe-oF recovery requires metadata-only control",
             ));
@@ -1684,7 +1956,7 @@ impl NodeInventory {
         if limit == 0 || limit > limits.recovery_page_batches {
             return Err(TcpError::new("recovery page count exceeds bound"));
         }
-        let record = self
+        let record = inventory
             .manifest
             .epochs
             .iter()
@@ -1703,7 +1975,16 @@ impl NodeInventory {
         if record.state != EpochState::Sealed {
             return Err(TcpError::new("recovery requires sealed immutable epoch"));
         }
-        let log = &self.logs[&epoch];
+        let log = inventory.logs[&epoch].clone();
+        inventory.released(|| Self::read_recovery_page(&log, cursor, limit, limits))
+    }
+
+    fn read_recovery_page(
+        log: &PartitionLog,
+        cursor: usize,
+        limit: usize,
+        limits: TcpLimits,
+    ) -> Result<Response, TcpError> {
         let count = log.receipt_count();
         if cursor > count {
             return Err(TcpError::new("recovery cursor beyond retained history"));
@@ -1775,8 +2056,36 @@ impl NodeInventory {
         }
     }
 
-    pub(super) fn replay_wal_page(
+    /// Kernel boot id read when this owner opened.
+    pub(super) fn boot_id(&self) -> [u8; 16] {
+        self.boot_id
+    }
+
+    /// Log of stream `epoch` for a durable-progress poll under `authority_epoch`.
+    /// `None`: the epoch exists but holds no log handle, an empty stream.
+    pub(super) fn durable_progress_log(
         &self,
+        authority_epoch: u64,
+        epoch: u64,
+    ) -> Result<Option<Arc<super::super::storage::PartitionLog>>, TcpError> {
+        self.active(authority_epoch)?;
+        let record = self
+            .manifest
+            .epochs
+            .iter()
+            .find(|entry| entry.epoch == epoch)
+            .ok_or_else(|| TcpError::new("durable progress epoch absent"))?;
+        match record.state {
+            EpochState::Active | EpochState::Sealed => Ok(self.logs.get(&epoch).cloned()),
+            EpochState::Abandoned => Err(TcpError::new("durable progress epoch abandoned")),
+            EpochState::Preparing => Err(TcpError::new("durable progress epoch incomplete")),
+        }
+    }
+
+    /// Validate under the inventory, then replay with it released. The caller
+    /// holds the lifecycle gate or owns the inventory.
+    pub(super) fn replay_wal_page<H: InventoryAccess>(
+        inventory: &mut H,
         authority_epoch: u64,
         epoch: u64,
         from: u64,
@@ -1784,10 +2093,10 @@ impl NodeInventory {
         require_end: u64,
         limits: TcpLimits,
     ) -> Result<Response, TcpError> {
-        self.require_history(true)?;
-        self.active(authority_epoch)?;
+        inventory.require_history(true)?;
+        inventory.active(authority_epoch)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_target.is_some() {
+        if inventory.live_export_mode.is_some() {
             return Err(TcpError::new(
                 "live NVMe-oF recovery requires metadata-only control",
             ));
@@ -1795,7 +2104,7 @@ impl NodeInventory {
         if limit == 0 || limit > limits.recovery_page_batches {
             return Err(TcpError::new("recovery page count exceeds bound"));
         }
-        let record = self
+        let record = inventory
             .manifest
             .epochs
             .iter()
@@ -1814,10 +2123,21 @@ impl NodeInventory {
         if record.state != EpochState::Sealed {
             return Err(TcpError::new("recovery requires sealed immutable epoch"));
         }
-        let log = self
+        let log = inventory
             .logs
             .get(&epoch)
+            .cloned()
             .ok_or_else(|| TcpError::new("recovery stream absent"))?;
+        inventory.released(|| Self::read_replay_page(&log, from, limit, require_end, limits))
+    }
+
+    fn read_replay_page(
+        log: &PartitionLog,
+        from: u64,
+        limit: usize,
+        require_end: u64,
+        limits: TcpLimits,
+    ) -> Result<Response, TcpError> {
         let page = log
             .replay_page(
                 from,
@@ -1894,6 +2214,15 @@ fn persist(root: &Path, manifest: &Manifest) -> Result<(), TcpError> {
 mod tests {
     use super::*;
     use crate::distributed::tcp::tests::{config, metrics};
+
+    fn proof(
+        inventory: &mut NodeInventory,
+        authority_epoch: u64,
+        epoch: u64,
+        prefix: usize,
+    ) -> Result<checkpoint::CheckpointProof, TcpError> {
+        NodeInventory::checkpoint_proof(&mut &mut *inventory, authority_epoch, epoch, prefix)
+    }
 
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     #[test]
@@ -2011,7 +2340,7 @@ mod tests {
         );
         assert!(inventory.fence_to(2).is_err());
         assert!(
-            matches!(inventory.recovery_page(2,0,32,TcpLimits::default()).unwrap(),Response::Recovery{batches,next:None} if batches.is_empty())
+            matches!(NodeInventory::recovery_page(&mut &mut inventory,2,0,32,TcpLimits::default()).unwrap(),Response::Recovery{batches,next:None} if batches.is_empty())
         );
         inventory.fence_to(3).unwrap();
         assert!(epoch_path(&config.root, 2).is_dir());
@@ -2084,7 +2413,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let prefix = inventory.checkpoint_proof(1, 1, 1).unwrap();
+        let prefix = proof(&mut inventory, 1, 1, 1).unwrap();
         assert_eq!(prefix.retained, 2);
         assert_eq!(
             prefix.digest,
@@ -2097,16 +2426,16 @@ mod tests {
         );
         assert_ne!(
             prefix.digest,
-            inventory.checkpoint_proof(1, 1, 2).unwrap().digest
+            proof(&mut inventory, 1, 1, 2).unwrap().digest
         );
-        assert!(inventory.checkpoint_proof(1, 1, 3).is_err());
-        assert!(inventory.checkpoint_proof(1, 99, 0).is_err());
+        assert!(proof(&mut inventory, 1, 1, 3).is_err());
+        assert!(proof(&mut inventory, 1, 99, 0).is_err());
         inventory.fence_to(2).unwrap();
-        assert!(inventory.checkpoint_proof(1, 1, 1).is_err());
-        assert_eq!(inventory.checkpoint_proof(2, 1, 1).unwrap(), prefix);
+        assert!(proof(&mut inventory, 1, 1, 1).is_err());
+        assert_eq!(proof(&mut inventory, 2, 1, 1).unwrap(), prefix);
         drop(inventory);
         let mut inventory = NodeInventory::open(config, metrics()).unwrap();
         inventory.fence_to(3).unwrap();
-        assert_eq!(inventory.checkpoint_proof(3, 1, 1).unwrap(), prefix);
+        assert_eq!(proof(&mut inventory, 3, 1, 1).unwrap(), prefix);
     }
 }

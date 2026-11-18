@@ -2004,13 +2004,7 @@ pub(crate) mod tests {
             };
             self.owner
                 .node
-                .inventory
-                .lock()
-                .live_target
-                .as_ref()
-                .unwrap()
-                .binding_for_file(&file)
-                .is_some()
+                .with_live_target(|target| target.binding_for_file(&file).is_some())
         }
 
         fn close_extent(
@@ -2051,9 +2045,13 @@ pub(crate) mod tests {
             assert_eq!(next.extent.segment.file_index, 1);
             self.owner
                 .node
-                .inventory
-                .lock()
-                .reap_idle_live_segments(1)
+                .with_lifecycle(|inventory, slot| {
+                    crate::distributed::tcp::NodeInventory::reap_idle_live_segments(
+                        inventory,
+                        slot.as_mut().unwrap(),
+                        1,
+                    )
+                })
                 .unwrap();
             next
         }
@@ -3066,7 +3064,7 @@ pub(crate) mod tests {
             configfs,
         )
         .unwrap();
-        lane._running.node.inventory.lock().live_target = Some(target);
+        lane._running.node.install_live_target(target).unwrap();
         lane.client.fence_to(1).unwrap();
         lane.client.open_live_exports(1).unwrap();
         assert_eq!(lane.client.live_exports.as_ref().unwrap().2, 0);

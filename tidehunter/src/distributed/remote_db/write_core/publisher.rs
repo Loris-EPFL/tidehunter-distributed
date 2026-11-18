@@ -168,6 +168,13 @@ impl WriteCore {
         // entered it, and the saturating leave keeps that window at zero.
         self.write_timeline
             .wait_leave(super::super::WriteWait::HarvestToDurable, receipts.len());
+        if let Some(cut) = &self.durable_cut
+            && let Some(&index) = self.partition_indexes.get(&owner)
+            && let Some(last) = receipts.iter().map(|(sequence, _)| *sequence).max()
+        {
+            // Before the publisher lock; see `DurableCut::published`.
+            cut.receipted(index, last.saturating_add(1));
+        }
         let result = self.publish_durable(owner, receipts);
         if let Err(error) = result {
             self.fail(error);
@@ -379,6 +386,9 @@ impl WriteCore {
                     _ => break,
                 }
                 publisher.published_next = sequence + 1;
+            }
+            if let Some(cut) = &self.durable_cut {
+                cut.published(publisher.published_next);
             }
             if let Some(upper) = publisher
                 .upper

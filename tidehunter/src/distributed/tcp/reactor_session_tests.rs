@@ -19,14 +19,17 @@ fn take_wire_responses(client: &mut Client) -> Vec<Envelope<Response>> {
 fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
     // The server closes a session whose accepted request waits longer than
     // `io_timeout`. This test holds the first append paused across two client
-    // waits of up to 2 s each, so the server bound must exceed their sum.
+    // waits of up to 2 s each, and the queued post-fence append and seal wait
+    // behind the fence and seal themselves: lifecycle operations (tens of
+    // fsyncs) that the client grants LIFECYCLE_TIMEOUT. So the server bound
+    // is that lifecycle budget; a data budget would assert fence latency.
     let server = Running::with_limits(
         Transport::Tcp,
         WalMemberReadPolicy::Positional,
         crate::distributed::tcp::default_read_bytes(),
         crate::distributed::tcp::default_device_reads(),
         crate::distributed::tcp::TcpLimits {
-            io_timeout: Duration::from_secs(10),
+            io_timeout: LIFECYCLE_TIMEOUT,
             max_frame_bytes: 2 * 1024 * 1024,
             ..TcpLimits::default()
         },
@@ -120,7 +123,8 @@ fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
     );
     resume_persist.send(()).unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // The remaining replies include the fence and the seal: lifecycle budget.
+    let deadline = Instant::now() + LIFECYCLE_TIMEOUT;
     let mut responses = Vec::new();
     while responses.len() != 5 {
         client.stream.progress(None).unwrap();
@@ -166,6 +170,63 @@ fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
         .find(|response| response.id == seal_id)
         .unwrap();
     assert!(matches!(seal.body, Response::Sealed));
+}
+
+#[test]
+fn owner_deadline_close_names_the_expired_request_to_the_client() {
+    // The owner ends a TLS session whose accepted request outlives its
+    // `io_timeout`. The persist barrier holds the append until the client has
+    // its error, so the owner's deadline, never the client's, ends the call.
+    let io_timeout = Duration::from_millis(300);
+    let server = Running::with_limits(
+        Transport::Tcp,
+        WalMemberReadPolicy::Positional,
+        crate::distributed::tcp::default_read_bytes(),
+        crate::distributed::tcp::default_device_reads(),
+        crate::distributed::tcp::TcpLimits {
+            io_timeout,
+            max_frame_bytes: 2 * 1024 * 1024,
+            ..TcpLimits::default()
+        },
+    );
+    server
+        .node
+        .set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+            crate::distributed::durability::DurabilityTier::Synchronous,
+        ))
+        .unwrap();
+    let mut client = server.client();
+    client.timeout = Duration::from_secs(60);
+    client.fence_to(1).unwrap();
+    let log = server.node.inventory.lock().active(1).unwrap();
+    let (persist_entered, resume_persist) = log.pause_next_persist();
+    let batch = crate::distributed::tcp::tests::batch(&server.config, 1, 0);
+
+    let error = client.append_many(1, &[batch]).unwrap_err().to_string();
+    persist_entered
+        .try_recv()
+        .expect("the append was held at its persist barrier");
+    assert!(
+        error.starts_with("owner closed the session: owner request deadline expired: request "),
+        "{error}"
+    );
+    assert!(
+        error.contains("(kind 7) was still executing after "),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("(owner deadline {io_timeout:?})")),
+        "{error}"
+    );
+    resume_persist.send(()).unwrap();
+    assert!(
+        client
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("connection requires replacement"),
+        "a session the owner closed must not be reused"
+    );
 }
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -346,7 +407,12 @@ fn seal_fence_and_retirement_wait_for_active_position_proofs() {
         } else {
             &mut other
         };
-        assert!(control.submit_control(&request, deadline).unwrap());
+        // Seal, fence and retirement are lifecycle operations (fsyncs, and for
+        // a live fence target revocation and recovery) that the client grants
+        // LIFECYCLE_TIMEOUT; a data budget would assert their latency. The
+        // proof keeps its own 5 s deadline: it completes before the control runs.
+        let control_deadline = Instant::now() + LIFECYCLE_TIMEOUT;
+        assert!(control.submit_control(&request, control_deadline).unwrap());
         let queued = loop {
             client.progress_appends().unwrap();
             other.progress_appends().unwrap();
@@ -389,7 +455,7 @@ fn seal_fence_and_retirement_wait_for_active_position_proofs() {
                 response.unwrap();
                 control_done = true;
             }
-            assert!(Instant::now() < deadline);
+            assert!(Instant::now() < control_deadline);
         }
     }
 }

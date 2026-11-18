@@ -176,7 +176,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         manual._reviewed_jobs({**spec, 'machine_type': 'z4m-highmem-16'})
                 jobs = manual._reviewed_jobs(spec)
-                expected_fleet_count = 9 if selection == 'nvmeof_p9_write_engine' else expected_count
+                expected_fleet_count = {'nvmeof_p9_write_engine': 9, 'nvmeof_p13_write_engine': 11}.get(selection, expected_count)
                 self.assertEqual(len(jobs), expected_fleet_count)
                 self.assertEqual(spec['max_cases'], expected_count)
                 self.assertEqual(spec['owner_hosts'], workflow_input.cloud_campaign.selection_owner_hosts(selection))
@@ -184,7 +184,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                 self.assertEqual(spec['backends'], ['tidehunter_nvme_rdma'] if selection in workflow_input.cloud_campaign.M3_SELECTIONS or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
                 self.assertEqual(workflow_input.specification(
                     'kv', ','.join(spec['backends']), 'focused', selection=selection),
-                    dict(spec, reservation_hours=2) if selection in workflow_input.cloud_campaign.M3_SELECTIONS else spec)
+                    {'reservation_hours': 2, **spec} if selection in workflow_input.cloud_campaign.M3_SELECTIONS else spec)
                 self.assertTrue(gcp_runtime.live_mode(spec))
                 for mutation in ({'job_count': expected_count - 1}, {'matrix_sha256': '0' * 64},
                                  {'owner_hosts': 6 if selection in workflow_input.cloud_campaign.M3_SELECTIONS else 5}, {'spdk_comparison': True},

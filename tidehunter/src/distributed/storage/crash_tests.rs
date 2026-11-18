@@ -299,3 +299,99 @@ fn inventory_recovery_rejects_a_logical_version_reused_on_another_partition() {
         Err(StorageError::VersionConflict)
     ));
 }
+
+#[test]
+fn reported_synced_prefix_survives_loss_of_the_unsynced_suffix() {
+    let temp = tempdir::TempDir::new("sharded-durable-progress-cut").unwrap();
+    let config = config(vec![3], 3);
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    let synced = log
+        .append_complete_batch(authority(&config), &batch(&config, 0, 0))
+        .unwrap();
+    log.persist_appended().unwrap();
+    let lost = [1, 2].map(|n| {
+        log.append_complete_batch(authority(&config), &batch(&config, n, n))
+            .unwrap()
+    });
+    let progress = log.durable_progress();
+    assert_eq!(progress.synced, Some(synced.version()));
+    assert_eq!(progress.appended, Some(lost[1].version()));
+    assert!(progress.synced_end < progress.appended_end);
+    drop(log);
+    // A power loss keeps the reported synced prefix and loses everything after it.
+    assert!(progress.appended_end <= config.wal_file_bytes);
+    let file = wal_file(&path, &config, 0);
+    file.set_len(progress.synced_end).unwrap();
+    file.sync_all().unwrap();
+    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    assert_eq!(recovered.receipt_page(0, 256).unwrap(), vec![synced]);
+    for receipt in lost {
+        assert_eq!(recovered.lookup(receipt.id()).unwrap(), None);
+    }
+}
+
+/// Owner continuity: a recovery reports a hole only when it ended early below a valid
+/// frame. Damage at the very tail is the normal crash tail. Both history modes.
+#[test]
+fn recovery_reports_a_hole_only_below_a_later_valid_frame() {
+    #[derive(Clone, Copy, Debug)]
+    enum Damage {
+        None,
+        Tail,
+        BelowLaterFragment,
+    }
+    for on_disk in [false, true] {
+        for damage in [Damage::None, Damage::Tail, Damage::BelowLaterFragment] {
+            let temp = tempdir::TempDir::new("sharded-recovery-hole").unwrap();
+            let config = config(vec![3], 3);
+            let path = temp.path().join("stream");
+            let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+            if on_disk {
+                log.set_history_persistence(HistoryPersistence::OnDisk)
+                    .unwrap();
+            }
+            // Unsynced appends until one lands in the second fragment.
+            let mut receipts = Vec::new();
+            for n in 0..32 {
+                let receipt = log
+                    .append_complete_batch(authority(&config), &batch(&config, n, n))
+                    .unwrap();
+                receipts.push(receipt);
+                if receipt.address().offset >= config.fragment_bytes {
+                    break;
+                }
+            }
+            let last = *receipts.last().unwrap();
+            assert!(last.address().offset >= config.fragment_bytes);
+            assert!(last.address().offset < config.wal_file_bytes);
+            assert!(!log.recovery_found_hole());
+            drop(log);
+            let damaged = match damage {
+                Damage::None => None,
+                Damage::Tail => Some(last.address()),
+                Damage::BelowLaterFragment => Some(receipts[0].address()),
+            };
+            if let Some(address) = damaged {
+                let file = wal_file(&path, &config, address.offset);
+                file.write_all_at(
+                    &[0xff],
+                    (address.offset + u64::from(address.len) - 1) % config.wal_file_bytes,
+                )
+                .unwrap();
+                file.sync_all().unwrap();
+            }
+            let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+            assert_eq!(
+                recovered.recovery_found_hole(),
+                matches!(damage, Damage::BelowLaterFragment),
+                "on_disk={on_disk} damage={damage:?}"
+            );
+            assert_eq!(
+                recovered.lookup(last.id()).unwrap().is_some(),
+                !matches!(damage, Damage::Tail),
+                "on_disk={on_disk} damage={damage:?}"
+            );
+        }
+    }
+}

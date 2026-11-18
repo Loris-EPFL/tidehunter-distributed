@@ -65,6 +65,16 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
         19
     );
     assert_eq!(
+        tag(&Request::DurableProgress {
+            authority_epoch: 0,
+            epoch: 0,
+            after: 0,
+            max_wait_ms: 0,
+            sync: false,
+        }),
+        20
+    );
+    assert_eq!(
         tag(&Response::Checkpoint(checkpoint::CheckpointProof {
             database: [0; 16],
             partition: 0,
@@ -84,8 +94,24 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
         }),
         18
     );
+    assert_eq!(
+        tag(&Response::DurableProgress(DurableProgressReport {
+            database: [0; 16],
+            partition: 0,
+            authority_epoch: 0,
+            epoch: 0,
+            generation: 0,
+            synced: None,
+            appended: None,
+            synced_end: 0,
+            appended_end: 0,
+            idle: true,
+            boot_id: [0; 16],
+        })),
+        19
+    );
     #[cfg(feature = "experimental-nvmeof")]
-    assert_eq!(tag(&Response::ValidatedRecordReferences(Vec::new())), 19);
+    assert_eq!(tag(&Response::ValidatedRecordReferences(Vec::new())), 20);
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     {
         assert_eq!(
@@ -96,7 +122,7 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
                 limit: 0,
                 require_end: 0,
             }),
-            36
+            37
         );
         assert_eq!(
             tag(&Response::LiveExports(live_control::LiveExportInfo {
@@ -108,7 +134,7 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
                 block_size: 0,
                 exported_files: 0,
             })),
-            31
+            32
         );
     }
 }
@@ -380,10 +406,10 @@ fn bounded_server_pool_overlaps_members_preserves_order_and_rechecks_fences() {
         *node.read_hook.lock() = Some(Arc::new(move |reference| {
             entered.send(reference.batch_version.sequence).unwrap();
             if reference.batch_version.sequence == 0 {
-                released
-                    .lock()
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap();
+                // Held across the fenced pass's `fence_to(2)`, a lifecycle
+                // operation (tens of fsyncs) that clients grant
+                // LIFECYCLE_TIMEOUT; a data budget would assert fence latency.
+                released.lock().recv_timeout(LIFECYCLE_TIMEOUT).unwrap();
             }
         }));
         let limits = TcpLimits {

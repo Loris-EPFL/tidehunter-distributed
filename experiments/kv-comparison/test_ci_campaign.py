@@ -112,7 +112,8 @@ class ConfigTests(unittest.TestCase):
         # Older reviewed selections still plan the tiers they were reviewed with.
         for selection, tiers in (('recommended', {'synchronous'}), ('nvmeof_m3_t1', {'synchronous'}),
                                  ('nvmeof_p9_small_put', {'synchronous'}),
-                                 ('nvmeof_p9_write_engine', {'synchronous', 'native'})):
+                                 ('nvmeof_p9_write_engine', {'synchronous', 'native'}),
+                                 ('nvmeof_p13_write_engine', {'synchronous', 'native'})):
             planned = {campaign.durability_tier(job) for job in campaign.make_focused_matrix(selection)
                        if job['backend'] in campaign.TRANSPORTS}
             with self.subTest(selection=selection):

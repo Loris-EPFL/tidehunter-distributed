@@ -27,6 +27,8 @@ pub use owner_transport::OwnerTransportStats;
 #[cfg(feature = "experimental-fabric")]
 pub use tidehunter_fabric::ProviderInfo;
 mod control;
+mod durable_progress;
+pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
 mod inventory;
 mod live_client;
 mod payload;
@@ -101,7 +103,8 @@ pub use inventory::SealedOwnerExport;
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
 /// 25 gives production requests and replies feature-stable tags before NVMe-oF and test-only variants.
 /// 26 adds controller-lifetime pins for non-permanent live exports.
-const PROTOCOL: u32 = 26;
+/// 27 adds DurableProgress and the owner durability tier in NodeStatus.
+const PROTOCOL: u32 = 27;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -301,7 +304,12 @@ pub enum PollingPolicy {
 /// The 3 s allowance adds about 30% to the measured 2.308668 s contended fsync.
 /// This is not a completion bound for sealing arbitrarily many retained files
 /// or revoking many exports. Larger explicitly configured timeouts still apply.
-/// Data requests, including read/write grants and position proofs, do not use it.
+/// A live export creation (13 target-registry saves, 26 fsyncs, plus the
+/// commissioning connection) is a lifecycle operation, so every request that
+/// may create one inline also uses it: a group reservation, a lease, live
+/// record resolution, prelease, and an adoption that leases the next extent.
+/// `StorageNode::live_inline_export_stats` counts how often each one did.
+/// Other data requests, including position proofs, do not use it.
 pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(34_500);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -373,6 +381,13 @@ pub struct NodeStatus {
     pub polling: PollingPolicy,
     /// The owner is configured for direct live NVMe-oF WAL access.
     pub live_nvmeof: bool,
+    /// The owner's write durability tier now; the default tier before configuration.
+    pub durability_tier: super::durability::DurabilityTier,
+    /// Kernel boot id (`/proc/sys/kernel/random/boot_id`) read when the owner opened.
+    pub boot_id: [u8; 16],
+    /// False when a WAL recovery this owner process ran found a lost or damaged
+    /// frame with a valid frame after it (a hole below the recovered tail).
+    pub recovery_clean: bool,
 }
 pub struct RecoveryPage {
     pub batches: Vec<(CompleteBatch, DurableBatch)>,
@@ -635,6 +650,15 @@ enum Request {
         epoch: u64,
         files: Vec<u64>,
     },
+    /// Owner durable progress of stream `epoch` for the coordinator's durable cut.
+    /// A long-poll: see `DurableProgressReport` for the reply contract.
+    DurableProgress {
+        authority_epoch: u64,
+        epoch: u64,
+        after: u64,
+        max_wait_ms: u32,
+        sync: bool,
+    },
     #[cfg(feature = "experimental-nvmeof")]
     ValidateRecordReferences {
         epoch: u64,
@@ -750,9 +774,10 @@ enum Request {
     ReadRamProbe,
 }
 impl Request {
-    /// Startup/recovery negotiation and durable epoch/retirement maintenance
-    /// have a different contract from data-path control messages. In particular,
-    /// a grant, adoption or position proof must not extend its caller's data SLA.
+    /// Startup/recovery negotiation, durable epoch/retirement maintenance and
+    /// live export creation have a different contract from data-path control
+    /// messages. A position proof must not extend its caller's data SLA. Client
+    /// and owner both derive their deadline from this method.
     fn timeout(&self, data_timeout: Duration) -> Duration {
         let lifecycle = match self {
             Self::Checkpoint { .. }
@@ -775,13 +800,27 @@ impl Request {
             | Self::OwnerTimelineArm { .. }
             | Self::OwnerTimelineFetch { .. }
             | Self::CheckpointPosition { .. } => false,
+            // A long-poll parks for its capped wait on top of the data-path SLA.
+            Self::DurableProgress { max_wait_ms, .. } => {
+                return data_timeout.saturating_add(durable_progress::capped_wait(*max_wait_ms));
+            }
             #[cfg(feature = "experimental-nvmeof")]
             Self::ValidateRecordReferences { .. } => false,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Self::RecoverLiveMetadata { .. }
             | Self::ShutdownLiveTarget { .. }
             | Self::OpenLiveExports { .. }
-            | Self::ReplayLiveWal { .. } => true,
+            | Self::ReplayLiveWal { .. }
+            | Self::ResolveLiveRecords { .. }
+            | Self::PreleaseLiveExtent { .. }
+            // Write grants that create an export inline when no preparation
+            // published their file: the first lease after open or a fence (a
+            // fence revokes every export), and a group reservation in a new
+            // file. The grant itself is memory work and stays short.
+            | Self::LeaseLiveExtent { .. }
+            | Self::ReserveLiveGroup { .. } => true,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Self::AdoptLiveExtent { lease_next, .. } => *lease_next,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Self::RegisterNvmeofExport { .. }
             | Self::ReleaseNvmeofExport { .. }
@@ -790,13 +829,8 @@ impl Request {
             | Self::ReleaseLiveEpochPin { .. }
             | Self::AcquireLiveExportPin { .. }
             | Self::ReleaseLiveExportPin { .. }
-            | Self::ReserveLiveGroup { .. }
             | Self::CompleteLiveGroup { .. }
-            | Self::ResolveLiveRecords { .. }
-            | Self::LiveTargetStats
-            | Self::LeaseLiveExtent { .. }
-            | Self::AdoptLiveExtent { .. }
-            | Self::PreleaseLiveExtent { .. } => false,
+            | Self::LiveTargetStats => false,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
             Self::ReadEvidence { evict, .. } => *evict,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -907,6 +941,7 @@ enum Response {
         incomplete: u64,
         more: bool,
     },
+    DurableProgress(DurableProgressReport),
     #[cfg(feature = "experimental-nvmeof")]
     ValidatedRecordReferences(Vec<ValidatedRecordLocation>),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -962,6 +997,32 @@ pub struct ValidatedRecordLocation {
 #[cfg(test)]
 type ReadHook = Arc<dyn Fn(&ValueRecordReference) + Send + Sync>;
 
+/// Live exports created inline by an owner request, while its caller waited,
+/// by request kind. A grant (reserve, lease) pays for one only when no
+/// preparation published its file first. Each count is one export creation
+/// with its target-registry syncs (see `LIFECYCLE_TIMEOUT`). Exports of
+/// background preparation and of `OpenLiveExports` are not counted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct LiveInlineExportStats {
+    /// `ReserveLiveGroup` (kind 27): a group reservation in a file without a
+    /// binding, the first of an epoch or after a file rollover.
+    pub reserve: u64,
+    /// `LeaseLiveExtent` (kind 33): a lease without a current extent, the first
+    /// after open or after a fence.
+    pub lease: u64,
+    /// `AdoptLiveExtent { lease_next: true }` (kind 34): rollover preparation.
+    pub rollover: u64,
+    /// `PreleaseLiveExtent` (kind 36): background lease-ahead.
+    pub prelease: u64,
+    /// `ResolveLiveRecords` (kind 29): the first resolution of a file without
+    /// a binding.
+    pub resolve: u64,
+    /// `RecoverLiveMetadata`: a recovery page over a file without a binding.
+    pub recover: u64,
+    /// `ReplayLiveWal`: a history page over a file without a binding.
+    pub replay: u64,
+}
+
 /// One partition's durable epoch authority. Writes/fences serialize at the node;
 /// read requests retain Arc log handles and perform disk I/O outside this mutex.
 pub struct StorageNode {
@@ -996,7 +1057,8 @@ impl StorageNode {
             Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
         let inventory = NodeInventory::open(config, metrics)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let live_nvme_selected = inventory.live_target.is_some();
+        let live_nvme_selected = inventory.live_export_mode.is_some();
+        let lifecycle = inventory.lifecycle.clone();
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
         let append_shape = inventory.shape.clone();
@@ -1011,6 +1073,7 @@ impl StorageNode {
         let control_context = Arc::new(control::ControlContext {
             partition,
             inventory: inventory.clone(),
+            lifecycle,
             readers: readers.clone(),
             terminal: terminal.clone(),
             poison_pending: Arc::new(AtomicBool::new(false)),
@@ -1062,6 +1125,9 @@ impl StorageNode {
         if self.control_context.poison_pending.load(Ordering::Acquire) {
             return Err(TcpError::new("reader authority is poison-pending"));
         }
+        // The gate orders status after any lifecycle step in progress: those
+        // steps release the inventory across their syncs.
+        let _lifecycle = self.control_context.lifecycle.lock();
         self.inventory.lock().status()
     }
     /// Final owner-process shutdown, after serving sessions have stopped.
@@ -1097,9 +1163,27 @@ impl StorageNode {
         }
     }
 
+    /// Owner-process count of live exports that a request created inline, by
+    /// request kind, including epochs replaced by fencing. Not part of the
+    /// wire protocol.
+    pub fn live_inline_export_stats(&self) -> LiveInlineExportStats {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            self.inventory.lock().inline_exports
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            // These builds have no live target, so no request can export.
+            LiveInlineExportStats::default()
+        }
+    }
+
     /// Enable local maintenance diagnostics for current and later epochs.
     /// This does not change the wire protocol or enable per-write clocks.
     pub fn set_history_maintenance_diagnostics(&self, enabled: bool) {
+        // The gate orders this against log creation, which captures the
+        // setting under the inventory and applies it to the unpublished log.
+        let _lifecycle = self.control_context.lifecycle.lock();
         self.inventory
             .lock()
             .set_history_maintenance_diagnostics(enabled);
@@ -1110,7 +1194,8 @@ impl StorageNode {
         &self,
         mode: super::storage::HistoryPersistence,
     ) -> Result<(), TcpError> {
-        self.inventory.lock().set_history_persistence(mode)
+        let _lifecycle = self.control_context.lifecycle.lock();
+        NodeInventory::switch_history_persistence(&mut self.inventory.lock(), mode)
     }
 
     /// Cumulative local snapshots, paired with epoch, without an RPC.
@@ -1182,15 +1267,52 @@ impl StorageNode {
         config: super::nvmeof::LiveTargetConfig,
         configfs: std::path::PathBuf,
     ) -> Result<(), TcpError> {
-        let mut inventory = self.inventory.lock();
-        if inventory.live_target.is_some() {
-            return Err(TcpError::new("live target fixture already installed"));
-        }
-        inventory.live_target = Some(
+        self.install_live_target(
             super::nvmeof::live_target::LiveTargetManager::open_fixture(config, configfs)
                 .map_err(TcpError::component)?,
-        );
+        )
+    }
+    /// Install a live target manager after open: the gate owns the manager and
+    /// the inventory records its immutable export mode.
+    #[cfg(all(
+        any(test, feature = "test-utils"),
+        feature = "experimental-nvmeof",
+        target_os = "linux"
+    ))]
+    pub(crate) fn install_live_target(
+        &self,
+        target: super::nvmeof::live_target::LiveTargetManager,
+    ) -> Result<(), TcpError> {
+        let mut slot = self.control_context.lifecycle.lock();
+        let mut inventory = self.inventory.lock();
+        if slot.is_some() || inventory.live_export_mode.is_some() {
+            return Err(TcpError::new("live target fixture already installed"));
+        }
+        inventory.live_export_mode = Some(target.export_mode());
+        *slot = Some(target);
         Ok(())
+    }
+    /// Test access to the installed live target, taken through the gate.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn with_live_target<R>(
+        &self,
+        f: impl FnOnce(&mut super::nvmeof::live_target::LiveTargetManager) -> R,
+    ) -> R {
+        let mut slot = self.control_context.lifecycle.lock();
+        f(slot.as_mut().expect("live target installed"))
+    }
+    /// Test access to a gated lifecycle step: the gate, then the inventory.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn with_lifecycle<R>(
+        &self,
+        f: impl FnOnce(
+            &mut parking_lot::MutexGuard<'_, NodeInventory>,
+            &mut inventory::LifecycleSlot,
+        ) -> R,
+    ) -> R {
+        let mut slot = self.control_context.lifecycle.lock();
+        let mut inventory = self.inventory.lock();
+        f(&mut inventory, &mut slot)
     }
     pub(super) fn reader_authority_valid(&self, epoch: u64, generation: Option<u64>) -> bool {
         if self.control_context.poison_pending.load(Ordering::Acquire) {

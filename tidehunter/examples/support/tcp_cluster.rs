@@ -271,6 +271,7 @@ pub fn prepare_external_case_with_durability(
         write_profile_limit: 0,
         index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
         checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
+        durable_cut: Default::default(),
     };
     fs::write(
         directory.join("remote.yaml"),
@@ -642,6 +643,8 @@ pub fn maybe_run_storage_node() -> Result<bool> {
                 "wal_prewrite_ns": wal_prewrite_ns,
                 "wal_prewrite_files": wal_prewrite_files,
             },
+            // Exports a request created inline while its caller waited.
+            "inline_exports": node.live_inline_export_stats(),
             "serve_error": result.as_ref().err().map(ToString::to_string),
             "cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
         });
@@ -1057,6 +1060,7 @@ impl LoopbackCluster {
             write_profile_limit: 0,
             index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
             checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
+            durable_cut: Default::default(),
         };
         // TLS configuration contains only paths, but it must not be presented as
         // a persistent usable credential bundle after the private tempdir closes.
