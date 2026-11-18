@@ -389,13 +389,15 @@ impl Client {
         }
     }
 
+    /// The deadline follows `Request::timeout`, as the owner's does: a
+    /// prelease may create the next file's export, a lifecycle operation.
     pub(crate) fn submit_prelease_live_extent(
         &mut self,
         epoch: u64,
         after: [u8; 16],
-        deadline: Instant,
     ) -> Result<bool, TcpError> {
-        self.submit_control(&Request::PreleaseLiveExtent { epoch, after }, deadline)
+        let request = Request::PreleaseLiveExtent { epoch, after };
+        self.submit_control(&request, Instant::now() + request.timeout(self.timeout))
     }
 
     pub(crate) fn take_prelease_live_extent(
@@ -474,18 +476,15 @@ impl Client {
         through: u64,
         close: bool,
         lease_next: bool,
-        deadline: Instant,
     ) -> Result<bool, TcpError> {
-        self.submit_control(
-            &Request::AdoptLiveExtent {
-                epoch,
-                token,
-                through,
-                close,
-                lease_next,
-            },
-            deadline,
-        )
+        let request = Request::AdoptLiveExtent {
+            epoch,
+            token,
+            through,
+            close,
+            lease_next,
+        };
+        self.submit_control(&request, Instant::now() + request.timeout(self.timeout))
     }
 
     pub(crate) fn take_adopt_live_extent(

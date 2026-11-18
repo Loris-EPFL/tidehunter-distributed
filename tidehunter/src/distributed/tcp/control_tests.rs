@@ -838,11 +838,11 @@ mod live_fencing {
             configfs,
         )
         .unwrap();
-        {
-            let mut inventory = node.inventory.lock();
-            inventory.live_target = Some(target);
-            inventory.fence_to(1).unwrap();
-        }
+        node.install_live_target(target).unwrap();
+        node.with_lifecycle(|inventory, slot| {
+            NodeInventory::fence(inventory, slot, 1, false, |_| Ok(()))
+        })
+        .unwrap();
         (config, node)
     }
 
@@ -951,9 +951,13 @@ mod live_fencing {
         wait_prepared(&log, 1);
         let segment = log.live_segment(1).unwrap();
         let (binding, created) = node
-            .inventory
-            .lock()
-            .publish_permanent_segment(&segment)
+            .with_lifecycle(|inventory, slot| {
+                NodeInventory::publish_permanent_segment(
+                    inventory,
+                    slot.as_mut().unwrap(),
+                    &segment,
+                )
+            })
             .unwrap();
         assert!(!created);
         let published = log.live_file_preparation_stats().live_files_published;
@@ -970,27 +974,31 @@ mod live_fencing {
             published
         );
         let exports = node
-            .inventory
-            .lock()
-            .live_target
-            .as_ref()
-            .unwrap()
-            .stats()
+            .with_live_target(|target| target.stats())
             .unwrap()
             .namespaces_exposed;
         let mut changed = segment.clone();
         changed.inode += 1;
         assert_eq!(
-            node.inventory
-                .lock()
-                .publish_permanent_segment(&changed)
-                .unwrap_err()
-                .to_string(),
+            node.with_lifecycle(|inventory, slot| {
+                NodeInventory::publish_permanent_segment(
+                    inventory,
+                    slot.as_mut().unwrap(),
+                    &changed,
+                )
+            })
+            .unwrap_err()
+            .to_string(),
             "live segment identity or access changed"
         );
         let second = node
             .control_context
-            .lease_live_published(1, DurabilityTier::Native, Some(first.extent.token))
+            .lease_live_published(
+                1,
+                DurabilityTier::Native,
+                Some(first.extent.token),
+                inventory::InlineExport::Prelease,
+            )
             .unwrap();
         // Close both empty extents with their skip markers before crossing.
         for extent in [&first.extent, &second.extent] {
@@ -1015,7 +1023,12 @@ mod live_fencing {
         }
         let third = node
             .control_context
-            .lease_live_published(1, DurabilityTier::Native, None)
+            .lease_live_published(
+                1,
+                DurabilityTier::Native,
+                None,
+                inventory::InlineExport::Lease,
+            )
             .unwrap();
         assert_eq!(third.extent.segment.file_index, 1);
         assert_eq!(third.binding, binding);
@@ -1023,12 +1036,7 @@ mod live_fencing {
         // Call the same grant handler directly to exclude a later preparation
         // from the export-count assertion.
         assert_eq!(
-            node.inventory
-                .lock()
-                .live_target
-                .as_ref()
-                .unwrap()
-                .stats()
+            node.with_live_target(|target| target.stats())
                 .unwrap()
                 .namespaces_exposed,
             exports
@@ -1050,12 +1058,7 @@ mod live_fencing {
             let log = node.inventory.lock().active(1).unwrap();
             wait_prepared(&log, 1);
             assert_eq!(
-                node.inventory
-                    .lock()
-                    .live_target
-                    .as_ref()
-                    .unwrap()
-                    .stats()
+                node.with_live_target(|target| target.stats())
                     .unwrap()
                     .owned_namespace_count,
                 2
@@ -1068,12 +1071,7 @@ mod live_fencing {
             }
             assert_eq!(node.control.preparer_count(), 0);
             assert_eq!(
-                node.inventory
-                    .lock()
-                    .live_target
-                    .as_ref()
-                    .unwrap()
-                    .stats()
+                node.with_live_target(|target| target.stats())
                     .unwrap()
                     .owned_namespace_count,
                 0
@@ -1081,7 +1079,7 @@ mod live_fencing {
         }
     }
 
-    fn wait_inventory_retry(node: &StorageNode) {
+    fn wait_gate_retry(node: &StorageNode) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             // Acquire observes the worker's positive failed-lock signal.
@@ -1091,20 +1089,20 @@ mod live_fencing {
                 .preparers
                 .lock()
                 .iter()
-                .any(|slot| slot.waiting_for_inventory.load(Ordering::Acquire))
+                .any(|slot| slot.waiting_for_gate.load(Ordering::Acquire))
             {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "worker did not reach inventory retry"
+                "worker did not reach lifecycle gate retry"
             );
             thread::yield_now();
         }
     }
 
     #[test]
-    fn final_target_shutdown_joins_a_preparer_parked_on_inventory() {
+    fn final_target_shutdown_joins_a_preparer_parked_on_the_lifecycle_gate() {
         let temp = tempdir::TempDir::new("prepared-final-shutdown").unwrap();
         let (_, node) = open_live_mode(
             temp.path(),
@@ -1120,10 +1118,10 @@ mod live_fencing {
         let owner = node.clone();
         let shutdown = thread::spawn(move || owner.control.finish_live_target_shutdown());
         entry.recv_timeout(Duration::from_secs(5)).unwrap();
-        // Teardown owns inventory before preparation begins, so the worker
-        // cannot expose any capability after teardown starts.
+        // Teardown owns the lifecycle gate before preparation begins, so the
+        // worker cannot expose any capability after teardown starts.
         node.control.shared.trigger_file_preparation(&log);
-        wait_inventory_retry(&node);
+        wait_gate_retry(&node);
         release.send(()).unwrap();
         let stats = shutdown.join().unwrap().unwrap();
         assert_eq!(node.control.preparer_count(), 0);
@@ -1150,7 +1148,7 @@ mod live_fencing {
         let shutdown = thread::spawn(move || owner.control.finish_live_target_shutdown());
         entry.recv_timeout(Duration::from_secs(5)).unwrap();
         node.control.shared.trigger_file_preparation(&log);
-        wait_inventory_retry(&node);
+        wait_gate_retry(&node);
         let remaining_stopping = {
             let mut slots = node.control.shared.preparers.lock();
             let stopping = slots[0].stopping.clone();
@@ -1163,7 +1161,7 @@ mod live_fencing {
                     log: log.clone(),
                     trigger,
                     stopping: Arc::new(AtomicBool::new(false)),
-                    waiting_for_inventory: Arc::new(AtomicBool::new(false)),
+                    waiting_for_gate: Arc::new(AtomicBool::new(false)),
                     worker: thread::spawn(|| panic!("injected preparer failure")),
                 },
             );
@@ -1179,20 +1177,74 @@ mod live_fencing {
         assert_eq!(node.control.preparer_count(), 0);
         assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
         assert_eq!(
-            node.inventory
-                .lock()
-                .live_target
-                .as_ref()
-                .unwrap()
-                .stats()
+            node.with_live_target(|target| target.stats())
                 .unwrap()
                 .namespaces_exposed,
             0
         );
     }
 
+    /// A grant whose export is paused inside a target journal sync holds only
+    /// the lifecycle gate: an inventory reader and a position proof on another
+    /// control worker complete while the sync is still paused.
     #[test]
-    fn preparer_retirement_joins_while_inventory_is_held() {
+    fn foreground_work_proceeds_while_a_target_journal_sync_is_paused() {
+        use crate::distributed::nvmeof::live_target::SaveStep;
+        let temp = tempdir::TempDir::new("paused-target-journal").unwrap();
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
+        let (entered, paused) = mpsc::sync_channel(1);
+        let (resume, resumed) = mpsc::sync_channel::<()>(1);
+        let mut armed = true;
+        node.with_live_target(|target| {
+            target.set_save_hook(Box::new(move |step| {
+                if armed && step == SaveStep::Prepared {
+                    armed = false;
+                    entered.send(()).map_err(io::Error::other)?;
+                    // `resume` drops on test unwind, so this cannot hang.
+                    resumed.recv().map_err(io::Error::other)?;
+                }
+                Ok(())
+            }));
+        });
+        let leasing = {
+            let node = node.clone();
+            thread::spawn(move || extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 }))
+        };
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The export holds the lifecycle gate across its journal sync...
+        assert!(node.control_context.lifecycle.try_lock().is_none());
+        // ...and not the inventory.
+        let inventory = node
+            .inventory
+            .try_lock_for(Duration::from_secs(5))
+            .expect("inventory is held across a target journal sync");
+        assert!(inventory.active(1).is_ok());
+        drop(inventory);
+        let (completed, completions) = mpsc::sync_channel(1);
+        let proof = Request::CheckpointPosition {
+            authority_epoch: 1,
+            epoch: 1,
+            through: 0,
+        };
+        assert!(command(&node, 2, proof, 4096, &completed).is_ok());
+        let response = receive(&completions, 2).response.unwrap();
+        assert!(matches!(
+            response,
+            Response::CheckpointPosition { epoch: 1, .. }
+        ));
+        assert!(
+            node.control_context.lifecycle.try_lock().is_none(),
+            "the position proof must complete while the export is still paused"
+        );
+        resume.send(()).unwrap();
+        let Response::LiveLeased(_) = leasing.join().unwrap() else {
+            panic!("expected lease")
+        };
+        shutdown(&node, 1);
+    }
+
+    #[test]
+    fn preparer_retirement_joins_while_the_lifecycle_gate_is_held() {
         for seal in [false, true] {
             let temp = tempdir::TempDir::new("prepared-try-lock").unwrap();
             let (_, node) = open_live_mode(
@@ -1203,16 +1255,16 @@ mod live_fencing {
             let log = node.inventory.lock().active(1).unwrap();
             log.lease_live_extent(RequestAuthority { epoch: 1 })
                 .unwrap();
-            let inventory = node.inventory.lock();
+            let lifecycle = node.control_context.lifecycle.lock();
             node.control.shared.trigger_file_preparation(&log);
             wait_prepared(&log, 0);
-            wait_inventory_retry(&node);
-            // At this point the worker cannot acquire inventory. Retirement
-            // holds the same lock in the real fence and seal paths.
+            wait_gate_retry(&node);
+            // At this point the worker cannot acquire the gate. Retirement
+            // holds the same gate in the real fence and seal paths.
             node.control.shared.retire_syncer(&log).unwrap();
             assert_eq!(node.control.preparer_count(), 0);
             assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
-            drop(inventory);
+            drop(lifecycle);
             drop(log);
             if seal {
                 shutdown(&node, 1);
@@ -1261,12 +1313,7 @@ mod live_fencing {
             } else {
                 assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
                 assert_eq!(
-                    node.inventory
-                        .lock()
-                        .live_target
-                        .as_ref()
-                        .unwrap()
-                        .stats()
+                    node.with_live_target(|target| target.stats())
                         .unwrap()
                         .owned_namespace_count,
                     0
@@ -1349,20 +1396,21 @@ mod live_fencing {
             }
             let lease = log.resolve_live_record(&reference).unwrap();
             let token = [7; 16];
-            let mut inventory = node.inventory.lock();
-            inventory.live_pins.insert(token, (1, vec![lease]));
-            inventory.release_live_pin(1, token).unwrap();
-            assert!(!inventory.live_pins.contains_key(&token));
-            inventory.reap_idle_live_segments(1).unwrap();
-            let target = inventory.live_target.as_ref().unwrap();
-            assert_eq!(
-                target.binding_for_file(&file).as_ref(),
-                Some(&leased.binding)
-            );
-            assert_eq!(
-                target.stats().unwrap().owned_namespace_count,
-                if prepared { 2 } else { 1 }
-            );
+            node.with_lifecycle(|inventory, slot| {
+                inventory.live_pins.insert(token, (1, vec![lease]));
+                NodeInventory::release_live_pin(inventory, slot.as_mut(), 1, token).unwrap();
+                assert!(!inventory.live_pins.contains_key(&token));
+                let target = slot.as_mut().unwrap();
+                NodeInventory::reap_idle_live_segments(inventory, target, 1).unwrap();
+                assert_eq!(
+                    target.binding_for_file(&file).as_ref(),
+                    Some(&leased.binding)
+                );
+                assert_eq!(
+                    target.stats().unwrap().owned_namespace_count,
+                    if prepared { 2 } else { 1 }
+                );
+            });
         }
         shutdown(&node, 1);
     }
@@ -1429,37 +1477,17 @@ mod live_fencing {
                 assert_eq!(info.mode, mode);
                 assert_eq!(info.exported_files, if permanent { 2 } else { 0 });
                 assert_eq!(info.wal_file_bytes, 32768);
-                let inventory = node.inventory.lock();
-                assert_eq!(
-                    inventory
-                        .live_target
-                        .as_ref()
-                        .unwrap()
-                        .stats()
-                        .unwrap()
-                        .namespaces_exposed,
-                    expected_namespaces
-                );
-                assert_eq!(
-                    inventory
-                        .live_target
-                        .as_ref()
-                        .unwrap()
-                        .stats()
-                        .unwrap()
-                        .owned_namespace_count,
-                    expected_namespaces
-                );
+                let stats = node.with_live_target(|target| target.stats()).unwrap();
+                assert_eq!(stats.namespaces_exposed, expected_namespaces);
+                assert_eq!(stats.owned_namespace_count, expected_namespaces);
                 assert_eq!(leased.binding.permanent, mode != LiveExportMode::OnDemand);
             }
-            node.inventory.lock().reap_idle_live_segments(1).unwrap();
+            node.with_lifecycle(|inventory, slot| {
+                NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 1)
+            })
+            .unwrap();
             assert_eq!(
-                node.inventory
-                    .lock()
-                    .live_target
-                    .as_ref()
-                    .unwrap()
-                    .stats()
+                node.with_live_target(|target| target.stats())
                     .unwrap()
                     .owned_namespace_count,
                 expected_namespaces
@@ -1491,12 +1519,7 @@ mod live_fencing {
         // namespace. File 1 exists on the target but has never had a lease.
         assert_eq!(info.exported_files, 1);
         assert_eq!(
-            node.inventory
-                .lock()
-                .live_target
-                .as_ref()
-                .unwrap()
-                .stats()
+            node.with_live_target(|target| target.stats())
                 .unwrap()
                 .owned_namespace_count,
             2
@@ -1735,13 +1758,7 @@ mod live_fencing {
     }
 
     fn target_stats(node: &StorageNode) -> crate::distributed::nvmeof::LiveTargetStats {
-        node.inventory
-            .lock()
-            .live_target
-            .as_ref()
-            .unwrap()
-            .stats()
-            .unwrap()
+        node.with_live_target(|target| target.stats()).unwrap()
     }
 
     #[test]
@@ -1758,7 +1775,10 @@ mod live_fencing {
             let first = history_page(&node, &config, 0, end, 0);
             let exposed = target_stats(&node).namespaces_exposed;
             release_history_page(&node, &first);
-            node.inventory.lock().reap_idle_live_segments(2).unwrap();
+            node.with_lifecycle(|inventory, slot| {
+                NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 2)
+            })
+            .unwrap();
             let retained = mode != LiveExportMode::OnDemand;
             assert_eq!(
                 target_stats(&node).owned_namespace_count,
@@ -1821,12 +1841,7 @@ mod live_fencing {
         }
         assert_eq!(node.inventory.lock().live_export_pins.len(), 1);
         assert_eq!(
-            node.inventory
-                .lock()
-                .live_target
-                .as_ref()
-                .unwrap()
-                .binding_for_file(&file),
+            node.with_live_target(|target| target.binding_for_file(&file)),
             Some(entry.binding.clone()),
         );
         assert!(matches!(
@@ -1852,25 +1867,29 @@ mod live_fencing {
             let segment = &page.entries[0].segment;
             release_history_page(&node, &page);
             assert_eq!(target_stats(&node).owned_namespace_count, 1);
-            {
-                let mut inventory = node.inventory.lock();
+            node.with_lifecycle(|inventory, slot| {
+                let target = slot.as_mut().unwrap();
                 assert_eq!(
-                    inventory
-                        .publish_live_segment(segment, true)
+                    NodeInventory::publish_live_segment(
+                        inventory,
+                        target,
+                        segment,
+                        true,
+                        inventory::InlineExport::Lease,
+                    )
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                    "live segment identity or access changed"
+                );
+                assert_eq!(
+                    NodeInventory::publish_permanent_segment(inventory, target, segment)
                         .err()
                         .unwrap()
                         .to_string(),
                     "live segment identity or access changed"
                 );
-                assert_eq!(
-                    inventory
-                        .publish_permanent_segment(segment)
-                        .err()
-                        .unwrap()
-                        .to_string(),
-                    "live segment identity or access changed"
-                );
-            }
+            });
             assert_eq!(
                 fence(&node, 1).err().unwrap().to_string(),
                 "epoch already fenced/sealed; cannot reactivate"
@@ -1956,10 +1975,10 @@ mod live_fencing {
         assert_eq!(Some(&pinned.entries[0].binding), first_binding.as_ref());
         let new = history_page(&node, &config, from, end, (bound * 2) as u64);
         from = new.next.unwrap() as u64;
-        node.inventory
-            .lock()
-            .release_live_pin(2, new.epoch_pin_token)
-            .unwrap();
+        node.with_lifecycle(|inventory, slot| {
+            NodeInventory::release_live_pin(inventory, slot.as_mut(), 2, new.epoch_pin_token)
+        })
+        .unwrap();
         assert_eq!(
             target_stats(&node).owned_namespace_count,
             (bound + 1) as u64
@@ -3039,7 +3058,7 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 26);
-    preface[4..6].copy_from_slice(&25u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 27);
+    preface[4..6].copy_from_slice(&26u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }

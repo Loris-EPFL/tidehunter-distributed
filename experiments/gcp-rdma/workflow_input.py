@@ -30,7 +30,7 @@ def specification(suite, backends, mode, selection=None):
         spec = copy.deepcopy(manual_campaign.REVIEWED_SPECS[selection])
         manual_campaign._reviewed_jobs(spec)
         if selection in (*cloud_campaign.M3_SELECTIONS, *cloud_campaign.TOOL_SELECTIONS):
-            spec["reservation_hours"] = 2
+            spec.setdefault("reservation_hours", 2)
         return spec
     if selection is not None:
         raise ValueError('selection is only valid in focused mode')

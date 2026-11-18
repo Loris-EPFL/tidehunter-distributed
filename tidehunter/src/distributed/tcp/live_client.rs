@@ -1714,11 +1714,10 @@ impl super::Client {
             extent.lease.extent.token,
             extent.written_end,
         );
-        let deadline = Instant::now() + self.timeout;
         let result = if target == PendingTarget::Prelease {
-            self.submit_prelease_live_extent(epoch, token, deadline)
+            self.submit_prelease_live_extent(epoch, token)
         } else {
-            self.submit_adopt_live_extent(epoch, token, through, close, false, deadline)
+            self.submit_adopt_live_extent(epoch, token, through, close, false)
         };
         match result {
             Ok(true) => {
@@ -3094,7 +3093,7 @@ pub(crate) mod leased_tests {
                 configfs,
             )
             .unwrap();
-            node.inventory.lock().live_target = Some(target);
+            node.install_live_target(target).unwrap();
             let tls = TlsFiles {
                 transport: Transport::TcpTrusted,
                 ca: PathBuf::new(),
@@ -5730,6 +5729,13 @@ impl super::Client {
     pub(crate) fn leased_test_release_held(&mut self) {
         self.live_writer.as_mut().unwrap().io.release_held();
     }
+    /// Write CQEs the queue has reaped, held ones included. Published
+    /// counters advance only when a completion is delivered.
+    pub(crate) fn leased_test_reaped_writes(&self) -> u64 {
+        self.live_writer
+            .as_ref()
+            .map_or(0, |writer| writer.io.stats().completed_write_ops)
+    }
     pub(crate) fn leased_test_fail_flight(&mut self, id: u64, result: i32) {
         self.live_writer
             .as_mut()
@@ -5794,7 +5800,7 @@ impl super::StorageNode {
         &self,
         target: crate::distributed::nvmeof::live_target::LiveTargetManager,
     ) {
-        self.inventory.lock().live_target = Some(target);
+        self.install_live_target(target).unwrap();
     }
 }
 

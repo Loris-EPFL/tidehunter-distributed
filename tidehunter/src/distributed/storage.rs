@@ -47,6 +47,9 @@ pub use history::{HistoryPersistence, WAL_REPLAY_WINDOW_BATCHES};
 mod wal_replay;
 use wal_replay::WalRoot;
 pub use wal_replay::{DecodedGroup, ReplayPage};
+mod durable_progress;
+pub use durable_progress::LogDurableProgress;
+use durable_progress::ProgressTail;
 
 /// Full static inventory for one database epoch, copied durably to every node.
 /// The caller must hold the unique database authority; this is not a consensus
@@ -431,6 +434,8 @@ struct State {
     references: ReferenceDirectoryWriter,
     appended_end: u64,
     durable_end: u64,
+    // Versions at the appended and durable ends; moves with them under this lock.
+    progress: ProgressTail,
     // Proof owned by this append-only handle, never a highest allocated file.
     // A new file requires a new namespace barrier. Rooted history permits
     // sealed whole-file retirement, never physical address reuse.
@@ -919,6 +924,9 @@ pub struct PartitionLog {
     live_read_pins: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "experimental-nvmeof")]
     live_stream: bool,
+    // Recovery of this handle stopped at a lost, torn or invalid frame and a valid
+    // frame followed later: a hole below the recovered tail. Owner continuity input.
+    recovery_hole: bool,
     #[cfg(test)]
     before_authority_load: Mutex<
         Option<(
@@ -1095,6 +1103,7 @@ impl PartitionLog {
                 references: reference_writer,
                 appended_end: 0,
                 durable_end: 0,
+                progress: ProgressTail::default(),
                 namespace_synced_file: None,
                 poison: None,
                 sealed: false,
@@ -1119,6 +1128,7 @@ impl PartitionLog {
             live_read_pins: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "experimental-nvmeof")]
             live_stream: false,
+            recovery_hole: false,
             #[cfg(test)]
             before_authority_load: Mutex::new(None),
             #[cfg(test)]
@@ -1328,6 +1338,11 @@ impl PartitionLog {
         let recovery_end = if live { scan_end } else { strict_end };
         let mut tail_seen = false;
         let mut stopped = false;
+        // Continuity evidence: a scan that ends early (lost, torn or invalid frame, or
+        // a lost skip marker) with a valid frame later left a hole below the recovered
+        // tail. Unwritten space at the tail is not a hole.
+        let mut gap = false;
+        let mut recovery_hole = false;
         while start < recovery_end && !stopped {
             if references.is_retired(start / expected.wal_file_bytes * expected.wal_file_bytes)? {
                 start = (start / expected.wal_file_bytes + 1) * expected.wal_file_bytes;
@@ -1348,8 +1363,15 @@ impl PartitionLog {
                     return Err(StorageError::Invalid("missing durable live WAL fragment"));
                 }
                 // Beyond the synced frontier a missing fragment is the end of the WAL.
-                Err(WalError::EndOfWal) if live => break,
+                Err(WalError::EndOfWal) if live => {
+                    gap = true;
+                    start = start
+                        .checked_add(expected.fragment_bytes)
+                        .ok_or(StorageError::Capacity)?;
+                    break;
+                }
                 Err(WalError::EndOfWal) => {
+                    gap = true;
                     start = start
                         .checked_add(expected.fragment_bytes)
                         .ok_or(StorageError::Capacity)?;
@@ -1391,6 +1413,7 @@ impl PartitionLog {
                                         "corrupt live skip-marker suffix",
                                     ));
                                 }
+                                gap = true;
                                 stopped = true;
                                 break 'frames;
                             }
@@ -1408,10 +1431,14 @@ impl PartitionLog {
                         return Err(StorageError::Invalid("corrupt durable live WAL frame"));
                     }
                     Err(WalError::Crc(_) | WalError::EndOfWal) if live => {
+                        gap = true;
                         stopped = true;
                         break 'frames;
                     }
-                    Err(WalError::Crc(_) | WalError::EndOfWal) => break,
+                    Err(WalError::Crc(_) | WalError::EndOfWal) => {
+                        gap = true;
+                        break;
+                    }
                     Err(error) => return Err(StorageError::Wal(error)),
                 };
                 if position.offset() >= start + expected.fragment_bytes {
@@ -1432,6 +1459,7 @@ impl PartitionLog {
                         || bytes[8..12] != [0, 3, 0, 12])
                 {
                     if position.offset() >= strict_end {
+                        gap = true;
                         stopped = true;
                         break 'frames;
                     }
@@ -1447,6 +1475,7 @@ impl PartitionLog {
                 ) {
                     Ok(group) => group,
                     Err(_) if live && position.offset() >= strict_end => {
+                        gap = true;
                         stopped = true;
                         break 'frames;
                     }
@@ -1493,9 +1522,13 @@ impl PartitionLog {
                 {
                     // An invalid or duplicate frame beyond the synced frontier ends
                     // the replay; it was never acknowledged durable.
+                    gap = true;
                     stopped = true;
                     break 'frames;
                 }
+                // Owner-RPC streams scan fragments independently: a frame adopted
+                // after an early fragment end lies above a hole.
+                recovery_hole |= gap;
                 physical_end = position.offset() + position.frame_len() as u64;
                 let mut group_metadata = Vec::with_capacity(group.batches().len());
                 for (batch, offset) in group.batches().iter().zip(group.batch_offsets()) {
@@ -1547,6 +1580,27 @@ impl PartitionLog {
             start = start
                 .checked_add(expected.fragment_bytes)
                 .ok_or(StorageError::Invalid("WAL scan offset overflow"))?;
+        }
+        // A live scan stops at its first defect; probe the first frame of every later
+        // fragment (bounded by the scan end) for a valid frame above it.
+        let mut probe = start;
+        while live && gap && !recovery_hole && probe < recovery_end {
+            if !references.is_retired(probe / expected.wal_file_bytes * expected.wal_file_bytes)? {
+                match wal.wal_iterator_for_scan(probe) {
+                    Ok(mut scan) => match scan.next() {
+                        Ok((position, _)) => {
+                            recovery_hole = position.offset() < probe + expected.fragment_bytes;
+                        }
+                        Err(WalError::Crc(_) | WalError::EndOfWal) => {}
+                        Err(error) => return Err(StorageError::Wal(error)),
+                    },
+                    Err(WalError::EndOfWal) => {}
+                    Err(error) => return Err(StorageError::Wal(error)),
+                }
+            }
+            probe = probe
+                .checked_add(expected.fragment_bytes)
+                .ok_or(StorageError::Capacity)?;
         }
         if let Some(frontier) = &frontier
             && let Some(tail) = &frontier.tail
@@ -1601,6 +1655,7 @@ impl PartitionLog {
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
+                progress: ProgressTail::default(),
                 namespace_synced_file: None,
                 poison: None,
                 sealed: true,
@@ -1625,6 +1680,7 @@ impl PartitionLog {
             live_read_pins: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "experimental-nvmeof")]
             live_stream: live,
+            recovery_hole,
             #[cfg(test)]
             before_authority_load: Mutex::new(None),
             #[cfg(test)]
@@ -3079,6 +3135,9 @@ impl PartitionLog {
             ))));
         }
         state.appended_end = group_end;
+        if let Some(last) = group.batches().last() {
+            state.progress.appended(last.version());
+        }
         // Adoption proves APPENDED bytes only. Synchronous reads and checkpoint
         // proofs still require the owner's separate covering persistence barrier.
         if let Some(frontier) = self.frontier.get() {
@@ -3822,6 +3881,9 @@ impl PartitionLog {
                 return Err(StorageError::Unknown(WalError::Io(io::Error::other(error))));
             }
             state.appended_end = group_end;
+            if let Some(last) = group.batches().last() {
+                state.progress.appended(last.version());
+            }
             if let Some(frontier) = self.frontier.get()
                 && frontier
                     .publish_appended(group_end, group.batches().len() as u64)
@@ -3914,6 +3976,21 @@ impl PartitionLog {
     /// A position-root proof can be ahead without publishing receipt bookkeeping.
     pub fn synced_frontier(&self) -> u64 {
         self.durable_frontier.load(Ordering::Acquire)
+    }
+
+    /// The recovery that opened this handle left a hole below its recovered tail: it
+    /// ended early at a lost, torn or invalid frame and a valid frame followed. Always
+    /// false for a handle created empty.
+    pub fn recovery_found_hole(&self) -> bool {
+        self.recovery_hole
+    }
+
+    /// Appended and synced tails with their byte frontiers, from one lock hold.
+    pub fn durable_progress(&self) -> LogDurableProgress {
+        let state = self.state.lock();
+        state
+            .progress
+            .snapshot(state.appended_end, state.durable_end)
     }
 
     /// Published position-root cut, distinct from the adopted receipt frontier.
@@ -4091,7 +4168,7 @@ impl PartitionLog {
         timing.stage(Some(WriteStage::PersistStateLock));
         #[cfg(feature = "experimental-nvmeof")]
         let mut live_frontier = None;
-        let (start, end, namespace_synced_file) = {
+        let (start, end, namespace_synced_file, captured) = {
             let mut state = self.state.lock();
             timing.stage(Some(WriteStage::PersistValidation));
             let Some(requested_end) = pending_scope(&state, scope)? else {
@@ -4135,6 +4212,8 @@ impl PartitionLog {
                 state.durable_end,
                 state.appended_end,
                 state.namespace_synced_file,
+                // The version of the last batch below `end`, read under the same lock.
+                state.progress.capture(),
             )
         };
         timing.stage(None);
@@ -4207,7 +4286,9 @@ impl PartitionLog {
         debug_assert!(end <= state.appended_end);
         state.stats.persistence_barriers += 1;
         state.stats.namespace_syncs += u64::from(namespace_sync);
+        let advanced = end > state.durable_end;
         state.durable_end = end;
+        state.progress.synced(captured, advanced);
         self.durable_frontier.store(end, Ordering::Release);
         if namespace_sync {
             state.namespace_synced_file =
@@ -5672,7 +5753,12 @@ impl PartitionLog {
             state.poison = Some(WriterPoison::Fatal);
             StorageError::Unknown(WalError::Io(io::Error::other(error)))
         })?;
+        // The seal synced every registered file under this lock hold, so it covers the
+        // whole appended tail.
+        let captured = state.progress.capture();
+        let advanced = end.physical_end > state.durable_end;
         state.durable_end = end.physical_end;
+        state.progress.synced(captured, advanced);
         self.durable_frontier
             .store(end.physical_end, Ordering::Release);
         Ok(())

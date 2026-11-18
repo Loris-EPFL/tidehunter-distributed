@@ -653,7 +653,53 @@ impl Session {
         self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
         Ok(())
     }
+    /// Tells a TCP peer why this side ends the session before `abort` closes it:
+    /// one unsolicited `Response::Error` frame with ID 0. Best effort and never
+    /// blocking: if the frame does not fit the output credit or the socket buffer
+    /// is full, the peer sees only the close. Fabric sessions skip it, because
+    /// `abort` releases provider ownership without waiting for TX completions.
+    fn send_close_notice(&mut self, message: &str, limit: usize) {
+        if self.closed || self.is_fabric() {
+            return;
+        }
+        let notice = Response::Error(message.to_owned());
+        if !self
+            .queue_size(0, &notice, limit)
+            .is_ok_and(|size| self.can_queue(size))
+            || self.queue(0, &notice, limit).is_err()
+        {
+            return;
+        }
+        // Every turn that reports progress wrote or retired bytes of a finite
+        // queue; a turn without progress (drained or WouldBlock) ends the drain.
+        loop {
+            self.output_budget.reset();
+            if !matches!(self.progress_output(), Ok(true)) {
+                break;
+            }
+        }
+    }
+    /// TLS close_notify on a TCP-carried session, so the peer can tell a
+    /// deliberate close from a truncated connection. One nonblocking drain of
+    /// rustls's buffered records; a full socket buffer drops the alert and the
+    /// peer then reports a close without close_notify.
+    fn send_close_notify(&mut self) {
+        if self.closed || self.is_fabric() {
+            return;
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        conn.send_close_notify();
+        while conn.wants_write() {
+            match conn.write_tls(&mut NonblockingIo(&mut self.sock)) {
+                Ok(written) if written != 0 => {}
+                _ => break,
+            }
+        }
+    }
     fn abort(&mut self) {
+        self.send_close_notify();
         #[cfg(feature = "experimental-fabric")]
         self.finish_direct_diagnostic("session-abort");
         #[cfg(feature = "experimental-fabric")]
@@ -961,7 +1007,11 @@ impl Session {
             let result = conn.read_tls(&mut NonblockingIo(&mut self.sock));
             self.stats.tls_read.record(began, &result);
             match result {
-                Ok(0) => return Err(TcpError::new("truncated TLS session")),
+                Ok(0) => {
+                    return Err(TcpError::new(
+                        "TLS session truncated: peer closed the connection without close_notify",
+                    ));
+                }
                 Ok(n) => {
                     let began = self.time_work.then(Instant::now);
                     let result = conn.process_new_packets();
@@ -1217,10 +1267,25 @@ impl Session {
             .ok_or_else(|| TcpError::new("rustls plaintext readiness underflow"))?;
         Ok(())
     }
+    /// The peer ended the session at a frame boundary: TLS close_notify with all
+    /// plaintext consumed, or plain-TCP EOF. No request or reply was cut short.
+    fn peer_finished(&self) -> bool {
+        self.peer_closed
+            && self.plaintext_pending == 0
+            && self.header_used == 0
+            && self.input_used == 0
+    }
+    fn peer_close_error(&self) -> TcpError {
+        TcpError::new(match (self.peer_finished(), self.conn.is_some()) {
+            (true, true) => "peer closed the session (TLS close_notify)",
+            (true, false) => "peer closed the connection",
+            (false, _) => "truncated transport frame: peer closed the session inside a frame",
+        })
+    }
     fn receive(&mut self, limit: usize) -> Result<Option<(Vec<u8>, usize)>, TcpError> {
         if self.conn.is_some() && self.plaintext_pending == 0 {
             return if self.peer_closed {
-                Err(TcpError::new("truncated transport frame"))
+                Err(self.peer_close_error())
             } else {
                 Ok(None)
             };
@@ -1234,6 +1299,11 @@ impl Session {
             );
             self.stats.plaintext_read.record(began, &result);
             match result {
+                // Plain TCP has no close_notify; EOF before a header is its clean close.
+                Ok(0) if self.conn.is_none() && !self.is_fabric() && self.header_used == 0 => {
+                    self.peer_closed = true;
+                    return Err(self.peer_close_error());
+                }
                 Ok(0) => return Err(TcpError::new("truncated transport frame")),
                 Ok(n) => {
                     if self.conn.is_some() {
@@ -1263,7 +1333,7 @@ impl Session {
         }
         if self.conn.is_some() && self.plaintext_pending == 0 {
             return if self.peer_closed {
-                Err(TcpError::new("truncated transport frame"))
+                Err(self.peer_close_error())
             } else {
                 Ok(None)
             };
@@ -1322,10 +1392,13 @@ impl Session {
     }
 }
 
-#[cfg(feature = "experimental-fabric")]
 impl Drop for Session {
     fn drop(&mut self) {
+        #[cfg(feature = "experimental-fabric")]
         self.finish_direct_diagnostic("session-drop");
+        // A session dropped without `abort` (a client going away) still ends its
+        // TLS stream deliberately; after `abort` this is a no-op.
+        self.send_close_notify();
     }
 }
 
@@ -2161,7 +2234,14 @@ impl Client {
                 return Err(TcpError::new("invalid response protocol"));
             }
             if envelope.id == 0 {
-                return Err(TcpError::new("invalid unsolicited response"));
+                // ID 0 is never a request: an owner that ends the session sends
+                // its reason (`send_close_notice`) right before closing.
+                return Err(match envelope.body {
+                    Response::Error(reason) => {
+                        TcpError::new(format!("owner closed the session: {reason}"))
+                    }
+                    _ => TcpError::new("invalid unsolicited response"),
+                });
             }
             if self
                 .reactor
@@ -2583,6 +2663,9 @@ impl Client {
 struct ServerPending {
     partition: u32,
     deadline: Instant,
+    /// Request kind code and owner timeout, kept only to name an expired deadline.
+    kind: u64,
+    timeout: Duration,
     charge: usize,
     epoch: Option<u64>,
     read_generation: Option<u64>,
@@ -2602,6 +2685,25 @@ struct ServerPending {
     is_append: bool,
     owner_trace: bool,
     owner_trace_shape: Option<(u64, usize, usize)>,
+}
+
+impl ServerPending {
+    /// Names the owner deadline that ends the session: which request, at which
+    /// stage, after how long. The owner logs it and sends it to the peer before
+    /// closing, so the peer does not see only a TLS teardown.
+    fn deadline_error(&self, id: u64, stage: &str, now: Instant) -> TcpError {
+        let age = self
+            .deadline
+            .checked_sub(self.timeout)
+            .map_or(self.timeout, |accepted| {
+                now.saturating_duration_since(accepted)
+            });
+        TcpError::new(format!(
+            "owner request deadline expired: request {id} (kind {}) {stage} after {age:?} \
+             (owner deadline {:?}); its outcome is unknown and the session is closed",
+            self.kind, self.timeout
+        ))
+    }
 }
 
 pub(super) struct WorkCompletion {
@@ -2815,16 +2917,43 @@ pub(super) fn serve_session(
             };
             // io_timeout bounds initial Status, partial frames and accepted work;
             // a healthy established connection may remain idle indefinitely.
-            if pending.values().any(|read| now >= read.deadline)
-                || held_request
-                    .as_ref()
-                    .is_some_and(|(_, _, deadline)| now >= *deadline)
-                || stream.partial_expired(now, limits.io_timeout)
-                || (!initialized
-                    && pending.is_empty()
-                    && now.duration_since(idle_since) >= limits.io_timeout)
+            if let Some((&id, request)) = pending.iter().find(|(_, read)| now >= read.deadline) {
+                let stage = if request.response_queued {
+                    "was still sending its response"
+                } else if request.ready_response.is_some() {
+                    "had a response ready to send"
+                } else {
+                    "was still executing"
+                };
+                return Err(request.deadline_error(id, stage, now));
+            }
+            if let Some((envelope, _, _)) = held_request
+                .as_ref()
+                .filter(|(_, _, deadline)| now >= *deadline)
             {
-                return Err(TcpError::new("session request deadline expired"));
+                return Err(TcpError::new(format!(
+                    "owner request deadline expired: request {} (kind {}) was still waiting \
+                     for session byte credits; the session is closed",
+                    envelope.id,
+                    request_kind_code(&envelope.body)
+                )));
+            }
+            if stream.partial_expired(now, limits.io_timeout) {
+                return Err(TcpError::new(format!(
+                    "owner I/O deadline expired: a request frame stayed incomplete for {:?}; \
+                     the session is closed",
+                    limits.io_timeout
+                )));
+            }
+            if !initialized
+                && pending.is_empty()
+                && now.duration_since(idle_since) >= limits.io_timeout
+            {
+                return Err(TcpError::new(format!(
+                    "owner I/O deadline expired: no Status request within {:?} of connect; \
+                     the session is closed",
+                    limits.io_timeout
+                )));
             }
             // An idle provider wait replaces this sweep's CQ acquisition. It
             // never adds a second consumer or parks an active client request.
@@ -2951,7 +3080,11 @@ pub(super) fn serve_session(
                     .get(&read.id)
                     .ok_or_else(|| TcpError::new("unknown authority planning completion ID"))?;
                 if Instant::now() >= request.deadline {
-                    return Err(TcpError::new("session request deadline expired"));
+                    return Err(request.deadline_error(
+                        read.id,
+                        "finished read planning",
+                        Instant::now(),
+                    ));
                 }
                 // The worker pinned native file ownership BEFORE this recheck.
                 // Fencing invalidates authority, never a live CQ/file owner.
@@ -2985,7 +3118,21 @@ pub(super) fn serve_session(
                     request
                 } else {
                     let starting_frame = stream.header_used == 0;
-                    let received = stream.receive(limits.max_frame_bytes)?;
+                    let received = match stream.receive(limits.max_frame_bytes) {
+                        Ok(received) => received,
+                        // A peer that closed at a frame boundary neither sends nor
+                        // reads again. End the session; report only cut-off work.
+                        Err(_) if stream.peer_finished() && pending.is_empty() => {
+                            return Ok(());
+                        }
+                        Err(_) if stream.peer_finished() => {
+                            return Err(TcpError::new(format!(
+                                "peer closed the session with {} accepted requests outstanding",
+                                pending.len()
+                            )));
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if starting_frame
                         && (received.is_some() || stream.header_used != 0)
                         && let Some(profile) = diagnostics.as_mut()
@@ -3171,6 +3318,8 @@ pub(super) fn serve_session(
                     ServerPending {
                         partition: node.control_context.partition.partition,
                         deadline,
+                        kind: request_kind_code(&envelope.body),
+                        timeout: envelope.body.timeout(limits.io_timeout),
                         charge,
                         epoch,
                         read_generation: None,
@@ -3366,7 +3515,11 @@ pub(super) fn serve_session(
                     continue;
                 }
                 if Instant::now() >= request.deadline {
-                    return Err(TcpError::new("session request deadline expired"));
+                    return Err(request.deadline_error(
+                        read.id,
+                        "reached read submission",
+                        Instant::now(),
+                    ));
                 }
                 if request.profile.is_some() {
                     request.executor_started.get_or_insert_with(Instant::now);
@@ -3612,6 +3765,17 @@ pub(super) fn serve_session(
         }
         Ok(())
     })();
+    // Tell a live peer why its session ends, so its error names the owner's
+    // deadline or failure instead of a bare connection close. `Ok` with a live
+    // peer means the node's shutdown flag ended the session.
+    if !stream.peer_closed {
+        match &result {
+            Err(error) => stream.send_close_notice(&error.to_string(), limits.max_frame_bytes),
+            Ok(()) => {
+                stream.send_close_notice("owner node is shutting down", limits.max_frame_bytes)
+            }
+        }
+    }
     stream.abort();
     // A disconnected caller cancels delivery, not accepted control work. Join
     // the bounded worker completions before releasing this session's credits.
@@ -3720,6 +3884,7 @@ fn request_kind_code(request: &Request) -> u64 {
         Request::CheckpointPosition { .. } => 18,
         Request::ReplayWal { .. } => 19,
         Request::RetireWalFiles { .. } => 20,
+        Request::DurableProgress { .. } => 44,
         #[cfg(feature = "experimental-nvmeof")]
         Request::ValidateRecordReferences { .. } => 21,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -3830,8 +3995,9 @@ fn flush_responses(
         if request.ready_response.is_none() {
             continue;
         }
-        if Instant::now() >= request.deadline {
-            return Err(TcpError::new("session request deadline expired"));
+        let now = Instant::now();
+        if now >= request.deadline {
+            return Err(request.deadline_error(id, "had a response ready to send", now));
         }
         // Recheck the captured authority without waiting for append or persistence.
         let recheck_started = request.response_ready_at.map(|_| Instant::now());

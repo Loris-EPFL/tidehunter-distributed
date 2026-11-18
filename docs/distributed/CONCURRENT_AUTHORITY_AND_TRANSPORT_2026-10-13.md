@@ -548,6 +548,72 @@ connection across the idle interval and then verify the stored record. The
 existing partial-frame, expired-request, peer-failure and shutdown regressions
 remain active.
 
+### Session close reasons (2026-11-17)
+
+Before this change, neither side sent TLS `close_notify`. A coordinator therefore
+reported every owner-side close as `truncated TLS session`. That included an
+owner request deadline expiring: under fsync contention, a first `ResolveLiveRecords`
+that creates a writable export can run 13 synced target-journal saves past the
+owner's 10 s data deadline. Owners also logged every coordinator disconnect the
+same way. The close contract is now:
+
+* An owner that ends a TCP or TLS-over-TCP session first sends one unsolicited
+  `Response::Error` with reserved response ID 0. It names the cause, for example
+  `owner request deadline expired: request 6 (kind 29) was still executing after
+  10.0s (owner deadline 10s)`. The kind codes are those of `owner_events.rs`. The
+  client fails with `owner closed the session: <reason>`, and the connection
+  is not reused.
+* Both sides send `close_notify` before closing a TLS session (`abort` and
+  `Drop`). A close at a frame boundary is reported as a peer close. Only a close
+  without `close_notify`, or a close inside a frame, is reported as truncation.
+* Both sends are nonblocking and best effort. If the socket buffer is full, the
+  peer sees only the close. Fabric sessions keep their existing close path,
+  because `abort` releases provider ownership without waiting for transmit
+  completions.
+
+Deadlines, retries and the request outcome are unchanged. A request whose
+deadline expired has an unknown outcome, and the error says so.
+
+### Export creation deadline class (2026-11-18)
+
+Client and owner derive a request deadline from one classification,
+`Request::timeout`. A data request uses the client timeout or the owner
+`io_timeout`. A lifecycle request uses at least `LIFECYCLE_TIMEOUT` (34.5 s),
+as a fence does.
+
+A live export creation is a lifecycle operation: 13 target-registry saves (one
+quarantine save, then two per configfs object for 6 objects), each a file sync
+and a directory sync, plus the commissioning connection
+on a kernel target. Under disk-sync load the saves of one request took
+10.5–12.5 s, more than the 10 s owner data deadline. The owner then closed the
+session, and recovery failed with `truncated TLS session` at its first
+`ResolveLiveRecords`. Every request that can create an export inline now uses
+the lifecycle class:
+
+* `ResolveLiveRecords` (kind 29), the first resolution of a file without a
+  binding;
+* `PreleaseLiveExtent` (kind 36), background preparation of the next extent;
+* `AdoptLiveExtent` with `lease_next` (kind 34), rollover preparation. Without
+  `lease_next` it stays a data request;
+* `LeaseLiveExtent` (kind 33), a lease without a current extent. A fence
+  revokes every export, so the first lease of every epoch creates its file's
+  export inline;
+* `ReserveLiveGroup` (kind 27), a group reservation in a file without a
+  binding: the first of an epoch and every file rollover in group write mode,
+  which has no preparation path.
+
+The grants (27, 33) are memory work when their file is already exported; the
+longer deadline applies to the whole grant, but only an inline export needs it.
+How often a grant pays for one shows in the owner counters:
+`StorageNode::live_inline_export_stats` counts the
+exports each request kind created inline (reserve, lease, rollover, prelease,
+resolve, recover, replay), and the owner writes them as `inline_exports` in its
+live-target shutdown proof. Exports of background preparation and of
+`OpenLiveExports` are not counted. The counters live in the node inventory and
+change under its lock when an export's binding is installed; they are not on
+the wire. Releases (kinds 26 and 43) only revoke exports and stay data requests. No
+retry was added, and the request outcome contract is unchanged.
+
 ### Final rebuilt replay and retained evidence
 
 The final source, including the idle-session correction, was rebuilt before

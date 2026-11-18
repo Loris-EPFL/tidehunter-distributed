@@ -153,6 +153,7 @@ pub(in crate::distributed::remote_db) struct OpenState {
     pub write_timeline: Arc<WriteTimeline>,
     pub clients: Vec<super::super::ClientWorker>,
     pub operational_sampler: super::super::OperationalReadIoSampler,
+    pub durable_cut: Option<super::super::durable_cut::DurableCut>,
     pub transport_pool: Option<Arc<super::super::RemoteTransportPool>>,
     pub transport_key: Option<[u8; 32]>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -217,6 +218,8 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub closing: AtomicBool,
     pub clients: Vec<super::super::ClientWorker>,
     pub operational_sampler: super::super::OperationalReadIoSampler,
+    /// Present when this epoch is tracked under durable-prefix recovery.
+    pub durable_cut: Option<super::super::durable_cut::DurableCut>,
     pub transport_pool: Option<Arc<super::super::RemoteTransportPool>>,
     pub transport_key: Option<[u8; 32]>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -295,6 +298,7 @@ impl WriteCore {
             owner_controls,
             clients: open.clients,
             operational_sampler: open.operational_sampler,
+            durable_cut: open.durable_cut,
             transport_pool: open.transport_pool,
             transport_key: open.transport_key,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

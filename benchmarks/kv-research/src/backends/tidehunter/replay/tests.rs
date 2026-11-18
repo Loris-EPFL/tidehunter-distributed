@@ -515,7 +515,7 @@ async fn unknown_owner_append_fails_replay_and_poisoned_authority_health() {
     let reason = error.to_string();
     assert!(
         reason.contains("stage=transport_progress")
-            && reason.contains("truncated transport frame")
+            && reason.contains("owner closed the session: injected lost durable append response")
             && reason.contains("batch=Some(BatchVersion { epoch: 1, sequence: 0 })"),
         "{reason}"
     );

@@ -33,6 +33,93 @@ def config_fixture():
             "replication_factor": 1}}
 
 
+class DeadlineBoundaryTests(unittest.TestCase):
+    def test_whole_second_runtime_boundary(self):
+        runtime = controller.Controller.__new__(controller.Controller)
+        runtime.clock = lambda: 100
+        for remaining in (0.5, 1.0, 1.000001):
+            runtime.work_end = 100 + remaining
+            with self.subTest(remaining=remaining):
+                if remaining < 1:
+                    with self.assertRaisesRegex(controller.CampaignTimeLimit, "campaign time limit reached"):
+                        runtime.client_runtime_seconds(600)
+                else:
+                    self.assertEqual(runtime.client_runtime_seconds(600), 1)
+        runtime.clock = Mock(side_effect=[100, 101.5])
+        runtime.work_end = 102
+        self.assertEqual(runtime.client_runtime_seconds(600), 2)
+        with self.assertRaises(controller.CampaignTimeLimit):
+            runtime.client_runtime_seconds(2)
+
+    def test_interference_requires_duration_plus_one_second(self):
+        runtime = controller.Controller.__new__(controller.Controller)
+        runtime.clock = lambda: 100
+        for remaining in (20.5, 21.0, 21.000001):
+            runtime.work_end = 100 + remaining
+            with self.subTest(remaining=remaining):
+                if remaining < 21:
+                    with self.assertRaises(controller.CampaignTimeLimit):
+                        runtime.client_runtime_seconds(600, minimum=21)
+                else:
+                    self.assertEqual(runtime.client_runtime_seconds(600, minimum=21), 21)
+
+    def test_time_limit_exports_partial_results_without_starting_case(self):
+        config = config_fixture()
+        runtime = controller.Controller(config, clients_fixture(config), clock=lambda: 100)
+        runtime.work_end = 100.5
+        runtime.bootstrap = Mock()
+        runtime.run_case = Mock()
+        runtime.stop_tide = Mock()
+        runtime.stop_backend = Mock()
+        runtime.export = Mock(return_value={"complete": False})
+        runtime.terminate = Mock(return_value={})
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            runtime.persist = lambda name, value: controller.dump(runtime.root / name, value)
+            with patch.object(controller, "platform_module", return_value=None):
+                self.assertEqual(runtime.run(), {"complete": False})
+            runtime.run_case.assert_not_called()
+            runtime.export.assert_called_once_with(None)
+            self.assertEqual(json.loads((runtime.root / "campaign-outcome.json").read_text()),
+                             {"outcome": "campaign time limit reached"})
+            runtime.terminate.assert_called_once()
+
+    def test_case_never_admits_or_launches_fractional_budget(self):
+        for budgets in ((0.5,), (2.0, 0.5)):
+            with self.subTest(budgets=budgets), tempfile.TemporaryDirectory() as tmp:
+                config = config_fixture()
+                runtime = controller.Controller(config, clients_fixture(config))
+                runtime.root = Path(tmp)
+                runtime.guard = Mock()
+                runtime.select_monitoring = Mock()
+                runtime.finish_monitoring = Mock()
+                runtime.work_end = 100
+                times = iter(100 - value for value in budgets)
+                runtime.clock = lambda: next(times, 99.5)
+                job = next(row for row in controller.cloud_campaign.make_matrix(config["spec"])
+                           if row["backend"] == "native")
+                with patch.object(controller.campaign, "admit_config") as admit, \
+                     patch.object(controller, "command") as command:
+                    with self.assertRaises(controller.CampaignTimeLimit):
+                        runtime.run_case(job)
+                admit.assert_not_called()
+                command.assert_not_called()
+                receipt = json.loads((runtime.root / "cases" / job["case_id"] / "receipt.json").read_text())
+                self.assertEqual(receipt["status"], "not_started")
+                self.assertIn("campaign time limit reached", receipt["error"])
+
+    def test_qualification_context_precedes_empty_samples(self):
+        cause = "pre-workload qualification failed: qualification initial read: Valkey RDMA GET timed out"
+        manifest = {"status": "failed", "run": {"qualification_failure": cause}}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = Path(tmp)
+            (result / "samples.csv").write_text("phase,operation,outcome,error_kind\n")
+            self.assertIn(cause, controller.core_workload_failure(result, manifest, {}, False, False))
+            manifest["run"] = {}
+            self.assertIn("without an unsuccessful recorded sample",
+                          controller.core_workload_failure(result, manifest, {}, False, False))
+
+
 class F7PackageTests(unittest.TestCase):
     def test_focused_package_profile_is_selection_specific(self):
         for selection, expected, rejected in (
@@ -1369,7 +1456,10 @@ class CommandSafetyTests(unittest.TestCase):
     def test_completed_live_case_without_route_proof_is_rejected(self):
         self._exercise_live_case_diagnostics(failed=False)
 
-    def _exercise_live_case_diagnostics(self, failed, observe=False, cold=False):
+    def test_qualification_failure_preserves_manifest_cause(self):
+        self._exercise_live_case_diagnostics(failed=True, qualification=True)
+
+    def _exercise_live_case_diagnostics(self, failed, observe=False, cold=False, qualification=False):
         config = config_fixture()
         runtime = controller.Controller(config, clients_fixture(config))
         runtime.config["platform"] = {"name": "gcp", "runtime": {}}
@@ -1437,7 +1527,9 @@ class CommandSafetyTests(unittest.TestCase):
                     result.mkdir()
                     core_status = "failed" if failed else "completed"
                     controller.dump(result / "manifest.json", {"schema_version": 1, "status": core_status,
-                        "backend_info": {}, "raw_samples_complete": True})
+                        "backend_info": {}, "raw_samples_complete": True,
+                        "run": {"qualification_failure": "qualification initial read: Valkey RDMA GET timed out"}
+                               if qualification else {}})
                     controller.dump(result / "summary.json", {"status": core_status, "backend": {}})
                     (result / "samples.csv").write_text(
                         "phase,operation,outcome,error_kind\npreload,put,error,authority stopped before acknowledgement\n"
@@ -1475,21 +1567,24 @@ class CommandSafetyTests(unittest.TestCase):
                 if failed:
                     with self.assertRaises(controller.InfrastructureError) as raised:
                         runtime.run_case(job)
-                    self.assertIn("authority stopped before acknowledgement", str(raised.exception))
+                    self.assertIn("qualification initial read: Valkey RDMA GET timed out" if qualification
+                                  else "authority stopped before acknowledgement", str(raised.exception))
                     self.assertIn("shared owner data retained", str(raised.exception))
                 else:
                     receipt = runtime.run_case(job)
             receipt = json.loads((directory / "receipt.json").read_text())
             self.assertEqual(receipt["status"], "failed")
             self.assertEqual(receipt["validated_timing_rows_by_phase"]["measurement"], counts["measurement"])
-            qualification = receipt["live_nvme_measurement_qualification"]
-            self.assertFalse(qualification["qualified"])
-            self.assertIn("live NVMe boundary counters unavailable", qualification["reasons"])
-            self.assertIn("no verified kernel live NVMe namespace route", qualification["reasons"])
+            path_qualification = receipt["live_nvme_measurement_qualification"]
+            self.assertFalse(path_qualification["qualified"])
+            self.assertIn("live NVMe boundary counters unavailable", path_qualification["reasons"])
+            self.assertIn("no verified kernel live NVMe namespace route", path_qualification["reasons"])
             if failed:
-                self.assertIn('"phase": "preload"', receipt["error"])
-                self.assertIn('"outcome": "error"', receipt["error"])
-                self.assertIn("authority stopped before acknowledgement", receipt["error"])
+                self.assertIn("qualification initial read: Valkey RDMA GET timed out" if qualification
+                              else '"phase": "preload"', receipt["error"])
+                if not qualification:
+                    self.assertIn('"outcome": "error"', receipt["error"])
+                    self.assertIn("authority stopped before acknowledgement", receipt["error"])
                 self.assertEqual(receipt["failure_initiator_evidence"],
                                  {"available": False, "reason": "OSError"})
                 self.assertEqual(receipt["cleanup_errors"][0]["phase"], "owner_storage")

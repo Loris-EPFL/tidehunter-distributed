@@ -46,7 +46,8 @@ DURABILITY_TIERS = ("native", "synchronous")
 DEFAULT_DURABILITY_TIER = "native"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
-M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put", "nvmeof_p9_write_engine")
+WRITE_ENGINE_SELECTIONS = ("nvmeof_p9_write_engine", "nvmeof_p13_write_engine")
+M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put", *WRITE_ENGINE_SELECTIONS)
 M3_OWNER_ADMISSION_TIMEOUT_SECONDS = 95
 M3_OWNER_ADMISSION_MARGIN_SECONDS = 5
 NVMEOF_PATH_SELECTIONS += M3_SELECTIONS
@@ -67,7 +68,7 @@ def active_owner_count(job):
     count = job.get("owner_count", 5)
     if type(count) is not int or count not in LOGICAL_OWNER_COUNTS:
         raise ValueError("unsupported logical owner_count")
-    if count not in (1, 5) or job.get("selection") == "nvmeof_p9_write_engine":
+    if count not in (1, 5) or job.get("selection") in WRITE_ENGINE_SELECTIONS:
         expected = _m3_cases().get(job.get("case_id"))
         if expected is None or not _focused_exact(job, expected):
             raise ValueError("multiple owners require an exact reviewed M3 case")
@@ -804,6 +805,7 @@ FOCUSED_COUNTS["nvmeof_f8"] = 36
 FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
 FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
 FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 18
+FOCUSED_COUNTS["nvmeof_p13_write_engine"] = 22
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -860,6 +862,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_m3_t2_5": {"G33W": 3, "G33R": 4, "G33M": 1},
     "nvmeof_p9_small_put": {"G34W": 7},
     "nvmeof_p9_write_engine": {"G35W": 12, "G35R": 2, "G35S": 4},
+    "nvmeof_p13_write_engine": {"G35W": 16, "G35R": 2, "G35S": 4},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -873,7 +876,7 @@ _FOCUSED_GROUP_COUNTS = {
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
-        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2)))[selection]
+        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2, 2)))[selection]
     return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
 
 
@@ -886,7 +889,7 @@ def job_owner_hosts(job):
     count = job.get("owner_count", 5)
     if type(count) is not int or count not in LOGICAL_OWNER_COUNTS:
         raise ValueError("unsupported logical owner_count")
-    if count not in (1, 5) or job.get("selection") == "nvmeof_p9_write_engine":
+    if count not in (1, 5) or job.get("selection") in WRITE_ENGINE_SELECTIONS:
         active_owner_count(job)
     return 1 if job.get("owner_topology") == "colocated" else count
 
@@ -2135,9 +2138,17 @@ def _nvmeof_p9_small_put():
 
 
 def _nvmeof_p9_write_engine():
-    """One nine-case fleet per backing arm, within the two-hour/export envelope."""
+    return _write_engine_matrix("nvmeof_p9_write_engine")
+
+
+def _write_engine_matrix(selection):
+    """One fleet per backing arm, with identical read and replay controls."""
     result = []
     puts = [job for job in _nvmeof_p9_small_put() if job["repeat"] == 0 and job["value_size"] == 512]
+    replay_source = puts[0]
+    if selection == "nvmeof_p13_write_engine":
+        c16, c64, _ = puts
+        puts = [dict(c16, concurrency=8), c16, dict(c64, concurrency=32), c64]
     reads = [job for job in _nvmeof_m3_owners()
              if job["selection"] == "nvmeof_m3_t2_5" and job["case_kind"] == "live_read"
              and job["value_size"] == 1024 and job["concurrency"] == 16]
@@ -2159,16 +2170,16 @@ def _nvmeof_p9_write_engine():
                                   case_deadline_seconds=max(180, math.ceil(6 * expected)),
                                   expected_archive_bytes=(4096 + clean["warmup_operations"] + measurement) * 256 + 8 * 1024**2)
                     clean.update(measurement_operations=measurement, measurement_sizing=sizing)
-                _clone_job(result, "nvmeof_p9_write_engine", clean, "G35W",
+                _clone_job(result, selection, clean, "G35W",
                            profile=f"G35W-put-c{clean['concurrency']}-separate-o2",
                            durability_tier=tier, **common)
         for source in reads:
             clean = {key: value for key, value in source.items() if key != "diagnostics"}
-            _clone_job(result, "nvmeof_p9_write_engine", clean, "G35R",
+            _clone_job(result, selection, clean, "G35R",
                        profile="G35R-read-c16-separate-o2", **common)
         for tier in ("synchronous", "native"):
-            source = {key: value for key, value in puts[0].items() if key != "diagnostics"}
-            _clone_job(result, "nvmeof_p9_write_engine", source, "G35S",
+            source = {key: value for key, value in replay_source.items() if key != "diagnostics"}
+            _clone_job(result, selection, source, "G35S",
                        profile="G35S-mainnet-perpetual-separate-o2",
                        case_kind="mainnet_replay", concurrency=16, durability_tier=tier,
                        replay_node_db_id=0, repetitions=4096, minimum_measurement_seconds=15,
@@ -2187,7 +2198,10 @@ def _nvmeof_p9_write_engine():
 
 @functools.cache
 def _m3_cases():
-    return {job["case_id"]: job for job in _nvmeof_m3_owners() + _nvmeof_p9_small_put() + _nvmeof_p9_write_engine()}
+    jobs = _nvmeof_m3_owners() + _nvmeof_p9_small_put()
+    for selection in WRITE_ENGINE_SELECTIONS:
+        jobs.extend(_write_engine_matrix(selection))
+    return {job["case_id"]: job for job in jobs}
 
 
 def _nvmeof_m3_owners():

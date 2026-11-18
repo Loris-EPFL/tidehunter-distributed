@@ -587,6 +587,10 @@ fn live_frontier_commit_failures_preserve_prior_ack_and_return_unknown() {
         let acknowledged = append_live_fixture(&log, &config, 0);
         log.persist_through(acknowledged).unwrap();
         let unacknowledged = append_live_fixture(&log, &config, 1);
+        let before = log.durable_progress();
+        assert_eq!(before.synced, Some(acknowledged.version()));
+        assert_eq!(before.appended, Some(unacknowledged.version()));
+        assert_eq!(before.generation, 1);
         log.fail_live_frontier.store(phase, Ordering::Release);
         let mut profile = StorageWriteProfile::default();
         assert!(matches!(
@@ -598,6 +602,12 @@ fn live_frontier_commit_failures_preserve_prior_ack_and_return_unknown() {
         assert_eq!(profile.live_frontier_file_successes, u64::from(phase != 1));
         assert_eq!(profile.live_frontier_namespace_calls, u64::from(phase == 3));
         assert_eq!(profile.live_frontier_namespace_successes, 0);
+        // A failed live-root sync publishes nothing: the reported synced tail stays.
+        let after = log.durable_progress();
+        assert_eq!(
+            (after.synced, after.synced_end, after.generation),
+            (before.synced, before.synced_end, before.generation)
+        );
         assert!(matches!(
             log.validate_durable_receipt(DurableBatch(unacknowledged)),
             Err(StorageError::Poisoned)

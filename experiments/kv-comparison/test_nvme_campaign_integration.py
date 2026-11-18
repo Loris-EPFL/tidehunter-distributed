@@ -284,7 +284,7 @@ class CampaignModeTests(unittest.TestCase):
                'read_lanes': 1, 'live_inline_reads': False, 'live_write_mode': 'leased',
                'durability_tier': 'native', 'live_export_mode': 'per_owner',
                'live_io_queues': 1, 'live_io_queue_size': 32, 'live_poll_queues': 0}
-        if selection == 'nvmeof_p9_write_engine':
+        if selection in cloud_campaign.WRITE_ENGINE_SELECTIONS:
             job = next(j for j in cloud_campaign.make_focused_matrix(selection)
                        if j['case_kind'] == 'live_read' and j['arm'] == 'file')
         names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'reserve_exchanges',
@@ -310,7 +310,7 @@ class CampaignModeTests(unittest.TestCase):
                 cloud_campaign.qualify_live_nvme_measurement(incomplete, job, self.exported(job))['reasons'])
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job, self.exported(job))['qualified'])
         mixed = dict(job, mix={'read': 50, 'put': 50})
-        if selection == 'nvmeof_p9_write_engine':
+        if selection in cloud_campaign.WRITE_ENGINE_SELECTIONS:
             mixed = next(j for j in cloud_campaign.make_focused_matrix(selection)
                          if j['case_kind'] == 'mainnet_replay' and j['arm'] == job['arm']
                          and j['durability_tier'] == 'native')

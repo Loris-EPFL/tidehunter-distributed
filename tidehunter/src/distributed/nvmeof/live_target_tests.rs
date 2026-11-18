@@ -1,6 +1,8 @@
 //! These tests exercise the journal and ownership state machine only; ordinary
 //! files are not evidence that a kernel nvmet namespace drains target I/O.
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tempdir::TempDir;
 
 struct Fixture {
@@ -49,7 +51,7 @@ impl Fixture {
         }
     }
     fn open(&self) -> io::Result<LiveTargetManager> {
-        LiveTargetManager::open_inner(self.config.clone(), self.configfs.clone(), true, None)
+        LiveTargetManager::open_inner(self.config.clone(), self.configfs.clone(), true, None, None)
     }
     fn open_existing(&self, identity: LiveTargetIdentity) -> io::Result<LiveTargetManager> {
         LiveTargetManager::open_inner(
@@ -57,6 +59,7 @@ impl Fixture {
             self.configfs.clone(),
             true,
             Some(identity),
+            None,
         )
     }
 }
@@ -699,4 +702,378 @@ fn batched_revoke_removes_only_fully_drained_permanent_subsystems() {
     assert!(manager.state.exports.is_empty());
     manager.revoke_all(&[]).unwrap();
     manager.shutdown().unwrap();
+}
+
+// Crash cuts of the target state journal. Each `save` has two persistence
+// steps: the synced pending record (old registry still current) and the
+// renamed record with its directory synced. Every configfs effect runs after a
+// save returned and before the next save begins, so a crash at each step of
+// each save covers every crash point of an operation: the state on disk is
+// "registry k-1, effects through k-1" (Prepared, also a lost rename) or
+// "registry k, effects through k-1" (Published).
+
+/// Crash at the `save`-th journal save (0-based, counted from installation)
+/// and `step`. The failing save returns as if the process died there; every
+/// later hook call is counted, because a dead process persists nothing more.
+fn crash_hook(save: usize, step: SaveStep, after_crash: Arc<AtomicUsize>) -> SaveHook {
+    let mut prepared = 0usize;
+    let mut crashed = false;
+    Box::new(move |current| {
+        if crashed {
+            after_crash.fetch_add(1, AtomicOrdering::Relaxed);
+            return Err(io::Error::other("journal save after injected crash"));
+        }
+        if current == SaveStep::Prepared {
+            prepared += 1;
+        }
+        if prepared == save + 1 && current == step {
+            crashed = true;
+            return Err(io::Error::other("injected crash"));
+        }
+        Ok(())
+    })
+}
+
+fn counting_hook(saves: Arc<AtomicUsize>) -> SaveHook {
+    Box::new(move |step| {
+        if step == SaveStep::Published {
+            saves.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        Ok(())
+    })
+}
+
+/// The registry a restarted process reads, or `None` before the first save.
+fn durable_state(f: &Fixture) -> Option<State> {
+    let bytes = match fs::read(f.config.state_dir.join(STATE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("read durable registry: {error}"),
+    };
+    let (checksum, payload) = bytes.split_at(4);
+    assert_eq!(
+        crc32fast::hash(payload),
+        u32::from_le_bytes(checksum.try_into().unwrap()),
+        "durable registry is torn"
+    );
+    Some(serde_json::from_slice(payload).unwrap())
+}
+
+/// Every exclusive configfs object (directory or link) under the fixture.
+fn configfs_objects(root: &Path) -> Vec<PathBuf> {
+    fn children(path: &Path) -> Vec<std::ffi::OsString> {
+        match fs::read_dir(path) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().file_name()).collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("list {}: {error}", path.display()),
+        }
+    }
+    let mut objects = Vec::new();
+    for top in ["hosts", "ports", "subsystems"] {
+        for name in children(&root.join(top)) {
+            let object = PathBuf::from(top).join(name);
+            let nested: &[&str] = match top {
+                "ports" => &["subsystems"],
+                "subsystems" => &["namespaces", "allowed_hosts"],
+                _ => &[],
+            };
+            for inner in nested {
+                for child in children(&root.join(&object).join(inner)) {
+                    objects.push(object.join(inner).join(child));
+                }
+            }
+            objects.push(object);
+        }
+    }
+    objects
+}
+
+/// Write-ahead invariant at the crash: every object that exists has a
+/// durable registry record, so recovery can find and revoke it.
+fn assert_write_ahead(f: &Fixture, durable: Option<&State>) {
+    let registered: std::collections::HashSet<&Path> = durable
+        .map(|state| state.objects.iter().map(|o| o.path.as_path()).collect())
+        .unwrap_or_default();
+    for object in configfs_objects(&f.configfs) {
+        assert!(
+            registered.contains(object.as_path()),
+            "configfs object {} has no durable registry record",
+            object.display()
+        );
+    }
+}
+
+/// Reopen after the crash and check what the fencing protocol requires.
+/// Either recovery revokes every capability and seals every WAL that was
+/// ever exposed writable, or it fails closed on an object whose creation
+/// record has no durable identity yet. Returns whether recovery succeeded.
+fn assert_recovery(
+    f: &Fixture,
+    identity: Option<LiveTargetIdentity>,
+    exposed: &[LiveFileIdentity],
+    durable: Option<&State>,
+) -> bool {
+    // The only cut that may fail closed: an object exists while its durable
+    // record has no identity yet (between `mkdir`/`symlink` and the identity
+    // save). Every other cut must recover.
+    let uncertain = durable.is_some_and(|durable| {
+        durable.objects.iter().any(|object| {
+            object.identity.is_none() && fs::symlink_metadata(f.configfs.join(&object.path)).is_ok()
+        })
+    });
+    let reopened = match identity {
+        Some(identity) => f.open_existing(identity),
+        None => f.open(),
+    };
+    let mut reopened = match reopened {
+        Ok(manager) => {
+            assert!(!uncertain, "an uncertain creation was adopted");
+            manager
+        }
+        Err(error) => {
+            assert!(uncertain, "recoverable cut failed: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            assert!(
+                error.to_string().contains("creation was interrupted"),
+                "{error}"
+            );
+            return false;
+        }
+    };
+    assert!(reopened.state.exports.is_empty());
+    assert!(
+        reopened
+            .state
+            .objects
+            .iter()
+            .all(|object| !object.path.starts_with("subsystems"))
+    );
+    assert_eq!(
+        fs::read_dir(f.configfs.join("subsystems")).unwrap().count(),
+        0
+    );
+    let mut sealed = exposed.to_vec();
+    if let Some(durable) = durable {
+        sealed.extend(
+            durable
+                .exports
+                .iter()
+                .filter(|export| !export.readonly)
+                .map(|export| export.file.clone()),
+        );
+    }
+    for file in &sealed {
+        assert_eq!(
+            reopened.sealed_file(&file.path).unwrap().as_ref(),
+            Some(file)
+        );
+        assert!(reopened.export_writable(file.clone()).is_err());
+    }
+    let fresh = extra_wal(f, "wal-after-crash");
+    assert!(!reopened.export_writable(fresh).unwrap().readonly);
+    reopened.shutdown().unwrap();
+    for top in ["hosts", "ports", "subsystems"] {
+        assert_eq!(fs::read_dir(f.configfs.join(top)).unwrap().count(), 0);
+    }
+    true
+}
+
+impl Fixture {
+    fn with_mode(mode: LiveExportMode) -> Self {
+        let mut f = Self::new();
+        f.config.export_mode = mode;
+        f
+    }
+}
+
+/// Files a scenario exported before the crash window; `true` = writable.
+type Prepared = Vec<(LiveFileIdentity, bool)>;
+
+/// Crash at both steps of every save of `operation`, then recover. Returns
+/// (recovered, failed closed) cut counts; every cut is one of the two.
+fn crash_cuts(
+    mode: LiveExportMode,
+    prepare: fn(&Fixture, &mut LiveTargetManager) -> Prepared,
+    operation: fn(&Fixture, &mut LiveTargetManager, &Prepared) -> io::Result<()>,
+) -> (usize, usize) {
+    let saves = {
+        let f = Fixture::with_mode(mode);
+        let mut manager = f.open().unwrap();
+        let prepared = prepare(&f, &mut manager);
+        let count = Arc::new(AtomicUsize::new(0));
+        manager.set_save_hook(counting_hook(count.clone()));
+        operation(&f, &mut manager, &prepared).unwrap();
+        count.load(AtomicOrdering::Relaxed)
+    };
+    assert!(saves > 0);
+    let mut outcomes = (0, 0);
+    for save in 0..saves {
+        for step in [SaveStep::Prepared, SaveStep::Published] {
+            let f = Fixture::with_mode(mode);
+            let mut manager = f.open().unwrap();
+            let identity = manager.identity().unwrap();
+            let prepared = prepare(&f, &mut manager);
+            let after_crash = Arc::new(AtomicUsize::new(0));
+            manager.set_save_hook(crash_hook(save, step, after_crash.clone()));
+            assert!(
+                operation(&f, &mut manager, &prepared).is_err(),
+                "save {save} {step:?} did not reach the injected crash"
+            );
+            drop(manager);
+            assert_eq!(after_crash.load(AtomicOrdering::Relaxed), 0);
+            let durable = durable_state(&f);
+            assert_write_ahead(&f, durable.as_ref());
+            let exposed: Vec<_> = prepared
+                .iter()
+                .filter(|(_, writable)| *writable)
+                .map(|(file, _)| file.clone())
+                .collect();
+            if assert_recovery(&f, Some(identity), &exposed, durable.as_ref()) {
+                outcomes.0 += 1;
+            } else {
+                outcomes.1 += 1;
+            }
+        }
+    }
+    assert_eq!(outcomes.0 + outcomes.1, 2 * saves);
+    outcomes
+}
+
+fn nothing(_: &Fixture, _: &mut LiveTargetManager) -> Prepared {
+    Vec::new()
+}
+
+fn writable_and_readonly(f: &Fixture, manager: &mut LiveTargetManager) -> Prepared {
+    let readonly = extra_wal(f, "wal-readonly");
+    manager.export_writable(f.file.clone()).unwrap();
+    manager.export_readonly(readonly.clone()).unwrap();
+    vec![(f.file.clone(), true), (readonly, false)]
+}
+
+/// Export two WAL files into one permanent subsystem.
+fn export_permanent_pair(f: &Fixture, manager: &mut LiveTargetManager) -> io::Result<Prepared> {
+    use super::super::live_storage::wal_export_name;
+    let second = extra_wal(f, "wal-1");
+    for (index, file) in [&f.file, &second].into_iter().enumerate() {
+        manager.export_permanent(
+            &wal_export_name(2, [1; 16], 2, 3, index as u64),
+            file.clone(),
+        )?;
+    }
+    Ok(vec![(f.file.clone(), true), (second, true)])
+}
+
+fn permanent_pair(f: &Fixture, manager: &mut LiveTargetManager) -> Prepared {
+    export_permanent_pair(f, manager).unwrap()
+}
+
+fn bindings(manager: &LiveTargetManager, prepared: &Prepared) -> Vec<LiveTargetBinding> {
+    prepared
+        .iter()
+        .map(|(file, _)| manager.binding_for_file(file).unwrap())
+        .collect()
+}
+
+/// A crash during the open that commissions the target ports and hosts.
+#[test]
+fn crash_at_every_journal_step_of_open_recovers_or_fails_closed() {
+    let open = |f: &Fixture, hook| {
+        LiveTargetManager::open_inner(f.config.clone(), f.configfs.clone(), true, None, Some(hook))
+    };
+    let saves = {
+        let f = Fixture::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        open(&f, counting_hook(count.clone())).unwrap();
+        count.load(AtomicOrdering::Relaxed)
+    };
+    assert!(saves > 0);
+    let mut recovered = 0;
+    for save in 0..saves {
+        for step in [SaveStep::Prepared, SaveStep::Published] {
+            let f = Fixture::new();
+            let after_crash = Arc::new(AtomicUsize::new(0));
+            assert!(open(&f, crash_hook(save, step, after_crash.clone())).is_err());
+            assert_eq!(after_crash.load(AtomicOrdering::Relaxed), 0);
+            let durable = durable_state(&f);
+            assert_write_ahead(&f, durable.as_ref());
+            recovered += usize::from(assert_recovery(&f, None, &[], durable.as_ref()));
+        }
+    }
+    assert!(recovered > 0);
+}
+
+#[test]
+fn crash_at_every_journal_step_of_writable_export_recovers_or_fails_closed() {
+    let (recovered, _) = crash_cuts(LiveExportMode::OnDemand, nothing, |f, manager, _| {
+        manager.export_writable(f.file.clone()).map(drop)
+    });
+    assert!(recovered > 0);
+}
+
+#[test]
+fn crash_at_every_journal_step_of_readonly_export_recovers_or_fails_closed() {
+    let (recovered, _) = crash_cuts(LiveExportMode::OnDemand, nothing, |f, manager, _| {
+        manager.export_readonly(f.file.clone()).map(drop)
+    });
+    assert!(recovered > 0);
+}
+
+#[test]
+fn crash_at_every_journal_step_of_permanent_export_recovers_or_fails_closed() {
+    let (recovered, _) = crash_cuts(LiveExportMode::PerOwner, nothing, |f, manager, _| {
+        export_permanent_pair(f, manager).map(drop)
+    });
+    assert!(recovered > 0);
+}
+
+#[test]
+fn crash_at_every_journal_step_of_revocation_recovers() {
+    for (mode, prepare) in [
+        (
+            LiveExportMode::OnDemand,
+            writable_and_readonly as fn(&Fixture, &mut LiveTargetManager) -> Prepared,
+        ),
+        (LiveExportMode::PerOwner, permanent_pair),
+    ] {
+        // Revocation creates nothing, so no cut can leave an uncertain
+        // creation: every crash must recover.
+        let (_, failed_closed) = crash_cuts(mode, prepare, |_, manager, prepared| {
+            let bindings = bindings(manager, prepared);
+            manager.revoke_all(&bindings.iter().collect::<Vec<_>>())
+        });
+        assert_eq!(failed_closed, 0);
+    }
+}
+
+#[test]
+fn crash_at_every_journal_step_of_shutdown_recovers() {
+    let (_, failed_closed) = crash_cuts(
+        LiveExportMode::OnDemand,
+        writable_and_readonly,
+        |_, manager, _| manager.shutdown(),
+    );
+    assert_eq!(failed_closed, 0);
+}
+
+/// Retiring a deleted WAL syncs its directory, then removes the marker and
+/// syncs the marker directory; it writes no registry record. A crash before
+/// the marker removal is durable leaves the marker of an absent file, and a
+/// restarted owner repeats the retirement.
+#[test]
+fn crash_before_tombstone_release_is_durable_repeats_retirement() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let identity = manager.identity().unwrap();
+    let binding = manager.export_writable(f.file.clone()).unwrap();
+    manager.revoke(&binding).unwrap();
+    fs::remove_file(&f.file.path).unwrap();
+    drop(manager);
+    let mut reopened = f.open_existing(identity).unwrap();
+    assert_eq!(
+        reopened.sealed_file(&f.file.path).unwrap().as_ref(),
+        Some(&f.file)
+    );
+    reopened.retire_deleted_file(&f.file).unwrap();
+    assert!(reopened.sealed_file(&f.file.path).unwrap().is_none());
+    reopened.shutdown().unwrap();
 }

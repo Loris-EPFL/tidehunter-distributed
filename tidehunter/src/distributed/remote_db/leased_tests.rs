@@ -906,6 +906,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 export_mode: Default::default(),
             }),
             checkpoint_mode: CheckpointMode::Exact,
+            durable_cut: Default::default(),
         };
         let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
         let database = RemoteDatabase::open(
@@ -1845,8 +1846,10 @@ fn leased_worker_position_proof_bypasses_an_unreleased_frame() {
         let first = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
         let second = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         drop(guard);
+        // A held CQE is not delivered, so published metrics omit it. CQE 2 can
+        // be reaped before CQE 1; wait on the queue's own reaped count.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while fixture.metrics.snapshot().counts.completed_write_ops < 2 {
+        while worker.client.lock().leased_test_reaped_writes() < 2 {
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }

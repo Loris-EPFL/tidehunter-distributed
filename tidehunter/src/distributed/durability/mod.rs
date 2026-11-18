@@ -184,3 +184,76 @@ impl DurabilityConfig {
         }
     }
 }
+
+/// Coordinator recovery of Native-tier writes. Synchronous acknowledgements are
+/// per-batch durable and are never truncated by this setting.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeRecovery {
+    /// Recover an exact prefix of the coordinator's version order, as a single
+    /// native WAL does after a power loss: the coordinator persists a durable cut
+    /// and recovery discards every batch above it.
+    #[default]
+    DurablePrefix,
+    /// Legacy: keep every batch that survived on its owner, with no cross-owner
+    /// prefix guarantee.
+    PerOwner,
+}
+
+/// How recovery bounds the epoch that ran under [`NativeRecovery::DurablePrefix`].
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CutRecovery {
+    /// Keep only the batches at or below the persisted cut.
+    Strict,
+    /// Fencing syncs every surviving batch; extend the persisted cut over the
+    /// unbroken run of surviving versions and stop at the first missing one.
+    #[default]
+    Extend,
+}
+
+/// Coordinator configuration of the durable cut. Every field has the default of
+/// the owner decision: durable prefix, extended at recovery, nudge at 1000 ms or
+/// 64 MiB of cut lag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DurableCutConfig {
+    pub recovery: NativeRecovery,
+    pub cut: CutRecovery,
+    /// Nudge lagging owners to sync once the oldest published batch above the
+    /// cut is this old (milliseconds). A quarter of it (at most 5 s) is the
+    /// long-poll wait of each owner.
+    pub lag_ms: u64,
+    /// Nudge lagging owners once this many bytes were appended above the cut.
+    pub lag_bytes: u64,
+}
+
+impl Default for DurableCutConfig {
+    fn default() -> Self {
+        Self {
+            recovery: NativeRecovery::DurablePrefix,
+            cut: CutRecovery::Extend,
+            lag_ms: 1000,
+            lag_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl DurableCutConfig {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Both lag thresholds must be positive; the age bound must fit a poll.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.lag_ms == 0 || self.lag_ms > 3_600_000 || self.lag_bytes == 0 {
+            return Err("durable_cut lag_ms must be in 1..=3600000 and lag_bytes positive");
+        }
+        Ok(())
+    }
+}
