@@ -3689,6 +3689,259 @@ fn test_sparse_gc_reopen_with_dead_window() {
     assert_eq!(v.as_deref(), Some(&rare_value[..]));
 }
 
+/// A crash between the control-region rename and its directory sync can
+/// reopen the previous control region. The snapshot deletes index files that
+/// only the previous control region references, so it must not delete them
+/// before the directory sync succeeds.
+///
+/// The test makes that sync fail: right after the rename it moves the database
+/// directory aside, so the directory cannot be opened. The snapshot must panic
+/// before it deletes a file of the previous control region, and the previous
+/// control region must reopen and return every value.
+#[test]
+fn test_control_region_directory_sync_precedes_index_file_deletion() {
+    use crate::control::ControlRegion;
+    use crate::wal::position::WalFileId;
+    use std::collections::BTreeSet;
+
+    const NUM_KEYS: u32 = 128;
+    const ROUNDS: u8 = 4;
+
+    let key = |i: u32| -> Vec<u8> {
+        let mut k = [0u8; 8];
+        k[..4].copy_from_slice(&(i * (u32::MAX / NUM_KEYS)).to_be_bytes());
+        k.to_vec()
+    };
+
+    let dir = tempdir::TempDir::new("test_cr_dir_sync_precedes_gc").unwrap();
+    let db_path = dir.path().join("db");
+    std::fs::create_dir(&db_path).unwrap();
+    let db_path = db_path.canonicalize().unwrap();
+    let aside = dir.path().join("aside");
+    let cr_path = db_path.join(CONTROL_REGION_FILE);
+    let mut config = Config::small();
+    // Tiny index files so a snapshot deletes the files of earlier snapshots.
+    config.frag_size = 8 * 1024;
+    config.wal_file_size = 8 * 1024;
+    config.index_min_occupancy_pct = 0;
+    config.snapshot_unload_threshold = 0;
+    config.max_dirty_keys = 100_000;
+    let config = Arc::new(config);
+    let mut builder = KeyShapeBuilder::new();
+    builder.add_key_space("bulk", 8, 16, KeyType::uniform(8));
+    let key_shape = builder.build();
+
+    {
+        let db = Db::open(&db_path, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
+        let ks = db.ks("bulk");
+        for round in 0..ROUNDS {
+            for i in 0..NUM_KEYS {
+                db.insert(ks, key(i), vec![round; 128]).unwrap();
+            }
+            db.force_rebuild_control_region().unwrap();
+        }
+        // Dropping the database drains the unlink worker, so no thread uses
+        // the directory path while the hook below moves it aside.
+    }
+
+    let db = Db::open(&db_path, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
+    let ks = db.ks("bulk");
+    let layout = db.indexes.layout().clone();
+    let previous_root = std::fs::read(&cr_path).unwrap();
+    let previous_files: BTreeSet<WalFileId> = ControlRegion::read(&cr_path, &key_shape)
+        .unwrap()
+        .snapshot()
+        .iter_valid_val_positions()
+        .map(|position| layout.locate_file(position.offset()))
+        .collect();
+    assert!(
+        !previous_files.is_empty(),
+        "the previous control region references no index file"
+    );
+    // Move the index writer past the files of the previous control region,
+    // so the next snapshot deletes them.
+    let payload = vec![0u8; config.frag_size as usize - 16];
+    for _ in 0..16 {
+        db.index_writer
+            .write(&PreparedWalWrite::new(&payload))
+            .unwrap();
+    }
+    for i in 0..NUM_KEYS {
+        db.insert(ks, key(i), vec![ROUNDS; 128]).unwrap();
+    }
+    {
+        let weak = Arc::downgrade(&db);
+        let db_path = db_path.clone();
+        let aside = aside.clone();
+        db.control_region_store
+            .lock()
+            .set_after_rename_hook(Box::new(move || {
+                let db = weak.upgrade().unwrap();
+                // Drain the trackers and mappers: no thread may create a WAL
+                // file while the directory is aside. `gc(0)` deletes nothing
+                // and returns after the mapper handled every queued message.
+                for writer in [&db.wal_writer, &db.index_writer] {
+                    writer.wal_tracker_barrier();
+                    writer.gc(0).unwrap();
+                }
+                drop(db);
+                std::fs::rename(&db_path, &aside).unwrap();
+            }));
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.force_rebuild_control_region()
+    }));
+    std::fs::rename(&aside, &db_path).unwrap();
+    let panic = result.expect_err("the snapshot must fail when the directory sync fails");
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        message.contains("Failed to sync control region directory"),
+        "unexpected panic: {message}"
+    );
+    let deleted: Vec<WalFileId> = previous_files
+        .iter()
+        .copied()
+        .filter(|id| !layout.wal_file_name(&db_path, *id).exists())
+        .collect();
+    assert!(
+        deleted.is_empty(),
+        "the snapshot deleted index files of the previous control region \
+         before the directory sync: {deleted:?}"
+    );
+    drop(db);
+
+    // A crash after the rename can reopen the previous control region.
+    std::fs::write(&cr_path, &previous_root).unwrap();
+    let db = Db::open(&db_path, key_shape, config, Metrics::new()).unwrap();
+    let ks = db.ks("bulk");
+    for i in 0..NUM_KEYS {
+        assert_eq!(
+            db.get(ks, &key(i)).unwrap().as_deref(),
+            Some(&[ROUNDS; 128][..])
+        );
+    }
+}
+
+/// A power loss keeps only the WAL pages that a sync covered. The snapshot
+/// must persist every WAL file the new control region depends on before the
+/// control region can become durable: the map syncer is asynchronous.
+///
+/// The test models the file system: the durable content of a WAL file is its
+/// content at its last sync by `Wal::fsync` or `Wal::sync_files_through`.
+/// Map-syncer msyncs are not credited: the model drops all of them, older maps
+/// included. At each control-region rename the test builds the crash image
+/// (durable WAL content, zeros for never-synced files, the new control
+/// region), reopens it, and reads the values of the round the snapshot covers.
+#[test]
+fn test_snapshot_syncs_wal_files_before_control_region_rename() {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    const NUM_KEYS: u32 = 128;
+    const ROUNDS: u8 = 4;
+
+    fn file_name(path: &Path) -> String {
+        path.file_name().unwrap().to_str().unwrap().to_string()
+    }
+
+    let key = |i: u32| -> Vec<u8> {
+        let mut k = [0u8; 8];
+        k[..4].copy_from_slice(&(i * (u32::MAX / NUM_KEYS)).to_be_bytes());
+        k.to_vec()
+    };
+
+    let dir = tempdir::TempDir::new("test_snapshot_syncs_wal").unwrap();
+    let images = tempdir::TempDir::new("test_snapshot_syncs_wal_images").unwrap();
+    let db_path = dir.path().canonicalize().unwrap();
+    let mut config = Config::small();
+    // Tiny files so one round spans several value and index files.
+    config.frag_size = 8 * 1024;
+    config.wal_file_size = 8 * 1024;
+    config.index_min_occupancy_pct = 0;
+    config.snapshot_unload_threshold = 0;
+    config.max_dirty_keys = 100_000;
+    let config = Arc::new(config);
+    let mut builder = KeyShapeBuilder::new();
+    builder.add_key_space("bulk", 8, 16, KeyType::uniform(8));
+    let key_shape = builder.build();
+    let db = Db::open(&db_path, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
+
+    // Durable WAL content by file name.
+    let durable: Arc<parking_lot::Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
+    for wal in [&db.wal, &db.indexes] {
+        let durable = durable.clone();
+        let layout = wal.layout().clone();
+        let db_path = db_path.clone();
+        wal.set_file_sync_hook(Box::new(move |id| {
+            let path = layout.wal_file_name(&db_path, id);
+            let bytes = std::fs::read(&path).unwrap();
+            durable.lock().insert(file_name(&path), bytes);
+        }));
+    }
+    let crash_images: Arc<parking_lot::Mutex<Vec<PathBuf>>> = Arc::default();
+    {
+        let durable = durable.clone();
+        let crash_images = crash_images.clone();
+        let images = images.path().to_path_buf();
+        let db_path = db_path.clone();
+        db.control_region_store
+            .lock()
+            .set_after_rename_hook(Box::new(move || {
+                let image = images.join(std::fs::read_dir(&images).unwrap().count().to_string());
+                std::fs::create_dir(&image).unwrap();
+                let durable = durable.lock();
+                for entry in std::fs::read_dir(&db_path).unwrap() {
+                    let entry = entry.unwrap();
+                    if !entry.file_type().unwrap().is_file() {
+                        continue;
+                    }
+                    let name = file_name(&entry.path());
+                    let target = image.join(&name);
+                    if name.starts_with("wal_") || name.starts_with("index_") {
+                        match durable.get(&name) {
+                            Some(bytes) => std::fs::write(&target, bytes).unwrap(),
+                            // Never synced: no page of the file reached the device.
+                            None => std::fs::File::create(&target)
+                                .unwrap()
+                                .set_len(entry.metadata().unwrap().len())
+                                .unwrap(),
+                        }
+                    } else {
+                        std::fs::copy(entry.path(), &target).unwrap();
+                    }
+                }
+                crash_images.lock().push(image);
+            }));
+    }
+
+    let ks = db.ks("bulk");
+    for round in 0..ROUNDS {
+        for i in 0..NUM_KEYS {
+            db.insert(ks, key(i), vec![round; 128]).unwrap();
+        }
+        db.force_rebuild_control_region().unwrap();
+        let image = {
+            let mut crash_images = crash_images.lock();
+            assert_eq!(
+                crash_images.len(),
+                1,
+                "round {round}: one control-region rename"
+            );
+            crash_images.pop().unwrap()
+        };
+        let reopened = Db::open(&image, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
+        let reopened_ks = reopened.ks("bulk");
+        for i in 0..NUM_KEYS {
+            assert_eq!(
+                reopened.get(reopened_ks, &key(i)).unwrap().as_deref(),
+                Some(&[round; 128][..]),
+                "round {round} key {i}: a crash after the control-region rename lost a value"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_force_relocate_dirty_entry_preserves_data() {
     let dir = tempdir::TempDir::new("test_force_relocate_dirty").unwrap();

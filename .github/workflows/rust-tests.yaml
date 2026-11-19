@@ -208,7 +208,7 @@ jobs:
           set -euo pipefail
           bash .github/scripts/setup.sh core
           sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y \
-            --no-install-recommends nvme-cli python3-yaml python3-boto3
+            --no-install-recommends nvme-cli python3-yaml python3-boto3 gdb
           for module in nvmet nvmet-tcp nvme-tcp; do
             timeout 10s sudo -n modprobe "$module"
           done
@@ -321,7 +321,6 @@ jobs:
             setup: fabric
           - profile: harness
             name: Harness Tests
-            setup: core
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -329,6 +328,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up repository Rust
+        if: matrix.profile != 'harness'
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
         with:
           toolchain: "1.90"
@@ -339,6 +339,7 @@ jobs:
         run: echo "TIDEHUNTER_LIBFABRIC_PREFIX=$RUNNER_TEMP/tidehunter-libfabric-2.6.0" >> "$GITHUB_ENV"
 
       - name: Cache Cargo dependencies
+        if: matrix.profile != 'harness'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -363,9 +364,31 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-libfabric-2.6.0-${{ hashFiles('.github/scripts/setup.sh') }}
 
       - name: Prepare selected profile
-        env:
-          TIDEHUNTER_SETUP_HARNESS_PLOTS: ${{ matrix.profile == 'harness' && '1' || '0' }}
+        if: matrix.profile != 'harness'
         run: bash .github/scripts/setup.sh "${{ matrix.setup }}"
+
+      - name: Select Python 3.12 for Harness
+        if: matrix.profile == 'harness'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Prepare isolated Python Harness dependencies
+        if: matrix.profile == 'harness'
+        timeout-minutes: 5
+        # The Harness profile runs Python discovery only. Use the same pinned
+        # wheels as Local KV, not Ubuntu's matplotlib/SciPy package graph.
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/harness-python"
+          python3 -m venv --system-site-packages "$venv"
+          if ! "$venv/bin/python" -m pip install --disable-pip-version-check --retries 2 --timeout 30 \
+              boto3==1.35.99 PyYAML==6.0.2 matplotlib==3.11.2; then
+            echo "::error::Failed to install the pinned Python Harness dependencies"
+            exit 1
+          fi
+          "$venv/bin/python" -c 'import boto3, matplotlib, tomllib, yaml'
+          echo "$venv/bin" >> "$GITHUB_PATH"
 
       # Software providers and deterministic fixtures are correctness checks,
       # not evidence of EFA/RDMA hardware activity or network performance.

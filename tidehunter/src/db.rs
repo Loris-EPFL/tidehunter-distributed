@@ -373,23 +373,32 @@ impl Db {
         Ok((key_shape, keyspaces, registry_dirty))
     }
 
-    /// Atomically writes the canonical shape to `shape_v2.yaml`
-    /// (write to a temp file, fsync, rename).
+    /// Durably writes the canonical shape to `shape_v2.yaml`.
     fn write_shape_file(path: &Path, key_shape: &KeyShape) -> DbResult<()> {
-        let shape_file_path = Self::shape_v2_file_path(path);
         let yaml = key_shape.to_yaml().map_err(|e| {
             DbError::Io(io::Error::other(format!(
                 "Failed to serialize key shape: {e}"
             )))
         })?;
-        let temp_file = shape_file_path.with_extension("yaml.tmp");
-        {
-            let mut file = std::fs::File::create(&temp_file)?;
-            file.write_all(yaml.as_bytes())?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&temp_file, &shape_file_path)?;
+        // WAL records use the canonical keyspace ids, so the file must be
+        // durable before the first write after open.
+        Self::write_file_durably(path, &Self::shape_v2_file_path(path), yaml.as_bytes())?;
         Ok(())
+    }
+
+    /// Atomically and durably replaces `file` in the database directory `path`:
+    /// write a temp file, sync it, rename it, then sync the directory.
+    fn write_file_durably(path: &Path, file: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut temp_file = file.as_os_str().to_owned();
+        temp_file.push(".tmp");
+        let temp_file = PathBuf::from(temp_file);
+        {
+            let mut temp = std::fs::File::create(&temp_file)?;
+            temp.write_all(bytes)?;
+            temp.sync_all()?;
+        }
+        std::fs::rename(&temp_file, file)?;
+        std::fs::File::open(path)?.sync_all()
     }
 
     /// Load key shape from database directory.
@@ -466,7 +475,8 @@ impl Db {
             let yaml = serde_yaml::to_string(config).map_err(|e| {
                 DbError::Io(io::Error::other(format!("Failed to serialize config: {e}")))
             })?;
-            std::fs::write(&config_file_path, yaml)?;
+            // A crash must leave either no file or the complete file.
+            Self::write_file_durably(path, &config_file_path, yaml.as_bytes())?;
         }
         Ok(())
     }
@@ -1682,8 +1692,26 @@ impl Db {
             // must keep every file the writer might traverse.
             None => Vec::new(),
         };
-        self.indexes.fsync()?;
-        self.wal.fsync()?;
+        // The new control region depends on the index files it references and
+        // on the value WAL entries those index files point to. Those entries
+        // can lie above `replay_from` (a cell flushed after the oldest dirty
+        // cell) and above the processed frontier (an earlier allocation still
+        // in flight), but below the current allocation position. Persist
+        // those files before the control region can become durable: the map
+        // syncer works asynchronously and gives no such order. The processed
+        // frontiers are captured before the syncs, so writes below them have
+        // finished.
+        let index_complete_below = layout.locate_file(self.index_writer.last_processed().as_u64());
+        if let Some(max_live_file) = max_live_file {
+            self.indexes
+                .sync_files_through(max_live_file, index_complete_below)?;
+        }
+        let wal_layout = self.wal.layout();
+        let wal_complete_below = wal_layout.locate_file(self.wal_writer.last_processed().as_u64());
+        self.wal.sync_files_through(
+            wal_layout.locate_file(self.wal_writer.position()),
+            wal_complete_below,
+        )?;
         // Persist the control region BEFORE unlinking files. A crash between
         // these steps must leave the on-disk CR consistent with the files
         // still present: extra (un-deleted) files are tolerated by the next

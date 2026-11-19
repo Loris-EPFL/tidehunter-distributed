@@ -186,6 +186,36 @@ class CollectorTests(unittest.TestCase):
             with self.subTest(cmdline=cmdline, cpus=cpus), self.assertRaises(ValueError):
                 trace.startup_ring_bound(cmdline, cpus, 4096)
 
+    def test_trace_ring_readback_rejects_wrong_size(self):
+        with tempfile.TemporaryDirectory() as temp:
+            instance = Path(temp)
+            (instance / 'buffer_total_size_kb').write_text('128')
+            self.assertEqual(trace.configure_trace_ring(instance),
+                             {'buffer_size_kb': 64, 'buffer_total_size_kb': 128})
+            self.assertEqual((instance / 'tracing_on').read_text(), '0')
+            read_text = Path.read_text
+
+            def wrong_size(path):
+                return '32' if path.name == 'buffer_size_kb' else read_text(path)
+
+            with mock.patch.object(Path, 'read_text', wrong_size), \
+                 self.assertRaisesRegex(ValueError, 'TRACE_RING_SIZE_MISMATCH.*32 KiB/CPU'):
+                trace.configure_trace_ring(instance)
+
+    def test_qualification_releases_owned_instance_even_on_ring_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            instances = root / 'instances'
+            instances.mkdir()
+            foreign = instances / 'foreign'
+            foreign.mkdir()
+            with mock.patch.object(trace, 'running_ring_bound', return_value={'possible_cpus': 1}), \
+                 mock.patch.object(trace, 'configure_trace_ring',
+                                   side_effect=ValueError('TRACE_RING_SIZE_MISMATCH')):
+                with self.assertRaisesRegex(ValueError, 'TRACE_RING_SIZE_MISMATCH'):
+                    trace.qualify_trace_ring(root)
+            self.assertEqual(list(instances.iterdir()), [foreign])
+
     def test_denied_is_unavailable_and_never_touches_global_tracing(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -267,6 +297,7 @@ class CollectorTests(unittest.TestCase):
             result = json.loads((state / 'result.json').read_text())
             self.assertFalse(result['qualified'])
             self.assertIsNone(result['matched_reads'])
+            self.assertEqual(result['trace_ring'], {'buffer_size_kb': 64, 'buffer_total_size_kb': 64})
             self.assertEqual(result['candidate_matched_reads'], 1)
             self.assertFalse(instance.exists())
 

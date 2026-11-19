@@ -47,6 +47,8 @@ pub use history::{HistoryPersistence, WAL_REPLAY_WINDOW_BATCHES};
 mod wal_replay;
 use wal_replay::WalRoot;
 pub use wal_replay::{DecodedGroup, ReplayPage};
+mod owned_frames;
+use owned_frames::{FrameSource, OwnedFrames};
 mod durable_progress;
 pub use durable_progress::LogDurableProgress;
 use durable_progress::ProgressTail;
@@ -1370,6 +1372,15 @@ impl PartitionLog {
         // tail. Unwritten space at the tail is not a hole.
         let mut gap = false;
         let mut recovery_hole = false;
+        // Restart durability guard (see `wal_replay::SuffixRewrite`): every frame
+        // and live skip marker accepted above the durable point is written back
+        // from the bytes this scan validated and synced before the barrier that
+        // certifies it. The durable point is the history root for owner-RPC
+        // streams and the synced live frontier (never below the root) for live
+        // streams. A sealed stream was synced whole before its seal.
+        let rewrite_from = if live { strict_end } else { root.end };
+        let mut rewrite =
+            (!path.join(SEAL).exists()).then(|| wal_replay::SuffixRewrite::new(&path, expected));
         while start < recovery_end && !stopped {
             if references.is_retired(start / expected.wal_file_bytes * expected.wal_file_bytes)? {
                 start = (start / expected.wal_file_bytes + 1) * expected.wal_file_bytes;
@@ -1384,7 +1395,17 @@ impl PartitionLog {
                 } else {
                     start
                 };
-            let mut scan = match wal.wal_iterator_for_scan(scan_position) {
+            // A fragment that reaches into the rewritten suffix is read into owned
+            // buffers: the guard rewrites exactly the validated snapshot, and no
+            // mapping of the fragment exists while it is written.
+            let owned = rewrite.is_some() && start + expected.fragment_bytes > rewrite_from;
+            let source = if owned {
+                OwnedFrames::new(&path, expected, scan_position).map(FrameSource::Owned)
+            } else {
+                wal.wal_iterator_for_scan(scan_position)
+                    .map(FrameSource::Mapped)
+            };
+            let mut scan = match source {
                 Ok(scan) => scan,
                 Err(WalError::EndOfWal) if live && scan_position < strict_end => {
                     return Err(StorageError::Invalid("missing durable live WAL fragment"));
@@ -1446,10 +1467,15 @@ impl PartitionLog {
                             }
                             at += len as u64;
                         }
+                        if cursor >= rewrite_from
+                            && let Some(rewrite) = rewrite.as_mut()
+                        {
+                            rewrite.skip_marker(cursor, end)?;
+                        }
                         break;
                     }
                 }
-                let (position, bytes) = match scan.next() {
+                let (position, bytes, frame) = match scan.next() {
                     Ok(record) => record,
                     // Below the synced frontier every frame was acknowledged durable:
                     // a defect is corruption. Beyond it the first missing or invalid
@@ -1578,6 +1604,18 @@ impl PartitionLog {
                         ));
                     }
                 }
+                // Rewrite before the barrier below: it certifies this group, and
+                // the history root advances past it right after. The frame is the
+                // owned snapshot the scan validated, written byte for byte.
+                if position.offset() >= rewrite_from
+                    && let Some(rewrite) = rewrite.as_mut()
+                {
+                    let frame = frame.ok_or(StorageError::Invalid(
+                        "suffix frame scanned without an owned snapshot",
+                    ))?;
+                    rewrite.validated_frame(position.offset(), &frame)?;
+                    rewrite.sync()?;
+                }
                 reference_writer.publish_group(group_metadata)?;
                 // Recovery persists each complete group before evicting its
                 // descriptor authority. A crash resumes from the last root.
@@ -1636,6 +1674,9 @@ impl PartitionLog {
                 .is_retired(tail.offset / expected.wal_file_bytes * expected.wal_file_bytes)?
         {
             return Err(StorageError::Invalid("missing live durable frontier tail"));
+        }
+        if let Some(rewrite) = rewrite {
+            rewrite.finish()?;
         }
         wal.persist_registered_files()?;
         reference_writer.persist_pending(scan_end.div_ceil(expected.wal_file_bytes))?;

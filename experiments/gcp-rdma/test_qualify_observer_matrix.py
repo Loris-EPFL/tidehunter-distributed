@@ -76,6 +76,9 @@ class ObserverMatrixQualification(unittest.TestCase):
             with self.subTest(selection=selection):
                 import manual_campaign
                 spec = manual_campaign.REVIEWED_SPECS[selection]
+                if selection == qualification.cloud_campaign.Q0_SELECTION:
+                    from test_q0_campaign import seals
+                    spec = manual_campaign.q0_spec(seals())
                 if selection == 'nvmeof_parallel_writes':
                     self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 jobs = qualification.cloud_campaign.make_focused_matrix(selection)

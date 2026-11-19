@@ -1,5 +1,6 @@
 import base64
 from contextlib import ExitStack
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import cloud_controller as controller
 import nvme_campaign_native
+import q0_campaign
 
 
 class CompactReadLifecycleTests(unittest.TestCase):
@@ -139,12 +141,27 @@ class CompactReadLifecycleTests(unittest.TestCase):
         for selection in controller.cloud_campaign.NVMEOF_PATH_SELECTIONS:
             with self.subTest(selection=selection):
                 config = config_fixture()
-                config['fleet']['nodes'] = config['fleet']['nodes'][:1]
+                config['fleet']['nodes'] = config['fleet']['nodes'][:(
+                    2 if selection == q0_campaign.SELECTION else 1)]
                 config['spec'].update(mode='focused', selection=selection)
+                jobs = controller.cloud_campaign.make_focused_matrix(selection)
+                if selection == q0_campaign.SELECTION:
+                    with self.assertRaisesRegex(ValueError, 'every selected binary role'):
+                        controller.Controller(config, clients_fixture(config))
+                    seals = {role: {
+                        'revision': (q0_campaign.BASELINE if role == 'baseline_ab'
+                                     else 'a' * 40 if role == 'land4' else role),
+                        'sha256': f'{index:064x}',
+                        **({'instrumentation_patch_sha256': q0_campaign.COUNTER_PATCH_SHA256}
+                           if role in q0_campaign.AB_ROLES else {}),
+                    } for index, role in enumerate(q0_campaign.ROLES)}
+                    jobs, attribution = q0_campaign.select_cases(jobs, seals)
+                    digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode())
+                    config['spec'].update(case_binaries=seals, bisect_revisions=attribution,
+                                          job_count=len(jobs), matrix_sha256=digest.hexdigest())
                 runtime = controller.Controller(config, clients_fixture(config))
                 runtime.run_floor_case = MagicMock(return_value='floor')
                 runtime.run_fio_case = MagicMock(return_value='fio')
-                jobs = controller.cloud_campaign.make_focused_matrix(selection)
                 with tempfile.TemporaryDirectory() as tmp:
                     runtime.root = Path(tmp)
                     for job in jobs:
