@@ -20,6 +20,32 @@ import gcp_api
 import gcp_image
 
 
+TRACE_BOOT_ARG = 'trace_buf_size=4K'
+
+
+class KernelBtfMissing(RuntimeError):
+    """The guest's running kernel does not expose readable vmlinux BTF."""
+
+
+def require_kernel_btf(path=Path('/sys/kernel/btf/vmlinux')):
+    if not path.is_file() or not os.access(path, os.R_OK):
+        raise KernelBtfMissing(f'KERNEL_BTF_MISSING: {path} must be readable')
+
+
+def prepare_trace_boot(kernel_release):
+    """Set the initial per-CPU trace buffer on the pinned kernel, for the next boot."""
+    require_kernel_btf()
+    kernel = '/boot/vmlinuz-' + kernel_release
+    run(['grubby', '--update-kernel=' + kernel, '--args=' + TRACE_BOOT_ARG], timeout=30)
+    info = run(['grubby', '--info=' + kernel], timeout=30)
+    args = [word for line in info.splitlines() if line.startswith('args=')
+            for word in line.removeprefix('args=').strip('"').split()
+            if word.startswith('trace_buf_size=')]
+    if args != [TRACE_BOOT_ARG]:
+        raise ValueError('TRACE_BOOT_BUFFER_INVALID: pinned kernel must have one ' + TRACE_BOOT_ARG)
+    return TRACE_BOOT_ARG
+
+
 def sha(path):
     h = hashlib.sha256()
     with path.open('rb') as src:
@@ -215,9 +241,11 @@ def finish_install(expected_sha, kernel_release, containers, python='/usr/bin/py
     module_evidence = inspect_modules(kernel_release, allow_loaded_kabi=allow_loaded_kabi)
     if os.uname().release != kernel_release:
         raise ValueError('running kernel changed during installation')
+    trace_boot_arg = prepare_trace_boot(kernel_release)
     installed = sorted(run(['rpm', '-qa', '--qf', '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n']).splitlines())
     return {'manifest_sha256': expected_sha, 'kernel_release': os.uname().release,
             'installed_rpms': installed, 'python': python_version, 'openssl': openssl,
+            'trace_boot_arg': trace_boot_arg,
             'libfabric_version': fabric_version, 'docker_compose': compose_version, 'modules': module_evidence,
             'container_references': sorted(containers)}
 

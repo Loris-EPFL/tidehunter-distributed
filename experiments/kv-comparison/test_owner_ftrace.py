@@ -80,6 +80,53 @@ class OwnerFtraceTests(unittest.TestCase):
             self.assertTrue(data['truncated'])
             self.assertIn('deadline expired', data['reason'])
 
+    def test_cgroup_memory_samples_timestamp_counter_changes_and_peak(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            cgroup = root / 'workload.service'
+            cgroup.mkdir()
+            (cgroup / 'memory.current').write_text('120\n')
+            (cgroup / 'memory.max').write_text('200\n')
+            (cgroup / 'memory.events').write_text('max 0\noom 0\n')
+            (cgroup / 'memory.peak').write_text('125\n')
+            elapsed = 0.0
+
+            def tick(interval):
+                nonlocal elapsed
+                elapsed += interval
+                if elapsed >= 1:
+                    (cgroup / 'memory.current').write_text('150\n')
+                    (cgroup / 'memory.events').write_text('max 3\noom 0\n')
+                    (cgroup / 'memory.peak').write_text('199\n')
+                if elapsed >= 1.5:
+                    (root / 'cgroup-memory.stop').touch()
+
+            with patch.object(owner_ftrace.time, 'monotonic', side_effect=lambda: elapsed), \
+                 patch.object(owner_ftrace.time, 'monotonic_ns', side_effect=lambda: int(elapsed * 1e9)), \
+                 patch.object(owner_ftrace.time, 'time_ns', side_effect=lambda: 10**18 + int(elapsed * 1e9)), \
+                 patch.object(owner_ftrace.time, 'sleep', side_effect=tick):
+                owner_ftrace.sample_memory(root, cgroup, duration_seconds=5)
+            data = json.loads((root / 'cgroup-memory.json').read_text())
+            self.assertTrue(data['available'])
+            self.assertEqual(data['cgroup'], str(cgroup))
+            self.assertEqual(data['sampled_peak_bytes'], 150)
+            self.assertEqual(data['kernel_peak_bytes'], 199)
+            samples = data['samples']
+            self.assertEqual([row['memory.events']['max'] for row in samples], [0, 3, 3])
+            self.assertEqual([row['memory.current'] for row in samples], [120, 150, 150])
+            self.assertEqual([row['memory.max'] for row in samples], [200] * 3)
+            self.assertEqual([row['observed_monotonic_ns'] for row in samples], [0, 10**9, 15 * 10**8])
+            self.assertEqual([row['observed_unix_ns'] - 10**18 for row in samples], [0, 10**9, 15 * 10**8])
+
+    def test_cgroup_memory_missing_required_counters_is_not_zero(self):
+        with tempfile.TemporaryDirectory() as root:
+            owner_ftrace.sample_memory(root, Path(root) / 'missing.service', duration_seconds=1)
+            data = json.loads((Path(root) / 'cgroup-memory.json').read_text())
+            self.assertFalse(data['available'])
+            self.assertEqual(data['samples'], [])
+            self.assertIsNone(data['sampled_peak_bytes'])
+            self.assertIn('memory.events', data['reason'])
+
     def test_missing_events_and_failed_start_remove_instance(self):
         with tempfile.TemporaryDirectory() as root:
             tracefs = Path(root)

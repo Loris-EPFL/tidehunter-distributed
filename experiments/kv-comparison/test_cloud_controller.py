@@ -686,6 +686,36 @@ class NvmeActionAdmissionTests(unittest.TestCase):
             self.assertIn("target", rows[0])
 
 
+class CgroupMemoryGuestTests(unittest.TestCase):
+    def test_dispatch_binds_client_and_owner_to_exact_service_cgroups(self):
+        import owner_ftrace
+        config = config_fixture()
+        case = "replay-1"
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(controller, "guarded", side_effect=lambda path, *args, **kwargs: Path(path)), \
+             patch.object(controller, "verify_local_identity"), \
+             patch.object(controller, "platform_module", return_value=object()):
+            config["fleet"]["data_root"] = root
+            for index, role in ((-1, "client"), (0, "storage-0")):
+                with self.subTest(role=role):
+                    service = controller.unit_name(config, case, role) + ".service"
+                    cgroup = "/system.slice/" + service
+                    directory = Path(root) / "cells" / case / "cgroup-memory" / role
+                    sampler = {"directory": str(directory)}
+                    start = {"action": "cgroup_memory_start", "case_id": case, "index": index}
+                    with patch.object(controller, "unit_status", return_value={"ControlGroup": cgroup}), \
+                         patch.object(owner_ftrace, "start_memory", return_value=sampler) as worker:
+                        self.assertEqual(controller.guest_operation(config, start, {}), {"role": role, **sampler})
+                    self.assertEqual(worker.call_args.args[:2], (directory, Path("/sys/fs/cgroup" + cgroup)))
+                    with patch.object(owner_ftrace, "stop_memory", return_value={"available": True}) as worker:
+                        result = controller.guest_operation(config, {**start, "action": "cgroup_memory_stop"}, {})
+                        self.assertEqual(result, {"role": role, "physical_host_index": index, "available": True})
+                    worker.assert_called_once_with(sampler)
+                    with patch.object(controller, "unit_status", return_value={"ControlGroup": cgroup + "/child"}), \
+                         self.assertRaisesRegex(controller.InfrastructureError, "CGROUP_MEMORY_UNAVAILABLE"):
+                        controller.guest_operation(config, start, {})
+
+
 class TracerCleanupTests(unittest.TestCase):
     def test_partial_start_is_stopped_and_evidence_is_bounded(self):
         receipt = {}

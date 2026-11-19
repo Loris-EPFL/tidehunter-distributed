@@ -72,6 +72,39 @@ def startup_ring_bound(cmdline, possible_cpus, page_size):
             'conservative_startup_ring_bound_bytes': bound}
 
 
+def running_ring_bound():
+    try:
+        return startup_ring_bound(Path('/proc/cmdline').read_text(),
+                                  Path('/sys/devices/system/cpu/possible').read_text(),
+                                  os.sysconf('SC_PAGE_SIZE'))
+    except (OSError, ValueError) as error:
+        raise ValueError(f'TRACE_BOOT_BUFFER_INVALID: {error}') from error
+
+
+def configure_trace_ring(instance):
+    size_path = instance / 'buffer_size_kb'
+    try:
+        (instance / 'tracing_on').write_text('0')
+        size_path.write_text(str(BUFFER_KB))
+        per_cpu = int(size_path.read_text())
+        total = int((instance / 'buffer_total_size_kb').read_text())
+        if per_cpu != BUFFER_KB or not per_cpu <= total <= BUFFER_KB * MAX_CPUS:
+            raise ValueError(f'expected {BUFFER_KB} KiB/CPU, read {per_cpu} KiB/CPU and {total} KiB total')
+    except (OSError, ValueError) as error:
+        raise ValueError(f'TRACE_RING_SIZE_MISMATCH: {error}') from error
+    return {'buffer_size_kb': per_cpu, 'buffer_total_size_kb': total}
+
+
+def qualify_trace_ring(trace_root=TRACE_ROOT):
+    startup_bound = running_ring_bound()
+    instance = trace_root / 'instances' / ('tidehunter-' + secrets.token_hex(16))
+    instance.mkdir()
+    try:
+        return {**startup_bound, **configure_trace_ring(instance)}
+    finally:
+        instance.rmdir()
+
+
 def resolve_device(wal_path, sys_block=SYS_BLOCK):
     path = Path(wal_path).resolve(strict=True)
     stat = path.stat()
@@ -546,15 +579,10 @@ def worker(state, wal_path, duration, instance_name):
         if identity is not None:
             result = identity
             return
-        startup_bound = startup_ring_bound(Path('/proc/cmdline').read_text(),
-                                           Path('/sys/devices/system/cpu/possible').read_text(),
-                                           os.sysconf('SC_PAGE_SIZE'))
+        startup_bound = running_ring_bound()
         instance.mkdir()
         created = True
-        (instance / 'tracing_on').write_text('0')
-        (instance / 'buffer_size_kb').write_text(str(BUFFER_KB))
-        if int((instance / 'buffer_total_size_kb').read_text().strip()) > BUFFER_KB * MAX_CPUS:
-            raise ValueError('trace ring exceeds total byte limit')
+        ring = configure_trace_ring(instance)
         (instance / 'trace_clock').write_text('mono')
         encoded = (int(mapping['device'].split(':')[0]) << 20) | int(mapping['device'].split(':')[1])
         for name in ('block_rq_issue', 'block_rq_complete', 'block_rq_requeue'):
@@ -578,6 +606,7 @@ def worker(state, wal_path, duration, instance_name):
                              truncated=truncated, lost=lost)
         result = {'available': True, 'state_dir': str(state), 'device': mapping,
                   'startup_ring_bound': startup_bound,
+                  'trace_ring': ring,
                   'started_monotonic_ns': started, 'stopped_monotonic_ns': stopped,
                   'scope': 'device-wide block events; candidate sector/length correlation lacks request identity and known boundary quiescence; not application or NAND service', **parsed}
         result['qualified'] = False
