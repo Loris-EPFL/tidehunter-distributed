@@ -4,6 +4,7 @@ The caller owns the fixture directory, prepared exports and live owner processes
 The helpers own target and initiator identities. No global cleanup is performed.
 """
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,10 @@ class TargetError(RuntimeError):
 SYSFS_NVME = Path("/sys/class/nvme")
 SYSFS_BLOCK = Path("/sys/class/block")
 NVMET_CONFIGFS = Path("/sys/kernel/config/nvmet")
+# Shared by all qualification workers on the host, even with different output roots.
+KERNEL_PORT_STATE = Path("/run/tidehunter-kernel-live-ports")
+IPV4_PORT_SYSCTLS = Path("/proc/sys/net/ipv4")
+KERNEL_SERVICE_PORTS = range(20000, 65535, 2)
 # Bound every diagnostic listing; evidence must not grow with host state.
 DIAGNOSTIC_ENTRIES = 256
 
@@ -471,24 +476,71 @@ def qualify_kernel_live(fixture, binary, *, transport="rdma",
     return json.loads(result.stdout)
 
 
-def _kernel_live_ports(address, *, commissioning_address, control_address):
-    """Bind-check each actual listener and the preparer's consecutive pair."""
-    for _ in range(32):
-        with socket.socket() as control, socket.socket() as service, socket.socket() as commissioning:
+def _kernel_port_exclusions(sysctls, configfs):
+    first, last = map(int, (sysctls / "ip_local_port_range").read_text().split())
+    if not 1 <= first <= last <= 65535:
+        raise TargetError("invalid ip_local_port_range")
+    excluded = set(range(first, last + 1))
+    reserved = (sysctls / "ip_local_reserved_ports").read_text().strip()
+    for item in reserved.split(",") if reserved else ():
+        low, sep, high = item.partition("-")
+        start, end = int(low), int(high if sep else low)
+        if not 1 <= start <= end <= 65535:
+            raise TargetError("invalid ip_local_reserved_ports")
+        excluded.update(range(start, end + 1))
+    for port in (configfs / "ports").iterdir():
+        # Use the service as configfs ID too. Reject either collision, even if
+        # the existing port has no subsystem linked and no listener to probe.
+        service = (port / "addr_trsvcid").read_text().strip()
+        excluded.add(int(port.name))
+        if service.isdecimal():
+            excluded.add(int(service))
+    return excluded
+
+
+def _kernel_live_ports(address, *, commissioning_address, control_address, state, evidence,
+                       deadline, sysctls=IPV4_PORT_SYSCTLS, configfs=NVMET_CONFIGFS):
+    """Claim a host-wide service pair; release only after verified cleanup."""
+    with (state / "allocate.lock").open("a") as lock:
+        while time.monotonic() < deadline:
             try:
-                control.bind((control_address, 0))
-                service.bind((address, 0))
-                control_port = control.getsockname()[1]
-                service_port = service.getsockname()[1]
-                if service_port == 65535 or control_port in (service_port, service_port + 1):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(.05)
+        else:
+            raise TimeoutError("kernel NVMe port pool lock deadline expired")
+
+        excluded = _kernel_port_exclusions(sysctls, configfs)
+        with socket.socket() as control:
+            control.bind((control_address, 0))
+            control_port = control.getsockname()[1]
+            excluded.add(control_port)
+            busy = 0
+            for service in KERNEL_SERVICE_PORTS:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("kernel NVMe port pool allocation deadline expired")
+                commissioning = service + 1
+                claim = state / f"{service}.claim"
+                if service in excluded or commissioning in excluded or claim.exists():
                     continue
-                commissioning.bind((commissioning_address, service_port + 1))
-                return control_port, service_port, service_port + 1
-            except OSError as error:
-                if error.errno != errno.EADDRINUSE:
-                    raise
-    raise TargetError("could not bind a distinct control port and consecutive "
-                      "service/commissioning pair after 32 attempts")
+                try:
+                    # These probes detect current address conflicts only. They
+                    # cannot hold the endpoints open for the kernel target.
+                    with socket.socket() as public, socket.socket() as private:
+                        public.bind((address, service))
+                        private.bind((commissioning_address, commissioning))
+                except OSError as error:
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                    busy += 1
+                    continue
+                # Persistent for this boot, unlike flock: a killed worker may
+                # leave a service or a target that has temporarily unbound it.
+                with claim.open("x") as stream:
+                    stream.write(f"{evidence}\n")
+                return control_port, service, commissioning, claim
+    raise TargetError(f"no free adjacent non-ephemeral kernel NVMe services ({busy} bind conflicts)")
 
 
 def _admit_kernel_durability(remote, tier):
@@ -514,6 +566,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         raise TargetError("kernel live worker requires root")
     output = Path(output).resolve(strict=True)
     owner._trusted_dir(output)
+    KERNEL_PORT_STATE.mkdir(mode=0o700, exist_ok=True)
+    owner._trusted_dir(KERNEL_PORT_STATE)
     binary = Path(binary).resolve(strict=True)
     deadline = time.monotonic() + max(0, deadline_epoch - time.time() - 5)
     with binary.open("rb") as stream:
@@ -549,23 +603,24 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
     def controllers(address, services, hostnqn):
         return _owned_controllers(SYSFS_NVME, transport, address, services, hostnqn)
 
-    def tier_run(tier, index):
+    def tier_run(tier):
         directory = root / tier
         directory.mkdir(mode=0o700)
         evidence = out / tier
         evidence.mkdir(mode=0o700)
         guest, prepared = directory / "guest", directory / "prepared"
         node = guest / "node-0"
-        # Unique candidate IDs; the Rust target refuses existing configfs objects.
-        port_id = 20000 + int(token[index * 4:index * 4 + 4], 16) % 20000
         # The kernel target commissions locally, on the same loopback as control.
         control_address = "127.0.0.1"
         addr = control_address if transport == "tcp" else "10.99.0.2"
-        control, service, commissioning = _kernel_live_ports(
-            addr, commissioning_address=control_address, control_address=control_address)
+        control, service, commissioning, claim = _kernel_live_ports(
+            addr, commissioning_address=control_address, control_address=control_address,
+            state=KERNEL_PORT_STATE, evidence=evidence, deadline=deadline)
+        port_id = service
         unit = "tidehunter-local-kernel-" + token + "-" + tier
         description = "Tidehunter local kernel " + token + " " + tier
-        record = {"tier": tier, "unit": unit, "cleanup_complete": False, "errors": []}
+        record = {"tier": tier, "unit": unit, "cleanup_complete": False, "errors": [],
+                  "port_claim": str(claim), "public_service": service, "commissioning_service": commissioning}
         attempted = captured = False
         client = None
         sampler = None
@@ -808,6 +863,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         raise TargetError("owner unit remains active")
                 if remote and controllers(addr, (service, commissioning), remote["live_nvme"]["host_nqn"]):
                     raise TargetError("controller reappeared after owner shutdown")
+                if attempted and any((NVMET_CONFIGFS / "ports" / str(port)).exists()
+                                     for port in (service, commissioning)):
+                    raise TargetError("configfs port remains after owner shutdown")
+                claim.unlink()
                 record["cleanup_complete"] = True
             except Exception as error:
                 record["errors"].append({"phase": "cleanup", "error": repr(error), "traceback": traceback.format_exc()})
@@ -820,8 +879,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         return record
 
     try:
-        for index, tier in enumerate(("native", "synchronous")):
-            record = tier_run(tier, index)
+        for tier in ("native", "synchronous"):
+            record = tier_run(tier)
             overall["tiers"][tier] = record
             if not record["cleanup_complete"]:
                 break

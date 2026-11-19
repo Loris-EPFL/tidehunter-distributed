@@ -1,8 +1,11 @@
 """Contract tests only; no hardware or target processes are started."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import errno
 import tempfile
 from pathlib import Path
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -337,64 +340,85 @@ class FailureEvidenceTests(unittest.TestCase):
 
 
 class KernelPortsContractTests(unittest.TestCase):
-    def sockets(self):
-        sockets = [MagicMock() for _ in range(3)]
-        for candidate in sockets:
-            candidate.__enter__.return_value = candidate
-        sockets[0].getsockname.return_value = ("127.0.0.1", 41000)
-        sockets[1].getsockname.return_value = ("10.99.0.2", 42000)
-        return sockets
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.sysctls = self.root / "ipv4"
+        self.sysctls.mkdir()
+        (self.sysctls / "ip_local_port_range").write_text("20001 20003\n")
+        (self.sysctls / "ip_local_reserved_ports").write_text("20004,20007-20009\n")
+        self.configfs = self.root / "nvmet"
+        (self.configfs / "ports").mkdir(parents=True)
 
-    def test_consecutive_pair_and_distinct_control_are_bind_checked(self):
-        sockets = self.sockets()
+    def allocate(self, evidence="run"):
+        return targets._kernel_live_ports(
+            "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1",
+            state=self.state, evidence=self.root / evidence, deadline=time.monotonic() + 5,
+            sysctls=self.sysctls, configfs=self.configfs)
+
+    @staticmethod
+    def socket_probe():
+        probe = MagicMock()
+        probe.__enter__.return_value = probe
+        probe.getsockname.return_value = ("127.0.0.1", 42000)
+        return probe
+
+    def test_pair_excludes_automatic_reserved_and_unlinked_configfs_ports(self):
+        for port_id, service in ((20011, 20020), (9, 20013)):
+            port = self.configfs / "ports" / str(port_id)
+            port.mkdir()
+            (port / "addr_trsvcid").write_text(f"{service}\n")
+        sockets = [self.socket_probe() for _ in range(3)]
         with patch.object(targets.socket, "socket", side_effect=sockets):
-            control, service, commissioning = targets._kernel_live_ports(
-                "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1")
-        self.assertEqual((control, service, commissioning), (41000, 42000, 42001))
-        self.assertNotIn(control, (service, commissioning))
+            control, service, commissioning, claim = self.allocate()
+        self.assertEqual((control, service, commissioning), (42000, 20014, 20015))
+        self.assertNotIn(service, range(20001, 20004))
+        self.assertNotIn(commissioning, range(20001, 20004))
+        self.assertEqual(claim.read_text(), f"{self.root / 'run'}\n")
         sockets[0].bind.assert_called_once_with(("127.0.0.1", 0))
-        sockets[1].bind.assert_called_once_with(("10.99.0.2", 0))
-        sockets[2].bind.assert_called_once_with(("127.0.0.1", service + 1))
-        for candidate in sockets:
-            candidate.__exit__.assert_called_once()
+        sockets[1].bind.assert_called_once_with(("10.99.0.2", service))
+        sockets[2].bind.assert_called_once_with(("127.0.0.1", commissioning))
+        for probe in sockets:
+            probe.__exit__.assert_called_once()
 
-    def test_pair_collision_exhausts_bounded_attempts_and_closes_sockets(self):
-        sockets = self.sockets()
+    def test_concurrent_allocations_keep_distinct_pairs_until_cleanup(self):
+        barrier = threading.Barrier(2, timeout=5)
+
+        def concurrent(name):
+            barrier.wait()
+            return self.allocate(name)
+
+        with patch.object(targets.socket, "socket", side_effect=self.socket_probe):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(concurrent, ("first", "second")))
+            pairs = sorted((service, commissioning) for _, service, commissioning, _ in results)
+            self.assertEqual(pairs, [(20010, 20011), (20012, 20013)])
+            self.assertEqual({claim.read_text().strip() for _, _, _, claim in results},
+                             {str(self.root / "first"), str(self.root / "second")})
+            min(results)[-1].unlink()
+            self.assertEqual(self.allocate("after-cleanup")[1:3], pairs[0])
+
+    def test_detects_commissioning_address_conflict_without_claiming_pair(self):
+        sockets = [self.socket_probe() for _ in range(5)]
         sockets[2].bind.side_effect = OSError(errno.EADDRINUSE, "port busy")
-        with patch.object(targets.socket, "socket", side_effect=sockets * 32) as factory:
-            with self.assertRaisesRegex(targets.TargetError, "after 32 attempts"):
-                targets._kernel_live_ports(
-                    "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1")
-        self.assertEqual(factory.call_count, 96)
-        for candidate in sockets:
-            self.assertEqual(candidate.__exit__.call_count, 32)
+        with patch.object(targets.socket, "socket", side_effect=sockets):
+            self.assertEqual(self.allocate()[1:3], (20012, 20013))
+        sockets[2].bind.assert_called_once_with(("127.0.0.1", 20011))
+        self.assertFalse((self.state / "20010.claim").exists())
+        for probe in sockets:
+            probe.__exit__.assert_called_once()
 
-    def test_loopback_only_commissioning_listener_is_detected(self):
-        real_socket = targets.socket.socket
-        with real_socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            busy_port = listener.getsockname()[1]
-            sockets = self.sockets()
-            sockets[0].getsockname.return_value = ("127.0.0.1", 1)
-            sockets[1].getsockname.return_value = ("10.99.0.2", busy_port - 1)
-            commissioning_sockets = []
-
-            def candidates():
-                for _ in range(32):
-                    yield sockets[0]
-                    yield sockets[1]
-                    candidate = real_socket()
-                    commissioning_sockets.append(candidate)
-                    yield candidate
-
-            with patch.object(targets.socket, "socket", side_effect=candidates()) as factory:
-                with self.assertRaisesRegex(targets.TargetError, "after 32 attempts"):
-                    targets._kernel_live_ports(
-                        "10.99.0.2", commissioning_address="127.0.0.1",
-                        control_address="127.0.0.1")
-            self.assertEqual(factory.call_count, 96)
-            self.assertTrue(all(candidate.fileno() == -1 for candidate in commissioning_sockets))
+    def test_fails_closed_if_every_pool_pair_overlaps_automatic_range(self):
+        (self.sysctls / "ip_local_port_range").write_text("20000 65535\n")
+        probe = self.socket_probe()
+        with patch.object(targets.socket, "socket", return_value=probe):
+            with self.assertRaisesRegex(targets.TargetError, "no free adjacent non-ephemeral"):
+                self.allocate()
+        probe.bind.assert_called_once_with(("127.0.0.1", 0))
+        self.assertEqual(list(self.state.glob("*.claim")), [])
 
 
 if __name__ == '__main__':
