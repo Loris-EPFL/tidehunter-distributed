@@ -7,9 +7,11 @@ use crate::distributed::native_index::IndexReadPin;
 use crate::distributed::types::{BatchVersion, MutationVersion};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io;
 
-/// Static placement, bounded resident authority windows and fenced epoch limits.
+/// Static placement and bounded resident authority windows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalInventoryConfig {
     pub database: [u8; 16],
     pub partitions: Vec<u32>,
@@ -21,10 +23,6 @@ pub struct LocalInventoryConfig {
     pub max_batches_per_partition: usize,
     /// Includes cold-authority cache and metadata pinned through read completion.
     pub max_reference_metadata_bytes: usize,
-    /// Includes interrupted preparation epochs. No epoch/identity history is
-    /// evicted to make room: reaching this limit requires an explicit lifecycle
-    /// extension, not silently recycling a directory or logical version.
-    pub max_epochs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,15 +57,23 @@ impl LocalCheckpoint {
 #[derive(Debug)]
 pub struct LocalDbError {
     message: String,
+    kind: io::ErrorKind,
     pub uncertain_version: Option<BatchVersion>,
 }
 
 impl LocalDbError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(io::ErrorKind::Other, message)
+    }
+    pub(crate) fn with_kind(kind: io::ErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind,
             uncertain_version: None,
         }
+    }
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        self.kind
     }
     pub(crate) fn message(&self) -> &str {
         &self.message
@@ -78,6 +84,7 @@ impl LocalDbError {
     pub(crate) fn unknown(version: BatchVersion, error: impl fmt::Display) -> Self {
         Self {
             message: format!("outcome requires recovery for {version:?}: {error}"),
+            kind: io::ErrorKind::Other,
             uncertain_version: Some(version),
         }
     }
@@ -90,3 +97,9 @@ impl fmt::Display for LocalDbError {
 }
 
 impl std::error::Error for LocalDbError {}
+
+impl From<io::Error> for LocalDbError {
+    fn from(error: io::Error) -> Self {
+        Self::with_kind(error.kind(), error.to_string())
+    }
+}

@@ -613,12 +613,12 @@ fn position_root_can_advance_without_another_file_barrier() {
     }
     let through = log.state.lock().appended_end;
     log.persist_wal_through(through).unwrap();
-    let mut root = log.state.lock().wal_root.clone().unwrap();
+    let mut root = WalRoot::clone(log.state.lock().wal_root.as_ref().unwrap());
     assert!(root.scan_from > 0);
     root.scan_from = 0; // A valid conservative replay root, with the same durable end.
     root.install(&log.path).unwrap();
     let generation = root.generation;
-    log.state.lock().wal_root = Some(root);
+    log.state.lock().wal_root = Some(Arc::new(root));
     let mut profile = StorageWriteProfile::default();
     log.persist_wal_through_profiled(through, Some(&mut profile))
         .unwrap();
@@ -661,4 +661,33 @@ fn position_recheck_rejects_a_direct_lifecycle_change_during_data_sync() {
             "position proof lifecycle changed during sync"
         ))
     ));
+}
+
+/// Fail closed: after a Fatal poison the in-memory root may lag a durable
+/// seal or retirement root, so a position proof must neither sync nor rewrite
+/// the root from RAM. It returns the poison and the root bytes stay as-is.
+#[test]
+fn fatal_poison_refuses_position_persist_and_keeps_root_bytes() {
+    let temp = tempdir::TempDir::new("position-fatal-poison").unwrap();
+    let config = config(vec![3], 3);
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    let appended: Vec<_> = (0..8).map(|n| append(&log, &config, n)).collect();
+    let middle = appended[3].address();
+    log.persist_wal_through(middle.offset + u64::from(middle.len))
+        .unwrap();
+    let root_path = path.join("partition-wal-root-v1");
+    let before = std::fs::read(&root_path).unwrap();
+    let generation = log.state.lock().wal_root.as_ref().unwrap().generation;
+    log.state.lock().poison = Some(WriterPoison::Fatal);
+    let through = log.state.lock().appended_end;
+    assert!(matches!(
+        log.persist_wal_through(through),
+        Err(StorageError::Poisoned)
+    ));
+    assert_eq!(std::fs::read(&root_path).unwrap(), before);
+    assert_eq!(
+        log.state.lock().wal_root.as_ref().unwrap().generation,
+        generation
+    );
 }

@@ -18,6 +18,9 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 #[cfg(test)]
+#[path = "control_forced_pause_tests.rs"]
+mod forced_pause_tests;
+#[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
 
@@ -46,6 +49,9 @@ pub(super) struct ControlContext {
     /// `inventory`, held across lifecycle and live target syncs.
     pub(super) lifecycle: inventory::LifecycleGate,
     pub(super) readers: Arc<parking_lot::RwLock<inventory::ReaderAuthority>>,
+    /// A lifecycle drop sets this under the live-control and lifecycle gates.
+    /// Session sweeps acquire it; a queued fence rechecks under those gates.
+    pub(super) closed: AtomicBool,
     pub(super) terminal: Arc<AtomicBool>,
     pub(super) poison_pending: Arc<AtomicBool>,
     /// Sticky for this owner incarnation: set by both poison funnels, never cleared,
@@ -62,10 +68,14 @@ pub(super) struct ControlContext {
     /// write their own cache-line shard (relaxed); a snapshot is not atomic.
     pub(super) transport: Arc<OwnerTransportCounters>,
     /// Data-free live-control gate. Lock order: this gate, then the lifecycle
-    /// gate, then the inventory, then `readers`. Fence, seal, retirement, live
-    /// read publication, live pin release and target shutdown take it first;
-    /// terminal publication only `try_lock`s it and defers while it is held.
+    /// gate, then the inventory, then `readers`. Fence, seal, generation trim,
+    /// older-stream retirement, live read publication, live pin release and
+    /// target shutdown take it first. The scheduler orders serving retirement
+    /// against exclusive controls; it does not take this gate. Terminal
+    /// publication only `try_lock`s it and defers while it is held.
     pub(super) live_control_gate: Mutex<()>,
+    #[cfg(test)]
+    pub(super) before_fence: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub(super) struct ControlWork {
@@ -77,6 +87,10 @@ pub(super) struct ControlWork {
     pub(super) submitted: Option<Instant>,
     pub(super) charge: usize,
     pub(super) completed: mpsc::SyncSender<reactor::WorkCompletion>,
+    /// Durable-progress requests only: wakes the session once the reply is
+    /// published. Drops after `complete`/`deliver` on every path of `run`, or
+    /// moves into the parked hub waiter.
+    pub(super) progress: Option<super::progress_wait::CompletionNotify>,
 }
 
 struct Queue {
@@ -198,6 +212,12 @@ impl Shared {
                                 #[cfg(test)]
                                 &worker_waiting,
                             );
+                        }
+                        // Maintenance after preparation: the prepared
+                        // successor always goes first. A seal is bounded,
+                        // takes no lifecycle gate and changes no namespace.
+                        if !worker_stopping.load(Ordering::Acquire) {
+                            context.seal_ready_files(&owner);
                         }
                     }
                 }) {
@@ -636,6 +656,20 @@ impl Drop for ControlOwner {
         }
     }
 }
+#[cfg(test)]
+impl ControlOwner {
+    /// Test-only: join every file preparer after its current step, so an
+    /// in-process crash image is taken at a step boundary (journal and
+    /// configfs agree) rather than across a running export.
+    pub(super) fn stop_preparers_for_test(&self) {
+        let slots = std::mem::take(&mut *self.shared.preparers.lock());
+        for slot in slots {
+            // A log poisoned by an injected cut still stops its preparer; the
+            // join result only reports that poison.
+            let _ = self.shared.join_preparer(slot);
+        }
+    }
+}
 
 /// Holds the scheduling state of one running command. Dropping it (including on
 /// unwind) releases the slot and wakes every worker, so a waiting control or the
@@ -686,6 +720,23 @@ impl StorageNode {
         log
     }
 
+    /// Test accessor: the owner's log of stream `source` while `authority`
+    /// serves (the active log, or an older sealed one), to read records of
+    /// either kind directly from the owner WAL.
+    #[cfg(test)]
+    pub(crate) fn source_log_for_test(
+        &self,
+        authority: u64,
+        source: u64,
+    ) -> Arc<super::super::storage::PartitionLog> {
+        let inventory = self.inventory.lock();
+        if source == authority {
+            inventory.active(source).unwrap()
+        } else {
+            inventory.retirement_log(authority, source).unwrap()
+        }
+    }
+
     /// Test hook: cap of a durable-progress wait for requests submitted from now on.
     #[cfg(test)]
     pub(crate) fn set_durable_progress_cap_for_test(&self, cap: Duration) {
@@ -715,6 +766,24 @@ pub(super) fn is_stream_request(request: &Request) -> bool {
     )
 }
 
+/// File maintenance of the serving stream and read-only file inventory. They
+/// overlap stream requests like a position proof (no append ticket, no flush
+/// barrier) and never take control's exclusive slot, so writes, grants and
+/// prepared rollovers keep running while a seal or retirement syncs. Fence,
+/// seal and shutdown still wait for them as active stream work. An older
+/// sealed stream's retirement stays an exclusive lifecycle control.
+pub(super) fn is_maintenance_request(request: &Request) -> bool {
+    match request {
+        Request::RetireWalFiles {
+            authority_epoch,
+            epoch,
+            ..
+        } => epoch == authority_epoch,
+        Request::FileInventoryPage { .. } | Request::RelocationPage { .. } => true,
+        _ => false,
+    }
+}
+
 /// Stream requests overlap; the log orders their state changes. Exclusive
 /// controls wait for all earlier stream operations, including position proofs,
 /// and block later work until completion. Returns `None` once stopped and empty.
@@ -725,7 +794,11 @@ fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>)> {
             None if queue.stopped => return None,
             None => None,
             Some(_) if queue.control_active => None,
-            Some(front) if is_stream_request(&front.request) => Some(true),
+            Some(front)
+                if is_stream_request(&front.request) || is_maintenance_request(&front.request) =>
+            {
+                Some(true)
+            }
             Some(_) => (queue.active_appends == 0).then_some(false),
         };
         let Some(append) = runnable else {
@@ -755,6 +828,7 @@ fn run(shared: &Shared) {
             submitted,
             charge,
             completed,
+            progress,
         } = work;
         let mut profile = ConnectionProfile::default();
         let began = measured.then(Instant::now);
@@ -921,6 +995,7 @@ fn run(shared: &Shared) {
                             log,
                             wake,
                             deadline,
+                            progress,
                         }));
                     }
                     Ok(DurablePoll::Ready(report)) => complete(
@@ -953,10 +1028,12 @@ fn run(shared: &Shared) {
         // data barriers. A grant must not join the flusher: that barrier may
         // self-adopt an unrelated predecessor or wait for durable metadata.
         // Lifecycle controls still drain the ordered flush queue.
-        let read_owned_barrier = matches!(
-            &request,
-            Request::CheckpointPosition { .. } | Request::ResolveLiveRecords { .. }
-        );
+        // File maintenance needs no flush: a sealed file's bytes are already
+        // covered by the durable position root.
+        let read_owned_barrier = match &request {
+            Request::CheckpointPosition { .. } | Request::ResolveLiveRecords { .. } => true,
+            request => is_maintenance_request(request),
+        };
         let (barrier_ok, barrier_wait_ns) = if read_owned_barrier {
             (true, 0)
         } else {
@@ -1027,9 +1104,9 @@ fn run(shared: &Shared) {
         }
         // The tier lives here, not in the inventory that builds the status.
         let response = response.map(|response| match response {
-            Response::Status(mut status) => {
+            Response::Status(StatusReply::Database(mut status)) => {
                 status.durability_tier = shared.durability.lock().config.tier;
-                Response::Status(status)
+                Response::Status(StatusReply::Database(status))
             }
             response => response,
         });
@@ -1330,6 +1407,21 @@ impl ControlContext {
             })
             .ok_or_else(|| TcpError::new("live pin token allocation failed"))?;
         inventory.live_pins.insert(token, (epoch, leases));
+        if let Some(events) = inventory.r1_events.as_mut() {
+            events.pin(
+                "pin_held",
+                "record",
+                token,
+                metadata.iter().map(|(segment, _, _)| {
+                    (
+                        segment.epoch,
+                        segment.file_index,
+                        Some((segment.device, segment.inode)),
+                    )
+                }),
+                "resolve",
+            );
+        }
         let mut locations = Vec::with_capacity(metadata.len());
         for (segment, offset, len) in metadata {
             let binding = match inventory.live_segment_writable(epoch, &segment) {
@@ -1391,6 +1483,36 @@ impl ControlContext {
         Err(TcpError::new(
             "live metadata response exceeds negotiated frame",
         ))
+    }
+    /// One bounded seal kick on the file preparer thread. A storage-detected
+    /// corruption below the durable position has already poisoned the log;
+    /// readers follow it. An I/O error only leaves the file unsealed until a
+    /// later kick. Takes the inventory only to count, never the gate.
+    fn seal_ready_files(&self, log: &Arc<super::super::storage::PartitionLog>) {
+        let result = log.seal_ready_files();
+        if matches!(result, Ok(0)) {
+            return;
+        }
+        if let Err(error) = &result
+            && !matches!(error, StorageError::Io(_))
+        {
+            self.poison_readers();
+            return;
+        }
+        // Read the durable seals before the inventory lock (state lock only);
+        // the events follow the root installs they name. A kick that ends in
+        // an I/O error keeps the seals it installed before it, so they are
+        // reported too.
+        let seals = log.file_retirement_state().0;
+        let generation = log.config().inventory.epoch;
+        let mut inventory = self.inventory.lock();
+        if let Ok(sealed) = result {
+            let stats = &mut inventory.file_maintenance;
+            stats.sealed_files = stats.sealed_files.saturating_add(sealed as u64);
+        }
+        if let Some(events) = inventory.r1_events.as_mut() {
+            events.seals(generation, &seals);
+        }
     }
     /// The preparer never waits for the lifecycle gate: fence, seal and final
     /// shutdown hold it while joining us. Retry at most 30,000 times, parking
@@ -1485,11 +1607,62 @@ impl ControlContext {
             TcpError::component(error)
         })?;
         let publish_started = Instant::now();
-        // Lock order: lifecycle gate, then inventory. The reap and the export
-        // release the inventory across their syncs, so appends and live
+        // Prepared file: answer from its published binding with only the
+        // inventory mutex. No reap, no target work, no lifecycle gate, so a
+        // seal, retirement revoke or tombstone removal never delays it.
+        let published = {
+            let mut inventory = self.inventory.lock();
+            // The grant is allocated: a first grant in a later file is a roll.
+            if let Some(events) = inventory.r1_events.as_mut() {
+                events.grant(&extent.segment);
+            }
+            let ready = (|| {
+                // Acquire observes terminal authority published during unlocked I/O.
+                if self.poison_pending.load(Ordering::Acquire)
+                    || self.terminal.load(Ordering::Acquire)
+                {
+                    return Err(TcpError::new(
+                        "live lease authority poisoned during pregrant",
+                    ));
+                }
+                inventory.ready_permanent_binding(epoch, &log, &extent.segment)
+            })();
+            match ready {
+                Ok(Some(binding)) => {
+                    drop(inventory);
+                    #[cfg(test)]
+                    log.record_test_lease_publication(0, 0, lookup_inventory_wait_ns);
+                    profile.publish_ns =
+                        publish_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    return Ok(LiveLeased {
+                        extent,
+                        binding,
+                        tier,
+                        profile,
+                    });
+                }
+                Ok(None) => inventory.has_live_binding(epoch, extent.segment.file_index),
+                Err(error) => {
+                    // Same contract as the gated path: the granted extent
+                    // has no usable binding, so its outcome is unknown.
+                    drop(inventory);
+                    log.poison_writer();
+                    self.poison_readers();
+                    return Err(TcpError::new(format!(
+                        "live target publication failed; outcome unknown: {error}"
+                    )));
+                }
+            }
+        };
+        // Missing binding: the only grant path that consults the lifecycle
+        // gate. Lock order: lifecycle gate, then inventory. The reap and the
+        // export release the inventory across their syncs, so appends and live
         // completions on the other workers never wait for them.
+        let gate_started = Instant::now();
         let mut lifecycle = self.lifecycle.lock();
+        let gate_wait_ns = gate_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let mut inventory = self.inventory.lock();
+        inventory.record_grant_gate_wait(published, gate_wait_ns);
         #[cfg(test)]
         let inventory_wait_ns = publish_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         #[cfg(test)]
@@ -1950,6 +2123,35 @@ impl ControlContext {
                     durable_end,
                 })
             }
+            Request::FileInventoryPage {
+                authority_generation,
+                source_generation,
+                after,
+                limit,
+            } => NodeInventory::file_inventory_page(
+                &self.inventory,
+                authority_generation,
+                source_generation,
+                after,
+                limit,
+            )
+            .map(|reply| Response::FileInventoryPage(Box::new(reply))),
+            Request::RelocationPage {
+                authority_generation,
+                source_generation,
+                from,
+                end,
+                limit,
+            } => NodeInventory::relocation_page(
+                &self.inventory,
+                authority_generation,
+                source_generation,
+                from,
+                end,
+                limit,
+                limits,
+            )
+            .map(|page| Response::RelocationPage(Box::new(page))),
             Request::RetirementFiles {
                 authority_epoch,
                 epoch,
@@ -1964,7 +2166,34 @@ impl ControlContext {
                 authority_epoch,
                 epoch,
                 files,
+                witness,
             } => {
+                if epoch > authority_epoch {
+                    return Err(TcpError::new("retirement of a future stream"));
+                }
+                if epoch == authority_epoch {
+                    // The scheduler counts serving retirement as active stream
+                    // work. Fence, Seal and target shutdown wait for that work
+                    // to finish. Do not block live read publication here: the
+                    // coordinator has drained the victims, whose pins are
+                    // rechecked in retire_active_files.
+                    let witness = witness.ok_or_else(|| {
+                        TcpError::new("serving stream retirement requires an Exact witness")
+                    })?;
+                    return NodeInventory::retire_active_files(
+                        &self.inventory,
+                        &self.lifecycle,
+                        authority_epoch,
+                        &files,
+                        &witness,
+                    )
+                    .map(Response::Retired);
+                }
+                if witness.is_some() {
+                    return Err(TcpError::new(
+                        "older sealed stream retirement takes no Exact witness",
+                    ));
+                }
                 let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::retire_wal_files(
@@ -1974,24 +2203,41 @@ impl ControlContext {
                     epoch,
                     &files,
                 )
-                .map(|()| Response::Retired)
+                .map(Response::Retired)
             }
-            Request::Status { protocol } => {
+            Request::Status { protocol, database } => {
                 if protocol != PROTOCOL {
                     return Err(TcpError::new("unsupported wire protocol"));
+                }
+                // A database session is bound to exactly this database.
+                if database != Some(self.partition.inventory.database) {
+                    return Err(TcpError::with_kind(
+                        std::io::ErrorKind::InvalidInput,
+                        "status scope differs from the bound database",
+                    ));
                 }
                 let mut status = self.status()?;
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
-                Ok(Response::Status(status))
+                Ok(Response::Status(StatusReply::Database(status)))
             }
             Request::Fence { epoch } => {
+                #[cfg(test)]
+                {
+                    let before_fence = self.before_fence.lock().take();
+                    if let Some(before_fence) = before_fence {
+                        before_fence();
+                    }
+                }
                 let _gate = self.live_control_gate.lock();
                 // Lock order: live-control gate, lifecycle gate, inventory. The
                 // fence releases the inventory across every revocation and sync.
                 let mut lifecycle = self.lifecycle.lock();
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(TcpError::new("database closed for drop"));
+                }
                 let mut status = if self.recoverable_live_failure.load(Ordering::Acquire) {
                     let status = NodeInventory::fence_recoverable_live(
                         &mut self.inventory.lock(),
@@ -2021,7 +2267,7 @@ impl ControlContext {
                 status.max_reads = self.effective_max_reads(limits);
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
-                Ok(Response::Status(status))
+                Ok(Response::Status(StatusReply::Database(status)))
             }
             // The long-poll needs the control owner's progress hub.
             Request::DurableProgress { .. } => Err(TcpError::new(
@@ -2090,6 +2336,46 @@ impl ControlContext {
                 .lock()
                 .process_resources_for_benchmark(epoch)
                 .map(Response::ProcessResources),
+            Request::InventoryPage(page) => self
+                .inventory
+                .lock()
+                .inventory_page(&page, limits.max_frame_bytes)
+                .map(Response::InventoryPage),
+            Request::CheckTrimGeneration(check) => {
+                let _gate = self.live_control_gate.lock();
+                let _lifecycle = self.lifecycle.lock();
+                let (result, _) = self
+                    .inventory
+                    .lock()
+                    .trim_readiness(check.authority_generation, check.generation)?;
+                Ok(Response::CheckTrimGeneration(
+                    super::generation_control::CheckTrimReply {
+                        generation: check.generation,
+                        result,
+                    },
+                ))
+            }
+            Request::TrimGeneration(trim) => {
+                let _gate = self.live_control_gate.lock();
+                let mut lifecycle = self.lifecycle.lock();
+                NodeInventory::trim_generation(
+                    &mut self.inventory.lock(),
+                    &mut lifecycle,
+                    trim.authority_generation,
+                    trim.generation,
+                )?;
+                Ok(Response::TrimGeneration(
+                    super::generation_control::TrimReply {
+                        generation: trim.generation,
+                    },
+                ))
+            }
+            Request::ProvisionDatabase { .. } | Request::DropDatabase { .. } => {
+                Err(TcpError::with_kind(
+                    std::io::ErrorKind::InvalidInput,
+                    "provision and drop require a host-scope session",
+                ))
+            }
         }
     }
 }

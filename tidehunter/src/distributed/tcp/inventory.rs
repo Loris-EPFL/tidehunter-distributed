@@ -12,10 +12,47 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const MANIFEST: &str = "tcp-node-inventory-v1";
-const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
+mod capacity;
+pub(super) mod r1_events;
+mod ready_binding;
+mod relocation;
+mod retirement;
+
+/// Owner file-maintenance counters of this process (R1 seal and retirement,
+/// and the live grant paths they must never delay). Changed only under the
+/// inventory mutex.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct FileMaintenanceStats {
+    /// Files this process sealed (durable `FileSeal` installed).
+    pub sealed_files: u64,
+    /// Files whose retirement finished unlink, directory sync and cleanup.
+    pub retired_files: u64,
+    /// Retirement requests that made no durable decision.
+    pub busy_retirements: u64,
+    /// Grants answered from an already published binding: no lifecycle gate.
+    pub ready_binding_grants: u64,
+    /// Grants that took the lifecycle gate although their binding was
+    /// published. Must stay zero: a prepared grant never waits for maintenance.
+    pub prepared_gate_waits: u64,
+    pub prepared_gate_wait_ns: u64,
+    /// Grants without a published binding that waited for the gate (the
+    /// unprepared residual, as native waits for map preparation).
+    pub unprepared_gate_waits: u64,
+    pub unprepared_gate_wait_ns: u64,
+}
+
+pub(super) const MANIFEST: &str = "tcp-node-inventory-v1";
+pub(super) const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
 /// Registry of the removed sealed-export route; see `reject_legacy_owner_state`.
 const LEGACY_EXPORT_LEASES: &str = "nvmeof-export-leases-v1";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum OpenMode {
+    /// Provisioning (or a direct test fixture) can initialize the inventory.
+    Prepare,
+    /// A Ready host entry requires the surviving ledger and target identity.
+    Ready,
+}
 // Bound idle history namespaces, subsystem objects and pinned target FDs
 // independently of WAL history size. In-flight pages keep their separate pins.
 pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
@@ -29,7 +66,7 @@ pub(super) enum InlineExport {
     Resolve,
     Replay,
 }
-#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum EpochState {
     Preparing,
     Active,
@@ -41,28 +78,65 @@ struct Epoch {
     epoch: u64,
     state: EpochState,
 }
+/// Owner fencing ledger (format `generations::FORMAT`). Retained entries can
+/// be trimmed; `highest_fenced_generation` never decreases and is the only
+/// source of the stale-fence check.
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     format: u32,
     partition: PartitionConfig,
     shape_yaml: String,
-    max_epochs: usize,
+    highest_fenced_generation: u64,
+    /// The one generation whose directory deletion is durably intended.
+    trim_pending: Option<u64>,
     epochs: Vec<Epoch>,
 }
+mod generations;
 #[derive(Serialize, Deserialize)]
 struct LiveTargetMarker {
     config: super::super::nvmeof::LiveTargetConfig,
     identity: super::super::nvmeof::live_target::LiveTargetIdentity,
 }
 
-#[cfg(test)]
+/// Database drop: the persisted target marker of one database root, or
+/// `None` when it does not exist. A non-regular file is corruption.
+pub(super) fn read_live_target_marker(
+    root: &Path,
+) -> Result<
+    Option<(
+        super::super::nvmeof::LiveTargetConfig,
+        super::super::nvmeof::live_target::LiveTargetIdentity,
+    )>,
+    TcpError,
+> {
+    let marker = root.join(LIVE_TARGET_CONFIG);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let saved: LiveTargetMarker = read_metadata(&marker).map_err(|error| {
+                TcpError::with_kind(
+                    io::ErrorKind::InvalidData,
+                    format!("live target marker {}: {error}", marker.display()),
+                )
+            })?;
+            Ok(Some((saved.config, saved.identity)))
+        }
+        Ok(_) => Err(TcpError::with_kind(
+            io::ErrorKind::InvalidData,
+            "live target configuration is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 std::thread_local! {
     static LIVE_FIXTURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Select only configfs emulation; `open` still commissions and validates the
 /// normal durable marker while holding the node lock, before recovering WALs.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(super) fn with_live_target_fixture<R>(configfs: PathBuf, open: impl FnOnce() -> R) -> R {
     struct Reset;
     impl Drop for Reset {
@@ -75,7 +149,7 @@ pub(super) fn with_live_target_fixture<R>(configfs: PathBuf, open: impl FnOnce()
     open()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 fn open_live_target_fixture(
     config: super::super::nvmeof::LiveTargetConfig,
     expected: Option<super::super::nvmeof::live_target::LiveTargetIdentity>,
@@ -225,6 +299,18 @@ pub struct NodeInventory {
     metrics: Arc<Metrics>,
     // Owner incarnation, created once at open (see `durable_progress::new_incarnation`).
     incarnation: [u8; 16],
+    /// Incarnation-local ledger revision, raised before every ledger install
+    /// (`persist_manifest`). Inventory pages are frozen at one revision.
+    revision: u64,
+    #[cfg(test)]
+    trim_crash: Option<super::generation_control::OwnerTrimCrash>,
+    /// Value WAL files passed to a successful retirement unlink step by this
+    /// process. Read by the R0 inventory page; R0 asserts it does not move.
+    value_wal_unlinks: u64,
+    /// Changed only under this mutex; see `FileMaintenanceStats`.
+    pub(super) file_maintenance: FileMaintenanceStats,
+    /// Ordered R1 evidence stream of this owner incarnation, when enabled.
+    pub(super) r1_events: Option<r1_events::OwnerR1Events>,
     /// Whether a live target is installed. Immutable after installation, so
     /// reading it needs no gate.
     pub(super) live_target_configured: bool,
@@ -349,22 +435,45 @@ impl NodeInventory {
         }
         Ok(evidence)
     }
-    pub fn open(mut config: NodeConfig, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
+    pub(in crate::distributed::tcp) fn persisted_high_water(
+        config: &NodeConfig,
+    ) -> Result<u64, TcpError> {
+        let manifest = generations::read_manifest(&config.root.join(MANIFEST))?;
+        let shape = config
+            .validated_shape()?
+            .to_yaml()
+            .map_err(TcpError::component)?;
+        generations::validate_manifest(&manifest, &config.partition, &shape)?;
+        Ok(manifest.highest_fenced_generation)
+    }
+
+    #[cfg(test)]
+    pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
+        Self::open_with_mode(config, metrics, OpenMode::Prepare)
+    }
+
+    pub(super) fn open_with_mode(
+        mut config: NodeConfig,
+        metrics: Arc<Metrics>,
+        mode: OpenMode,
+    ) -> Result<Self, TcpError> {
         let shape = config.validated_shape()?;
         config.shape_yaml = shape.to_yaml().map_err(TcpError::component)?;
-        match fs::create_dir(&config.root) {
-            Ok(()) => {
-                File::open(
-                    config
-                        .root
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .unwrap_or(Path::new(".")),
-                )?
-                .sync_all()?;
+        if mode == OpenMode::Prepare {
+            match fs::create_dir(&config.root) {
+                Ok(()) => {
+                    File::open(
+                        config
+                            .root
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .unwrap_or(Path::new(".")),
+                    )?
+                    .sync_all()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
         }
         directory(&config.root)?;
         config.root = config.root.canonicalize()?;
@@ -373,9 +482,18 @@ impl NodeInventory {
         let manifest_path = config.root.join(MANIFEST);
         let mut manifest = match fs::symlink_metadata(&manifest_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                read_metadata::<Manifest>(&manifest_path).map_err(TcpError::component)?
+                generations::read_manifest(&manifest_path)?
             }
             Ok(_) => return Err(TcpError::new("node manifest is not a regular file")),
+            Err(error) if mode == OpenMode::Ready && error.kind() == io::ErrorKind::NotFound => {
+                return Err(TcpError::with_kind(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Ready owner inventory ledger is missing: {}",
+                        manifest_path.display()
+                    ),
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 for entry in fs::read_dir(&config.root)? {
                     let entry = entry?;
@@ -386,37 +504,18 @@ impl NodeInventory {
                         return Err(TcpError::new("missing node inventory beside existing data"));
                     }
                 }
-                let manifest = Manifest {
-                    format: 1,
-                    partition: config.partition.clone(),
-                    shape_yaml: config.shape_yaml.clone(),
-                    max_epochs: config.max_epochs,
-                    epochs: Vec::new(),
-                };
+                let manifest = generations::new_manifest(&config);
                 persist(&config.root, &manifest)?;
                 manifest
             }
             Err(error) => return Err(error.into()),
         };
-        if manifest.format != 1
-            || manifest.partition != config.partition
-            || manifest.shape_yaml != config.shape_yaml
-            || manifest.max_epochs != config.max_epochs
-            || manifest.epochs.len() > config.max_epochs
-            || manifest.epochs.iter().any(|e| e.epoch == 0)
-            || manifest.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch)
-            || manifest.epochs.iter().enumerate().any(|(index, e)| {
-                matches!(e.state, EpochState::Active | EpochState::Preparing)
-                    && index + 1 != manifest.epochs.len()
-            })
-        {
-            return Err(TcpError::new("node inventory/configuration differs"));
-        }
+        generations::validate_manifest(&manifest, &config.partition, &config.shape_yaml)?;
         // Hold the node lock before revoking capabilities: another process
         // must never revoke a currently running owner's namespaces.
-        let live_target = {
+        let mut live_target = {
             let marker = config.root.join(LIVE_TARGET_CONFIG);
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-utils")))]
             use super::super::nvmeof::live_target::LiveTargetManager;
             match fs::symlink_metadata(&marker) {
                 Ok(metadata) if metadata.file_type().is_file() => {
@@ -427,10 +526,10 @@ impl NodeInventory {
                             "live target configuration required and must match persisted configuration",
                         ));
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-utils"))]
                     let manager = open_live_target_fixture(saved.config, Some(saved.identity))
                         .map_err(TcpError::component)?;
-                    #[cfg(not(test))]
+                    #[cfg(not(any(test, feature = "test-utils")))]
                     let manager = LiveTargetManager::open_existing(saved.config, saved.identity)
                         .map_err(TcpError::component)?;
                     Some(manager)
@@ -438,6 +537,17 @@ impl NodeInventory {
                 Ok(_) => {
                     return Err(TcpError::new(
                         "live target configuration is not a regular file",
+                    ));
+                }
+                Err(error)
+                    if mode == OpenMode::Ready && error.kind() == io::ErrorKind::NotFound =>
+                {
+                    return Err(TcpError::with_kind(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Ready owner live target identity marker is missing: {}",
+                            marker.display()
+                        ),
                     ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -452,10 +562,13 @@ impl NodeInventory {
                         }
                     }
                     if let Some(target_config) = config.live_target.clone() {
-                        #[cfg(test)]
+                        // The host slot's target directory is created only after the
+                        // owner inventory has reached its first durable image.
+                        super::host::prepare_host_target(&config.root, &target_config)?;
+                        #[cfg(any(test, feature = "test-utils"))]
                         let manager = open_live_target_fixture(target_config.clone(), None)
                             .map_err(TcpError::component)?;
-                        #[cfg(not(test))]
+                        #[cfg(not(any(test, feature = "test-utils")))]
                         let manager = LiveTargetManager::open(target_config.clone())
                             .map_err(TcpError::component)?;
                         let saved = LiveTargetMarker {
@@ -476,6 +589,9 @@ impl NodeInventory {
                 Err(error) => return Err(error.into()),
             }
         };
+        // A durably intended trim names the only directory open accepts without
+        // a ledger entry. Finish it before any log is recovered or published.
+        generations::resume_trim(&config.root, &mut manifest, live_target.as_mut())?;
         for entry in fs::read_dir(&config.root)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -544,6 +660,12 @@ impl NodeInventory {
             readers,
             metrics,
             incarnation: super::durable_progress::new_incarnation()?,
+            revision: 0,
+            #[cfg(test)]
+            trim_crash: None,
+            value_wal_unlinks: 0,
+            file_maintenance: FileMaintenanceStats::default(),
+            r1_events: None,
             live_target_configured: live_target.is_some(),
             lifecycle: Arc::new(Mutex::new(live_target)),
             live_shutdown: false,
@@ -582,16 +704,8 @@ impl NodeInventory {
         Ok(NodeStatus {
             partition: self.config.partition.clone(),
             shape_yaml: self.config.shape_yaml.clone(),
-            max_epochs: self.config.max_epochs,
-            epochs: self
-                .manifest
-                .epochs
-                .iter()
-                .map(|e| NodeEpoch {
-                    epoch: e.epoch,
-                    sealed: e.state != EpochState::Active,
-                })
-                .collect(),
+            highest_fenced_generation: self.manifest.highest_fenced_generation,
+            inventory_revision: self.revision,
             active_epoch: self
                 .manifest
                 .epochs
@@ -675,27 +789,23 @@ impl NodeInventory {
         if inventory.live_shutdown {
             return Err(TcpError::new("live target has shut down; reopen required"));
         }
-        if inventory
-            .manifest
-            .epochs
-            .last()
-            .is_some_and(|e| e.epoch == epoch && e.state == EpochState::Active)
-        {
-            return inventory.status();
-        }
-        if epoch == 0
-            || inventory
+        // Only a retained Active entry at the high-water on a healthy owner makes
+        // an equal fence idempotent; the high-water, never the retained list,
+        // rejects every other stale or repeated generation.
+        let highest = inventory.manifest.highest_fenced_generation;
+        if epoch == highest
+            && inventory
                 .manifest
                 .epochs
                 .last()
-                .is_some_and(|e| epoch <= e.epoch)
+                .is_some_and(|e| e.epoch == epoch && e.state == EpochState::Active)
         {
-            return Err(TcpError::new(
-                "epoch already fenced/sealed; cannot reactivate",
-            ));
+            return inventory.status();
         }
-        if inventory.manifest.epochs.len() == inventory.config.max_epochs {
-            return Err(TcpError::new("retained node epoch capacity reached"));
+        if epoch == 0 || epoch <= highest {
+            return Err(TcpError::new(format!(
+                "fencing generation {epoch} already fenced or sealed (owner high-water {highest})"
+            )));
         }
         let target = live_target(inventory, slot)?;
         let live = target.is_some();
@@ -716,8 +826,33 @@ impl NodeInventory {
                     .iter()
                     .map(|(token, (epoch, _))| (*token, *epoch)),
             );
+            let record_pins: Vec<_> = inventory
+                .live_pins
+                .iter()
+                .map(|(token, (_, leases))| (*token, r1_events::lease_files(leases)))
+                .collect();
+            let export_pins: Vec<_> = inventory
+                .live_export_pins
+                .iter()
+                .map(|(token, (_, key))| (*token, *key))
+                .collect();
+            // Dropping the record leases releases their inode/read pins.
             inventory.live_pins.clear();
             inventory.live_export_pins.clear();
+            if let Some(events) = inventory.r1_events.as_mut() {
+                for (token, files) in record_pins {
+                    events.pin("pin_released", "record", token, files, "fence");
+                }
+                for (token, (source, file)) in export_pins {
+                    events.pin(
+                        "pin_released",
+                        "export",
+                        token,
+                        [(source, file, None)],
+                        "fence",
+                    );
+                }
+            }
         }
         if let Some(old) = inventory
             .manifest
@@ -781,6 +916,19 @@ impl NodeInventory {
         }
         inventory.healthy = false;
         inventory.readers.write().invalidate();
+        // A Preparing entry left by a failed fence of this incarnation can never
+        // grant; a strictly higher fence resolves it to Abandoned.
+        if let Some(last) = inventory
+            .manifest
+            .epochs
+            .last_mut()
+            .filter(|e| e.state == EpochState::Preparing)
+        {
+            last.state = EpochState::Abandoned;
+        }
+        // The high-water and Preparing are installed together, before the
+        // generation directory is touched.
+        inventory.manifest.highest_fenced_generation = epoch;
         inventory.manifest.epochs.push(Epoch {
             epoch,
             state: EpochState::Preparing,
@@ -818,6 +966,7 @@ impl NodeInventory {
     /// Install the manifest with the inventory released. Only lifecycle gate
     /// holders change the manifest, so installs happen in decision order.
     fn persist_manifest<H: InventoryAccess>(inventory: &mut H) -> Result<(), TcpError> {
+        inventory.bump_revision()?;
         let bytes = encode_metadata(&inventory.manifest).map_err(TcpError::component)?;
         let root = inventory.config.root.clone();
         inventory
@@ -1000,12 +1149,16 @@ impl NodeInventory {
         }
         result
     }
+    /// Revoke the live bindings of `files` in `epoch`. Returns `(start,
+    /// device, inode)` of every binding actually revoked; a file without a
+    /// binding (never exported, evicted, or revoked by an earlier attempt) is
+    /// absent from the result.
     fn revoke_live_files<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
         epoch: u64,
         files: &[u64],
-    ) -> Result<(), TcpError> {
+    ) -> Result<Vec<(u64, u64, u64)>, TcpError> {
         let bytes = inventory.config.partition.wal_file_bytes;
         let retired = |(binding_epoch, file): &(u64, u64)| {
             *binding_epoch == epoch && files.contains(&(file * bytes))
@@ -1021,12 +1174,15 @@ impl NodeInventory {
             .filter_map(|key| inventory.live_bindings.remove_entry(key))
             .collect();
         let result = inventory.released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
-        if result.is_err() {
+        if let Err(error) = result {
             inventory.live_bindings.extend(claimed);
-            return result;
+            return Err(error);
         }
         inventory.idle_history_exports.retain(|key| !retired(key));
-        Ok(())
+        Ok(claimed
+            .iter()
+            .map(|((_, file), (segment, _, _))| (file * bytes, segment.device, segment.inode))
+            .collect())
     }
 
     pub(super) fn acquire_live_export_pin(
@@ -1059,6 +1215,15 @@ impl NodeInventory {
             })
             .ok_or_else(|| TcpError::new("live export pin token allocation failed"))?;
         self.live_export_pins.insert(token, (epoch, key));
+        if let Some(events) = self.r1_events.as_mut() {
+            events.pin(
+                "pin_held",
+                "export",
+                token,
+                [(key.0, key.1, Some((segment.device, segment.inode)))],
+                "connect",
+            );
+        }
         // A connected history export cannot be an idle-owner eviction victim.
         self.idle_history_exports.retain(|file| *file != key);
         Ok(token)
@@ -1083,8 +1248,21 @@ impl NodeInventory {
                 "export pin belongs to another authority epoch",
             ));
         }
+        let identity = inventory
+            .live_bindings
+            .get(&key)
+            .map(|(segment, _, _)| (segment.device, segment.inode));
         Self::release_live_bindings(inventory, target, [key], Some(token))?;
         inventory.live_export_pins.remove(&token);
+        if let Some(events) = inventory.r1_events.as_mut() {
+            events.pin(
+                "pin_released",
+                "export",
+                token,
+                [(key.0, key.1, identity)],
+                "release",
+            );
+        }
         Ok(())
     }
 
@@ -1113,12 +1291,23 @@ impl NodeInventory {
                 .map(|lease| (lease.segment.epoch, lease.segment.file_index)),
             None,
         );
-        if result.is_err() {
+        if let Err(error) = result {
             // A revoke can fail after a partial target change. Restore the
             // record leases, keeping their inode/read pins until a fence.
             inventory.live_pins.insert(token, (authority, leases));
+            return Err(error);
         }
-        result
+        // Only an enabled stream pays for the file list (read release path).
+        let files = inventory
+            .r1_events
+            .is_some()
+            .then(|| r1_events::lease_files(&leases));
+        // Dropping the record leases releases their inode/read pins.
+        drop(leases);
+        if let (Some(events), Some(files)) = (inventory.r1_events.as_mut(), files) {
+            events.pin("pin_released", "record", token, files, "release");
+        }
+        Ok(())
     }
 
     fn release_live_bindings<H: InventoryAccess>(
@@ -1378,7 +1567,7 @@ impl NodeInventory {
             _ => Err(TcpError::new("recovery requires sealed immutable epoch")),
         }
     }
-    fn retirement_log(
+    pub(super) fn retirement_log(
         &self,
         authority_epoch: u64,
         epoch: u64,
@@ -1412,84 +1601,6 @@ impl NodeInventory {
         self.retirement_log(authority_epoch, epoch)?
             .wal_file_page(after, limit)
             .map_err(TcpError::component)
-    }
-
-    /// The caller holds the lifecycle gate (`slot` is its content) or owns the
-    /// inventory exclusively.
-    pub(super) fn retire_wal_files<H: InventoryAccess>(
-        inventory: &mut H,
-        slot: &mut LifecycleSlot,
-        authority_epoch: u64,
-        epoch: u64,
-        files: &[u64],
-    ) -> Result<(), TcpError> {
-        Self::retire_files_inner(inventory, slot, authority_epoch, epoch, files)
-    }
-
-    fn retire_files_inner<H: InventoryAccess>(
-        inventory: &mut H,
-        slot: &mut LifecycleSlot,
-        authority_epoch: u64,
-        epoch: u64,
-        files: &[u64],
-    ) -> Result<(), TcpError> {
-        if files.len() > 256 {
-            return Err(TcpError::new("retirement file count exceeds bound"));
-        }
-        let log = inventory.retirement_log(authority_epoch, epoch)?;
-        if !inventory.live_pins.is_empty() {
-            return Err(TcpError::new(
-                "live NVMe-oF pins must drain before retirement",
-            ));
-        }
-        if inventory
-            .live_export_pins
-            .values()
-            .any(|(_, (source, file))| {
-                *source == epoch
-                    && files.contains(&(file * inventory.config.partition.wal_file_bytes))
-            })
-        {
-            return Err(TcpError::new(
-                "live connection pins must drain before retirement",
-            ));
-        }
-        let mut target = live_target(inventory, slot)?;
-        let retired_identities = if let Some(target) = target.as_deref_mut() {
-            if let Err(error) = Self::revoke_live_files(inventory, target, epoch, files) {
-                inventory.healthy = false;
-                return Err(error);
-            }
-            let root = epoch_path(&inventory.config.root, epoch);
-            let bytes = inventory.config.partition.wal_file_bytes;
-            inventory.released(|| {
-                let mut identities = Vec::new();
-                for offset in files {
-                    let path = root.join(format!("wal_{:016x}", offset / bytes));
-                    if let Some(identity) =
-                        target.sealed_file(&path).map_err(TcpError::component)?
-                    {
-                        identities.push(identity);
-                    }
-                }
-                Ok::<_, TcpError>(identities)
-            })?
-        } else {
-            Vec::new()
-        };
-        inventory.released(|| {
-            log.retire_wal_files(files).map_err(TcpError::component)?;
-            // Each tombstone release syncs the WAL directory before its marker
-            // removal, so a crash cannot resurrect an untracked old file.
-            if let Some(target) = target {
-                for identity in &retired_identities {
-                    target
-                        .retire_deleted_file(identity)
-                        .map_err(TcpError::component)?;
-                }
-            }
-            Ok(())
-        })
     }
 
     pub(super) fn checkpoint_log(
@@ -1785,6 +1896,7 @@ mod tests {
         let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
         inventory.fence_to(1).unwrap();
         inventory.seal(1).unwrap();
+        inventory.manifest.highest_fenced_generation = 2;
         inventory.manifest.epochs.push(Epoch {
             epoch: 2,
             state: EpochState::Preparing,
@@ -1795,19 +1907,18 @@ mod tests {
         fs::create_dir(epoch_path(&config.root, 2)).unwrap();
         drop(inventory);
         let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
-        assert_eq!(
-            inventory.status().unwrap().epochs,
-            vec![
-                NodeEpoch {
-                    epoch: 1,
-                    sealed: true
-                },
-                NodeEpoch {
-                    epoch: 2,
-                    sealed: true
-                }
-            ]
+        let status = inventory.status().unwrap();
+        assert_eq!(status.highest_fenced_generation, 2);
+        assert_eq!(status.active_epoch, None);
+        assert!(
+            inventory
+                .manifest
+                .epochs
+                .iter()
+                .map(|e| (e.epoch, e.state == EpochState::Active))
+                .eq([(1, false), (2, false)])
         );
+        assert!(inventory.manifest.epochs[1].state == EpochState::Abandoned);
         assert!(inventory.fence_to(2).is_err());
         inventory.fence_to(3).unwrap();
         assert!(epoch_path(&config.root, 2).is_dir());

@@ -2722,7 +2722,8 @@ fn test_bloom_filter_restore() {
             db.insert(ks, i.to_be_bytes().to_vec(), vec![0, 1, 2])
                 .unwrap();
         }
-        thread::sleep(Duration::from_millis(10)); // todo replace this with wal tracker barrier
+        // `rebuild_control_region` flushes only processed entries.
+        db.wal_writer.wal_tracker_barrier();
         db.rebuild_control_region().unwrap();
         assert!(db.large_table.is_all_clean());
     }

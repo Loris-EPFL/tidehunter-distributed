@@ -563,5 +563,141 @@ class PhysicalRouteTest(unittest.TestCase):
                         route()
 
 
+DROPPED, PROVISIONED = 'aa' * 16, 'bb' * 16
+LIVE_CONFIG = {'live_nvme': {'host_id': [1] * 16}}
+FIRST = live.cloud_campaign.effective_live_owner(LIVE_CONFIG['live_nvme'], DROPPED, 0)
+SECOND = live.cloud_campaign.effective_live_owner(LIVE_CONFIG['live_nvme'], PROVISIONED, 0)
+
+
+def scoped_route(route, identity):
+    route.update(host_nqn=identity['host_nqn'], host_id=list(identity['host_id']))
+    route['namespace_identity']['nqn'] = identity['subsystem_scope'] + 'sub-00000000-0000-0000-0000-000000000001'
+    return route
+
+
+def owner_host_evidence(tier='synchronous'):
+    """Owner-host (launch `host`) qualification: schema 2 with drop -> reprovision."""
+    proof, coordinator, owner = evidence()
+    proof['schema_version'] = 2
+    proof['checks']['target_reuse'] = True
+    for sample in (proof['before_close'], proof['after_hit'], proof['abrupt_child']['end'],
+                   proof['abrupt_recovery'], proof['member_transition']):
+        for route in sample.get('routes', sample.get('writer_routes')):
+            scoped_route(route, FIRST)
+    before = [copy.deepcopy(proof['member_transition']['writer_routes'][0])]
+    after = [scoped_route(copy.deepcopy(before[0]), SECOND)]
+    proof['target_reuse'] = {
+        'dropped_database': DROPPED, 'database': PROVISIONED,
+        'dropped_initiators': [{'partition': 0, 'database': DROPPED,
+                                'host_nqn': FIRST['host_nqn'], 'host_id': FIRST['host_id']}],
+        'initiators': [{'partition': 0, 'database': PROVISIONED,
+                        'host_nqn': SECOND['host_nqn'], 'host_id': SECOND['host_id']}],
+        'routes_before_drop': before, 'routes_after_reprovision': after}
+    # The shutdown runs on the reprovisioned database's first fencing generation.
+    proof['target_shutdown'][0].update(database=list(bytes.fromhex(PROVISIONED)), epoch=1)
+    launch, receipt = owner_evidence(tier)
+    launch.pop('node')
+    launch.update(partition=0, host={'root': '/data/node-0/storage'})
+    receipt.pop('database')
+    return proof, coordinator, owner, launch, receipt
+
+
+class OwnerHostQualificationTest(unittest.TestCase):
+    def admit(self, proof, coordinator, owner, launch, receipt, target='kernel'):
+        return live.admit(proof, 'rdma', '10.1.0.2', '10.1.0.1', '10.0.0.2', coordinator, owner,
+                          target=target, tier='synchronous', owner_launch=launch, owner_receipt=receipt,
+                          remote_config=LIVE_CONFIG)
+
+    def test_owner_host_proof_with_target_reuse_is_accepted(self):
+        proof, coordinator, owner, launch, receipt = owner_host_evidence()
+        self.assertEqual(self.admit(proof, coordinator, owner, launch, receipt)['proof'], proof)
+
+    def test_owner_host_proof_requires_scoped_identities_and_slot_reuse(self):
+        mutations = [
+            ('schema 1', lambda p, l, r: p.update(schema_version=1)),
+            ('reuse check', lambda p, l, r: p['checks'].pop('target_reuse')),
+            ('reuse evidence', lambda p, l, r: p.pop('target_reuse')),
+            ('same identity', lambda p, l, r: p['target_reuse'].update(
+                database=DROPPED, initiators=p['target_reuse']['dropped_initiators'])),
+            ('zero identity', lambda p, l, r: p['target_reuse'].update(database='0' * 32)),
+            ('initiator nqn', lambda p, l, r: p['target_reuse']['initiators'][0].update(
+                host_nqn=SECOND['host_nqn'].replace('-p00000000-', '-p00000001-'))),
+            ('initiator id', lambda p, l, r: p['target_reuse']['initiators'][0].update(host_id=[5] * 16)),
+            ('no route after', lambda p, l, r: p['target_reuse'].update(routes_after_reprovision=[])),
+            ('old initiator after', lambda p, l, r: scoped_route(
+                p['target_reuse']['routes_after_reprovision'][0], FIRST)),
+            ('other slot after', lambda p, l, r: p['target_reuse']['routes_after_reprovision'][0].update(
+                service=4421)),
+            ('new initiator before', lambda p, l, r: scoped_route(
+                p['before_close']['routes'][0], SECOND)),
+            ('unscoped subsystem', lambda p, l, r: p['after_hit']['routes'][0]['namespace_identity'].update(
+                nqn='nqn.2026-01.local.tidehunter:live-1')),
+            ('configured initiator', lambda p, l, r: p['abrupt_recovery']['routes'][0].update(
+                host_nqn='nqn.2014-08.org.nvmexpress:uuid:11111111-1111-4111-8111-111111111111')),
+            ('shutdown of dropped', lambda p, l, r: p['target_shutdown'][0].update(
+                database=list(bytes.fromhex(DROPPED)))),
+            ('shutdown generation', lambda p, l, r: p['target_shutdown'][0].update(epoch=0)),
+            ('receipt database', lambda p, l, r: r.update(database=[1] * 16)),
+            ('receipt legacy history', lambda p, l, r: r.update(history_persistence='on_disk')),
+            ('typed shutdown count', lambda p, l, r: p['target_shutdown'][0]['stats'].update(errors=False)),
+        ]
+        for name, mutate in mutations:
+            proof, coordinator, owner, launch, receipt = owner_host_evidence()
+            mutate(proof, launch, receipt)
+            with self.subTest(name), self.assertRaises(ValueError):
+                self.admit(proof, coordinator, owner, launch, receipt)
+
+    def test_launch_shape_selects_proof_schema(self):
+        archive, coordinator, owner = evidence()
+        _, _, _, launch, receipt = owner_host_evidence()
+        with self.assertRaisesRegex(ValueError, 'receipt missing or mismatched'):
+            self.admit(archive, coordinator, owner, launch, receipt)
+        proof, coordinator, owner, _, _ = owner_host_evidence()
+        archive_launch, archive_receipt = owner_evidence()
+        with self.assertRaisesRegex(ValueError, 'receipt missing or mismatched'):
+            self.admit(proof, coordinator, owner, archive_launch, archive_receipt)
+        # Owner hosts serve kernel targets only.
+        proof, coordinator, owner, launch, receipt = owner_host_evidence()
+        proof.update(target_implementation='spdk',
+                     scope='verified_spdk_namespace_not_physical_media_performance')
+        with self.assertRaisesRegex(ValueError, 'receipt missing or mismatched'):
+            self.admit(proof, coordinator, owner, launch, receipt, target='spdk')
+
+    def test_prepared_owner_launch_matches_admitted_slot(self):
+        node = Path('/run/q/node-0')
+        pool = {'address': '10.1.0.2', 'transport': 'rdma', 'public_port_base': 1000,
+                'public_service_base': 4420, 'commissioning_port_base': 1001,
+                'commissioning_service_base': 4421}
+        host = {'listen': '10.0.0.2:9400', 'ready_file': str(node / 'ready'), 'stop_file': str(node / 'stop'),
+                'partition': 0, 'host': {'root': str(node / 'storage'), 'max_databases': 1,
+                                         'live_target_pool': pool}}
+        self.assertIsNone(live._admit_owner_launch(host, node, '10.0.0.2', '10.1.0.2', 'rdma', False))
+        for mutate in (lambda l: l['host'].update(max_databases=2),
+                       lambda l: l['host']['live_target_pool'].update(public_service_base=4422),
+                       lambda l: l['host']['live_target_pool'].update(transport='tcp'),
+                       lambda l: l['host'].update(live_target={}),
+                       lambda l: l.update(partition=1),
+                       lambda l: l.update(node={}),
+                       lambda l: l['host'].update(root=str(node / 'other')),
+                       lambda l: l.update(stop_file='/elsewhere')):
+            launch = copy.deepcopy(host)
+            mutate(launch)
+            with self.subTest(launch=launch), self.assertRaises(ValueError):
+                live._admit_owner_launch(launch, node, '10.0.0.2', '10.1.0.2', 'rdma', False)
+        with self.assertRaises(ValueError):
+            live._admit_owner_launch(host, node, '10.0.0.2', '10.1.0.2', 'rdma', True)
+        target = {'address': '10.1.0.2', 'transport': 'rdma', 'service': 4420, 'port_id': 1000,
+                  'commissioning_service': 4421, 'commissioning_port_id': 1001,
+                  'state_dir': str(node / 'live-nvmeof')}
+        archive = {key: host[key] for key in ('listen', 'ready_file', 'stop_file')}
+        archive['node'] = {'root': str(node / 'storage'), 'live_target': target}
+        self.assertEqual(live._admit_owner_launch(archive, node, '10.0.0.2', '10.1.0.2', 'rdma', True), target)
+        with self.assertRaises(ValueError):
+            live._admit_owner_launch(archive, node, '10.0.0.2', '10.1.0.2', 'rdma', False)
+        archive['node']['live_target'] = dict(target, commissioning_service=4422)
+        with self.assertRaises(ValueError):
+            live._admit_owner_launch(archive, node, '10.0.0.2', '10.1.0.2', 'rdma', True)
+
+
 if __name__ == '__main__':
     unittest.main()

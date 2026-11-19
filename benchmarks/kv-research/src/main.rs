@@ -16,7 +16,61 @@ fn entry() -> BackendResult<()> {
     if backends::tidehunter::maybe_run_storage_node()? {
         return Ok(());
     }
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    if backends::tidehunter::maybe_run_leased_fixture_owner()? {
+        return Ok(());
+    }
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--q1-index-stage")
+    {
+        let (stage, phase, partition, output) = match arguments.as_slice() {
+            [_, stage, flag, phase, out, output] if flag == "--phase" && out == "--output" => {
+                (stage, phase, None, output)
+            }
+            [_, stage, flag, phase, part, partition, out, output]
+                if flag == "--phase" && part == "--partition" && out == "--output" =>
+            {
+                (stage, phase, Some(partition.parse::<u32>()?), output)
+            }
+            _ => {
+                return Err("usage: kv-research --q1-index-stage STAGE.json --phase <build|pilot|overwrite|cold-reopen|verify|owner-observe> [--partition N] --output FRESH_DIR".into());
+            }
+        };
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        return backends::tidehunter::q1_index_stage(
+            Path::new(stage),
+            phase,
+            partition,
+            Path::new(output),
+        );
+        #[cfg(not(all(feature = "test-utils", target_os = "linux")))]
+        {
+            let _ = (stage, phase, partition, output);
+            return Err(
+                "the Q1 index stage runner requires Linux and the test-utils feature".into(),
+            );
+        }
+    }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--index-a1-cold-reopen")
+    {
+        if arguments.len() != 4 || arguments[2] != "--output" {
+            return Err(
+                "usage: kv-research --index-a1-cold-reopen OVERWRITE_CONFIG.json --output FRESH_DIR"
+                    .into(),
+            );
+        }
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        return backends::tidehunter::index_a1_cold_reopen(
+            Path::new(&arguments[1]),
+            Path::new(&arguments[3]),
+        );
+        #[cfg(not(all(feature = "test-utils", target_os = "linux")))]
+        return Err("the A1 index fixture requires Linux and the test-utils feature".into());
+    }
     if arguments
         .first()
         .is_some_and(|arg| arg == "--experimental-live-nvmeof-qualification-child")
@@ -188,6 +242,11 @@ fn entry() -> BackendResult<()> {
                 runner::run(backend, config, &output, registry).await
             }
             "tidehunter" => {
+                #[cfg(all(feature = "test-utils", target_os = "linux"))]
+                if config.index_fixture_stage()?.is_some() {
+                    let backend = backends::tidehunter::open_index_fixture(&config)?;
+                    return runner::run(backend, config, &output, registry).await;
+                }
                 let backend =
                     backends::tidehunter::open(&config.backend.options, &registry).await?;
                 runner::run(backend, config, &output, registry).await

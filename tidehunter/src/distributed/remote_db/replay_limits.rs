@@ -42,10 +42,15 @@ impl ReplayLimits {
         Ok(())
     }
 
-    /// Start a checkpoint at a quarter of either limit; a larger window alone
-    /// does not make a checkpointer that cannot keep up sustainable.
-    pub(super) fn checkpoint_due(self, batches: usize, bytes: usize) -> bool {
-        batches >= (self.max_batches / 4).max(1) || bytes >= (self.max_encoded_bytes / 4).max(1)
+    /// Start well before the hard bound; a larger window alone does not make a
+    /// checkpointer that cannot keep up sustainable. Batches and bytes are
+    /// separate soft triggers.
+    pub(super) fn batches_due(self, batches: usize) -> bool {
+        batches >= (self.max_batches / 4).max(1)
+    }
+
+    pub(super) fn bytes_due(self, bytes: usize) -> bool {
+        bytes >= (self.max_encoded_bytes / 4).max(1)
     }
 }
 
@@ -59,15 +64,15 @@ mod tests {
             max_batches: 16,
             max_encoded_bytes: 400,
         };
-        assert!(!limits.checkpoint_due(3, 99));
-        assert!(limits.checkpoint_due(4, 0));
-        assert!(limits.checkpoint_due(0, 100));
+        assert!(!limits.batches_due(3) && !limits.bytes_due(99));
+        assert!(limits.batches_due(4));
+        assert!(limits.bytes_due(100));
         let tiny = ReplayLimits {
             max_batches: 1,
             max_encoded_bytes: 1,
         };
-        assert!(!tiny.checkpoint_due(0, 0));
-        assert!(tiny.checkpoint_due(1, 0));
+        assert!(!tiny.batches_due(0) && !tiny.bytes_due(0));
+        assert!(tiny.batches_due(1));
     }
 
     #[test]

@@ -64,10 +64,14 @@ fn read_result<T>(
     result
 }
 
+/// Same path for every root format; `WalRoot.format` selects the grammar.
 pub(super) const ROOT: &str = "partition-wal-root-v1";
+const ROOT_FORMAT: u32 = 2;
 const MEMBER_MISMATCH: &str = "WAL member differs from the reference";
-const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
+pub(super) const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
 
+/// Format 2: fixed-width bincode plus a trailing little-endian CRC32. Format 1
+/// (one offset per retired file) is refused: deployments use fresh databases.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct WalRoot {
     format: u32,
@@ -77,24 +81,30 @@ pub(super) struct WalRoot {
     pub(super) generation: u64,
     pub(super) scan_from: u64,
     pub(super) synced_end: u64,
-    pub(super) retired: Vec<u64>,
+    pub(super) retired: RetiredFiles,
+    /// Sorted by start; never retired.
+    pub(super) sealed_files: Vec<FileSeal>,
+    /// Sorted by start; every entry is retired.
+    pub(super) cleanup_pending: Vec<PendingRetirement>,
 }
 
 impl WalRoot {
     pub(super) fn new(config: &PartitionConfig) -> Self {
         Self {
-            format: 1,
+            format: ROOT_FORMAT,
             database: config.inventory.database,
             partition: config.partition,
             epoch: config.inventory.epoch,
             generation: 1,
             scan_from: 0,
             synced_end: 0,
-            retired: Vec::new(),
+            retired: RetiredFiles::default(),
+            sealed_files: Vec::new(),
+            cleanup_pending: Vec::new(),
         }
     }
 
-    fn encode(&self) -> Result<Vec<u8>, StorageError> {
+    pub(super) fn encode(&self) -> Result<Vec<u8>, StorageError> {
         let mut bytes = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .serialize(self)
@@ -108,8 +118,23 @@ impl WalRoot {
         Ok(())
     }
 
-    fn open(path: &Path, config: &PartitionConfig) -> Result<Self, StorageError> {
-        let bytes = fs::read(path.join(ROOT))?;
+    /// First file start at or above which no file is sealed or retired. Seals
+    /// are installed in ascending file order, so every unretired file below
+    /// this bound is sealed.
+    pub(super) fn seal_cursor(&self) -> u64 {
+        self.sealed_files
+            .last()
+            .map_or(0, |seal| seal.end)
+            .max(self.retired.end())
+    }
+
+    pub(super) fn open(path: &Path, config: &PartitionConfig) -> Result<Self, StorageError> {
+        let file = File::open(path.join(ROOT))?;
+        if file.metadata()?.len() > MAX_METADATA_BYTES {
+            return Err(StorageError::Invalid("WAL root exceeds metadata limit"));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_METADATA_BYTES + 1).read_to_end(&mut bytes)?;
         let body_len = bytes
             .len()
             .checked_sub(4)
@@ -117,29 +142,37 @@ impl WalRoot {
         if bytes[body_len..] != crc32fast::hash(&bytes[..body_len]).to_le_bytes() {
             return Err(StorageError::Invalid("invalid WAL root CRC"));
         }
+        // Fixed-width bincode writes `format` first as four little-endian bytes.
+        if bytes.get(..4) != Some(&ROOT_FORMAT.to_le_bytes()[..]) {
+            return Err(StorageError::Invalid(
+                "unsupported WAL root format: use archive/multi-design",
+            ));
+        }
         let root: Self = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_limit(body_len as u64)
             .reject_trailing_bytes()
             .deserialize(&bytes[..body_len])
             .map_err(|_| StorageError::Invalid("invalid WAL root format"))?;
-        if root.format != 1
-            || root.database != config.inventory.database
+        if root.database != config.inventory.database
             || root.partition != config.partition
             || root.epoch != config.inventory.epoch
             || root.generation == 0
             || root.synced_end < root.scan_from
             || !root.scan_from.is_multiple_of(config.fragment_bytes)
-            || root.retired.windows(2).any(|pair| pair[0] >= pair[1])
-            || root
-                .retired
-                .iter()
-                .any(|offset| !offset.is_multiple_of(config.wal_file_bytes))
         {
             return Err(StorageError::Invalid(
                 "WAL root differs from registered stream",
             ));
         }
+        validate_root_sets(
+            &root.retired,
+            &root.sealed_files,
+            &root.cleanup_pending,
+            root.synced_end,
+            root.generation,
+            config.wal_file_bytes,
+        )?;
         Ok(root)
     }
 }
@@ -170,7 +203,7 @@ impl PartitionLog {
             .lock()
             .wal_root
             .as_ref()
-            .is_some_and(|root| root.retired.binary_search(&offset).is_ok()))
+            .is_some_and(|root| root.retired.contains(offset)))
     }
 
     /// Sync the fixed acknowledged cut without blocking leases on the file barrier.
@@ -198,6 +231,12 @@ impl PartitionLog {
         timing.stage(Some(WriteStage::PersistValidation));
         let (snapshot, lifecycle) = {
             let state = self.state.lock();
+            // Fail closed: after a Fatal poison the in-memory root may lag a
+            // durable root (a seal or retirement root installed without its
+            // publish). Nothing may be synced or rewritten from RAM.
+            if matches!(state.poison, Some(WriterPoison::Fatal)) {
+                return Err(StorageError::Poisoned);
+            }
             let allocated = state
                 .writer
                 .as_ref()
@@ -241,7 +280,7 @@ impl PartitionLog {
         if through > snapshot.synced_end {
             for id in snapshot.scan_from / size..=through.saturating_sub(1) / size {
                 let start = id * size;
-                if snapshot.retired.binary_search(&start).is_err() {
+                if !snapshot.retired.contains(start) {
                     timing.stage(Some(WriteStage::PersistFile));
                     timing.record(|profile| profile.file_persist_calls += 1);
                     let proof_file_sync_span = super::super::owner_events::OwnerEventSpan::new(
@@ -278,8 +317,13 @@ impl PartitionLog {
         timing.stage(Some(WriteStage::PersistSerializationLock));
         let _persistence = self.persistence.lock();
         timing.stage(Some(WriteStage::PersistValidation));
-        let mut root = {
+        let current = {
             let state = self.state.lock();
+            // Recheck under `persistence`: every root writer sets a Fatal
+            // poison while it still holds `persistence`.
+            if matches!(state.poison, Some(WriterPoison::Fatal)) {
+                return Err(StorageError::Poisoned);
+            }
             // The node and session stream guards must prevent these lifecycle
             // transitions. Never return a proof if a direct caller broke that rule.
             if position_lifecycle(&state) != lifecycle {
@@ -296,7 +340,9 @@ impl PartitionLog {
         self.pause_live_at(LivePausePoint::PositionRootLocked);
         let scan_from =
             through.saturating_sub(1) / self.config().fragment_bytes * self.config().fragment_bytes;
-        if through > root.synced_end || scan_from > root.scan_from {
+        if through > current.synced_end || scan_from > current.scan_from {
+            // Copy the root without the state lock: its seal set is O(sealed files).
+            let mut root = WalRoot::clone(&current);
             root.synced_end = root.synced_end.max(through);
             root.scan_from = root.scan_from.max(scan_from);
             root.generation = root
@@ -306,7 +352,7 @@ impl PartitionLog {
             timing.stage(Some(WriteStage::PersistPublication));
             self.install_wal_root(&root)?;
             let synced_end = root.synced_end;
-            self.state.lock().wal_root = Some(root);
+            self.state.lock().wal_root = Some(Arc::new(root));
             #[cfg(test)]
             self.fail_position_at(6)?;
             #[cfg(test)]
@@ -317,7 +363,7 @@ impl PartitionLog {
         }
         timing.success(0);
         proof_span.end_at(through);
-        Ok(root.synced_end)
+        Ok(current.synced_end)
     }
 
     #[cfg(test)]
@@ -332,7 +378,7 @@ impl PartitionLog {
         Ok(())
     }
 
-    fn install_wal_root(&self, root: &WalRoot) -> Result<(), StorageError> {
+    pub(super) fn install_wal_root(&self, root: &WalRoot) -> Result<(), StorageError> {
         #[cfg(test)]
         {
             let fail = self
@@ -362,74 +408,27 @@ impl PartitionLog {
         root.install(&self.path)
     }
 
+    /// Retire whole files of this older sealed stream. The caller supplies no
+    /// inode; the owner binds the inode it observes. `file_retirement` owns the
+    /// durable record -> unlink -> directory sync order.
     pub fn retire_wal_files(&self, files: &[u64]) -> Result<(), StorageError> {
-        let _persistence = self.persistence.lock();
-        let mut state = self.state.lock();
-        if !state.sealed || state.writer.is_some() || state.poison.is_some() {
-            return Err(StorageError::Invalid(
-                "retirement requires healthy sealed storage",
-            ));
+        let proofs: Vec<_> = files
+            .iter()
+            .map(|&file_start| RetireProof {
+                file_start,
+                inode: None,
+                seal_generation: None,
+            })
+            .collect();
+        match self.retire_proved_files(&proofs, None)? {
+            RetirementOutcome::Completed => Ok(()),
+            RetirementOutcome::Busy => Err(StorageError::Invalid(
+                "retirement cleanup set is full; retry after cleanup",
+            )),
         }
-        if files.len() > 256 || files.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(StorageError::Invalid(
-                "retirement differs from complete durable prefix",
-            ));
-        }
-        let mut root = state
-            .wal_root
-            .clone()
-            .ok_or(StorageError::Invalid("request requires WAL replay history"))?;
-        if files.is_empty() {
-            return Ok(());
-        }
-        let size = self.config().wal_file_bytes;
-        let inventory_end = highest_wal_end(&self.path, self.config())?
-            .max(root.retired.last().map_or(0, |offset| offset + size));
-        let mut ids = Vec::with_capacity(files.len());
-        for &offset in files {
-            if !offset.is_multiple_of(size) || offset >= inventory_end {
-                return Err(StorageError::Invalid(
-                    "retirement outside registered WAL inventory",
-                ));
-            }
-            let id = crate::wal::position::WalFileId::from_u64(offset / size);
-            if !self
-                .config()
-                .layout()
-                .wal_file_name(&self.path, id)
-                .is_file()
-                && root.retired.binary_search(&offset).is_err()
-            {
-                return Err(StorageError::Invalid("unexplained missing WAL file"));
-            }
-            ids.push(id);
-        }
-        let mut admission = self.read_admission.write();
-        if self.live_read_pins.load(Ordering::Acquire) != 0 {
-            return Err(StorageError::Invalid(
-                "live namespace or read pin prevents retirement",
-            ));
-        }
-        *admission = false;
-        root.retired.extend_from_slice(files);
-        root.retired.sort_unstable();
-        root.retired.dedup();
-        root.generation = root
-            .generation
-            .checked_add(1)
-            .ok_or(StorageError::Capacity)?;
-        self.install_wal_root(&root)?;
-        state.wal_root = Some(root);
-        #[cfg(test)]
-        if self.fail_wal_retire.swap(false, Ordering::AcqRel) {
-            return Err(StorageError::Invalid("injected crash before WAL unlink"));
-        }
-        self.wal.retire_files(&ids)?;
-        *admission = true;
-        Ok(())
     }
 
-    fn open_replay_file(&self, offset: u64) -> Result<File, StorageError> {
+    pub(super) fn open_replay_file(&self, offset: u64) -> Result<File, StorageError> {
         let id = crate::wal::position::WalFileId::from_u64(offset / self.config().wal_file_bytes);
         Ok(File::open(
             self.config().layout().wal_file_name(&self.path, id),
@@ -448,7 +447,7 @@ impl PartitionLog {
         Ok(&cached.as_ref().expect("file installed above").1)
     }
 
-    fn frame_header(&self, file: &File, offset: u64) -> Result<[u8; 8], StorageError> {
+    pub(super) fn frame_header(&self, file: &File, offset: u64) -> Result<[u8; 8], StorageError> {
         let mut header = [0; 8];
         file.read_exact_at(&mut header, offset % self.config().wal_file_bytes)?;
         Ok(header)
@@ -501,7 +500,7 @@ impl PartitionLog {
         self.decode_group_from_file(&file, offset)
     }
 
-    fn decode_group_from_file(
+    pub(super) fn decode_group_from_file(
         &self,
         file: &File,
         offset: u64,
@@ -651,7 +650,7 @@ impl PartitionLog {
             }
             (
                 state.appended_end,
-                state.wal_root.as_ref().map(|root| root.retired.clone()),
+                state.wal_root.clone(),
                 state.live,
                 state.wal_root.as_ref().map_or(0, |root| root.synced_end),
             )
@@ -661,10 +660,36 @@ impl PartitionLog {
                 "sealed WAL ends below the required position",
             ));
         }
+        self.replay_groups(
+            from..end,
+            end,
+            retired.as_deref(),
+            (!live).then_some(strict_end),
+            limit,
+            max_bytes,
+        )
+    }
+
+    /// Whole groups that start in `starts`, skipping retired intervals and
+    /// validated skip suffixes. Every group frame must end at or below
+    /// `frame_bound` (at least `starts.end`): a group that starts below
+    /// `starts.end` is read whole. An undecodable group is corruption, except
+    /// at or above `tolerate_from` (a sealed non-live tail beyond its strict
+    /// bound).
+    pub(super) fn replay_groups(
+        &self,
+        starts: std::ops::Range<u64>,
+        frame_bound: u64,
+        retired: Option<&WalRoot>,
+        tolerate_from: Option<u64>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<ReplayPage, StorageError> {
+        let std::ops::Range { start: from, end } = starts;
         if limit == 0 || limit > 256 {
             return Err(StorageError::Invalid("receipt page limit must be 1..=256"));
         }
-        if !from.is_multiple_of(8) || from > end {
+        if !from.is_multiple_of(8) || from > end || end > frame_bound {
             return Err(StorageError::Invalid(FRAME_BOUNDARY));
         }
         let _admission = self.read_admission()?;
@@ -696,11 +721,12 @@ impl PartitionLog {
         let mut groups = Vec::new();
         while cursor < end {
             let file_start = cursor / self.config().wal_file_bytes * self.config().wal_file_bytes;
-            if retired
+            // Jump over a whole retired interval; never visit its files one by one.
+            if let Some(skip) = retired
                 .as_ref()
-                .is_some_and(|retired| retired.binary_search(&file_start).is_ok())
+                .and_then(|root| root.retired.skip_end(file_start))
             {
-                cursor = (file_start + self.config().wal_file_bytes).min(end);
+                cursor = skip.min(end);
                 continue;
             }
             let fragment_end =
@@ -719,13 +745,13 @@ impl PartitionLog {
             }
             let decoded = match self.decode_group_from_file(current_file, cursor) {
                 Ok(decoded) => decoded,
-                Err(_) if !live && cursor >= strict_end => {
+                Err(_) if tolerate_from.is_some_and(|strict_end| cursor >= strict_end) => {
                     cursor = fragment_end.min(end);
                     continue;
                 }
                 Err(_) => return Err(StorageError::Invalid(FRAME_BOUNDARY)),
             };
-            if decoded.frame_end > end {
+            if decoded.frame_end > frame_bound {
                 return Err(StorageError::Invalid(FRAME_BOUNDARY));
             }
             let group_bytes = decoded.receipts.iter().try_fold(0usize, |bytes, receipt| {
@@ -758,7 +784,12 @@ impl PartitionLog {
         Ok(ReplayPage { groups, next })
     }
 
-    fn validate_skip_suffix(&self, file: &File, offset: u64, end: u64) -> Result<(), StorageError> {
+    pub(super) fn validate_skip_suffix(
+        &self,
+        file: &File,
+        offset: u64,
+        end: u64,
+    ) -> Result<(), StorageError> {
         let mut cursor = offset + 8;
         let mut buffer = [0; 65536];
         while cursor < end {
@@ -785,22 +816,35 @@ impl PartitionLog {
         let expected = &registration.config;
         let root = WalRoot::open(&path, expected)?;
         let mut inventory = std::collections::BTreeMap::new();
+        // Retired dirents are allowed only as the exact inode of a durable
+        // pending cleanup entry; anything else is not a permit to unlink.
+        let mut retired_present = Vec::new();
         for entry in fs::read_dir(&path)? {
-            if let Some((id, len)) = wal_file_entry(&entry?, expected)? {
+            let entry = entry?;
+            if let Some((id, len)) = wal_file_entry(&entry, expected)? {
                 let offset = id * expected.wal_file_bytes;
-                if root.retired.binary_search(&offset).is_err() {
+                if root.retired.contains(offset) {
+                    let metadata = entry.metadata()?;
+                    retired_present.push((offset, metadata.dev(), metadata.ino()));
+                } else {
                     inventory.insert(offset, len);
                 }
             }
         }
+        retired_present.sort_unstable();
+        super::file_retirement::check_retired_dirents(&root.cleanup_pending, &retired_present)?;
         if let (Some((&first, _)), Some((&last, _))) =
             (inventory.first_key_value(), inventory.last_key_value())
         {
             let mut offset = first;
             while offset < last {
-                if !inventory.contains_key(&offset) && root.retired.binary_search(&offset).is_err()
-                {
-                    return Err(StorageError::Invalid("unexplained missing WAL file"));
+                if !inventory.contains_key(&offset) {
+                    // A retired interval explains its whole span at once.
+                    offset = root
+                        .retired
+                        .skip_end(offset)
+                        .ok_or(StorageError::Invalid("unexplained missing WAL file"))?;
+                    continue;
                 }
                 offset = offset
                     .checked_add(expected.wal_file_bytes)
@@ -852,20 +896,42 @@ impl PartitionLog {
             }
             let last_file = sealed.physical_end.saturating_sub(1) / expected.wal_file_bytes
                 * expected.wal_file_bytes;
-            if root.retired.binary_search(&last_file).is_ok() {
+            if root.retired.contains(last_file) {
                 physical_end = sealed.physical_end;
             }
         }
         let (references, reference_writer) = ReferenceDirectory::open(expected)?;
         let wal = Wal::open_retained(&path, expected.layout(), metrics)?;
-        let retired = root
-            .retired
+        // Repeat the unlink of every pending dirent, then sync the directory
+        // even if none remained: an earlier unlink may not be durable yet.
+        // `cleanup_pending` stays in the root until target cleanup finishes.
+        let present = retired_present
             .iter()
-            .map(|offset| {
+            .map(|&(offset, _, _)| {
                 crate::wal::position::WalFileId::from_u64(offset / expected.wal_file_bytes)
             })
             .collect::<Vec<_>>();
-        wal.retire_files(&retired)?;
+        wal.retire_files(&present)?;
+        if !root.cleanup_pending.is_empty() {
+            File::open(&path)?.sync_all()?;
+        }
+        // What the repeated unlink found, for the R1 event stream: a present
+        // dirent is the pending inode (checked above) and was just unlinked.
+        let recovered_cleanup: Vec<_> = root
+            .cleanup_pending
+            .iter()
+            .map(|entry| {
+                let present = retired_present
+                    .iter()
+                    .any(|&(offset, _, _)| offset == entry.start);
+                let outcome = if present {
+                    super::UnlinkOutcome::Unlinked
+                } else {
+                    super::UnlinkOutcome::AlreadyAbsent
+                };
+                (*entry, outcome)
+            })
+            .collect();
         let mut log = Self {
             state: Mutex::new(State {
                 open_live_extent: None,
@@ -876,7 +942,7 @@ impl PartitionLog {
                 live_tail: None,
                 live_root_end: physical_end,
                 writer: None,
-                wal_root: Some(root.clone()),
+                wal_root: Some(Arc::new(root.clone())),
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
@@ -910,6 +976,11 @@ impl PartitionLog {
             #[cfg(test)]
             fail_wal_retire: AtomicBool::new(false),
             #[cfg(test)]
+            r1_crash: AtomicU8::new(0),
+            recovered_cleanup: Mutex::new(recovered_cleanup),
+            #[cfg(test)]
+            before_unlink: Mutex::new(None),
+            #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]
             fail_persist: AtomicBool::new(false),
@@ -937,10 +1008,7 @@ impl PartitionLog {
                 tail.offset < root.scan_from
                     || root
                         .retired
-                        .binary_search(
-                            &(tail.offset / expected.wal_file_bytes * expected.wal_file_bytes),
-                        )
-                        .is_ok()
+                        .contains(tail.offset / expected.wal_file_bytes * expected.wal_file_bytes)
             });
         let mut last_tail = None;
         let mut file = None;
@@ -958,10 +1026,8 @@ impl PartitionLog {
         // In both cases only present WAL files bound the uncheckpointed suffix.
         while cursor < scan_end.max(strict_end) {
             let file_start = cursor / expected.wal_file_bytes * expected.wal_file_bytes;
-            if root.retired.binary_search(&file_start).is_ok() {
-                cursor = file_start
-                    .checked_add(expected.wal_file_bytes)
-                    .ok_or(StorageError::Capacity)?;
+            if let Some(skip) = root.retired.skip_end(file_start) {
+                cursor = skip;
                 continue;
             }
             let fragment_end = (cursor / expected.fragment_bytes + 1) * expected.fragment_bytes;
@@ -1121,7 +1187,7 @@ impl PartitionLog {
         let mut probe = (cursor / expected.fragment_bytes + 1) * expected.fragment_bytes;
         while live && gap && !recovery_hole && probe < scan_end {
             let file_start = probe / expected.wal_file_bytes * expected.wal_file_bytes;
-            if root.retired.binary_search(&file_start).is_err() {
+            if !root.retired.contains(file_start) {
                 recovery_hole = log.probe_valid_frame(&mut file, probe)?;
             }
             probe = probe

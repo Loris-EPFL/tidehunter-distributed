@@ -163,7 +163,7 @@ fn close_notice_reaches_the_peer_before_tls_close_notify() {
     );
     let notice: Envelope<Response> = pair.session.decode(&plaintext[4..], 8192).unwrap();
     assert_eq!(notice.id, 0, "the notice uses the ID no request can have");
-    assert!(matches!(notice.body, Response::Error(message) if message == reason));
+    assert!(matches!(notice.body, Response::Error(message) if message.message == reason));
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn peer_close_is_clean_only_at_a_frame_boundary() {
         &Envelope {
             protocol: PROTOCOL,
             id: 1,
-            body: Response::Error("last reply".to_owned()),
+            body: Response::Error("last reply".into()),
         },
         8192,
     )
@@ -227,7 +227,7 @@ fn output_only_turn_preserves_buffered_unread_tls_plaintext() {
         &Envelope {
             protocol: PROTOCOL,
             id: 1,
-            body: Response::Error("buffered".to_owned()),
+            body: Response::Error("buffered".into()),
         },
         8192,
     )
@@ -267,7 +267,7 @@ fn recycled_plaintext_buffer_decodes_frames_without_stale_trailing_bytes() {
             &Envelope {
                 protocol: PROTOCOL,
                 id,
-                body: Response::Error(message.to_owned()),
+                body: Response::Error(message.into()),
             },
             8192,
         )
@@ -281,7 +281,7 @@ fn recycled_plaintext_buffer_decodes_frames_without_stale_trailing_bytes() {
     let envelope: Envelope<Response> = pair.session.decode(&received[..frame_len], 8192).unwrap();
     assert_eq!(envelope.protocol, PROTOCOL);
     assert_eq!(envelope.id, 1);
-    assert!(matches!(envelope.body, Response::Error(message) if message == large_message));
+    assert!(matches!(envelope.body, Response::Error(message) if message.message == large_message));
     pair.session.recycle_input(received);
 
     let small_message = "S".repeat(8);
@@ -297,14 +297,14 @@ fn recycled_plaintext_buffer_decodes_frames_without_stale_trailing_bytes() {
     let envelope: Envelope<Response> = pair.session.decode(&received[..frame_len], 8192).unwrap();
     assert_eq!(envelope.protocol, PROTOCOL);
     assert_eq!(envelope.id, 2);
-    assert!(matches!(envelope.body, Response::Error(message) if message == small_message));
+    assert!(matches!(envelope.body, Response::Error(message) if message.message == small_message));
     pair.session.recycle_input(received);
 
     let (received, frame_len) = pair.session.receive(8192).unwrap().unwrap();
     let envelope: Envelope<Response> = pair.session.decode(&received[..frame_len], 8192).unwrap();
     assert_eq!(envelope.protocol, PROTOCOL);
     assert_eq!(envelope.id, 3);
-    assert!(matches!(envelope.body, Response::Error(message) if message == medium_message));
+    assert!(matches!(envelope.body, Response::Error(message) if message.message == medium_message));
 }
 
 #[test]
@@ -867,7 +867,7 @@ fn ready_reply_deadline_and_retirement_follow_transport_fences() {
         );
         let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
         let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
-        assert!(matches!(reply.body, Response::Error(message) if message == "ready reply"));
+        assert!(matches!(reply.body, Response::Error(message) if message.message == "ready reply"));
         let mut wire = Wire {
             allowance: usize::MAX,
             ..Wire::default()

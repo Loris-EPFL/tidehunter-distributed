@@ -484,6 +484,37 @@ fn live_inline_deadline_releases_credit_only_after_retirement() {
     assert_eq!(case.snapshot(), before);
 }
 
+/// Native parity: time an inline read spends after admission and before its
+/// transport submission does not count against its I/O deadline.
+#[test]
+fn live_inline_pause_before_submission_does_not_spend_deadline() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    let timeout = Duration::from_millis(50);
+    case.db.core.reads.set_limits_for_test(None, Some(timeout));
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.core.reads.state.inline_pause.lock() = Some((entered, resume));
+    let reads = case.db.core.reads.clone();
+    let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
+    let pin = case.db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
+    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, Some(pin)));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    {
+        let registry = case.db.core.reads.state.flights.lock();
+        let (flight, _) = registry.find(node, &reference).unwrap();
+        assert_eq!(flight.io_deadline(), None, "not yet submitted");
+    }
+    thread::sleep(3 * timeout);
+    release.send(()).unwrap();
+    let values = producer.join().unwrap().unwrap().unwrap();
+    assert_eq!(values, vec![super::tests::put(0, 7)]);
+    assert!(!case.db.core.reads.failed());
+    assert_eq!(*case.db.core.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+}
+
 #[test]
 fn live_inline_eight_callers_share_one_lane_and_exact_flight() {
     let case = Case::new();

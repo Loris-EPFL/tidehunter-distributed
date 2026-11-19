@@ -1283,6 +1283,37 @@ impl IndexTable {
         self.retain(|_, v| v.offset >= last_processed);
     }
 
+    /// Turns every live entry with offset < `position` into a tombstone at its
+    /// own position. Existing tombstones and entries at or above `position`
+    /// stay. Returns whether any entry changed. Used over a deeper level,
+    /// where dropping the entry would expose an older version of its key.
+    pub fn tombstone_below_position(&mut self, position: u64) -> bool {
+        let tombstone = |iwp: IndexWalPosition| IndexWalPosition {
+            kind: IndexEntryKind::Removed,
+            ..iwp
+        };
+        let mut changed = false;
+        self.retain_flat(|_, iwp| {
+            if iwp.offset < position && !iwp.is_removed() {
+                changed = true;
+                Some(tombstone(iwp))
+            } else {
+                Some(iwp)
+            }
+        });
+        for positions in self.data.values_mut() {
+            let latest = *positions.last().expect("data positions are never empty");
+            if latest.offset < position && !latest.is_removed() {
+                *positions = smallvec![tombstone(latest)];
+                changed = true;
+            }
+        }
+        let (kb, dc) = self.recount_stats();
+        self.key_bytes = kb;
+        self.dirty_count = dc;
+        changed
+    }
+
     /// Compact index by retaining keys identified by the compactor.
     /// The compactor receives a double-ended iterator over all keys and returns keys to retain.
     ///
@@ -2406,6 +2437,28 @@ mod tests {
         assert!(index.get(&[2]).is_none()); // offset 200, removed
         assert_eq!(index.get(&[3]), Some(WalPosition::test_value(300))); // offset 300, kept
         assert_eq!(index.get(&[4]), Some(WalPosition::test_value(400))); // offset 400, kept
+    }
+
+    #[test]
+    fn test_tombstone_below_position() {
+        let mut index = IndexTable::default();
+        index.insert(vec![1].into(), WalPosition::test_value(100));
+        index.insert(vec![2].into(), WalPosition::test_value(200));
+        index.remove(vec![5].into(), WalPosition::test_value(150));
+        // Keys 1, 2 and the tombstone move to flat; keys 3, 4 and 6 go to data.
+        index.promote_to_flat_unconditionally(LastProcessed::new(250));
+        index.insert(vec![3].into(), WalPosition::test_value(300));
+        index.insert(vec![4].into(), WalPosition::test_value(400));
+        index.insert(vec![6].into(), WalPosition::test_value(210));
+
+        assert!(index.tombstone_below_position(250));
+        assert_eq!(index.len(), 6, "no key is dropped");
+        for key in [1, 2, 5, 6] {
+            assert_eq!(index.get(&[key]), Some(WalPosition::INVALID), "key {key}");
+        }
+        assert_eq!(index.get(&[3]), Some(WalPosition::test_value(300)));
+        assert_eq!(index.get(&[4]), Some(WalPosition::test_value(400)));
+        assert!(!index.tombstone_below_position(250), "already hidden");
     }
 
     #[test]

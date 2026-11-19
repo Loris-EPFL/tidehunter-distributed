@@ -406,6 +406,39 @@ impl Endpoint {
                 .is_some_and(Resources::supports_idle_wait)
     }
 
+    /// Whether setup granted a CQ wait fd (`verbs` opened with
+    /// [`Endpoint::open_idle_parking`] and accepted by the provider). A
+    /// capability query only; [`Endpoint::arm_wait_fd`] checks quiescence.
+    #[must_use]
+    pub fn has_wait_fd(&self) -> bool {
+        !self.failed
+            && self
+                .resources
+                .as_deref()
+                .is_some_and(Resources::has_wait_fd)
+    }
+
+    /// Arms the CQ wait fd for one caller-owned readiness wait that can also
+    /// include other descriptors. `Ok(Some(fd))`: `fi_trywait` succeeded on a
+    /// fully quiescent message endpoint; the caller may block in `poll(2)` until
+    /// `fd` is readable and must then progress normally. `Ok(None)`: work is
+    /// queued or the endpoint is not quiescent; progress without blocking. The fd
+    /// stays owned by the provider and valid while this endpoint lives.
+    /// # Errors
+    /// `Unsupported` without a wait fd; a fatal `fi_trywait` code poisons the
+    /// endpoint.
+    pub fn arm_wait_fd(&mut self) -> io::Result<Option<std::os::fd::RawFd>> {
+        self.ready()?;
+        if !self.has_wait_fd() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fabric endpoint has no completion queue wait fd",
+            ));
+        }
+        let result = self.inner().arm_wait_fd();
+        self.finish_try(result)
+    }
+
     /// Derived ordered-stream readiness; never polls, copies or posts.
     /// # Errors
     /// Fails if the endpoint is unbound or poisoned.

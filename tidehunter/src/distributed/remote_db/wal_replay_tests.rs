@@ -133,9 +133,8 @@ fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
     fail_stop_without_checkpoint(db);
     fixture.stop_owners();
     let file = fixture
-        .temp
-        .path()
-        .join("node-0/epoch_0000000000000001/wal_0000000000000000");
+        .owner_database_root(0)
+        .join("epoch_0000000000000001/wal_0000000000000000");
     fs::OpenOptions::new()
         .write(true)
         .open(file)
@@ -173,9 +172,8 @@ fn wal_replay_reopen_fails_when_owner_wal_content_ends_below_checkpoint_position
         .write(true)
         .open(
             fixture
-                .temp
-                .path()
-                .join("node-0/epoch_0000000000000001/wal_0000000000000000"),
+                .owner_database_root(0)
+                .join("epoch_0000000000000001/wal_0000000000000000"),
         )
         .unwrap();
     let len = file.metadata().unwrap().len();
@@ -250,9 +248,8 @@ fn wal_replay_retires_sealed_file_only_after_complete_image() {
     }
     db.flush_index().unwrap();
     let file = fixture
-        .temp
-        .path()
-        .join("node-0/epoch_0000000000000001/wal_0000000000000000");
+        .owner_database_root(0)
+        .join("epoch_0000000000000001/wal_0000000000000000");
     assert!(file.exists());
     fail_stop_without_checkpoint(db);
     let db = fixture.open();
@@ -393,9 +390,8 @@ fn wal_replay_native_owner_loss_beyond_durable_end_keeps_checkpoint() {
     fixture.stop_owners();
     // Simulate lost native-tier page-cache bytes, not a synchronous-tier loss.
     let path = fixture
-        .temp
-        .path()
-        .join("node-0/epoch_0000000000000001/wal_0000000000000000");
+        .owner_database_root(0)
+        .join("epoch_0000000000000001/wal_0000000000000000");
     let file = fs::OpenOptions::new().write(true).open(path).unwrap();
     file.write_all_at(&[0; 8], frame_end).unwrap();
     file.sync_all().unwrap();
@@ -431,7 +427,8 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         fail_stop_without_checkpoint(db);
         let mut manifest: AuthorityManifest = read_metadata(&path.join(MANIFEST)).unwrap();
         let commit = manifest.checkpoint.as_mut().unwrap();
-        let mut image: CheckpointImageV3 =
+        // The writer emits the callback-start wrapper (format 4).
+        let mut image: CheckpointImageV4 =
             read_checkpoint(&path.join(commit.metadata_name())).unwrap();
         if wrong_format {
             image.format = 2;
@@ -447,11 +444,11 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         commit.metadata_bytes = encoded.len() as u64;
         commit.metadata_digest = Blake2b::<U32>::digest(&encoded).into();
         install_metadata(&path, &commit.metadata_name(), &encoded).unwrap();
-        persist_manifest(&path, &manifest).unwrap();
+        persist_manifest(&path, &manifest, CoordinatorIoCategory::Open).unwrap();
         let error = reopen_result(&fixture).err().unwrap().to_string();
         assert!(
             error.contains(if wrong_format {
-                "checkpoint image format is not the WAL-replay format 3"
+                "checkpoint image format is not a WAL-replay format (3 or 4)"
             } else {
                 "sealed WAL ends below the required position"
             }),

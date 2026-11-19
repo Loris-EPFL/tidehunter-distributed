@@ -132,7 +132,9 @@ pub(crate) struct LiveReadToken(u64);
 /// Members of one logical read, in caller order.
 pub(crate) struct LiveReadRequest {
     pub(crate) references: Vec<ValueRecordReference>,
-    pub(crate) deadline: Instant,
+    /// Bound of each submitted flight and grant connect, counted from its own
+    /// start. Time a member waits for grant credit does not count.
+    pub(crate) timeout: Duration,
     pub(crate) trace: Option<ReadTraceChild>,
 }
 
@@ -390,7 +392,10 @@ struct Flight {
 
 struct InFlightRequest {
     references: Vec<ValueRecordReference>,
-    deadline: Instant,
+    timeout: Duration,
+    /// Deadline of the latest submitted flight; `None` while no flight is
+    /// outstanding.
+    io_deadline: Option<Instant>,
     trace: Option<ReadTraceChild>,
     slots: Vec<Slot>,
     output: Vec<Option<Mutation>>,
@@ -832,7 +837,8 @@ impl LiveReadCache {
         let members = request.references.len();
         let mut state = InFlightRequest {
             references: request.references,
-            deadline: request.deadline,
+            timeout: request.timeout,
+            io_deadline: None,
             trace: request.trace,
             slots: vec![Slot::Pending; members],
             output: (0..members).map(|_| None).collect(),
@@ -896,19 +902,19 @@ impl LiveReadCache {
 
     /// Blocks until a CQE is ready, a waker fires or `max` passes, whichever is
     /// first. It never spins: with nothing in flight it sleeps in `poll(2)`.
-    /// The timeout also stops at the nearest deadline or retry time of a
-    /// request that still has members to start. Pass a `max` of at most a
-    /// second: `LiveIo` expires overdue operations from its progress calls.
+    /// The timeout also stops at the nearest retry time of a request that
+    /// still has members to start. Pass a `max` of at most a second: `LiveIo`
+    /// expires overdue operations from its progress calls.
     /// EINTR is retried; any other `poll(2)` or eventfd failure is returned and
     /// means the lane cannot be trusted to wake: stop it.
     pub(crate) fn wait(&mut self, max: Duration) -> Result<LiveReadWait, TcpError> {
         let now = Instant::now();
         let mut timeout = max;
         for state in self.requests.values() {
-            if state.error.is_none() && state.pending > 0 {
-                let at = state
-                    .retry_at
-                    .map_or(state.deadline, |retry| retry.min(state.deadline));
+            if state.error.is_none()
+                && state.pending > 0
+                && let Some(at) = state.retry_at
+            {
                 timeout = timeout.min(at.saturating_duration_since(now));
             }
         }
@@ -1054,11 +1060,9 @@ impl LiveReadCache {
             return;
         }
         state.retry_at = None;
-        let failure = if now >= state.deadline {
-            Some(TcpError::new("live read deadline expired"))
-        } else {
-            self.admit(client, epoch, token, state).err()
-        };
+        // Parked members never expire: each flight's deadline starts at its
+        // submission (`submit_group`), as a native read waits for the disk.
+        let failure = self.admit(client, epoch, token, state).err();
         if let Some(error) = failure {
             state.fail(error);
             self.cancel_flights(token);
@@ -1184,7 +1188,7 @@ impl LiveReadCache {
             return Err(TcpError::new("missing live location"));
         };
         let since = *state.connect_since.get_or_insert_with(Instant::now);
-        let connect_deadline = state.deadline.min(since + connect_timeout);
+        let connect_deadline = since + connect_timeout.min(state.timeout);
         let id = self.next_grant;
         match Self::connect_grant(client, epoch, location, pin, id, connect_deadline) {
             Ok(mut grant) => {
@@ -1258,7 +1262,7 @@ impl LiveReadCache {
             file,
         );
         let since = *state.connect_since.get_or_insert_with(Instant::now);
-        let deadline = state.deadline.min(since + connect_timeout);
+        let deadline = since + connect_timeout.min(state.timeout);
         if let Some(index) = self
             .grants
             .iter()
@@ -1634,7 +1638,7 @@ impl LiveReadCache {
             return Ok(Group::Blocked);
         }
         let flight = self.next_flight;
-        let deadline = state.deadline.min(Instant::now() + io_timeout);
+        let deadline = Instant::now() + io_timeout.min(state.timeout);
         let slot = grant.scope.slot(&state.references[selected[0]]);
         let submitted = match slot {
             Some(slot) => {
@@ -1666,6 +1670,7 @@ impl LiveReadCache {
         }
         state.flights += 1;
         state.submitted_at.get_or_insert_with(Instant::now);
+        state.io_deadline = Some(deadline);
         self.flights.insert(
             flight,
             Flight {
@@ -1699,8 +1704,15 @@ impl LiveReadCache {
         state.flights -= 1;
         if state.flights == 0 {
             self.active_requests -= 1;
+            state.io_deadline = None;
         }
         Some(state)
+    }
+
+    /// Deadline of the latest flight `token` has outstanding; `None` while
+    /// none is outstanding or the request is gone.
+    pub(crate) fn io_deadline(&self, token: LiveReadToken) -> Option<Instant> {
+        self.requests.get(&token)?.io_deadline
     }
 
     fn complete_flight(
@@ -1882,7 +1894,7 @@ impl Client {
     ) -> Result<Vec<Mutation>, TcpError> {
         let request = LiveReadRequest {
             references: references.to_vec(),
-            deadline,
+            timeout: deadline.saturating_duration_since(Instant::now()),
             trace: trace.cloned(),
         };
         let token = match cache.submit(self, epoch, request) {
@@ -2770,7 +2782,8 @@ pub(crate) mod tests {
         assert_eq!(after.namespace_connects, before.namespace_connects);
         let mut state = InFlightRequest {
             references: vec![a],
-            deadline: Instant::now() + Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            io_deadline: None,
             trace: None,
             slots: vec![Slot::Pending],
             output: vec![None],
@@ -2877,7 +2890,7 @@ pub(crate) mod tests {
         fn submit(&mut self, references: Vec<ValueRecordReference>) -> LiveReadToken {
             let request = LiveReadRequest {
                 references,
-                deadline: Instant::now() + Duration::from_secs(10),
+                timeout: Duration::from_secs(10),
                 trace: None,
             };
             match self.cache.submit(&mut self.client, 1, request) {
@@ -3054,7 +3067,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn lane_rejects_when_full_and_fails_an_expired_deadline() {
+    fn lane_rejects_when_full() {
         let mut lane = lane(4);
         let a = lane.a;
         for _ in 0..4 {
@@ -3062,7 +3075,7 @@ pub(crate) mod tests {
         }
         let request = LiveReadRequest {
             references: vec![a],
-            deadline: Instant::now() + Duration::from_secs(10),
+            timeout: Duration::from_secs(10),
             trace: None,
         };
         match lane.cache.submit(&mut lane.client, 1, request) {
@@ -3070,25 +3083,35 @@ pub(crate) mod tests {
             _ => panic!("a full lane must hand the request back"),
         }
         lane.collect(4);
-        let expired = LiveReadRequest {
+        assert_eq!(lane.cache.grants[0].io.outstanding(), 0);
+    }
+
+    /// Native parity: a member that waits for grant credit longer than its
+    /// timeout does not expire; its I/O deadline starts at device submission.
+    #[test]
+    fn parked_member_waits_for_grant_credit_longer_than_its_timeout() {
+        // One queue slot: the first request's flight holds the grant credit.
+        let mut lane = lane(1);
+        let a = lane.a;
+        let first = lane.submit(vec![a]);
+        let timeout = Duration::from_millis(50);
+        let request = LiveReadRequest {
             references: vec![a],
-            deadline: Instant::now(),
+            timeout,
             trace: None,
         };
-        let Ok(token) = lane.cache.submit(&mut lane.client, 1, expired) else {
-            panic!("admission failure is reported through poll")
+        let Ok(parked) = lane.cache.submit(&mut lane.client, 1, request) else {
+            panic!("lane rejected the request")
         };
-        let done = lane.collect(1);
-        assert_eq!(done[0].token, token);
-        assert!(
-            done[0]
-                .result
-                .as_ref()
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("deadline")
-        );
+        assert_eq!(lane.cache.requests[&parked].pending, 1);
+        assert!(lane.cache.io_deadline(first).is_some());
+        assert_eq!(lane.cache.io_deadline(parked), None);
+        std::thread::sleep(3 * timeout);
+        let done = lane.collect(2);
+        let one = lane.first.mutations()[0].clone();
+        for finished in &done {
+            assert_eq!(finished.result.as_ref().unwrap(), &vec![one.clone()]);
+        }
         assert_eq!(lane.cache.grants[0].io.outstanding(), 0);
     }
 

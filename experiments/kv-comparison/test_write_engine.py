@@ -281,22 +281,34 @@ class WriteEngineTests(unittest.TestCase):
 
     def test_replay_owner_preparation_uses_pinned_domain(self):
         job = next(j for j in campaign.make_focused_matrix(SELECTION) if j["case_kind"] == "mainnet_replay")
-        with tempfile.TemporaryDirectory() as tmp:
-            instance = SimpleNamespace(config={"fleet": {"data_root": tmp, "nodes": [
-                {"index": i, "address": f"10.0.0.{i + 1}", "rdma_address": f"10.1.0.{i + 1}"} for i in range(2)],
-                "server_cpus": 16, "server_memory_mib": 16384}, "binary": "/bin/kv-research"}, remaining=lambda: 100)
-            with patch.object(controller, "platform_module", return_value=None), \
-                 patch.object(controller, "live_nvme_preparation", return_value={}), \
-                 patch.object(controller, "environment", return_value={}), \
-                 patch.object(controller, "command", side_effect=RuntimeError("captured typed preparation")):
-                with self.assertRaisesRegex(RuntimeError, "captured typed preparation"):
-                    controller.Controller.prepare_tide(instance, job, Path(tmp))
-            prep = json.loads((Path(tmp) / "prepare-input.json").read_text())
-            self.assertEqual(len(prep["addresses"]), 2)
-            self.assertEqual(prep["replay_node_db_id"], 0)
-            self.assertEqual(len(prep["database"]), 16)
-            self.assertEqual(prep["batch_limits"], {"max_operations": 519, "max_encoded_bytes": 500000})
-            self.assertEqual(prep["durability_tier"], job["durability_tier"])
+        # Current coordinators provision the database identity; only a sealed
+        # archive binary still takes the configured one.
+        for seal in (None, {"sha256": "0" * 64}):
+            with self.subTest(archive=seal is not None), tempfile.TemporaryDirectory() as tmp:
+                instance = SimpleNamespace(config={"fleet": {"data_root": tmp, "nodes": [
+                    {"index": i, "address": f"10.0.0.{i + 1}", "rdma_address": f"10.1.0.{i + 1}"} for i in range(2)],
+                    "server_cpus": 16, "server_memory_mib": 16384}, "binary": "/bin/kv-research"},
+                    remaining=lambda: 100)
+                with patch.object(controller, "platform_module", return_value=None), \
+                     patch.object(controller, "resolve_case_binary", return_value=(Path("/bin/kv-research"), seal)), \
+                     patch.object(controller, "live_nvme_preparation", return_value={"service": 4420, "port_id": 1000}), \
+                     patch.object(controller, "environment", return_value={}), \
+                     patch.object(controller, "command", side_effect=RuntimeError("captured typed preparation")):
+                    with self.assertRaisesRegex(RuntimeError, "captured typed preparation"):
+                        controller.Controller.prepare_tide(instance, job, Path(tmp))
+                prep = json.loads((Path(tmp) / "prepare-input.json").read_text())
+                self.assertEqual(len(prep["addresses"]), 2)
+                self.assertEqual(prep["replay_node_db_id"], 0)
+                if seal is None:
+                    self.assertNotIn("database", prep)
+                    self.assertNotIn("commissioning_service", prep["live_nvmeof"])
+                else:
+                    self.assertEqual(prep["database"], list(hashlib.blake2b(
+                        job["case_id"].encode(), digest_size=16).digest()))
+                    self.assertEqual((prep["live_nvmeof"]["commissioning_service"],
+                                      prep["live_nvmeof"]["commissioning_port_id"]), (4421, 1001))
+                self.assertEqual(prep["batch_limits"], {"max_operations": 519, "max_encoded_bytes": 500000})
+                self.assertEqual(prep["durability_tier"], job["durability_tier"])
 
     def test_prepared_owner_launch_validates_for_both_arms(self):
         # Whatever the prepared launch carries (the preparer's explicit false, true, or

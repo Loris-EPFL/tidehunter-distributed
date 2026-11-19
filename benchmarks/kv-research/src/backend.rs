@@ -276,6 +276,28 @@ pub trait KvBackend: Send + Sync + 'static {
         async { Err(unsupported("measurement-phase read profiling")) }
     }
 
+    /// Coordinator databases for Exact checkpoint attribution (Tidehunter).
+    fn index_checkpoint_targets(
+        &self,
+    ) -> BackendResult<Vec<crate::index_checkpoint::IndexCheckpointTarget>> {
+        Err(unsupported("index checkpoint diagnostics"))
+    }
+
+    /// A1 index-fixture run state for the per-put runner hooks; `None` for
+    /// every backend and route except the Tidehunter leased fixture.
+    fn index_fixture(&self) -> Option<&crate::index_a1::FixtureRun> {
+        None
+    }
+
+    /// End an A1 index-fixture stage after post-workload qualification and
+    /// before shutdown; returns the stage evidence.
+    fn finish_index_fixture(
+        &self,
+        _finish: &crate::index_a1::FixtureFinish,
+    ) -> BackendResult<serde_json::Value> {
+        Err(unsupported("A1 index fixture"))
+    }
+
     /// Arm bounded write diagnostics at the measurement boundary.
     fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {
         if limit == 0 {

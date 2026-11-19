@@ -1885,12 +1885,14 @@ name = "kv-research"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "crc32fast",
  "foundationdb",
  "libc",
  "prometheus 0.14.0",
  "rand 0.8.5",
  "redis",
  "reqwest",
+ "ring",
  "rocksdb",
  "rustls 0.23.31",
  "rustls-pemfile 2.2.0",

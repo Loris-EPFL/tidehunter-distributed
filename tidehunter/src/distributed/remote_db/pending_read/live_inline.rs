@@ -68,7 +68,6 @@ impl ReadService {
         pin: Option<IndexReadPin>,
         trace: Option<&ReadTraceChild>,
     ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
-        let deadline = Instant::now() + self.timeout();
         let bytes = self
             .plan_member(reference)?
             .charge
@@ -213,6 +212,8 @@ impl ReadService {
             references: vec![*reference],
             slot,
             completion: FlightCompletion::new(),
+            // Set at submission below: admission locks and pauses do not count.
+            io_deadline: Mutex::new(None),
             _pin: pin,
             _credit: credit,
         });
@@ -242,6 +243,9 @@ impl ReadService {
         let _poison = PoisonOnPanic(&self.state);
         let sampled = self.state.diagnostics.select();
         let started = sampled.then(Instant::now);
+        // The I/O deadline starts at transport submission, as for queued reads.
+        let deadline = Instant::now() + self.timeout();
+        *flight.io_deadline.lock() = Some(deadline);
         let result = cache
             .read_inline_cached(&client, reference, deadline, trace)
             .map_err(|error| {

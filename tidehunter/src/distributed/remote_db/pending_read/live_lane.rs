@@ -7,8 +7,9 @@
 //! Input: a bounded `sync_channel` of `max_requests`; every entry holds a
 //! global flight credit. The actor uses `try_send` and bounded overflow.
 //! Exit: however the worker stops, it closes its inbox and completes every
-//! request it holds or that is still in the channel, so no caller waits for
-//! its deadline (`LaneInbox::close`).
+//! request it holds or that is still in the channel, so no caller is left
+//! waiting for it (`LaneInbox::close`). Only submitted device I/O has a
+//! deadline; time in the inbox or parked for grant credit never expires.
 //!
 //! Requests are admitted in arrival order while the cache has room, finish in
 //! any order, and each caller reads its own result slot, so per-caller result
@@ -24,7 +25,7 @@ use std::sync::OnceLock;
 
 /// Idle time after which cached file grants are released.
 const IDLE_GRANT_RELEASE: Duration = Duration::from_secs(1);
-/// Longest sleep with requests in flight; the cache also stops at deadlines.
+/// Longest sleep with requests in flight; the cache also stops at retry times.
 const MAX_POLL_WAIT: Duration = Duration::from_secs(1);
 
 /// The waker the actor uses after queueing a request on this lane.
@@ -238,24 +239,16 @@ pub(super) fn run(
             }
         }
         let mut client = lane.client.lock();
-        while let Some(request) = inbox.waiting.pop_front() {
-            if state.failed.load(Ordering::Acquire) || Instant::now() >= request.deadline {
-                // An expired request poisons the authority, as on the transport lanes.
-                let expired = !state.failed.load(Ordering::Acquire);
-                if expired {
-                    state.poison();
-                }
-                request.complete_nvme(Err(LocalDbError::new(if expired {
-                    "remote read admission deadline expired"
-                } else {
-                    "read authority is poisoned"
-                })));
+        while let Some(mut request) = inbox.waiting.pop_front() {
+            // Time spent in the inbox is not I/O time and never expires a
+            // request: the cache bounds each member from its device submission.
+            if state.failed.load(Ordering::Acquire) {
+                request.complete_nvme(Err(LocalDbError::new("read authority is poisoned")));
                 continue;
             }
-            let mut request = request;
             let live = LiveReadRequest {
                 references: std::mem::take(&mut request.references),
-                deadline: request.deadline,
+                timeout: request.timeout,
                 trace: request.trace.clone(),
             };
             match cache.submit(&mut client, epoch, live) {
@@ -304,6 +297,11 @@ pub(super) fn run(
             break 'lane;
         }
         let delivered = inbox.deliver();
+        // Callers time out against the device I/O each request has
+        // outstanding, not against time its members wait for grant credit.
+        for (token, request) in &mut inbox.flying {
+            request.set_io_deadline(cache.io_deadline(*token));
+        }
         if cache.in_flight() == 0 {
             driver.live_cache = Some(cache);
             drop(driver);

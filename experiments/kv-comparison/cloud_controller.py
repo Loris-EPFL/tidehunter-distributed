@@ -1852,12 +1852,31 @@ def live_nvme_preparation(config, case, transport):
     if type(requests) is not int or not 1 <= requests <= 1024:
         raise SafetyError("live_max_inflight_requests must be an integer in 1..1024")
     field = "rdma_address" if platform_module(config) and transport == "rdma" else "address"
+    # Owner-host pool bases: one database per owner, so owner `p` serves
+    # service/port_id + 2p and commissions on the next value (kv-research
+    # `owner_target_pool`). Archive binaries also take explicit commissioning
+    # bases (`archive_live_preparation`).
     return {"addresses": [host[field] for host in logical_owner_hosts(config, job)],
             "transport": transport, "service": 4420, "port_id": 1000,
-            "commissioning_service": 4421, "commissioning_port_id": 1001,
             "max_inflight_requests": requests,
             "max_inflight_bytes": min(1024**3, requests * 512 * 1024),
             "leased_write_window": None, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}
+
+
+def archive_live_preparation(prep):
+    """The single-database archive binary's input also names its commissioning bases."""
+    return dict(prep, commissioning_service=prep["service"] + 1, commissioning_port_id=prep["port_id"] + 1)
+
+
+def live_target_pool_for_owner(config, case, index, transport):
+    """The exact target slot pool an owner host launch must carry (one database per owner)."""
+    prep = live_nvme_preparation(config, case, transport)
+    offset = 2 * index
+    return {"address": prep["addresses"][index], "transport": transport,
+            "public_port_base": prep["port_id"] + offset,
+            "public_service_base": prep["service"] + offset,
+            "commissioning_port_base": prep["port_id"] + offset + 1,
+            "commissioning_service_base": prep["service"] + offset + 1}
 
 
 def live_host_identity(host_nqn):
@@ -1911,7 +1930,8 @@ def admit_prepared_live_client(live_client, prep, tier):
 
 
 def live_target_for_owner(config, case, index, transport, host_nqn, target="kernel", export_mode="on_demand"):
-    prep = live_nvme_preparation(config, case, transport)
+    """The exact `live_target` of an archive single-database owner launch."""
+    prep = archive_live_preparation(live_nvme_preparation(config, case, transport))
     live_host_identity(host_nqn)
     offset = 2 * index
     result = {"address": prep["addresses"][index], "service": prep["service"] + offset,
@@ -1940,7 +1960,7 @@ def case_owner_wal_prewrite(job):
 
 def bind_owner_wal_prewrite(job, launch):
     """Write the case's choice as an explicit boolean: owners read an absent key as on."""
-    launch["node"]["wal_prewrite"] = case_owner_wal_prewrite(job)
+    cloud_campaign.owner_launch_config(launch)["wal_prewrite"] = case_owner_wal_prewrite(job)
 
 
 def load_owner_launch(job, launch_path):
@@ -1961,15 +1981,24 @@ def validate_launch(config, launch, case, index, polling=None):
         if launch.get(field) != str(path):
             raise SafetyError("typed launch marker escapes exact case/node")
         guarded(path, root)
-    if launch.get("node", {}).get("root") != str(node / "storage"):
+    owner = cloud_campaign.owner_launch_config(launch)
+    if owner.get("root") != str(node / "storage"):
         raise SafetyError("typed database root escapes exact case/node")
     guarded(node / "storage", root)
     job = case_owner_job(config, case)
-    actual_prewrite = launch.get("node", {}).get("wal_prewrite")
+    actual_prewrite = owner.get("wal_prewrite")
     if type(actual_prewrite) is not bool:
         raise SafetyError("owner launch must carry an explicit boolean wal_prewrite")
     if "owner_wal_prewrite" in job and actual_prewrite != case_owner_wal_prewrite(job):
         raise SafetyError("owner wal_prewrite differs from the exact reviewed case")
+    if "host" in launch:
+        # Owner host: no partition template, shape or target; the coordinator
+        # provisions them. One database per owner, slot pool from the campaign.
+        pool = owner.get("live_target_pool")
+        if (launch.get("partition") != index or owner.get("max_databases") != 1
+                or "live_target" in owner or "partition" in owner or not isinstance(pool, dict)
+                or pool != live_target_pool_for_owner(config, case, index, pool.get("transport"))):
+            raise SafetyError("owner host launch differs from exact owner campaign configuration")
     live_target = launch.get("node", {}).get("live_target")
     if live_target is not None:
         if not isinstance(live_target, dict):
@@ -2133,7 +2162,7 @@ def live_case_observation(config, case, index, launch, boundary, expected):
     truncated = False
     if index >= 0:
         import cold_device_trace
-        root = Path(launch["node"]["root"])
+        root = Path(cloud_campaign.owner_launch_config(launch)["root"])
         pending = [(root, 0)]
         examined = 0
         while pending and examined < 1024 and len(images) < 256:
@@ -2174,19 +2203,38 @@ def live_case_observation(config, case, index, launch, boundary, expected):
                     continue
                 path = Path("/sys/class/nvme") / entry.name
                 attrs = {key: module._attribute(path / key) for key in
-                         ("subsysnqn", "hostnqn", "transport", "address")}
+                         ("subsysnqn", "hostnqn", "hostid", "transport", "address")}
                 if not all(value.get("available") for value in attrs.values()):
                     continue
                 address = dict(part.split("=", 1) for part in attrs["address"]["value"].split(",") if "=" in part)
-                candidates = expected.get("owners", {}).values() or [
-                    {"host_nqn": expected["host_nqn"], "address": address, "service": expected["service"]}
-                    for address in expected["addresses"]]
-                if (attrs["subsysnqn"]["value"].startswith("nqn.2026-01.local.tidehunter:live-")
-                        and attrs["transport"]["value"] == expected["transport"]
-                        and any(attrs["hostnqn"]["value"] == owner["host_nqn"]
-                                and address.get("traddr") == owner["address"]
-                                and address.get("trsvcid") == str(owner["service"]) for owner in candidates)):
+                candidates = expected.get("owners") or {
+                    str(i): {"host_nqn": expected["host_nqn"], "address": addr,
+                             "service": expected["service"]}
+                    for i, addr in enumerate(expected["addresses"])}
+                if attrs["transport"]["value"] != expected["transport"]:
+                    continue
+                subsystem, host_nqn = (attrs[key]["value"] for key in ("subsysnqn", "hostnqn"))
+                for partition, owner in candidates.items():
+                    if address.get("traddr") != owner["address"] or address.get("trsvcid") != str(owner["service"]):
+                        continue
+                    if expected.get("identity_scope") == "database":
+                        # The DB may not have opened at begin; scope diagnostics to a
+                        # correctly derived identity at this exact slot and endpoint.
+                        scoped = cloud_campaign.LIVE_HOST_SCOPE.fullmatch(host_nqn)
+                        if scoped is None:
+                            continue
+                        try:
+                            effective = cloud_campaign.effective_live_owner(owner, scoped[2], int(partition))
+                        except ValueError:
+                            continue
+                        if (host_nqn != effective["host_nqn"]
+                                or attrs["hostid"]["value"] != str(uuid.UUID(bytes=bytes(effective["host_id"])))
+                                or not cloud_campaign.scoped_live_subsystem(subsystem, effective["subsystem_scope"])):
+                            continue
+                    elif host_nqn != owner["host_nqn"] or not subsystem.startswith("nqn.2026-01.local.tidehunter:live-"):
+                        continue
                     controllers.append(entry.name)
+                    break
             controllers.sort()
         except OSError as exc:
             errors.append((type(exc).__name__ + ": " + str(exc))[:300])
@@ -2960,7 +3008,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
         import yaml
         launch = yaml.safe_load((capsule_root / "launch.yaml").read_text())
         validate_launch(config, launch, case, index)
-        if not (launch["node"].get("live_target") or {}).get("spdk"):
+        if not (launch.get("node", {}).get("live_target") or {}).get("spdk"):
             raise SafetyError("live SPDK snapshot requires the exact SPDK owner")
         script = Path(config["repository_root"]) / "experiments/nvmeof/live_spdk_daemon.py"
         target = json.loads(command([sys.executable, "-B", script, "observe", "--state",
@@ -2996,10 +3044,13 @@ def guest_operation(config, request, clients, *, local_mode=None):
         if action == "live_case_snapshot":
             if not admitted_live_campaign(config, case):
                 raise SafetyError("live boundary observation requires live campaign")
-            if index >= 0 and launch["node"].get("live_target") is None:
+            if index >= 0 and not cloud_campaign.owner_launch_live(launch):
                 raise SafetyError("live boundary requires exact live owner")
             expected = request.get("expected")
-            if not isinstance(expected, dict) or set(expected) not in ({"host_nqn", "transport"}, {"host_nqn", "transport", "owners"}):
+            legacy = {"host_nqn", "transport"}
+            scoped = legacy | {"owners", "identity_scope"}
+            if (not isinstance(expected, dict) or set(expected) not in (legacy, legacy | {"owners"}, scoped)
+                    or "identity_scope" in expected and expected["identity_scope"] != "database"):
                 raise SafetyError("exact live initiator identity and transport required")
             live_host_identity(expected["host_nqn"])
             if expected["transport"] not in ("tcp", "rdma"):
@@ -3018,7 +3069,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
             result["journal"] = bounded_owner_journal(name)
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             result["journal"] = {"available": False, "reason": (type(exc).__name__ + ": " + str(exc))[:300]}
-        if (launch["node"].get("live_target") or {}).get("spdk") is not None:
+        if (launch.get("node", {}).get("live_target") or {}).get("spdk") is not None:
             try:
                 import nvme_campaign_owner
                 state = nvme_campaign_owner._read_json(capsule_root / "live-spdk-daemon/state.json")
@@ -3056,7 +3107,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
         import yaml
         launch = yaml.safe_load((capsule_root / "launch.yaml").read_text())
         validate_launch(config, launch, case, index)
-        wal_root = guarded(launch["node"]["root"], capsule_root, must_exist=True)
+        wal_root = guarded(cloud_campaign.owner_launch_config(launch)["root"], capsule_root, must_exist=True)
         trace_id = request.get("trace_id", case)
         if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", trace_id):
             raise SafetyError("invalid exact trace identity")
@@ -3094,10 +3145,12 @@ def guest_operation(config, request, clients, *, local_mode=None):
         validate_launch(config, launch, case, index)
         before_wal = (owner_case_device_snapshot(capsule_root, index)
                       if config["spec"].get("selection") == cloud_campaign.REDRAIN_AB_SELECTION else None)
-        if launch["node"].get("live_target") is not None:
-            live_state = guarded(launch["node"]["live_target"]["state_dir"], capsule_root)
+        # An owner host creates each database's target state below its root.
+        archive_target = launch.get("node", {}).get("live_target")
+        if archive_target is not None:
+            live_state = guarded(archive_target["state_dir"], capsule_root)
             live_state.mkdir(mode=0o700, exist_ok=False)
-        live_spdk = (launch["node"].get("live_target") or {}).get("spdk")
+        live_spdk = (archive_target or {}).get("spdk")
         daemon = None
         if live_spdk is not None:
             script = Path(config["repository_root"]) / "experiments/nvmeof/live_spdk_daemon.py"
@@ -3136,7 +3189,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
                                              "observed": unit_status(shared_slice)}
                 if daemon is not None:
                     result["live_spdk_daemon"] = daemon
-                if launch["node"].get("live_target") is not None:
+                if cloud_campaign.owner_launch_live(launch):
                     import nvme_campaign_owner
                     result["live_owner_identity"] = nvme_campaign_owner.capture_live_owner_identity(
                         capsule_root, capsule_root / "launch.yaml", status)
@@ -3175,14 +3228,14 @@ def guest_operation(config, request, clients, *, local_mode=None):
         if request.get("owner_trace"):
             owner_path = (capsule_root / "launch.yaml").with_suffix(".owner-events.json")
             result["owner_events"] = json.loads(guarded(owner_path, guest_root, must_exist=True).read_text())
-        if launch["node"].get("live_target") is not None:
+        if cloud_campaign.owner_launch_live(launch):
             import nvme_campaign_owner
             try:
                 result["live_target_shutdown"] = nvme_campaign_owner.admit_live_shutdown(
                     capsule_root, capsule_root / "launch.yaml", launch, index, stopped)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 raise InfrastructureError("live target shutdown unconfirmed; owner database retained: " + str(exc)) from exc
-        if (launch["node"].get("live_target") or {}).get("spdk") is not None:
+        if (launch.get("node", {}).get("live_target") or {}).get("spdk") is not None:
             if request.get("initiator_drained") is not True:
                 raise InfrastructureError("live SPDK initiator drain unconfirmed; owner and daemon retained")
             script = Path(config["repository_root"]) / "experiments/nvmeof/live_spdk_daemon.py"
@@ -3190,7 +3243,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
                 "--state", capsule_root / "live-spdk-daemon", "--owner-proof",
                 (capsule_root / "launch.yaml").with_suffix(".live-target-shutdown.json"),
                 "--initiator-drained"], timeout=45))
-        database = guarded(launch["node"]["root"], capsule_root, must_exist=True)
+        database = guarded(cloud_campaign.owner_launch_config(launch)["root"], capsule_root, must_exist=True)
         shutil.rmtree(database)
         result["database_removed"] = str(database)
         if config["spec"].get("selection") == cloud_campaign.REDRAIN_AB_SELECTION:
@@ -3771,6 +3824,7 @@ class Controller:
         storage_batches = (planned_write_batches_per_partition(job)
                            if job.get("selection") in ("nvmeof_f7_highmem32", *cloud_campaign.M3_SELECTIONS)
                            else job["keys"] + job["warmup_operations"] + job["measurement_operations"])
+        executable, binary_seal = resolve_case_binary(self.config, job)
         owner_hosts = logical_owner_hosts(self.config, job)
         prep = {"guest_root": guest_root, "addresses": [h["address"] + ":" + str(9400 + (i if job.get("owner_topology") else 0)) for i, h in enumerate(owner_hosts)],
                 "transport": owner_control_settings(job)["owner_transport"],
@@ -3785,10 +3839,11 @@ class Controller:
         prep["durability_tier"] = tier
         if job.get("case_kind") == "mainnet_replay":
             prep.update(replay_node_db_id=0,
-                        database=list(hashlib.blake2b(case.encode(), digest_size=16).digest()),
                         batch_limits={"max_operations": 519, "max_encoded_bytes": 500000})
+            if binary_seal is not None:
+                # Archive binaries configure the identity; current coordinators provision it.
+                prep["database"] = list(hashlib.blake2b(case.encode(), digest_size=16).digest())
         receipts, nonces = {}, {}
-        executable, binary_seal = resolve_case_binary(self.config, job)
         if job.get("nvmeof_route") == "live":
             live_transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}.get(job["backend"])
             prep["live_nvmeof"] = live_nvme_preparation(self.config, case, live_transport)
@@ -3812,6 +3867,7 @@ class Controller:
                 prep.update(owner_read_resident_first=job.get("owner_read_resident_first", False),
                             owner_read_memory_allowance_bytes=allowance)
                 prep["history_persistence"] = "wal_replay"
+                prep["live_nvmeof"] = archive_live_preparation(prep["live_nvmeof"])
                 prep["live_nvmeof"].update(write_mode="leased", export_mode="per_owner")
         if "live_pin_read_lanes" in job:
             prep["pin_read_lanes"] = job["live_pin_read_lanes"]
@@ -3837,8 +3893,12 @@ class Controller:
                 raise SafetyError("invalid owner WAL file size override")
             geometry = (geometry[0], size)
         for index in range(owner_count):
-            launch = yaml.safe_load((prepared / f"node-{index}" / "launch.yaml").read_text())
-            partition = (launch or {}).get("node", {}).get("partition", {})
+            launch = yaml.safe_load((prepared / f"node-{index}" / "launch.yaml").read_text()) or {}
+            if "host" in launch:
+                # Owner hosts receive the geometry in each provision request;
+                # the coordinator check below covers it.
+                continue
+            partition = launch.get("node", {}).get("partition", {})
             if geometry is None or (partition.get("fragment_bytes"), partition.get("wal_file_bytes")) != geometry:
                 raise SafetyError("prepared owner WAL geometry differs from the planned case")
         self.active_tide = (job, directory, [])
@@ -3870,14 +3930,18 @@ class Controller:
             launch_path = prepared / f"node-{index}" / "launch.yaml"
             launch = load_owner_launch(job, launch_path)
             validate_launch(self.config, launch, case, index, polling)
-            if job.get("nvmeof_route") == "live":
+            if job.get("nvmeof_route") == "live" and "host" in launch:
+                if (launch["host"].get("live_target_pool")
+                        != live_target_pool_for_owner(self.config, case, index, live_transport)):
+                    raise SafetyError("prepared live target pool is missing or differs from selected transport")
+            elif job.get("nvmeof_route") == "live":
                 selected = launch.get("node", {}).get("live_target") or {}
                 if selected != live_target_for_owner(
                         self.config, case, index, live_transport,
                         owner_identities.get(str(index), {}).get("host_nqn", host_nqn), job.get("nvmeof_target", "kernel"),
                         "per_owner"):
                     raise SafetyError("prepared live target is missing or differs from selected transport")
-            elif launch.get("node", {}).get("live_target") is not None:
+            elif "host" in launch or launch.get("node", {}).get("live_target") is not None:
                 raise SafetyError("unexpected live target in non-live campaign case")
             launch["launch_nonce"] = nonces[index] = secrets.token_hex(16)
             launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
@@ -3954,7 +4018,6 @@ class Controller:
         config = cloud_campaign.make_owner_admission_config(config, job["owner_count"])
         remote = config["backend"]["options"]["external_remote_config"]
         identities = remote["live_nvme"]["owner_identities"]
-        expected_nqns = {identities[str(index)]["host_nqn"] for index in range(job["owner_count"])}
         keys = 16 * job["owner_count"]
         dump(cell / "config.json", config)
         began = self.clock()
@@ -3967,9 +4030,26 @@ class Controller:
             cloud_campaign.admit_redrain_arm(job, summary.get("backend"))
         except (KeyError, TypeError, ValueError) as exc:
             raise SafetyError("owner admission did not confirm its reviewed redrain arm") from exc
+        database = cloud_campaign.backend_live_database(summary.get("backend"))
+        try:
+            admitted = (identities if binary_seal is not None else
+                        {str(i): cloud_campaign.effective_live_owner(identities[str(i)], database, i)
+                         for i in range(job["owner_count"])})
+        except (KeyError, ValueError) as exc:
+            raise SafetyError("owner admission lacks a valid database-scoped initiator identity") from exc
+        expected_by_nqn = {owner["host_nqn"]: owner for owner in admitted.values()}
+        expected_nqns = set(expected_by_nqn)
         evidence = json.loads((cell / "result/measurement-read-evidence.json").read_text())
         live = (evidence.get("end") or {}).get("live_nvmeof") or {}
         routes = live.get("routes", [])
+        if binary_seal is None:
+            for route in routes:
+                owner = expected_by_nqn.get(route.get("host_nqn")) if isinstance(route, dict) else None
+                ns = route.get("namespace_identity") if owner else None
+                if (not isinstance(ns, dict) or not cloud_campaign.live_identity_bytes(route.get("host_id"))
+                        or route["host_id"] != owner["host_id"]
+                        or not cloud_campaign.scoped_live_subsystem(ns.get("nqn"), owner["subsystem_scope"])):
+                    raise SafetyError("full-inventory logical owner write/read admission failed: wrong route identity")
         read_nqns = {route.get("host_nqn") for route in routes if route.get("writer") is None}
         write_nqns = {route.get("host_nqn") for route in routes if route.get("writer") is not None}
         with (cell / "result/samples.csv").open() as stream:
@@ -4004,7 +4084,7 @@ class Controller:
         # Owners retain the granted epochs. The measured coordinator must reopen
         # this authority, not create a new manifest with no knowledge of them.
         proofs = [{"owner_index": index, "host_index": owner_host_index(self.config, job, index),
-                   "host_nqn": identities[str(index)]["host_nqn"], "endpoint": remote["endpoints"][index],
+                   "host_nqn": admitted[str(index)]["host_nqn"], "endpoint": remote["endpoints"][index],
                    "config": str((cell / "config.json").relative_to(directory)),
                    "summary_sha256": digest(cell / "result/summary.json")}
                   for index in range(job["owner_count"])]
@@ -4987,6 +5067,8 @@ class Controller:
                         str(index): {"address": address, "service": prep["service"] + 2 * index,
                                      **identity["owner_identities"][str(index)]}
                         for index, address in enumerate(prep["addresses"])}
+                    if binary_seal is None:
+                        live_expected["identity_scope"] = "database"
                     dump(directory / "live-nvme-expected.json", live_expected)
                     receipt["live_nvme_expected"] = {"path": "live-nvme-expected.json",
                                                      "sha256": digest(directory / "live-nvme-expected.json")}
@@ -5079,6 +5161,8 @@ class Controller:
                 try:
                     expected_route = {"host_nqn": live_expected["host_nqn"], "transport": live_expected["transport"],
                                       "owners": live_expected["owners"]}
+                    if "identity_scope" in live_expected:
+                        expected_route["identity_scope"] = live_expected["identity_scope"]
                     receipt["live_observation_begin"] = self.live_boundaries(job["case_id"], "begin", directory, expected_route)
                 except Exception as exc:
                     receipt["live_observation_begin"] = {"available": False, "reason": repr(exc)}

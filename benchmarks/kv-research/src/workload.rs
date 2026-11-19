@@ -52,12 +52,35 @@ pub fn key_bytes(namespace: &[u8; 16], seed: u64, id: u64) -> Bytes {
     Bytes::copy_from_slice(&digest[..KEY_BYTES])
 }
 
+#[must_use]
+pub fn value_bytes(namespace: &[u8; 16], seed: u64, id: u64, size: usize, entropy: f64) -> Bytes {
+    Bytes::from(value_vec(namespace, seed, id, size, entropy))
+}
+
+/// Index-fixture payload of one value domain: the stock value with `mark`
+/// XORed into byte zero before the buffer is frozen, so each domain differs
+/// from the build value (mark 0) without extra generation.
+#[must_use]
+pub fn marked_value_bytes(
+    namespace: &[u8; 16],
+    seed: u64,
+    id: u64,
+    size: usize,
+    entropy: f64,
+    mark: u8,
+) -> Bytes {
+    let mut value = value_vec(namespace, seed, id, size, entropy);
+    if let Some(first) = value.first_mut() {
+        *first ^= mark;
+    }
+    Bytes::from(value)
+}
+
 // Admitted values are at most 65,536 bytes and entropy is finite in [0, 1].
 #[allow(clippy::cast_precision_loss)]
 // Deliberate nearest-byte rounding of the nonnegative, bounded entropy fraction.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-#[must_use]
-pub fn value_bytes(namespace: &[u8; 16], seed: u64, id: u64, size: usize, entropy: f64) -> Bytes {
+fn value_vec(namespace: &[u8; 16], seed: u64, id: u64, size: usize, entropy: f64) -> Vec<u8> {
     let mut hasher = Blake2b512::new();
     hasher.update(b"kv-research-value-v1");
     hasher.update(namespace);
@@ -71,7 +94,7 @@ pub fn value_bytes(namespace: &[u8; 16], seed: u64, id: u64, size: usize, entrop
     value[..identity_len].copy_from_slice(&digest[..identity_len]);
     let random_bytes = ((size - identity_len) as f64 * entropy).round() as usize;
     rng.fill_bytes(&mut value[identity_len..identity_len + random_bytes.min(size - identity_len)]);
-    Bytes::from(value)
+    value
 }
 
 pub fn fresh_namespace() -> std::io::Result<[u8; 16]> {
@@ -88,6 +111,8 @@ pub struct WorkloadGenerator {
     distribution: KeyDistribution,
     put_key_policy: PutKeyPolicy,
     next_put_index: Arc<AtomicU64>,
+    /// A1 index-fixture build: `new` IDs are exactly `0..key_count`.
+    build_ids: bool,
 }
 
 impl WorkloadGenerator {
@@ -109,8 +134,18 @@ impl WorkloadGenerator {
             distribution,
             put_key_policy,
             next_put_index,
+            build_ids: false,
         }
     }
+
+    /// A1 index-fixture build: `new` puts take IDs `0..key_count` once each;
+    /// a put past the dataset is an error, never a wrap.
+    #[must_use]
+    pub fn with_build_ids(mut self) -> Self {
+        self.build_ids = true;
+        self
+    }
+
     /// Reads stay in the prepared range. Each put uses a new logical id above that range.
     pub(crate) fn interference_item(
         &mut self,
@@ -220,15 +255,18 @@ impl WorkloadGenerator {
         // Relaxed reserves unique ids only; it does not publish any other shared state.
         // With K>1 clients, ID assignment follows thread interleaving; uniqueness
         // and coverage remain exact. K=1 retains its fully deterministic sequence.
+        let base = if self.build_ids { 0 } else { self.key_count };
         let index = self
             .next_put_index
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
-                self.key_count.checked_add(index)?;
+                base.checked_add(index)?;
+                if self.build_ids && index >= self.key_count {
+                    return None;
+                }
                 index.checked_add(1)
             })
             .map_err(|_| std::io::Error::other("new put key range overflow"))?;
-        self.key_count
-            .checked_add(index)
+        base.checked_add(index)
             .ok_or_else(|| std::io::Error::other("new put key range overflow").into())
     }
 

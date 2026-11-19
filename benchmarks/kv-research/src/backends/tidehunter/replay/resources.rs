@@ -20,6 +20,8 @@ pub(super) fn reservation(
     let mut databases = Vec::new();
     let mut total = 0;
     for (db, _, opts) in options(value)? {
+        let remote = external_config(&opts)?;
+        let batch_limits = remote.storage.batch_limits;
         let shape = shape(&trace.tables, db);
         let index = NativeIndex::with_shards(&shape, [0; 16], 512 * 1024 * 1024, 1)?;
         let rows: Vec<_> = trace
@@ -56,7 +58,7 @@ pub(super) fn reservation(
                     key: row.key.clone(),
                     value: row.value.clone(),
                 }],
-                batch_limits(&opts),
+                batch_limits,
             )?;
             let reduced = if table.key_shape == "digest_reduction_0_16" {
                 16
@@ -135,7 +137,7 @@ pub(super) fn reservation(
                     sequence: 0,
                 },
                 mutations,
-                batch_limits(&opts),
+                batch_limits,
             )?;
             let bytes = batch.encoded().len() as u64;
             // Fresh-cell charges overbound this batch's transient charge, including unpublished routing.
@@ -147,7 +149,6 @@ pub(super) fn reservation(
         }
         batches = mul(batches, repetitions)?;
         encoded = mul(encoded, repetitions)?;
-        let remote = &opts.external_remote_config;
         let replay_limits = opts.replay_limits.unwrap_or(remote.replay_limits);
         let max_index = remote.max_index_bytes as u64;
         let max_identities = remote.max_admitted_batches as u64;
@@ -227,7 +228,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let input = serde_json::json!({
             "guest_root":root.join("guest"),"addresses":["127.0.0.1:19001","127.0.0.1:19002"],
-            "database":vec![7;16],"transport":{"kind":"tcp-trusted"},
+            "transport":{"kind":"tcp-trusted"},
             "owner_wal_geometry":"native_default","replay_node_db_id":0,
             "batch_limits":{"max_operations":519,"max_encoded_bytes":500000},
             "max_batches_per_partition":32768,"max_admitted_batches":1000000,"max_index_bytes":512*1024*1024,
@@ -256,8 +257,10 @@ mod tests {
         let database = &bound["databases"][0];
         assert_eq!(database["batches"], 20480);
         assert_eq!(database["full_index_image_bytes"], 797_710_617_u64);
-        assert_eq!(database["maximum_checkpoints"], 219);
-        assert_eq!(bound["reservation_bytes"], 176_564_578_965_u64);
+        // The ordered cell directory charges a second cell identity and birth
+        // ID, shrinking the index-pressure window compared to pre-L3.
+        assert_eq!(database["maximum_checkpoints"], 225);
+        assert_eq!(bound["reservation_bytes"], 181_350_842_667_u64);
         // z4m-highmem-16: one 14,000 GiB local SSD; keep the owner's 50% guard.
         assert!(bound["reservation_bytes"].as_u64().unwrap() < 14000 * 1024_u64.pow(3) / 2);
         eprintln!("cloud-replay-coordinator-bound={bound}");

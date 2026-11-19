@@ -526,7 +526,12 @@ fn retirement_refuses_pinned_export_then_targeted_eviction_allows_retirement_and
                 Request::RetireWalFiles {
                     authority_epoch: 2,
                     epoch: 1,
-                    files: vec![0],
+                    files: vec![crate::distributed::storage::RetireProof {
+                        file_start: 0,
+                        inode: None,
+                        seal_generation: None,
+                    }],
+                    witness: None,
                 },
                 TcpLimits::default()
             )

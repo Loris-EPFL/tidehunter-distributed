@@ -4,17 +4,18 @@
 //! Explicit Sui adapter. Committed reads do not borrow the write-progress owner.
 //! Ordinary remote writes overlap; only maintenance requires write quiescence.
 //!
-//! Remote pruning follows the native WAL filter's database-wide stop frontier,
-//! expressed in logical batches (partition offsets are incomparable). Historical
-//! Stop rows protect their whole atomic batch. Durable tombstones precede history
-//! retirement; pinned iterator/checkpoint cuts protect their immutable backing.
-//! Only wholly unreferenced WAL files are reclaimed by the authority lifecycle.
-use super::codec::{CompleteBatch, HEADER_LEN, Mutation};
+//! Remote pruning runs native `WalBased` relocation semantics asynchronously
+//! on one background worker per database (`relocation`): it calls the filters
+//! over the original WAL puts in logical order up to the first Stop, removes
+//! index entries only below whole-file targets, and takes no write gate.
+//! Pinned iterator/checkpoint cuts protect their immutable backing. Only
+//! wholly unreferenced WAL files are reclaimed by the authority lifecycle.
+use super::codec::Mutation;
 use super::native_index::{IndexReadCut, IndexReadPin};
 use super::remote_db::{
     ConcurrentRemoteDatabase, PendingScanPage, RemoteDatabase, RemoteDatabaseConfig,
 };
-use super::types::{BatchVersion, MutationVersion, ValueRecordReference};
+use super::types::ValueRecordReference;
 use super::write_timeline::{WriteTimelineExport, WriteTimelineSample, WriteTimelineStage};
 use crate::config::Config;
 use crate::db::{Db as NativeDb, DbError};
@@ -28,17 +29,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+mod drop_cells;
+mod index_checkpoint;
 pub(crate) mod kv_capture;
+mod relocation;
 
 pub type Result<T, E = DbError> = std::result::Result<T, E>;
 fn error(e: impl std::fmt::Display) -> DbError {
     DbError::Io(std::io::Error::other(e.to_string()))
 }
+/// Keep the typed class (busy, missing, invalid) of a remote open failure.
+fn remote_error(e: super::storage::LocalDbError) -> DbError {
+    DbError::Io(std::io::Error::new(e.kind(), e.to_string()))
+}
 
 /// Cumulative completed spans, including failed calls and unwinding. Nanoseconds
 /// are sums across callers, not wall time or means. Recording allocates nothing.
-/// Errors mean Err/unwind at that boundary: detached waits return completion
-/// handles, so their transport/authority errors surface in read_finish instead.
+/// Errors mean Err/unwind at that boundary.
 #[derive(Default)]
 struct Stage {
     ns: AtomicU64,
@@ -526,66 +533,22 @@ enum Backend {
     Remote(Remote),
 }
 struct Remote {
-    db: ConcurrentRemoteDatabase,
+    /// First field, so it drops (cancels and joins its worker) before `db`.
+    relocator: relocation::RemoteRelocator,
+    /// Shared only with the relocation worker, which `relocator` joins.
+    db: Arc<ConcurrentRemoteDatabase>,
     epoch: u64,
-    timeout: std::time::Duration,
-    batch_limits: super::codec::BatchLimits,
     scalar_read: Stage,
     bulk_read: Stage,
     write_commit: Stage,
-    read_submit: Stage,
-    read_admission_wait: Stage,
-    read_detached_wait: Stage,
-    read_finish: Stage,
     profile: super::remote_db::ReadProfileMonitor,
 }
 impl Remote {
-    fn submit<T>(
-        &self,
-        submit: impl FnOnce(
-            &ConcurrentRemoteDatabase,
-        ) -> std::result::Result<T, super::storage::LocalDbError>,
-    ) -> std::result::Result<T, super::storage::LocalDbError> {
-        self.read_submit.run(|| submit(&self.db))
-    }
-    fn admit<T>(
-        &self,
-        mut submit: impl FnMut(
-            &ConcurrentRemoteDatabase,
-        ) -> std::result::Result<T, super::storage::LocalDbError>,
-    ) -> Result<T> {
-        let deadline = Instant::now() + self.timeout;
-        loop {
-            // Capture before admission so completion between a failed attempt
-            // and the wait cannot be lost. The read service owns credit wakeups.
-            let generation = self.db.read_admission_generation();
-            match self.submit(&mut submit) {
-                Ok(value) => return Ok(value),
-                Err(e) if RemoteDatabase::read_backpressured(&e) => {
-                    self.read_admission_wait.run(|| {
-                        self.db
-                            .wait_read_admission(generation, deadline)
-                            .map_err(error)
-                    })?;
-                }
-                Err(e) => return Err(error(e)),
-            }
-        }
-    }
-    fn record(
-        &self,
-        ks: KeySpace,
-        reduced_key: &[u8],
-        reference: ValueRecordReference,
-        pin: &IndexReadPin,
-    ) -> Result<Mutation> {
-        let pending = self.admit(|db| db.submit_record_at(reference, pin.clone()))?;
-        let completed = self.read_detached_wait.measure(|| pending.wait());
-        self.read_finish.run(|| {
-            self.db
-                .finish_record(completed, ks, reduced_key)
-                .map_err(error)
-        })
+    /// Join the relocation worker, then take the database out of its `Arc`.
+    fn into_database(self) -> Result<ConcurrentRemoteDatabase> {
+        drop(self.relocator);
+        Arc::try_unwrap(self.db)
+            .map_err(|_| error("remote database still shared after the relocation worker joined"))
     }
 }
 impl Db {
@@ -594,6 +557,15 @@ impl Db {
     pub fn live_nvmeof_stats(&self) -> Option<super::nvmeof::live_metrics::LiveNvmeStats> {
         match &self.backend {
             Backend::Remote(remote) => remote.db.live_nvmeof_stats(),
+            Backend::Native(_) => None,
+        }
+    }
+
+    /// The provisioned database identity of a remote backend; `None` for the
+    /// native backend.
+    pub fn remote_database_id(&self) -> Option<[u8; 16]> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote.db.database_id()),
             Backend::Native(_) => None,
         }
     }
@@ -615,6 +587,49 @@ impl Db {
         }
     }
 
+    /// Start R0 shadow capacity observation on a remote database. Physical WAL
+    /// retirement is suppressed while the observer runs; logical pruning,
+    /// checkpoints and floor advancement are unchanged. Finish the returned
+    /// observer before closing the database.
+    pub fn start_capacity_observer(
+        &self,
+        config: super::capacity::CapacityObserverConfig,
+        sink: Box<dyn super::capacity::R0Sink>,
+    ) -> Result<super::remote_db::CapacityObserver> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .db
+                .start_capacity_observer(config, sink)
+                .map_err(error),
+            Backend::Native(_) => Err(error("capacity observation requires a remote database")),
+        }
+    }
+
+    /// Owner persistence counters of each owner as `(partition, counters)`,
+    /// in endpoint order. `None` for the native backend.
+    pub fn owner_storage_stats_by_partition(
+        &self,
+    ) -> Result<Option<Vec<(u32, super::storage::PartitionStats)>>> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .db
+                .storage_stats_by_partition()
+                .map(Some)
+                .map_err(error),
+            Backend::Native(_) => Ok(None),
+        }
+    }
+
+    /// Upper mutation version of the remote published cut (the logical
+    /// frontier); `None` before the first publication and for the native
+    /// backend. Benchmark observation only.
+    pub fn published_frontier(&self) -> Result<Option<super::types::MutationVersion>> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.published_frontier().map_err(error),
+            Backend::Native(_) => Ok(None),
+        }
+    }
+
     /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
     /// live target's exported namespaces and is not a reopen operation.
     pub fn shutdown_live_target_final(
@@ -623,7 +638,10 @@ impl Db {
         let database = Arc::try_unwrap(self)
             .map_err(|_| error("Sui database still has live owners during final shutdown"))?;
         match database.backend {
-            Backend::Remote(remote) => remote.db.shutdown_live_target_final().map_err(error),
+            Backend::Remote(remote) => remote
+                .into_database()?
+                .shutdown_live_target_final()
+                .map_err(error),
             Backend::Native(_) => Err(error("final live shutdown requires a live remote backend")),
         }
     }
@@ -635,14 +653,13 @@ impl Db {
         }
     }
 
+    /// Native or coordinated remote drop, classified under the target's
+    /// namespace lock (never from an unlocked marker check): a remote
+    /// authority drops every owner and nested remote database first; an
+    /// unmarked directory with remote descendants is refused (`AlreadyExists`)
+    /// instead of being removed natively. Busy gives `AlreadyExists`.
     pub fn drop_db(path: &Path) -> std::io::Result<()> {
-        if path.join("tcp-database-authority-v1").exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "cannot destroy only a sharded-wal coordinator: retained shard history requires coordinated retirement",
-            ));
-        }
-        NativeDb::drop_db(path)
+        super::remote_db::drop_db(path, NativeDb::drop_db)
     }
     pub fn open_native(
         path: &Path,
@@ -705,28 +722,22 @@ impl Db {
         if let Some(unavailable) = super::sys::route_unavailable() {
             return Err(error(unavailable));
         }
-        let timeout = config.timeout;
-        let batch_limits = config.storage.batch_limits;
-        let capture_id =
-            kv_capture::open(path, &shape, Some(&config.storage.database)).map_err(error)?;
-        let mut db = open(path, &shape, config).map_err(error)?;
+        let mut db = open(path, &shape, config).map_err(remote_error)?;
+        let capture_id = kv_capture::open(path, &shape, Some(&db.database_id())).map_err(error)?;
         db.configure_sui_read_cache();
         let epoch = db.epoch();
         let profile = db.read_profile_monitor();
-        let db = ConcurrentRemoteDatabase::new(db).map_err(error)?;
+        let db = Arc::new(ConcurrentRemoteDatabase::new(db).map_err(error)?);
+        let relocator =
+            relocation::RemoteRelocator::start_worker(Arc::clone(&db)).map_err(error)?;
         Ok(Self::new(
             Backend::Remote(Remote {
+                relocator,
                 db,
                 epoch,
-                timeout,
-                batch_limits,
                 scalar_read: Stage::default(),
                 bulk_read: Stage::default(),
                 write_commit: Stage::default(),
-                read_submit: Stage::default(),
-                read_admission_wait: Stage::default(),
-                read_detached_wait: Stage::default(),
-                read_finish: Stage::default(),
                 profile,
             }),
             shape,
@@ -983,17 +994,7 @@ impl Db {
             set("retention_floor_epoch", epoch);
             set("retention_floor_sequence", sequence);
             set("retention_floor_operation_index", operation_index);
-            visit_stages!(
-                set,
-                remote,
-                scalar_read,
-                bulk_read,
-                write_commit,
-                read_submit,
-                read_admission_wait,
-                read_detached_wait,
-                read_finish
-            );
+            visit_stages!(set, remote, scalar_read, bulk_read, write_commit);
             remote.profile.visit(&mut set);
             remote.db.visit_write_metrics(|snapshot| {
                 let checkpoint = snapshot.checkpoint_diagnostics;
@@ -1047,6 +1048,7 @@ impl Db {
                     capacity_error_count,
                     progress_error_count,
                 );
+                index_checkpoint::visit_attribution(&checkpoint.attribution, &mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);
@@ -1061,22 +1063,6 @@ impl Db {
                 );
                 set("write_checkpoint_ns", authority.checkpoint_ns);
                 set("write_checkpoint_count", authority.checkpoint_count);
-                set(
-                    "write_foreground_checkpoint_ns",
-                    authority.foreground_checkpoint_ns,
-                );
-                set(
-                    "write_foreground_checkpoint_count",
-                    authority.foreground_checkpoint_count,
-                );
-                set(
-                    "write_concurrent_checkpoint_deferrals",
-                    authority.concurrent_checkpoint_deferrals,
-                );
-                set(
-                    "write_concurrent_checkpoint_wait_ns",
-                    authority.concurrent_checkpoint_wait_ns,
-                );
                 set(
                     "write_background_checkpoint_suffix_batches",
                     authority.background_checkpoint_suffix_batches,
@@ -1270,17 +1256,7 @@ impl Db {
             set("retention_floor_epoch", epoch);
             set("retention_floor_sequence", sequence);
             set("retention_floor_operation_index", operation_index);
-            visit_stages!(
-                set,
-                remote,
-                scalar_read,
-                bulk_read,
-                write_commit,
-                read_submit,
-                read_admission_wait,
-                read_detached_wait,
-                read_finish
-            );
+            visit_stages!(set, remote, scalar_read, bulk_read, write_commit);
             remote.profile.visit(&mut set);
             remote.db.try_visit_write_metrics(|snapshot| {
                 let checkpoint = snapshot.checkpoint_diagnostics;
@@ -1334,6 +1310,7 @@ impl Db {
                     capacity_error_count,
                     progress_error_count,
                 );
+                index_checkpoint::visit_attribution(&checkpoint.attribution, &mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);
@@ -1348,22 +1325,6 @@ impl Db {
                 );
                 set("write_checkpoint_ns", authority.checkpoint_ns);
                 set("write_checkpoint_count", authority.checkpoint_count);
-                set(
-                    "write_foreground_checkpoint_ns",
-                    authority.foreground_checkpoint_ns,
-                );
-                set(
-                    "write_foreground_checkpoint_count",
-                    authority.foreground_checkpoint_count,
-                );
-                set(
-                    "write_concurrent_checkpoint_deferrals",
-                    authority.concurrent_checkpoint_deferrals,
-                );
-                set(
-                    "write_concurrent_checkpoint_wait_ns",
-                    authority.concurrent_checkpoint_wait_ns,
-                );
                 set(
                     "write_background_checkpoint_suffix_batches",
                     authority.background_checkpoint_suffix_batches,
@@ -1838,10 +1799,25 @@ impl Db {
             Backend::Remote(remote) => remote.db.flush_index().map_err(error),
         }
     }
+    /// Native: rebuild the control region. Remote: one named Exact generation
+    /// covering every earlier write, which runs the compactor of every dirty
+    /// callback cell (native's index-flush compactor). No write gate is taken.
     pub fn force_rebuild_control_region(&self) -> Result<()> {
         match &self.backend {
             Backend::Native(db) => db.force_rebuild_control_region().map(|_| ()),
-            Backend::Remote(_) => self.flush(),
+            Backend::Remote(remote) => remote.db.force_rebuild_index().map(|_| ()).map_err(error),
+        }
+    }
+    /// Test fixtures: the same force, returning the remote named completion
+    /// (adopted Exact generation, cut and compactor counters). `None` on the
+    /// native backend.
+    #[cfg(feature = "test-utils")]
+    pub fn force_rebuild_control_region_observed(
+        &self,
+    ) -> Result<Option<super::remote_db::IndexForceReport>> {
+        match &self.backend {
+            Backend::Native(db) => db.force_rebuild_control_region().map(|_| None),
+            Backend::Remote(remote) => remote.db.force_rebuild_index().map(Some).map_err(error),
         }
     }
     pub fn wait_for_background_threads_to_finish(self: Arc<Self>) -> Result<()> {
@@ -1852,7 +1828,7 @@ impl Db {
                 db.wait_for_background_threads_to_finish();
                 Ok(())
             }
-            Backend::Remote(remote) => remote.db.shutdown().map_err(error),
+            Backend::Remote(remote) => remote.into_database()?.shutdown().map_err(error),
         }
     }
     pub fn iterator(self: &Arc<Self>, ks: KeySpace) -> DbIterator {
@@ -1935,227 +1911,85 @@ impl Db {
             Backend::Native(_) => Some(None),
         }
     }
+    /// Start relocation and return at once, as native does. A remote pass
+    /// runs on the database's relocation worker without any write gate;
+    /// requests made while one is queued or running coalesce into one pass.
     pub fn start_relocation(self: &Arc<Self>) -> Result<()> {
-        if let Backend::Native(db) = &self.backend {
-            return db.start_relocation().map_err(error);
-        }
-        // Tombstone current Remove rows first, then durably advance only the
-        // unprotected prefix. A Stop protects its entire historical batch.
-        let _guard = self.write_gate();
-        let Backend::Remote(remote) = &self.backend else {
-            unreachable!()
+        let remote = match &self.backend {
+            Backend::Native(db) => return db.start_relocation().map_err(error),
+            Backend::Remote(remote) => remote,
         };
-        // Write-gated: these in-call cuts end with this call, one call at a
-        // time, so they take no owner charge (see `StandingViewBudget`).
-        let (cut, pin) = remote.db.call_protected_cut().map_err(error)?;
-        let mut cutoff: Option<BatchVersion> = None;
-        // Native wal_based_relocation scans retained WAL records, not just live
-        // keys. Retained index history includes overwritten Stop puts, including
-        // checkpoint-backed versions above the supported-history floor.
-        // Visit order is irrelevant to the minimum logical stop batch; do not
-        // compare member offsets or admit any pruning before this pass completes.
-        for descriptor in self.shape.iter_ks() {
-            if descriptor.destroyed() {
-                continue;
+        let relocator = &remote.relocator;
+        relocator.start().map_err(|cause| match cause {
+            relocation::StartError::ShuttingDown => {
+                error("relocation rejected: the database is shutting down")
             }
-            let Some(filter) = descriptor.relocation_filter() else {
-                continue;
-            };
-            let mut history = remote
-                .db
-                .relocation_history(descriptor.id(), cut.clone())
-                .map_err(error)?;
-            loop {
-                let row = remote
-                    .db
-                    .next_relocation_record(&mut history)
-                    .map_err(error)?;
-                let Some((key, reference)) = row else { break };
-                if cutoff.is_some_and(|stop| reference.batch_version >= stop) {
-                    continue;
-                }
-                let Mutation::Put { key, value, .. } =
-                    remote.record(descriptor.id(), &key, reference, &pin)?
-                else {
-                    return Err(error("relocation put history resolved to a tombstone"));
-                };
-                if matches!(filter(&key, &value), crate::Decision::StopRelocation) {
-                    cutoff = Some(reference.batch_version);
-                }
+            relocation::StartError::WorkerStopped => {
+                error("relocation worker stopped: a relocation filter panicked")
             }
-        }
-        for descriptor in self.shape.iter_ks() {
-            if descriptor.destroyed() {
-                continue;
-            }
-            if let Some(compactor) = descriptor.compactor() {
-                let Backend::Remote(remote) = &self.backend else {
-                    unreachable!()
-                };
-                let cut = remote.db.call_published_cut().map_err(error)?;
-                let mut after: Option<Bytes> = None;
-                let mut cell = None;
-                let mut rows = Vec::new();
-                loop {
-                    let page = remote
-                        .db
-                        .index_page(descriptor.id(), after.as_deref(), false, cut.clone())
-                        .map_err(error)?;
-                    if page.is_empty() {
-                        break;
-                    }
-                    after = page.last().map(|(key, _)| key.clone());
-                    for (key, reference) in page {
-                        let next_cell = descriptor.cell_id(&key);
-                        if cell.as_ref().is_some_and(|cell| cell != &next_cell) {
-                            self.compact_cell(descriptor.id(), compactor, &rows)?;
-                            rows.clear();
-                        }
-                        cell = Some(next_cell);
-                        rows.push((key, reference));
-                    }
-                }
-                self.compact_cell(descriptor.id(), compactor, &rows)?;
-            }
-            let Some(filter) = descriptor.relocation_filter() else {
-                continue;
-            };
-            let cut = remote.db.call_published_cut().map_err(error)?;
-            let mut after = None;
-            let mut deletes =
-                Vec::with_capacity((remote.batch_limits.max_operations as usize).min(256));
-            let mut encoded_bytes = HEADER_LEN;
-            loop {
-                let page = remote
-                    .db
-                    .index_page(descriptor.id(), after.as_deref(), false, cut.clone())
-                    .map_err(error)?;
-                if page.is_empty() {
-                    break;
-                }
-                for (key, reference) in page {
-                    if cutoff.is_none_or(|stop| reference.batch_version < stop) {
-                        let Mutation::Put { key, value, .. } =
-                            remote.record(descriptor.id(), &key, reference, &pin)?
-                        else {
-                            return Err(error("live relocation row resolved to a tombstone"));
-                        };
-                        if matches!(filter(&key, &value), crate::Decision::Remove) {
-                            self.push_pruning_delete(
-                                &mut deletes,
-                                &mut encoded_bytes,
-                                Mutation::Delete {
-                                    keyspace: descriptor.id(),
-                                    key,
-                                },
-                            )?;
-                        }
-                    }
-                    after = Some(key);
-                }
-            }
-            if !deletes.is_empty() {
-                self.commit_remote(deletes, None)?;
-            }
-        }
-        drop(pin);
-        let floor = match cutoff {
-            None => cut,
-            Some(stop) => {
-                let before_stop = if stop.sequence != 0 {
-                    IndexReadCut::At(MutationVersion {
-                        batch: BatchVersion {
-                            sequence: stop.sequence - 1,
-                            ..stop
-                        },
-                        operation_index: u32::MAX,
-                    })
-                } else if stop.epoch != 0 {
-                    IndexReadCut::At(MutationVersion {
-                        batch: BatchVersion {
-                            epoch: stop.epoch - 1,
-                            sequence: u64::MAX,
-                        },
-                        operation_index: u32::MAX,
-                    })
-                } else {
-                    IndexReadCut::BeforeAll
-                };
-                match (cut, before_stop) {
-                    (IndexReadCut::At(cut), IndexReadCut::At(before)) => {
-                        IndexReadCut::At(cut.min(before))
-                    }
-                    _ => IndexReadCut::BeforeAll,
-                }
-            }
-        };
-        remote.db.retire_history_before(floor).map_err(error)?;
-        Ok(())
-    }
-    fn push_pruning_delete(
-        &self,
-        deletes: &mut Vec<Mutation>,
-        encoded_bytes: &mut usize,
-        mutation: Mutation,
-    ) -> Result<()> {
-        let Backend::Remote(remote) = &self.backend else {
-            unreachable!()
-        };
-        let limits = remote.batch_limits;
-        let member_bytes = CompleteBatch::encoded_len_for_mutations(
-            &self.shape,
-            std::slice::from_ref(&mutation),
-            limits,
-        )
-        .map_err(error)?
-            - HEADER_LEN;
-        let capacity = (limits.max_operations as usize).min(256);
-        if !deletes.is_empty()
-            && (deletes.len() == capacity
-                || *encoded_bytes + member_bytes > limits.max_encoded_bytes)
-        {
-            self.commit_remote(
-                std::mem::replace(deletes, Vec::with_capacity(capacity)),
-                None,
-            )?;
-            *encoded_bytes = HEADER_LEN;
-        }
-        *encoded_bytes += member_bytes;
-        deletes.push(mutation);
-        Ok(())
+        })
     }
 
-    fn compact_cell(
+    /// One named observed pass, waited for until `deadline` (the deadline
+    /// drops only the waiter). Remote returns the native report shape: one
+    /// stream per scanned `(partition, fencing generation)` and no copied
+    /// survivors, because leased relocation never copies.
+    #[cfg(feature = "test_methods")]
+    pub fn start_relocation_for_test(
         &self,
-        ks: KeySpace,
-        compactor: &crate::key_shape::Compactor,
-        rows: &[(Bytes, ValueRecordReference)],
-    ) -> Result<()> {
-        let Backend::Remote(remote) = &self.backend else {
-            unreachable!()
+        deadline: Instant,
+    ) -> std::result::Result<crate::RelocationObservation, crate::RelocationTestError> {
+        use super::remote_db::{CallbackDecision, RelocationGate};
+        use crate::RelocationTestError;
+        let remote = match &self.backend {
+            Backend::Native(db) => return db.start_relocation_for_test(deadline),
+            Backend::Remote(remote) => remote,
         };
-        // Called only under `start_relocation`'s write gate.
-        let (_, pin) = remote.db.call_protected_cut().map_err(error)?;
-        let retain = compactor(&mut rows.iter().map(|(key, _)| key));
-        let mut deletes =
-            Vec::with_capacity((remote.batch_limits.max_operations as usize).min(256));
-        let mut encoded_bytes = HEADER_LEN;
-        for (key, reference) in rows {
-            if !retain.contains(key) {
-                let Mutation::Put { key, .. } = remote.record(ks, key, *reference, &pin)? else {
-                    return Err(error("live compactor row resolved to a tombstone"));
-                };
-                self.push_pruning_delete(
-                    &mut deletes,
-                    &mut encoded_bytes,
-                    Mutation::Delete { keyspace: ks, key },
-                )?;
-            }
-        }
-        if !deletes.is_empty() {
-            self.commit_remote(deletes, None)?;
-        }
-        Ok(())
+        let relocator = &remote.relocator;
+        let report = relocator
+            .run_for_test(deadline)
+            .map_err(|cause| match cause {
+                relocation::TestError::Busy => RelocationTestError::Busy,
+                relocation::TestError::DeadlineExceeded => RelocationTestError::DeadlineExceeded,
+                relocation::TestError::WorkerStopped => RelocationTestError::WorkerStopped,
+                relocation::TestError::Pass(cause) => RelocationTestError::Native(error(cause)),
+            })?;
+        Ok(crate::RelocationObservation {
+            gate: match report.gate {
+                RelocationGate::NoWork => crate::RelocationGate::NoWork,
+                RelocationGate::DidWork => crate::RelocationGate::DidWork,
+            },
+            streams: report
+                .streams
+                .iter()
+                .map(|stream| crate::StreamObservation {
+                    stream_id: crate::RelocationStreamId {
+                        partition: stream.partition,
+                        fencing_generation: stream.fencing_generation,
+                    },
+                    processed_upper: stream.processed_upper,
+                    terminal_position: stream.terminal_position,
+                    rounded_target: stream.rounded_target,
+                })
+                .collect(),
+            callbacks: report
+                .callbacks
+                .into_iter()
+                .map(|callback| crate::RelocationCallback {
+                    keyspace: callback.keyspace,
+                    key: callback.key,
+                    value: callback.value,
+                    wal_position: callback.wal_position,
+                    decision: match callback.decision {
+                        CallbackDecision::Keep => crate::Decision::Keep,
+                        CallbackDecision::Remove => crate::Decision::Remove,
+                        CallbackDecision::Stop => crate::Decision::StopRelocation,
+                    },
+                })
+                .collect(),
+            copied_survivors: 0,
+            witness: crate::RelocationWorkerWitness::Completed,
+        })
     }
     pub fn drop_cells_in_range(
         self: &Arc<Self>,
@@ -2180,61 +2014,9 @@ impl Db {
             db.drop_cells_in_range(ks, from, to)?;
             return self.native_barrier(false);
         }
-        let descriptor = self.shape.ks(ks);
-        let reduced_from = descriptor.reduce_key(from);
-        let reduced_to = descriptor.reduce_key(to);
-        descriptor.map_key_range_to_cell_range(&reduced_from, &reduced_to);
-        let _guard = self.write_gate();
-        let Backend::Remote(remote) = &self.backend else {
-            unreachable!()
-        };
-        let mut retained_bytes = 128usize;
-        // Write-gated and in-call: no owner charge (see `StandingViewBudget`).
-        let (cut, pin) = remote.db.call_protected_cut().map_err(error)?;
-        // The validated endpoints denote complete reduced cells. A full-key
-        // iterator bound would wrongly exclude colliding keys whose suffix sorts
-        // below `from`; include the reduced lower key and then page exclusively.
-        let mut after = Bytes::copy_from_slice(&reduced_from);
-        let mut page = Vec::new();
-        if let Some(reference) = remote
-            .db
-            .index_reference(ks, from, cut.clone())
-            .map_err(error)?
-        {
-            page.push((after.clone(), reference));
-        }
-        let mut deletes = Vec::with_capacity(256);
-        'pages: loop {
-            for (reduced, reference) in page {
-                if reduced.as_ref() > reduced_to.as_ref() {
-                    break 'pages;
-                }
-                retained_bytes =
-                    retained_bytes.saturating_add(reference.descriptor.key_len as usize + 64);
-                if deletes.len() >= remote.batch_limits.max_operations as usize
-                    || retained_bytes > remote.batch_limits.max_encoded_bytes
-                {
-                    return Err(error(
-                        "atomic cell-range deletion exceeds configured batch admission bound",
-                    ));
-                }
-                let mutation = remote.record(ks, &reduced, reference, &pin)?;
-                let (Mutation::Put { key, .. } | Mutation::Delete { key, .. }) = mutation;
-                deletes.push(Mutation::Delete { keyspace: ks, key });
-                after = reduced;
-            }
-            page = remote
-                .db
-                .index_page(ks, Some(&after), false, cut.clone())
-                .map_err(error)?;
-            if page.is_empty() {
-                break;
-            }
-        }
-        if !deletes.is_empty() {
-            self.commit_remote(deletes, None)?;
-        }
-        Ok(())
+        // One singleton DropCells batch under the shared gate; see
+        // `drop_cells::drop_remote_cells`.
+        self.drop_remote_cells(ks, from, to)
     }
 }
 

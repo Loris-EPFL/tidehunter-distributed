@@ -427,10 +427,13 @@ class LocalMode:
         # contradicts a reviewed case that pins owner_wal_prewrite.
         self.cloud.bind_owner_wal_prewrite(self.cloud.case_owner_job(self.config, case), launch)
         if "wal_prewrite" in self.config:
-            launch["node"]["wal_prewrite"] = self.config["wal_prewrite"]
+            self.cloud.cloud_campaign.owner_launch_config(launch)["wal_prewrite"] = self.config["wal_prewrite"]
         launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
         self.cloud.validate_launch(self.config, launch, case, index)
+        # Archive single-database launches carry their target; an owner host
+        # derives each database's target and state directory itself.
         live = launch.get("node", {}).get("live_target")
+        live_owner = self.cloud.cloud_campaign.owner_launch_live(launch)
         daemon = None
         if live is not None:
             Path(live["state_dir"]).mkdir(mode=0o700)
@@ -473,7 +476,7 @@ class LocalMode:
                     raise ValueError("owner readiness differs from launch")
                 result = {"ready": address, "launch_sha256": self.cloud.digest(launch_path),
                           "unit": status, "durability_receipt": self.cloud.owner_durability_receipt(launch)}
-                if live is not None:
+                if live_owner:
                     import nvme_campaign_owner
                     result["live_owner_identity"] = nvme_campaign_owner.capture_live_owner_identity(
                         launch_path.parent, launch_path, status)
@@ -509,7 +512,7 @@ class LocalMode:
         result = {"after": after, "stop_command_completed": True,
                   "logs": self.root_command(["journalctl", "--no-pager", "--unit", name,
                                               "--output=short-precise"], timeout=30)}
-        if launch["node"].get("live_target") is not None:
+        if self.cloud.cloud_campaign.owner_launch_live(launch):
             import nvme_campaign_owner
             result["live_target_shutdown"] = nvme_campaign_owner.admit_live_shutdown(
                 launch_path.parent, launch_path, launch, index, status)
@@ -520,7 +523,8 @@ class LocalMode:
             result["live_spdk_daemon"] = daemon.stop(
                 launch_path.with_suffix(".live-target-shutdown.json"), initiator_drained=True)
             del self.daemons[(case, index)]
-        database = self.cloud.guarded(launch["node"]["root"], launch_path.parent, must_exist=True)
+        database = self.cloud.guarded(self.cloud.cloud_campaign.owner_launch_config(launch)["root"],
+                                      launch_path.parent, must_exist=True)
         shutil.rmtree(database)
         result["database_removed"] = str(database)
         return result

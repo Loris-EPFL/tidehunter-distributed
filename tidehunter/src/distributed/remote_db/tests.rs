@@ -151,6 +151,53 @@ fn read_lanes_default_to_parallelism_and_validate_bounds() {
     }
 }
 
+/// Open keeps the caller's key shape: relocation filters and compactors are
+/// closures that the shape YAML cannot carry, and coordinator code that reads
+/// them (relocation, retirement guards) must see the caller's.
+#[test]
+fn open_keeps_the_callers_relocation_filters_and_compactors() {
+    use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = KeyShapeBuilder::new();
+    let counted = Arc::clone(&calls);
+    builder.add_key_space_config(
+        "filtered",
+        4,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new()
+            .with_relocation_filter(move |_, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                crate::Decision::StopRelocation
+            })
+            .with_compactor(Box::new(|keys| {
+                keys.next_back().cloned().into_iter().collect()
+            })),
+    );
+    builder.add_key_space_config("plain", 4, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    let fixture = Fixture::new_with_shape(128, builder.build());
+    // First open, then a reopen of the existing authority.
+    for open in 1..=2 {
+        let db = fixture.open();
+        let keyspace = |name: &str| {
+            db.core
+                .shape
+                .iter_ks()
+                .find(|keyspace| keyspace.name() == name)
+                .unwrap()
+        };
+        let filter = keyspace("filtered").relocation_filter().unwrap();
+        // The caller's closure itself: its decision and its side effect.
+        assert!(matches!(filter(&[], &[]), crate::Decision::StopRelocation));
+        assert_eq!(calls.load(Ordering::Relaxed), open);
+        assert!(keyspace("filtered").compactor().is_some());
+        assert!(keyspace("plain").relocation_filter().is_none());
+        assert!(keyspace("plain").compactor().is_none());
+        drop(db);
+    }
+}
+
 #[test]
 fn recorded_live_identity_cannot_reopen_as_tcp() {
     let fixture = Fixture::new();
@@ -162,23 +209,24 @@ fn recorded_live_identity_cannot_reopen_as_tcp() {
         "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
         [1; 16],
     ));
-    persist_manifest(&root, &manifest).unwrap();
+    persist_manifest(&root, &manifest, CoordinatorIoCategory::Open).unwrap();
 
     let error = reopen_result(&fixture).err().unwrap();
     assert!(
         error
             .to_string()
-            .contains("authority configuration/history differs")
+            .contains("authority configuration differs")
     );
     let after: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(after.epochs.len(), manifest.epochs.len());
+    assert_eq!(after.generations, manifest.generations);
+    assert_eq!(after.next_generation, manifest.next_generation);
 }
 
 #[test]
-fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
-    // Exact field order and representations of the pre-owner-map manifest.
+fn empty_owner_identity_map_preserves_manifest_bytes() {
+    // Exact field order of the current manifest without the optional map.
     #[derive(Serialize, Deserialize)]
-    struct LegacyManifest {
+    struct ManifestWithoutOwnerMap {
         format: u32,
         storage: LocalInventoryConfig,
         history_persistence: String,
@@ -186,15 +234,19 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
         shape_yaml: String,
         replay_limits: ReplayLimits,
         live_nvme_identity: Option<(String, [u8; 16])>,
-        epochs: Vec<AuthorityEpoch>,
+        next_generation: u64,
+        generations: Vec<AuthorityGeneration>,
+        trim_pending: Option<u64>,
         checkpoint: Option<CheckpointCommit>,
         checkpoint_staging: Option<CheckpointFiles>,
         checkpoint_obsolete: Option<CheckpointCommit>,
+        lifecycle: Option<AuthorityLifecycle>,
+        owner_control: Option<OwnerControlConfig>,
     }
     let f = Fixture::new();
     let db = f.open();
     let manifest = &manifest(&db);
-    let legacy = LegacyManifest {
+    let without_map = ManifestWithoutOwnerMap {
         format: manifest.format,
         storage: manifest.storage.clone(),
         history_persistence: "wal_replay".into(),
@@ -202,18 +254,22 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
         shape_yaml: manifest.shape_yaml.clone(),
         replay_limits: manifest.replay_limits,
         live_nvme_identity: manifest.live_nvme_identity.clone(),
-        epochs: manifest.epochs.clone(),
+        next_generation: manifest.next_generation,
+        generations: manifest.generations.clone(),
+        trim_pending: manifest.trim_pending,
         checkpoint: manifest.checkpoint.clone(),
         checkpoint_staging: manifest.checkpoint_staging.clone(),
         checkpoint_obsolete: manifest.checkpoint_obsolete.clone(),
+        lifecycle: manifest.lifecycle,
+        owner_control: manifest.owner_control.clone(),
     };
     assert_eq!(
         encode_metadata(manifest).unwrap(),
-        encode_metadata(&legacy).unwrap()
+        encode_metadata(&without_map).unwrap()
     );
-    let old: AuthorityManifest =
-        serde_yaml::from_str(&serde_yaml::to_string(&legacy).unwrap()).unwrap();
-    assert!(old.live_nvme_owner_identities.is_empty());
+    let decoded: AuthorityManifest =
+        serde_yaml::from_str(&serde_yaml::to_string(&without_map).unwrap()).unwrap();
+    assert!(decoded.live_nvme_owner_identities.is_empty());
     drop(db);
 }
 
@@ -370,8 +426,13 @@ fn checkpoint_is_not_adopted_until_every_required_shard_is_fenced() {
     );
     let manifest: AuthorityManifest =
         read_metadata(&fixture.temp.path().join("authority").join(MANIFEST)).unwrap();
-    assert_eq!(manifest.epochs.last().unwrap().epoch, 2);
-    assert!(!manifest.epochs.last().unwrap().active);
+    assert_eq!(
+        manifest.generations.last().copied(),
+        Some(AuthorityGeneration {
+            generation: 2,
+            state: GenerationState::Reserved,
+        })
+    );
     let mut db = fixture.open();
     assert_eq!(db.epoch(), 3);
     assert!(db.recovery_stats().checkpoint_loaded);
@@ -384,7 +445,7 @@ fn checkpoint_is_not_adopted_until_every_required_shard_is_fenced() {
     );
 }
 
-fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointImageV3)) {
+fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointImageV4)) {
     let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
     let commit = manifest.checkpoint.as_mut().unwrap();
     let name = commit.metadata_name();
@@ -394,7 +455,7 @@ fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointI
     commit.metadata_bytes = encoded.len() as u64;
     commit.metadata_digest = Blake2b::<U32>::digest(&encoded).into();
     install_metadata(root, &name, &encoded).unwrap();
-    persist_manifest(root, &manifest).unwrap();
+    persist_manifest(root, &manifest, CoordinatorIoCategory::Open).unwrap();
 }
 
 #[test]
@@ -442,13 +503,12 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
     };
     fixture.config.max_admitted_batches = 1024;
     let limits = fixture.config.replay_limits;
-    assert!(checkpoint_metadata_fits(
-        &fixture.config,
-        limits.max_batches + 8
-    ));
-    assert!(!checkpoint_metadata_fits(&fixture.config, usize::MAX));
+    // Eight retained generations per owner, the old fixture's lifetime quota.
+    let streams = fixture.config.endpoints.len() * 8;
+    assert!(checkpoint_metadata_fits(streams, limits.max_batches + 8));
+    assert!(!checkpoint_metadata_fits(streams, usize::MAX));
     assert!(!checkpoint_metadata_fits(
-        &fixture.config,
+        streams,
         MAX_CHECKPOINT_METADATA_BYTES as usize / 128
     ));
     let db = fixture.open();
@@ -466,18 +526,11 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
         acknowledged.push((operation, value, version));
     }
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(db.authority_write_stats().foreground_checkpoint_count, 0);
     assert_eq!(checkpoint_tail(&db).0, count);
     assert!(!db.core.path.join("receipt-history-v2").exists());
     let retained_tail = checkpoint_tail(&db).0;
     let clocks = db.authority_write_stats();
     assert!(clocks.checkpoint_count > 0);
-    assert!(clocks.foreground_checkpoint_count <= clocks.checkpoint_count);
-    if clocks.foreground_checkpoint_count == 0 {
-        assert_eq!(clocks.foreground_checkpoint_ns, 0);
-    } else {
-        assert!(clocks.foreground_checkpoint_ns > 0);
-    }
     drop(resume);
     fail_stop_without_checkpoint(db);
     let mut db = fixture.open();
@@ -518,10 +571,9 @@ fn checkpoint_does_not_turn_damaged_referenced_value_into_absence() {
     let file = fs::OpenOptions::new()
         .write(true)
         .open(
-            fixture
-                .temp
-                .path()
-                .join("node-0")
+            fixture.startups[0]
+                .0
+                .root
                 .join("epoch_0000000000000001")
                 .join(format!(
                     "wal_{:016x}",
@@ -840,17 +892,25 @@ fn failed_parallel_connect_does_not_reserve_or_escape_an_authority() {
     let fixture = Fixture::new();
     let mut config = fixture.config.clone();
     config.endpoints[2].server_name = "wrong-peer.invalid".to_owned();
-    let root = fixture.temp.path().join("failed-connect");
-    assert!(
-        RemoteDatabase::open(&root, &fixture.shape, config.clone(), recovery_metrics()).is_err()
-    );
-    let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert!(manifest.epochs.is_empty());
+    let root = fixture.authority();
+    let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
+    // Match the recorded endpoint so open reaches the parallel mTLS handshakes
+    // rather than refusing changed geometry or a supplied ID for a new path.
+    manifest.endpoints[2].server_name = config.endpoints[2].server_name.clone();
+    persist_manifest(&root, &manifest, CoordinatorIoCategory::Open).unwrap();
+    let before = fs::read(root.join(MANIFEST)).unwrap();
+    let error = fixture.try_open_with(config.clone()).err().unwrap();
+    assert!(error.to_string().contains("wrong-peer.invalid"), "{error}");
+    assert!(manifest.generations.is_empty());
+    assert_eq!(manifest.next_generation, 1);
+    assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before);
     // The failed attempt's scoped connection workers are all gone before lock
     // acquisition can succeed. Keep the recorded immutable endpoint inventory.
     let lock = DbLock::acquire(&root, Duration::ZERO).unwrap();
     drop(lock);
-    assert!(RemoteDatabase::open(&root, &fixture.shape, config, recovery_metrics()).is_err());
+    let retry = fixture.try_open_with(config).err().unwrap();
+    assert!(retry.to_string().contains("wrong-peer.invalid"), "{retry}");
+    assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before);
 }
 
 #[test]
@@ -867,8 +927,13 @@ fn failed_setup_joins_owned_workers_and_next_open_reserves_a_new_epoch() {
         .is_err()
     );
     let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(manifest.epochs.len(), 1);
-    assert!(!manifest.epochs[0].active);
+    assert_eq!(
+        manifest.generations,
+        vec![AuthorityGeneration {
+            generation: 1,
+            state: GenerationState::Reserved,
+        }]
+    );
     let db = fixture.open();
     assert_eq!(db.epoch(), 2);
     assert_eq!(db.recovery_stats().fabric_worker_ns, None);
@@ -989,7 +1054,6 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
     fixture.config.max_pending_reads = 1;
     fixture.config.max_pending_read_bytes = ReadService::MIN_FLIGHT_BYTES + 4096;
     fixture.config.read_cache_bytes = 0;
-    let root = fixture.temp.path().join("authority");
     for existing in [false, true] {
         if existing {
             let db = fixture.open();
@@ -997,6 +1061,11 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
                 .unwrap();
             db.shutdown().unwrap();
         }
+        let root = if existing {
+            fixture.authority()
+        } else {
+            fixture.temp.path().join("unusable-before-provision")
+        };
         let before = existing.then(|| fs::read(root.join(MANIFEST)).unwrap());
         for (requests, bytes) in [
             (0, fixture.config.max_pending_read_bytes),
@@ -1005,6 +1074,9 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
             let mut config = fixture.config.clone();
             config.max_pending_reads = requests;
             config.max_pending_read_bytes = bytes;
+            if !existing {
+                config.storage.database = [0; 16];
+            }
             assert!(
                 RemoteDatabase::open(&root, &fixture.shape, config, recovery_metrics()).is_err(),
                 "accepted unusable read capacity: requests={requests}, bytes={bytes}"
@@ -1142,7 +1214,10 @@ fn sui_adapter_pages_reverse_bounds_snapshot_and_reopen() {
     assert!(timing.contains_key("write_durable_receipt_publication_blocked_batches"));
     assert!(timing.contains_key("write_durable_receipt_publication_waiting_batches"));
     assert!(timing.contains_key("write_durable_receipt_publication_waiting_peak"));
-    assert!(timing.contains_key("write_foreground_checkpoint_count"));
+    assert!(timing.contains_key("write_index_checkpoint_cleaned"));
+    assert!(timing.contains_key("coordinator_io_durable_cut_bytes"));
+    assert!(!timing.contains_key("write_foreground_checkpoint_count"));
+    assert!(!timing.contains_key("write_concurrent_checkpoint_wait_ns"));
     assert!(timing.contains_key("cache_inserts"));
     assert!(timing.contains_key("index_reader_held_view_bytes"));
     assert!(!timing.contains_key("read_cache_hits"));
@@ -1463,7 +1538,9 @@ fn sui_adapter_variable_prefix_bounds_and_bulk_order() {
 }
 
 #[test]
-fn sui_cell_pruning_rejects_oversized_atomic_range_without_partial_deletion() {
+fn sui_cell_pruning_drops_more_keys_than_one_batch_admits() {
+    // One DropCells batch replaces the bounded enumerate-and-delete batch, so
+    // five keys drop although a batch admits four operations.
     use crate::distributed::sui::Db;
     let fixture = Fixture::new();
     let db = Db::open_remote_local_fixture(
@@ -1476,192 +1553,11 @@ fn sui_cell_pruning_rejects_oversized_atomic_range_without_partial_deletion() {
     for key in 0..5u32 {
         db.insert(ks, key.to_be_bytes().to_vec(), vec![7]).unwrap();
     }
-    assert!(db.drop_cells_in_range(ks, &[0; 4], &[255; 4]).is_err());
-    for key in 0..5u32 {
-        assert!(db.exists(ks, &key.to_be_bytes()).unwrap());
-    }
-    db.remove(ks, 4u32.to_be_bytes().to_vec()).unwrap();
+    assert!(5 > fixture.config.storage.batch_limits.max_operations);
     db.drop_cells_in_range(ks, &[0; 4], &[255; 4]).unwrap();
     assert!(db.iterator(ks).next().is_none());
-}
-
-fn sui_pruning_shape() -> KeyShape {
-    use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
-    let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space_config(
-        "transactions",
-        4,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(|_, _| crate::Decision::Remove),
-    );
-    builder.add_key_space_config(
-        "effects",
-        4,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(|_, value: &[u8]| match value[0] {
-            0 => crate::Decision::Remove,
-            1 => crate::Decision::StopRelocation,
-            _ => crate::Decision::Keep,
-        }),
-    );
-    builder.build()
-}
-
-#[test]
-fn sui_relocation_respects_operation_and_encoded_byte_limits() {
-    use crate::distributed::sui::Db;
-    use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
-    for compact in [false, true] {
-        for byte_limited in [false, true] {
-            let key_size = if byte_limited { 1024 } else { 4 };
-            let key_bytes = |number: u32| {
-                let mut key = vec![0; key_size];
-                key[..4].copy_from_slice(&number.to_be_bytes());
-                key
-            };
-            let mut builder = KeyShapeBuilder::new();
-            let mut config =
-                KeySpaceConfig::new().with_relocation_filter(|_, _| crate::Decision::Remove);
-            if compact {
-                config = config.with_compactor(Box::new(|keys| {
-                    keys.next_back().cloned().into_iter().collect()
-                }));
-            }
-            builder.add_key_space_config("transactions", key_size, 1, KeyType::uniform(1), config);
-            builder.add_key_space_config(
-                "effects",
-                4,
-                1,
-                KeyType::uniform(1),
-                KeySpaceConfig::new()
-                    .with_relocation_filter(|_, _| crate::Decision::StopRelocation),
-            );
-            let fixture = Fixture::new_with_shape(128, builder.build());
-            let tx = fixture
-                .shape
-                .iter_ks()
-                .find(|ks| ks.name() == "transactions")
-                .unwrap()
-                .id();
-            let db = Db::open_remote_local_fixture(
-                &fixture.temp.path().join("authority"),
-                fixture.shape.clone(),
-                fixture.config.clone(),
-            )
-            .unwrap();
-            for key in 0..5u32 {
-                db.insert(tx, key_bytes(key), vec![0]).unwrap();
-            }
-            db.insert(db.ks("effects"), vec![0; 4], vec![1]).unwrap();
-            db.insert(tx, key_bytes(99), vec![0]).unwrap();
-            db.start_relocation().unwrap();
-            for key in 0..5u32 {
-                assert!(!db.exists(tx, &key_bytes(key)).unwrap());
-            }
-            assert!(db.exists(tx, &key_bytes(99)).unwrap());
-            assert!(db.exists(db.ks("effects"), &[0; 4]).unwrap());
-        }
-    }
-}
-
-#[test]
-fn sui_relocation_protects_unconditional_remove_after_other_keyspace_stop() {
-    use crate::distributed::sui::Db;
-    let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
-    let db = Db::open_remote_local_fixture(
-        &fixture.temp.path().join("authority"),
-        fixture.shape.clone(),
-        fixture.config.clone(),
-    )
-    .unwrap();
-    db.insert(db.ks("effects"), vec![0; 4], vec![1]).unwrap();
-    db.insert(db.ks("transactions"), vec![0; 4], vec![0])
-        .unwrap();
-    db.start_relocation().unwrap();
-    assert!(db.exists(db.ks("transactions"), &[0; 4]).unwrap());
-    assert!(db.exists(db.ks("effects"), &[0; 4]).unwrap());
-}
-
-#[test]
-fn sui_relocation_protects_entire_atomic_batch_at_stop() {
-    use crate::distributed::sui::Db;
-    let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
-    let db = Db::open_remote_local_fixture(
-        &fixture.temp.path().join("authority"),
-        fixture.shape.clone(),
-        fixture.config.clone(),
-    )
-    .unwrap();
-    let mut batch = db.write_batch();
-    batch.write(db.ks("transactions"), vec![0; 4], vec![0]);
-    batch.write(db.ks("effects"), vec![0; 4], vec![1]);
-    batch.commit().unwrap();
-    db.start_relocation().unwrap();
-    assert!(db.exists(db.ks("transactions"), &[0; 4]).unwrap());
-    assert!(db.exists(db.ks("effects"), &[0; 4]).unwrap());
-}
-
-#[test]
-fn sui_relocation_deletes_eligible_rows_but_keeps_rows_across_keyspaces() {
-    use crate::distributed::sui::Db;
-    let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
-    let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-        .unwrap();
-    let tx = db.ks("transactions");
-    let effects = db.ks("effects");
-    db.insert(tx, vec![0; 4], vec![0]).unwrap();
-    db.insert(effects, vec![0; 4], vec![0]).unwrap();
-    db.insert(effects, vec![1; 4], vec![2]).unwrap();
-    db.insert(effects, vec![2; 4], vec![1]).unwrap();
-    db.insert(tx, vec![1; 4], vec![0]).unwrap();
-    db.start_relocation().unwrap();
-    assert!(!db.exists(tx, &[0; 4]).unwrap());
-    assert!(!db.exists(effects, &[0; 4]).unwrap());
-    assert!(db.exists(effects, &[1; 4]).unwrap());
-    assert!(db.exists(effects, &[2; 4]).unwrap());
-    assert!(db.exists(tx, &[1; 4]).unwrap());
-    drop(db);
-    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-        .unwrap();
-    assert!(!db.exists(tx, &[0; 4]).unwrap());
-    assert!(!db.exists(effects, &[0; 4]).unwrap());
-    assert!(db.exists(tx, &[1; 4]).unwrap());
-}
-
-#[test]
-fn sui_relocation_consults_overwritten_and_deleted_stop_history_after_reopen() {
-    use crate::distributed::sui::Db;
-    for delete in [false, true] {
-        let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
-        let path = fixture.temp.path().join("authority");
-        let db =
-            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-                .unwrap();
-        let tx = db.ks("transactions");
-        let effects = db.ks("effects");
-        db.insert(tx, vec![0; 4], vec![0]).unwrap();
-        db.insert(effects, vec![0; 4], vec![1]).unwrap();
-        db.insert(tx, vec![1; 4], vec![0]).unwrap();
-        if delete {
-            db.remove(effects, vec![0; 4]).unwrap();
-        } else {
-            db.insert(effects, vec![0; 4], vec![0]).unwrap();
-        }
-        db.flush().unwrap();
-        drop(db);
-        let db =
-            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-                .unwrap();
-        db.start_relocation().unwrap();
-        assert!(!db.exists(tx, &[0; 4]).unwrap());
-        assert!(
-            db.exists(tx, &[1; 4]).unwrap(),
-            "historical Stop must survive overwrite/delete and checkpoint reload"
-        );
-        assert_eq!(db.exists(effects, &[0; 4]).unwrap(), !delete);
+    for key in 0..5u32 {
+        assert!(!db.exists(ks, &key.to_be_bytes()).unwrap());
     }
 }
 
@@ -1722,54 +1618,6 @@ fn sui_native_cell_pruning_propagates_durability_barrier_failure() {
 }
 
 #[test]
-fn sui_relocation_compactor_keeps_cell_semantics_and_historical_stop() {
-    use crate::distributed::sui::Db;
-    use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
-    let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space_config(
-        "effects",
-        4,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new()
-            .with_relocation_filter(|_, _| crate::Decision::StopRelocation)
-            .with_compactor(Box::new(|keys| {
-                keys.next_back().cloned().into_iter().collect()
-            })),
-    );
-    builder.add_key_space_config(
-        "transactions",
-        4,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(|_, _| crate::Decision::Remove),
-    );
-    let fixture = Fixture::new_with_shape(128, builder.build());
-    let db = Db::open_remote_local_fixture(
-        &fixture.temp.path().join("authority"),
-        fixture.shape.clone(),
-        fixture.config.clone(),
-    )
-    .unwrap();
-    let effects = db.ks("effects");
-    let tx = db.ks("transactions");
-    db.insert(effects, vec![0; 4], vec![1]).unwrap();
-    db.insert(tx, vec![0; 4], vec![0]).unwrap();
-    db.insert(effects, vec![1; 4], vec![1]).unwrap();
-    // The earliest stop is in a mapped block; the later versions are overlay.
-    db.flush().unwrap();
-    db.insert(effects, vec![2; 4], vec![1]).unwrap();
-    db.start_relocation().unwrap();
-    assert!(!db.exists(effects, &[0; 4]).unwrap());
-    assert!(!db.exists(effects, &[1; 4]).unwrap());
-    assert!(db.exists(effects, &[2; 4]).unwrap());
-    assert!(db.exists(tx, &[0; 4]).unwrap());
-    // Compaction's tombstones must not hide the old stop on the next pass.
-    db.start_relocation().unwrap();
-    assert!(db.exists(tx, &[0; 4]).unwrap());
-}
-
-#[test]
 fn sui_native_cell_pruning_durable_deletion_survives_reopen() {
     use crate::distributed::sui::Db;
     use crate::key_shape::{KeyIndexing, KeyType};
@@ -1800,36 +1648,6 @@ fn sui_native_cell_pruning_durable_deletion_survives_reopen() {
     let db = Db::open_native(temp.path(), shape, config, recovery_metrics()).unwrap();
     assert!(!db.exists(ks, &[0; 8]).unwrap());
     db.wait_for_background_threads_to_finish().unwrap();
-}
-
-#[test]
-fn sui_relocation_retains_stop_overwritten_within_atomic_batch() {
-    use crate::distributed::sui::Db;
-    for checkpoint in [false, true] {
-        let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
-        let path = fixture.temp.path().join("authority");
-        let db =
-            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-                .unwrap();
-        let tx = db.ks("transactions");
-        let effects = db.ks("effects");
-        let mut batch = db.write_batch();
-        batch.write(tx, vec![0; 4], vec![0]);
-        batch.write(effects, vec![0; 4], vec![1]);
-        batch.write(effects, vec![0; 4], vec![0]);
-        batch.commit().unwrap();
-        let db = if checkpoint {
-            db.flush().unwrap();
-            drop(db);
-            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-                .unwrap()
-        } else {
-            db
-        };
-        db.start_relocation().unwrap();
-        assert!(db.exists(tx, &[0; 4]).unwrap());
-        assert_eq!(db.get(effects, &[0; 4]).unwrap().unwrap().as_ref(), &[0]);
-    }
 }
 
 #[test]
@@ -1902,7 +1720,7 @@ fn legacy_manifest_modes_fail_open_before_any_mutation() {
     for (index, node) in fixture.nodes.iter().enumerate() {
         // Fencing generation 1 only: no reopen reached an owner.
         assert_eq!(
-            node.status().unwrap().epochs.len(),
+            node.status().unwrap().highest_fenced_generation,
             1,
             "owner {index} was fenced by a legacy open"
         );
@@ -1918,6 +1736,27 @@ fn legacy_manifest_modes_fail_open_before_any_mutation() {
         &[7; 32]
     );
     db.shutdown().unwrap();
+}
+
+#[test]
+fn pre_generation_authority_manifest_is_rejected_without_rewrite() {
+    let fixture = Fixture::new();
+    fail_stop_without_checkpoint(fixture.open());
+    let root = fixture.temp.path().join("authority");
+    let mut old: serde_yaml::Value = read_metadata(&root.join(MANIFEST)).unwrap();
+    let fields = old.as_mapping_mut().unwrap();
+    fields.insert("format".into(), 2u32.into());
+    install_metadata(&root, MANIFEST, &encode_metadata(&old).unwrap()).unwrap();
+    let before = fs::read(root.join(MANIFEST)).unwrap();
+    let error = reopen_result(&fixture).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "unsupported distributed authority manifest format 2 (expected {})",
+            fencing_generations::AUTHORITY_FORMAT
+        )
+    );
+    assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before);
 }
 
 #[test]

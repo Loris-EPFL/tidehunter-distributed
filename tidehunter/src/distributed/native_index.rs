@@ -43,10 +43,19 @@ use std::ops::Bound;
 use std::path::Path;
 use typenum::U32;
 
+mod compactor;
+mod prune_marks;
+mod relocation;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
+pub(crate) use compactor::CompactorPolicy;
+use compactor::{CellPolicy, PolicyCapture, PolicyRoot};
+pub use compactor::{CompactorCadence, CompactorStats};
+use prune_marks::PruneMark;
+pub use prune_marks::PruneStats;
+pub(crate) use prune_marks::{MarkBudget, PruneCandidate, PrunePlan, UnboundedMarkBudget};
 
 /// Fixed cap of the Exact checkpoint cell flusher pool. Not a measured optimum.
 pub(crate) const MAX_CELL_FLUSHERS: usize = 8;
@@ -58,7 +67,6 @@ pub(crate) fn cell_flushers(shards: usize) -> usize {
         .min(shards)
         .clamp(1, MAX_CELL_FLUSHERS)
 }
-
 pub use retention::IndexReadPin;
 use retention::{CaptureLease, RetentionState, position, view_charge};
 pub(crate) use retention::{PublicationViewReservation, StandingViewBudget};
@@ -67,19 +75,40 @@ pub use shards::{
     DEFAULT_INDEX_SHARDS, IndexShardLoad, IndexShardStats, MAX_INDEX_SHARDS,
     PUBLICATION_HISTOGRAM_BUCKETS,
 };
-pub(crate) use snapshot::{PersistedIndexImage, PreparedIndexImage};
+pub(crate) use snapshot::{
+    CellEncodeStats, ImagePersistStats, PersistedIndexImage, PreparedIndexImage,
+};
+use std::sync::atomic::AtomicU64;
 pub use writer::IndexWriter;
 use writer::WriterState;
+pub(crate) use writer::drop_mask_charge;
 
 const MAGIC: &[u8; 8] = b"THINDEX1";
-const FORMAT: u16 = 4;
+/// The one root format the writer produces: the cell directory, then the
+/// sparse `DropCells` mask section (`be_u32` count, possibly zero). Older
+/// binaries accept only format 4 and refuse it. The final number is
+/// assigned at merge.
+const FORMAT: u16 = 5;
+/// The previous root format, read only: no mask section.
+const PREVIOUS_FORMAT: u16 = 4;
 const REFERENCE_BYTES: usize = 134;
 const MAX_IMAGE_BYTES: usize = 1 << 30;
 const VERSION_CHARGE: usize = std::mem::size_of::<ValueRecordReference>() + 32;
 const CELL_CHARGE: usize = std::mem::size_of::<CellIndex>() + 256;
+/// One `DropCells` mask version on one materialized cell, with its staging
+/// target entry and vector slack.
+const MASK_CHARGE: usize = std::mem::size_of::<MutationVersion>() + 40;
+
+/// One occupied cell collected for a `DropCells` member before READY, with
+/// the runtime birth ID it had then. Birth IDs are never persisted or reused.
+#[derive(Clone, Debug)]
+pub(crate) struct DropCellsTarget {
+    pub(crate) identity: (KeySpace, CellId),
+    pub(crate) birth: u64,
+}
 
 fn cell_directory_charge(cell: &CellId) -> usize {
-    // The append-only capture directory owns a second cell identity.
+    // The ordered cell directory owns a second cell identity and its birth ID.
     CELL_CHARGE + 2 * cell.len()
 }
 
@@ -140,6 +169,16 @@ impl SparseIndexView {
 }
 
 impl IndexReadCut {
+    /// Highest mutation version the cut includes; `None` for the empty cut
+    /// and for an unresolved `Latest`.
+    pub fn upper(&self) -> Option<MutationVersion> {
+        match self {
+            Self::Latest | Self::BeforeAll => None,
+            Self::At(version) => Some(*version),
+            Self::Sparse(view) => Some(view.upper),
+        }
+    }
+
     fn within_upper(&self, reference: &ValueRecordReference) -> bool {
         match self {
             Self::Latest => true,
@@ -158,6 +197,19 @@ impl IndexReadCut {
                     .is_err(),
                 _ => true,
             }
+    }
+
+    /// Same rule as [`Self::contains`] for a logical version without a
+    /// reference: upper bound, prefix bound and sparse exclusion.
+    fn contains_mutation(&self, version: MutationVersion) -> bool {
+        match self {
+            Self::Latest => true,
+            Self::BeforeAll => false,
+            Self::At(cut) => version <= *cut,
+            Self::Sparse(view) => {
+                version <= view.upper && view.excluded.binary_search(&version.batch).is_err()
+            }
+        }
     }
 }
 
@@ -236,6 +288,21 @@ struct CellIndex {
     sealed: Option<std::sync::Arc<Overlay<ValueRecordReference>>>,
     generation: u64,
     base: Option<SortedBlock>,
+    /// Ascending versions of the `DropCells` masks over this cell. A mask
+    /// hides every point reference at or below it from cuts containing it.
+    drop_versions: Vec<MutationVersion>,
+    /// Runtime identity of this materialization; a repopulated cell gets a
+    /// fresh one. Never persisted.
+    birth: u64,
+    /// Adopted index-only suppression marks, sorted by key then cut. Replaced
+    /// only by installation (one writer); `None` means none.
+    prune_marks: Option<std::sync::Arc<[PruneMark]>>,
+    /// Compactor progress of the adopted image; `None` is the keyspace
+    /// baseline. Replaced only by installation.
+    policy: Option<CellPolicy>,
+    /// Native per-birth dirty-key jitter, sampled at the first capture of a
+    /// callback-enabled cell. Never persisted.
+    jitter: Option<u32>,
 }
 
 /// One database's native-routed cells with typed logical versions and locations.
@@ -259,6 +326,11 @@ pub struct NativeIndex {
     accounting: Accounting,
     publication_shards: PublicationHistogram,
     retention: std::sync::Arc<RetentionState>,
+    /// Install epoch reached by the last completed installation. Marks with
+    /// a larger epoch belong to an installation in progress and stay hidden.
+    prune_epoch: AtomicU64,
+    /// Runtime compactor policy, set once at open from the caller's shape.
+    compactor: std::sync::OnceLock<std::sync::Arc<CompactorPolicy>>,
 }
 
 /// Digest of the exact durable CRC-framed image, usable by its manifest owner.
@@ -279,11 +351,12 @@ pub(crate) struct NativeIndexScan {
     cut: IndexReadCut,
 }
 
-/// Retained-history traversal for native WAL-style relocation filters. Latest
-/// rows cannot establish a safe cutoff: overwritten/deleted puts can still Stop.
-/// A retained-floor pin protects all traversed history, not just latest heads.
-/// The logical key/version frontier survives unloading and base replacement;
+/// Retained-history traversal of every retained version, oldest first. Only
+/// tests use it since R1 relocation replaced the pass that walked history in
+/// the coordinator. A retained-floor pin protects all traversed history. The
+/// logical key/version frontier survives unloading and base replacement;
 /// values are resolved one at a time without cloning retained history.
+#[cfg(test)]
 pub(crate) struct NativeIndexHistory {
     cells: Vec<(KeySpace, CellId)>,
     after: Option<(Bytes, MutationVersion)>,
@@ -291,14 +364,18 @@ pub(crate) struct NativeIndexHistory {
     cut: IndexReadCut,
 }
 
+#[cfg(test)]
 impl NativeIndexHistory {
     pub(crate) fn next(&mut self, index: &NativeIndex) -> Option<(Bytes, ValueRecordReference)> {
         loop {
             let last = self.cells.len().checked_sub(1)?;
             let next = {
                 // One shard read lock per row; no lock is held between rows.
+                // A reaped cell holds nothing for any valid cut.
                 let shard = index.shard_for(&self.cells[last]).read();
-                shard[&self.cells[last]].next_history(self.after.as_ref(), &self.cut)
+                shard.get(&self.cells[last]).and_then(|cell| {
+                    cell.next_history(self.after.as_ref(), &self.cut, cell.mask_at(&self.cut))
+                })
             };
             if let Some((key, reference)) = next {
                 self.after = Some((key.clone(), reference.mutation_version()));
@@ -323,7 +400,11 @@ impl NativeIndexScan {
 
     fn advance(&mut self, index: &NativeIndex, cell: usize) {
         while let Some((key, reference)) = self.cells[cell].next(index, self.reverse, &self.cut) {
-            if reference.descriptor.kind == RecordKind::Put {
+            let cursor = &self.cells[cell];
+            if reference.descriptor.kind == RecordKind::Put
+                && unmasked(&reference, cursor.mask)
+                && !cursor.suppressed
+            {
                 self.heads.push(ScanHead {
                     key,
                     reference,
@@ -343,6 +424,12 @@ struct CellScan {
     base_position: usize,
     base_owner: Option<Bytes>,
     after: Option<Bytes>,
+    /// The newest `DropCells` mask visible at the scan's fixed cut. Masks
+    /// staged later are above the cut; an absorbed mask leaves with the
+    /// references it covers, so the value stays exact for the whole scan.
+    mask: Option<MutationVersion>,
+    /// True when a visible prune mark suppresses the row `next` returned.
+    suppressed: bool,
 }
 
 impl CellScan {
@@ -361,6 +448,8 @@ impl CellScan {
             base_position,
             base_owner: source.base.as_ref().map(|block| block.bytes.clone()),
             after: after.cloned(),
+            mask: source.mask_at(cut),
+            suppressed: false,
         };
         cursor.advance_base(source, reverse, cut);
         cursor
@@ -415,7 +504,7 @@ impl CellScan {
         // One shard read lock per step; none is held between steps, so a scan
         // never blocks publication of its shard across pages.
         let shard = index.shard_for(&self.identity).read();
-        let source = &shard[&self.identity];
+        let source = shard.get(&self.identity)?;
         let replaced = match (&self.base_owner, &source.base) {
             (None, None) => false,
             (Some(owner), Some(block)) => {
@@ -458,6 +547,13 @@ impl CellScan {
             }
             self.advance_base(source, reverse, cut);
         }
+        self.suppressed = prune_marks::suppressed(
+            source.prune_marks.as_ref(),
+            &result.0,
+            result.1.mutation_version(),
+            cut,
+            &index.prune_epoch,
+        );
         self.after = Some(result.0.clone());
         Some(result)
     }
@@ -506,6 +602,8 @@ impl NativeIndex {
             accounting: Accounting::default(),
             publication_shards: PublicationHistogram::default(),
             retention: RetentionState::new(),
+            prune_epoch: AtomicU64::new(0),
+            compactor: std::sync::OnceLock::new(),
         })
     }
 
@@ -530,7 +628,12 @@ impl NativeIndex {
             .mutations()
             .iter()
             .try_fold(0usize, |total, mutation| {
-                let (_, reduced, cell) = self.route(mutation.keyspace(), mutation.key())?;
+                // A DropCells charge depends on the ordered cell directory,
+                // which only the writer reads: see `IndexWriter::drop_cells_charge`.
+                let key = mutation.point_key().ok_or(NativeIndexError::Invalid(
+                    "DropCells charge requires the index writer",
+                ))?;
+                let (_, reduced, cell) = self.route(mutation.keyspace(), key)?;
                 let cell_charge = if self.contains_cell(mutation.keyspace(), &cell) {
                     0
                 } else {
@@ -665,10 +768,35 @@ impl NativeIndex {
             &cut
         };
         self.validate_resolved(cut)?;
-        Ok(shard
-            .get(&identity)
-            .and_then(|cell| cell.get(&reduced, cut))
-            .filter(|reference| reference.descriptor.kind == RecordKind::Put))
+        Ok(shard.get(&identity).and_then(|cell| {
+            // A visible prune mark makes the selected version absent; the
+            // lookup never falls back to an older version.
+            cell.get(&reduced, cut).filter(|reference| {
+                reference.descriptor.kind == RecordKind::Put
+                    && !prune_marks::suppressed(
+                        cell.prune_marks.as_ref(),
+                        &reduced,
+                        reference.mutation_version(),
+                        cut,
+                        &self.prune_epoch,
+                    )
+            })
+        }))
+    }
+
+    /// Install the runtime compactor policy of the caller's shape. Once, at
+    /// open, before the index serves; later calls are refused.
+    pub(crate) fn set_compactor_policy(
+        &self,
+        policy: std::sync::Arc<CompactorPolicy>,
+    ) -> Result<(), NativeIndexError> {
+        self.compactor
+            .set(policy)
+            .map_err(|_| NativeIndexError::Invalid("compactor policy already installed"))
+    }
+
+    pub(crate) fn compactor_policy(&self) -> Option<&std::sync::Arc<CompactorPolicy>> {
+        self.compactor.get()
     }
 
     /// Ordered index references; cursors and ordering are reduced native index
@@ -730,6 +858,7 @@ impl NativeIndex {
         Ok(rows)
     }
 
+    #[cfg(test)]
     pub(crate) fn relocation_history(
         &self,
         keyspace: KeySpace,
@@ -815,7 +944,9 @@ impl NativeIndex {
         let mut retained = self.accounting.overlay();
         for shard in self.shards.iter_mut() {
             for ((_, cell_id), cell) in shard.get_mut().iter() {
-                directory += cell_directory_charge(cell_id);
+                directory += cell_directory_charge(cell_id)
+                    + cell.drop_versions.len() * MASK_CHARGE
+                    + prune_marks::marks_charge(cell.prune_marks.as_ref());
                 versions += cell
                     .overlay
                     .values()
@@ -895,6 +1026,59 @@ impl NativeIndex {
                     })
             })
         })
+    }
+
+    /// Visit every retained version of the installed immutable image: each
+    /// cell base, including floor anchors, overwritten history and destroyed
+    /// keyspaces. Overlay, captured and pending layers are not part of the image.
+    /// A shard lock is held only to clone block handles (reference counts, no
+    /// payload); decoding runs unlocked. `visit(None)` follows each cell.
+    pub(crate) fn visit_installed_references(
+        &self,
+        mut visit: impl FnMut(Option<&ValueRecordReference>),
+    ) -> Result<(), NativeIndexError> {
+        let mut blocks: Vec<(Bytes, usize)> = Vec::new();
+        for shard in self.shards.iter() {
+            blocks.clear();
+            blocks.extend(
+                shard
+                    .read()
+                    .values()
+                    .filter_map(|cell| cell.base.as_ref())
+                    .map(|block| (block.bytes.clone(), block.count)),
+            );
+            for (bytes, count) in &blocks {
+                for index in 0..*count {
+                    let values = installed_entry_values(bytes, index)
+                        .ok_or(NativeIndexError::Invalid("installed cell entry bounds"))?;
+                    for value in values.chunks_exact(REFERENCE_BYTES) {
+                        visit(Some(&decode_reference(value)?));
+                    }
+                }
+                visit(None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit references held only by volatile layers: the live overlay and a
+    /// captured generation. References are copied per shard under its read
+    /// lock and visited after it is released.
+    pub(crate) fn visit_volatile_references(
+        &self,
+        mut reference: impl FnMut(&ValueRecordReference),
+    ) {
+        let mut copied: Vec<ValueRecordReference> = Vec::new();
+        for shard in self.shards.iter() {
+            copied.clear();
+            for cell in shard.read().values() {
+                copied.extend(cell.overlay.values().flatten().copied());
+                if let Some(sealed) = &cell.sealed {
+                    copied.extend(sealed.values().flatten().copied());
+                }
+            }
+            copied.iter().for_each(&mut reference);
+        }
     }
 
     pub fn open_snapshot(
@@ -1041,11 +1225,37 @@ impl CellIndex {
         }
     }
 
+    /// The newest `DropCells` mask visible at `cut`, with the same `Latest`,
+    /// prefix and sparse rules as a point reference.
+    fn mask_at(&self, cut: &IndexReadCut) -> Option<MutationVersion> {
+        self.drop_versions
+            .iter()
+            .rev()
+            .copied()
+            .find(|version| cut.contains_mutation(*version))
+    }
+
+    /// True when no staged, published or stored state remains: the cell can
+    /// leave the directory without changing any cut's answer.
+    fn is_empty(&self) -> bool {
+        self.pending.len() == 0
+            && self.overlay.is_empty()
+            && self.sealed.is_none()
+            && self.base.is_none()
+            && self.drop_versions.is_empty()
+    }
+
     fn exact(&self, key: &[u8], version: MutationVersion) -> Option<ValueRecordReference> {
-        let selected = self.get(key, &IndexReadCut::At(version));
+        // Unmasked: duplicate detection compares stored references.
+        let selected = self.get_unmasked(key, &IndexReadCut::At(version));
         selected.filter(|reference| reference.mutation_version() == version)
     }
     fn get(&self, key: &[u8], cut: &IndexReadCut) -> Option<ValueRecordReference> {
+        let mask = self.mask_at(cut);
+        self.get_unmasked(key, cut)
+            .filter(|reference| unmasked(reference, mask))
+    }
+    fn get_unmasked(&self, key: &[u8], cut: &IndexReadCut) -> Option<ValueRecordReference> {
         let selected = |overlay: &Overlay<ValueRecordReference>| {
             overlay.get(key).and_then(|values| {
                 matching_prefix(values, |value| cut.within_upper(value))
@@ -1108,10 +1318,12 @@ impl CellIndex {
         }
     }
 
+    #[cfg(test)]
     fn next_history(
         &self,
         after: Option<&(Bytes, MutationVersion)>,
         cut: &IndexReadCut,
+        mask: Option<MutationVersion>,
     ) -> Option<(Bytes, ValueRecordReference)> {
         let base = self.base.as_ref().and_then(|block| {
             let first = after.map_or(0, |(key, _)| {
@@ -1133,7 +1345,10 @@ impl CellIndex {
                     if !cut.within_upper(&reference) {
                         break;
                     }
-                    if cut.contains(&reference) && reference.descriptor.kind == RecordKind::Put {
+                    if cut.contains(&reference)
+                        && reference.descriptor.kind == RecordKind::Put
+                        && unmasked(&reference, mask)
+                    {
                         return Some((block.bytes.slice_to_bytes(key), reference));
                     }
                 }
@@ -1155,7 +1370,9 @@ impl CellIndex {
                         .iter()
                         .take_while(|value| cut.within_upper(value))
                         .find(|value| {
-                            cut.contains(value) && value.descriptor.kind == RecordKind::Put
+                            cut.contains(value)
+                                && value.descriptor.kind == RecordKind::Put
+                                && unmasked(value, mask)
                         })
                         .map(|reference| (key.clone(), *reference))
                 })
@@ -1165,6 +1382,7 @@ impl CellIndex {
     }
 }
 
+#[cfg(test)]
 fn earliest_history(
     a: Option<(Bytes, ValueRecordReference)>,
     b: Option<(Bytes, ValueRecordReference)>,
@@ -1183,6 +1401,12 @@ fn earliest_history(
             },
         ),
     }
+}
+
+/// A point reference survives a visible `DropCells` mask only when it is
+/// newer than the mask.
+fn unmasked(reference: &ValueRecordReference, mask: Option<MutationVersion>) -> bool {
+    mask.is_none_or(|mask| reference.mutation_version() > mask)
 }
 
 fn newest(
@@ -1210,6 +1434,10 @@ struct SortedBlock {
     retained_versions: usize,
 }
 impl SortedBlock {
+    /// Validate the rows of a cell payload. Returns the block, which holds
+    /// only the rows, and the bytes after the last row: the cell's prune-mark
+    /// trailer, empty for a cell without marks. The caller validates the
+    /// trailer.
     fn validated(
         bytes: Bytes,
         mapped: bool,
@@ -1218,7 +1446,7 @@ impl SortedBlock {
         descriptor: &KeySpaceDesc,
         cell: &CellId,
         cut: IndexReadCut,
-    ) -> Result<Self, NativeIndexError> {
+    ) -> Result<(Self, Bytes), NativeIndexError> {
         let mut cursor = Cursor::new(&bytes);
         let count = cursor.u32()? as usize;
         if count == 0 || count > cursor.remaining() / 4 {
@@ -1272,18 +1500,42 @@ impl SortedBlock {
             prior_key = Some(key);
             expected = cursor.position;
         }
-        if cursor.remaining() != 0 {
-            return Err(NativeIndexError::Invalid("trailing block bytes"));
+        let rows = cursor.position;
+        Ok((
+            Self {
+                bytes: bytes.slice(..rows),
+                count,
+                mapped,
+                cut,
+                file: None,
+                retained_bytes,
+                retained_versions,
+            },
+            bytes.slice(rows..),
+        ))
+    }
+
+    /// Length of the rows of an already validated cell payload: the end of
+    /// its last row. The payload may continue with a prune-mark trailer.
+    fn rows_len(payload: &[u8]) -> Result<usize, NativeIndexError> {
+        let field = |at: usize| -> Result<usize, NativeIndexError> {
+            payload
+                .get(at..at + 4)
+                .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
+                .ok_or(NativeIndexError::Invalid("truncated cell payload"))
+        };
+        let count = field(0)?;
+        if count == 0 {
+            return Err(NativeIndexError::Invalid("block offset count"));
         }
-        Ok(Self {
-            bytes,
-            count,
-            mapped,
-            cut,
-            file: None,
-            retained_bytes,
-            retained_versions,
-        })
+        let last = field(4 + (count - 1) * 4)?;
+        let key = field(last)?;
+        let versions = field(last + 4 + key)?;
+        let end = last + 8 + key + versions * REFERENCE_BYTES;
+        if end > payload.len() {
+            return Err(NativeIndexError::Invalid("truncated cell payload"));
+        }
+        Ok(end)
     }
     fn entry(&self, index: usize) -> (&[u8], &[u8]) {
         let offset =
@@ -1380,6 +1632,23 @@ fn encode_reference(reference: &ValueRecordReference, output: &mut Vec<u8>) {
     output.extend_from_slice(&d.checksum.0.to_be_bytes());
     debug_assert_eq!(output.len() - before, REFERENCE_BYTES);
 }
+
+/// Checked form of `SortedBlock::entry` for a cloned block handle: the encoded
+/// reference list of entry `index`, or `None` if any bound is out of range.
+fn installed_entry_values(bytes: &[u8], index: usize) -> Option<&[u8]> {
+    let u32_at = |at: usize| -> Option<usize> {
+        let end = at.checked_add(4)?;
+        let word: [u8; 4] = bytes.get(at..end)?.try_into().ok()?;
+        usize::try_from(u32::from_be_bytes(word)).ok()
+    };
+    let offset = u32_at(index.checked_mul(4)?.checked_add(4)?)?;
+    let key_len = u32_at(offset)?;
+    let count_at = offset.checked_add(4)?.checked_add(key_len)?;
+    let count = u32_at(count_at)?;
+    let start = count_at.checked_add(4)?;
+    bytes.get(start..start.checked_add(count.checked_mul(REFERENCE_BYTES)?)?)
+}
+
 fn decode_reference(bytes: &[u8]) -> Result<ValueRecordReference, NativeIndexError> {
     let mut c = Cursor::new(bytes);
     let id = BatchId {
@@ -1523,10 +1792,13 @@ mod tests {
     use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig};
     use crate::metrics::Metrics;
 
+    mod compactor_policy;
     mod containers;
     mod cursors;
+    mod drop_cells;
     mod legacy_fixtures;
     mod lifecycle;
+    mod mark_frames;
     mod owners;
     mod sharding;
     mod sparse;
@@ -1682,7 +1954,7 @@ mod tests {
                     assert_eq!(&*actual_key, key);
                     value
                 }
-                Mutation::Delete { .. } => panic!("get returned a tombstone"),
+                _ => panic!("get returned a tombstone"),
             }
         })
     }
@@ -2357,7 +2629,8 @@ mod tests {
             }),
             ("cell-floor", {
                 let mut bytes = payload.to_vec();
-                let at = bytes.len() - 21;
+                // The last cell floor precedes the 4-byte empty mask section.
+                let at = bytes.len() - 4 - 21;
                 bytes[at] = 7;
                 bytes
             }),

@@ -11,11 +11,18 @@
 //! point reads use trusted membership metadata and verify only the selected
 //! member. This keeps the paper's direct index-to-Value-WAL read path (§3)
 //! without reading sibling values or creating another permanent value representation.
+//!
+//! Version 4 is a singleton batch whose one member is a native `DropCells`
+//! entry (tag 6, see `drop_cells`). It has no value and no record descriptor;
+//! it is never mixed with point members.
+
+mod drop_cells;
 
 use super::types::{
     BatchId, BatchVersion, MemberChecksum, MutationVersion, PayloadDigest, PhysicalValueAddress,
     RecordDescriptor, RecordKind, ValueRecordReference,
 };
+use crate::cell::CellId;
 use crate::crc::IntoBytesFixed;
 use crate::db::{MAX_KEY_LEN, WalEntry};
 use crate::key_shape::{KeyIndexing, KeyShape, KeySpace};
@@ -25,6 +32,8 @@ use std::fmt;
 
 const MAGIC: &[u8; 8] = b"THBATCH3";
 pub const FORMAT_VERSION: u16 = 3;
+/// Format of a singleton `DropCells` batch. Point batches keep version 3.
+pub(crate) const DROP_CELLS_FORMAT_VERSION: u16 = 4;
 // magic, format, reserved, stable identity, original version, count, payload digest.
 const DIGEST_OFFSET: usize = 8 + 2 + 2 + 32 + 16 + 4;
 pub(crate) const HEADER_LEN: usize = DIGEST_OFFSET + 32;
@@ -67,18 +76,29 @@ pub enum Mutation {
         keyspace: KeySpace,
         key: Bytes,
     },
+    /// Clear every key of the inclusive reduced-cell range at this version.
+    /// Valid only as the sole member of a batch; it has no key or value.
+    DropCells {
+        keyspace: KeySpace,
+        first_cell: CellId,
+        last_cell: CellId,
+    },
 }
 
 impl Mutation {
     pub fn keyspace(&self) -> KeySpace {
         match self {
-            Self::Put { keyspace, .. } | Self::Delete { keyspace, .. } => *keyspace,
+            Self::Put { keyspace, .. }
+            | Self::Delete { keyspace, .. }
+            | Self::DropCells { keyspace, .. } => *keyspace,
         }
     }
 
-    pub fn key(&self) -> &Bytes {
+    /// The key of a point member; `None` for `DropCells`.
+    pub fn point_key(&self) -> Option<&Bytes> {
         match self {
-            Self::Put { key, .. } | Self::Delete { key, .. } => key,
+            Self::Put { key, .. } | Self::Delete { key, .. } => Some(key),
+            Self::DropCells { .. } => None,
         }
     }
 
@@ -90,8 +110,38 @@ impl Mutation {
                 value,
             } => WalEntry::Record(*keyspace, key.clone(), value.clone(), false),
             Self::Delete { keyspace, key } => WalEntry::Remove(*keyspace, key.clone()),
+            Self::DropCells {
+                keyspace,
+                first_cell,
+                last_cell,
+            } => WalEntry::DropCells(*keyspace, first_cell.clone(), last_cell.clone()),
         }
     }
+}
+
+/// Framing of the one `DropCells` member: offset and length inside the
+/// payload and its domain-separated CRC. Not a value record reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RangeMemberDescriptor {
+    pub offset: u32,
+    pub len: u32,
+    pub checksum: MemberChecksum,
+}
+
+/// Point batches carry one record descriptor per member; a `DropCells`
+/// batch carries one member and zero record descriptors.
+#[derive(Clone, Debug)]
+enum BatchDescriptors {
+    Points(Vec<RecordDescriptor>),
+    DropCells(
+        // The validated framing of the one member. Readers need only the
+        // decoded cells; the codec tests check the framing.
+        #[cfg_attr(
+            not(test),
+            expect(dead_code, reason = "member framing is checked by codec tests only")
+        )]
+        RangeMemberDescriptor,
+    ),
 }
 
 /// A validated, immutable canonical record. Construction does not append or
@@ -102,7 +152,7 @@ pub struct CompleteBatch {
     version: BatchVersion,
     digest: PayloadDigest,
     mutations: Vec<Mutation>,
-    descriptors: Vec<RecordDescriptor>,
+    descriptors: BatchDescriptors,
     encoded: Bytes,
     // All constructors own encoded bytes before validation. `new` additionally
     // needs to detach caller mutation owners before retaining a queued job.
@@ -152,6 +202,7 @@ impl CompleteBatch {
     ) -> Result<(), CodecError> {
         limits.validate()?;
         check_count(self.mutations.len(), limits)?;
+        check_drop_cells_singleton(&self.mutations)?;
         if self.encoded.len() > limits.max_encoded_bytes {
             return Err(CodecError::TooLarge);
         }
@@ -179,6 +230,7 @@ impl CompleteBatch {
     ) -> Result<ValidatedMutations<'a>, CodecError> {
         limits.validate()?;
         check_count(mutations.len(), limits)?;
+        check_drop_cells_singleton(mutations)?;
         let mut size = HEADER_LEN;
         let mut routing_heap_bound = 0usize;
         // One walk validates encoding and bounds retained routing allocations.
@@ -191,9 +243,24 @@ impl CompleteBatch {
                 .and_then(|n| n.checked_add(mutation.native_entry().len()))
                 .filter(|size| *size <= limits.max_encoded_bytes)
                 .ok_or(CodecError::TooLarge)?;
+            let key = match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key, .. } => key,
+                Mutation::DropCells {
+                    first_cell,
+                    last_cell,
+                    ..
+                } => {
+                    // The slot copy and the routing copy of each spilled prefix.
+                    routing_heap_bound = drop_cells::spilled_bytes(first_cell, last_cell)
+                        .checked_mul(2)
+                        .and_then(|bytes| routing_heap_bound.checked_add(bytes))
+                        .ok_or(CodecError::TooLarge)?;
+                    continue;
+                }
+            };
             let descriptor = shape.ks(mutation.keyspace());
             let indexing = descriptor.key_indexing();
-            let reduced_len = indexing.index_key_size().unwrap_or(mutation.key().len());
+            let reduced_len = indexing.index_key_size().unwrap_or(key.len());
             if reduced_len > 16 {
                 routing_heap_bound = reduced_len
                     .checked_mul(2)
@@ -231,9 +298,23 @@ impl CompleteBatch {
         mutations: Vec<Mutation>,
         size: usize,
     ) -> Result<Self, CodecError> {
+        let range = match mutations.as_slice() {
+            [
+                Mutation::DropCells {
+                    keyspace,
+                    first_cell,
+                    last_cell,
+                },
+            ] => Some((*keyspace, first_cell, last_cell)),
+            _ => None,
+        };
         let mut encoded = BytesMut::with_capacity(size);
         encoded.put_slice(MAGIC);
-        encoded.put_u16(FORMAT_VERSION);
+        encoded.put_u16(if range.is_some() {
+            DROP_CELLS_FORMAT_VERSION
+        } else {
+            FORMAT_VERSION
+        });
         encoded.put_u16(0); // reserved, must remain zero for canonical encoding
         encoded.put_slice(&id.database);
         encoded.put_slice(&id.operation);
@@ -241,6 +322,27 @@ impl CompleteBatch {
         encoded.put_u64(version.sequence);
         encoded.put_u32(mutations.len() as u32);
         encoded.put_slice(&[0; 32]);
+        if let Some((keyspace, first_cell, last_cell)) = range {
+            let descriptor = drop_cells::encode_member(
+                id,
+                version,
+                keyspace,
+                first_cell,
+                last_cell,
+                &mut encoded,
+            )?;
+            let digest = record_digest(&encoded);
+            encoded[DIGEST_OFFSET..HEADER_LEN].copy_from_slice(&digest.0);
+            return Ok(Self {
+                id,
+                version,
+                digest,
+                mutations,
+                descriptors: BatchDescriptors::DropCells(descriptor),
+                encoded: encoded.freeze().into(),
+                canonical_owned: false,
+            });
+        }
         let mut descriptors = Vec::with_capacity(mutations.len());
         for (operation_index, mutation) in mutations.iter().enumerate() {
             let entry = mutation.native_entry();
@@ -248,7 +350,10 @@ impl CompleteBatch {
             encoded.put_u32(entry.len() as u32);
             encoded.put_u32(0);
             entry.write_into_bytes(&mut encoded);
-            descriptors.push(describe_mutation(operation_index as u32, offset, mutation));
+            descriptors.push(
+                describe_mutation(operation_index as u32, offset, mutation)
+                    .ok_or(CodecError::DropCellsNotSingleton)?,
+            );
         }
         for descriptor in &mut descriptors {
             let checksum =
@@ -265,7 +370,7 @@ impl CompleteBatch {
             version,
             digest,
             mutations,
-            descriptors,
+            descriptors: BatchDescriptors::Points(descriptors),
             encoded: encoded.freeze().into(),
             canonical_owned: false,
         })
@@ -315,7 +420,8 @@ impl CompleteBatch {
         if cursor.take(8)? != MAGIC {
             return Err(CodecError::InvalidFormat);
         }
-        if cursor.u16()? != FORMAT_VERSION || cursor.u16()? != 0 {
+        let format = cursor.u16()?;
+        if !matches!(format, FORMAT_VERSION | DROP_CELLS_FORMAT_VERSION) || cursor.u16()? != 0 {
             return Err(CodecError::InvalidFormat);
         }
         let id = BatchId {
@@ -337,6 +443,45 @@ impl CompleteBatch {
         if digest != record_digest(&encoded) {
             return Err(CodecError::DigestMismatch);
         }
+        if format == DROP_CELLS_FORMAT_VERSION {
+            if count != 1 {
+                return Err(CodecError::DropCellsNotSingleton);
+            }
+            let offset = u32::try_from(cursor.position).map_err(|_| CodecError::TooLarge)?;
+            let len = cursor.u32()? as usize;
+            let checksum = MemberChecksum(cursor.u32()?);
+            let native = cursor.take(len)?;
+            if cursor.position != encoded.len() {
+                return Err(CodecError::TrailingBytes);
+            }
+            // Version 4 accepts only tag 6; version 3 rejects it below.
+            let mutation = drop_cells::decode_native(shape, native)?;
+            let descriptor = RangeMemberDescriptor {
+                offset,
+                len: u32::try_from(MEMBER_HEADER_LEN + len).map_err(|_| CodecError::TooLarge)?,
+                checksum,
+            };
+            if checksum
+                != drop_cells::member_checksum(
+                    id,
+                    version,
+                    &descriptor,
+                    mutation.keyspace(),
+                    native,
+                )
+            {
+                return Err(CodecError::ChecksumMismatch);
+            }
+            return Ok(Self {
+                id,
+                version,
+                digest,
+                mutations: vec![mutation],
+                descriptors: BatchDescriptors::DropCells(descriptor),
+                encoded,
+                canonical_owned: true,
+            });
+        }
         let mut mutations = Vec::with_capacity(count);
         let mut descriptors = Vec::with_capacity(count);
         for operation_index in 0..count {
@@ -346,7 +491,8 @@ impl CompleteBatch {
             let start = cursor.position;
             cursor.take(len)?;
             let mutation = decode_native(shape, &encoded.slice(start..start + len))?;
-            let mut descriptor = describe_mutation(operation_index as u32, offset, &mutation);
+            let mut descriptor = describe_mutation(operation_index as u32, offset, &mutation)
+                .ok_or(CodecError::InvalidMutation)?;
             descriptor.checksum = checksum;
             mutations.push(mutation);
             descriptors.push(descriptor);
@@ -366,7 +512,7 @@ impl CompleteBatch {
             version,
             digest,
             mutations,
-            descriptors,
+            descriptors: BatchDescriptors::Points(descriptors),
             encoded,
             canonical_owned: true,
         })
@@ -380,8 +526,12 @@ impl CompleteBatch {
         if self.canonical_owned {
             return self;
         }
-        let mutations: Vec<_> = self
-            .descriptors
+        // A DropCells member owns its cell identities; nothing borrows input.
+        let BatchDescriptors::Points(descriptors) = self.descriptors else {
+            self.canonical_owned = true;
+            return self;
+        };
+        let mutations: Vec<_> = descriptors
             .iter()
             .map(|descriptor| {
                 let value_start = descriptor.offset as usize + descriptor.value_offset as usize;
@@ -401,7 +551,7 @@ impl CompleteBatch {
             })
             .collect();
         self.mutations = mutations.into_boxed_slice().into_vec();
-        self.descriptors = self.descriptors.into_boxed_slice().into_vec();
+        self.descriptors = BatchDescriptors::Points(descriptors.into_boxed_slice().into_vec());
         self.canonical_owned = true;
         self
     }
@@ -422,8 +572,36 @@ impl CompleteBatch {
         &self.encoded
     }
 
+    /// Point record descriptors; empty for a `DropCells` batch, which has one
+    /// member but no value record.
     pub fn record_descriptors(&self) -> &[RecordDescriptor] {
-        &self.descriptors
+        match &self.descriptors {
+            BatchDescriptors::Points(descriptors) => descriptors,
+            BatchDescriptors::DropCells(_) => &[],
+        }
+    }
+
+    /// Framing of the `DropCells` member, for codec tests.
+    #[cfg(test)]
+    pub(crate) fn range_member(&self) -> Option<RangeMemberDescriptor> {
+        match &self.descriptors {
+            BatchDescriptors::DropCells(member) => Some(*member),
+            BatchDescriptors::Points(_) => None,
+        }
+    }
+
+    /// The validated cell range of a singleton `DropCells` batch.
+    pub(crate) fn drop_cells(&self) -> Option<(KeySpace, &CellId, &CellId)> {
+        match self.mutations.as_slice() {
+            [
+                Mutation::DropCells {
+                    keyspace,
+                    first_cell,
+                    last_cell,
+                },
+            ] => Some((*keyspace, first_cell, last_cell)),
+            _ => None,
+        }
     }
 
     /// Create membership metadata only after the complete batch was validated.
@@ -433,11 +611,13 @@ impl CompleteBatch {
         address: PhysicalValueAddress,
         operation_index: usize,
     ) -> Result<ValueRecordReference, CodecError> {
+        let BatchDescriptors::Points(descriptors) = &self.descriptors else {
+            return Err(CodecError::DropCellsReference);
+        };
         if address.len as usize != self.encoded.len() + NATIVE_CRC_HEADER_LEN {
             return Err(CodecError::InvalidReference);
         }
-        let descriptor = *self
-            .descriptors
+        let descriptor = *descriptors
             .get(operation_index)
             .ok_or(CodecError::InvalidReference)?;
         let reference = ValueRecordReference {
@@ -499,24 +679,30 @@ impl IntoBytesFixed for CompleteBatch {
     }
 }
 
-fn describe_mutation(operation_index: u32, offset: usize, mutation: &Mutation) -> RecordDescriptor {
-    let (kind, value_len, native_header_len) = match mutation {
-        Mutation::Put { value, .. } => (RecordKind::Put, value.len(), 4),
-        Mutation::Delete { .. } => (RecordKind::Delete, 0, 2),
+/// `None` for `DropCells`, which has no record descriptor.
+fn describe_mutation(
+    operation_index: u32,
+    offset: usize,
+    mutation: &Mutation,
+) -> Option<RecordDescriptor> {
+    let (kind, key, value_len, native_header_len) = match mutation {
+        Mutation::Put { key, value, .. } => (RecordKind::Put, key, value.len(), 4),
+        Mutation::Delete { key, .. } => (RecordKind::Delete, key, 0, 2),
+        Mutation::DropCells { .. } => return None,
     };
     // Callers validated total frame size (< 1 GiB) and the native key limit.
-    let value_offset = MEMBER_HEADER_LEN + native_header_len + mutation.key().len();
-    RecordDescriptor {
+    let value_offset = MEMBER_HEADER_LEN + native_header_len + key.len();
+    Some(RecordDescriptor {
         operation_index,
         offset: offset as u32,
         len: (value_offset + value_len) as u32,
         keyspace: mutation.keyspace().0,
         kind,
-        key_len: mutation.key().len() as u32,
+        key_len: key.len() as u32,
         value_offset: value_offset as u32,
         value_len: value_len as u32,
         checksum: MemberChecksum(0),
-    }
+    })
 }
 
 /// Validate untrusted address arithmetic before any storage I/O or allocation.
@@ -628,7 +814,8 @@ fn decode_record_mutation(
         descriptor.operation_index,
         descriptor.offset as usize,
         &mutation,
-    );
+    )
+    .ok_or(CodecError::DropCellsReference)?;
     expected.checksum = descriptor.checksum;
     if *descriptor != expected {
         return Err(CodecError::InvalidReference);
@@ -718,7 +905,27 @@ fn check_encoded_len(len: usize, limits: BatchLimits) -> Result<(), CodecError> 
     }
 }
 
+/// A `DropCells` member is valid only as the sole member of a batch.
+fn check_drop_cells_singleton(mutations: &[Mutation]) -> Result<(), CodecError> {
+    if mutations.len() > 1
+        && mutations
+            .iter()
+            .any(|mutation| matches!(mutation, Mutation::DropCells { .. }))
+    {
+        return Err(CodecError::DropCellsNotSingleton);
+    }
+    Ok(())
+}
+
 fn validate_mutation(shape: &KeyShape, mutation: &Mutation) -> Result<(), CodecError> {
+    let key = match mutation {
+        Mutation::Put { key, .. } | Mutation::Delete { key, .. } => key,
+        Mutation::DropCells {
+            keyspace,
+            first_cell,
+            last_cell,
+        } => return drop_cells::validate(shape, *keyspace, first_cell, last_cell),
+    };
     let keyspace = mutation.keyspace();
     let Some(descriptor) = shape
         .iter_ks()
@@ -729,7 +936,7 @@ fn validate_mutation(shape: &KeyShape, mutation: &Mutation) -> Result<(), CodecE
     if descriptor.destroyed() {
         return Err(CodecError::DestroyedKeySpace(keyspace.0));
     }
-    let len = mutation.key().len();
+    let len = key.len();
     let valid = len <= MAX_KEY_LEN
         && match descriptor.key_indexing() {
             KeyIndexing::Fixed(expected) | KeyIndexing::Reduction(expected, _) => len == *expected,
@@ -805,11 +1012,28 @@ pub enum CodecError {
     InvalidRouting {
         keyspace: u8,
     },
+    /// A `DropCells` member shares its batch with another member.
+    DropCellsNotSingleton,
+    /// Malformed, noncanonical or reversed `DropCells` cells for the shape.
+    InvalidDropCells {
+        keyspace: u8,
+    },
+    /// A value reference was requested for the `DropCells` member.
+    DropCellsReference,
 }
 
 impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid complete batch: {self:?}")
+        match self {
+            Self::DropCellsNotSingleton => {
+                f.write_str("DropCells must be the only member in a batch")
+            }
+            Self::InvalidDropCells { keyspace } => {
+                write!(f, "invalid DropCells cell encoding for keyspace {keyspace}")
+            }
+            Self::DropCellsReference => f.write_str("DropCells does not have a value reference"),
+            _ => write!(f, "invalid complete batch: {self:?}"),
+        }
     }
 }
 impl std::error::Error for CodecError {}
@@ -981,10 +1205,10 @@ mod tests {
         assert_eq!(canonical.encoded(), &encoded);
         assert_eq!(canonical.digest(), digest);
         assert_eq!(canonical.mutations.capacity(), canonical.mutations.len());
-        assert_eq!(
-            canonical.descriptors.capacity(),
-            canonical.descriptors.len()
-        );
+        let BatchDescriptors::Points(descriptors) = &canonical.descriptors else {
+            panic!("point batch has point descriptors");
+        };
+        assert_eq!(descriptors.capacity(), descriptors.len());
         let decoded = CompleteBatch::decode(&shape(), encoded.clone(), limits()).unwrap();
         assert_eq!(canonical.mutations(), decoded.mutations());
         assert_eq!(canonical.record_descriptors(), decoded.record_descriptors());
@@ -1193,7 +1417,7 @@ mod tests {
         .unwrap();
         let _ = boundary
             .ks(KeySpace(0))
-            .cell_id(accepted.mutations()[0].key());
+            .cell_id(accepted.mutations()[0].point_key().unwrap());
 
         // Deserialization can encounter a zero count even though the ordinary
         // KeyType constructor rejects it. It must fail the same admission gate.

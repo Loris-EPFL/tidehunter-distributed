@@ -159,7 +159,7 @@ impl ConcurrentRemoteDatabase {
             let generation = self.read_admission_generation();
             pending.batch.dispatch(&self.reads)?;
             if pending.batch.reads.is_empty() {
-                self.wait_read_admission(generation, pending.batch.deadline)?;
+                self.wait_read_admission(generation, None)?;
             } else {
                 pending
                     .batch

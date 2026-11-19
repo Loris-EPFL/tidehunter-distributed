@@ -23,6 +23,11 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "live_target/retirement.rs"]
+mod retirement;
+#[path = "live_target/teardown.rs"]
+mod teardown;
+
 const CONFIGFS: &str = "/sys/kernel/config/nvmet";
 const STATE: &str = "live-target.json";
 const MAX_STATE: u64 = 4 * 1024 * 1024;
@@ -290,13 +295,20 @@ impl LiveTargetManager {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn open_existing_fixture(
         config: LiveTargetConfig,
         configfs: PathBuf,
         expected: LiveTargetIdentity,
     ) -> io::Result<Self> {
-        Self::open_inner(config, configfs, true, Some(expected), None)
+        Self::open_inner(
+            config,
+            configfs,
+            true,
+            Some(expected),
+            #[cfg(test)]
+            None,
+        )
     }
 
     pub fn open(config: LiveTargetConfig) -> io::Result<Self> {
@@ -334,6 +346,26 @@ impl LiveTargetManager {
         configfs: PathBuf,
         fixture: bool,
         expected: Option<LiveTargetIdentity>,
+        #[cfg(test)] save_hook: Option<SaveHook>,
+    ) -> io::Result<Self> {
+        Self::open_inner_mode(
+            config,
+            configfs,
+            fixture,
+            expected,
+            true,
+            #[cfg(test)]
+            save_hook,
+        )
+    }
+    /// `setup = false` reconciles and cleans the journal but never creates
+    /// the host, ports or commissioning objects again.
+    fn open_inner_mode(
+        config: LiveTargetConfig,
+        configfs: PathBuf,
+        fixture: bool,
+        expected: Option<LiveTargetIdentity>,
+        setup: bool,
         #[cfg(test)] save_hook: Option<SaveHook>,
     ) -> io::Result<Self> {
         validate_config(&config)?;
@@ -482,7 +514,9 @@ impl LiveTargetManager {
             manager.commissioning = Some(LiveConnectionRegistry::open(&path)?);
         }
         manager.cleanup(None)?;
-        manager.setup()?;
+        if setup {
+            manager.setup()?;
+        }
         Ok(manager)
     }
     /// Caller must durably bind this identity to the node before export.
@@ -775,6 +809,12 @@ impl LiveTargetManager {
             } else {
                 Err(invalid("WAL file already exported"))
             };
+        }
+        // A durable seal marker means this path was fenced or retired: never
+        // restore a writable capability. Refused without quarantining the
+        // manager, as `export` does for its writable case.
+        if self.sealed_file(&file.path)?.is_some() {
+            return Err(invalid("fenced WAL cannot be exported writable again"));
         }
         let result = self.export_permanent_inner(name, file);
         if result.is_err() {

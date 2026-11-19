@@ -238,13 +238,43 @@ def _delta(before, after, source, peer, transport):
     return advancing
 
 
+def _admit_target_reuse(proof, remote_config):
+    """Return the reuse proof and independently derived initiators by database."""
+    reuse = proof.get('target_reuse')
+    if not isinstance(reuse, dict):
+        raise ValueError('target reuse evidence missing')
+    live = remote_config.get('live_nvme') if isinstance(remote_config, dict) else None
+    if not isinstance(live, dict):
+        raise ValueError('prepared live owner identity missing')
+    seed = live.get('owner_identities', {}).get('0', live)
+    initiators = {}
+    for database_key, initiator_key in (('dropped_database', 'dropped_initiators'), ('database', 'initiators')):
+        database = reuse.get(database_key)
+        rows = reuse.get(initiator_key)
+        if (not cloud_campaign.live_database_id(database) or not isinstance(rows, list) or len(rows) != 1
+                or not isinstance(rows[0], dict) or type(rows[0].get('partition')) is not int
+                or rows[0]['partition'] != 0 or rows[0].get('database') != database):
+            raise ValueError('target reuse database or effective initiator invalid')
+        effective = cloud_campaign.effective_live_owner(seed, database, 0)
+        if (not cloud_campaign.live_identity_bytes(rows[0].get('host_id'))
+                or any(rows[0].get(key) != effective[key] for key in ('host_nqn', 'host_id'))):
+            raise ValueError('effective initiator differs from the prepared owner seed')
+        initiators[database] = effective
+    if len(initiators) != 2:
+        raise ValueError('target reuse reprovisioned the dropped database identity')
+    return reuse, initiators
+
+
 def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coordinator_counters, owner_counters, *,
-          target, tier, owner_launch, owner_receipt, archive_binary=False):
+          target, tier, owner_launch, owner_receipt, archive_binary=False, remote_config=None):
     scope = ('verified_spdk_namespace_not_physical_media_performance' if target == 'spdk'
              else 'verified_kernel_namespace_not_physical_media_performance')
     _owner_receipt(owner_receipt, owner_launch, tier)
-    if (target not in ('kernel', 'spdk') or target == 'spdk' and transport != 'rdma'
-            or not isinstance(proof, dict) or proof.get('schema_version') != 1
+    # Owner hosts (launch `host`) provision databases and scope each target
+    # and initiator to one; archive single-database owners (`node`) did not.
+    owner_host = 'host' in owner_launch
+    if (target not in ('kernel', 'spdk') or target == 'spdk' and (transport != 'rdma' or owner_host)
+            or not isinstance(proof, dict) or proof.get('schema_version') != (2 if owner_host else 1)
             or proof.get('kind') != 'live_nvmeof_qualification'
             or proof.get('expected_route') != transport or proof.get('scope') != scope
             or proof.get('durability_tier') != tier
@@ -254,7 +284,8 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
         raise ValueError('owner launch endpoint mismatch')
     checks = proof.get('checks', {})
     required = ('scalar_write_delete', 'mixed_batch', 'ordered_batch_missing_exists',
-                'checkpoint_iteration', 'flush_reopen', 'abrupt_tail_recovery', 'fence_drain', 'cache_miss_hit')
+                'checkpoint_iteration', 'flush_reopen', 'abrupt_tail_recovery', 'fence_drain', 'cache_miss_hit',
+                *(('target_reuse',) if owner_host else ()))
     if (not isinstance(checks, dict) or any(checks.get(name) is not True for name in required)
             or (archive_binary and checks.get('payload_rpc_fallback') is not False)):
         raise ValueError('live write/read/fence/recovery checks incomplete')
@@ -340,42 +371,59 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
     if initial is None or not any(file_index > 0 and namespace != initial
                                   for (epoch, file_index), namespace in members.items()):
         raise ValueError('member_transition missing distinct first and later writable members')
-    host_identity = None
-    for sample in (before_close, after_hit, abrupt['end'], crash_recovery,
-                   {'routes': writer_routes}):
-        routes = sample.get('routes')
-        if not isinstance(routes, list) or not routes:
-            raise ValueError('observed kernel namespace route missing')
-        for route in routes:
-            if not isinstance(route, dict):
-                raise ValueError('invalid observed kernel namespace route')
-            host_id = route.get('host_id')
-            host_nqn = route.get('host_nqn')
-            if (not isinstance(host_id, list) or len(host_id) != 16
-                    or any(type(value) is not int or not 0 <= value <= 255 for value in host_id)):
-                raise ValueError('invalid observed initiator identity')
-            host_uuid = uuid.UUID(bytes=bytes(host_id))
-            if (host_uuid.version != 4 or host_nqn != 'nqn.2014-08.org.nvmexpress:uuid:' + str(host_uuid)
-                    or (host_identity is not None and host_identity != host_nqn)):
-                raise ValueError('observed initiator identity is inconsistent')
-            host_identity = host_nqn
-            ident = route.get('namespace_identity', {})
-            if target == 'spdk' and (route.get('target_implementation') != 'spdk'
-                                     or not isinstance(ident, dict) or ident.get('target_implementation') != 'spdk'):
-                raise ValueError('observed route does not identify the SPDK target')
-            if (route.get('transport') != transport or route.get('address') != owner_fabric
-                    or route.get('service') != 4420 or not isinstance(ident, dict)
-                    or not re.fullmatch(r'/dev/nvme[0-9]+n[0-9]+', str(ident.get('namespace_path', '')))
-                    or not str(ident.get('nqn', '')).startswith('nqn.')
-                    or type(ident.get('nsid')) is not int or ident['nsid'] < 1
-                    or type(ident.get('bytes')) is not int or ident['bytes'] < 1
-                    or type(ident.get('controller_instance')) is not int or ident['controller_instance'] < 0
-                    or type(ident.get('block_size')) is not int or ident['block_size'] < 512
-                    or ident['block_size'] & (ident['block_size'] - 1)
-                    or not isinstance(ident.get('uuid'), list) or len(ident['uuid']) != 16
-                    or any(type(value) is not int or not 0 <= value <= 255 for value in ident['uuid'])
-                    or not any(ident['uuid'])):
-                raise ValueError('observed namespace does not match the admitted owner route')
+    route_groups = [(None, (before_close, after_hit, abrupt['end'], crash_recovery, {'routes': writer_routes}))]
+    if owner_host:
+        # Every route of the qualified database names its effective initiator
+        # and scoped subsystem; after drop -> reprovision the new database's
+        # routes name its own, on the same target slot (public service 4420).
+        reuse, initiators = _admit_target_reuse(proof, remote_config)
+        route_groups = [(reuse['dropped_database'], route_groups[0][1]
+                         + ({'routes': reuse.get('routes_before_drop')},)),
+                        (reuse['database'], ({'routes': reuse.get('routes_after_reprovision')},))]
+    for database, group in route_groups:
+        host_identity = None
+        for sample in group:
+            routes = sample.get('routes')
+            if not isinstance(routes, list) or not routes:
+                raise ValueError('observed kernel namespace route missing')
+            for route in routes:
+                if not isinstance(route, dict):
+                    raise ValueError('invalid observed kernel namespace route')
+                host_id = route.get('host_id')
+                host_nqn = route.get('host_nqn')
+                if (not isinstance(host_id, list) or len(host_id) != 16
+                        or any(type(value) is not int or not 0 <= value <= 255 for value in host_id)):
+                    raise ValueError('invalid observed initiator identity')
+                ident = route.get('namespace_identity', {})
+                if database is None:
+                    host_uuid = uuid.UUID(bytes=bytes(host_id))
+                    consistent = (host_uuid.version == 4
+                                  and host_nqn == 'nqn.2014-08.org.nvmexpress:uuid:' + str(host_uuid)
+                                  and host_identity in (None, host_nqn))
+                else:
+                    effective = initiators[database]
+                    consistent = (host_nqn == effective['host_nqn'] and host_id == effective['host_id']
+                                  and isinstance(ident, dict) and cloud_campaign.scoped_live_subsystem(
+                                      ident.get('nqn'), effective['subsystem_scope']))
+                if not consistent:
+                    raise ValueError('observed initiator identity is inconsistent')
+                host_identity = host_nqn
+                if target == 'spdk' and (route.get('target_implementation') != 'spdk'
+                                         or not isinstance(ident, dict) or ident.get('target_implementation') != 'spdk'):
+                    raise ValueError('observed route does not identify the SPDK target')
+                if (route.get('transport') != transport or route.get('address') != owner_fabric
+                        or route.get('service') != 4420 or not isinstance(ident, dict)
+                        or not re.fullmatch(r'/dev/nvme[0-9]+n[0-9]+', str(ident.get('namespace_path', '')))
+                        or not str(ident.get('nqn', '')).startswith('nqn.')
+                        or type(ident.get('nsid')) is not int or ident['nsid'] < 1
+                        or type(ident.get('bytes')) is not int or ident['bytes'] < 1
+                        or type(ident.get('controller_instance')) is not int or ident['controller_instance'] < 0
+                        or type(ident.get('block_size')) is not int or ident['block_size'] < 512
+                        or ident['block_size'] & (ident['block_size'] - 1)
+                        or not isinstance(ident.get('uuid'), list) or len(ident['uuid']) != 16
+                        or any(type(value) is not int or not 0 <= value <= 255 for value in ident['uuid'])
+                        or not any(ident['uuid'])):
+                    raise ValueError('observed namespace does not match the admitted owner route')
     fences = crash_recovery.get('fences')
     if not isinstance(fences, list) or not any(
             isinstance(f, dict) and f.get('partition') == 0 and type(f.get('authority_epoch')) is int
@@ -387,18 +435,22 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
             for f in fences):
         raise ValueError('kernel namespace fencing and drain evidence missing')
     shutdown = proof.get('target_shutdown')
+    # The shutdown runs on the reprovisioned database, whose first open is its
+    # fencing generation 1; an archive owner's single database had reopened.
     if (not isinstance(shutdown, list) or len(shutdown) != 1 or not isinstance(shutdown[0], dict)
-            or shutdown[0].get('partition') != 0 or shutdown[0].get('endpoint') != owner_control + ':9400'
-            or type(shutdown[0].get('epoch')) is not int or shutdown[0]['epoch'] < 2
-            or not isinstance(shutdown[0].get('database'), list) or len(shutdown[0]['database']) != 16
-            or any(type(value) is not int or not 0 <= value <= 255 for value in shutdown[0]['database'])
-            or not any(shutdown[0]['database'])
+            or type(shutdown[0].get('partition')) is not int or shutdown[0]['partition'] != 0
+            or shutdown[0].get('endpoint') != owner_control + ':9400'
+            or type(shutdown[0].get('epoch')) is not int or shutdown[0]['epoch'] < (1 if owner_host else 2)
+            or not cloud_campaign.live_identity_bytes(shutdown[0].get('database'))
             or not isinstance(shutdown[0].get('stats'), dict)
             or shutdown[0]['stats'].get('fixture_only') is not False
-            or shutdown[0]['stats'].get('owned_namespace_count') != 0
-            or shutdown[0]['stats'].get('errors') != 0):
+            or any(type(shutdown[0]['stats'].get(key)) is not int or shutdown[0]['stats'][key] != 0
+                   for key in ('owned_namespace_count', 'errors'))):
         raise ValueError('owner namespace shutdown evidence missing')
-    if shutdown[0]['database'] != owner_receipt['database'] or shutdown[0]['partition'] != owner_receipt['partition']:
+    # Owner-host receipts name no database: the coordinator provisions it.
+    expected_database = (list(bytes.fromhex(reuse['database'])) if owner_host
+                         else owner_receipt['database'])
+    if shutdown[0]['database'] != expected_database or shutdown[0]['partition'] != owner_receipt['partition']:
         raise ValueError('shutdown identity differs from owner receipt')
     if target == 'spdk' and shutdown[0]['stats'].get('target_implementation') != 'spdk':
         raise ValueError('owner shutdown did not identify the SPDK target')
@@ -581,6 +633,34 @@ def _copy_tls(prepared, root, tls):
             _write_secret(target, data)
 
 
+def _admit_owner_launch(launch, node, owner_control, owner_fabric, transport, archive_binary):
+    """Check the prepared owner launch; return the archive `live_target` (None for an owner host)."""
+    if (not isinstance(launch, dict) or launch.get('listen') != owner_control + ':9400'
+            or launch.get('ready_file') != str(node / 'ready') or launch.get('stop_file') != str(node / 'stop')):
+        raise ValueError('owner launch does not match admitted identities')
+    if not archive_binary:
+        # Owner host: no partition template, shape or target; the coordinator
+        # provisions the database into the host's single slot.
+        host = launch.get('host')
+        if (not isinstance(host, dict) or 'node' in launch or launch.get('partition') != 0
+                or host.get('root') != str(node / 'storage') or host.get('max_databases') != 1
+                or 'live_target' in host or host.get('live_target_pool') != {
+                    'address': owner_fabric, 'transport': transport,
+                    'public_port_base': 1000, 'public_service_base': 4420,
+                    'commissioning_port_base': 1001, 'commissioning_service_base': 4421}):
+            raise ValueError('owner launch does not match admitted identities')
+        return None
+    owner = launch.get('node')
+    target = owner.get('live_target') if isinstance(owner, dict) else None
+    if (not isinstance(target, dict) or 'host' in launch or owner.get('root') != str(node / 'storage')
+            or target.get('address') != owner_fabric or target.get('transport') != transport
+            or target.get('service') != 4420 or target.get('port_id') != 1000
+            or target.get('commissioning_service') != 4421 or target.get('commissioning_port_id') != 1001
+            or target.get('state_dir') != str(node / 'live-nvmeof')):
+        raise ValueError('owner launch does not match admitted identities')
+    return target
+
+
 def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, transport, tier):
     import yaml
     if transport not in ('tcp', 'rdma'):
@@ -637,17 +717,17 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         preparation = {'guest_root': str(root), 'addresses': [owner_control + ':9400'], 'transport': {'kind': 'tcp'},
             'owner_wal_geometry': 'research',
             'durability_tier': tier, 'max_batches_per_partition': 16384, 'max_admitted_batches': 16384, 'max_index_bytes': 128 * 1024**2,
-            'max_epochs': 4, 'coordinator_cache_bytes': 4 * 1024**2,
+            'coordinator_cache_bytes': 4 * 1024**2,
             'owner_wal_member_read': 'async', 'polling': 'adaptive',
             'live_nvmeof': {'transport': transport, 'addresses': [owner_fabric], 'service': 4420, 'port_id': 1000,
-                'commissioning_service': 4421, 'commissioning_port_id': 1001,
                 'max_inflight_requests': 32, 'max_inflight_bytes': 16 * 1024**2,
                 'connect_timeout_ms': 30000, 'io_timeout_ms': 30000}}
         if archive_binary:
             preparation.update(owner_read_workers=2, owner_read_resident_first=False,
                                owner_read_memory_allowance_bytes=512 * 1024**2)
             preparation['history_persistence'] = 'wal_replay'
-            preparation['live_nvmeof'].update(write_mode='leased', export_mode='per_owner')
+            preparation['live_nvmeof'].update(write_mode='leased', export_mode='per_owner',
+                                              commissioning_service=4421, commissioning_port_id=1001)
         input_path = root / 'prepare.json'
         input_path.write_text(json.dumps(preparation))
         prepared = root / 'prepared'
@@ -656,8 +736,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         remote = json.loads((prepared / 'remote.json').read_text())
         launch = yaml.safe_load((prepared / 'node-0/launch.yaml').read_text())
         launch['launch_nonce'] = secrets.token_hex(16)
-        if launch.get('listen') != owner_control + ':9400' or launch.get('ready_file') != str(root / 'node-0/ready'):
-            raise ValueError('prepared owner launch identity mismatch')
+        _admit_owner_launch(launch, root / 'node-0', owner_control, owner_fabric, transport, archive_binary)
         _copy_tls(prepared, root, remote['tls'])
         launch_text = yaml.safe_dump(launch, sort_keys=False)
         capsule = {'identity': identity, 'launch': launch_text,
@@ -710,7 +789,8 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         result = admit(proof, transport, owner_fabric, coordinator_fabric, owner_control,
                        {'before': before, 'after': after}, {'before': peer['before'], 'after': peer['after']},
                        target=target_kind, tier=tier, owner_launch=launch,
-                       owner_receipt=peer.get('owner_receipt'), archive_binary=archive_binary)
+                       owner_receipt=peer.get('owner_receipt'), archive_binary=archive_binary,
+                       remote_config=remote)
         if target_kind == 'spdk':
             metadata = json.loads((package / 'runtime/spdk/spdk.json').read_text())
             observations, daemon = peer.get('spdk_observations'), peer.get('spdk_daemon')
@@ -719,33 +799,36 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
             result.update(spdk_observation=observation, spdk_daemon=daemon,
                           launch_sha256=capsule['launch_sha256'])
         put('admitted', {'result': result})
-        barrier('owner-stopped')
+        stopped = barrier('owner-stopped')
+        if 'host' in launch:
+            shutdown = stopped.get('owner_shutdown')
+            expected = proof['target_shutdown'][0]['database']
+            targets = shutdown.get('targets') if isinstance(shutdown, dict) else None
+            if (not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], dict)
+                    or targets[0].get('database') != expected or shutdown.get('complete') is not True):
+                raise ValueError('graceful owner shutdown did not prove exact database cleanup')
+            result['owner_shutdown'] = shutdown
         return result
     capsule = bootstrap._wait(store, capsule_key, deadline, {})
     if capsule.get('identity') != identity or not isinstance(capsule.get('tls'), dict):
         raise ValueError('owner capsule identity mismatch')
     node = root / 'node-0'
     node.mkdir(mode=0o700)
-    (node / 'live-nvmeof').mkdir(mode=0o700)
     launch_text = capsule.get('launch')
     if (not isinstance(launch_text, str) or len(launch_text) > 65536
             or capsule.get('launch_sha256') != hashlib.sha256(launch_text.encode()).hexdigest()):
         raise ValueError('invalid owner launch capsule or launch digest')
     launch = yaml.safe_load(launch_text)
-    target = launch.get('node', {}).get('live_target', {})
-    if (launch.get('listen') != owner_control + ':9400' or launch.get('ready_file') != str(node / 'ready')
-            or launch.get('stop_file') != str(node / 'stop') or launch.get('node', {}).get('root') != str(node / 'storage')
-            or target.get('address') != owner_fabric or target.get('transport') != transport
-            or target.get('service') != 4420 or target.get('port_id') != 1000
-            or target.get('commissioning_service') != 4421 or target.get('commissioning_port_id') != 1001
-            or target.get('state_dir') != str(node / 'live-nvmeof')):
-        raise ValueError('owner launch does not match admitted identities')
+    target = _admit_owner_launch(launch, node, owner_control, owner_fabric, transport, archive_binary)
+    if target is not None:
+        # An owner host creates each database's target state below its root.
+        (node / 'live-nvmeof').mkdir(mode=0o700)
     expected_spdk = None
     if target_kind == 'spdk':
         token = uuid.uuid5(uuid.NAMESPACE_URL, cfg['run_id'] + ':' + owner + ':spdk-qualification:' + tier).hex
         expected_spdk = {'rpc_socket': '/run/tidehunter-spdk-live/' + token + '/rpc.sock',
                          'executable': str(package / 'runtime/spdk/bin/nvmf_tgt')}
-    if target.get('spdk') != expected_spdk:
+    if (target or {}).get('spdk') != expected_spdk:
         raise ValueError('owner live target implementation differs from qualification selection')
     if (not isinstance(launch.get('durability'), dict) or launch['durability'].get('tier') != tier
             or not isinstance(launch.get('launch_nonce'), str) or not launch['launch_nonce']):
@@ -780,13 +863,13 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         if (node / 'ready').read_text().strip() != owner_control + ':9400':
             raise ValueError('live owner readiness endpoint mismatch')
         owner_helper = None
-        if daemon:
+        if daemon or 'host' in launch:
             helper_path = package / 'source/experiments/kv-comparison/nvme_campaign_owner.py'
             helper_spec = importlib.util.spec_from_file_location('qualification_nvme_owner', helper_path)
             owner_helper = importlib.util.module_from_spec(helper_spec)
             helper_spec.loader.exec_module(owner_helper)
             if process.poll() is not None:
-                raise RuntimeError('live SPDK owner exited before identity capture')
+                raise RuntimeError('live owner exited before identity capture')
             owner_helper.capture_live_owner_identity(node, launch_file, {'MainPID': str(process.pid)})
         owner_receipt = _running_owner_receipt(launch, tier, process, started_ns)
         put('owner-ready', {'owner_receipt': owner_receipt})
@@ -840,14 +923,20 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
                             **({'spdk_daemon': daemon, 'spdk_observations': observations} if daemon else {})})
         _export_partial(root, store, cfg, identity, own, own_id, transport, 'owner-before-admission',
                         ('node-0/owner.log',), deadline, tier=tier)
-        barrier('admitted')
+        admitted = barrier('admitted')
         (node / 'stop').touch(exist_ok=False)
         process.wait(timeout=bootstrap._remaining(deadline, 30))
         if process.returncode != 0:
             raise RuntimeError('live owner did not shut down cleanly')
+        owner_shutdown = None
+        if owner_helper is not None:
+            database = (admitted['result']['proof']['target_reuse']['database'] if 'host' in launch else None)
+            if 'host' in launch and not cloud_campaign.live_database_id(database):
+                raise ValueError('admitted qualification database identity missing')
+            owner_shutdown = owner_helper.admit_live_shutdown(node, launch_file, launch, 0,
+                {'MainPID': '0', 'SubState': 'exited', 'Result': 'success', 'ExecMainStatus': '0'},
+                expected_database=database)
         if daemon:
-            owner_helper.admit_live_shutdown(node, launch_file, launch, 0,
-                {'MainPID': '0', 'SubState': 'exited', 'Result': 'success', 'ExecMainStatus': '0'})
             observation = bootstrap._call(['python3', '-B', str(daemon_script), 'observe',
                 '--state', str(daemon_state), '--diagnostics'], deadline, 30)
             (node / 'daemon-before-stop.json').write_text(observation)
@@ -857,7 +946,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
             bootstrap._call(['python3', '-B', str(daemon_script), 'stop', '--state', str(daemon_state),
                 '--owner-proof', str(launch_file.with_suffix('.live-target-shutdown.json')),
                 '--initiator-drained'], deadline, 45)
-        put('owner-stopped', {})
+        put('owner-stopped', {'owner_shutdown': owner_shutdown} if owner_shutdown is not None else {})
         return None
     finally:
         bootstrap._stop_processes([process])

@@ -64,6 +64,8 @@ pub(super) fn root_bindings(path: &Path) -> (Vec<u8>, Vec<RootBinding>) {
             digest_at,
         });
     }
+    // The always-present mask section is empty: these fixtures drop nothing.
+    assert_eq!(cursor.u32().unwrap(), 0);
     assert_eq!(cursor.remaining(), 0);
     (payload, bindings)
 }

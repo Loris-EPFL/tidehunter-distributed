@@ -2067,6 +2067,8 @@ fn missing_live_registration_cannot_downgrade_frontier_recovery() {
 }
 
 mod conflict_index;
+mod file_retirement;
 mod live_extent;
 mod live_native;
+mod relocation_scan;
 mod wal_replay;

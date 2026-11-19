@@ -1,6 +1,7 @@
 //! Shared write engine. Callers allocate/encode; owner workers publish durable
 //! batches. Checkpoint persistence owns no foreground or publication lock.
 
+use super::super::checkpoint_attribution::{CheckpointTriggerFlags, SuffixTracker, TailCount};
 use super::super::{
     AppendedBatch, AuthorityManifest, AuthorityWriteStats, BackgroundCheckpoint, BatchId,
     CheckpointDiagnostic, CheckpointDiagnosticSummary, ControlHandle, IndexReadCut, LocalDbError,
@@ -32,6 +33,9 @@ pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub stream_last: &'a mut BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: &'a mut BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: &'a mut BTreeSet<(u32, u64)>,
+    pub committed_streams: &'a mut BTreeSet<(u32, u64)>,
+    /// Adopted R1 callback starts, keyed by `(partition, fencing_generation)`.
+    pub callback_starts: &'a mut BTreeMap<(u32, u64), u64>,
     pub recent: &'a mut VecDeque<RecentReceipt>,
     pub latest: &'a mut Option<MutationVersion>,
     pub live_latest: &'a mut Option<MutationVersion>,
@@ -46,6 +50,7 @@ pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub next_checkpoint_diagnostic: &'a mut u64,
     pub dropped_checkpoint_diagnostics: &'a mut u64,
     pub last_checkpoint_diagnostic: &'a mut Option<CheckpointDiagnostic>,
+    pub index_suffix: &'a mut Option<SuffixTracker>,
 }
 
 pub(in crate::distributed::remote_db) struct PublisherState {
@@ -56,6 +61,12 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     pub stream_last: BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: BTreeSet<(u32, u64)>,
+    /// Every stream the committed root names in its positions, complete or
+    /// not. A generation trim adopts a replacement root only when the root
+    /// names the trimmed stream or the stream produced it (L1).
+    pub committed_streams: BTreeSet<(u32, u64)>,
+    /// Adopted R1 callback starts; changed only by an Exact installation.
+    pub callback_starts: BTreeMap<(u32, u64), u64>,
     pub recent: VecDeque<RecentReceipt>,
     pub latest: Option<MutationVersion>,
     pub live_latest: Option<MutationVersion>,
@@ -70,10 +81,31 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     pub next_checkpoint_diagnostic: u64,
     pub dropped_checkpoint_diagnostics: u64,
     pub last_checkpoint_diagnostic: Option<CheckpointDiagnostic>,
+    /// Published-suffix debt tracker; present once index checkpoint
+    /// diagnostics are armed (checkpoint_attribution.rs).
+    pub index_suffix: Option<SuffixTracker>,
     /// Exclusive contiguous publication frontier, including an empty epoch 0.
     pub published_next: u64,
     pub upper: Option<MutationVersion>,
     pub dependents: HashMap<u64, Vec<u64>>,
+    /// The one unresolved fresh `DropCells` slot, if any. While present no
+    /// sequence above it publishes; see `RangeBarrier`.
+    pub range_barrier: Option<RangeBarrier>,
+}
+
+/// Global publication barrier of one fresh `DropCells` slot. It never stops
+/// WAL admission, owner queues or durable completion of other sequences: it
+/// only defers publication of sequences above `sequence`. Lower sequences
+/// publish normally; the range publishes once `published_next == sequence`.
+/// Each deferred durable sequence is queued here exactly once and requeued
+/// in order when the range is published or aborted before READY.
+///
+/// Bound: `deferred_ready` holds distinct admitted sequences above
+/// `sequence`, so its length is below the sequencer window. Owner: the
+/// publisher mutex. Lifetime: the admitted slot, not the caller's timeout.
+pub(in crate::distributed::remote_db) struct RangeBarrier {
+    pub sequence: u64,
+    pub deferred_ready: Vec<u64>,
 }
 
 impl PublisherState {
@@ -85,6 +117,8 @@ impl PublisherState {
             stream_last: &mut self.stream_last,
             positions: &mut self.positions,
             committed_complete: &mut self.committed_complete,
+            committed_streams: &mut self.committed_streams,
+            callback_starts: &mut self.callback_starts,
             recent: &mut self.recent,
             latest: &mut self.latest,
             live_latest: &mut self.live_latest,
@@ -99,6 +133,7 @@ impl PublisherState {
             next_checkpoint_diagnostic: &mut self.next_checkpoint_diagnostic,
             dropped_checkpoint_diagnostics: &mut self.dropped_checkpoint_diagnostics,
             last_checkpoint_diagnostic: &mut self.last_checkpoint_diagnostic,
+            index_suffix: &mut self.index_suffix,
         }
     }
 }
@@ -148,7 +183,6 @@ pub(in crate::distributed::remote_db) struct OpenState {
     pub write_profile: Arc<Mutex<WriteProfileSnapshot>>,
     pub write_timeline: Arc<WriteTimeline>,
     pub clients: Vec<super::super::ClientWorker>,
-    pub durable_cut: Option<super::super::durable_cut::DurableCut>,
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     pub publisher: PublisherState,
@@ -178,6 +212,8 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub before_publish: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub before_release: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub fail_publication: Option<u64>,
+    /// Named-force waiter deadline instead of `config.timeout`.
+    pub force_timeout: Option<std::time::Duration>,
 }
 
 /// Lock order for the final engine: identity → ascending key shards → owner
@@ -199,6 +235,10 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub publisher: Mutex<PublisherState>,
     pub floor_changed: Condvar,
     pub(crate) retirement: Mutex<()>,
+    /// Opt-in R0 capacity observation; inert until an observer installs a hook.
+    pub capacity: super::super::capacity_observer::CapacitySlot,
+    /// Opt-in ordered R1 evidence stream; inert until enabled.
+    pub(crate) r1_events: super::super::r1_events::R1EventSlot,
     pub stats: Mutex<CoreStats>,
     pub read_resolve_ns: AtomicU64,
     pub value_read_ns: AtomicU64,
@@ -207,9 +247,14 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub first_failure: Arc<OnceLock<super::super::FirstFailure>>,
     pub stopped: AtomicBool,
     pub closing: AtomicBool,
+    /// The one named index force in flight (`force_rebuild_index`); claimed
+    /// by compare-exchange, released when its ticket drops.
+    pub force_in_flight: Arc<AtomicBool>,
     pub clients: Vec<super::super::ClientWorker>,
-    /// Present when this epoch is tracked under durable-prefix recovery.
-    pub durable_cut: Option<super::super::durable_cut::DurableCut>,
+    /// Set when this epoch is tracked under durable-prefix recovery. Open
+    /// attaches it after offline fencing-generation maintenance, before the
+    /// handle is returned and before any write can be admitted.
+    pub durable_cut: OnceLock<super::super::durable_cut::DurableCut>,
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     #[cfg(test)]
@@ -273,6 +318,8 @@ impl WriteCore {
             write_timeline: open.write_timeline,
             floor_changed: Condvar::new(),
             retirement: Mutex::new(()),
+            capacity: Default::default(),
+            r1_events: Default::default(),
             stats: Mutex::new(open.stats),
             admission,
             read_resolve_ns: AtomicU64::new(0),
@@ -283,7 +330,8 @@ impl WriteCore {
             closing: AtomicBool::new(false),
             owner_controls,
             clients: open.clients,
-            durable_cut: open.durable_cut,
+            force_in_flight: Arc::new(AtomicBool::new(false)),
+            durable_cut: OnceLock::new(),
             live_pool: open.live_pool,
             live_metrics: open.live_metrics,
             #[cfg(test)]
@@ -598,7 +646,17 @@ impl WriteCore {
     pub(in crate::distributed::remote_db) fn request_checkpoint(
         self: &Arc<Self>,
     ) -> Result<(), LocalDbError> {
-        super::super::checkpoint_lifecycle::core_request_checkpoint(self)
+        self.request_checkpoint_for(CheckpointTriggerFlags::default())
+    }
+
+    /// Start a due checkpoint; `extra` names a hard admission request that
+    /// accompanies the soft predicates. Policy is unchanged: only a due
+    /// checkpoint starts.
+    pub(in crate::distributed::remote_db) fn request_checkpoint_for(
+        self: &Arc<Self>,
+        extra: CheckpointTriggerFlags,
+    ) -> Result<(), LocalDbError> {
+        super::super::checkpoint_lifecycle::core_request_checkpoint(self, extra)
     }
 
     pub(in crate::distributed::remote_db) fn start_checkpoint(
@@ -619,8 +677,31 @@ impl WriteCore {
     pub(in crate::distributed::remote_db) fn commit_checkpoint(
         self: &Arc<Self>,
     ) -> Result<(), LocalDbError> {
-        let result = super::super::checkpoint_lifecycle::core_commit_checkpoint(self);
+        self.commit_checkpoint_for(CheckpointTriggerFlags::EXPLICIT)
+    }
+
+    pub(in crate::distributed::remote_db) fn commit_checkpoint_for(
+        self: &Arc<Self>,
+        trigger: CheckpointTriggerFlags,
+    ) -> Result<(), LocalDbError> {
+        let result = super::super::checkpoint_lifecycle::core_commit_checkpoint(self, trigger);
         self.checkpoint_result(result)
+    }
+
+    pub(in crate::distributed::remote_db) fn commit_recovery_baseline(
+        self: &Arc<Self>,
+    ) -> Result<(), LocalDbError> {
+        let result = super::super::checkpoint_lifecycle::core_commit_recovery_baseline(self);
+        self.checkpoint_result(result)
+    }
+
+    /// Named Exact force (`force_rebuild_control_region`). A failure of the
+    /// named checkpoint already failed the core; `Busy` and an expired
+    /// deadline do not.
+    pub(in crate::distributed::remote_db) fn force_rebuild_index(
+        self: &Arc<Self>,
+    ) -> Result<super::super::IndexForceReport, super::super::IndexForceError> {
+        super::super::checkpoint_lifecycle::core_force_rebuild_index(self)
     }
 
     pub(in crate::distributed::remote_db) fn retire_history_before(
@@ -637,13 +718,14 @@ impl WriteCore {
         result
     }
 
+    /// Returns the granted replay tail before and after the release.
     pub(in crate::distributed::remote_db) fn release_checkpoint_credits(
         &self,
         credits: CheckpointCredits,
-    ) -> Result<(), LocalDbError> {
-        self.admission.release_checkpoint(credits)?;
+    ) -> Result<(TailCount, TailCount), LocalDbError> {
+        let granted = self.admission.release_checkpoint(credits)?;
         self.admission.regrant();
-        Ok(())
+        Ok(granted)
     }
 
     /// Called before dropping writer→publisher on a publication failure.
@@ -982,12 +1064,10 @@ mod tests {
             scope.spawn(move || {
                 read_started.send(()).unwrap();
                 read_finished
-                    .send(
-                        core.reads.wait_admission(
-                            read_generation,
-                            Instant::now() + Duration::from_secs(5),
-                        ),
-                    )
+                    .send(core.reads.wait_admission(
+                        read_generation,
+                        Some(Instant::now() + Duration::from_secs(5)),
+                    ))
                     .unwrap();
             });
             scope.spawn(move || {

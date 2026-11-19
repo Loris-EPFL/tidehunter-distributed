@@ -6,6 +6,7 @@
 //! for the recovery and publication contract, and the implementation record for
 //! the supported subset. No wire format or disk-format stability is promised yet.
 
+pub mod capacity;
 pub mod codec;
 pub mod durability;
 pub mod group;
@@ -14,6 +15,7 @@ pub mod native_index;
 pub mod native_publication;
 pub mod nvmeof;
 pub mod owner_events;
+pub mod r1_events;
 pub mod reference_directory;
 pub mod remote_db;
 pub mod sequence;

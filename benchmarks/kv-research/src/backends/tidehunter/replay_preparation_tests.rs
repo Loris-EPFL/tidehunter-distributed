@@ -30,8 +30,8 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 /// Digest of every output file. Each preparation draws fresh random initiator
-/// identities, so those fields are removed from `remote.json`, `remote.yaml`
-/// and every `launch.yaml` before hashing; nothing else is normalized.
+/// identities, so only those fields in `remote.json` and `remote.yaml`
+/// are normalized. Owner launch files carry no database-scoped identity.
 fn collect_hashes(root: &Path, directory: &Path, files: &mut BTreeMap<String, String>) {
     for entry in fs::read_dir(directory).unwrap() {
         let entry = entry.unwrap();
@@ -47,15 +47,7 @@ fn collect_hashes(root: &Path, directory: &Path, files: &mut BTreeMap<String, St
             .unwrap()
             .to_owned();
         let bytes = fs::read(&path).unwrap();
-        let bytes = if name.ends_with("launch.yaml") {
-            let mut launch: serde_yaml::Value = serde_yaml::from_slice(&bytes).unwrap();
-            launch["node"]["live_target"]
-                .as_mapping_mut()
-                .unwrap()
-                .remove("host_nqn")
-                .unwrap();
-            serde_yaml::to_string(&launch).unwrap().into_bytes()
-        } else if name == "remote.json" || name == "remote.yaml" {
+        let bytes = if name == "remote.json" || name == "remote.yaml" {
             let mut remote: serde_json::Value = if name == "remote.json" {
                 serde_json::from_slice(&bytes).unwrap()
             } else {
@@ -134,7 +126,8 @@ fn automatic_preparation_keeps_runtime_counts_out_of_generated_configs() {
         assert!(remote.get("read_lanes").is_none());
         let launch: serde_yaml::Value =
             serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
-        assert!(launch["node"].get("read_workers").is_none());
+        assert!(launch.get("node").is_none());
+        assert!(launch["host"].get("read_workers").is_none());
         let mut hashes = BTreeMap::new();
         collect_hashes(&output, &output, &mut hashes);
         if let Some(previous) = &previous {
@@ -183,13 +176,13 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
 }
 
 #[test]
-fn replay_preparation_rejects_implicit_identity_limits_and_unknown_node_db() {
+fn replay_preparation_rejects_configured_identity_missing_limits_and_unknown_node_db() {
     let root = temp();
     let input = root.join("input.json");
     for variant in 0..4 {
         let mut value = synthetic_input();
         value["replay_node_db_id"] = serde_json::json!(if variant == 0 { 3 } else { 0 });
-        if variant != 1 {
+        if variant == 1 {
             value["database"] = serde_json::json!(vec![71; 16]);
         }
         if variant != 2 {
@@ -220,12 +213,10 @@ fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_out
         let mut value = synthetic_input();
         value["guest_root"] = serde_json::json!(root.join(format!("guest-{id}")));
         value["replay_node_db_id"] = serde_json::json!(id);
-        value["database"] = serde_json::json!(vec![id as u8 + 71; 16]);
         value["batch_limits"] =
             serde_json::json!({"max_operations":519,"max_encoded_bytes":500000});
         value["live_nvmeof"] = serde_json::json!({
             "addresses":["127.0.0.1"],"transport":"tcp","service":4420+2*id,"port_id":1000+2*id,
-            "commissioning_service":4421+2*id,"commissioning_port_id":1001+2*id,
             "max_inflight_requests":16,"max_inflight_bytes":8388608,"connect_timeout_ms":10000,"io_timeout_ms":30000,
             "leased_write_window":1,"leased_sync":"per_frame_fua",
             "inline_reads":true
@@ -234,10 +225,12 @@ fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_out
         fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
         let output = root.join(format!("output-{id}"));
         prepare_external_case_file(&input, &output).unwrap();
-        let remote: RemoteDatabaseConfig =
-            serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
+        let json = fs::read(output.join("remote.json")).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert!(raw["storage"].get("database").is_none());
+        let remote: RemoteDatabaseConfig = serde_json::from_slice(&json).unwrap();
         remote.validate().unwrap();
-        assert_eq!(remote.storage.database, [id as u8 + 71; 16]);
+        assert_eq!(remote.storage.database, [0; 16]);
         assert_eq!(remote.storage.batch_limits.max_operations, 519);
         assert_eq!(remote.storage.batch_limits.max_encoded_bytes, 500000);
         let shape: KeyShape =
@@ -256,11 +249,12 @@ fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_out
         assert_eq!(names, expected);
         let launch: serde_yaml::Value =
             serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
-        let node: tidehunter::distributed::tcp::NodeConfig =
-            serde_yaml::from_value(launch["node"].clone()).unwrap();
-        assert_eq!(node.shape_yaml, serde_yaml::to_string(&shape).unwrap());
-        assert_eq!(node.partition.inventory.database, remote.storage.database);
-        assert_eq!(node.partition.batch_limits, remote.storage.batch_limits);
+        assert!(launch.get("node").is_none());
+        assert_eq!(launch["partition"].as_u64(), Some(0));
+        let host: tidehunter::distributed::tcp::OwnerHostConfig =
+            serde_yaml::from_value(launch["host"].clone()).unwrap();
+        host.validate().unwrap();
+        assert_eq!(host.max_databases, 1);
         let mut members = 0;
         for batch in trace.batches.iter().filter(|b| b.db == id) {
             let mutations = batch
@@ -296,9 +290,12 @@ fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_out
         let live = &remote.live_nvme;
         assert_eq!(live.leased_durability, DurabilityTier::Native);
         assert!(initiators.insert(live.host_id));
-        let target = node.live_target.as_ref().unwrap();
-        assert_eq!(target.host_nqn, live.host_nqn);
-        assert_eq!(target.service, 4420 + 2 * id);
+        assert_eq!(host.live_target_pool.public_service_base, 4420 + 2 * id);
+        assert_eq!(
+            host.live_target_pool.commissioning_service_base,
+            4421 + 2 * id
+        );
+        assert_eq!(host.live_target_pool.public_port_base, 1000 + 2 * id);
         databases.push(serde_json::json!({"db_id":id,"options":{
             "transport":{"kind":"tcp-trusted"},"path":root.join(format!("coordinator-{id}")),"owners":1,
             "external_remote_config":remote

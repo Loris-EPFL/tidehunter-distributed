@@ -2,13 +2,18 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import errno
+import json
 import tempfile
 from pathlib import Path
 import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
+import uuid
+import zlib
 
+import cloud_campaign as campaign
+import nvme_campaign_owner as owner
 import local_dry_run_targets as targets
 
 
@@ -195,10 +200,10 @@ class OwnedControllerTeardownTests(unittest.TestCase):
         self.sysfs = Path(self.tmp.name) / 'nvme'
         self.sysfs.mkdir()
 
-    def controller(self, name, hostnqn=HOST, service=4420, transport='tcp'):
+    def controller(self, name, hostnqn=HOST, service=4420, transport='tcp', subsystem='nqn.sub'):
         path = self.sysfs / name
         path.mkdir()
-        for attr, value in (('transport', transport), ('subsysnqn', 'nqn.sub'), ('hostnqn', hostnqn),
+        for attr, value in (('transport', transport), ('subsysnqn', subsystem), ('hostnqn', hostnqn),
                             ('hostid', 'id'), ('queue_count', '2'), ('sqsize', '31'),
                             ('address', f'traddr=127.0.0.1,trsvcid={service}')):
             (path / attr).write_text(value + '\n')
@@ -208,6 +213,84 @@ class OwnedControllerTeardownTests(unittest.TestCase):
     def delete(self, deadline):
         return targets._delete_owned_controllers(self.sysfs, 'tcp', '127.0.0.1', (4420, 4421),
                                                  self.HOST, deadline)
+
+    def test_public_match_requires_both_nqn_scopes_and_only_public_service(self):
+        seed = {'host_id': [1] * 16}
+        effective = campaign.effective_live_owner(seed, 'aa' * 16, 0)
+        nqn = effective['host_nqn']
+        subsystem = effective['subsystem_scope'] + 'sub-00000000-0000-0000-0000-000000000001'
+        self.controller('nvme0', hostnqn=nqn, subsystem=subsystem)
+        self.controller('nvme1', hostnqn=nqn, subsystem=subsystem.replace('aa' * 16, 'bb' * 16))
+        self.controller('nvme2', hostnqn=nqn, subsystem=subsystem.replace('p00000000', 'p00000001'))
+        self.controller('nvme3', hostnqn=self.HOST, subsystem=subsystem)
+        self.controller('nvme4', hostnqn=nqn, service=4421, subsystem=subsystem)
+        matches = targets._owned_controllers(self.sysfs, 'tcp', '127.0.0.1', (4420,), targets._kernel_public_identity)
+        self.assertEqual([row['controller'] for row in matches], ['nvme0'])
+
+    def test_private_identity_comes_from_checksummed_exact_slot_journal(self):
+        db = 'aa' * 16
+        root = Path(self.tmp.name) / 'storage'
+        directory = root / ('db-' + db) / 'live-target'
+        directory.mkdir(parents=True)
+        path = directory / 'live-target.json'
+        scope = campaign.effective_live_owner({'host_id': [1] * 16}, db, 0)['subsystem_scope']
+        private = 'nqn.2026-01.local.tidehunter:commission-00000000-0000-0000-0000-000000000001'
+        config = {'state_dir': str(directory), 'host_nqn': scope + 'host', 'address': '10.2.0.2',
+                  'transport': 'rdma', 'service': 4420, 'port_id': 1000,
+                  'commissioning_service': 4421, 'commissioning_port_id': 1001}
+
+        def journal():
+            payload = json.dumps({'version': 1, 'private_host': private, 'config': config}).encode()
+            path.write_bytes(zlib.crc32(payload).to_bytes(4, 'little') + payload)
+
+        def identities():
+            return targets._kernel_commissioning_identities(root, '10.2.0.2', 'rdma', 4420, 1000)
+
+        with patch.object(owner, '_trusted_dir'), patch.object(
+                owner, '_read_bytes', side_effect=lambda file, limit: file.read_bytes()[:limit + 1]):
+            journal()
+            self.assertEqual(identities(), {private: scope})
+            path.write_bytes(b'\0\0\0\0' + path.read_bytes()[4:])
+            with self.assertRaisesRegex(targets.TargetError, 'checksum'):
+                identities()
+            config['commissioning_port_id'] = 1002
+            journal()
+            with self.assertRaisesRegex(targets.TargetError, 'exact owner slot'):
+                identities()
+
+    def test_kernel_reuse_requires_shutdown_of_exact_reprovisioned_database(self):
+        remote = {'live_nvme': {'host_id': [1] * 16}}
+        old, new = 'aa' * 16, 'bb' * 16
+        address, service, endpoint = '127.0.0.1', 4420, '127.0.0.1:9400'
+
+        def evidence(database):
+            owner = campaign.effective_live_owner(remote['live_nvme'], database, 0)
+            initiator = {key: owner[key] for key in ('host_id', 'host_nqn')}
+            route = dict(initiator, address=address, service=service, transport='tcp',
+                         namespace_identity={'controller_instance': 3, 'nqn': owner['subsystem_scope']
+                             + 'sub-00000000-0000-0000-0000-000000000001'})
+            return dict(initiator, database=database, partition=0), route
+
+        first, before = evidence(old)
+        second, after = evidence(new)
+        shutdown = {'database': list(bytes.fromhex(new)), 'partition': 0, 'epoch': 1, 'endpoint': endpoint,
+                    'stats': {'errors': 0, 'owned_namespace_count': 0, 'fixture_only': False}}
+        proof = {'target_reuse': {'dropped_database': old, 'database': new,
+                                'dropped_initiators': [first], 'initiators': [second],
+                                'routes_before_drop': [before], 'routes_after_reprovision': [after]},
+                 'member_transition': {'writer_routes': [before]}, 'target_shutdown': [shutdown]}
+
+        def admit():
+            return targets._admit_kernel_reuse(proof, remote, address, service, 'tcp', endpoint)
+
+        self.assertEqual(admit()[1], [before, after])
+        shutdown['database'] = list(bytes.fromhex(old))
+        with self.assertRaisesRegex(targets.TargetError, 'clean reprovisioned database'):
+            admit()
+        shutdown['database'] = list(bytes.fromhex(new))
+        after['host_id'] = remote['live_nvme']['host_id']
+        with self.assertRaisesRegex(targets.TargetError, 'route differs'):
+            admit()
 
     def test_deletes_only_this_runs_controllers_and_waits_for_removal(self):
         owned = self.controller('nvme0')
@@ -426,38 +509,45 @@ class KernelPortsContractTests(unittest.TestCase):
             _, public, private, _ = self.allocate(address=address)
         sysfs = self.root / "sysfs"
         sysfs.mkdir()
-        host_nqn, host_id = "nqn.2014-08.org.nvmexpress:uuid:fixture", "fixture-host-id"
+        seed = {"host_id": [1] * 16}
+        first, second = [campaign.effective_live_owner(seed, byte * 16, 0) for byte in ("aa", "bb")]
 
-        def controller(instance, service, subsystem, queues="2", initiator=host_nqn):
+        def controller(instance, service, identity, *, queues="2", initiator=None):
             directory = sysfs / f"nvme{instance}"
             directory.mkdir()
+            subsystem = identity["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000001"
             for key, value in {"transport": "tcp", "address": f"traddr={address},trsvcid={service}",
-                               "hostnqn": initiator, "hostid": host_id, "subsysnqn": subsystem,
+                               "hostnqn": initiator or identity["host_nqn"], "subsysnqn": subsystem,
+                               "hostid": str(uuid.UUID(bytes=bytes(identity["host_id"]))),
                                "queue_count": queues, "sqsize": "31"}.items():
                 (directory / key).write_text(value)
-            return directory
+            return directory, {"host_nqn": identity["host_nqn"], "host_id": identity["host_id"],
+                               "namespace_identity": {"controller_instance": instance, "nqn": subsystem}}
 
-        expected = controller(0, public, "nqn.writer")
-        unrelated = controller(1, public, "nqn.other")
-        controller(2, private, "nqn.writer", queues="5", initiator="nqn.commissioning")
-        proof = {"member_transition": {"writer_routes": [
-            {"namespace_identity": {"controller_instance": 0, "nqn": "nqn.writer"}}]}}
+        expected, before = controller(0, public, first)
+        unrelated, _ = controller(1, public, first)
+        controller(2, private, first, queues="5", initiator="nqn.commissioning")
+        _, after = controller(3, public, second)
+
         def scan(errors):
-            return targets._owned_controllers(sysfs, "tcp", address, (public, private), host_nqn,
-                                              sample_errors=errors)
+            return targets._owned_controllers(sysfs, "tcp", address, (public,),
+                                              targets._kernel_public_identity, sample_errors=errors)
 
-        return proof, host_id, expected, unrelated, scan
+        return [before, after], expected, unrelated, scan
 
     def test_geometry_on_allocator_chosen_public_service(self):
-        proof, host_id, _, _, scan = self.geometry_fixture()
+        routes, _, _, scan = self.geometry_fixture()
         record = {"sample_errors": [], "sample_errors_truncated": False}
         rows = scan(record["sample_errors"])
-        targets._admit_kernel_geometry(record, proof, host_id, rows)
-        self.assertEqual([row["controller"] for row in record["queue_samples"]], ["nvme0"])
+        targets._admit_kernel_geometry(record, routes, rows)
+        self.assertEqual({row["controller"] for row in record["queue_samples"]}, {"nvme0", "nvme3"})
+        with self.assertRaisesRegex(targets.TargetError, "missing identities"):
+            targets._admit_kernel_geometry(record, routes, [row for row in rows if row["controller"] != "nvme3"])
+        self.assertEqual([row[0] for row in record["missing_queue_identities"]], ["nvme3"])
         self.assertEqual(record["sample_errors"], [])
 
     def test_geometry_records_errno_path_and_identity_without_tolerating_errors(self):
-        proof, host_id, expected, unrelated, scan = self.geometry_fixture()
+        routes, expected, unrelated, scan = self.geometry_fixture()
         earlier = scan([])
         read = Path.read_text
         for directory, code in ((unrelated, errno.ENODEV), (expected, errno.ENODEV), (unrelated, errno.EIO)):
@@ -485,7 +575,7 @@ class KernelPortsContractTests(unittest.TestCase):
                 self.assertEqual(error["identity"]["controller"], directory.name)
                 self.assertEqual(error["disappeared"], code == errno.ENODEV)
                 with self.assertRaisesRegex(targets.TargetError, "sampling errors: 1"):
-                    targets._admit_kernel_geometry(record, proof, host_id, earlier)
+                    targets._admit_kernel_geometry(record, routes, earlier)
                 self.assertEqual(record["missing_queue_identities"], [])
                 self.assertEqual(record["invalid_queue_samples"], [])
 
