@@ -373,23 +373,32 @@ impl Db {
         Ok((key_shape, keyspaces, registry_dirty))
     }
 
-    /// Atomically writes the canonical shape to `shape_v2.yaml`
-    /// (write to a temp file, fsync, rename).
+    /// Durably writes the canonical shape to `shape_v2.yaml`.
     fn write_shape_file(path: &Path, key_shape: &KeyShape) -> DbResult<()> {
-        let shape_file_path = Self::shape_v2_file_path(path);
         let yaml = key_shape.to_yaml().map_err(|e| {
             DbError::Io(io::Error::other(format!(
                 "Failed to serialize key shape: {e}"
             )))
         })?;
-        let temp_file = shape_file_path.with_extension("yaml.tmp");
-        {
-            let mut file = std::fs::File::create(&temp_file)?;
-            file.write_all(yaml.as_bytes())?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&temp_file, &shape_file_path)?;
+        // WAL records use the canonical keyspace ids, so the file must be
+        // durable before the first write after open.
+        Self::write_file_durably(path, &Self::shape_v2_file_path(path), yaml.as_bytes())?;
         Ok(())
+    }
+
+    /// Atomically and durably replaces `file` in the database directory `path`:
+    /// write a temp file, sync it, rename it, then sync the directory.
+    fn write_file_durably(path: &Path, file: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut temp_file = file.as_os_str().to_owned();
+        temp_file.push(".tmp");
+        let temp_file = PathBuf::from(temp_file);
+        {
+            let mut temp = std::fs::File::create(&temp_file)?;
+            temp.write_all(bytes)?;
+            temp.sync_all()?;
+        }
+        std::fs::rename(&temp_file, file)?;
+        std::fs::File::open(path)?.sync_all()
     }
 
     /// Load key shape from database directory.
@@ -466,7 +475,8 @@ impl Db {
             let yaml = serde_yaml::to_string(config).map_err(|e| {
                 DbError::Io(io::Error::other(format!("Failed to serialize config: {e}")))
             })?;
-            std::fs::write(&config_file_path, yaml)?;
+            // A crash must leave either no file or the complete file.
+            Self::write_file_durably(path, &config_file_path, yaml.as_bytes())?;
         }
         Ok(())
     }
