@@ -8,7 +8,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 import plot_cloud_comparison as plots
-from cloud_campaign import LEGACY_BACKENDS, make_matrix
+from cloud_campaign import make_matrix
 
 
 def population(operation="read", outcome="success", count=10, p50=100, p99=900):
@@ -60,12 +60,6 @@ def full_matrix_cases(repeats=(0,)):
     cells += [(backend, "primary_rf1", profile, 1024)
               for backend in plots.BACKENDS
               for profile in ("offered-1000", "offered-10000", "offered-50000", "zipf-read")]
-    cells += [(backend, cohort, profile, size)
-              for backend in plots.TH for size in (256, 8192)
-              for cohort, profile in (("coordinator_cache_configured", "coordinator-cache"),
-                                      ("owner_cache_configured", "owner-cache"))]
-    cells += [("tidehunter_efa_native", "registered_ram_configured", "registered-ram", size)
-              for size in (256, 8192)]
     cells += [(backend, "cold_os_cache", "cold-os-large", 65536) for backend in plots.BACKENDS]
     cells += [("native", "native_pagecache", profile, size)
               for profile in ("point-mixed", "read-many32") for size in plots.SIZES]
@@ -101,8 +95,8 @@ class NativeWriteBoundaries(unittest.TestCase):
 
     def test_generated_backend_settings_do_not_change_workload_matching(self):
         spec = json.loads(Path(__file__).with_name("cloud-campaign.json").read_text())
-        backends = ["native", "tidehunter_tcp", "tikv"]
-        spec.update(backends=backends, repeats=2)
+        backends = ["native", "tidehunter_nvme_tcp", "tikv"]
+        spec.update(mode="standard-with-live-nvmeof", backends=backends, repeats=2)
         items = []
         for job in make_matrix(spec):
             if (job["cohort"], job["profile"], job["value_size"]) != (
@@ -111,6 +105,8 @@ class NativeWriteBoundaries(unittest.TestCase):
             item = case(job["backend"], job["repeat"],
                         populations=[population("put", count=job["measurement_operations"])])
             item.update(case_id=job["case_id"], job=job)
+            if job.get("nvmeof_route") == "live":
+                item["backend"]["name"] = "tidehunter_live_nvmeof"
             items.append(item)
         cells = [(backend, "primary_rf1", "write-concurrent", 1024) for backend in backends]
         self.assertEqual(dataset(items).matched_repeats(cells), [0, 1])
@@ -261,23 +257,6 @@ class SingleRepeatPolicy(unittest.TestCase):
         cache = next(item for item in old if item["name"] == "cache-cohorts")
         self.assertIn("Historical registered RAM", cache["caption"])
 
-    def test_historical_eight_system_report_keeps_coverage_and_single_repeat_policy(self):
-        original = [row for row in full_matrix_cases()
-                    if row["job"]["backend"] in LEGACY_BACKENDS]
-        frozen = copy.deepcopy(original)
-        data = dataset(original)
-        figures, omitted = plots.build_figures(data)
-        self.assertEqual(omitted, [])
-        self.assertEqual(original, frozen)
-        coverage = plots.coverage(data)
-        self.assertEqual(coverage["total"], {"completed": 228})
-        self.assertFalse(coverage["current_backend_coverage"])
-        self.assertNotIn("valkey_tcp", coverage["planned_backends"])
-        primary = next(row for row in figures if row["name"] == "primary-read-concurrent")
-        self.assertEqual(len(primary["panels"][0]["series"]), 8)
-        self.assertFalse(primary["run_to_run_errorbars"])
-        self.assertEqual(primary["repeats"], [0])
-
     def test_valkey_has_real_observations_in_its_series(self):
         data = dataset(full_matrix_cases())
         figures, _ = plots.build_figures(data)
@@ -288,7 +267,7 @@ class SingleRepeatPolicy(unittest.TestCase):
 
     def test_backend_subsets_keep_primary_figures_without_unplanned_cache_series(self):
         subsets = (("valkey_tcp",), ("native", "valkey_tcp"),
-                   ("tidehunter_tcp", "tidehunter_efa_native"))
+                   ("native", "foundationdb"))
         for selected in subsets:
             with self.subTest(selected=selected):
                 cases = [row for row in full_matrix_cases() if row["job"]["backend"] in selected]
@@ -371,12 +350,12 @@ class SingleRepeatPolicy(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     data.matched_repeats(cells)
 
-    def test_full_single_repeat_has_all_twelve_performance_figures_plus_coverage(self):
+    def test_full_single_repeat_has_all_standard_figures_plus_coverage(self):
         cases = full_matrix_cases()
         original = copy.deepcopy(cases)
         figures, omitted = plots.build_figures(dataset(cases))
         self.assertEqual(omitted, [])
-        self.assertEqual(len(figures) + 1, 13)
+        self.assertEqual(len(figures) + 1, 12)
         self.assertEqual(cases, original)  # Source summaries/populations are never rewritten.
         for figure in figures:
             self.assertEqual(figure["repeats"], [0])
@@ -390,7 +369,7 @@ class SingleRepeatPolicy(unittest.TestCase):
                 item.update(status="not_run", metrics=None)
         figures, omitted = plots.build_figures(dataset(cases))
         self.assertEqual(omitted, [])
-        self.assertEqual(len(figures), 12)
+        self.assertEqual(len(figures), 11)
         for figure in figures:
             self.assertEqual(figure["planned_repeats"], [0, 1, 2])
             self.assertEqual(figure["repeats"], [0, 1])
@@ -730,68 +709,6 @@ class NvmeTcpEvidenceReporting(unittest.TestCase):
                     for series in figure["panels"][0]["series"]}
         self.assertEqual(observed, {"tidehunter_nvme_rdma": 100, "tidehunter_spdk_live_rdma": 200})
         self.assertEqual(plots.evidence_appendix(data)[1]["requested_nvmeof_target"], "spdk")
-
-    def test_generated_tcp_verbs_nvme_rdma_plan_keeps_distinct_series_and_contracts(self):
-        spec = {
-            "schema_version": 1, "mode": "nvmeof-focused", "seed": 1775, "repeats": 1,
-            "value_sizes": list(plots.SIZES),
-            "backends": ["native", "tidehunter_tcp", "tidehunter_verbs_native", "tidehunter_nvme_rdma"],
-            "keys": 4096, "max_cases": 2000, "offered_rates": [1000, 10000, 50000],
-            "offered_seconds": 8, "case_deadline_seconds": 600,
-            "hard_deadline_seconds": 10800, "export_reserve_seconds": 600,
-        }
-        jobs = make_matrix(spec)
-        items = []
-        expected = {}
-        for job in jobs:
-            operation = next(name for name, weight in job["mix"].items() if weight)
-            value = 100 + 10 * len(items)
-            item = case(job["backend"], populations=[
-                population(operation, count=job["measurement_operations"], p50=value, p99=value * 10)])
-            item["case_id"], item["job"] = job["case_id"], copy.deepcopy(job)
-            if job.get("nvmeof_route") == "sealed_read":
-                item["backend"]["name"] = job["backend"] + "_sealed_read"
-            logical_keys = job["measurement_operations"] * (32 if operation in ("get_many", "put_batch") else 1)
-            item["metrics"]["populations"][0]["logical_keys"] = logical_keys
-            item["metrics"]["success_logical_keys_per_second"] = logical_keys
-            item["metrics"]["success_value_mib_per_second"] = (
-                logical_keys * job["value_size"] / 1024**2)
-            items.append(item)
-            if job["value_size"] == 1024 and job["profile"] == "first_touch-scalar-c1-baseline":
-                expected[job["backend"]] = value
-        data = dataset(items)
-        figures, _ = plots.build_figures(data)
-        reads = next(row for row in figures if row["name"] == "sealed_read-first_touch-scalar-c1-baseline")
-        actual = {series["backend"]: next(point["median"] for point in series["points"]
-                                         if point["value_bytes"] == 1024)
-                  for series in reads["panels"][0]["series"]}
-        self.assertEqual(actual, expected)
-        writes = next(row for row in figures if row["name"] == "native_write_regression-write-c16-baseline")
-        self.assertEqual({series["backend"] for series in writes["panels"][0]["series"]},
-                         set(spec["backends"]) - {"tidehunter_nvme_rdma"})
-        originals = [item for item in items if item["job"]["cohort"] == "sealed_read"
-                     and item["job"]["value_size"] == 1024
-                     and item["job"]["profile"] == "first_touch-scalar-c1-baseline"]
-        mislabeled = copy.deepcopy(next(item for item in originals
-                                         if item["job"]["backend"] == "tidehunter_nvme_rdma"))
-        mislabeled["backend"]["name"] = "tidehunter_nvme_rdma"
-        with self.assertRaisesRegex(ValueError, "job and observed backend differ"):
-            dataset([mislabeled])
-        repeated = copy.deepcopy(next(item for item in originals
-                                     if item["job"]["backend"] == "tidehunter_nvme_rdma"))
-        repeated["case_id"] = repeated["job"]["case_id"] = repeated["case_id"] + "-r1"
-        repeated["job"]["repeat"] = 1
-        repeated["job"]["sealed_dataset"]["directness"] = "changed"
-        with self.assertRaisesRegex(ValueError, "implementation contract changed"):
-            dataset(originals + [repeated])
-        changed = copy.deepcopy(originals)
-        changed[-1]["job"]["concurrency"] = 2
-        with self.assertRaisesRegex(ValueError, "workload contract changed"):
-            dataset(changed)
-        changed = copy.deepcopy(originals)
-        changed[-1]["job"]["sealed_dataset"]["data_id"] = "different-logical-data"
-        with self.assertRaisesRegex(ValueError, "logical dataset contract changed"):
-            dataset(changed)
 
     def test_sealed_observations_retain_backend_source_and_case_identity(self):
         native = self.sealed_case("native")

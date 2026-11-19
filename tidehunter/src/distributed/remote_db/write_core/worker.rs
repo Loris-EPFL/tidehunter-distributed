@@ -20,22 +20,9 @@ impl ClientWorker {
             policy,
         } = diagnostics;
         client.trace_controls(Arc::clone(&write_timeline), partition);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let worker_wake = {
-            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-            // SAFETY: eventfd has plain value arguments. Check its result before taking ownership.
-            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: fd is a new, valid descriptor and has no other owner.
-            let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-            client.set_worker_wake(fd.as_raw_fd());
-            fd
-        };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let worker_wake = Arc::new(crate::distributed::sys::eventfd()?);
+        client.set_worker_wake(std::os::fd::AsRawFd::as_raw_fd(&*worker_wake));
         let thread_wake = Arc::clone(&worker_wake);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let leased_write_window = client.leased_write_window();
         let client = Arc::new(Mutex::new(client));
         let worker_client = Arc::clone(&client);
@@ -44,19 +31,20 @@ impl ClientWorker {
         let worker_queue = Arc::clone(&queue);
         let accounting = Arc::new(WorkerAccounting::default());
         let worker_accounting = Arc::clone(&accounting);
-        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+        #[cfg(test)]
         let caller_failure = Arc::clone(&failure);
-        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+        #[cfg(test)]
         let caller_first_failure = Arc::clone(&first_failure);
         let thread = thread::Builder::new()
             .name("value-wal-tcp".into())
             .spawn(move || {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let _thread_wake = thread_wake;
                 let mut write_profile_limit = write_profile_limit;
-                let mut profile_attempted = false;
                 let mut profile_enabled = false;
                 let mut profile_requests = 0usize;
+                // The configured limit arms the profile before the first frame;
+                // ArmProfile replaces that attempt.
+                let mut profile_attempted = false;
                 let mut checkpoint_samples = 0usize;
                 let mut checkpoint_stalls = 0u64;
                 let mut checkpoint_started: Option<Instant> = None;
@@ -65,32 +53,22 @@ impl ClientWorker {
                 let mut queued = VecDeque::new();
                 let mut controls: VecDeque<OrderedCommand> =
                     VecDeque::with_capacity(queue_capacity);
-                // One fixed-cut proof may wait outside the append FIFO. Later
-                // non-append commands never pass it. Earlier covered appends
+                // One fixed-cut position proof may wait outside the append FIFO.
+                // Later non-append commands never pass it. Earlier covered appends
                 // have already run; passing appends have later WAL positions.
                 let mut parked_checkpoint: Option<WorkerItem> = None;
-                let mut appends: HashMap<u64, (BatchVersion, GroupCompletion)> = HashMap::new();
-                let mut checkpoint: Option<(
-                    u64,
-                    usize,
-                    Reply<crate::distributed::tcp::checkpoint::CheckpointProof>,
-                )> = None;
                 let mut position: Option<(u64, u64, Reply<CheckpointPositionProof>)> = None;
                 let mut disconnected = false;
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut leased_replies: VecDeque<(u64, LeasedMembers)> =
                     VecDeque::with_capacity(leased_write_window);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut deferred: Option<(u64, Vec<CompleteBatch>, LeasedMembers)> = None;
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut released = Vec::with_capacity(leased_write_window);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let prepare_leased_command =
                     |client: &mut Client,
                      command: &WorkerItem,
                      released: &mut Vec<(u64, Vec<DurableBatch>)>,
                      replies: &mut VecDeque<(u64, LeasedMembers)>| {
-                        if !client.live_leased_mode() {
+                        if !client.live_nvme_configured() {
                             return true;
                         }
                         // Acquire observes a fatal checkpoint or another owner's
@@ -100,13 +78,7 @@ impl ClientWorker {
                             return false;
                         }
                         let result = match command {
-                            WorkerItem::Control(Command::Checkpoint(..)) => {
-                                client.settle_leased_extent(released, Some(&write_timeline))
-                            }
                             WorkerItem::Control(Command::CheckpointPosition(..)) => Ok(()),
-                            WorkerItem::Control(Command::ReadIoStats(_)) => {
-                                client.wait_leased_control(released, Some(&write_timeline))
-                            }
                             WorkerItem::Control(Command::Seal(..))
                             | WorkerItem::Control(Command::Control(_)) => {
                                 client.close_leased_extent(released, Some(&write_timeline))
@@ -121,14 +93,15 @@ impl ClientWorker {
                                 Ok(())
                             }
                         };
-                        let result =
-                            result.and_then(|()| release_leased_replies(released, replies));
+                        let result = result.and_then(|()| {
+                            release_leased_replies(released, replies, &write_timeline)
+                        });
                         if let Err(error) = result {
                             client.record_live_write_error();
                             record_first_failure(
                                 &first_failure,
                                 Some(partition),
-                                None,
+                                first_unresolved_leased(replies, None),
                                 "leased_command",
                                 &error,
                             );
@@ -142,7 +115,6 @@ impl ClientWorker {
                 // disconnection or the first fail-stop condition.
                 'worker: loop {
                     if failure.load(std::sync::atomic::Ordering::Acquire) {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         worker_client.lock().record_live_write_error();
                         break;
                     }
@@ -150,7 +122,6 @@ impl ClientWorker {
                     // Failure may have arrived while a control/test holder kept
                     // this mutex. Recheck before taking any READY queue entry.
                     if failure.load(std::sync::atomic::Ordering::Acquire) {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         client.record_live_write_error();
                         break;
                     }
@@ -167,7 +138,6 @@ impl ClientWorker {
                         },
                     );
                     disconnected |= closed;
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     let mut queue_credit_blocked = false;
                     for _ in 0..queue_capacity + policy.append_occupancy {
                         if controls
@@ -205,10 +175,7 @@ impl ClientWorker {
                                 break;
                             }
                             Ok(GroupDrain::CreditBlocked) => {
-                                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                                {
-                                    queue_credit_blocked = true;
-                                }
+                                queue_credit_blocked = true;
                                 break;
                             }
                             Err(error) => {
@@ -230,8 +197,7 @@ impl ClientWorker {
                         crate::distributed::write_timeline::WriteOwnerQueue::WorkerQueued,
                         queued.len(),
                     );
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    if client.live_leased_mode() {
+                    if client.live_nvme_configured() {
                         write_timeline.owner_queue(
                             partition,
                             crate::distributed::write_timeline::WriteOwnerQueue::LeasedFlights,
@@ -246,13 +212,15 @@ impl ClientWorker {
                         let mut leased_failure_stage = "live_group";
                         let result = (|| {
                             client.progress_leased_flights(&mut released, Some(&write_timeline))?;
-                            if let Err(error) =
-                                release_leased_replies(&mut released, &mut leased_replies)
-                            {
+                            if let Err(error) = release_leased_replies(
+                                &mut released,
+                                &mut leased_replies,
+                                &write_timeline,
+                            ) {
                                 record_first_failure(
                                     &first_failure,
                                     Some(partition),
-                                    None,
+                                    first_unresolved_leased(&leased_replies, None),
                                     "leased_release_order",
                                     &error,
                                 );
@@ -260,43 +228,25 @@ impl ClientWorker {
                             }
                             leased_failure_stage = "leased_adoption";
                             if client.leased_adoption_pending() {
-                                client.progress_appends()?;
+                                client.progress_session()?;
                                 client.harvest_leased_adoption()?;
                             }
                             if parked_checkpoint.is_none()
-                                && checkpoint.is_none()
                                 && position.is_none()
                                 && matches!(
                                     queued.front(),
-                                    Some(
-                                        WorkerItem::Control(Command::CheckpointPosition(..))
-                                            | WorkerItem::Control(Command::Checkpoint(..))
-                                    )
+                                    Some(WorkerItem::Control(Command::CheckpointPosition(..)))
                                 )
                             {
                                 parked_checkpoint = queued.pop_front();
                             }
-                            if let Some(command) = parked_checkpoint.as_ref() {
-                                let ready = if matches!(
-                                    command,
-                                    WorkerItem::Control(Command::CheckpointPosition(..))
-                                ) {
-                                    client.prepare_leased_position()?;
-                                    true
-                                } else {
-                                    !client.leased_adoption_pending()
-                                };
-                                if ready {
-                                    // Fixed through/prefix proofs tolerate later appends:
-                                    // position persistence validates its captured offset;
-                                    // on-disk receipt history retains the exact prefix.
-                                    // Checkpoint still settles its extent before submission.
-                                    queued.push_front(parked_checkpoint.take().unwrap());
-                                }
+                            if parked_checkpoint.is_some() {
+                                client.prepare_leased_position()?;
+                                // A fixed-through proof tolerates later appends:
+                                // position persistence validates its captured offset.
+                                queued.push_front(parked_checkpoint.take().unwrap());
                             }
-                            if appends.is_empty()
-                                && checkpoint.is_none()
-                                && parked_checkpoint.is_none()
+                            if parked_checkpoint.is_none()
                                 && matches!(queued.front(), Some(WorkerItem::Append(..)) | None)
                             {
                                 client.submit_leased_adoption()?;
@@ -305,10 +255,14 @@ impl ClientWorker {
                         })();
                         if let Err(error) = result {
                             client.record_live_write_error();
+                            // Every frame still in flight has an unknown outcome.
                             record_first_failure(
                                 &first_failure,
                                 Some(partition),
-                                None,
+                                first_unresolved_leased(
+                                    &leased_replies,
+                                    deferred.as_ref().map(|(_, _, members)| members),
+                                ),
                                 leased_failure_stage,
                                 &error,
                             );
@@ -316,8 +270,7 @@ impl ClientWorker {
                             failure.store(true, std::sync::atomic::Ordering::Release);
                             break;
                         }
-                        if checkpoint.is_none()
-                            && position.is_none()
+                        if position.is_none()
                             && client.leased_adoption_pending()
                             && client.leased_flights_in_flight() == 0
                             && !matches!(
@@ -331,10 +284,6 @@ impl ClientWorker {
                             // The control slot progresses only on this thread. Do
                             // not park forever on the command channel or spin on
                             // an adoption: wake within 1 ms to drive its deadline.
-                            #[cfg(test)]
-                            if !queued.is_empty() {
-                                client.leased_test_note_command_adoption_wait();
-                            }
                             // A guard regression would wait here with a frame in flight.
                             #[cfg(test)]
                             if client.leased_flights_in_flight() != 0 {
@@ -375,18 +324,9 @@ impl ClientWorker {
                     if !disconnected
                         && queued.is_empty()
                         && parked_checkpoint.is_none()
-                        && appends.is_empty()
                         && !client.has_pending_io()
-                        && {
-                            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                            {
-                                client.leased_flights_in_flight() == 0 && deferred.is_none()
-                            }
-                            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                            {
-                                true
-                            }
-                        }
+                        && client.leased_flights_in_flight() == 0
+                        && deferred.is_none()
                     {
                         if !worker_queue.park() {
                             continue;
@@ -404,7 +344,6 @@ impl ClientWorker {
                         worker_queue.unpark();
                         continue;
                     }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if let Some((epoch, batches, members)) = deferred.take() {
                         match client.submit_leased_group(
                             epoch,
@@ -416,6 +355,10 @@ impl ClientWorker {
                             Ok(crate::distributed::tcp::LeasedSubmit::Submitted(id)) => {
                                 if let Some(counters) = client.live_counters() {
                                     counters.record_deferred_submit();
+                                }
+                                if profile_enabled {
+                                    profile_requests += 1;
+                                    write_profile.lock().sampled_requests += 1;
                                 }
                                 leased_replies.push_back((id, members));
                                 if position.is_none() {
@@ -440,7 +383,6 @@ impl ClientWorker {
                             }
                         }
                     }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if client.leased_flights_in_flight() != 0
                         && (deferred.is_some()
                             || !matches!(queued.front(), Some(WorkerItem::Append(..)))
@@ -460,7 +402,10 @@ impl ClientWorker {
                             record_first_failure(
                                 &first_failure,
                                 Some(partition),
-                                None,
+                                first_unresolved_leased(
+                                    &leased_replies,
+                                    deferred.as_ref().map(|(_, _, members)| members),
+                                ),
                                 "live_group",
                                 &error,
                             );
@@ -472,22 +417,45 @@ impl ClientWorker {
                         }
                     }
                     // Merge ready same-epoch appends without crossing a control
-                    // barrier. Reserved writes keep one reservation in flight.
-                    // Leased frames use the configured completion window.
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    // barrier. Leased frames use the configured completion window.
                     if client.live_nvme_configured()
-                        && appends.is_empty()
-                        && checkpoint.is_none()
-                        && (position.is_none() || client.live_leased_mode())
-                        && (!client.live_leased_mode()
-                            || (deferred.is_none()
-                                && client.leased_flights_in_flight()
-                                    < client.leased_write_window()))
-                        && let Some(WorkerItem::Append(epoch, _, _)) = queued.front()
+                        && deferred.is_none()
+                        && client.leased_flights_in_flight() < client.leased_write_window()
+                        // A sampled profile stops dispatch at its limit until
+                        // the capture below has closed it.
+                        && (!profile_enabled || profile_requests < write_profile_limit)
+                        && let Some(WorkerItem::Append(batches, _)) = queued.front()
                     {
-                        let epoch = *epoch;
-                        if client.live_leased_mode()
-                            && policy.leased_submit_redrain
+                        let epoch = batches[0].version().epoch;
+                        if write_profile_limit > 0
+                            && !profile_attempted
+                            && position.is_none()
+                            && parked_checkpoint.is_none()
+                        {
+                            profile_attempted = true;
+                            if let Err(error) = settle_leased_for_control(
+                                &mut client,
+                                &mut released,
+                                &mut leased_replies,
+                                &write_timeline,
+                            ) {
+                                client.record_live_write_error();
+                                record_first_failure(
+                                    &first_failure,
+                                    Some(partition),
+                                    first_unresolved_leased(&leased_replies, None),
+                                    "leased_profile",
+                                    &error,
+                                );
+                                failure.store(true, std::sync::atomic::Ordering::Release);
+                                break;
+                            }
+                            match client.connection_profile(true, false) {
+                                Ok(_) => profile_enabled = true,
+                                Err(_) => record_write_profile_error(&write_profile, true),
+                            }
+                        }
+                        if policy.leased_submit_redrain
                             && !crate::distributed::storage::baseline_write_path()
                         {
                             // Last-moment merge: take groups that became READY
@@ -545,10 +513,10 @@ impl ClientWorker {
                         let mut frame_full = false;
                         let mut payload = crate::distributed::tcp::LiveGroupBudget::EMPTY_PAYLOAD;
                         for command in &queued {
-                            let WorkerItem::Append(command_epoch, batches, _) = command else {
+                            let WorkerItem::Append(batches, _) = command else {
                                 break;
                             };
-                            if *command_epoch != epoch {
+                            if batches[0].version().epoch != epoch {
                                 break;
                             }
                             match budget.extend(count, payload, batches) {
@@ -585,21 +553,15 @@ impl ClientWorker {
                             }
                         }
                         if take != 0 {
-                            let leased = client.live_leased_mode();
-                            let mut merged = if leased {
-                                Vec::new()
-                            } else {
-                                Vec::with_capacity(count.max(1))
-                            };
+                            let mut merged = Vec::new();
                             let mut members: LeasedMembers = Vec::with_capacity(take);
                             for _ in 0..take {
-                                let Some(WorkerItem::Append(_, batches, reply)) =
-                                    queued.pop_front()
+                                let Some(WorkerItem::Append(batches, reply)) = queued.pop_front()
                                 else {
                                     unreachable!("append queue front changed");
                                 };
                                 members.push((batches[0].version(), batches.len(), reply));
-                                if leased && merged.is_empty() {
+                                if merged.is_empty() {
                                     // Transfer the first command's allocation with its batches.
                                     merged = batches;
                                 } else {
@@ -607,86 +569,51 @@ impl ClientWorker {
                                 }
                             }
                             let first = members[0].0;
-                            if leased {
-                                // Same evidence bound in every arm: READY
-                                // entries before the first ordered control.
-                                let left = write_core::worker_group::ready_left(
-                                    &worker_queue,
-                                    controls
-                                        .front()
-                                        .map_or(u64::MAX, |control| control.before_owner_seq),
-                                    &policy,
-                                    &queued,
-                                );
-                                match client.submit_leased_group(
-                                    epoch,
-                                    merged,
-                                    &write_timeline,
-                                    partition,
-                                    queued.is_empty(),
-                                ) {
-                                    Ok(crate::distributed::tcp::LeasedSubmit::Submitted(id)) => {
-                                        if let Some(counters) = client.live_counters() {
-                                            counters.record_submit_ready_left(left, frame_full);
-                                        }
-                                        leased_replies.push_back((id, members));
+                            // READY entries before the first ordered control.
+                            let left = write_core::worker_group::ready_left(
+                                &worker_queue,
+                                controls
+                                    .front()
+                                    .map_or(u64::MAX, |control| control.before_owner_seq),
+                                &policy,
+                                &queued,
+                            );
+                            match client.submit_leased_group(
+                                epoch,
+                                merged,
+                                &write_timeline,
+                                partition,
+                                queued.is_empty(),
+                            ) {
+                                Ok(crate::distributed::tcp::LeasedSubmit::Submitted(id)) => {
+                                    if let Some(counters) = client.live_counters() {
+                                        counters.record_submit_ready_left(left, frame_full);
                                     }
-                                    Ok(crate::distributed::tcp::LeasedSubmit::Deferred(
-                                        batches,
-                                    )) => {
-                                        deferred = Some((epoch, batches, members));
+                                    // One sampled request per frame, as one owner
+                                    // append request was before R3.
+                                    if profile_enabled {
+                                        profile_requests += 1;
+                                        write_profile.lock().sampled_requests += 1;
                                     }
-                                    Err(error) => {
-                                        deferred = Some((epoch, Vec::new(), members));
-                                        client.record_live_write_error();
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            Some(first),
-                                            "live_group",
-                                            &error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                        break;
-                                    }
+                                    leased_replies.push_back((id, members));
                                 }
-                                if position.is_none() {
-                                    continue;
+                                Ok(crate::distributed::tcp::LeasedSubmit::Deferred(batches)) => {
+                                    deferred = Some((epoch, batches, members));
                                 }
-                            } else {
-                                match client.write_live_group(
-                                    epoch,
-                                    &merged,
-                                    &write_timeline,
-                                    partition,
-                                ) {
-                                    Ok(receipts) => {
-                                        let mut receipts = receipts.into_iter();
-                                        for (_, len, reply) in members.drain(..) {
-                                            let _ = reply
-                                                .send(Ok(receipts.by_ref().take(len).collect()));
-                                        }
-                                    }
-                                    Err(error) => {
-                                        client.record_live_write_error();
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            Some(first),
-                                            "live_group",
-                                            &error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                        for (version, _, reply) in members.drain(..) {
-                                            let _ = reply
-                                                .send(Err(LocalDbError::unknown(version, &error)));
-                                        }
-                                        break;
-                                    }
+                                Err(error) => {
+                                    deferred = Some((epoch, Vec::new(), members));
+                                    client.record_live_write_error();
+                                    record_first_failure(
+                                        &first_failure,
+                                        Some(partition),
+                                        Some(first),
+                                        "live_group",
+                                        &error,
+                                    );
+                                    failure.store(true, std::sync::atomic::Ordering::Release);
+                                    break;
                                 }
                             }
-                            // While a proof is pending, also drive its reply/deadline
-                            // after each direct frame. A full append FIFO cannot starve it.
                             if position.is_none() {
                                 continue;
                             }
@@ -694,154 +621,7 @@ impl ClientWorker {
                     }
 
                     let mut progressed = false;
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                    let live_append = client.live_nvme_configured();
-                    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                    let live_append = false;
-                    if let Some(WorkerItem::Append(epoch, batches, _)) = queued.front()
-                        && !live_append
-                        && (!profile_enabled || profile_requests < write_profile_limit)
-                    {
-                        if write_profile_limit > 0
-                            && !profile_attempted
-                            && appends.is_empty()
-                            && checkpoint.is_none()
-                            && position.is_none()
-                        {
-                            profile_attempted = true;
-                            match client.connection_profile(true, false) {
-                                Ok(_) => profile_enabled = true,
-                                Err(_) => record_write_profile_error(&write_profile, true),
-                            }
-                        }
-                        let first = batches[0].version();
-                        match client.submit_append_many(*epoch, batches) {
-                            Ok(Some(id)) => {
-                                if write_timeline.enabled() {
-                                    for batch in batches {
-                                        write_timeline.batch_event(
-                                            batch.version(),
-                                            WriteTimelineStage::TxQueued,
-                                            Some(partition),
-                                            Some(id),
-                                        );
-                                    }
-                                }
-                                let WorkerItem::Append(_, _, reply) =
-                                    queued.pop_front().expect("front append exists")
-                                else {
-                                    unreachable!("append queue front changed");
-                                };
-                                appends.insert(id, (first, reply));
-                                if profile_enabled {
-                                    profile_requests += 1;
-                                    write_profile.lock().sampled_requests += 1;
-                                }
-                                progressed = true;
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                let WorkerItem::Append(_, _, reply) =
-                                    queued.pop_front().expect("front append exists")
-                                else {
-                                    unreachable!("append queue front changed");
-                                };
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    Some(first),
-                                    "append_submit",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                let _ = reply.send(Err(LocalDbError::unknown(first, error)));
-                                progressed = true;
-                            }
-                        }
-                    }
-                    if checkpoint.is_none()
-                        && parked_checkpoint.is_none()
-                        && position.is_none()
-                        && let Some(WorkerItem::Control(Command::Checkpoint(
-                            authority,
-                            epoch,
-                            prefix,
-                            _,
-                        ))) = queued.front()
-                    {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                        if let Some(command) = queued.front()
-                            && !prepare_leased_command(
-                                &mut client,
-                                command,
-                                &mut released,
-                                &mut leased_replies,
-                            )
-                        {
-                            break;
-                        }
-                        let deadline = *checkpoint_admission_deadline
-                            .get_or_insert_with(|| client.checkpoint_deadline());
-                        match client.submit_checkpoint(*authority, *epoch, *prefix, deadline) {
-                            Ok(true) => {
-                                let WorkerItem::Control(Command::Checkpoint(
-                                    _,
-                                    epoch,
-                                    prefix,
-                                    reply,
-                                )) = queued.pop_front().expect("front checkpoint exists")
-                                else {
-                                    unreachable!("checkpoint queue front changed");
-                                };
-                                write_timeline.checkpoint(
-                                    "control_submit",
-                                    Some(partition),
-                                    epoch,
-                                    Some(prefix),
-                                );
-                                checkpoint_admission_deadline = None;
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_samples += 1;
-                                    checkpoint_started = Some(Instant::now());
-                                    let mut profile = write_profile.lock();
-                                    profile.checkpoint_requests += 1;
-                                    profile.checkpoint_admission_stalls = profile
-                                        .checkpoint_admission_stalls
-                                        .saturating_add(checkpoint_stalls);
-                                }
-                                checkpoint_stalls = 0;
-                                checkpoint = Some((epoch, prefix, reply));
-                                progressed = true;
-                            }
-                            Ok(false) => {
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_stalls = checkpoint_stalls.saturating_add(1);
-                                }
-                            }
-                            Err(error) => {
-                                let WorkerItem::Control(Command::Checkpoint(_, _, _, reply)) =
-                                    queued.pop_front().expect("front checkpoint exists")
-                                else {
-                                    unreachable!("checkpoint queue front changed");
-                                };
-                                checkpoint_admission_deadline = None;
-                                checkpoint_stalls = 0;
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    None,
-                                    "checkpoint_submit",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                let _ = reply.send(Err(LocalDbError::component(error)));
-                                progressed = true;
-                            }
-                        }
-                    }
-
-                    if checkpoint.is_none()
-                        && parked_checkpoint.is_none()
+                    if parked_checkpoint.is_none()
                         && position.is_none()
                         && let Some(WorkerItem::Control(Command::CheckpointPosition(
                             authority,
@@ -850,7 +630,6 @@ impl ClientWorker {
                             _,
                         ))) = queued.front()
                     {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if let Some(command) = queued.front()
                             && !prepare_leased_command(
                                 &mut client,
@@ -925,49 +704,9 @@ impl ClientWorker {
                             }
                         }
                     }
-                    if !appends.is_empty() || client.has_pending_io() {
-                        match client.progress_appends() {
-                            Ok(completions) => {
-                                if !completions.is_empty() {
-                                    progressed = true;
-                                }
-                                for completion in completions {
-                                    if checkpoint_started.is_some()
-                                        && appends.contains_key(&completion.id)
-                                    {
-                                        checkpoint_append_completions =
-                                            checkpoint_append_completions.saturating_add(1);
-                                    }
-                                    write_timeline.response(partition, completion.id);
-                                    if let Some((first, reply)) = appends.remove(&completion.id) {
-                                        let result = completion
-                                            .result
-                                            .map_err(|error| LocalDbError::unknown(first, error));
-                                        if let Ok(receipts) = &result {
-                                            write_timeline.wait_enter(
-                                                WriteWait::HarvestToDurable,
-                                                receipts.len(),
-                                            );
-                                            // One W3 handoff per harvested completion.
-                                            // Publication runs on this worker inside
-                                            // reply.send, so it never needs a hint.
-                                            write_timeline
-                                                .wait_wake(WriteWait::HarvestToDurable, true);
-                                        }
-                                        if let Err(error) = &result {
-                                            record_first_failure(
-                                                &first_failure,
-                                                Some(partition),
-                                                Some(first),
-                                                "append_completion",
-                                                error,
-                                            );
-                                            failure
-                                                .store(true, std::sync::atomic::Ordering::Release);
-                                        }
-                                        let _ = reply.send(result);
-                                    }
-                                }
+                    if client.has_pending_io() {
+                        match client.progress_session() {
+                            Ok(()) => {
                                 if let Some((epoch, through, _)) = position.as_ref()
                                     && let Some(result) =
                                         client.take_checkpoint_position(*epoch, *through)
@@ -1004,56 +743,16 @@ impl ClientWorker {
                                     let _ = reply.send(result);
                                     progressed = true;
                                 }
-                                if let Some((epoch, prefix, _)) = checkpoint.as_ref()
-                                    && let Some(result) = client.take_checkpoint(*epoch, *prefix)
-                                {
-                                    write_timeline.checkpoint(
-                                        "control_retire",
-                                        Some(partition),
-                                        *epoch,
-                                        Some(*prefix),
-                                    );
-                                    if let Some(started) = checkpoint_started.take() {
-                                        let mut profile = write_profile.lock();
-                                        profile.checkpoint_completed += 1;
-                                        profile.checkpoint_wait_ns = profile
-                                            .checkpoint_wait_ns
-                                            .saturating_add(elapsed(started));
-                                        profile.checkpoint_append_completions = profile
-                                            .checkpoint_append_completions
-                                            .saturating_add(checkpoint_append_completions);
-                                        checkpoint_append_completions = 0;
-                                    }
-                                    let (_, _, reply) =
-                                        checkpoint.take().expect("checkpoint exists");
-                                    let result = result.map_err(LocalDbError::component);
-                                    if let Err(error) = &result {
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            None,
-                                            "checkpoint_completion",
-                                            error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                    }
-                                    let _ = reply.send(result);
-                                    progressed = true;
-                                }
                             }
                             Err(error) => {
-                                let first = appends.values().next().map(|(first, _)| *first);
                                 record_first_failure(
                                     &first_failure,
                                     Some(partition),
-                                    first,
+                                    None,
                                     "transport_progress",
                                     &error,
                                 );
                                 failure.store(true, std::sync::atomic::Ordering::Release);
-                                for (_, (first, reply)) in appends.drain() {
-                                    let _ = reply.send(Err(LocalDbError::unknown(first, &error)));
-                                }
                                 if let Some(started) = checkpoint_started.take() {
                                     let mut profile = write_profile.lock();
                                     profile.checkpoint_completed += 1;
@@ -1063,16 +762,13 @@ impl ClientWorker {
                                         .checkpoint_append_completions
                                         .saturating_add(checkpoint_append_completions);
                                 }
-                                if let Some((_, _, reply)) = checkpoint.take() {
-                                    let _ = reply.send(Err(LocalDbError::new(error.to_string())));
-                                }
                                 if let Some((_, _, reply)) = position.take() {
                                     let _ = reply.send(Err(LocalDbError::new(error.to_string())));
                                 }
                                 let message = error.to_string();
                                 for command in queued.drain(..) {
                                     match command {
-                                        WorkerItem::Append(_, batches, reply) => {
+                                        WorkerItem::Append(batches, reply) => {
                                             let first = batches[0].version();
                                             let _ = reply
                                                 .send(Err(LocalDbError::unknown(first, &message)));
@@ -1080,18 +776,7 @@ impl ClientWorker {
                                         WorkerItem::Control(Command::Stats(reply)) => {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
                                         }
-                                        WorkerItem::Control(Command::ReadIoStats(reply)) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
                                         WorkerItem::Control(Command::CheckpointPosition(
-                                            _,
-                                            _,
-                                            _,
-                                            reply,
-                                        )) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        WorkerItem::Control(Command::Checkpoint(
                                             _,
                                             _,
                                             _,
@@ -1116,10 +801,9 @@ impl ClientWorker {
                             }
                         }
                     }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     // Acquire observes checkpoint submission/completion failure in
                     // this pass before profile control, queued commands or close.
-                    if client.live_leased_mode()
+                    if client.live_nvme_configured()
                         && failure.load(std::sync::atomic::Ordering::Acquire)
                     {
                         client.record_live_write_error();
@@ -1128,10 +812,28 @@ impl ClientWorker {
 
                     if profile_enabled
                         && profile_requests >= write_profile_limit
-                        && appends.is_empty()
-                        && checkpoint.is_none()
                         && position.is_none()
+                        && parked_checkpoint.is_none()
                     {
+                        // The capture is a control exchange: settle the sampled
+                        // frames and their adoption first, as for FinishProfile.
+                        if let Err(error) = settle_leased_for_control(
+                            &mut client,
+                            &mut released,
+                            &mut leased_replies,
+                            &write_timeline,
+                        ) {
+                            client.record_live_write_error();
+                            record_first_failure(
+                                &first_failure,
+                                Some(partition),
+                                first_unresolved_leased(&leased_replies, None),
+                                "leased_profile",
+                                &error,
+                            );
+                            failure.store(true, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
                         match client.connection_profile(false, false) {
                             Ok(profile) => capture_write_profile(&write_profile, profile),
                             Err(_) => record_write_profile_error(&write_profile, false),
@@ -1140,20 +842,14 @@ impl ClientWorker {
                         progressed = true;
                     }
 
-                    if appends.is_empty()
-                        && checkpoint.is_none()
-                        && position.is_none()
-                        && parked_checkpoint.is_none()
-                    {
+                    if position.is_none() && parked_checkpoint.is_none() {
                         match queued.front() {
                             Some(WorkerItem::Control(Command::Stats(_)))
-                            | Some(WorkerItem::Control(Command::ReadIoStats(_)))
                             | Some(WorkerItem::Control(Command::OwnerTimelineArm(_, _)))
                             | Some(WorkerItem::Control(Command::Seal(_, _)))
                             | Some(WorkerItem::Control(Command::ArmProfile(_, _)))
                             | Some(WorkerItem::Control(Command::FinishProfile(_)))
                             | Some(WorkerItem::Control(Command::Control(_))) => {
-                                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                                 if let Some(command) = queued.front()
                                     && !prepare_leased_command(
                                         &mut client,
@@ -1182,11 +878,6 @@ impl ClientWorker {
                                                 .map_err(LocalDbError::component),
                                         );
                                     }
-                                    WorkerItem::Control(Command::ReadIoStats(reply)) => {
-                                        let _ = reply.send(
-                                            client.read_io_stats().map_err(LocalDbError::component),
-                                        );
-                                    }
                                     WorkerItem::Control(Command::Seal(epoch, reply)) => {
                                         let _ = reply.send(
                                             client.seal(epoch).map_err(LocalDbError::component),
@@ -1195,9 +886,9 @@ impl ClientWorker {
                                     WorkerItem::Control(Command::ArmProfile(limit, reply)) => {
                                         write_profile_limit = limit;
                                         profile_requests = 0;
+                                        profile_attempted = limit != 0;
                                         checkpoint_samples = 0;
                                         checkpoint_stalls = 0;
-                                        profile_attempted = limit != 0;
                                         let enabled = limit != 0;
                                         let result = client
                                             .connection_profile(enabled, true)
@@ -1234,7 +925,6 @@ impl ClientWorker {
                                     }
                                     WorkerItem::Control(Command::QueueReady) => {}
                                     WorkerItem::Append(..)
-                                    | WorkerItem::Control(Command::Checkpoint(..))
                                     | WorkerItem::Control(Command::CheckpointPosition(..)) => {
                                         unreachable!()
                                     }
@@ -1247,13 +937,10 @@ impl ClientWorker {
                     if disconnected
                         && queued.is_empty()
                         && controls.is_empty()
-                        && appends.is_empty()
-                        && checkpoint.is_none()
                         && position.is_none()
                         && parked_checkpoint.is_none()
                     {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                        if client.live_leased_mode()
+                        if client.live_nvme_configured()
                             && let Err(error) =
                                 client.close_leased_extent(&mut released, Some(&write_timeline))
                         {
@@ -1280,13 +967,6 @@ impl ClientWorker {
                         failure_context(&first_failure, "TCP worker stopped during position proof");
                     let _ = reply.send(Err(LocalDbError::new(message)));
                 }
-                if let Some((_, _, reply)) = checkpoint.take() {
-                    let message = failure_context(
-                        &first_failure,
-                        "TCP worker stopped during checkpoint proof",
-                    );
-                    let _ = reply.send(Err(LocalDbError::new(message)));
-                }
                 if let Some(command) = parked_checkpoint.take() {
                     let message = failure_context(
                         &first_failure,
@@ -1296,13 +976,9 @@ impl ClientWorker {
                         WorkerItem::Control(Command::CheckpointPosition(_, _, _, reply)) => {
                             let _ = reply.send(Err(LocalDbError::new(message)));
                         }
-                        WorkerItem::Control(Command::Checkpoint(_, _, _, reply)) => {
-                            let _ = reply.send(Err(LocalDbError::new(message)));
-                        }
                         _ => unreachable!("only fixed-cut proofs may be parked"),
                     }
                 }
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 {
                     let message = failure_context(
                         &first_failure,
@@ -1340,9 +1016,6 @@ impl ClientWorker {
                         &first_failure,
                         "owner worker stopped with unresolved writes",
                     );
-                    for (_, (version, reply)) in appends.drain() {
-                        let _ = reply.send(Err(LocalDbError::unknown(version, &message)));
-                    }
                     completion.failed(partition, &[], LocalDbError::new(message));
                 }
                 // Acquire keeps profile control off a failed authority.
@@ -1358,18 +1031,17 @@ impl ClientWorker {
         Ok(Self {
             client,
             sender: Some(Arc::new(sender)),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             worker_wake,
             thread: Mutex::new(Some(thread)),
             queue,
             accounting,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             failure: caller_failure,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             first_failure: caller_first_failure,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             partition,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             test_completion: None,
         })
     }

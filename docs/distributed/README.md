@@ -4,11 +4,14 @@ Started 6 October 2026 in a separate checkout named `tidehunter-sharded-wal`.
 
 [Performance plan and benchmark references, 10 November 2026](PERFORMANCE_PLAN_2026-11-10.md).
 
-The distributed node configuration exposes `live_target` independently of the
-NVMe-oF feature. A nonempty target requires `experimental-nvmeof` on Linux;
-unsupported builds reject it rather than starting a native node silently.
-Final target-shutdown evidence is available through the same node API in both
-builds, with `None` identifying a native node.
+The `experimental-distributed` feature always contains the leased live NVMe-oF
+route; there is no separate NVMe-oF feature. The route runs on Linux only. On
+other targets the feature still builds and the native `distributed::sui::Db`
+paths work, but a remote database or owner node open fails with
+`distributed route requires Linux (leased NVMe-oF): <target_os>`. The Linux
+system interface is confined to `tidehunter/src/distributed/sys/`. Final
+target-shutdown evidence is available through the node API, with `None`
+identifying a node without a configured `live_target`.
 
 **Distributed-KV research comparison:**
 [Experimental protocol, guarantee tiers and source mapping](KV_COMPARISON_PROTOCOL.md).

@@ -3,10 +3,7 @@ use super::*;
 use bincode::Options;
 
 mod recovered_suffix;
-pub(super) use recovered_suffix::SuffixRewrite;
-// Used by the on-disk owned frame reader and the live-stream guard test.
-#[cfg(test)]
-pub(super) use recovered_suffix::hook as suffix_rewrite_hook;
+use recovered_suffix::SuffixRewrite;
 
 /// Recovery scans read beyond the durable frontier, where a frame can be absent or
 /// torn. Only these outcomes mean "no valid frame here": a missing file, a short
@@ -44,7 +41,7 @@ thread_local! {
 
 /// Test hook: replace the result of the next `read` at WAL `offset` on this thread
 /// with EIO. The faulted reads are on live streams, which need the NVMe-oF feature.
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 pub(crate) fn inject_read_fault(read: RecoveryRead, offset: u64) {
     READ_FAULT.with(|slot| slot.set(Some((read, offset))));
 }
@@ -163,21 +160,17 @@ pub struct ReplayPage {
 }
 
 fn position_lifecycle(state: &State) -> (bool, bool, bool) {
-    #[cfg(feature = "experimental-nvmeof")]
-    let sealing = state.sealing;
-    #[cfg(not(feature = "experimental-nvmeof"))]
-    let sealing = false;
-    (state.sealed, state.writer.is_some(), sealing)
+    (state.sealed, state.writer.is_some(), state.sealing)
 }
 
 impl PartitionLog {
     pub(super) fn is_retired(&self, offset: u64) -> Result<bool, StorageError> {
-        let state = self.state.lock();
-        if let Some(root) = &state.wal_root {
-            return Ok(root.retired.binary_search(&offset).is_ok());
-        }
-        drop(state);
-        self.references.is_retired(offset)
+        Ok(self
+            .state
+            .lock()
+            .wal_root
+            .as_ref()
+            .is_some_and(|root| root.retired.binary_search(&offset).is_ok()))
     }
 
     /// Sync the fixed acknowledged cut without blocking leases on the file barrier.
@@ -214,10 +207,7 @@ impl PartitionLog {
                     "checkpoint position beyond allocated WAL",
                 ));
             }
-            #[cfg(feature = "experimental-nvmeof")]
             let leased = state.open_live_extent.is_some();
-            #[cfg(not(feature = "experimental-nvmeof"))]
-            let leased = false;
             // Owner-RPC cuts must be below the owner's completed-write frontier.
             // An open lease has no owner-visible CQE; only its coordinator may
             // name a fully written acknowledged cut above that frontier.
@@ -241,7 +231,7 @@ impl PartitionLog {
                 let _ = resume.recv();
             }
         }
-        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        #[cfg(test)]
         self.pause_live_at(LivePausePoint::PositionBeforeData);
         #[cfg(test)]
         self.fail_position_at(4)?;
@@ -283,7 +273,7 @@ impl PartitionLog {
         }
         #[cfg(test)]
         self.fail_position_at(5)?;
-        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        #[cfg(test)]
         self.pause_live_at(LivePausePoint::PositionBeforeRoot);
         timing.stage(Some(WriteStage::PersistSerializationLock));
         let _persistence = self.persistence.lock();
@@ -302,7 +292,7 @@ impl PartitionLog {
                 .clone()
                 .ok_or(StorageError::Invalid("position root removed during sync"))?
         };
-        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        #[cfg(test)]
         self.pause_live_at(LivePausePoint::PositionRootLocked);
         let scan_from =
             through.saturating_sub(1) / self.config().fragment_bytes * self.config().fragment_bytes;
@@ -319,7 +309,7 @@ impl PartitionLog {
             self.state.lock().wal_root = Some(root);
             #[cfg(test)]
             self.fail_position_at(6)?;
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             self.pause_live_at(LivePausePoint::PositionAfterRoot);
             timing.success(0);
             proof_span.end_at(through);
@@ -375,11 +365,7 @@ impl PartitionLog {
     pub fn retire_wal_files(&self, files: &[u64]) -> Result<(), StorageError> {
         let _persistence = self.persistence.lock();
         let mut state = self.state.lock();
-        if !state.sealed
-            || state.writer.is_some()
-            || state.poison.is_some()
-            || state.references.background_failed()
-        {
+        if !state.sealed || state.writer.is_some() || state.poison.is_some() {
             return Err(StorageError::Invalid(
                 "retirement requires healthy sealed storage",
             ));
@@ -419,7 +405,6 @@ impl PartitionLog {
             ids.push(id);
         }
         let mut admission = self.read_admission.write();
-        #[cfg(feature = "experimental-nvmeof")]
         if self.live_read_pins.load(Ordering::Acquire) != 0 {
             return Err(StorageError::Invalid(
                 "live namespace or read pin prevents retirement",
@@ -580,7 +565,6 @@ impl PartitionLog {
     }
 
     pub(super) fn leased_address(state: &State, address: PhysicalValueAddress) -> bool {
-        #[cfg(feature = "experimental-nvmeof")]
         if let Some(open) = &state.open_live_extent {
             let end = state
                 .next_live_extent
@@ -665,14 +649,10 @@ impl PartitionLog {
                     "replay requires sealed immutable epoch",
                 ));
             }
-            #[cfg(feature = "experimental-nvmeof")]
-            let live = state.live;
-            #[cfg(not(feature = "experimental-nvmeof"))]
-            let live = false;
             (
                 state.appended_end,
                 state.wal_root.as_ref().map(|root| root.retired.clone()),
-                live,
+                state.live,
                 state.wal_root.as_ref().map_or(0, |root| root.synced_end),
             )
         };
@@ -716,10 +696,10 @@ impl PartitionLog {
         let mut groups = Vec::new();
         while cursor < end {
             let file_start = cursor / self.config().wal_file_bytes * self.config().wal_file_bytes;
-            if match &retired {
-                Some(retired) => retired.binary_search(&file_start).is_ok(),
-                None => self.references.is_retired(file_start)?,
-            } {
+            if retired
+                .as_ref()
+                .is_some_and(|retired| retired.binary_search(&file_start).is_ok())
+            {
                 cursor = (file_start + self.config().wal_file_bytes).min(end);
                 continue;
             }
@@ -876,8 +856,7 @@ impl PartitionLog {
                 physical_end = sealed.physical_end;
             }
         }
-        let (references, reference_writer) =
-            ReferenceDirectory::open(&path, expected, false, HistoryPersistence::WalReplay)?;
+        let (references, reference_writer) = ReferenceDirectory::open(expected)?;
         let wal = Wal::open_retained(&path, expected.layout(), metrics)?;
         let retired = root
             .retired
@@ -889,23 +868,12 @@ impl PartitionLog {
         wal.retire_files(&retired)?;
         let mut log = Self {
             state: Mutex::new(State {
-                #[cfg(feature = "experimental-nvmeof")]
-                pending_live: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 open_live_extent: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 next_live_extent: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 last_live_adoption: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 live,
-                #[cfg(feature = "experimental-nvmeof")]
                 sealing: false,
-                #[cfg(feature = "experimental-nvmeof")]
-                last_live_complete: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 live_root_end: physical_end,
                 writer: None,
                 wal_root: Some(root.clone()),
@@ -917,9 +885,8 @@ impl PartitionLog {
                 poison: None,
                 sealed: true,
                 stats: PartitionStats::default(),
-                #[cfg(feature = "experimental-nvmeof")]
                 live_file_preparation: LiveFilePreparationStats::default(),
-                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                #[cfg(test)]
                 live_test_diagnostics: LiveTestDiagnostics::default(),
             }),
             references,
@@ -930,17 +897,12 @@ impl PartitionLog {
             frontier: std::sync::OnceLock::new(),
             sync_profile: Mutex::new(StorageWriteProfile::default()),
             serve_unsynced: AtomicBool::new(false),
-            worker_claimed: AtomicBool::new(false),
             persistence: Mutex::new(()),
             read_admission: parking_lot::RwLock::new(true),
-            #[cfg(feature = "experimental-nvmeof")]
             live_read_pins: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(feature = "experimental-nvmeof")]
             live_stream: live,
             // Set after the scan below.
             recovery_hole: false,
-            #[cfg(test)]
-            before_authority_load: Mutex::new(None),
             #[cfg(test)]
             fail_inventory_witness: AtomicU8::new(0),
             #[cfg(test)]
@@ -953,16 +915,15 @@ impl PartitionLog {
             fail_persist: AtomicBool::new(false),
             #[cfg(test)]
             fail_namespace_persist: AtomicBool::new(false),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             fail_live_frontier: AtomicU8::new(0),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             live_pause: Mutex::new(None),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             fail_after_live_publish: AtomicBool::new(false),
             wal,
             registration,
             shape,
-            device: fs::metadata(&path)?.dev(),
             path,
             _lock: lock,
             _local_authority: None,
@@ -991,9 +952,7 @@ impl PartitionLog {
         // Restart durability guard (see `recovered_suffix`): every frame and skip
         // marker accepted above the persisted root is written back from the bytes
         // this scan validated. A sealed stream was synced whole before its seal.
-        let mut rewrite = recorded
-            .is_none()
-            .then(|| SuffixRewrite::new(&log.path, expected));
+        let mut rewrite = recorded.is_none().then(SuffixRewrite::default);
         // Live streams stop globally at an invalid tail. Ordinary owner-RPC
         // streams scan fragments independently, including after a lost skip.
         // In both cases only present WAL files bound the uncheckpointed suffix.
@@ -1039,7 +998,7 @@ impl PartitionLog {
                 } else if cursor >= strict_end
                     && let Some(rewrite) = rewrite.as_mut()
                 {
-                    rewrite.skip_marker(cursor, fragment_end)?;
+                    log.rewrite_skip_marker(rewrite, cursor, fragment_end)?;
                 }
                 cursor = fragment_end;
                 continue;
@@ -1147,7 +1106,7 @@ impl PartitionLog {
             if cursor >= strict_end
                 && let Some(rewrite) = rewrite.as_mut()
             {
-                rewrite.frame(cursor, decoded.group.encoded())?;
+                log.rewrite_validated_frame(rewrite, cursor, decoded.group.encoded())?;
             }
             physical_end = physical_end.max(decoded.frame_end);
             cursor = decoded
@@ -1178,7 +1137,7 @@ impl PartitionLog {
         // The rewritten suffix reaches the device before the barrier below may
         // certify it and before any root or seal is installed.
         if let Some(rewrite) = rewrite {
-            rewrite.finish()?;
+            log.finish_suffix_rewrite(rewrite)?;
         }
         log.wal.persist_registered_files()?;
         if live
@@ -1211,7 +1170,6 @@ impl PartitionLog {
             state.appended_end = physical_end;
             state.durable_end = physical_end;
             state.progress = ProgressTail::recovered(physical_end);
-            #[cfg(feature = "experimental-nvmeof")]
             {
                 state.live_root_end = physical_end;
             }

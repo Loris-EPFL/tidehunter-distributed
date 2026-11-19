@@ -120,19 +120,32 @@ fn configuration_admission_reports_estimates_without_host_capacity() {
 fn configuration_admission_accepts_estimates_that_execution_rejects() {
     let root = temp("oversized-admission");
     let cfg = config(&root);
-    for kind in ["native", "tidehunter_tcp"] {
-        let mut cfg = cfg.clone();
+    // The distributed arm needs the leased live route; replay::tests owns its
+    // fixture options and is gated the same way.
+    #[cfg(feature = "test-utils")]
+    let arms = [
+        cfg.clone(),
+        ReplayConfig {
+            backend: BackendSpec {
+                kind: "tidehunter_tcp".into(),
+                options: crate::backends::tidehunter::replay::tests::local_options(&root),
+            },
+            ..cfg.clone()
+        },
+    ];
+    #[cfg(not(feature = "test-utils"))]
+    let arms = [cfg.clone()];
+    for cfg in arms {
+        let kind = cfg.backend.kind.clone();
         if kind == "tidehunter_tcp" {
-            cfg.backend = BackendSpec {
-                kind: kind.into(),
-                options: serde_json::json!({"databases":(0..3).map(|id| serde_json::json!({
-                    "db_id":id,"options":{
-                        "transport":{"kind":"tcp-trusted"},"path":root.join(format!("db-{id}")),
-                        "database":vec![id+1;16],"owners":1,"owner_wal_geometry":"research",
-                        "batch_limits":{"max_operations":519,"max_encoded_bytes":500000}
-                    }
-                })).collect::<Vec<_>>()}),
-            };
+            let (_, _, resources) = cfg.admit_configuration().unwrap();
+            let coordinator = &resources["coordinator_disk_reservation"];
+            assert!(coordinator["reservation_bytes"].as_u64().unwrap() > 0);
+            assert_eq!(
+                resources["estimated_disk_reservation_bytes"],
+                coordinator["reservation_bytes"]
+            );
+            assert_eq!(resources["wal_fragment_reservation_bytes"], 0);
         }
         for dimension in [
             "estimated_disk_reservation_bytes",

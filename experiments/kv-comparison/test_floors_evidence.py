@@ -1,16 +1,13 @@
-import base64
 import copy
 import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import MagicMock
 
 import analyze
-import cloud_campaign
-import cloud_controller
 import floors
+from test_floors import ssd_floor_job
 
 
 class FloorsEvidenceTest(unittest.TestCase):
@@ -18,9 +15,11 @@ class FloorsEvidenceTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        jobs = cloud_campaign.make_focused_matrix('floors')
-        self.net = next(j for j in jobs if j['case_kind'] == 'net_floor')
-        self.ssd = next(j for j in jobs if j['case_kind'] == 'ssd_floor')
+        self.net = {'case_id': 'network-floor', 'case_kind': 'net_floor',
+                    'net': {'tool': 'ib_send_lat', 'mode': 'polled', 'interface': 'rdma0',
+                            'provider': None, 'endpoint': None, 'sizes': [8, 1024, 4096, 65536],
+                            'iterations': 5000, 'warmup': 0}}
+        self.ssd = ssd_floor_job()
 
     def bind(self, name, content):
         raw = content if isinstance(content, bytes) else json.dumps(content).encode()
@@ -102,57 +101,6 @@ class FloorsEvidenceTest(unittest.TestCase):
                 bad['ssd_floor_result'] = self.bind('ssd.json', result)
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 analyze.admit_focused_artifacts(self.root, job, bad, completed=True)
-
-    def test_controller_receipts_are_admitted_and_hash_bound(self):
-        jobs = cloud_campaign.make_focused_matrix('nvmeof_path_core')
-        self.net = next(job for job in jobs if job['case_kind'] == 'net_floor')
-        self.ssd = next(job for job in jobs if job['case_kind'] == 'ssd_floor')
-        instance = cloud_controller.Controller.__new__(cloud_controller.Controller)
-        instance.root = self.root
-        instance.config = {'binary_blake2b512': 'a' * 128,
-                           'fleet': {'coordinator': {'address': '10.0.0.1', 'rdma_address': '10.1.0.1'},
-                                     'nodes': [{'address': '10.0.0.2', 'rdma_address': '10.1.0.2'}]}}
-        instance.active_tide = instance.active_nvme = instance.active_backend = instance.shared_tide = None
-        instance.monitoring_attempted = False
-        instance.monitoring_events = []
-        instance.select_monitoring = MagicMock()
-        instance.finish_monitoring = MagicMock()
-        instance.stop_tide = MagicMock()
-        instance.guard = MagicMock()
-        instance.remaining = MagicMock(return_value=100)
-        instance.cleanup_deadline = MagicMock(return_value=100)
-        instance.cleanup_timeout = MagicMock(return_value=30)
-
-        runs = self.network()['runs']
-        servers = [{'argv': ['server'], 'exit_status': 0, 'output': ''} for _ in runs]
-        instance.request = MagicMock(side_effect=[{'ready': True}, {'runs': runs, 'build': None},
-                                                   {'servers': servers}])
-        net_receipt = instance.run_floor_case(self.net)
-
-        ssd = self.ssd['ssd']
-        fio = {'jobs': [{'read': {'total_ios': 1, 'io_bytes': ssd['block_bytes'], 'runtime': 1000,
-                                 'clat_ns': {'percentile': {'50.000000': 1, '99.000000': 2, '99.900000': 3}}},
-                         'write': {'total_ios': 0}, 'error': 0, 'iodepth_level': {'1': 100}}]}
-        raw = json.dumps(fio).encode()
-        log = f"1, 2, 0, {ssd['block_bytes']}, 0, 0\n".encode()
-        argv = ['fio', '--readonly', '--direct=1', '--rw=randread', '--output-format=json',
-                '--numjobs=1', '--name=read']
-        instance.request = MagicMock(return_value={'raw_base64': base64.b64encode(raw).decode(),
-            'lat_base64': base64.b64encode(log).decode(), 'argv': argv, 'device_identity': '259:0',
-            'opened_read_only': True, 'actual_direct': True, 'host_index': 0})
-        ssd_receipt = instance.run_floor_case(self.ssd)
-
-        for job, receipt, stem in ((self.net, net_receipt, 'net_floor_result'),
-                                    (self.ssd, ssd_receipt, 'ssd_floor_result')):
-            with self.subTest(kind=job['case_kind']):
-                self.assertEqual(receipt['status'], 'completed')
-                directory = self.root / 'cases' / job['case_id']
-                self.assertIn(stem, analyze.admit_focused_artifacts(directory, job, receipt, completed=True))
-                self.assertEqual(cloud_campaign.summarize_case(directory)['status'], 'completed')
-                tampered = copy.deepcopy(receipt)
-                tampered[stem]['sha256'] = '0' * 64
-                with self.assertRaises(ValueError):
-                    analyze.admit_focused_artifacts(directory, job, tampered, completed=True)
 
     def test_append_evidence_binds_host_and_rows(self):
         spec = {'mode': 'append_mmap_fsync', 'block_bytes': 1024, 'region_bytes': 536870912,

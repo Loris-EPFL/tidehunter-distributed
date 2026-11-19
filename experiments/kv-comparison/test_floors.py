@@ -1,4 +1,3 @@
-import base64
 import json
 from pathlib import Path
 import tempfile
@@ -9,7 +8,15 @@ import cloud_controller
 import floors
 
 
+def ssd_floor_job():
+    return {'case_id': 'ssd-floor', 'case_kind': 'ssd_floor',
+            'ssd': {'block_bytes': 4096, 'region_bytes': 64 * 1024**2, 'state': 'fresh',
+                    'age_seconds': 0, 'runtime_seconds': 6, 'queue_depth': 1,
+                    'pattern': 'randread', 'direct': True}}
+
+
 class FloorTests(unittest.TestCase):
+
     def test_real_perftest_row(self):
         # Captured ib_send_lat output; keep the fixture independent of local
         # checkpoint-work/focused-launch-20261109-g10b campaign artifacts.
@@ -88,8 +95,7 @@ Disabling dynamic polling
             cloud_controller.remove_fio_scratch(tmp, 'random', identity)
 
     def test_ssd_fio_command_uses_job_runtime(self):
-        job = next(j for j in cloud_controller.cloud_campaign.make_focused_matrix('floors')
-                   if j['case_kind'] == 'ssd_floor')
+        job = ssd_floor_job()
         ssd = job['ssd']
         argv = cloud_controller.fio_read_command('fio', '/scratch', {**ssd, 'location': 'local_file'},
                                                 ssd['region_bytes'], runtime_seconds=ssd['runtime_seconds'])
@@ -163,115 +169,6 @@ Disabling dynamic polling
                 patch.object(cloud_controller.time, 'monotonic', return_value=0):
             self.assertEqual(cloud_controller.floor_client_attempts(['ib_send_lat'], 10, perftest=True)[2], 1)
             self.assertEqual(command.call_count, 1)
-
-    def test_all_matrix_jobs_reach_floor_dispatcher(self):
-        jobs = cloud_controller.cloud_campaign.make_focused_matrix('floors')
-        self.assertEqual(len(jobs), 69)
-        for job in jobs:
-            cloud_controller.cloud_campaign.validate_focused_job(job)
-        instance = object.__new__(cloud_controller.Controller)
-        instance.config = {'fleet': {'nodes': [
-            {'index': i, 'instance_id': f'i-owner-{i}', 'address': f'10.0.0.{i + 2}'}
-            for i in range(5)]}}
-        for job in jobs:
-            with patch.object(instance, 'run_floor_case', return_value='dispatched') as dispatch:
-                self.assertEqual(instance.run_case(job), 'dispatched')
-                dispatch.assert_called_once_with(job)
-
-    def controller(self, root):
-        instance = cloud_controller.Controller.__new__(cloud_controller.Controller)
-        instance.root = Path(root)
-        instance.config = {'binary_blake2b512': 'a' * 128,
-                           'fleet': {'coordinator': {'address': '10.0.0.1', 'rdma_address': '10.1.0.1'},
-                                     'nodes': [{'address': '10.0.0.2', 'rdma_address': '10.1.0.2'}]}}
-        instance.active_tide = instance.active_nvme = instance.active_backend = instance.shared_tide = None
-        instance.monitoring_attempted = False
-        instance.monitoring_events = []
-        instance.select_monitoring = MagicMock()
-        instance.finish_monitoring = MagicMock()
-        instance.stop_tide = MagicMock()
-        instance.guard = MagicMock()
-        instance.remaining = MagicMock(return_value=100)
-        instance.cleanup_deadline = MagicMock(return_value=100)
-        instance.cleanup_timeout = MagicMock(return_value=30)
-        return instance
-
-    def test_ssd_case_binds_evidence_and_handles_measurement_failure(self):
-        job = next(j for j in cloud_controller.cloud_campaign.make_focused_matrix('floors')
-                   if j['case_kind'] == 'ssd_floor')
-        raw = json.dumps({'jobs': [{'read': {'total_ios': 1, 'io_bytes': 4096, 'runtime': 1000,
-                    'clat_ns': {'percentile': {'50.000000': 1, '99.000000': 2, '99.900000': 3}}},
-                    'write': {'total_ios': 0}, 'error': 0, 'iodepth_level': {'1': 100}}]}).encode()
-        log = b'1, 2, 0, 4096, 0, 0\n'
-        with tempfile.TemporaryDirectory() as tmp:
-            instance = self.controller(tmp)
-            instance.request = MagicMock(return_value={'raw_base64': base64.b64encode(raw).decode(),
-                'lat_base64': base64.b64encode(log).decode(), 'argv': ['fio', '--readonly'],
-                'device_identity': '259:0', 'opened_read_only': True, 'actual_direct': True})
-            receipt = instance.run_floor_case(job)
-            self.assertEqual(instance.request.call_args.args[0], 0)
-            self.assertEqual(receipt['status'], 'completed')
-            result = json.loads((Path(tmp) / 'cases' / job['case_id'] / 'ssd_floor_result.json').read_text())
-            self.assertEqual(result['lat_log']['path'], receipt['ssd_floor_lat_log']['path'])
-            self.assertEqual(result['lat_log']['sha256'], receipt['ssd_floor_lat_log']['sha256'])
-            self.assertEqual(result['lat_log']['rows'], 1)
-            self.assertIn('fio_command', receipt)
-            self.assertIn('phase_timing', receipt)
-        with tempfile.TemporaryDirectory() as tmp:
-            instance = self.controller(tmp)
-            instance.request = MagicMock(return_value={'fio_failed': 'measurement error'})
-            receipt = instance.run_floor_case(job)
-            self.assertEqual(receipt['status'], 'failed')
-            self.assertIn('measurement error', receipt['error'])
-
-    def test_network_client_failure_collects_server(self):
-        job = next(j for j in cloud_controller.cloud_campaign.make_focused_matrix('floors')
-                   if j['case_kind'] == 'net_floor')
-        with tempfile.TemporaryDirectory() as tmp:
-            instance = self.controller(tmp)
-            def request(index, request, **kwargs):
-                if request['action'] == 'net_floor_serve':
-                    return {'ready': True}
-                if request['action'] == 'net_floor_run':
-                    raise ValueError('client error')
-                return {'servers': []}
-            instance.request = MagicMock(side_effect=request)
-            receipt = instance.run_floor_case(job)
-            self.assertEqual(receipt['status'], 'failed')
-            self.assertEqual(instance.request.call_args_list[-1].args[1]['action'], 'net_floor_collect')
-            instance.request = MagicMock(side_effect=[{'ready': True}, ValueError('client error'),
-                                                       RuntimeError('cleanup error')])
-        with tempfile.TemporaryDirectory() as tmp:
-            instance.root = Path(tmp)
-            with self.assertRaises(cloud_controller.InfrastructureError):
-                instance.run_floor_case(job)
-
-    def test_network_evidence_binds_server_and_result(self):
-        import hashlib
-        job = next(j for j in cloud_controller.cloud_campaign.make_focused_matrix('floors')
-                   if j['case_kind'] == 'net_floor')
-        net = job['net']
-        runs = [{'size_bytes': size, 'iterations': net['iterations'], 'status': 'completed',
-                 'argv_client': ['client'], 'argv_server': None, 'latency_semantics': 'half_round_trip',
-                 'latency_us': dict.fromkeys(floors.LATENCY_FIELDS), 'setsockopt': None,
-                 'raw_client_output': '', 'raw_server_output': '',
-                 'raw_sha256': hashlib.sha256(b'').hexdigest(), 'error': None} for size in net['sizes']]
-        servers = [{'argv': ['server'], 'exit_status': 0, 'output': ''} for _ in net['sizes']]
-        with tempfile.TemporaryDirectory() as tmp:
-            instance = self.controller(tmp)
-            instance.request = MagicMock(side_effect=[{'ready': True}, {'runs': runs, 'build': None},
-                                                       {'servers': servers}])
-            receipt = instance.run_floor_case(job)
-            self.assertEqual(receipt['status'], 'completed')
-            result = json.loads((Path(tmp) / 'cases' / job['case_id'] / 'net_floor_result.json').read_text())
-            cloud_controller.analyze._validate_focused_artifact('net_floor_result', result, job, receipt)
-            result['runs'][0]['attempts'] = 3
-            cloud_controller.analyze._validate_focused_artifact('net_floor_result', result, job, receipt)
-            result['runs'][0]['attempts'] = 4
-            with self.assertRaises(ValueError):
-                cloud_controller.analyze._validate_focused_artifact('net_floor_result', result, job, receipt)
-            self.assertTrue(all(row['argv_server'] == ['server'] for row in result['runs']))
-
 
     def test_append_argv_and_log_contract(self):
         spec = {'mode': 'append_pwrite', 'block_bytes': 1024, 'region_bytes': 536870912,

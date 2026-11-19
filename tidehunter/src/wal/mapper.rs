@@ -1,4 +1,4 @@
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 use super::external::ExternalPreparation;
 use super::layout::WalLayout;
 use super::position::{MapId, WalFileId};
@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -22,9 +22,9 @@ pub(crate) enum WalMapperMessage {
     MapFinalized(MapId),
     MinWalPositionUpdated(u64, mpsc::SyncSender<()>),
     DeleteFiles(Vec<WalFileId>, mpsc::SyncSender<()>),
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     EnsureExternalFile(WalFileId, mpsc::SyncSender<std::io::Result<()>>),
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(all(test, feature = "experimental-distributed"))]
     PauseMap(
         MapId,
         mpsc::SyncSender<()>,
@@ -36,15 +36,15 @@ pub(crate) enum WalMapperMessage {
 pub(crate) struct WalMapper {
     jh: Option<JoinHandle<()>>,
     sender: Option<mpsc::SyncSender<WalMapperMessage>>,
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     external_preparation: Arc<ExternalPreparation>,
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     files: Arc<ArcSwap<WalFiles>>,
 }
 
 /// Cold external-file requests share the mapper's bounded five-message queue.
 /// Sending waits for capacity; dropping this handle releases its sender.
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 #[derive(Clone)]
 pub(crate) struct ExternalFilePreparer {
     sender: mpsc::SyncSender<WalMapperMessage>,
@@ -52,7 +52,7 @@ pub(crate) struct ExternalFilePreparer {
     files: Arc<ArcSwap<WalFiles>>,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 impl ExternalFilePreparer {
     /// Check allocation coverage and current registration without a mapper request.
     pub(crate) fn is_ready(&self, id: WalFileId) -> bool {
@@ -97,11 +97,11 @@ struct WalMapperThread {
     syncer: WalSyncer,
     metrics: Arc<Metrics>,
     unlinker: UnlinkWorker,
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     external_preparation: Arc<ExternalPreparation>,
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     prewrite_buffer: Vec<u8>,
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(all(test, feature = "experimental-distributed"))]
     map_pause: Option<(MapId, mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
 }
 /// Number of fragments past the writer's current one that the mapper keeps
@@ -227,7 +227,7 @@ impl WalMapper {
         syncer: WalSyncer,
         metrics: Arc<Metrics>,
         health: Arc<BackgroundHealth>,
-        #[cfg(feature = "experimental-nvmeof")] external_preparation: Arc<ExternalPreparation>,
+        #[cfg(feature = "experimental-distributed")] external_preparation: Arc<ExternalPreparation>,
     ) -> Self {
         let maps = maps_arc.load();
         assert!(
@@ -242,7 +242,7 @@ impl WalMapper {
             );
         }
         let maps = WalMaps::clone(&maps);
-        #[cfg(feature = "experimental-nvmeof")]
+        #[cfg(feature = "experimental-distributed")]
         let this_files = files.clone();
         let (sender, receiver) = mpsc::sync_channel(5);
         let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name(), health.clone());
@@ -255,11 +255,11 @@ impl WalMapper {
             metrics,
             syncer,
             unlinker,
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             external_preparation: external_preparation.clone(),
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             prewrite_buffer: Vec::new(),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(all(test, feature = "experimental-distributed"))]
             map_pause: None,
         };
         let jh = thread::Builder::new()
@@ -280,9 +280,9 @@ impl WalMapper {
         Self {
             jh,
             sender,
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             external_preparation,
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             files: this_files,
         }
     }
@@ -304,9 +304,9 @@ impl WalMapper {
             Self {
                 jh: None,
                 sender: Some(sender),
-                #[cfg(feature = "experimental-nvmeof")]
+                #[cfg(feature = "experimental-distributed")]
                 external_preparation: Arc::new(ExternalPreparation::new(false)),
-                #[cfg(feature = "experimental-nvmeof")]
+                #[cfg(feature = "experimental-distributed")]
                 files: Arc::new(ArcSwap::from_pointee(WalFiles {
                     base_path: PathBuf::new(),
                     files: BTreeMap::new(),
@@ -357,7 +357,7 @@ impl WalMapper {
         rx.recv().ok();
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn external_file_preparer(&self) -> ExternalFilePreparer {
         ExternalFilePreparer {
             sender: self.sender.as_ref().expect("WAL mapper dropped").clone(),
@@ -366,7 +366,7 @@ impl WalMapper {
         }
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn ensure_external_file(&self, id: WalFileId) -> std::io::Result<()> {
         self.external_file_preparer().ensure(id)
     }
@@ -431,12 +431,12 @@ impl WalMapperThread {
                     self.delete_files(&to_delete);
                     // dropping _cb to release receiver
                 }
-                #[cfg(feature = "experimental-nvmeof")]
+                #[cfg(feature = "experimental-distributed")]
                 WalMapperMessage::EnsureExternalFile(id, reply) => {
                     let result = self.ensure_external_file(id);
                     let _ = reply.send(result);
                 }
-                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                #[cfg(all(test, feature = "experimental-distributed"))]
                 WalMapperMessage::PauseMap(map, entered, resume, ack) => {
                     self.map_pause = Some((map, entered, resume));
                     let _ = ack.send(());
@@ -446,7 +446,7 @@ impl WalMapperThread {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     fn ensure_external_file(&mut self, id: WalFileId) -> std::io::Result<()> {
         // Relaxed is sufficient on the sole writer; readers use Acquire below.
         if self.external_preparation.ready.load(Ordering::Relaxed) > id.0
@@ -556,7 +556,7 @@ impl WalMapperThread {
     }
 
     fn make_map(&mut self, map_id: MapId) -> std::io::Result<()> {
-        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        #[cfg(all(test, feature = "experimental-distributed"))]
         if self
             .map_pause
             .as_ref()
@@ -576,7 +576,7 @@ impl WalMapperThread {
             self.files.store(Arc::new(new_wal_files));
             files = self.files.load();
         }
-        #[cfg(feature = "experimental-nvmeof")]
+        #[cfg(feature = "experimental-distributed")]
         if self.external_preparation.prewrite {
             // Lookahead must prepare before publishing a writable map, too:
             // mixing owner writes and later leases cannot erase earlier bytes.

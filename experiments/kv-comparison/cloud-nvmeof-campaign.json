@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "mode": "nvmeof-focused",
+  "mode": "standard-with-live-nvmeof",
   "seed": 1775,
   "repeats": 1,
   "value_sizes": [64, 256, 1024, 8192, 65536],
-  "backends": ["native", "tidehunter_tcp", "tidehunter_nvme_tcp", "tidehunter_efa_native"],
+  "backends": ["native", "tidehunter_nvme_tcp"],
   "keys": 4096,
   "max_cases": 128,
   "offered_rates": [1000, 10000, 50000],

@@ -234,16 +234,7 @@ pub(crate) fn visit_write_connection_profile(
         response_body_ns,
         response_decode_ns,
         record_verify_ns,
-        ram_payload_verify_ns,
-        ram_payload_verify_calls,
-        ram_payload_verified_bytes,
         requests,
-        server_handler_ns,
-        server_authority_lookup_ns,
-        server_record_read_ns,
-        server_response_recheck_wait_ns,
-        server_response_recheck_ns,
-        server_response_recheck_samples,
     );
     fields!(
         "write_profile_client_socket_",
@@ -487,7 +478,6 @@ pub(crate) fn visit_write_connection_profile(
         append_geometry_capacity_ns,
         append_metadata_reservation_ns,
         append_descriptor_preparation_ns,
-        append_history_ns,
         append_wal_ns,
         append_publication_ns,
         persist_calls,
@@ -554,15 +544,15 @@ impl Remote {
         &self,
         submit: impl FnOnce(
             &ConcurrentRemoteDatabase,
-        ) -> std::result::Result<T, super::local_db::LocalDbError>,
-    ) -> std::result::Result<T, super::local_db::LocalDbError> {
+        ) -> std::result::Result<T, super::storage::LocalDbError>,
+    ) -> std::result::Result<T, super::storage::LocalDbError> {
         self.read_submit.run(|| submit(&self.db))
     }
     fn admit<T>(
         &self,
         mut submit: impl FnMut(
             &ConcurrentRemoteDatabase,
-        ) -> std::result::Result<T, super::local_db::LocalDbError>,
+        ) -> std::result::Result<T, super::storage::LocalDbError>,
     ) -> Result<T> {
         let deadline = Instant::now() + self.timeout;
         loop {
@@ -599,49 +589,8 @@ impl Remote {
     }
 }
 impl Db {
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn install_nvmeof_file_fixture(
-        &self,
-        config: super::nvmeof::NvmeofReaderConfig,
-        path: &Path,
-    ) -> Result<()> {
-        match &self.backend {
-            Backend::Remote(remote) => remote
-                .db
-                .install_nvmeof_file_fixture(config, path)
-                .map_err(error),
-            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
-        }
-    }
-
-    /// Install the optional sealed-WAL reader on a remote backend.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn install_nvmeof_reader(&self, config: super::nvmeof::NvmeofReaderConfig) -> Result<()> {
-        match &self.backend {
-            Backend::Remote(remote) => remote.db.install_nvmeof_reader(config).map_err(error),
-            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn clear_nvmeof_reader(&self) -> Result<()> {
-        match &self.backend {
-            Backend::Remote(remote) => remote.db.clear_nvmeof_reader().map_err(error),
-            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn nvmeof_stats(&self) -> Vec<super::nvmeof::NvmeofStats> {
-        match &self.backend {
-            Backend::Remote(remote) => remote.db.nvmeof_stats(),
-            Backend::Native(_) => Vec::new(),
-        }
-    }
-
     /// Live payload counters and verified namespace evidence, not configuration
     /// intent. Returns `None` when this database does not use live NVMe-oF.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_nvmeof_stats(&self) -> Option<super::nvmeof::live_metrics::LiveNvmeStats> {
         match &self.backend {
             Backend::Remote(remote) => remote.db.live_nvmeof_stats(),
@@ -668,7 +617,6 @@ impl Db {
 
     /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
     /// live target's exported namespaces and is not a reopen operation.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn shutdown_live_target_final(
         self: Arc<Self>,
     ) -> Result<super::remote_db::LiveFinalShutdownEvidence> {
@@ -680,7 +628,6 @@ impl Db {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn register_nvmeof_metrics(&self, registry: &prometheus::Registry) -> Result<()> {
         match &self.backend {
             Backend::Remote(remote) => remote.db.register_nvmeof_metrics(registry).map_err(error),
@@ -713,39 +660,56 @@ impl Db {
         shape: KeyShape,
         config: RemoteDatabaseConfig,
     ) -> Result<Arc<Self>> {
-        Self::open_remote_inner(path, shape, config, |_: &mut RemoteDatabase| Ok(()))
+        Self::open_remote_inner(path, shape, config, |path, shape, config| {
+            let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
+            RemoteDatabase::open(path, shape, config, metrics)
+        })
     }
     /// Ordinary-file live I/O fixture only; never a hardware qualification route.
-    #[cfg(all(
-        feature = "test-utils",
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
+    /// The fixture is selected before open replays the live WAL, so reopening a
+    /// nonempty database never touches the real route.
+    #[cfg(feature = "test-utils")]
     pub fn open_remote_with_local_live_fixture(
         path: &Path,
         shape: KeyShape,
         config: RemoteDatabaseConfig,
         buffered: bool,
     ) -> Result<Arc<Self>> {
-        Self::open_remote_inner(path, shape, config, |db| {
-            db.enable_local_live_fixture(buffered)
+        Self::open_remote_inner(path, shape, config, |path, shape, config| {
+            RemoteDatabase::open_with_local_live_fixture(path, shape, config, buffered)
+        })
+    }
+    /// `open_remote` over the unbuffered ordinary-file live I/O fixture;
+    /// never a hardware qualification route.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn open_remote_local_fixture(
+        path: &Path,
+        shape: KeyShape,
+        config: RemoteDatabaseConfig,
+    ) -> Result<Arc<Self>> {
+        Self::open_remote_inner(path, shape, config, |path, shape, config| {
+            RemoteDatabase::open_with_local_live_fixture(path, shape, config, false)
         })
     }
     fn open_remote_inner(
         path: &Path,
         shape: KeyShape,
         config: RemoteDatabaseConfig,
-        configure: impl FnOnce(
-            &mut RemoteDatabase,
-        ) -> std::result::Result<(), super::local_db::LocalDbError>,
+        open: impl FnOnce(
+            &Path,
+            &KeyShape,
+            RemoteDatabaseConfig,
+        ) -> std::result::Result<RemoteDatabase, super::storage::LocalDbError>,
     ) -> Result<Arc<Self>> {
+        // Before capture: a refused open must not create capture files.
+        if let Some(unavailable) = super::sys::route_unavailable() {
+            return Err(error(unavailable));
+        }
         let timeout = config.timeout;
         let batch_limits = config.storage.batch_limits;
-        let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
         let capture_id =
             kv_capture::open(path, &shape, Some(&config.storage.database)).map_err(error)?;
-        let mut db = RemoteDatabase::open(path, &shape, config, metrics).map_err(error)?;
-        configure(&mut db).map_err(error)?;
+        let mut db = open(path, &shape, config).map_err(error)?;
         db.configure_sui_read_cache();
         let epoch = db.epoch();
         let profile = db.read_profile_monitor();
@@ -1058,10 +1022,6 @@ impl Db {
                     new_capture_wait_count,
                     staging_manifest_ns,
                     staging_manifest_count,
-                    receipt_history_ns,
-                    receipt_history_count,
-                    receipt_history_sync_ns,
-                    receipt_history_sync_count,
                     node_prefix_wait_ns,
                     node_prefix_wait_count,
                     index_prepare_ns,
@@ -1076,15 +1036,6 @@ impl Db {
                     owner_adoption_count,
                     obsolete_cleanup_ns,
                     obsolete_cleanup_count,
-                    history_io_checkpoint_count,
-                    history_stream_opens,
-                    history_previous_slot_reads,
-                    history_receipt_write_ops,
-                    history_receipt_write_bytes,
-                    history_buffer_flushes,
-                    history_node_write_ops,
-                    history_node_write_bytes,
-                    history_sync_operations,
                     tail_pressure_count,
                     known_identity_pressure_count,
                     partition_window_pressure_count,
@@ -1358,10 +1309,6 @@ impl Db {
                     new_capture_wait_count,
                     staging_manifest_ns,
                     staging_manifest_count,
-                    receipt_history_ns,
-                    receipt_history_count,
-                    receipt_history_sync_ns,
-                    receipt_history_sync_count,
                     node_prefix_wait_ns,
                     node_prefix_wait_count,
                     index_prepare_ns,
@@ -1376,15 +1323,6 @@ impl Db {
                     owner_adoption_count,
                     obsolete_cleanup_ns,
                     obsolete_cleanup_count,
-                    history_io_checkpoint_count,
-                    history_stream_opens,
-                    history_previous_slot_reads,
-                    history_receipt_write_ops,
-                    history_receipt_write_bytes,
-                    history_buffer_flushes,
-                    history_node_write_ops,
-                    history_node_write_bytes,
-                    history_sync_operations,
                     tail_pressure_count,
                     known_identity_pressure_count,
                     partition_window_pressure_count,
@@ -1942,28 +1880,11 @@ impl Db {
             checkpoint
         }
     }
-    /// Obtain remote read evidence for quiescent measurement boundaries.
-    /// Owner samples are sequential and are not a globally consistent cut.
-    pub fn read_evidence_monitor(&self) -> Option<super::remote_db::ReadEvidenceMonitor> {
-        match &self.backend {
-            Backend::Remote(remote) => Some(remote.db.read_evidence_monitor()),
-            Backend::Native(_) => None,
-        }
-    }
-
-    pub fn operational_read_io_monitor(
-        &self,
-    ) -> Option<super::remote_db::OperationalReadIoMonitor> {
-        match &self.backend {
-            Backend::Remote(remote) => Some(remote.db.operational_read_io_monitor()),
-            Backend::Native(_) => None,
-        }
-    }
     pub fn remote_counters(
         &self,
     ) -> Option<(
         super::remote_db::ReadCacheStats,
-        super::local_db::LocalDbStats,
+        super::storage::LocalDbStats,
         u64,
     )> {
         match &self.backend {
@@ -1989,7 +1910,7 @@ impl Db {
     ) -> Option<
         Option<(
             super::remote_db::ReadCacheStats,
-            super::local_db::LocalDbStats,
+            super::storage::LocalDbStats,
             u64,
         )>,
     > {

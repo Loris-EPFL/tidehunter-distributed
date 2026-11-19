@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline correctness checks. No profile proves EFA/RDMA hardware or performance."""
+"""Offline correctness checks. No profile proves RDMA hardware or performance."""
 
 import argparse
 import os
@@ -8,7 +8,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,31 +23,11 @@ SOFTWARE_STREAM_TESTS = (
     "software_provider_nonblocking_backpressure_resumes_without_replaying_unposted_bytes",
     "software_provider_nonblocking_close_keeps_pending_dma_slots_owned",
     "software_provider_explicit_sweeps_transfer_without_repolling",
-    "software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership",
-    "software_provider_rma_group_preserves_order_with_retained_consumers",
-    "software_provider_source_byte_budget_tracks_registration_and_retirement",
     "software_provider_idle_wait_wakes_once_and_transfers_both_ways",
     "software_provider_pending_send_disables_idle_cq_wait",
     "software_provider_buffered_receive_disables_idle_cq_wait",
     "software_provider_records_effective_geometry_and_rxm_parameters",
     "software_provider_transfers_with_a_larger_slot_count",
-)
-SOFTWARE_ENGINE_TESTS = (
-    "fabric_mtls_authentication_lost_response_and_recovery",
-    "established_software_fabric_connection_survives_idle_timeout",
-    "software_provider_adaptive_idle_wakes_for_scalar_read_and_shutdown",
-    "one_software_fabric_connection_completes_out_of_order",
-    "fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadline",
-    "fabric_authenticated_ram_probe_boundaries_and_busy_shutdown",
-    "software_fabric_cold_authority_preserves_hot_progress_and_rechecks_fencing",
-    "native_software_provider_mixed_rpc_reads_complete_out_of_order",
-    "fabric_tcp_native_rejects_invalid_reference_and_epoch_without_tls",
-    "fabric_tcp_native_mode_mismatch_with_tls_fails_closed",
-    "fabric_tcp_native_rejects_corrupt_member_reply_without_tls",
-    "fabric_tcp_native_large_partial_frames_bypass_tls",
-    "fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement",
-    "software_provider_operational_session_binds_identity_and_cannot_admit_data",
-    "software_fabric_owner_transport_aggregate_sums_sessions_and_keeps_closed_ones",
 )
 
 
@@ -123,8 +102,7 @@ def check(profile, env):
     if profile == "format":
         cargo(env, "fmt", "--all", "--", "--check")
     elif profile == "lint":
-        for features in ((), ("--features", "experimental-distributed,test-utils"),
-                         ("--features", "experimental-nvmeof,test-utils")):
+        for features in ((), ("--features", "experimental-distributed,test-utils")):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "tidehunter-fabric", "--all-targets", "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--", "-D", "warnings")
@@ -132,11 +110,16 @@ def check(profile, env):
         cargo(env, "test", "-p", "tidehunter")
     elif profile == "distributed":
         cargo(env, "test", "-p", "tidehunter", "--features", "experimental-distributed,test-utils")
+        cargo(env, "test", "-p", "kv-research", "--features", "test-utils")
     elif profile == "fabric":
         fabric = fabric_environment(env)
+        cargo(fabric, "clippy", "-p", "tidehunter", "--all-targets", "--features",
+              "experimental-distributed,experimental-fabric", "--", "-D", "warnings")
+        cargo(fabric, "clippy", "-p", "kv-research", "--all-targets", "--features",
+              "fabric", "--", "-D", "warnings")
         for package, features in (("tidehunter-fabric", "native"),
-                                  ("tidehunter", "experimental-nvmeof,experimental-fabric,test-utils"),
-                                  ("kv-research", "nvmeof,fabric,test-utils")):
+                                  ("tidehunter", "experimental-distributed,experimental-fabric,test-utils"),
+                                  ("kv-research", "fabric,test-utils")):
             cargo(fabric, "clippy", "-p", package, "--all-targets", "--features", features,
                   "--", "-D", "warnings")
             cargo(fabric, "test", "-p", package, "--features", features)
@@ -144,28 +127,11 @@ def check(profile, env):
         fabric = software_fabric_environment(fabric_environment(env), software=True)
         stream = ("-p", "tidehunter-fabric", "--features", "native", "--test", "software_provider")
         selected_ignored(fabric, stream, "software_provider_", SOFTWARE_STREAM_TESTS)
-        direct = "software_provider_runs_direct_packet_adapter_on_large_partial_streams"
-        selected_ignored(fabric, ("-p", "tidehunter-fabric", "--features", "native", "--lib"), direct, (direct,))
-        strict_read = "strict_device_read_rejects_software_provider"
-        selected_ignored(fabric, ("-p", "tidehunter-fabric", "--features", "native", "--lib"), strict_read, (strict_read,))
-        engine = ("-p", "tidehunter", "--features", "experimental-fabric,test-utils", "--lib")
-        for name in SOFTWARE_ENGINE_TESTS:
-            selected_ignored(fabric, engine, name, (name,))
-        cargo(fabric, "build", "-p", "tidehunter", "--features", "experimental-fabric,test-utils",
-              "--example", "sharded_wal_transport_bench")
-        binary = ROOT / fabric.get("CARGO_TARGET_DIR", "target") / "debug/examples/sharded_wal_transport_bench"
-        with tempfile.TemporaryDirectory(prefix="tidehunter-raw-read-") as temporary:
-            evidence = str(Path(temporary) / "evidence")
-            run([sys.executable, "experiments/aws-sharded-wal/raw_rma_floor.py", "local-software",
-                 "--binary", str(binary), "--output", evidence], fabric)
-            run([sys.executable, "-m", "unittest", "discover", "-s", "experiments/aws-sharded-wal",
-                 "-p", "test_raw_rma_floor.py", "-v"], fabric | {"RAW_RMA_SOFTWARE_EVIDENCE": evidence})
     elif profile == "harness":
-        if env.get("TH_TEST_SYSTEMD") == "1":
-            raise RuntimeError("harness is offline: unset TH_TEST_SYSTEMD; run real-systemd checks separately")
-        print("Offline harnesses: optional MCP SDK tests may skip if absent; real-systemd exercise is excluded.", flush=True)
-        run([sys.executable, "-m", "unittest", "discover", "-s", "experiments/aws-sharded-wal",
-             "-p", "test_*.py", "-v"], env)
+        for directory in ("experiments/kv-comparison", "experiments/kv-comparison/observability",
+                          "experiments/gcp-rdma"):
+            run([sys.executable, "-B", "-m", "unittest", "discover", "-s", directory,
+                 "-p", "test_*.py", "-v"], env)
 
 
 def main():
@@ -174,7 +140,7 @@ def main():
         "Cargo uses --locked --offline and rust-toolchain.toml. Set TIDEHUNTER_LIBFABRIC_PREFIX for a "
         "custom provider install; existing PKG_CONFIG_*/LD_LIBRARY_PATH and Cargo/Rust controls are retained. "
         "Tests default to two parallel cases; an explicit RUST_TEST_THREADS is retained. "
-        "all includes software-fabric and fails if tcp;ofi_rxm cannot execute. EFA hardware tests stay ignored."))
+        "all includes software-fabric and fails if tcp;ofi_rxm cannot execute."))
     parser.add_argument("profile", choices=PROFILES)
     args = parser.parse_args()
     env = os.environ.copy()

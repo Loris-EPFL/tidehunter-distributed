@@ -14,7 +14,6 @@ pub(in crate::distributed::remote_db) struct WorkerPolicy {
     pub append_bytes: AppendByteBudget,
     /// `RemoteDatabaseConfig::leased_submit_redrain`; only leased live writes
     /// have the pre-submit re-drain.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub leased_submit_redrain: bool,
 }
 
@@ -36,14 +35,11 @@ impl WorkerPolicy {
             largest_charge,
         )
         .map_err(LocalDbError::new)?;
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let _ = leased_submit_redrain;
         Ok(Self {
             storage,
             max_pending_batches,
             append_occupancy,
             append_bytes,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             leased_submit_redrain,
         })
     }
@@ -85,12 +81,9 @@ pub(in crate::distributed::remote_db) fn take_ready_group(
     let mut rejected = false;
     let mut credit_blocked = false;
     let mut stop = DrainStop::Limit;
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     let live = client
         .live_nvme_configured()
         .then(|| client.live_group_budget());
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-    let _ = client;
 
     for _ in 0..limits.max_batches {
         let next = queue.take_ready_before(before_owner_seq, |batch| {
@@ -124,7 +117,6 @@ pub(in crate::distributed::remote_db) fn take_ready_group(
                 rejected = true;
                 return false;
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             if live.is_some_and(|budget| {
                 budget
                     .extend(count, payload, std::slice::from_ref(batch))
@@ -189,24 +181,18 @@ pub(in crate::distributed::remote_db) fn take_ready_group(
         charge,
         Arc::clone(accounting),
     );
-    Ok(GroupDrain::Ready(WorkerItem::Append(
-        epoch, batches, result,
-    )))
+    Ok(GroupDrain::Ready(WorkerItem::Append(batches, result)))
 }
 
 fn record_drain(client: &Client, accounting: &WorkerAccounting, batches: usize, stop: DrainStop) {
     accounting.record_drain(batches, stop);
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     if let Some(counters) = client.live_counters() {
         counters.record_owner_drain(batches as u64, stop.live());
     }
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-    let _ = client;
 }
 
 /// Packing evidence at one leased frame submission: READY batches that this
 /// frame does not carry, in unmerged queued groups or at the owner-queue head.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(in crate::distributed::remote_db) fn ready_left(
     queue: &OwnerQueue,
     before_owner_seq: u64,
@@ -216,7 +202,7 @@ pub(in crate::distributed::remote_db) fn ready_left(
     let queued_batches: usize = queued
         .iter()
         .map_while(|item| match item {
-            WorkerItem::Append(_, batches, _) => Some(batches.len()),
+            WorkerItem::Append(batches, _) => Some(batches.len()),
             WorkerItem::Control(_) => None,
         })
         .sum();

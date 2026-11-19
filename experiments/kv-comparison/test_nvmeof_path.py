@@ -232,8 +232,10 @@ class NvmeofPathTests(unittest.TestCase):
             self.assertEqual(tuple(row[k] for k in ('group', 'operation', 'concurrency', 'value_size')), expected)
             self.assertEqual(float(row['p99_us']), 3)
 
-    def test_every_reviewed_selection_group_is_accepted(self):
+    def test_every_branch_benchmark_selection_group_is_accepted(self):
         for selection in cloud_campaign.NVMEOF_PATH_SELECTIONS:
+            if selection == cloud_campaign.Q0_SELECTION:
+                continue  # Q0 reports use per-job archived binary provenance.
             with self.subTest(selection=selection):
                 jobs = cloud_campaign.make_focused_matrix(selection)
                 matrix = self.export / 'all-groups.json'

@@ -3,17 +3,132 @@
 //! independent durable batches may publish beyond an unresolved gap.
 //! Existing connection guards and storage persistence hooks deterministically
 //! pause append progress; tests make no assumptions about SSD speed or scheduling.
+//!
+//! Every owner serves the leased live route (the only write route) through
+//! the ordinary-file LiveIo fixture: a commissioned fixture target per owner,
+//! the production leased worker, real frame I/O and CRC checks, and no kernel
+//! controller or NVMe device.
 
 use super::*;
 use crate::distributed::codec::BatchLimits;
+use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::tcp::{NodeConfig, StorageNode, TcpError, TcpLimits};
+use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
+use crate::distributed::tcp::{LiveClientConfig, NodeConfig, StorageNode, TcpError, TcpLimits};
 use crate::key_shape::KeyType;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "../../../examples/support/tls_material.rs"]
 mod tls_material;
+
+/// Host NQN of the default fixture client and of every fixture target's allowed
+/// host. A test that configures another `live_nvme.host_nqn` gets targets that
+/// admit that host instead.
+pub(super) const LIVE_HOST_NQN: &str = "nqn.2026-01.test:pipeline";
+
+/// Default live client of the fixture: the leased route at the fixture tier,
+/// with caller-inline reads on as in production. A test that needs reads
+/// only through the lane worker sets `inline_reads = false` with a reason.
+/// The queue byte bound admits the default write frame and the recovery
+/// buffers of the fixture's batch limits (validated at open).
+pub(super) fn live_config(tier: DurabilityTier) -> LiveClientConfig {
+    LiveClientConfig {
+        host_nqn: LIVE_HOST_NQN.into(),
+        host_id: [1; 16],
+        owner_identities: Default::default(),
+        max_inflight_requests: 8,
+        leased_write_window: None,
+        leased_sync: Default::default(),
+        leased_flush_min_frame_bytes: LiveClientConfig::default_leased_flush_min_frame_bytes(),
+        max_inflight_bytes: 4 * 1024 * 1024,
+        connect_timeout_ms: 5000,
+        io_timeout_ms: 5000,
+        leased_durability: tier,
+        lease_ahead: true,
+        polled_writes: false,
+        inline_reads: true,
+        queue_geometry: Default::default(),
+    }
+}
+
+/// Fixture coordinator configuration at the native tier, with no endpoints.
+pub(super) fn coordinator_config(
+    owner_count: usize,
+    max_batches: usize,
+    group_max_batches: u32,
+    tls: TlsFiles,
+) -> RemoteDatabaseConfig {
+    RemoteDatabaseConfig {
+        storage: LocalInventoryConfig {
+            database: [71; 16],
+            partitions: (0..owner_count as u32).collect(),
+            batch_limits: BatchLimits {
+                max_operations: 4,
+                max_encoded_bytes: 2048,
+            },
+            group_limits: GroupLimits {
+                max_batches: group_max_batches,
+                max_encoded_bytes: 4088,
+            },
+            fragment_bytes: 4096,
+            wal_file_bytes: 8192,
+            max_batches_per_partition: max_batches,
+            max_reference_metadata_bytes: 1024 * 1024,
+            max_epochs: 8,
+        },
+        endpoints: Vec::new(),
+        tls,
+        // Five-node startup/replay shares disk and CPU with the full suite.
+        // This is a bounded liveness guard, not a latency assertion.
+        timeout: Duration::from_secs(30),
+        max_admitted_batches: max_batches,
+        max_index_bytes: 1024 * 1024,
+        max_pending_batches: 64,
+        max_pending_bytes: 1024 * 1024,
+        replay_limits: Default::default(),
+        owner_append_occupancy: DEFAULT_OWNER_APPEND_OCCUPANCY,
+        pipelined_writes: true,
+        leased_submit_redrain: true,
+        read_cache_bytes: 64 * 1024,
+        index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
+        read_memory_allowance_bytes: 512 * 1024 * 1024,
+        scan_prefetch_pages: 2,
+        read_lanes: Some(2),
+        pin_read_lanes: false,
+        max_pending_reads: 256,
+        max_pending_read_bytes: 64 * 1024 * 1024,
+        write_profile_limit: 0,
+        live_nvme: live_config(DurabilityTier::Native),
+        durable_cut: Default::default(),
+    }
+}
+
+/// Open (or reopen) one owner with its commissioned fixture target. Target
+/// state and fake configfs live beside the owner root, so a reopen finds the
+/// same registry.
+pub(super) fn open_live_node(
+    mut config: NodeConfig,
+    host_nqn: &str,
+) -> Result<Arc<StorageNode>, TcpError> {
+    let state_dir = config.root.with_extension("live-target");
+    let configfs = config.root.with_extension("live-configfs");
+    fs::create_dir_all(&state_dir).unwrap();
+    for name in ["hosts", "ports", "subsystems"] {
+        fs::create_dir_all(configfs.join(name)).unwrap();
+    }
+    config.live_target = Some(LiveTargetConfig {
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        host_nqn: host_nqn.into(),
+        port_id: 42,
+        state_dir,
+        commissioning_port_id: 43,
+        commissioning_service: 4421,
+    });
+    StorageNode::bench_open_live_fixture(config, metrics(), configfs)
+}
 
 pub(super) struct Fixture {
     pub(super) config: RemoteDatabaseConfig,
@@ -26,14 +141,6 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
-    pub(super) fn history(mut self, mode: HistoryPersistence) -> Self {
-        self.config.history_persistence = mode;
-        for node in &self.nodes {
-            node.set_history_persistence(mode).unwrap();
-        }
-        self
-    }
-
     pub(super) fn new() -> Self {
         Self::new_with_capacity(128)
     }
@@ -56,14 +163,16 @@ impl Fixture {
 
     /// Opt one test into the synchronous tier: for tests whose assertions need
     /// persistence to stay pending (prior durability, paused syncs) or receipts
-    /// that are already durable. Call before the first write.
-    pub(super) fn synchronous(self) -> Self {
+    /// that are already durable. Call before the first write. The leased client
+    /// requests the same tier, as a grant of another tier is refused.
+    pub(super) fn synchronous(mut self) -> Self {
         for node in &self.nodes {
             node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
-                crate::distributed::durability::DurabilityTier::Synchronous,
+                DurabilityTier::Synchronous,
             ))
             .unwrap();
         }
+        self.config.live_nvme.leased_durability = DurabilityTier::Synchronous;
         self
     }
 
@@ -80,7 +189,7 @@ impl Fixture {
             shape,
             group_max_batches,
             configure,
-            |config| StorageNode::open(config, metrics()).unwrap(),
+            |_| {},
         )
     }
 
@@ -91,87 +200,42 @@ impl Fixture {
         shape: KeyShape,
         group_max_batches: u32,
         configure: impl FnOnce(&mut RemoteDatabaseConfig),
-        open_node: impl Fn(NodeConfig) -> Arc<StorageNode>,
+        configure_node: impl Fn(&mut NodeConfig),
     ) -> Self {
         assert!((1..=16).contains(&owner_count));
-        let tier = crate::distributed::durability::DurabilityTier::Native;
+        let tier = DurabilityTier::Native;
         let certs = tls_material::TestCertificates::generate(&temp.path().join("tls"), owner_count)
             .unwrap();
-        let mut config = RemoteDatabaseConfig {
-            history_persistence: HistoryPersistence::default(),
-            storage: LocalInventoryConfig {
-                database: [71; 16],
-                partitions: (0..owner_count as u32).collect(),
-                batch_limits: BatchLimits {
-                    max_operations: 4,
-                    max_encoded_bytes: 2048,
-                },
-                group_limits: GroupLimits {
-                    max_batches: group_max_batches,
-                    max_encoded_bytes: 4088,
-                },
-                fragment_bytes: 4096,
-                wal_file_bytes: 8192,
-                max_batches_per_partition: max_batches,
-                max_reference_metadata_bytes: 1024 * 1024,
-                max_epochs: 8,
-            },
-            endpoints: Vec::new(),
-            tls: TlsFiles {
+        let mut config = coordinator_config(
+            owner_count,
+            max_batches,
+            group_max_batches,
+            TlsFiles {
                 transport: Default::default(),
                 ca: certs.ca.clone(),
                 cert: certs.authority.certificate.clone(),
                 key: certs.authority.private_key.clone(),
                 server_name: String::new(),
             },
-            // Five-node startup/replay shares disk and CPU with the full suite.
-            // This is a bounded liveness guard, not a latency assertion.
-            timeout: Duration::from_secs(30),
-            max_admitted_batches: max_batches,
-            max_index_bytes: 1024 * 1024,
-            max_pending_batches: 64,
-            max_pending_bytes: 1024 * 1024,
-            replay_limits: Default::default(),
-            owner_append_occupancy: DEFAULT_OWNER_APPEND_OCCUPANCY,
-            pipelined_writes: true,
-            leased_submit_redrain: true,
-            read_cache_bytes: 64 * 1024,
-            index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
-            read_memory_allowance_bytes: 512 * 1024 * 1024,
-            scan_prefetch_pages: 2,
-            read_lanes: Some(2),
-            pin_read_lanes: false,
-            max_pending_reads: 256,
-            max_pending_read_bytes: 64 * 1024 * 1024,
-            write_profile_limit: 0,
-            live_nvme: None,
-            checkpoint_mode: CheckpointMode::Exact,
-            durable_cut: Default::default(),
-        };
+        );
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut nodes = Vec::new();
         let mut servers = Vec::new();
         let mut startups = Vec::new();
         for (index, identity) in certs.nodes.into_iter().enumerate() {
-            let node_config = NodeConfig {
+            let mut node_config = NodeConfig {
                 root: temp.path().join(format!("node-{index}")),
                 partition: config.partition_config(1, index as u32),
                 shape_yaml: shape.to_yaml().unwrap(),
                 max_epochs: config.storage.max_epochs,
-                read_workers: Some(2),
                 wal_member_read: Default::default(),
                 wal_prewrite: false,
-                read_resident_first: false,
-                read_memory_allowance_bytes: 512 * 1024 * 1024,
-                read_max_inflight_requests: 32,
-                read_max_inflight_bytes: 64 * 1024 * 1024,
                 read_max_device_reads: 128,
                 live_target: None,
             };
-            let node = open_node(node_config.clone());
-            node.set_history_persistence(config.history_persistence)
-                .unwrap();
+            configure_node(&mut node_config);
+            let node = open_live_node(node_config.clone(), &config.live_nvme.host_nqn).unwrap();
             node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
                 tier,
             ))
@@ -224,11 +288,11 @@ impl Fixture {
         self.nodes.clear();
     }
 
+    /// Reopen every stopped owner with its commissioned fixture target.
     pub(super) fn restart_owners(&mut self) -> Result<(), TcpError> {
         self.shutdown.store(false, Ordering::Release);
         for (config, tls, listener) in &self.startups {
-            let node = StorageNode::open(config.clone(), metrics())?;
-            node.set_history_persistence(self.config.history_persistence)?;
+            let node = open_live_node(config.clone(), &self.config.live_nvme.host_nqn)?;
             let serving = node.clone();
             let tls = tls.clone();
             let listener = listener.try_clone().unwrap();
@@ -250,13 +314,20 @@ impl Fixture {
     }
 
     pub(super) fn open(&self) -> RemoteDatabase {
-        RemoteDatabase::open(
+        self.try_open_with(self.config.clone()).unwrap()
+    }
+
+    /// Open the fixture authority with `config` through the ordinary-file
+    /// live fixture: recovery and every later live read and write use it.
+    pub(super) fn try_open_with(
+        &self,
+        config: RemoteDatabaseConfig,
+    ) -> Result<RemoteDatabase, LocalDbError> {
+        RemoteDatabase::open_local_live_fixture(
             &self.temp.path().join("authority"),
             &self.shape,
-            self.config.clone(),
-            metrics(),
+            config,
         )
-        .unwrap()
     }
 
     pub(super) fn operation(&self, partition: u32, seed: u64) -> [u8; 16] {
@@ -277,6 +348,25 @@ impl Fixture {
                     == partition
             })
             .unwrap()
+    }
+
+    /// Fence owner `node` to `epoch` over a fresh authenticated control
+    /// session, as a competing authority would. An authority worker's leased
+    /// session may own its single control exchange, so tests do not fence
+    /// through it.
+    pub(super) fn fence_owner(&self, node: usize, epoch: u64) {
+        let endpoint = &self.config.endpoints[node];
+        let mut tls = self.config.tls.clone();
+        tls.server_name = endpoint.server_name.clone();
+        let mut client = Client::connect(
+            &endpoint.address,
+            &tls,
+            Duration::from_secs(5),
+            self.config.partition_config(1, endpoint.partition),
+            &self.shape,
+        )
+        .unwrap();
+        client.fence_to(epoch).unwrap();
     }
 }
 
@@ -582,6 +672,8 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     assert_eq!(db.scan(KeySpace(0)).unwrap().len(), 31);
     db.shutdown().unwrap();
     drop(db);
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop(connections);
     let mut reopened = fixture.open();
     assert_eq!(reopened.epoch(), 2);
     assert_eq!(value(&mut reopened, 0), Some(vec![99; 32]));
@@ -1093,9 +1185,11 @@ fn lost_append_response_blocks_cached_reads_and_reopen_recovers_uncertain_group(
     assert_eq!(value(&mut db, 0), Some(vec![1; 32]));
     assert!(db.read_cache_stats().hits > 0);
     assert_eq!(db.core.published_next(), 2);
-    fixture.nodes[2].inject_drop_next_append_response();
+    // The owner-2 frame reaches its WAL file but its completion reports EIO:
+    // the outcome is unknown to the authority, as for a lost reply.
     let connection = Arc::clone(&db.core.clients[2].client);
-    let held = connection.lock();
+    let mut held = connection.lock();
+    held.leased_test_fail_write(-libc::EIO);
     let operation = fixture.operation(2, 2);
     let version = db.submit(operation, vec![put(2, 3)]).unwrap();
     db.submit(fixture.operation(2, 3), vec![put(3, 4)]).unwrap();
@@ -1114,6 +1208,8 @@ fn lost_append_response_blocks_cached_reads_and_reopen_recovers_uncertain_group(
     assert!(db.submit(operation, vec![put(2, 3)]).is_err());
     assert!(db.shutdown().is_err());
     drop(db);
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(connection);
     let mut reopened = fixture.open();
     for key in 0..4u32 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8 + 1; 32]));
@@ -1131,7 +1227,10 @@ fn observed_stale_epoch_read_stops_authority_before_any_later_cache_hit() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
     db.submit(fixture.operation(0, 0), vec![put(0, 1)]).unwrap();
-    db.submit(fixture.operation(0, 1), vec![put(1, 2)]).unwrap();
+    // Key 1 lives on another owner: on the leased route a read is uncached
+    // (needs an owner exchange) only while its file grant is not cached, and
+    // reading key 0 below caches owner 0's grant.
+    db.submit(fixture.operation(1, 1), vec![put(1, 2)]).unwrap();
     db.drain().unwrap();
     db.clear_read_cache();
     assert_eq!(value(&mut db, 0), Some(vec![1; 32]));
@@ -1140,13 +1239,9 @@ fn observed_stale_epoch_read_stops_authority_before_any_later_cache_hit() {
 
     // Simulate a competing authority becoming known to this storage node. The
     // authority has no background lease protocol: this test begins its safety
-    // assertion when an uncached RPC actually observes that its epoch is stale.
+    // assertion when an uncached read actually observes that its epoch is stale.
     let next_epoch = db.epoch() + 1;
-    db.core.clients[0]
-        .client
-        .lock()
-        .fence_to(next_epoch)
-        .unwrap();
+    fixture.fence_owner(1, next_epoch);
     assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
     assert!(db.core.ensure_healthy().is_err());
     let hits = db.read_cache_stats().hits;
@@ -1260,9 +1355,13 @@ fn lone_worker_append_keeps_durability_and_unknown_response_recovery_rules() {
     assert_eq!(value(&mut db, 0), Some(vec![17; 32]));
     assert!(db.read_cache_stats().hits > 0);
 
-    // Losing the worker's response cannot refund the batch or keep cached
-    // reads serving, exactly as for a multi-member frame.
-    fixture.nodes[1].inject_drop_next_append_response();
+    // An unknown worker write outcome (frame written, completion EIO) cannot
+    // refund the batch or keep cached reads serving, exactly as for a
+    // multi-member frame.
+    db.core.clients[1]
+        .client
+        .lock()
+        .leased_test_fail_write(-libc::EIO);
     let uncertain_operation = fixture.operation(1, 1);
     let uncertain_version = db.submit(uncertain_operation, vec![put(1, 231)]).unwrap();
     assert_eq!(
@@ -1288,6 +1387,8 @@ fn lone_worker_append_keeps_durability_and_unknown_response_recovery_rules() {
     assert!(db.submit(uncertain_operation, vec![put(1, 231)]).is_err());
     assert!(db.shutdown().is_err());
     drop(db);
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(connection);
 
     let mut reopened = fixture.open();
     assert_eq!(value(&mut reopened, 0), Some(vec![17; 32]));
@@ -1406,13 +1507,7 @@ fn preparation_budget_and_lost_reply_keep_the_existing_failure_contract() {
     let oversized: Vec<_> = (0..64u64)
         .map(|seed| (fixture.operation(0, 100 + seed), vec![put(seed as u32, 41)]))
         .collect();
-    let db = RemoteDatabase::open(
-        &fixture.temp.path().join("authority"),
-        &fixture.shape,
-        tight,
-        metrics(),
-    )
-    .unwrap();
+    let db = fixture.try_open_with(tight).unwrap();
     let error = db.submit_many(&oversized).unwrap_err();
     assert!(
         error.to_string().contains("admission byte budget"),
@@ -1424,9 +1519,9 @@ fn preparation_budget_and_lost_reply_keep_the_existing_failure_contract() {
     db.shutdown().unwrap();
     drop(db);
     let mut db = fixture.open();
-    fixture.nodes[0].inject_drop_next_append_response();
     let connection = Arc::clone(&db.core.clients[0].client);
-    let held = connection.lock();
+    let mut held = connection.lock();
+    held.leased_test_fail_write(-libc::EIO);
     let versions = db.submit_many(&window).unwrap();
     drop(held);
     assert!(db.drain().is_err());
@@ -1435,6 +1530,8 @@ fn preparation_budget_and_lost_reply_keep_the_existing_failure_contract() {
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert!(db.shutdown().is_err());
     drop(db);
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(connection);
     let mut reopened = fixture.open();
     assert_eq!(reopened.submit_many(&window).unwrap(), versions);
     assert_eq!(reopened.stats().admitted_batches, 0);
@@ -1528,6 +1625,8 @@ fn paused_caller_does_not_stall_owner_progress_or_admit_invalid_chunk() {
     }
     db.shutdown().unwrap();
     drop(db);
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(connection);
     let mut reopened = fixture.open();
     assert_eq!(value(&mut reopened, 7), None);
     for key in 0..6u32 {
@@ -1544,11 +1643,56 @@ fn paused_caller_does_not_stall_owner_progress_or_admit_invalid_chunk() {
     reopened.shutdown().unwrap();
 }
 
+/// Room for several frames in one leased extent: frames in flight together
+/// must share an extent, and the default 4 KiB fragment holds a single frame.
+fn frame_room(config: &mut RemoteDatabaseConfig) {
+    config.storage.fragment_bytes = 64 * 1024;
+    config.storage.wal_file_bytes = 256 * 1024;
+}
+
+/// Hold owner `owner`'s first leased frame completion, so its prefix (and,
+/// in frame order, every later receipt) stays unacknowledged; returns the
+/// write CQEs reaped before any test frame.
+fn hold_first_frame(db: &RemoteDatabase, owner: usize) -> u64 {
+    let mut client = db.core.clients[owner].client.lock();
+    client.leased_test_hold_completions(&[1]);
+    client.leased_test_reaped_writes()
+}
+
+/// Wait until `frames` more write CQEs were reaped on `owner`: those frames
+/// are in its WAL file, held completions included.
+fn wait_frames_written(db: &RemoteDatabase, owner: usize, before: u64, frames: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if db.core.clients[owner]
+            .client
+            .lock()
+            .leased_test_reaped_writes()
+            >= before + frames
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::yield_now();
+    }
+}
+
+fn release_frames(db: &RemoteDatabase, owner: usize) {
+    db.core.clients[owner]
+        .client
+        .lock()
+        .leased_test_release_held();
+}
+
 #[test]
 fn same_shard_window_appends_successor_before_prefix_is_durable() {
-    let fixture = Fixture::new().synchronous();
+    let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
+    let fixture = Fixture::new_with_config(128, shape, 2, frame_room).synchronous();
     let mut db = fixture.open();
-    let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
+    // The first frame's completion is held: its prefix is not durable.
+    let reaped = hold_first_frame(&db, 0);
     let operations: Vec<_> = (0..4u64).map(|seed| fixture.operation(0, seed)).collect();
     let connection = Arc::clone(&db.core.clients[0].client);
     let first_guard = connection.lock();
@@ -1557,36 +1701,18 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
             .unwrap();
     }
     drop(first_guard);
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(wait_frames_written(&db, 0, reaped, 1));
     let later_guard = connection.lock();
     for (key, operation) in operations.iter().copied().enumerate().skip(2) {
         db.submit(operation, vec![put(key as u32, key as u8)])
             .unwrap();
     }
     drop(later_guard);
+    drop(connection);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let later_appended = loop {
-        if fixture.nodes[0]
-            .contains_batch(
-                1,
-                BatchId {
-                    database: fixture.config.storage.database,
-                    operation: operations[3],
-                },
-            )
-            .unwrap()
-        {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        thread::yield_now();
-    };
     assert!(
-        later_appended,
-        "successor must reach the appender during the stall"
+        wait_frames_written(&db, 0, reaped, 2),
+        "successor must reach the owner WAL during the stall"
     );
     assert_eq!(worker_groups(&db, 0), 2);
     wait_for_flights(&db, 0, 2);
@@ -1605,7 +1731,7 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
             .is_none()
     }));
 
-    release.send(()).unwrap();
+    release_frames(&db, 0);
     assert_eq!(
         complete_owner(&db, 0, &[0, 1, 2, 3]),
         vec![vec![0, 1], vec![2, 3]]
@@ -1623,46 +1749,26 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
 #[test]
 fn tail_flush_dispatches_third_group_before_prior_durability() {
     let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-    let fixture = Fixture::new_with_shape_and_group(128, shape, 1)
-        .synchronous()
-        .history(HistoryPersistence::OnDisk);
+    let fixture = Fixture::new_with_config(128, shape, 1, frame_room).synchronous();
     let mut db = fixture.open();
-    let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
+    let reaped = hold_first_frame(&db, 0);
     let operations: Vec<_> = (0..3u64)
         .map(|seed| fixture.operation(0, 800 + seed))
         .collect();
     db.submit(operations[0], vec![put(800, 0)]).unwrap();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(wait_frames_written(&db, 0, reaped, 1));
     db.submit(operations[1], vec![put(801, 1)]).unwrap();
     db.submit(operations[2], vec![put(802, 2)]).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let reached_owner = loop {
-        if fixture.nodes[0]
-            .contains_batch(
-                1,
-                BatchId {
-                    database: fixture.config.storage.database,
-                    operation: operations[2],
-                },
-            )
-            .unwrap()
-        {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        thread::yield_now();
-    };
+    let reached_owner = wait_frames_written(&db, 0, reaped, 3);
     let in_flight = worker_groups(&db, 0);
     wait_for_flights(&db, 0, 3);
     assert_worker_bytes(&db, 0, 3, &[0, 1, 2]);
     let acknowledgements_held = (0..3).all(|sequence| db.core.durable_receipt(sequence).is_none());
     let published = db.core.published_next();
-    release.send(()).unwrap();
+    release_frames(&db, 0);
     assert!(
         reached_owner,
-        "third group must reach the real owner while persistence is paused"
+        "third group must reach the owner WAL while the prefix is not durable"
     );
     assert_eq!(in_flight, 3);
     assert!(acknowledgements_held);
@@ -1684,19 +1790,21 @@ fn tail_flush_dispatches_third_group_before_prior_durability() {
     reopened.shutdown().unwrap();
 }
 
+/// The leased frame window (`live_nvme.leased_write_window`) bounds frames in
+/// flight; groups beyond it stay staged in the owner queue.
 #[test]
-fn tail_flush_respects_bounded_owner_command_window() {
+fn tail_flush_respects_bounded_leased_frame_window() {
+    const WINDOW: usize = 4;
     let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-    let mut fixture = Fixture::new_with_shape_and_group(128, shape, 1)
-        .synchronous()
-        .history(HistoryPersistence::OnDisk);
-    fixture.config.owner_append_occupancy = super::super::tcp::APPEND_COMMAND_WINDOW;
+    let mut fixture = Fixture::new_with_config(128, shape, 1, frame_room).synchronous();
+    fixture.config.owner_append_occupancy = WINDOW;
+    fixture.config.live_nvme.leased_write_window = Some(WINDOW);
     let db = fixture.open();
-    let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
-    let count = super::super::tcp::APPEND_COMMAND_WINDOW + 4;
+    let reaped = hold_first_frame(&db, 0);
+    let count = WINDOW + 4;
     db.submit(fixture.operation(0, 900), vec![put(900, 0)])
         .unwrap();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(wait_frames_written(&db, 0, reaped, 1));
     for key in 1..count {
         db.submit(
             fixture.operation(0, 900 + key as u64),
@@ -1704,7 +1812,7 @@ fn tail_flush_respects_bounded_owner_command_window() {
         )
         .unwrap();
     }
-    wait_for_flights(&db, 0, super::super::tcp::APPEND_COMMAND_WINDOW);
+    wait_for_flights(&db, 0, WINDOW);
     let in_flight = worker_groups(&db, 0);
     let (head, next, queued) = db.core.clients[0].queue.snapshot();
     let staged = queued.len();
@@ -1722,25 +1830,9 @@ fn tail_flush_respects_bounded_owner_command_window() {
         in_flight,
         &(0..in_flight as u64).collect::<Vec<_>>(),
     );
-    let (checkpoint_reply, checkpoint_result) = mpsc::sync_channel(1);
-    db.core.clients[0]
-        .send(Command::Checkpoint(
-            db.epoch(),
-            db.epoch(),
-            0,
-            checkpoint_reply,
-        ))
-        .unwrap();
-    let checkpoint_held = matches!(checkpoint_result.try_recv(), Err(mpsc::TryRecvError::Empty));
-    release.send(()).unwrap();
-    assert_eq!(in_flight, super::super::tcp::APPEND_COMMAND_WINDOW);
-    assert!(checkpoint_held);
-    let proof = checkpoint_result
-        .recv_timeout(Duration::from_secs(10))
-        .unwrap()
-        .unwrap();
-    assert_eq!(proof.prefix, 0);
-    assert_eq!(staged, count - super::super::tcp::APPEND_COMMAND_WINDOW);
+    release_frames(&db, 0);
+    assert_eq!(in_flight, WINDOW);
+    assert_eq!(staged, count - WINDOW);
     let sequences: Vec<_> = (0..count as u64).collect();
     assert_eq!(
         complete_owner(&db, 0, &sequences),
@@ -1829,6 +1921,8 @@ fn large_groups_bypass_small_tail_window_but_respect_admission_cap() {
     }
     db.shutdown().unwrap();
     drop(db);
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(connection);
     let mut reopened = fixture.open();
     for key in 0..4u32 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 33 * 1024]));
@@ -1975,6 +2069,8 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
     assert_eq!(value(&mut db, 300), Some(vec![10; 32]));
     db.shutdown().unwrap();
     drop(db);
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop((connection, other_connection));
     let mut reopened = fixture.open();
     for key in 0..11u32 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 32]));
@@ -2040,75 +2136,4 @@ fn write_profile_limit_stops_dispatch_after_one_selected_append() {
     assert_eq!(profile.sampled_requests, 1);
     assert_eq!(profile.captured_connections, 1);
     db.shutdown().unwrap();
-}
-
-#[test]
-fn synchronous_append_preserves_other_correlated_completions() {
-    let fixture = Fixture::new();
-    let authority = fixture.open();
-    let endpoint = &fixture.config.endpoints[0];
-    let mut tls = fixture.config.tls.clone();
-    tls.server_name = endpoint.server_name.clone();
-    let mut client = Client::connect(
-        &endpoint.address,
-        &tls,
-        Duration::from_secs(5),
-        fixture.config.partition_config(1, endpoint.partition),
-        &fixture.shape,
-    )
-    .unwrap();
-    let first = CompleteBatch::new(
-        &fixture.shape,
-        BatchId {
-            database: fixture.config.storage.database,
-            operation: fixture.operation(0, 0),
-        },
-        BatchVersion {
-            epoch: 1,
-            sequence: 0,
-        },
-        vec![put(0, 1)],
-        fixture.config.storage.batch_limits,
-    )
-    .unwrap();
-    let second = CompleteBatch::new(
-        &fixture.shape,
-        BatchId {
-            database: fixture.config.storage.database,
-            operation: fixture.operation(0, 1),
-        },
-        BatchVersion {
-            epoch: 1,
-            sequence: 1,
-        },
-        vec![put(1, 2)],
-        fixture.config.storage.batch_limits,
-    )
-    .unwrap();
-    let first_id = client
-        .submit_append_many(1, std::slice::from_ref(&first))
-        .unwrap()
-        .unwrap();
-    let second_receipts = client
-        .append_many(1, std::slice::from_ref(&second))
-        .unwrap();
-    assert_eq!(second_receipts[0].appended().version(), second.version());
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let first_receipts = loop {
-        if let Some(completion) = client
-            .progress_appends()
-            .unwrap()
-            .into_iter()
-            .find(|completion| completion.id == first_id)
-        {
-            break completion.result.unwrap();
-        }
-        if Instant::now() >= deadline {
-            panic!("first correlated append completion was lost");
-        }
-        thread::yield_now();
-    };
-    assert_eq!(first_receipts[0].appended().version(), first.version());
-    authority.shutdown().unwrap();
 }

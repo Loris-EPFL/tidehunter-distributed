@@ -2,7 +2,7 @@
 //! write CQEs do not prove persistence. Receipts and publication belong to the
 //! caller. Cancellation and deadlines report only after all operations retire.
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess};
-use io_uring::{IoUring, opcode, types};
+use crate::distributed::sys::{Ring, Sqe};
 use minibytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -305,7 +305,7 @@ struct Request {
 pub(crate) struct NamespaceSlot(u32);
 
 pub struct LiveIo {
-    ring: IoUring,
+    ring: Ring,
     namespace: Arc<LiveNamespace>,
     attached: Vec<Arc<LiveNamespace>>,
     polled: bool,
@@ -351,12 +351,7 @@ impl LiveIo {
         if max_inflight_slots == 0 || max_inflight_slots > 32768 || max_inflight_bytes == 0 {
             return Err(LiveIoError::Invalid("invalid queue limits"));
         }
-        let mut builder = IoUring::builder();
-        builder.dontfork();
-        if polled {
-            builder.setup_iopoll();
-        }
-        let ring = builder.build(max_inflight_slots.next_power_of_two() as u32)?;
+        let ring = Ring::new(max_inflight_slots.next_power_of_two() as u32, polled)?;
         // At most one returned block per slot is queued, and no more than
         // `max_inflight_bytes` of them (see `ReturnLane`).
         let (sender, returns) = mpsc::sync_channel(max_inflight_slots);
@@ -401,7 +396,7 @@ impl LiveIo {
         })
     }
     pub(crate) fn register_worker_wake(&self, fd: std::os::fd::RawFd) -> io::Result<()> {
-        self.ring.submitter().register_eventfd(fd)
+        self.ring.register_eventfd(fd)
     }
 
     #[cfg(test)]
@@ -498,7 +493,7 @@ impl LiveIo {
     }
     /// Whether any CQE awaits harvest. A progress call is then non-blocking work.
     pub(crate) fn completion_ready(&mut self) -> bool {
-        !self.ring.completion().is_empty()
+        self.ring.completion_ready()
     }
     /// Free request credit: `(SQE slots, bytes)` another read may take now.
     pub(crate) fn credit(&self) -> (usize, usize) {
@@ -846,7 +841,7 @@ impl LiveIo {
         let operations = ranges.len();
         let flush = data.is_some() && read_bytes == 0;
         // Scalar reads and writes keep all transient SQE metadata inline.
-        let mut entries = SmallVec::<[io_uring::squeue::Entry; 1]>::with_capacity(ranges.len());
+        let mut entries = SmallVec::<[(Sqe, u64); 1]>::with_capacity(ranges.len());
         let mut prepared = SmallVec::<[(u64, Operation); 1]>::with_capacity(ranges.len());
         for (index, read) in ranges.into_iter().enumerate() {
             let PlannedRead {
@@ -882,25 +877,24 @@ impl LiveIo {
             }
             let token = self.next_token + index as u64;
             let entry = if flush {
-                opcode::Fsync::new(types::Fd(fd))
-                    .flags(types::FsyncFlags::DATASYNC)
-                    .build()
+                Sqe::DataSync { fd }
             } else if data.is_some() {
-                opcode::Write::new(types::Fd(fd), buffer.ptr(), len as u32)
-                    .offset(offset)
-                    .rw_flags(if matches!(data, Some((_, LiveWriteSync::Data))) {
-                        libc::RWF_DSYNC
-                    } else {
-                        0
-                    })
-                    .build()
+                Sqe::Write {
+                    fd,
+                    buf: buffer.ptr(),
+                    len: len as u32,
+                    offset,
+                    data_sync: matches!(data, Some((_, LiveWriteSync::Data))),
+                }
             } else {
-                opcode::Read::new(types::Fd(fd), buffer.ptr(), len as u32)
-                    .offset(offset)
-                    .build()
-            }
-            .user_data(token);
-            entries.push(entry);
+                Sqe::Read {
+                    fd,
+                    buf: buffer.ptr(),
+                    len: len as u32,
+                    offset,
+                }
+            };
+            entries.push((entry, token));
             prepared.push((
                 token,
                 Operation {
@@ -916,8 +910,7 @@ impl LiveIo {
         // SAFETY: SQEs reference allocations moved into operations below; they and
         // every namespace descriptor remain alive until every terminal CQE.
         // Attached handles stay in `attached` until drop, which aborts if operations remain.
-        // No SQPOLL observes SQEs before submit. push_multiple is all-or-nothing.
-        if unsafe { self.ring.submission().push_multiple(&entries) }.is_err() {
+        if !unsafe { self.ring.push(&entries) } {
             for (_, op) in prepared {
                 self.pool.push(op.buffer);
             }
@@ -1006,13 +999,9 @@ impl LiveIo {
             }
             return Ok(true);
         }
-        let pending = self.ring.submission().len();
+        let pending = self.ring.queued();
         let started = Instant::now();
-        let timespec = types::Timespec::from(timeout);
-        let result = self
-            .ring
-            .submitter()
-            .submit_with_args(1, &types::SubmitArgs::new().timespec(&timespec));
+        let result = self.ring.submit_and_wait_timeout(timeout);
         self.account_submissions(pending, started);
         match result {
             Ok(_) => Ok(self.completion_ready()),
@@ -1034,21 +1023,17 @@ impl LiveIo {
     /// transient submit left work queued; the caller retains ownership and retries.
     pub(crate) fn submit_pending_write(&mut self) -> Result<bool, LiveIoError> {
         self.flush_submissions()?;
-        Ok(self.ring.submission().is_empty())
+        Ok(self.ring.queued() == 0)
     }
     /// Hands queued SQEs to the kernel. A transient EBUSY/EINTR leaves any
     /// unconsumed SQEs queued for the next call.
     fn flush_submissions(&mut self) -> Result<(), LiveIoError> {
-        let pending = self.ring.submission().len();
+        let pending = self.ring.queued();
         if pending == 0 && !self.polled {
             return Ok(());
         }
         let started = Instant::now();
-        let result = if self.polled {
-            self.ring.submit_and_wait(0)
-        } else {
-            self.ring.submit()
-        };
+        let result = self.ring.submit(self.polled);
         self.account_submissions(pending, started);
         if let Err(error) = result {
             if matches!(
@@ -1066,7 +1051,7 @@ impl LiveIo {
     fn account_submissions(&mut self, pending: usize, started: Instant) {
         // Even ETIME/EINTR may follow consumed SQEs. With no SQPOLL and one
         // queue owner, the SQ head gives the exact number consumed by this enter.
-        let submitted = pending - self.ring.submission().len();
+        let submitted = pending - self.ring.queued();
         // A polled enter with no queued SQE only reaps completions: it is not
         // submission time. The interrupt ring keeps its accounting unchanged.
         if pending > 0 || !self.polled {
@@ -1130,7 +1115,7 @@ impl LiveIo {
     }
 
     /// Scalar retirement without allocating a completion Vec.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn progress_one(&mut self) -> Result<Option<LiveCompletion>, LiveIoError> {
         let mut out = None;
         let mut multiple = false;
@@ -1161,10 +1146,10 @@ impl LiveIo {
         }
         let _ = self.flush_submissions();
         for _ in 0..self.operations.len() {
-            let Some(cqe) = self.ring.completion().next() else {
+            let Some((user_data, result)) = self.ring.next_completion() else {
                 break;
             };
-            let Some(op) = self.operations.remove(&cqe.user_data()) else {
+            let Some(op) = self.operations.remove(&user_data) else {
                 std::process::abort()
             };
             let Operation {
@@ -1179,9 +1164,8 @@ impl LiveIo {
                 std::process::abort()
             };
             if let (Some(trace), Some(queue)) = (&req.trace, self.trace_queue) {
-                trace.event_io("live_io_cqe_observed", queue, cqe.user_data());
+                trace.event_io("live_io_cqe_observed", queue, user_data);
             }
-            let result = cqe.result();
             #[cfg(test)]
             if write {
                 self.last_write_errno = (result < 0).then_some(-result);
@@ -1338,7 +1322,8 @@ impl Drop for LiveIo {
     }
 }
 
-#[cfg(test)]
+// These tests drive a real io_uring; off Linux `LiveIo` cannot be constructed.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::fs::OpenOptions;

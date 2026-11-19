@@ -61,41 +61,6 @@ class WriteFloorTests(unittest.TestCase):
             self.assertEqual(runtime.run_case(job), 'ok')
             run.assert_called_once_with(job)
 
-    def test_stage_shapes_are_admitted(self):
-        jobs = controller.cloud_campaign.make_focused_matrix('stages')
-        for backend in ('tidehunter_verbs_native', 'tidehunter_tcp'):
-            self.assertTrue(any(j['group'] == 'G12D' and j['case_kind'] == 'media_read'
-                and j['backend'] == backend and j['concurrency'] == 16
-                and j['media']['expected'] == 'memory' for j in jobs))
-        for state in ('memory', 'cold'):
-            job = next(j for j in jobs if j['group'] == 'G12D' and j['case_kind'] == 'media_read'
-                       and j['backend'] == 'tidehunter_verbs' and j['media']['expected'] == state)
-            controller.cloud_campaign.validate_focused_job(job)
-            self.assertEqual(job['diagnostics']['read_profile_limit'], 4096)
-        for operation in ('put_batch', 'delete'):
-            job = next(j for j in jobs if j['group'] == 'G12D' and j['case_kind'] == 'remote_put'
-                       and j['backend'] == 'tidehunter_tcp' and j['mix'][operation] == 100)
-            controller.cloud_campaign.validate_focused_job(job)
-            self.assertEqual(job['diagnostics']['write_timeline_limit'], 4096)
-        selected = [j for j in jobs if j['group'] == 'G12D' and
-                    ((j['case_kind'] == 'media_read' and
-                      ((j['concurrency'] == 16 and j['backend'] in ('tidehunter_verbs_native', 'tidehunter_tcp')
-                        and j['media']['expected'] == 'memory') or
-                       j['backend'] == 'tidehunter_verbs'))
-                     or (j['case_kind'] == 'remote_put' and j['backend'] == 'tidehunter_tcp'
-                         and (j['mix']['put_batch'] or j['mix']['delete'])))]
-        self.assertEqual(len(selected), 6)
-        for job in selected:
-            cfg = controller.cloud_campaign.make_run_config(job, Path('/tmp/case'), {}, 'a' * 40, 600)
-            self.assertEqual(cfg['execution']['concurrency'], job['concurrency'])
-            self.assertEqual(cfg['workload']['mix'], job['mix'])
-            self.assertEqual(cfg['diagnostics'], job['diagnostics'])
-            self.assertEqual(cfg['backend']['options']['transport'], controller.cloud_campaign.TRANSPORTS[job['backend']])
-            if job['case_kind'] == 'media_read':
-                self.assertFalse(cfg['phases']['preload'])
-                self.assertTrue(cfg['phases']['verify_existing_dataset'])
-
-
     def test_fd_guard_rejects_other_file_and_device(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); scratch = root / 'scratch'; scratch.write_bytes(b'x')

@@ -1,17 +1,14 @@
-//! One bounded FIFO owner for this node's physical append stream and controls.
+//! One bounded FIFO owner for this node's stream requests and controls.
 //!
-//! Like `GroupCommitWorker`, accepted work owns its payload through completion,
-//! drains on shutdown and never runs synchronous WAL I/O on network progress.
-//! TiKV WriteBarrier::enter services an empty queue immediately, then takes only
-//! callers already behind active work; no timer is needed here. Each Append RPC
-//! remains a complete recovery group, while multiple groups may append during an
-//! earlier captured prefix's file/namespace barrier. The serial flusher completes
-//! receipts only after durability.
-//! Source: tikv/raft-engine 097c499a19fbb38754c73aa2f31532329df7c0c6,
-//! src/write_barrier.rs:170-225 and src/engine.rs:147-235.
+//! Accepted work owns its payload through completion, drains on shutdown and
+//! never runs synchronous WAL I/O on network progress. Stream requests (live
+//! extent leases and adoptions, record resolution, position proofs, durable
+//! progress polls) overlap; every other control is an exclusive barrier that
+//! first drains the ordered flush queue.
 
+use super::super::durability::DurabilityConfig;
+use super::super::durability::DurabilityTier;
 use super::super::durability::frontier::{Frontier, Syncer, flush_all};
-use super::super::durability::{DurabilityConfig, DurabilityTier};
 use super::super::storage::LogDurableProgress;
 use super::durable_progress::{self, HubSender, PollIdentity, Wake};
 use super::*;
@@ -28,20 +25,15 @@ const MAX_COMMANDS: usize = 64;
 const MAX_COMMAND_BYTES: usize = 256 * 1024 * 1024;
 // See `Shared::flush` for the capacity bound.
 const FLUSH_QUEUE: usize = 2 * MAX_COMMANDS + 16;
-// Fixed worker set. Appends overlap up to this many at a time; the partition's
-// state lock orders the WAL allocation, not this pool.
+// Fixed worker set. Stream requests overlap up to this many at a time; the
+// partition's state lock orders their state changes, not this pool.
 const CONTROL_WORKERS: usize = 4;
-// Admission retries after a persistence drain. Another worker's appended group
-// may still be on its way to the flush queue when a drain runs, so one drain does
-// not always free capacity; each retry's drain then covers it.
-const ADMISSION_RETRIES: usize = 8;
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type PublishedLiveLeases = (
     [u8; 16],
     Vec<(
         super::super::nvmeof::live_storage::LiveWalSegment,
-        super::super::nvmeof::live_target::LiveTargetBinding,
+        super::super::nvmeof::live_storage::LiveTargetBinding,
         u64,
         u64,
     )>,
@@ -60,20 +52,20 @@ pub(super) struct ControlContext {
     /// not even by a successful live recovery fence. Shared with the inventory, which
     /// reports `NodeStatus::recovery_clean = false` once it is set.
     pub(super) persistence_failed: Arc<AtomicBool>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) recoverable_live_failure: AtomicBool,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) poison_gate: Mutex<()>,
-    pub(super) append_shape: KeyShape,
-    pub(super) append_batch_limits: BatchLimits,
-    pub(super) append_group_limits: GroupLimits,
     pub(super) wal_member_read: super::super::storage::WalMemberReadPolicy,
-    pub(super) read_config: read_executor::ReadExecutorConfig,
-    pub(super) read_admission: Arc<read_executor::ReadAdmission>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
-    #[cfg(test)]
-    pub(super) panic_after_append: Arc<AtomicBool>,
+    /// With async member reads, caps `NodeStatus::max_reads` and each
+    /// `ResolveLiveRecords` request (see `effective_max_reads`).
+    pub(super) read_max_device_reads: usize,
+    /// Owner OFI transport counters, reported by `PartitionStats`. Sessions
+    /// write their own cache-line shard (relaxed); a snapshot is not atomic.
+    pub(super) transport: Arc<OwnerTransportCounters>,
+    /// Data-free live-control gate. Lock order: this gate, then the lifecycle
+    /// gate, then the inventory, then `readers`. Fence, seal, retirement, live
+    /// read publication, live pin release and target shutdown take it first;
+    /// terminal publication only `try_lock`s it and defers while it is held.
+    pub(super) live_control_gate: Mutex<()>,
 }
 
 pub(super) struct ControlWork {
@@ -81,7 +73,6 @@ pub(super) struct ControlWork {
     pub(super) request: Request,
     pub(super) limits: TcpLimits,
     pub(super) measured: bool,
-    pub(super) trace_shape: Option<(u64, usize, usize)>,
     pub(super) queued: Option<Instant>,
     pub(super) submitted: Option<Instant>,
     pub(super) charge: usize,
@@ -97,8 +88,6 @@ struct Queue {
     flush_failed: bool,
     // Stream operations between dequeue and completion/flush hand-off.
     active_appends: usize,
-    // Next append ticket to hand out, in queue (submission) order.
-    next_ticket: u64,
     // An exclusive control is executing; nothing else may start.
     control_active: bool,
 }
@@ -106,17 +95,12 @@ struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
     context: Arc<ControlContext>,
-    // Owner: the flusher thread (sole receiver). Capacity: every queued request
-    // owns at most one `Append` item (<= MAX_COMMANDS), plus at most one
-    // `Barrier` per append worker and per exclusive control; the capacity below
-    // exceeds that sum, so a send made under the queue lock never blocks.
-    // Full-queue policy: unreachable by this bound.
+    // Owner: the flusher thread (sole receiver). Capacity: at most one
+    // `Barrier` per control worker (each waits for its own before continuing);
+    // the capacity below exceeds that, so a send made under the queue lock
+    // never blocks. Full-queue policy: unreachable by this bound.
     // Shutdown: `Stop` after the workers joined; queued items are served first.
     flush: mpsc::SyncSender<FlushCommand>,
-    // Tier policy. Synchronous: an append waits for the covering sync before
-    // its reply. Native: the reply follows the WAL write and the node's syncer
-    // makes it durable in the background; exclusive controls flush first.
-    synchronous: AtomicBool,
     // Lock order: `durability` before `syncers`. Both are cold on the append
     // path (first append of each log, configuration and live fencing). A live
     // extent request (lease or adoption) reads the tier under `durability`
@@ -126,12 +110,7 @@ struct Shared {
     // old log's worker before recovery; shutdown joins any remaining workers.
     syncers: Mutex<Vec<SyncerSlot>>,
     // Leaf lock: never hold with `durability` or `syncers`; join off-lock.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     preparers: Mutex<Vec<PreparerSlot>>,
-    // Next append ticket allowed to reach the WAL. Never held with `queue`.
-    // Waiting is bounded by the tickets ahead, which always progress.
-    order: Mutex<u64>,
-    order_cv: Condvar,
     // Parked durable-progress polls. Log syncers notify it after each sync.
     progress: HubSender,
     // Test-only cap of a poll's wait (ms), default `DURABLE_PROGRESS_MAX_WAIT`.
@@ -139,12 +118,10 @@ struct Shared {
     #[cfg(test)]
     progress_cap_ms: std::sync::atomic::AtomicU64,
     #[cfg(test)]
-    before_ack: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
-    #[cfg(test)]
     session_barrier_waits: std::sync::atomic::AtomicU64,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     grant_profiles: Mutex<(Vec<TestGrantProfile>, u64)>,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     before_target_shutdown: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
 }
 
@@ -160,7 +137,6 @@ struct SyncerSlot {
     syncer: Syncer,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct PreparerSlot {
     log: Arc<super::super::storage::PartitionLog>,
     trigger: mpsc::SyncSender<()>,
@@ -170,7 +146,7 @@ struct PreparerSlot {
     worker: JoinHandle<()>,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 #[derive(Clone, serde::Serialize)]
 struct TestGrantProfile {
     envelope_id: u64,
@@ -189,7 +165,6 @@ impl Shared {
     /// One worker owns each log's preparation triggers. Capacity one: a full
     /// queue coalesces triggers because the worker recomputes the target.
     /// Shutdown sets stopping, wakes publication retries, drops the sender and joins.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn trigger_file_preparation(&self, log: &Arc<super::super::storage::PartitionLog>) {
         let mut slots = self.preparers.lock();
         let slot = if let Some(index) = slots.iter().position(|slot| Arc::ptr_eq(&slot.log, log)) {
@@ -243,7 +218,6 @@ impl Shared {
         let _ = slot.trigger.try_send(());
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn join_preparer(&self, slot: PreparerSlot) -> Result<(), TcpError> {
         let PreparerSlot {
             log,
@@ -307,7 +281,6 @@ impl Shared {
             .iter()
             .map(|slot| slot.log.clone())
             .collect();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         for log in &logs {
             log.self_adopt_live_extent().map_err(TcpError::component)?;
         }
@@ -323,7 +296,6 @@ impl Shared {
             .map_err(|error| TcpError::new(format!("log frontier flush failed: {error}")))?;
         // An explicit flush also catches up a live root the syncer deferred. The
         // catch-up publishes durable progress, so parked polls re-check.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             for log in &logs {
                 log.persist_live_root()
@@ -340,7 +312,6 @@ impl Shared {
         &self,
         log: &Arc<super::super::storage::PartitionLog>,
     ) -> Result<(), TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             let slot = {
                 let mut slots = self.preparers.lock();
@@ -363,7 +334,6 @@ impl Shared {
         if let Some(SyncerSlot { log, syncer }) = slot {
             let result = syncer.shutdown().map_err(|error| error.to_string());
             // Fence and retirement also catch up a deferred live root.
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             let result =
                 result.and_then(|()| log.persist_live_root().map_err(|error| error.to_string()));
             drop(log);
@@ -378,37 +348,7 @@ impl Shared {
     }
 }
 
-/// What the owner replies once the covering barrier has completed.
-enum FlushReply {
-    Appended,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    LiveCompleted {
-        validation_ns: u64,
-        validation_samples: u64,
-    },
-}
-
-struct PendingFlush {
-    id: u64,
-    charge: usize,
-    completed: mpsc::SyncSender<reactor::WorkCompletion>,
-    log: Arc<super::super::storage::PartitionLog>,
-    receipts: Vec<AppendedBatch>,
-    reply: FlushReply,
-    profile: ConnectionProfile,
-    measured: bool,
-    began: Option<Instant>,
-    enqueued: Option<Instant>,
-    // Appended frontier captured at hand-off; covers this command's groups.
-    end: u64,
-}
-
-// Keep append commands inline: the fixed-capacity channel bounds resident work,
-// and boxing would add a per-append allocation.
-#[allow(clippy::large_enum_variant)]
 enum FlushCommand {
-    /// Synchronous tier: reply after the barrier covering `receipts`.
-    Append(PendingFlush),
     /// A frontier flush ordered after every earlier command.
     Barrier(mpsc::SyncSender<()>),
     Stop,
@@ -434,7 +374,6 @@ impl ControlOwner {
                 flush_failed: false,
                 active_appends: 0,
                 control_active: false,
-                next_ticket: 0,
             }),
             ready: Condvar::new(),
             context,
@@ -444,24 +383,16 @@ impl ControlOwner {
             progress_cap_ms: std::sync::atomic::AtomicU64::new(
                 super::DURABLE_PROGRESS_MAX_WAIT.as_millis() as u64,
             ),
-            synchronous: AtomicBool::new(
-                DurabilityConfig::default().tier == DurabilityTier::Synchronous,
-            ),
             durability: Mutex::new(DurabilityState {
                 config: DurabilityConfig::default(),
                 started: false,
             }),
             syncers: Mutex::new(Vec::new()),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             preparers: Mutex::new(Vec::new()),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
-            grant_profiles: Mutex::new((Vec::new(), 0)),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
-            before_target_shutdown: Mutex::new(None),
-            order: Mutex::new(0),
-            order_cv: Condvar::new(),
             #[cfg(test)]
-            before_ack: Mutex::new(None),
+            grant_profiles: Mutex::new((Vec::new(), 0)),
+            #[cfg(test)]
+            before_target_shutdown: Mutex::new(None),
             #[cfg(test)]
             session_barrier_waits: std::sync::atomic::AtomicU64::new(0),
         });
@@ -480,11 +411,7 @@ impl ControlOwner {
                         queue.flush_failed = true;
                         queue.stopped = true;
                     }
-                    fail_queued_flush(
-                        &flush_shared,
-                        &receiver,
-                        "log persistence owner panicked; append outcome may be unknown",
-                    );
+                    fail_queued_flush(&receiver);
                 }
             })?;
         let mut threads = Vec::with_capacity(CONTROL_WORKERS);
@@ -530,25 +457,11 @@ impl ControlOwner {
             };
         }
         current.config = config;
-        // Release pairs with the Acquire load in `hand_off`.
-        self.shared.synchronous.store(
-            config.tier == DurabilityTier::Synchronous,
-            Ordering::Release,
-        );
         Ok(())
     }
 
     pub(super) fn durability(&self) -> DurabilityConfig {
         self.shared.durability.lock().config
-    }
-
-    /// Test hook: hold the next appended group just before its acknowledgement.
-    #[cfg(test)]
-    pub(super) fn pause_before_next_ack(&self) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
-        let (entered, entered_rx) = mpsc::sync_channel(1);
-        let (resume_tx, resume) = mpsc::sync_channel(0);
-        *self.shared.before_ack.lock() = Some((entered, resume));
-        (entered_rx, resume_tx)
     }
 
     #[cfg(test)]
@@ -559,7 +472,7 @@ impl ControlOwner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn session_barrier_waits(&self) -> u64 {
         self.shared.session_barrier_waits.load(Ordering::Relaxed)
     }
@@ -569,7 +482,7 @@ impl ControlOwner {
         self.shared.queue.lock().requests
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn exclusive_waits_for_stream(&self) -> bool {
         let queue = self.shared.queue.lock();
         queue.active_appends != 0
@@ -599,15 +512,11 @@ impl ControlOwner {
     }
     /// Final process teardown: prevent new controls only after the session
     /// owner and all admitted work have quiesced.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn finish_live_target_shutdown(
         &self,
     ) -> Result<super::super::nvmeof::LiveTargetStats, TcpError> {
         let context = &self.shared.context;
-        let leases = context.nvmeof_leases.lock();
-        if leases.has_live_or_quarantined() {
-            return Err(TcpError::new("NVMe-oF leases must drain before shutdown"));
-        }
+        let _gate = context.live_control_gate.lock();
         // Teardown owns the lifecycle gate from here on, so the preparer cannot
         // expose a capability after teardown starts. The inventory is taken
         // only to check and, at the end, to install the shutdown state.
@@ -652,7 +561,7 @@ impl ControlOwner {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 impl ControlOwner {
     pub(super) fn grant_profiles(&self) -> serde_json::Value {
         let profiles = self.shared.grant_profiles.lock();
@@ -664,7 +573,7 @@ impl ControlOwner {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 #[test]
 fn preparation_triggers_coalesce_when_the_worker_is_busy() {
     use crate::distributed::storage::LivePausePoint;
@@ -703,7 +612,6 @@ impl Drop for ControlOwner {
                 self.shared.context.poison_readers();
             }
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             let slots = std::mem::take(&mut *self.shared.preparers.lock());
             for slot in slots {
@@ -721,10 +629,7 @@ impl Drop for ControlOwner {
         let syncers = std::mem::take(&mut *self.shared.syncers.lock());
         for SyncerSlot { log, syncer } in syncers {
             let drained = syncer.shutdown().is_ok();
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             let drained = drained && log.persist_live_root().is_ok();
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            let _ = log;
             if !drained {
                 self.shared.context.poison_readers();
             }
@@ -738,16 +643,9 @@ impl Drop for ControlOwner {
 struct Slot<'a> {
     shared: &'a Shared,
     append: bool,
-    // Append ticket (queue order), passed on when the slot drops.
-    ticket: Option<u64>,
 }
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        // Pass the append turn first, outside the queue lock, so later tickets
-        // proceed even when this append failed before reaching its turn.
-        if let Some(ticket) = self.ticket {
-            pass_turn(self.shared, ticket);
-        }
         let mut queue = self.shared.queue.lock();
         if self.append {
             queue.active_appends -= 1;
@@ -776,6 +674,18 @@ impl StorageNode {
         self.inventory.lock().active(epoch).unwrap()
     }
 
+    /// Test hook: the log of `epoch` with its stream frontier and syncer
+    /// attached, as the first lease (formerly the first append) does.
+    #[cfg(test)]
+    pub(crate) fn stream_log_for_test(
+        &self,
+        epoch: u64,
+    ) -> Arc<super::super::storage::PartitionLog> {
+        let log = self.log_for_test(epoch);
+        self.control.shared.frontier_for(&log).unwrap();
+        log
+    }
+
     /// Test hook: cap of a durable-progress wait for requests submitted from now on.
     #[cfg(test)]
     pub(crate) fn set_durable_progress_cap_for_test(&self, cap: Duration) {
@@ -794,25 +704,21 @@ impl StorageNode {
 // A durable-progress poll overlaps writes like a position proof: it takes no
 // append ticket and no flush barrier, and leaves its slot before it parks.
 pub(super) fn is_stream_request(request: &Request) -> bool {
-    match request {
-        Request::Append { .. }
-        | Request::CheckpointPosition { .. }
-        | Request::DurableProgress { .. } => true,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReserveLiveGroup { .. }
-        | Request::CompleteLiveGroup { .. }
-        | Request::LeaseLiveExtent { .. }
-        | Request::PreleaseLiveExtent { .. }
-        | Request::AdoptLiveExtent { .. }
-        | Request::ResolveLiveRecords { .. } => true,
-        _ => false,
-    }
+    matches!(
+        request,
+        Request::CheckpointPosition { .. }
+            | Request::DurableProgress { .. }
+            | Request::LeaseLiveExtent { .. }
+            | Request::PreleaseLiveExtent { .. }
+            | Request::AdoptLiveExtent { .. }
+            | Request::ResolveLiveRecords { .. }
+    )
 }
 
 /// Stream requests overlap; the log orders their state changes. Exclusive
 /// controls wait for all earlier stream operations, including position proofs,
 /// and block later work until completion. Returns `None` once stopped and empty.
-fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>, u64)> {
+fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>)> {
     let mut queue = shared.queue.lock();
     loop {
         let runnable = match queue.work.front() {
@@ -827,58 +733,24 @@ fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>, u64)> {
             continue;
         };
         let work = queue.work.pop_front()?;
-        let ticket = (append && matches!(work.request, Request::Append { .. })).then(|| {
-            let ticket = queue.next_ticket;
-            queue.next_ticket += 1;
-            ticket
-        });
         if append {
             queue.active_appends += 1;
         } else {
             queue.control_active = true;
         }
-        return Some((
-            work,
-            Slot {
-                shared,
-                append,
-                ticket,
-            },
-            ticket.unwrap_or(0),
-        ));
+        return Some((work, Slot { shared, append }));
     }
-}
-
-/// Block until every append dequeued before this one has passed its turn.
-fn wait_turn(shared: &Shared, ticket: u64) {
-    let mut turn = shared.order.lock();
-    while *turn != ticket {
-        shared.order_cv.wait(&mut turn);
-    }
-}
-
-/// Pass the turn to the next ticket once this one's turn has come.
-fn pass_turn(shared: &Shared, ticket: u64) {
-    let mut turn = shared.order.lock();
-    while *turn != ticket {
-        shared.order_cv.wait(&mut turn);
-    }
-    *turn += 1;
-    shared.order_cv.notify_all();
 }
 
 fn run(shared: &Shared) {
-    // CONTROL_WORKERS identical workers drain one FIFO. Appends run in parallel;
-    // controls are exclusive barriers (see `next_work`). Each append hands its
-    // complete group to the bounded flush queue, where the syncer batches the
-    // WAL barrier for every ready group.
-    while let Some((work, _slot, ticket)) = next_work(shared) {
+    // CONTROL_WORKERS identical workers drain one FIFO. Stream requests run in
+    // parallel; controls are exclusive barriers (see `next_work`).
+    while let Some((work, _slot)) = next_work(shared) {
         let ControlWork {
             id,
             request,
             limits,
             measured,
-            trace_shape: _,
             queued,
             submitted,
             charge,
@@ -920,89 +792,6 @@ fn run(shared: &Shared) {
             continue;
         }
         let request = match request {
-            Request::Append { epoch, batches } => {
-                let mut drain_wait_ns = 0;
-                let mut drain = || {
-                    let (done, completed) = mpsc::sync_channel(0);
-                    let queued = Instant::now();
-                    {
-                        let queue = shared.queue.lock();
-                        if queue.flush_failed {
-                            return Err(TcpError::new(
-                                "log flusher stopped before admission retry",
-                            ));
-                        }
-                        shared
-                            .flush
-                            .send(FlushCommand::Barrier(done))
-                            .map_err(|_| {
-                                TcpError::new("log flusher stopped before admission retry")
-                            })?;
-                    }
-                    let result = completed
-                        .recv()
-                        .map_err(|_| TcpError::new("log flusher stopped before admission retry"));
-                    drain_wait_ns += elapsed_ns(queued);
-                    result
-                };
-                // Decode and group construction run in parallel; only the WAL
-                // append waits for its ticket (queue order). The ticket passes on
-                // when the worker's slot drops, whatever the outcome.
-                let mut take_turn = || wait_turn(shared, ticket);
-                let append = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    shared.context.append_profiled(
-                        epoch,
-                        batches,
-                        measured.then_some(&mut profile),
-                        Some(&mut drain),
-                        Some(&mut take_turn),
-                    )
-                }))
-                .unwrap_or_else(|_| {
-                    shared.context.poison_readers();
-                    Err(TcpError::new(
-                        "log control owner panicked after append; outcome may be unknown; reopen authority",
-                    ))
-                });
-                if measured {
-                    profile.control_queue_ns =
-                        profile.control_queue_ns.saturating_add(drain_wait_ns);
-                    profile.append_barrier_wait_ns = drain_wait_ns;
-                    profile.control_execution_ns =
-                        began.map_or(0, elapsed_ns).saturating_sub(drain_wait_ns);
-                }
-                match append {
-                    Ok((log, receipts)) => hand_off(
-                        shared,
-                        PendingFlush {
-                            id,
-                            charge,
-                            completed,
-                            log,
-                            receipts,
-                            reply: FlushReply::Appended,
-                            profile,
-                            measured,
-                            began,
-                            enqueued: measured.then(Instant::now),
-                            end: 0,
-                        },
-                        Some(epoch),
-                    ),
-                    Err(error) => complete(
-                        shared,
-                        id,
-                        charge,
-                        completed,
-                        Err(error),
-                        profile,
-                        measured,
-                        began,
-                    ),
-                }
-                continue;
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             request @ (Request::LeaseLiveExtent { .. }
             | Request::PreleaseLiveExtent { .. }
             | Request::AdoptLiveExtent { .. }) => {
@@ -1095,54 +884,6 @@ fn run(shared: &Shared) {
                 );
                 continue;
             }
-            // Validation and publication run here. Persistence is handed to the
-            // flusher exactly like an append, so the WAL and frontier barriers of
-            // several completions are shared and never run inside this worker.
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::CompleteLiveGroup { epoch, token } => {
-                let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    shared.context.complete_live_published(epoch, token)
-                }))
-                .unwrap_or_else(|_| {
-                    shared.context.poison_readers();
-                    Err(TcpError::new(
-                        "log control owner panicked during live completion; outcome may be unknown; reopen authority",
-                    ))
-                });
-                match completion {
-                    Ok((log, receipts, validation_ns, validation_samples)) => hand_off(
-                        shared,
-                        PendingFlush {
-                            id,
-                            charge,
-                            completed,
-                            log,
-                            receipts,
-                            reply: FlushReply::LiveCompleted {
-                                validation_ns,
-                                validation_samples,
-                            },
-                            profile,
-                            measured,
-                            began,
-                            enqueued: measured.then(Instant::now),
-                            end: 0,
-                        },
-                        None,
-                    ),
-                    Err(error) => complete(
-                        shared,
-                        id,
-                        charge,
-                        completed,
-                        Err(error),
-                        profile,
-                        measured,
-                        began,
-                    ),
-                }
-                continue;
-            }
             Request::DurableProgress {
                 authority_epoch,
                 epoch,
@@ -1212,12 +953,10 @@ fn run(shared: &Shared) {
         // data barriers. A grant must not join the flusher: that barrier may
         // self-adopt an unrelated predecessor or wait for durable metadata.
         // Lifecycle controls still drain the ordered flush queue.
-        let read_owned_barrier = match &request {
-            Request::CheckpointPosition { .. } => true,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ResolveLiveRecords { .. } => true,
-            _ => false,
-        };
+        let read_owned_barrier = matches!(
+            &request,
+            Request::CheckpointPosition { .. } | Request::ResolveLiveRecords { .. }
+        );
         let (barrier_ok, barrier_wait_ns) = if read_owned_barrier {
             (true, 0)
         } else {
@@ -1354,12 +1093,8 @@ fn durable_progress_poll(
         ));
     };
     let wake = if sync {
-        #[cfg(feature = "experimental-nvmeof")]
         log.self_adopt_live_extent().map_err(TcpError::component)?;
-        #[cfg(feature = "experimental-nvmeof")]
         let live = log.persist_live_progress().map_err(TcpError::component)?;
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let live = false;
         if live {
             // Other parked polls of this log see the barrier's publication.
             shared.progress.advanced();
@@ -1391,221 +1126,13 @@ fn durable_progress_poll(
     })
 }
 
-fn wire_receipts(receipts: &[AppendedBatch]) -> Vec<Receipt> {
-    receipts
-        .iter()
-        .map(|receipt| Receipt {
-            id: receipt.id(),
-            version: receipt.version(),
-            digest: receipt.digest(),
-            address: receipt.address(),
-        })
-        .collect()
-}
-
-fn reply_for(
-    reply: &FlushReply,
-    receipts: Vec<Receipt>,
-    persistence: super::super::storage::StorageWriteProfile,
-) -> Response {
-    match reply {
-        FlushReply::Appended => {
-            let _ = persistence;
-            Response::Appended(receipts)
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        FlushReply::LiveCompleted {
-            validation_ns,
-            validation_samples,
-        } => Response::LiveCompleted(Box::new(live_control::LiveCompletionWire {
-            receipts,
-            validation_ns: *validation_ns,
-            validation_samples: *validation_samples,
-            persistence,
-        })),
-    }
-}
-
-/// A persistence owner failure: nothing later may be acknowledged.
-fn fail_open(shared: &Shared, pending: PendingFlush, error: TcpError) {
-    shared.context.poison_readers();
-    {
-        let mut queue = shared.queue.lock();
-        queue.flush_failed = true;
-        queue.stopped = true;
-    }
-    complete(
-        shared,
-        pending.id,
-        pending.charge,
-        pending.completed,
-        Err(error),
-        pending.profile,
-        pending.measured,
-        pending.began,
-    );
-}
-
-/// Acknowledge an appended (or live-completed) group according to the tier.
-/// Native replies now: the WAL write is in the page cache and the log's syncer
-/// makes it durable in the background, so a process crash keeps it and a kernel
-/// crash can lose only the unsynced suffix. Synchronous queues the group for the
-/// flusher, which replies once the synced frontier covers it.
-fn hand_off(shared: &Shared, mut pending: PendingFlush, prefix_epoch: Option<u64>) {
-    let frontier = match shared.frontier_for(&pending.log) {
-        Ok(frontier) => frontier,
-        Err(error) => return fail_open(shared, pending, error),
-    };
-    // Native tier: the reply follows validation (a live completion) or the WAL
-    // write (an append), both of which publish into the contiguous appended
-    // frontier. A live frame beyond the persisted frontier root is recovered by
-    // the tolerant live replay, so a process crash loses nothing acknowledged.
-    #[cfg(test)]
-    if let Some((entered, resume)) = shared.before_ack.lock().take() {
-        let _ = entered.send(());
-        let _ = resume.recv();
-    }
-    if !shared.synchronous.load(Ordering::Acquire) {
-        // Re-checked at the acknowledgement point: an append paused before this
-        // hand-off must not succeed after any persistence failure or poison.
-        let poisoned = shared.context.terminal.load(Ordering::Acquire)
-            || shared.context.poison_pending.load(Ordering::Acquire);
-        if let Some(reason) = frontier
-            .failure()
-            .or_else(|| poisoned.then(|| "log control authority is poisoned".to_owned()))
-        {
-            return fail_open(
-                shared,
-                pending,
-                TcpError::new(format!(
-                    "log syncer failed; append outcome unknown: {reason}"
-                )),
-            );
-        }
-        let response = reply_for(
-            &pending.reply,
-            wire_receipts(&pending.receipts),
-            super::super::storage::StorageWriteProfile::default(),
-        );
-        complete(
-            shared,
-            pending.id,
-            pending.charge,
-            pending.completed,
-            Ok(response),
-            pending.profile,
-            pending.measured,
-            pending.began,
-        );
-        return;
-    }
-    // Acquire: this load observes every group published before it, including
-    // this command's own, so waiting for it covers them.
-    pending.end = frontier.appended();
-    let rejected = {
-        let queue = shared.queue.lock();
-        if pending.measured
-            && let Some(epoch) = prefix_epoch
-        {
-            let mut prefix = super::super::write_timeline::ReadyAppendPrefix {
-                commands: 0,
-                batches: 0,
-                encoded_bytes: 0,
-            };
-            let mut available = true;
-            for queued in &queue.work {
-                match &queued.request {
-                    Request::Append {
-                        epoch: queued_epoch,
-                        ..
-                    } if *queued_epoch == epoch => {}
-                    _ => break,
-                }
-                if let Some((_, batches, bytes)) = queued.trace_shape {
-                    prefix.commands += 1;
-                    prefix.batches = prefix.batches.saturating_add(batches);
-                    prefix.encoded_bytes = prefix.encoded_bytes.saturating_add(bytes);
-                } else {
-                    available = false;
-                    break;
-                }
-            }
-            pending.profile.ready_append_prefix = available.then_some(prefix);
-        }
-        if queue.flush_failed {
-            Some(pending)
-        } else {
-            match shared.flush.send(FlushCommand::Append(pending)) {
-                Ok(()) => None,
-                Err(error) => match error.0 {
-                    FlushCommand::Append(pending) => Some(pending),
-                    FlushCommand::Barrier(_) | FlushCommand::Stop => None,
-                },
-            }
-        }
-    };
-    if let Some(pending) = rejected {
-        fail_open(
-            shared,
-            pending,
-            TcpError::new("log persistence owner stopped; append outcome unknown"),
-        );
-    }
-}
-
-/// Group commit for the synchronous tier. The flusher takes the first queued
-/// command with a blocking receive, then every command that is ready now
-/// (`try_recv`); it never waits for more, so an empty queue adds no delay and a
-/// command's wait is bounded by one sync. One wait on the log's synced frontier
-/// covers all of them, because the syncer's capture includes every group
-/// appended before the wait began. A reply follows the sync that covers it.
-/// Count and byte caps bound the batch and the memory it pins.
-const MAX_FLUSH_BATCH_BYTES: usize = 64 * 1024 * 1024;
-
 fn flush_run(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>) {
-    // The batch never exceeds MAX_COMMANDS entries and is reused.
-    let mut batch: Vec<PendingFlush> = Vec::with_capacity(MAX_COMMANDS);
-    let mut carried = None;
-    loop {
-        let command = match carried.take() {
-            Some(command) => command,
-            None => match receiver.recv() {
-                Ok(command) => command,
-                Err(_) => return,
-            },
-        };
+    while let Ok(command) = receiver.recv() {
         match command {
-            FlushCommand::Append(first) => {
-                let mut bytes = first.charge;
-                batch.push(first);
-                while batch.len() < MAX_COMMANDS && bytes < MAX_FLUSH_BATCH_BYTES {
-                    match receiver.try_recv() {
-                        Ok(FlushCommand::Append(next)) => {
-                            bytes = bytes.saturating_add(next.charge);
-                            batch.push(next);
-                        }
-                        // A barrier or stop keeps its FIFO place after this batch.
-                        Ok(other) => {
-                            carried = Some(other);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                if !flush_batch(shared, &mut batch) {
-                    drop(carried.take());
-                    fail_queued_flush(
-                        shared,
-                        receiver,
-                        "log persistence failed; append outcome may be unknown",
-                    );
-                    return;
-                }
-            }
             FlushCommand::Barrier(done) => {
                 // Every command before this one is replied; now make anything
                 // acknowledged under the native tier durable too.
-                if let Err(error) = shared.flush_logs() {
+                if shared.flush_logs().is_err() {
                     drop(done);
                     shared.context.poison_readers();
                     {
@@ -1613,7 +1140,7 @@ fn flush_run(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>) {
                         queue.flush_failed = true;
                         queue.stopped = true;
                     }
-                    fail_queued_flush(shared, receiver, &error.to_string());
+                    fail_queued_flush(receiver);
                     return;
                 }
                 let _ = done.send(());
@@ -1623,155 +1150,11 @@ fn flush_run(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>) {
     }
 }
 
-/// Complete every command in `batch`, one frontier wait per distinct log (one
-/// active log per epoch, so runs are adjacent). Returns false after a failure;
-/// the caller then fails everything still queued.
-fn flush_batch(shared: &Shared, batch: &mut Vec<PendingFlush>) -> bool {
-    for pending in batch.iter_mut() {
-        if let (Some(enqueued), true) = (pending.enqueued, pending.measured) {
-            let wait = elapsed_ns(enqueued);
-            pending.profile.flusher_queue_ns = wait;
-            pending.profile.control_queue_ns =
-                pending.profile.control_queue_ns.saturating_add(wait);
-        }
-    }
-    let mut failed = false;
-    while !batch.is_empty() {
-        let run = batch
-            .iter()
-            .take_while(|pending| Arc::ptr_eq(&pending.log, &batch[0].log))
-            .count();
-        if failed {
-            for pending in batch.drain(..run) {
-                complete(
-                    shared,
-                    pending.id,
-                    pending.charge,
-                    pending.completed,
-                    Err(TcpError::new(
-                        "log persistence failed; append outcome may be unknown",
-                    )),
-                    pending.profile,
-                    pending.measured,
-                    pending.began,
-                );
-            }
-            continue;
-        }
-        let end = batch[..run]
-            .iter()
-            .map(|pending| pending.end)
-            .max()
-            .unwrap_or(0);
-        let leader = batch[..run]
-            .iter()
-            .position(|pending| pending.measured)
-            .unwrap_or(0);
-        let started = batch[leader].measured.then(Instant::now);
-        let log = &batch[0].log;
-        let synced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let frontier = log
-                .frontier()
-                .ok_or_else(|| TcpError::new("log frontier missing"))?;
-            DurabilityTier::Synchronous
-                .acknowledge(frontier, end, None)
-                .map(|_| ())
-                .map_err(|error| {
-                    TcpError::new(format!(
-                        "log persistence failed; append outcome may be unknown: {error}"
-                    ))
-                })
-        }))
-        .map_err(|_| {
-            log.poison_writer();
-            TcpError::new("log persistence panicked; append outcome may be unknown")
-        })
-        .and_then(|result| result);
-        // Stage timings of the sync(s) this wait covered go to the batch leader.
-        let sync_profile = log.take_sync_profile();
-        if let Some(started) = started {
-            let elapsed = elapsed_ns(started);
-            let storage = &mut batch[leader].profile.storage_write;
-            storage.add(sync_profile);
-            // `add` drops the single-invocation capture; the leader keeps it.
-            storage.persistence_capture = sync_profile.persistence_capture;
-            storage.flush_batches = storage.flush_batches.saturating_add(1);
-            storage.flush_batch_commands = storage.flush_batch_commands.saturating_add(run as u64);
-            for pending in batch[..run].iter_mut().filter(|pending| pending.measured) {
-                pending.profile.append_persist_ns += elapsed;
-                pending.profile.control_execution_ns =
-                    pending.profile.control_execution_ns.saturating_add(elapsed);
-            }
-        }
-        match synced {
-            Ok(()) => {
-                for (index, pending) in batch.drain(..run).enumerate() {
-                    let persistence = if index == leader {
-                        sync_profile
-                    } else {
-                        super::super::storage::StorageWriteProfile::default()
-                    };
-                    let response = reply_for(
-                        &pending.reply,
-                        wire_receipts(&pending.receipts),
-                        persistence,
-                    );
-                    complete(
-                        shared,
-                        pending.id,
-                        pending.charge,
-                        pending.completed,
-                        Ok(response),
-                        pending.profile,
-                        pending.measured,
-                        pending.began,
-                    );
-                }
-            }
-            Err(error) => {
-                failed = true;
-                shared.context.poison_readers();
-                {
-                    let mut queue = shared.queue.lock();
-                    queue.flush_failed = true;
-                    queue.stopped = true;
-                }
-                let message = error.to_string();
-                for pending in batch.drain(..run) {
-                    complete(
-                        shared,
-                        pending.id,
-                        pending.charge,
-                        pending.completed,
-                        Err(TcpError::new(message.clone())),
-                        pending.profile,
-                        pending.measured,
-                        pending.began,
-                    );
-                }
-            }
-        }
-    }
-    !failed
-}
-
-fn fail_queued_flush(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>, error: &str) {
-    loop {
-        match receiver.try_recv() {
-            Ok(FlushCommand::Append(pending)) => complete(
-                shared,
-                pending.id,
-                pending.charge,
-                pending.completed,
-                Err(TcpError::new(error)),
-                pending.profile,
-                pending.measured,
-                pending.began,
-            ),
-            Ok(FlushCommand::Barrier(done)) => drop(done),
-            Ok(FlushCommand::Stop)
-            | Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return,
-        }
+/// Drop every queued barrier after a persistence failure: its waiter sees the
+/// disconnect and fails its control.
+fn fail_queued_flush(receiver: &mpsc::Receiver<FlushCommand>) {
+    while let Ok(FlushCommand::Barrier(done)) = receiver.try_recv() {
+        drop(done);
     }
 }
 
@@ -1828,13 +1211,11 @@ pub(super) fn deliver(
         id,
         response,
         profile,
-        is_control: true,
     });
 }
 
 impl ControlContext {
     fn status(&self) -> Result<NodeStatus, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.poison_pending.load(Ordering::Acquire)
             && self.recoverable_live_failure.load(Ordering::Acquire)
         {
@@ -1844,28 +1225,19 @@ impl ControlContext {
     }
     pub(super) fn effective_max_reads(&self, limits: TcpLimits) -> usize {
         if self.wal_member_read == super::super::storage::WalMemberReadPolicy::Async {
-            limits.max_reads.min(self.read_config.max_device_reads)
+            limits.max_reads.min(self.read_max_device_reads)
         } else {
             limits.max_reads
         }
     }
     fn permits_recovery_control(&self, request: &Request) -> bool {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        {
-            // Terminal publication does not revoke idle exports. Their pool
-            // must still be able to release pins after confirmed disconnects.
-            matches!(request, Request::ReleaseLiveExportPin { .. })
-                || (self.recoverable_live_failure.load(Ordering::Acquire)
-                    && matches!(request, Request::Status { .. } | Request::Fence { .. }))
-        }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        {
-            let _ = request;
-            false
-        }
+        // Terminal publication does not revoke idle exports. Their pool
+        // must still be able to release pins after confirmed disconnects.
+        matches!(request, Request::ReleaseLiveExportPin { .. })
+            || (self.recoverable_live_failure.load(Ordering::Acquire)
+                && matches!(request, Request::Status { .. } | Request::Fence { .. }))
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn poison_incomplete_live(&self) {
         // Release: before the flags below, so a fence that observes the recoverable
         // failure (Acquire) also observes the latch.
@@ -1880,15 +1252,12 @@ impl ControlContext {
         self.finish_poison_if_quiescent();
     }
     pub(super) fn poison_readers(&self) {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let _gate = self.poison_gate.lock();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.recoverable_live_failure
             .store(false, Ordering::Release);
         // Release, before `poison_pending`: see `poison_incomplete_live`.
         self.persistence_failed.store(true, Ordering::Release);
         self.poison_pending.store(true, Ordering::Release);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         drop(_gate);
         self.finish_poison_if_quiescent();
     }
@@ -1896,16 +1265,13 @@ impl ControlContext {
         if !self.poison_pending.load(Ordering::Acquire) {
             return;
         }
-        // Record/sealed pins protect in-flight I/O. Idle controller pins protect
+        // Record pins protect in-flight I/O. Idle controller pins protect
         // exports only and must not delay terminal authority publication.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let Some(leases) = self.nvmeof_leases.try_lock() else {
+        // A held live-control gate defers publication, as a held lifecycle
+        // gate does below.
+        let Some(_gate) = self.live_control_gate.try_lock() else {
             return;
         };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if leases.has_live_or_quarantined() {
-            return;
-        }
         // A lifecycle step holds the gate while it releases the inventory
         // across its syncs; its intermediate states (cleared pins, a fence
         // that resets `terminal` at its end) must not publish terminal
@@ -1914,7 +1280,6 @@ impl ControlContext {
         // drop their gate guard before poisoning; a poison raised inside a
         // gated step (drain, history failure) defers exactly as it did when
         // that step held the inventory.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             let Some(_lifecycle) = self.lifecycle.try_lock() else {
                 return;
@@ -1932,7 +1297,6 @@ impl ControlContext {
     }
     /// `kind` names the request (resolve, recovery or replay) that counts an
     /// export created inline here.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn publish_live_leases(
         &self,
         epoch: u64,
@@ -1943,11 +1307,11 @@ impl ControlContext {
             .iter()
             .map(|lease| (lease.segment.clone(), lease.offset, u64::from(lease.len)))
             .collect();
-        let registry = self.nvmeof_leases.lock();
+        let gate = self.live_control_gate.lock();
         if !self.readers.read().active_valid(epoch, &self.terminal) {
             return Err(TcpError::new("stale live read authority"));
         }
-        // Lock order: registry, lifecycle gate, inventory. Each export below
+        // Lock order: live-control gate, lifecycle gate, inventory. Each export below
         // releases the inventory across its journal syncs and configfs work.
         let mut lifecycle = self.lifecycle.lock();
         let mut inventory = self.inventory.lock();
@@ -1986,7 +1350,7 @@ impl ControlContext {
                     // the durable target registry is drained on restart.
                     drop(inventory);
                     drop(lifecycle);
-                    drop(registry);
+                    drop(gate);
                     self.poison_readers();
                     return Err(TcpError::new(format!(
                         "live read export failed; outcome unknown: {error}"
@@ -1996,7 +1360,6 @@ impl ControlContext {
         }
         Ok((token, locations))
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn bounded_live_response(
         &self,
         epoch: u64,
@@ -2029,172 +1392,10 @@ impl ControlContext {
             "live metadata response exceeds negotiated frame",
         ))
     }
-    fn append_profiled(
-        &self,
-        epoch: u64,
-        batches: Vec<WireBytes>,
-        mut profile: Option<&mut ConnectionProfile>,
-        drain: Option<&mut dyn FnMut() -> Result<(), TcpError>>,
-        mut turn: Option<&mut dyn FnMut()>,
-    ) -> Result<(Arc<super::super::storage::PartitionLog>, Vec<AppendedBatch>), TcpError> {
-        if self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire) {
-            return Err(TcpError::new(
-                "log control authority is poisoned; reopen required",
-            ));
-        }
-        let shape = &self.append_shape;
-        let batch_limits = self.append_batch_limits;
-        let group_limits = self.append_group_limits;
-        if batches.is_empty() || batches.len() > group_limits.max_batches as usize {
-            return Err(TcpError::new("invalid append group count"));
-        }
-        let began = profile.as_ref().map(|_| Instant::now());
-        let batches = batches
-            .into_iter()
-            .map(|bytes| {
-                CompleteBatch::decode_owned(shape, bytes.into_vec(), batch_limits)
-                    .map_err(TcpError::component)
-            })
-            .collect::<Result<Vec<_>, _>>();
-        if let Some(p) = profile.as_deref_mut() {
-            p.append_decode_ns += began.map_or(0, elapsed_ns);
-        }
-        let began = profile.as_ref().map(|_| Instant::now());
-        let group = batches.and_then(|batches| {
-            CompleteGroup::new(shape, batches, batch_limits, group_limits)
-                .map_err(TcpError::component)
-        });
-        if let Some(p) = profile.as_deref_mut() {
-            p.append_group_build_ns += began.map_or(0, elapsed_ns);
-        }
-        let group = group?;
-
-        let began = profile.as_ref().map(|_| Instant::now());
-        // The node inventory lock covers only the active-log lookup. Holding it
-        // across the append would serialize every append worker on one node-wide
-        // lock. Controls that change the active log run exclusively (`next_work`).
-        let log = {
-            let inventory = self.inventory.lock();
-            let residence = profile.as_ref().map(|_| Instant::now());
-            if let Some(p) = profile.as_deref_mut() {
-                p.append_inventory_wait_ns +=
-                    began.zip(residence).map_or(0, |(start, acquired)| {
-                        acquired
-                            .duration_since(start)
-                            .as_nanos()
-                            .min(u64::MAX as u128) as u64
-                    });
-            }
-            let log = inventory.active(epoch)?;
-            if let Some(p) = profile.as_deref_mut() {
-                p.append_inventory_residence_ns += residence.map_or(0, elapsed_ns);
-            }
-            log
-        };
-        let began = profile.as_ref().map(|_| Instant::now());
-        // Appends of one owner must reach the WAL in submission order: the
-        // coordinator's receipt history and checkpoint prefix digests assume it.
-        if let Some(turn) = turn.as_mut() {
-            turn();
-        }
-        let mut appended = log.try_append_group(
-            RequestAuthority { epoch },
-            &group,
-            profile.as_deref_mut().map(|p| &mut p.storage_write),
-        );
-        let elapsed = began.map_or(0, elapsed_ns);
-        if let Some(p) = profile.as_deref_mut() {
-            p.append_wal_ns += elapsed;
-        }
-        let mut drain = drain;
-        for _ in 0..ADMISSION_RETRIES {
-            if !matches!(&appended, Err(StorageError::NeedsPersistence)) {
-                break;
-            }
-            if let Some(drain) = drain.as_mut()
-                && drain().is_err()
-            {
-                self.poison_readers();
-                return Err(TcpError::new("log flusher stopped before admission retry"));
-            }
-            if let Err(error) = log.wait_history() {
-                self.poison_readers();
-                return Err(TcpError::component(error));
-            }
-            let began = profile.as_ref().map(|_| Instant::now());
-            appended = if let Some(p) = profile.as_deref_mut() {
-                log.append_group_profiled(RequestAuthority { epoch }, &group, &mut p.storage_write)
-            } else {
-                log.append_group(RequestAuthority { epoch }, &group)
-            };
-            let elapsed = began.map_or(0, elapsed_ns);
-            if let Some(p) = profile.as_deref_mut() {
-                p.append_wal_ns += elapsed;
-            }
-        }
-        let receipts = match appended {
-            Ok(receipts) => receipts,
-            Err(error) => {
-                if !matches!(
-                    &error,
-                    StorageError::WrongDatabase
-                        | StorageError::WrongPartition
-                        | StorageError::Fenced
-                        | StorageError::Sealed
-                        | StorageError::IdentityConflict
-                        | StorageError::VersionConflict
-                        | StorageError::Capacity
-                        | StorageError::NeedsPersistence
-                        | StorageError::MixedRetry
-                        | StorageError::Codec(_)
-                        | StorageError::Group(_)
-                ) {
-                    self.poison_readers();
-                }
-                return Err(TcpError::component(error));
-            }
-        };
-        #[cfg(test)]
-        assert!(
-            !self.panic_after_append.swap(false, Ordering::AcqRel),
-            "injected panic after native append",
-        );
-        Ok((log, receipts))
-    }
-    /// Validate the written live frame and publish its receipts. Durability is
-    /// not established here: the caller makes the covering sync follow.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn complete_live_published(
-        &self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<
-        (
-            Arc<super::super::storage::PartitionLog>,
-            Vec<AppendedBatch>,
-            u64,
-            u64,
-        ),
-        TcpError,
-    > {
-        let log = self.inventory.lock().active(epoch)?;
-        let (receipts, validation_ns, validation_samples) = log
-            .complete_live_group_profiled(RequestAuthority { epoch }, token)
-            .map_err(|error| {
-                if matches!(&error, StorageError::IncompleteLiveFrame) {
-                    self.poison_incomplete_live();
-                } else if matches!(&error, StorageError::Unknown(_) | StorageError::Poisoned) {
-                    self.poison_readers();
-                }
-                TcpError::component(error)
-            })?;
-        Ok((log, receipts, validation_ns, validation_samples))
-    }
     /// The preparer never waits for the lifecycle gate: fence, seal and final
     /// shutdown hold it while joining us. Retry at most 30,000 times, parking
     /// 1 ms between attempts. Once it holds the gate it may wait for the
     /// inventory, whose holders never wait for the gate or for this worker.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn publish_prepared_file(
         &self,
         log: &Arc<super::super::storage::PartitionLog>,
@@ -2226,12 +1427,6 @@ impl ControlContext {
                 return;
             };
             let mut inventory = self.inventory.lock();
-            if inventory
-                .live_export_mode
-                .is_none_or(|mode| mode.files_per_subsystem().is_none())
-            {
-                return;
-            }
             // Acquire observes authority loss during unlocked file preparation.
             if self.poison_pending.load(Ordering::Acquire)
                 || self.terminal.load(Ordering::Acquire)
@@ -2266,7 +1461,6 @@ impl ControlContext {
 
     /// `kind` names the request (lease, prelease or rollover) that counts an
     /// export created inline here.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn lease_live_published(
         &self,
         epoch: u64,
@@ -2317,29 +1511,13 @@ impl ControlContext {
                 .as_mut()
                 .ok_or_else(|| TcpError::new("live target not configured"))?;
             NodeInventory::reap_idle_live_segments(&mut inventory, target, epoch)?;
-            if inventory
-                .live_export_mode
-                .is_some_and(|mode| mode.files_per_subsystem().is_some())
-            {
-                let (binding, created) = NodeInventory::publish_permanent_segment(
-                    &mut inventory,
-                    target,
-                    &extent.segment,
-                )?;
-                if created {
-                    // Background preparation had not published this file yet.
-                    inventory.record_inline_export(kind);
-                }
-                Ok(binding)
-            } else {
-                NodeInventory::publish_live_segment(
-                    &mut inventory,
-                    target,
-                    &extent.segment,
-                    true,
-                    kind,
-                )
+            let (binding, created) =
+                NodeInventory::publish_permanent_segment(&mut inventory, target, &extent.segment)?;
+            if created {
+                // Background preparation had not published this file yet.
+                inventory.record_inline_export(kind);
             }
+            Ok(binding)
         })();
         #[cfg(test)]
         let publication_call_ns = publication_started
@@ -2370,7 +1548,6 @@ impl ControlContext {
         })
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn handle_live_extent(
         &self,
         request: Request,
@@ -2436,6 +1613,7 @@ impl ControlContext {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn handle_profiled(
         &self,
         request: Request,
@@ -2449,31 +1627,12 @@ impl ControlContext {
         &self,
         request: Request,
         limits: TcpLimits,
-        mut profile: Option<&mut ConnectionProfile>,
+        profile: Option<&mut ConnectionProfile>,
         _drain_log: impl FnOnce(&Arc<super::super::storage::PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<Response, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Request::ReleaseNvmeofExport { epoch, token } = &request {
-            self.nvmeof_leases
-                .lock()
-                .release(*epoch, *token)
-                .map_err(TcpError::component)?;
-            self.finish_poison_if_quiescent();
-            return Ok(Response::NvmeofExportReleased);
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Request::ReleaseNvmeofEpochPin { epoch, token } = &request {
-            self.nvmeof_leases
-                .lock()
-                .release_epoch_pin(*epoch, *token)
-                .map_err(TcpError::component)?;
-            self.finish_poison_if_quiescent();
-            return Ok(Response::NvmeofEpochReleased);
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Request::ReleaseLiveEpochPin { epoch, token } = &request {
             let (result, failed) = {
-                let _leases = self.nvmeof_leases.lock();
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 let mut inventory = self.inventory.lock();
                 let result = if inventory.live_pins.contains_key(token) {
@@ -2497,7 +1656,6 @@ impl ControlContext {
             self.finish_poison_if_quiescent();
             return Ok(Response::NvmeofEpochReleased);
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Request::ReleaseLiveExportPin { epoch, token } = &request {
             let (result, failed) = {
                 let mut lifecycle = self.lifecycle.lock();
@@ -2528,7 +1686,6 @@ impl ControlContext {
             ));
         }
         match request {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::OpenLiveExports { authority_epoch } => {
                 let mut lifecycle = self.lifecycle.lock();
                 let mut inventory = self.inventory.lock();
@@ -2536,13 +1693,8 @@ impl ControlContext {
                 let target = lifecycle
                     .as_mut()
                     .ok_or_else(|| TcpError::new("live target not configured"))?;
-                let mode = target.export_mode();
                 let (address, service, transport) = target.endpoint();
-                let count = if mode.files_per_subsystem().is_some() {
-                    log.live_file_count().map_err(TcpError::component)?
-                } else {
-                    0
-                };
+                let count = log.live_file_count().map_err(TcpError::component)?;
                 for file in 0..count {
                     let segment = match log.live_segment(file) {
                         Ok(segment) => segment,
@@ -2563,8 +1715,7 @@ impl ControlContext {
                         )));
                     }
                 }
-                Ok(Response::LiveExports(live_control::LiveExportInfo {
-                    mode,
+                Ok(Response::LiveExports(LiveExportInfo {
                     address,
                     service,
                     transport,
@@ -2573,115 +1724,11 @@ impl ControlContext {
                     exported_files: count,
                 }))
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::LeaseLiveExtent { .. }
             | Request::PreleaseLiveExtent { .. }
             | Request::AdoptLiveExtent { .. } => Err(TcpError::new(
                 "live extent requires the stream durability dispatch",
             )),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ReserveLiveGroup { epoch, descriptor } => {
-                use super::super::nvmeof::live_storage::LiveReserveResult;
-                // The inventory covers only the active-log lookup: the
-                // reservation and its history wait are log I/O, and fence or
-                // seal cannot run while this stream request holds its slot.
-                let log = {
-                    let inventory = self.inventory.lock();
-                    if inventory
-                        .live_export_mode
-                        .is_some_and(|mode| mode.files_per_subsystem().is_some())
-                    {
-                        return Err(TcpError::new(
-                            "permanent live export requires leased write mode",
-                        ));
-                    }
-                    inventory.active(epoch)?
-                };
-                let mut result =
-                    log.reserve_live_group(RequestAuthority { epoch }, descriptor.clone());
-                if matches!(result, Err(StorageError::NeedsPersistence)) {
-                    log.wait_history().map_err(TcpError::component)?;
-                    result = log.reserve_live_group(RequestAuthority { epoch }, descriptor);
-                }
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        if matches!(&error, StorageError::Unknown(_) | StorageError::Poisoned) {
-                            self.poison_readers();
-                        }
-                        return Err(TcpError::component(error));
-                    }
-                };
-                match result {
-                    LiveReserveResult::Existing(receipts) => {
-                        let durable = log.persist_many(&receipts).map_err(|error| {
-                            self.poison_readers();
-                            TcpError::component(error)
-                        })?;
-                        Ok(Response::LiveReserved(
-                            live_control::LiveReserveWire::Existing(
-                                durable.into_iter().map(Receipt::from_durable).collect(),
-                            ),
-                        ))
-                    }
-                    LiveReserveResult::Reserved(reservation) => {
-                        let mut lifecycle = self.lifecycle.lock();
-                        let mut inventory = self.inventory.lock();
-                        let binding = (|| {
-                            if !Arc::ptr_eq(&inventory.active(epoch)?, &log) {
-                                return Err(TcpError::new("live reservation authority changed"));
-                            }
-                            let target = lifecycle
-                                .as_mut()
-                                .ok_or_else(|| TcpError::new("live target not configured"))?;
-                            NodeInventory::reap_idle_live_segments(&mut inventory, target, epoch)?;
-                            NodeInventory::publish_live_segment(
-                                &mut inventory,
-                                target,
-                                &reservation.segment,
-                                true,
-                                super::inventory::InlineExport::Reserve,
-                            )
-                        })();
-                        drop(inventory);
-                        drop(lifecycle);
-                        let binding = binding.map_err(|error| {
-                            log.poison_writer();
-                            self.poison_readers();
-                            TcpError::new(format!(
-                                "live target publication failed; outcome unknown: {error}"
-                            ))
-                        })?;
-                        Ok(Response::LiveReserved(
-                            live_control::LiveReserveWire::Reserved(LiveReserved {
-                                reservation,
-                                binding,
-                            }),
-                        ))
-                    }
-                }
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::CompleteLiveGroup { epoch, token } => {
-                let (log, receipts, validation_ns, validation_samples) =
-                    self.complete_live_published(epoch, token)?;
-                let mut persistence = super::super::storage::StorageWriteProfile::default();
-                let durable = log
-                    .persist_many_profiled(&receipts, &mut persistence)
-                    .map_err(|error| {
-                        self.poison_readers();
-                        TcpError::component(error)
-                    })?;
-                Ok(Response::LiveCompleted(Box::new(
-                    live_control::LiveCompletionWire {
-                        receipts: durable.into_iter().map(Receipt::from_durable).collect(),
-                        validation_ns,
-                        validation_samples,
-                        persistence,
-                    },
-                )))
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ResolveLiveRecords {
                 authority_epoch,
                 references,
@@ -2689,11 +1736,7 @@ impl ControlContext {
                 if references
                     .iter()
                     .any(|reference| reference.batch_version.epoch == authority_epoch)
-                    && self
-                        .inventory
-                        .lock()
-                        .live_export_mode
-                        .is_some_and(|mode| mode.files_per_subsystem().is_some())
+                    && self.inventory.lock().live_target_configured
                 {
                     return Err(TcpError::new(
                         "live record resolution is disabled for the active epoch in permanent export mode",
@@ -2743,78 +1786,6 @@ impl ControlContext {
                     limits.max_frame_bytes,
                 )
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::RecoverLiveMetadata {
-                authority_epoch,
-                source_epoch,
-                cursor,
-                limit,
-            } => {
-                self.inventory.lock().require_history(false)?;
-                if limit == 0 || limit > limits.recovery_page_batches || limit > 256 {
-                    return Err(TcpError::new("live recovery page count exceeds bound"));
-                }
-                let log = self
-                    .inventory
-                    .lock()
-                    .live_recovery_log(authority_epoch, source_epoch)?;
-                let (receipts, plans, next) = if let Some(log) = log {
-                    let count = log.receipt_count();
-                    if cursor > count {
-                        return Err(TcpError::new("recovery cursor beyond retained history"));
-                    }
-                    let receipts = log
-                        .receipt_page(cursor, limit)
-                        .map_err(TcpError::component)?;
-                    let mut durable = Vec::with_capacity(receipts.len());
-                    let mut plans = Vec::with_capacity(receipts.len());
-                    for receipt in receipts {
-                        durable.push(Receipt::from_durable(
-                            log.persist_through(receipt).map_err(TcpError::component)?,
-                        ));
-                        plans.push(
-                            log.resolve_live_batch(receipt)
-                                .map_err(TcpError::component)?,
-                        );
-                    }
-                    let end = cursor + durable.len();
-                    (durable, plans, (end < count).then_some(end))
-                } else {
-                    if cursor != 0 {
-                        return Err(TcpError::new("invalid abandoned epoch cursor"));
-                    }
-                    (Vec::new(), Vec::new(), None)
-                };
-                let (token, locations) = self.publish_live_leases(
-                    authority_epoch,
-                    plans,
-                    super::inventory::InlineExport::Recover,
-                )?;
-                let entries = receipts
-                    .into_iter()
-                    .zip(locations)
-                    .map(|(receipt, (segment, binding, offset, len))| {
-                        live_control::LiveRecoveryEntryWire {
-                            receipt,
-                            segment,
-                            binding,
-                            offset,
-                            len,
-                        }
-                    })
-                    .collect();
-                self.bounded_live_response(
-                    authority_epoch,
-                    token,
-                    Response::LiveRecovery(live_control::LiveRecoveryWire {
-                        entries,
-                        next,
-                        epoch_pin_token: token,
-                    }),
-                    limits.max_frame_bytes,
-                )
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ReplayLiveWal {
                 authority_epoch,
                 source_epoch,
@@ -2822,11 +1793,10 @@ impl ControlContext {
                 limit,
                 require_end,
             } => {
-                let log = {
-                    let inventory = self.inventory.lock();
-                    inventory.require_history(true)?;
-                    inventory.live_recovery_log(authority_epoch, source_epoch)?
-                };
+                let log = self
+                    .inventory
+                    .lock()
+                    .live_recovery_log(authority_epoch, source_epoch)?;
                 if limit == 0 || limit > limits.recovery_page_batches || limit > 256 {
                     return Err(TcpError::new("live recovery page count exceeds bound"));
                 }
@@ -2876,7 +1846,7 @@ impl ControlContext {
                     .into_iter()
                     .zip(locations)
                     .map(|(receipt, (segment, binding, offset, len))| {
-                        live_control::LiveRecoveryEntryWire {
+                        live_wire::LiveRecoveryEntryWire {
                             receipt,
                             segment,
                             binding,
@@ -2888,7 +1858,7 @@ impl ControlContext {
                 self.bounded_live_response(
                     authority_epoch,
                     token,
-                    Response::LiveRecovery(live_control::LiveRecoveryWire {
+                    Response::LiveRecovery(live_wire::LiveRecoveryWire {
                         entries,
                         next,
                         epoch_pin_token: token,
@@ -2896,7 +1866,6 @@ impl ControlContext {
                     limits.max_frame_bytes,
                 )
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::AcquireLiveExportPin {
                 epoch,
                 segment,
@@ -2910,7 +1879,6 @@ impl ControlContext {
                     .acquire_live_export_pin(epoch, &segment, &binding)
                     .map(Response::NvmeofEpochPinned)
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::LiveTargetStats => {
                 // Stats verify configfs objects: file I/O, gate only.
                 let mut lifecycle = self.lifecycle.lock();
@@ -2921,12 +1889,8 @@ impl ControlContext {
                     target.stats().map_err(TcpError::component)?,
                 ))
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ShutdownLiveTarget { epoch } => {
-                let leases = self.nvmeof_leases.lock();
-                if leases.has_live_or_quarantined() {
-                    return Err(TcpError::new("NVMe-oF leases must drain before shutdown"));
-                }
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 let target = lifecycle
                     .as_mut()
@@ -2934,154 +1898,15 @@ impl ControlContext {
                 NodeInventory::shutdown_live_target(&mut self.inventory.lock(), target, epoch)
                     .map(Response::LiveTargetStats)
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::RegisterNvmeofEpochPin { epoch } => {
-                let mut leases = self.nvmeof_leases.lock();
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                {
-                    return Err(TcpError::new("NVMe-oF epoch pin authority mismatch"));
-                }
-                let token = leases
-                    .register_epoch_pin(epoch)
-                    .map_err(TcpError::component)?;
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                {
-                    leases
-                        .release_epoch_pin(epoch, token)
-                        .map_err(TcpError::component)?;
-                    return Err(TcpError::new("authority changed during NVMe-oF epoch pin"));
-                }
-                Ok(Response::NvmeofEpochPinned(token))
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ReleaseNvmeofEpochPin { .. }
-            | Request::ReleaseLiveEpochPin { .. }
-            | Request::ReleaseLiveExportPin { .. } => {
+            Request::ReleaseLiveEpochPin { .. } | Request::ReleaseLiveExportPin { .. } => {
                 unreachable!("release handled before health check")
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::RegisterNvmeofExport {
-                epoch,
-                binding,
-                reference,
-            } => {
-                let mut leases = self.nvmeof_leases.lock();
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                    || binding.database_uuid != self.partition.inventory.database
-                    || binding.partition != self.partition.partition
-                    || binding.epoch > epoch
-                    || binding.generation != binding.epoch
-                    || binding.wal_file_bytes != self.partition.wal_file_bytes
-                {
-                    return Err(TcpError::new("NVMe-oF export authority mismatch"));
-                }
-                // Retirement is serialized by this same lease gate. Recheck a
-                // durable member of the exact source file at the admission
-                // boundary, after any earlier paged catalog validation.
-                let snapshot = self.readers.read().snapshot(
-                    epoch,
-                    std::slice::from_ref(&reference),
-                    &self.terminal,
-                )?;
-                let (log, member) = snapshot
-                    .members
-                    .first()
-                    .ok_or_else(|| TcpError::new("missing export authority member"))?;
-                let location = log
-                    .nvmeof_record_location(member)
-                    .map_err(TcpError::component)?;
-                if location.reference != reference
-                    || reference.batch_version.epoch != binding.epoch
-                    || reference.batch_address.segment_generation != binding.generation
-                    || location.wal_file_bytes != binding.wal_file_bytes
-                    || location.source_file_index != binding.source_file_index
-                    || location.source_device != binding.source_device
-                    || location.source_inode != binding.source_inode
-                    || location.source_file_len != binding.image_len
-                    || location.durable_frontier != binding.durable_frontier
-                    || !self.readers.read().snapshot_valid(
-                        epoch,
-                        snapshot.generation,
-                        &self.terminal,
-                    )
-                {
-                    return Err(TcpError::new(
-                        "NVMe-oF source no longer matches owner authority",
-                    ));
-                }
-                let token = leases
-                    .register(epoch, &binding)
-                    .map_err(TcpError::component)?;
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                {
-                    leases.release(epoch, token).map_err(TcpError::component)?;
-                    return Err(TcpError::new(
-                        "authority changed during NVMe-oF registration",
-                    ));
-                }
-                Ok(Response::NvmeofExportRegistered(token))
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ReleaseNvmeofExport { .. } => {
-                unreachable!("release handled before health check")
-            }
-            #[cfg(feature = "experimental-nvmeof")]
-            Request::ValidateRecordReferences { epoch, references } => {
-                if references.is_empty() || references.len() > limits.max_reads.min(256) {
-                    return Err(TcpError::new("record validation count exceeds bound"));
-                }
-                let snapshot = self
-                    .readers
-                    .read()
-                    .snapshot(epoch, &references, &self.terminal)?;
-                let generation = snapshot.generation;
-                // Pageable descriptor I/O runs on this bounded control owner,
-                // never under reader authority or on the network reactor.
-                let locations = snapshot
-                    .members
-                    .iter()
-                    .map(|(log, reference)| {
-                        log.nvmeof_record_location(reference)
-                            .map_err(TcpError::component)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if !self
-                    .readers
-                    .read()
-                    .snapshot_valid(epoch, generation, &self.terminal)
-                {
-                    return Err(TcpError::new(
-                        "reader authority changed during export admission",
-                    ));
-                }
-                Ok(Response::ValidatedRecordReferences(locations))
-            }
-            Request::Checkpoint {
-                authority_epoch,
-                epoch,
-                prefix,
-            } => {
-                // The prefix sync runs with the inventory released; the gate
-                // keeps the validated log authoritative until the proof returns.
-                let _lifecycle = self.lifecycle.lock();
-                NodeInventory::checkpoint_proof(
-                    &mut self.inventory.lock(),
-                    authority_epoch,
-                    epoch,
-                    prefix,
-                )
-                .map(Response::Checkpoint)
             }
             Request::CheckpointPosition {
                 authority_epoch,
                 epoch,
                 through,
             } => {
-                let mut measured = profile.as_deref_mut();
+                let mut measured = profile;
                 // The active stream slot excludes fence/seal/retirement. Retain
                 // the validated log, not inventory, across the slow file barrier.
                 let log = self
@@ -3125,24 +1950,6 @@ impl ControlContext {
                     durable_end,
                 })
             }
-            Request::ReplayWal {
-                authority_epoch,
-                source_epoch,
-                from,
-                limit,
-                require_end,
-            } => {
-                let _lifecycle = self.lifecycle.lock();
-                NodeInventory::replay_wal_page(
-                    &mut self.inventory.lock(),
-                    authority_epoch,
-                    source_epoch,
-                    from,
-                    limit,
-                    require_end,
-                    limits,
-                )
-            }
             Request::RetirementFiles {
                 authority_epoch,
                 epoch,
@@ -3153,45 +1960,12 @@ impl ControlContext {
                 .lock()
                 .retirement_files(authority_epoch, epoch, after, limit)
                 .map(Response::RetirementFiles),
-            Request::RetireFiles {
-                authority_epoch,
-                epoch,
-                prefix,
-                files,
-            } => {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before retirement"));
-                    }
-                    leases
-                };
-                let mut lifecycle = self.lifecycle.lock();
-                NodeInventory::retire_files(
-                    &mut self.inventory.lock(),
-                    &mut lifecycle,
-                    authority_epoch,
-                    epoch,
-                    prefix,
-                    &files,
-                )
-                .map(|()| Response::Retired)
-            }
             Request::RetireWalFiles {
                 authority_epoch,
                 epoch,
                 files,
             } => {
-                self.inventory.lock().require_history(true)?;
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before retirement"));
-                    }
-                    leases
-                };
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::retire_wal_files(
                     &mut self.inventory.lock(),
@@ -3202,20 +1976,6 @@ impl ControlContext {
                 )
                 .map(|()| Response::Retired)
             }
-            Request::ReadIoStats => {
-                let log = {
-                    let inventory = self.inventory.lock();
-                    let active = inventory.status()?.active_epoch;
-                    active.map(|epoch| inventory.active(epoch)).transpose()?
-                };
-                let mut stats = self.read_admission.stats();
-                stats.authority = log.map(|log| log.authority_cache_stats());
-                Ok(Response::ReadIoStats(stats))
-            }
-            Request::OperationalReadIoStats => Ok(Response::OperationalReadIoStats(Box::new((
-                self.partition.clone(),
-                self.read_admission.try_stats(),
-            )))),
             Request::Status { protocol } => {
                 if protocol != PROTOCOL {
                     return Err(TcpError::new("unsupported wire protocol"));
@@ -3223,24 +1983,15 @@ impl ControlContext {
                 let mut status = self.status()?;
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
-                status.max_read_bytes = self.read_config.max_bytes;
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
                 Ok(Response::Status(status))
             }
             Request::Fence { epoch } => {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before fencing"));
-                    }
-                    leases
-                };
-                // Lock order: leases, lifecycle gate, inventory. The fence
-                // releases the inventory across every revocation and sync.
+                let _gate = self.live_control_gate.lock();
+                // Lock order: live-control gate, lifecycle gate, inventory. The
+                // fence releases the inventory across every revocation and sync.
                 let mut lifecycle = self.lifecycle.lock();
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut status = if self.recoverable_live_failure.load(Ordering::Acquire) {
                     let status = NodeInventory::fence_recoverable_live(
                         &mut self.inventory.lock(),
@@ -3266,71 +2017,18 @@ impl ControlContext {
                         _drain_log,
                     )?
                 };
-                #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                let mut status = NodeInventory::fence(
-                    &mut self.inventory.lock(),
-                    &mut lifecycle,
-                    epoch,
-                    false,
-                    _drain_log,
-                )?;
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
-                status.max_read_bytes = self.read_config.max_bytes;
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
                 Ok(Response::Status(status))
-            }
-            Request::Append { epoch, batches } => {
-                let (log, receipts) =
-                    self.append_profiled(epoch, batches, profile.as_deref_mut(), None, None)?;
-                let began = profile.as_ref().map(|_| Instant::now());
-                let durable = if let Some(p) = profile.as_deref_mut() {
-                    log.persist_many_profiled(&receipts, &mut p.storage_write)
-                } else {
-                    log.persist_many(&receipts)
-                };
-                if let Some(p) = profile {
-                    p.append_persist_ns += began.map_or(0, elapsed_ns);
-                }
-                let durable = durable.map_err(|error| {
-                    self.poison_readers();
-                    TcpError::component(error)
-                })?;
-                Ok(Response::Appended(
-                    durable.into_iter().map(Receipt::from_durable).collect(),
-                ))
-            }
-            Request::Read { .. } | Request::ReadProfiled { .. } => {
-                Err(TcpError::new("read sent to the log control owner"))
             }
             // The long-poll needs the control owner's progress hub.
             Request::DurableProgress { .. } => Err(TcpError::new(
                 "durable progress poll bypassed the log control owner",
             )),
-            Request::Recover {
-                epoch,
-                cursor,
-                limit,
-            } => {
-                let _lifecycle = self.lifecycle.lock();
-                NodeInventory::recovery_page(
-                    &mut self.inventory.lock(),
-                    epoch,
-                    cursor,
-                    limit,
-                    limits,
-                )
-            }
             Request::Seal { epoch } => {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before sealing"));
-                    }
-                    leases
-                };
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::seal_epoch(
                     &mut self.inventory.lock(),
@@ -3353,9 +2051,12 @@ impl ControlContext {
                     metadata: stats.reference_metadata_bytes,
                 })
             }
-            Request::PartitionStats => Ok(Response::PartitionStats(Box::new(
-                self.inventory.lock().stats()?,
-            ))),
+            Request::PartitionStats => {
+                Ok(Response::PartitionStats(Box::new(PartitionStatsReply {
+                    partition: self.inventory.lock().stats()?,
+                    transport: self.transport.snapshot(),
+                })))
+            }
             Request::Stats => {
                 let stats = self.inventory.lock().stats()?;
                 Ok(Response::Stats {
@@ -3371,10 +2072,10 @@ impl ControlContext {
             | Request::OwnerTimelineFetch { .. } => Err(TcpError::new(
                 "connection diagnostics require an authenticated session",
             )),
-            #[cfg(feature = "test-utils")]
-            Request::PrepareRamProbe { .. } | Request::ReadRamProbe => Err(TcpError::new(
-                "RAM probes require the authenticated session owner",
-            )),
+            #[cfg(not(all(target_os = "linux", feature = "test-utils")))]
+            Request::ReadEvidence { .. } | Request::ProcessResources { .. } => {
+                Err(TcpError::new(super::EVIDENCE_UNAVAILABLE))
+            }
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
             Request::ReadEvidence { epoch, evict } => {
                 let inventory = self.inventory.lock();

@@ -664,7 +664,6 @@ def main(argv=None):
             try:
                 qualification = local_dry_run_targets.qualify_kernel_live(
                     fixture, staged_binary, transport="rdma", deadline_seconds=max(120, args.case_timeout),
-                    history_persistence="on_disk",
                     library_path=runtime / "lib")
             except Exception as exc:
                 proofs = [json.loads(path.read_text()) for path in fixture.glob("kernel-live-*/proof.json")]

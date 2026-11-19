@@ -1702,13 +1702,12 @@ fn resource_estimate(config: &ReplayConfig, trace: &Trace) -> BackendResult<serd
             .ok_or("missing native fragment geometry")?;
         native_disk_reservation(payload, fragment_size)?
     } else {
+        // Leased replay owners are external to the coordinator disk budget.
         (
             coordinator["reservation_bytes"]
                 .as_u64()
                 .ok_or("missing distributed coordinator disk reservation")?,
-            coordinator["local_owner_wal_reservation_bytes"]
-                .as_u64()
-                .ok_or("missing colocated owner WAL reservation")?,
+            0,
         )
     };
     // Include immutable row views, retained raw samples, key-map nodes and key owners

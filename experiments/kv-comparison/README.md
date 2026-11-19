@@ -640,7 +640,7 @@ Focused offline regressions remain for the integrating agent to run:
 ## Campaigns, repeat identity and raw exports
 
 ```sh
-# Default: 5 backends × 3 profiles × 3 offered rates × 5 repeats = 225 finite cells.
+# Default: 7 backends × 3 profiles × 3 offered rates × 1 repeat = 63 finite cells.
 python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/campaign.json \
   --binary target/release/kv-research --output /tmp/kv-campaign-new
 # Exactly one backend, retaining the same declared seed/profile/rate/repeat definitions:
@@ -649,28 +649,19 @@ python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparis
 # Explicit local subset: comma-separated backend IDs; unsupported, empty, or
 # duplicate selections fail before deployment/resource acquisition.
 python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/campaign.json \
-  --backends tidehunter_tcp,tikv --binary target/release/kv-research --output /tmp/kv-selected-new
+  --backends native,tikv --binary target/release/kv-research --output /tmp/kv-selected-new
 # API qualification also accepts an explicit backend subset:
 python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/ci.json \
-  --backends native,tidehunter_tcp --binary target/debug/kv-research --qualification --output /tmp/kv-api-selected-new
+  --backends native,tikv --binary target/debug/kv-research --qualification --output /tmp/kv-api-selected-new
 # Emergency/repeated exact-owned cleanup from an explicit campaign result root:
 python3 experiments/kv-comparison/cleanup.py --root /tmp/kv-campaign-new
 ```
 An explicit `--backends` subset must be admitted by the selected tracked or
-custom manifest; the option cannot add an ID the manifest does not name. For
-manual non-default Tidehunter transports, put the matching central case ID in
-a custom manifest and select that same ID. For example, a verbs config belongs
-to `tidehunter_verbs`, not `tidehunter_tcp`:
-
-```sh
-python3 experiments/kv-comparison/campaign.py --manifest /path/to/custom-manifest.json \
-  --backends tidehunter_verbs --transport-config transport-verbs.json \
-  --binary target/release/kv-research --output /tmp/kv-verbs-new
-```
-
-`--transport-config` requires exactly one selected Tidehunter case and must
-match its provider/security; it changes only host-local selectors, not the
-case identity, report label, or transport cohort.
+custom manifest; the option cannot add an ID the manifest does not name.
+This local runner handles native TideHunter and the other stores. To exercise
+distributed TideHunter, use `local_dry_run.py` with a leased NVMe-oF case or
+the kernel qualification in `local_dry_run_targets.py`; there is no in-process
+owner-RPC mode.
 
 
 ### Valkey TCP and matched RDMA controls
@@ -748,22 +739,13 @@ Both the local and cloud paths require an actual RC-capable device and system
 RDMA-CM/verbs libraries; EFA and loopback TCP are not substitutes.
 
 
-The default primary matrix includes `tidehunter_tcp`, TiKV, Cassandra,
+The default primary matrix includes native TideHunter, TiKV, Cassandra,
 FoundationDB, Valkey Cluster TCP, Garnet and Apache Kvrocks. Development manifests
 use one independent repetition. Optional embedded controls stay in a **separate**
 copied manifest and output directory: set `backends` to `["native","rocksdb","blobdb"]`
 and `max_runs` to 27 for the same three-profile/three-rate/one-repeat design. Their
 one-process API boundaries and acknowledgement policies are an embedded control
 tier, never a pretend distributed deployment.
-
-For TCP cells the controller calculates a finite per-partition retained-history
-cap as preload keys plus all configured phase calls plus 1024 qualification
-allowance, conservatively allowing all groups to concentrate on one owner.
-Requirements above the supported 1,000,000 cap are rejected, never clamped.
-The calculated cap and `physical_wal_gc=false` remain in effective metadata and
-the controller receipt. This is not a preallocation or a promise of unbounded
-steady state: independent metadata bounds can reject admission, and physical WAL
-bytes are not reclaimed.
 
 To reuse a separately started exact-owned stack, add `--reuse-state /tmp/kv-tikv`
 and `--backend tikv`, with the manifest's same `distributed` layout. Every cell

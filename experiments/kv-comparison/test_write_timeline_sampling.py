@@ -10,8 +10,8 @@ import cloud_campaign as campaign
 class WriteTimelineSamplingTests(unittest.TestCase):
     def specification(self):
         spec = json.loads(Path(__file__).with_name("cloud-campaign.json").read_text())
-        spec.update(backends=["tidehunter_tcp"], max_cases=2000,
-                    diagnostics={"write_timeline_limit": 2})
+        spec.update(mode="standard-with-live-nvmeof", backends=["tidehunter_nvme_tcp"],
+                    max_cases=2000, diagnostics={"write_timeline_limit": 2})
         return spec
 
     def test_stride_is_explicit_and_forwarded_to_diagnostic_jobs(self):

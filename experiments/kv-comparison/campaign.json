@@ -3,7 +3,7 @@
   "seed": 1775,
   "repeats": 1,
   "layout": "distributed",
-  "backends": ["tidehunter_tcp", "tikv", "cassandra", "foundationdb", "valkey_tcp", "garnet", "kvrocks"],
+  "backends": ["native", "tikv", "cassandra", "foundationdb", "valkey_tcp", "garnet", "kvrocks"],
   "profiles": [
     {"name": "fresh-small-working-set", "keys": 4096, "aging_operations": 0},
     {"name": "aged-small-working-set", "keys": 4096, "aging_operations": 8192},

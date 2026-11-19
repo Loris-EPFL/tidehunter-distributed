@@ -19,24 +19,10 @@ impl Running {
         transport: Transport,
         policy: WalMemberReadPolicy,
     ) -> Self {
-        Self::with_bounds(
-            transport,
-            policy,
-            default_read_bytes(),
-            default_device_reads(),
-        )
-    }
-    fn with_bounds(
-        transport: Transport,
-        policy: WalMemberReadPolicy,
-        bytes: usize,
-        device_reads: usize,
-    ) -> Self {
         Self::with_limits(
             transport,
             policy,
-            bytes,
-            device_reads,
+            default_device_reads(),
             TcpLimits {
                 io_timeout: Duration::from_secs(3),
                 max_frame_bytes: 2 * 1024 * 1024,
@@ -47,16 +33,14 @@ impl Running {
     pub(in crate::distributed::tcp) fn with_limits(
         transport: Transport,
         policy: WalMemberReadPolicy,
-        bytes: usize,
         device_reads: usize,
         limits: TcpLimits,
     ) -> Self {
-        Self::with_config(transport, policy, bytes, device_reads, limits, |_| {})
+        Self::with_config(transport, policy, device_reads, limits, |_| {})
     }
     fn with_config(
         transport: Transport,
         policy: WalMemberReadPolicy,
-        bytes: usize,
         device_reads: usize,
         limits: TcpLimits,
         configure: impl FnOnce(&mut NodeConfig),
@@ -77,7 +61,6 @@ impl Running {
         };
         let mut config = config(&temp.path().join("node"));
         config.wal_member_read = policy;
-        config.read_max_inflight_bytes = bytes;
         config.read_max_device_reads = device_reads;
         configure(&mut config);
         let node = StorageNode::open(config.clone(), metrics()).unwrap();
@@ -109,21 +92,6 @@ impl Running {
         )
         .unwrap()
     }
-    fn data(&self, client: &mut Client) -> (Vec<CompleteBatch>, Vec<ValueRecordReference>) {
-        client.fence_to(1).unwrap();
-        let batches = vec![batch(&self.config, 1, 0), batch(&self.config, 1, 1)];
-        let receipts = client.append_many(1, &batches).unwrap();
-        let references = batches
-            .iter()
-            .zip(receipts)
-            .map(|(batch, receipt)| {
-                batch
-                    .record_reference(receipt.appended().address(), 0)
-                    .unwrap()
-            })
-            .collect();
-        (batches, references)
-    }
 }
 impl Drop for Running {
     fn drop(&mut self) {
@@ -133,65 +101,6 @@ impl Drop for Running {
         }
     }
 }
-fn collect(
-    client: &mut Client,
-    count: usize,
-) -> Vec<crate::distributed::tcp::reactor::ReadCompletion> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut completed = Vec::new();
-    while completed.len() != count {
-        completed.extend(client.progress_reads().unwrap());
-        assert!(Instant::now() < deadline, "read owner did not complete");
-        thread::yield_now();
-    }
-    completed
-}
-
-#[test]
-fn correlated_data_read_keeps_five_second_deadline_under_stall() {
-    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
-    let mut client = server.client();
-    client.timeout = Duration::from_secs(5);
-    let (_, references) = server.data(&mut client);
-    let (entered, entries) = mpsc::sync_channel(1);
-    let (release, released) = mpsc::sync_channel(1);
-    let released = Mutex::new(released);
-    *server.node.read_hook.lock() = Some(Arc::new(move |_| {
-        entered.send(()).unwrap();
-        released
-            .lock()
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-    }));
-    let deadline = Instant::now() + client.timeout;
-    client
-        .submit_read(1, vec![references[0]], deadline, false)
-        .unwrap()
-        .unwrap();
-    let admission_deadline = Instant::now() + Duration::from_secs(2);
-    while entries.try_recv().is_err() {
-        client.progress_reads().unwrap();
-        assert!(
-            Instant::now() < admission_deadline,
-            "read did not enter stall"
-        );
-        thread::yield_now();
-    }
-    // Advance only the deadline-check clock; no wall-clock sleep is needed.
-    client
-        .progress_correlated_at(deadline - Duration::from_nanos(1))
-        .unwrap();
-    let result = client.progress_correlated_at(deadline + Duration::from_nanos(1));
-    release.send(()).unwrap();
-    server.node.read_hook.lock().take();
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("remote operation deadline expired")
-    );
-}
-
 #[test]
 fn correlated_lifecycle_control_expires_at_its_separate_deadline_under_stall() {
     let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
@@ -252,12 +161,11 @@ fn correlated_position_proof_keeps_data_deadline_under_stall() {
 }
 
 #[test]
-fn owner_session_deadlines_extend_fence_but_not_reads() {
+fn owner_session_deadlines_extend_fence() {
     let io_timeout = Duration::from_millis(300);
     let server = Running::with_limits(
         Transport::TcpTrusted,
         WalMemberReadPolicy::Positional,
-        default_read_bytes(),
         default_device_reads(),
         TcpLimits {
             io_timeout,
@@ -281,7 +189,7 @@ fn owner_session_deadlines_extend_fence_but_not_reads() {
     );
     // Start the hold only after this Fence has entered the owner's queue.
     while server.node.control.pending_requests_for_test() == 0 {
-        client.progress_reads().unwrap();
+        client.progress_session().unwrap();
         assert!(
             Instant::now() < admission_deadline,
             "Fence was not admitted"
@@ -292,7 +200,7 @@ fn owner_session_deadlines_extend_fence_but_not_reads() {
     drop(inventory);
     let completion_deadline = Instant::now() + Duration::from_secs(2);
     let response = loop {
-        client.progress_reads().unwrap();
+        client.progress_session().unwrap();
         if let Some(response) = client.take_control() {
             break response.unwrap();
         }
@@ -300,64 +208,6 @@ fn owner_session_deadlines_extend_fence_but_not_reads() {
         thread::yield_now();
     };
     assert!(matches!(response, Response::Status(status) if status.active_epoch == Some(1)));
-
-    let (_, references) = server.data(&mut client);
-    let (entered, entries) = mpsc::sync_channel(1);
-    let (release, released) = mpsc::sync_channel(1);
-    let released = Mutex::new(released);
-    *server.node.read_hook.lock() = Some(Arc::new(move |_| {
-        entered.send(()).unwrap();
-        released
-            .lock()
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
-    }));
-    client
-        .submit_read(
-            1,
-            vec![references[0]],
-            Instant::now() + client.timeout,
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    let admission_deadline = Instant::now() + Duration::from_secs(2);
-    while entries.try_recv().is_err() {
-        client.progress_reads().unwrap();
-        assert!(
-            Instant::now() < admission_deadline,
-            "read did not enter stall"
-        );
-        thread::yield_now();
-    }
-    thread::sleep(io_timeout + Duration::from_millis(100));
-    release.send(()).unwrap();
-    server.node.read_hook.lock().take();
-    let completion_deadline = Instant::now() + Duration::from_secs(2);
-    let error = loop {
-        match client.progress_reads() {
-            Err(error) => break error,
-            Ok(completed) => assert!(completed.is_empty(), "owner extended a data deadline"),
-        }
-        assert!(
-            Instant::now() < completion_deadline,
-            "owner did not expire the stalled read"
-        );
-        thread::yield_now();
-    };
-    assert!(
-        !error
-            .to_string()
-            .contains("remote operation deadline expired"),
-        "the owner's short deadline, not the five-second client deadline, must expire"
-    );
-    // The owner names its expired deadline before closing the session.
-    let error = error.to_string();
-    assert!(
-        error.starts_with("owner closed the session: owner request deadline expired: request ")
-            && error.contains(" (kind 8) "),
-        "{error}"
-    );
 }
 
 #[test]
@@ -392,13 +242,13 @@ fn invalid_status_bounds_and_wrong_variants_name_the_failure() {
     let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
     let mut client = server.client();
     let mut status = client.status().unwrap();
-    status.max_read_bytes = 0;
+    status.max_reads = 0;
     assert_eq!(
         client
             .check_status("Fence", status)
             .unwrap_err()
             .to_string(),
-        "Fence reply failed check: max_read_bytes=0; expected 1..=268435456"
+        "Fence reply failed check: max_reads=0; expected 1..=256"
     );
     assert!(client.broken);
     let error = client
@@ -428,11 +278,10 @@ fn observe_idle_readiness_wait(client: &mut Client) {
     }
 }
 
-fn adaptive_idle_reads_and_shutdown(transport: Transport) {
+fn adaptive_idle_controls_and_shutdown(transport: Transport) {
     let server = Running::with_limits(
         transport,
         WalMemberReadPolicy::Positional,
-        default_read_bytes(),
         default_device_reads(),
         TcpLimits {
             polling: PollingPolicy::Adaptive,
@@ -440,102 +289,30 @@ fn adaptive_idle_reads_and_shutdown(transport: Transport) {
         },
     );
     let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
+    client.fence_to(1).unwrap();
     for _ in 0..3 {
         observe_idle_readiness_wait(&mut client);
-        assert_eq!(
-            client.read_record(1, &references[0]).unwrap(),
-            batches[0].mutations()[0],
-        );
+        assert_eq!(client.status().unwrap().active_epoch, Some(1));
     }
     observe_idle_readiness_wait(&mut client);
     drop(server);
-    assert!(client.read_record(1, &references[0]).is_err());
+    assert!(client.status().is_err());
 }
 
 #[test]
-fn adaptive_idle_tcp_wakes_for_scalar_read_and_shutdown() {
-    adaptive_idle_reads_and_shutdown(Transport::Tcp);
+fn adaptive_idle_tcp_wakes_for_control_request_and_shutdown() {
+    adaptive_idle_controls_and_shutdown(Transport::Tcp);
 }
 
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
-fn software_provider_adaptive_idle_wakes_for_scalar_read_and_shutdown() {
+fn software_provider_adaptive_idle_wakes_for_control_request_and_shutdown() {
     for transport in [
         software_transport(FabricSecurity::MutualTls),
         software_transport(FabricSecurity::Trusted),
     ] {
-        adaptive_idle_reads_and_shutdown(transport);
-    }
-}
-
-fn operational_session_for_transport(transport: Transport) {
-    let server = Running::new(transport, WalMemberReadPolicy::Positional);
-    let mut serving = server.client();
-    let (batches, references) = server.data(&mut serving);
-    assert_eq!(
-        serving.read_record(1, &references[0]).unwrap(),
-        batches[0].mutations()[0],
-    );
-    let tls = server.tls.client_config_with_identity().unwrap();
-    let diagnostic = |expected| {
-        Client::connect_operational_shared(
-            &server.endpoint,
-            &server.tls,
-            tls.clone(),
-            Duration::from_secs(2),
-            expected,
-            &shape(),
-        )
-        .unwrap()
-    };
-    let mut wrong_owner = server.config.partition.clone();
-    wrong_owner.inventory.database[0] ^= 1;
-    assert!(
-        diagnostic(wrong_owner.clone())
-            .operational_read_io_stats()
-            .is_err()
-    );
-    let next = batch(&server.config, 1, 2);
-    for try_status_upgrade in [false, true] {
-        let mut client = diagnostic(server.config.partition.clone());
-        assert_eq!(client.session_present(), Some(true));
-        client.broken = true;
-        assert_eq!(client.session_present(), None);
-        client.broken = false;
-        let stats = client.operational_read_io_stats().unwrap().unwrap();
-        assert_eq!(stats.completed_reads, 1);
-        if try_status_upgrade {
-            assert!(client.status().is_err());
-        } else {
-            assert!(client.append_many(1, std::slice::from_ref(&next)).is_err());
-        }
-    }
-    let receipts = serving.append_many(1, std::slice::from_ref(&next)).unwrap();
-    let reference = next
-        .record_reference(receipts[0].appended().address(), 0)
-        .unwrap();
-    assert_eq!(
-        serving.read_record(1, &reference).unwrap(),
-        next.mutations()[0],
-    );
-}
-
-#[test]
-fn operational_session_binds_owner_identity_and_cannot_admit_data() {
-    operational_session_for_transport(Transport::Tcp);
-}
-
-#[cfg(feature = "experimental-fabric")]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
-fn software_provider_operational_session_binds_identity_and_cannot_admit_data() {
-    for transport in [
-        software_transport(FabricSecurity::MutualTls),
-        software_transport(FabricSecurity::Trusted),
-    ] {
-        operational_session_for_transport(transport);
+        adaptive_idle_controls_and_shutdown(transport);
     }
 }
 
@@ -548,37 +325,21 @@ fn established_connection_survives_idle_timeout(transport: Transport) {
     let server = Running::with_limits(
         transport,
         WalMemberReadPolicy::Positional,
-        default_read_bytes(),
         default_device_reads(),
         limits,
     );
-    // Fencing and appending persist the fixture. Do that before opening the
-    // timed session: this regression tests idle reuse, not an fsync deadline
-    // under contention from other tests on the same disk.
+    // Fencing persists the fixture. Do that before opening the timed session:
+    // this regression tests idle reuse, not an fsync deadline under
+    // contention from other tests on the same disk.
     server
         .node
         .handle(Request::Fence { epoch: 1 }, limits)
         .unwrap();
-    let value = batch(&server.config, 1, 0);
-    let Response::Appended(receipts) = server
-        .node
-        .handle(
-            Request::Append {
-                epoch: 1,
-                batches: vec![value.encoded().clone().into()],
-            },
-            limits,
-        )
-        .unwrap()
-    else {
-        panic!("fixture append did not return its receipt");
-    };
-    let reference = value.record_reference(receipts[0].address, 0).unwrap();
     let mut client = server.client();
     thread::sleep(limits.io_timeout + Duration::from_millis(100));
     assert_eq!(
-        client.read_record(1, &reference).unwrap(),
-        value.mutations()[0],
+        client.status().unwrap().active_epoch,
+        Some(1),
         "an authenticated established connection remains usable after an idle interval",
     );
 }
@@ -595,98 +356,6 @@ fn established_software_fabric_connection_survives_idle_timeout() {
     established_connection_survives_idle_timeout(software_transport(FabricSecurity::MutualTls));
 }
 
-fn delayed_independent(transport: Transport) {
-    let server = Running::new(transport, WalMemberReadPolicy::Positional);
-    let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-    let (entered, entries) = mpsc::sync_channel(1);
-    let (release, released) = mpsc::sync_channel(1);
-    let released = Mutex::new(released);
-    *server.node.read_hook.lock() = Some(Arc::new(move |reference| {
-        if reference.batch_version.sequence == 0 {
-            entered.send(()).unwrap();
-            released
-                .lock()
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-        }
-    }));
-    let slow = client
-        .submit_read(
-            1,
-            vec![references[0]],
-            Instant::now() + Duration::from_secs(2),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    let fast = client
-        .submit_read(
-            1,
-            vec![references[1]],
-            Instant::now() + Duration::from_secs(2),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    assert_ne!(slow, fast);
-    let mut first = collect(&mut client, 1);
-    entries.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(
-        first[0].id, fast,
-        "one connection must not serialize independent reads"
-    );
-    assert_eq!(
-        first.pop().unwrap().result.unwrap().0,
-        vec![batches[1].mutations()[0].clone()]
-    );
-    // Keep a cold/blocking worker pending while the socket is otherwise idle.
-    // A new ready read must still progress, and its completion cannot rely on
-    // another arrival to wake the owner.
-    client.connection_profile(true, true).unwrap();
-    let another = client
-        .submit_read(
-            1,
-            vec![references[1]],
-            Instant::now() + Duration::from_secs(2),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    let completed = collect(&mut client, 1).pop().unwrap();
-    assert_eq!(completed.id, another);
-    assert_eq!(
-        completed.result.unwrap().0,
-        vec![batches[1].mutations()[0].clone()],
-    );
-    let profile = client.connection_profile(false, false).unwrap();
-    assert_eq!(profile.polling.idle_wait_calls, 0);
-    release.send(()).unwrap();
-    let mut last = collect(&mut client, 1);
-    assert_eq!(last[0].id, slow);
-    assert_eq!(
-        last.pop().unwrap().result.unwrap().0,
-        vec![batches[0].mutations()[0].clone()]
-    );
-    server.node.read_hook.lock().take();
-}
-#[test]
-fn one_tcp_connection_completes_ready_read_before_delayed_read() {
-    delayed_independent(Transport::Tcp);
-}
-#[cfg(feature = "experimental-fabric")]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn one_software_fabric_connection_completes_out_of_order() {
-    delayed_independent(software_transport(FabricSecurity::MutualTls));
-}
-#[cfg(feature = "experimental-fabric")]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn native_software_provider_mixed_rpc_reads_complete_out_of_order() {
-    delayed_independent(software_transport(FabricSecurity::Trusted));
-}
-
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
@@ -695,65 +364,36 @@ fn software_fabric_owner_transport_aggregate_sums_sessions_and_keeps_closed_ones
         software_transport(FabricSecurity::Trusted),
         WalMemberReadPolicy::Positional,
     );
-    let sent = |stats: &ReadExecutorStats| {
-        let transport = stats.transport;
+    let sent = |reply: &PartitionStatsReply| {
+        let transport = reply.transport;
         transport.send_size_le_4k
             + transport.send_size_le_16k
             + transport.send_size_le_64k
             + transport.send_size_gt_64k
     };
     let mut first = server.client();
-    let (batches, references) = server.data(&mut first);
+    first.fence_to(1).unwrap();
     let mut second = server.client();
     for client in [&mut first, &mut second] {
-        for index in 0..8 {
-            assert_eq!(
-                client.read_record(1, &references[index % 2]).unwrap(),
-                batches[index % 2].mutations()[0]
-            );
+        for _ in 0..8 {
+            assert_eq!(client.status().unwrap().active_epoch, Some(1));
         }
     }
     // A session publishes its counters at the end of every sweep, so its own
     // later stats request already includes everything it sent before.
-    let both_open = first.read_io_stats().unwrap();
-    let second_only = second.read_io_stats().unwrap();
+    let both_open = first.partition_stats().unwrap();
+    let second_only = second.partition_stats().unwrap();
     assert!(sent(&both_open) >= 16, "{:?}", both_open.transport);
     assert!(sent(&second_only) >= sent(&both_open));
     drop(first);
     drop(second);
-    let reopened = server.client().read_io_stats().unwrap();
+    let reopened = server.client().partition_stats().unwrap();
     assert!(
         sent(&reopened) >= sent(&second_only),
         "closed sessions must stay in the total"
     );
 }
 
-#[cfg(feature = "experimental-fabric")]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn fabric_tcp_native_rejects_invalid_reference_and_epoch_without_tls() {
-    let server = Running::new(
-        software_transport(FabricSecurity::Trusted),
-        WalMemberReadPolicy::Positional,
-    );
-    let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-
-    let mut forged_offset = references[0];
-    forged_offset.descriptor.offset += 1;
-    assert!(client.read_record(1, &forged_offset).is_err());
-
-    let mut forged_checksum = references[0];
-    forged_checksum.descriptor.checksum.0 ^= 1;
-    assert!(client.read_record(1, &forged_checksum).is_err());
-    assert!(client.read_record(2, &references[0]).is_err());
-
-    assert_eq!(
-        client.read_record(1, &references[0]).unwrap(),
-        batches[0].mutations()[0],
-        "rejected references and epochs must not poison a valid native session",
-    );
-}
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
@@ -799,148 +439,6 @@ fn fabric_tcp_native_mode_mismatch_with_tls_fails_closed() {
         "a native client must not downgrade to the TLS listener",
     );
 }
-#[test]
-fn fence_while_read_pending_is_rechecked_before_reply() {
-    // The read below is held across `fence_to(2)`, a lifecycle operation
-    // (seal, manifest and new-epoch creation: tens of fsyncs) that the client
-    // grants LIFECYCLE_TIMEOUT. Every bound spanning the fence uses that
-    // budget: the server's `io_timeout`, the read deadline and the hook's wait
-    // for release. A data budget would assert fence latency, which is not under
-    // test. Liveness after release stays bounded by `collect`.
-    let server = Running::with_limits(
-        Transport::Tcp,
-        WalMemberReadPolicy::Mapped,
-        default_read_bytes(),
-        default_device_reads(),
-        TcpLimits {
-            io_timeout: LIFECYCLE_TIMEOUT,
-            max_frame_bytes: 2 * 1024 * 1024,
-            ..TcpLimits::default()
-        },
-    );
-    let mut client = server.client();
-    let (_, references) = server.data(&mut client);
-    let (entered, entries) = mpsc::sync_channel(1);
-    let (release, released) = mpsc::sync_channel(1);
-    let released = Mutex::new(released);
-    *server.node.read_hook.lock() = Some(Arc::new(move |_| {
-        entered.send(()).unwrap();
-        released.lock().recv_timeout(LIFECYCLE_TIMEOUT).unwrap();
-    }));
-    client
-        .submit_read(
-            1,
-            vec![references[0]],
-            Instant::now() + LIFECYCLE_TIMEOUT,
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        assert!(client.progress_reads().unwrap().is_empty());
-        if entries.try_recv().is_ok() {
-            break;
-        }
-        assert!(Instant::now() < deadline);
-        thread::yield_now();
-    }
-    let mut authority = server.client();
-    authority.fence_to(2).unwrap();
-    release.send(()).unwrap();
-    assert!(collect(&mut client, 1).pop().unwrap().result.is_err());
-    server.node.read_hook.lock().take();
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn async_tcp_multiple_misses_are_bounded_and_report_real_wal_submissions() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Async);
-    let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-    let before = client.read_io_stats().unwrap();
-    observe_idle_readiness_wait(&mut client);
-    let mut ids = Vec::new();
-    for index in 0..32 {
-        ids.push(
-            client
-                .submit_read(
-                    1,
-                    vec![references[index % 2]],
-                    Instant::now() + Duration::from_secs(2),
-                    false,
-                )
-                .unwrap()
-                .unwrap(),
-        );
-    }
-    assert!(!client.read_admission(&references[..1], false).unwrap());
-    assert!(
-        client
-            .submit_read(
-                1,
-                vec![references[0]],
-                Instant::now() + Duration::from_secs(2),
-                false
-            )
-            .unwrap()
-            .is_none()
-    );
-    for completion in collect(&mut client, 32) {
-        let index = ids.iter().position(|id| *id == completion.id).unwrap();
-        assert_eq!(
-            completion.result.unwrap().0,
-            vec![batches[index % 2].mutations()[0].clone()]
-        );
-    }
-    let after = client.read_io_stats().unwrap();
-    assert_eq!(after.wal_reads - before.wal_reads, 32);
-    assert!(after.peak_inflight_requests <= server.config.read_max_inflight_requests);
-    assert!(after.peak_inflight_bytes <= server.config.read_max_inflight_bytes);
-    assert!(after.peak_inflight_reads <= server.config.read_max_device_reads);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn async_reader_disconnects_do_not_block_new_authenticated_connections() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Async);
-    let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-    for index in 0..32 {
-        assert_eq!(
-            client.read_record(1, &references[index % 2]).unwrap(),
-            batches[index % 2].mutations()[0]
-        );
-        drop(client);
-        client = server.client();
-    }
-    let stats = client.read_io_stats().unwrap();
-    assert_eq!(stats.wal_reads, 32);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn aggregate_256_members_split_at_negotiated_device_and_byte_bounds() {
-    let server = Running::with_bounds(Transport::Tcp, WalMemberReadPolicy::Async, 32 * 1024, 8);
-    let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-    let status = client.status().unwrap();
-    assert_eq!(status.max_reads, 8);
-    assert_eq!(status.max_read_bytes, 32 * 1024);
-    let requested: Vec<_> = (0..256).map(|i| references[i % 2]).collect();
-    let (values, profile) = client.read_records_profiled(1, &requested).unwrap();
-    assert!(profile.requests > 256 / 8); // retained-byte cap further splits
-    assert_eq!(profile.server_response_recheck_samples, profile.requests);
-    assert_eq!(values.len(), 256);
-    for (index, value) in values.iter().enumerate() {
-        assert_eq!(value, &batches[index % 2].mutations()[0]);
-    }
-    let stats = client.read_io_stats().unwrap();
-    assert_eq!(stats.wal_reads, 256);
-    assert!(stats.peak_inflight_reads <= 8);
-    assert!(stats.peak_inflight_bytes <= 32 * 1024);
-}
-
 #[derive(Clone, Copy)]
 enum Fault {
     BadId,
@@ -948,8 +446,6 @@ enum Fault {
     Truncated,
     Deadline,
     PartialValid,
-    CorruptMember,
-    WrongMemberCount,
 }
 trait FaultPeerIo: Read + Write {}
 impl<T: Read + Write> FaultPeerIo for T {}
@@ -981,6 +477,8 @@ impl Write for NativeFaultPeer {
     }
 }
 
+/// A scripted owner answers the client's first correlated control request
+/// (a Fence) with a real Fence reply, damaged as `fault` selects.
 fn faulty_peer(fault: Fault, transport: Transport) {
     let temp = tempdir::TempDir::new("correlated-reply-fault").unwrap();
     let tls = if transport.is_native() {
@@ -996,31 +494,12 @@ fn faulty_peer(fault: Fault, transport: Transport) {
     };
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let value = batch(&config, 1, 0);
-    let receipts = append(&node, 1, std::slice::from_ref(&value));
-    let reference = value.record_reference(receipts[0].address, 0).unwrap();
     let status = node
         .handle(Request::Status { protocol: PROTOCOL }, TcpLimits::default())
         .unwrap();
-    let mut response = node
-        .handle(
-            Request::Read {
-                epoch: 1,
-                references: vec![reference],
-            },
-            TcpLimits::default(),
-        )
+    let response = node
+        .handle(Request::Fence { epoch: 1 }, TcpLimits::default())
         .unwrap();
-    if let Response::Records(records) = &mut response {
-        if matches!(fault, Fault::CorruptMember) {
-            let mut bytes = records.pop().unwrap().into_vec();
-            *bytes.last_mut().unwrap() ^= 1;
-            records.push(bytes.into());
-        } else if matches!(fault, Fault::WrongMemberCount) {
-            records.clear();
-        }
-    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap().to_string();
     let server_config = tls.server_config().unwrap().config;
@@ -1071,10 +550,7 @@ fn faulty_peer(fault: Fault, transport: Transport) {
         };
         let encoded = encode_frame(&reply, HARD_FRAME_LIMIT).unwrap();
         match fault {
-            Fault::BadId
-            | Fault::StaleProtocol
-            | Fault::CorruptMember
-            | Fault::WrongMemberCount => {
+            Fault::BadId | Fault::StaleProtocol => {
                 write_frame(&mut stream, &reply, HARD_FRAME_LIMIT).unwrap();
             }
             Fault::Truncated => {
@@ -1108,27 +584,26 @@ fn faulty_peer(fault: Fault, transport: Transport) {
     } else {
         Duration::from_secs(2)
     };
-    client
-        .submit_read(1, vec![reference], Instant::now() + timeout, false)
-        .unwrap()
-        .unwrap();
+    let request = Request::Fence { epoch: 1 };
+    assert!(
+        client
+            .submit_control(&request, Instant::now() + timeout)
+            .unwrap()
+    );
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match client.progress_reads() {
-            Err(_) => {
-                assert!(!matches!(fault, Fault::PartialValid));
-                assert!(client.status().is_err());
-                break;
-            }
-            Ok(mut completed) if !completed.is_empty() => {
-                assert!(matches!(fault, Fault::PartialValid));
-                assert_eq!(
-                    completed.pop().unwrap().result.unwrap().0,
-                    value.mutations()
-                );
-                break;
-            }
-            Ok(_) => {}
+        if client.progress_session().is_err() {
+            assert!(!matches!(fault, Fault::PartialValid));
+            assert!(client.status().is_err());
+            break;
+        }
+        if let Some(result) = client.take_control() {
+            assert!(matches!(fault, Fault::PartialValid));
+            assert!(matches!(
+                result.unwrap(),
+                Response::Status(status) if status.active_epoch == Some(1)
+            ));
+            break;
         }
         assert!(Instant::now() < deadline);
         thread::yield_now();
@@ -1158,123 +633,6 @@ fn expired_inflight_deadline_fails_connection() {
 fn tls_records_and_frame_header_can_arrive_one_byte_at_a_time() {
     faulty_peer(Fault::PartialValid, Transport::Tcp);
 }
-
-#[test]
-fn authenticated_scalar_payload_corruption_fails_connection() {
-    faulty_peer(Fault::CorruptMember, Transport::Tcp);
-}
-
-#[test]
-fn authenticated_scalar_wrong_member_count_fails_connection() {
-    faulty_peer(Fault::WrongMemberCount, Transport::Tcp);
-}
-
-#[cfg(feature = "experimental-fabric")]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn fabric_tcp_native_rejects_corrupt_member_reply_without_tls() {
-    faulty_peer(
-        Fault::CorruptMember,
-        software_transport(FabricSecurity::Trusted),
-    );
-}
-
-#[test]
-fn diagnostic_read_policies_reject_async_executor_options() {
-    let temp = tempdir::TempDir::new("diagnostic-cache-policy").unwrap();
-    for policy in [WalMemberReadPolicy::Mapped, WalMemberReadPolicy::Positional] {
-        let mut config = config(&temp.path().join("node"));
-        config.wal_member_read = policy;
-        config.read_resident_first = true;
-        assert!(StorageNode::open(config, metrics()).is_err());
-    }
-}
-
-#[test]
-fn idle_reuse_refreshes_status_and_preserves_durable_scalar_outcomes() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
-    let mut client = server.client();
-    let batches = vec![batch(&server.config, 1, 0)];
-    client.fence_to(1).unwrap();
-    let receipts = client.append_many(1, &batches).unwrap();
-    let reference = batches[0]
-        .record_reference(receipts[0].appended().address(), 0)
-        .unwrap();
-    client.refresh_for_reuse().unwrap();
-    assert_eq!(client.connected_status().active_epoch, Some(1));
-    assert_eq!(client.append_many(1, &batches).unwrap(), receipts);
-    assert_eq!(
-        client.read_record(1, &reference).unwrap(),
-        batches[0].mutations()[0]
-    );
-    let mut authority = server.client();
-    authority.fence_to(2).unwrap();
-    client.refresh_for_reuse().unwrap();
-    assert_eq!(client.connected_status().active_epoch, Some(2));
-    assert!(client.append_many(1, &batches).is_err());
-}
-
-#[test]
-fn reuse_rejects_live_read_without_consuming_its_result() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
-    let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-    let id = client
-        .submit_read(
-            1,
-            vec![references[0]],
-            Instant::now() + Duration::from_secs(2),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    assert!(client.refresh_for_reuse().is_err());
-    let result = collect(&mut client, 1).remove(0);
-    assert_eq!(result.id, id);
-    assert_eq!(result.result.unwrap().0, batches[0].mutations());
-    client.refresh_for_reuse().unwrap();
-}
-
-#[test]
-fn reuse_revalidates_certificate_time_and_original_trust_snapshot() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
-    let client = server.client();
-    client
-        .revalidate_peer_at(rustls::pki_types::UnixTime::now())
-        .unwrap();
-    let far_future =
-        rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(4_102_444_800));
-    assert!(client.revalidate_peer_at(far_future).is_err());
-    let before = server.tls.client_config_with_identity().unwrap().identity;
-    let original = fs::read(&server.tls.cert).unwrap();
-    fs::write(&server.tls.cert, b"not a certificate").unwrap();
-    assert!(server.tls.client_config_with_identity().is_err());
-    // Existing verification must use its authenticated snapshot, not re-read
-    // credentials which may now differ from the parent's pool key.
-    client
-        .revalidate_peer_at(rustls::pki_types::UnixTime::now())
-        .unwrap();
-    fs::write(&server.tls.cert, original).unwrap();
-    assert_eq!(
-        server.tls.client_config_with_identity().unwrap().identity,
-        before
-    );
-}
-
-#[test]
-fn reuse_fails_closed_after_control_peer_shutdown() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
-    let mut client = server.client();
-    client
-        .stream
-        .sock
-        .socket
-        .shutdown(std::net::Shutdown::Both)
-        .unwrap();
-    assert!(client.refresh_for_reuse().is_err());
-    assert!(client.status().is_err());
-}
-
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
@@ -1284,12 +642,8 @@ fn fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadli
         WalMemberReadPolicy::Positional,
     );
     let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-    client.refresh_for_reuse().unwrap();
-    assert_eq!(
-        client.read_record(1, &references[0]).unwrap(),
-        batches[0].mutations()[0]
-    );
+    client.fence_to(1).unwrap();
+    assert_eq!(client.status().unwrap().active_epoch, Some(1));
     client
         .stream
         .sock
@@ -1300,7 +654,7 @@ fn fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadli
     // not from a request timeout (client=2s, server=3s). Allow scheduler slack.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        if client.progress_reads().is_err() {
+        if client.progress_session().is_err() {
             assert!(client.status().is_err());
             break;
         }
@@ -1310,488 +664,4 @@ fn fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadli
         );
         thread::yield_now();
     }
-}
-
-#[cfg(feature = "test-utils")]
-fn ram_probe_round_trip(transport: Transport, polling: PollingPolicy) {
-    let server = Running::with_limits(
-        transport.clone(),
-        WalMemberReadPolicy::Positional,
-        default_read_bytes(),
-        default_device_reads(),
-        TcpLimits {
-            polling,
-            ..TcpLimits::default()
-        },
-    );
-    let mut client = server.client();
-    assert_eq!(client.polling_policy(), polling);
-    assert_eq!(client.status().unwrap().polling, polling);
-    let mut isolated_profile = TcpReadProfile::default();
-    client
-        .exchange_correlated(
-            &Request::Status { protocol: PROTOCOL },
-            Some(&mut isolated_profile),
-        )
-        .unwrap();
-    assert_eq!(isolated_profile.requests, 1);
-    assert!(isolated_profile.response_decode_ns > 0);
-    assert!(
-        client
-            .read_ram_probe()
-            .unwrap_err()
-            .to_string()
-            .contains("not prepared")
-    );
-    let before = client.read_io_stats().unwrap();
-    client.connection_profile(true, true).unwrap();
-    client.status().unwrap();
-    // Boundary and persistent replacement cases; the last zero-length buffer
-    // is distinct from the unprepared state.
-    for len in [0, 1, 1024, 8192, 65536, 0] {
-        client.prepare_ram_probe(len).unwrap();
-        // Exercise the genuinely idle policy, including manual fabric CQ
-        // progress. No microsecond latency threshold is used as evidence.
-        thread::sleep(Duration::from_millis(20));
-        for _ in 0..3 {
-            let bytes = client.read_ram_probe().unwrap();
-            assert_eq!(bytes.len(), len);
-            assert!(bytes.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
-        }
-    }
-    assert!(client.prepare_ram_probe(65537).is_err());
-    // Bypass the public preflight to exercise the server's boundary as well.
-    assert!(
-        client
-            .request(Request::PrepareRamProbe {
-                value_bytes: usize::MAX
-            })
-            .is_err()
-    );
-    assert_eq!(client.read_ram_probe().unwrap().len(), 0);
-    let profile = client.connection_profile(false, false).unwrap();
-    assert!(profile.polling.progress_sweeps > 0);
-    assert!(profile.polling.request_first_poll_samples > 0);
-    assert!(profile.control_queue_samples > 0);
-    assert_eq!(
-        profile.control_queue_samples,
-        profile.control_execution_samples
-    );
-    assert!(profile.control_execution_ns > 0);
-    assert!(profile.handler_ns >= profile.control_execution_ns);
-    for stats in [profile.transport, profile.client_transport] {
-        assert!(stats.frame_encode.calls > 0);
-        assert!(stats.frame_decode.calls > 0);
-        assert!(stats.plaintext_write.bytes > 0);
-        assert!(stats.plaintext_read.bytes > 0);
-        if transport.is_native() {
-            assert_eq!(stats.tls_read.calls, 0);
-            assert_eq!(stats.tls_write.calls, 0);
-            assert_eq!(stats.tls_process.calls, 0);
-        } else {
-            assert!(stats.tls_read.calls > 0);
-            assert!(stats.tls_write.calls > 0);
-            assert!(stats.tls_process.calls > 0);
-        }
-        assert!(stats.output_queue_samples > 0);
-        assert!(stats.output_submit_samples > 0);
-        assert!(stats.output_retire_samples > 0);
-    }
-    if transport != Transport::Tcp {
-        for transport in [profile.transport, profile.client_transport] {
-            assert!(transport.send_copy_calls > 0);
-            assert!(transport.receive_copy_calls > 0);
-            assert!(transport.send_post_calls > 0);
-            assert!(transport.receive_post_calls > 0);
-            assert!(transport.cq_timed_calls > 0);
-            assert!(transport.cq_dispatch_calls > 0);
-            assert!(transport.tx_all_slots_pending_polls <= transport.cq_timed_calls);
-            assert!(transport.rx_no_posted_slots_polls <= transport.cq_timed_calls);
-            assert!(transport.rx_unread_slots_polls <= transport.cq_timed_calls);
-        }
-    }
-    let mut exported = std::collections::BTreeMap::new();
-    crate::distributed::sui::visit_write_connection_profile(
-        &mut |name, value| {
-            exported.insert(name, value);
-        },
-        profile,
-    );
-    let json = serde_json::to_value(&exported).unwrap();
-    for side in ["client_transport", "transport"] {
-        for field in [
-            "tx_all_slots_pending_polls",
-            "rx_no_posted_slots_polls",
-            "rx_unread_slots_polls",
-        ] {
-            let key = format!("write_profile_{side}_{field}");
-            if transport == Transport::Tcp {
-                assert!(json.get(key.as_str()).is_none());
-            } else {
-                assert!(
-                    json.get(key.as_str())
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some()
-                );
-            }
-        }
-    }
-    if polling == PollingPolicy::Busy {
-        assert_eq!(profile.polling.idle_wait_calls, 0);
-        assert_eq!(profile.polling.scheduler_yields, 0);
-    }
-    let after = client.read_io_stats().unwrap();
-    assert_eq!(before.wal_reads, after.wal_reads);
-    assert_eq!(before.wal_read_bytes, after.wal_read_bytes);
-    assert_eq!(before.completed_reads, after.completed_reads);
-    // Probe state belongs to the authenticated session, not node/WAL state.
-    let mut other = server.client();
-    assert!(other.read_ram_probe().is_err());
-    // Shutdown must still terminate a busy idle session while the client lives.
-    drop(server);
-    assert!(client.read_ram_probe().is_err());
-}
-
-#[cfg(feature = "test-utils")]
-#[test]
-fn authenticated_ram_probe_boundaries_and_busy_shutdown() {
-    for polling in [PollingPolicy::Adaptive, PollingPolicy::Busy] {
-        ram_probe_round_trip(Transport::Tcp, polling);
-    }
-}
-
-#[cfg(all(feature = "test-utils", feature = "experimental-fabric"))]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn fabric_authenticated_ram_probe_boundaries_and_busy_shutdown() {
-    for polling in [PollingPolicy::Adaptive, PollingPolicy::Busy] {
-        ram_probe_round_trip(software_transport(FabricSecurity::MutualTls), polling);
-    }
-}
-#[cfg(all(feature = "test-utils", feature = "experimental-fabric"))]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn fabric_tcp_native_large_partial_frames_bypass_tls() {
-    for polling in [PollingPolicy::Adaptive, PollingPolicy::Busy] {
-        ram_probe_round_trip(software_transport(FabricSecurity::Trusted), polling);
-    }
-}
-
-#[cfg(feature = "test-utils")]
-#[test]
-fn ram_probe_frame_bound_and_expired_request_preserve_fail_stop() {
-    let server = Running::with_limits(
-        Transport::Tcp,
-        WalMemberReadPolicy::Positional,
-        default_read_bytes(),
-        default_device_reads(),
-        TcpLimits {
-            max_frame_bytes: 8192,
-            polling: PollingPolicy::Busy,
-            ..TcpLimits::default()
-        },
-    );
-    let mut client = server.client();
-    client.prepare_ram_probe(8168).unwrap();
-    assert_eq!(client.read_ram_probe().unwrap().len(), 8168);
-    assert!(client.prepare_ram_probe(8169).is_err());
-    assert!(
-        client
-            .request(Request::PrepareRamProbe { value_bytes: 8169 })
-            .is_err()
-    );
-    assert_eq!(client.read_ram_probe().unwrap().len(), 8168);
-    // The normal absolute deadline guard is deterministic, not a sleep/race.
-    client.timeout = Duration::ZERO;
-    assert!(
-        client
-            .read_ram_probe()
-            .unwrap_err()
-            .to_string()
-            .contains("deadline")
-    );
-    assert!(client.read_ram_probe().is_err());
-}
-
-#[cfg(feature = "test-utils")]
-#[test]
-fn ram_probe_does_not_acquire_inventory_or_dispatch_read_workers() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
-    let mut client = server.client();
-    client.prepare_ram_probe(8192).unwrap();
-    // Both blocking workers are occupied, and the inventory is inaccessible.
-    // A reactor-local diagnostic must still produce the real response.
-    let (started_tx, started_rx) = mpsc::channel();
-    let mut releases = Vec::new();
-    for _ in 0..server.config.effective_read_workers() {
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        releases.push(release_tx);
-        let started = started_tx.clone();
-        server.node.read_pool.spawn(move || {
-            if started.send(()).is_err() {
-                return;
-            }
-            let _ = release_rx.recv();
-        });
-    }
-    for _ in 0..server.config.effective_read_workers() {
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    }
-    let inventory = server.node.inventory.lock();
-    let response = client.read_ram_probe();
-    drop(inventory);
-    // Always release before asserting so a failing test cannot strand workers.
-    drop(releases);
-    assert_eq!(response.unwrap().len(), 8192);
-}
-
-fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenced: bool) {
-    let server = Running::with_config(
-        transport,
-        WalMemberReadPolicy::Async,
-        default_read_bytes(),
-        default_device_reads(),
-        TcpLimits {
-            // The server bounds each read by `io_timeout`, and the slow read
-            // below is held across the fenced pass's lifecycle fence. See there.
-            io_timeout: LIFECYCLE_TIMEOUT,
-            ..TcpLimits::default()
-        },
-        |config| {
-            config.partition.max_batches = 1;
-            config.partition.group_limits.max_batches = 1;
-        },
-    );
-    server
-        .node
-        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    let mut client = server.client();
-    client.fence_to(1).unwrap();
-    let log = server.node.inventory.lock().active(1).unwrap();
-    // With OnDisk history and `max_batches = 1`, a covering barrier that leaves
-    // a batch pending starts an `authority-history` thread that moves it from
-    // the resident pending window into cold history (and re-caches it after
-    // adoption). That thread runs after the receipt (on the native tier even
-    // its barrier does, in `value-wal-syncer`). Left running, it can drain
-    // record 1 or hold the authority lock during the residency checks below or
-    // while the reactor plans the warm read; and a still-pending batch 0 makes
-    // the next append wait for that spill's fsyncs inside its data deadline.
-    // After each append, make every appended byte durable and join the spill
-    // its barrier started: with nothing left to persist, no barrier and so no
-    // spill can start again before the fence.
-    let batches = [batch(&server.config, 1, 0), batch(&server.config, 1, 1)];
-    let references: Vec<_> = batches
-        .iter()
-        .map(|batch| {
-            let receipt = client
-                .append_many(1, std::slice::from_ref(batch))
-                .unwrap()
-                .remove(0);
-            log.persist_appended().unwrap();
-            log.wait_history().unwrap();
-            batch
-                .record_reference(receipt.appended().address(), 0)
-                .unwrap()
-        })
-        .collect();
-    log.evict_authority_cache();
-    // Re-warm only record 1: the blocking loader caches history authority.
-    assert_eq!(
-        client.read_record(1, &references[1]).unwrap(),
-        batches[1].mutations()[0]
-    );
-    let before = client.read_io_stats().unwrap();
-    assert!(log.try_plan_record_read(&references[0]).unwrap().is_none());
-    assert!(log.try_plan_record_read(&references[1]).unwrap().is_some());
-    let (entered, release) = log.pause_next_authority_load();
-    let slow = client
-        .submit_read(
-            1,
-            vec![references[0]],
-            // This read is held across the fenced pass's lifecycle fence
-            // (seal, manifest and new-epoch creation: tens of fsyncs). The
-            // client grants that fence LIFECYCLE_TIMEOUT, so the read spanning
-            // it gets the same budget here and on the server (`io_timeout`);
-            // a data-read budget would assert fence latency, which is not
-            // under test. Its liveness after release stays bounded by `collect`.
-            Instant::now() + LIFECYCLE_TIMEOUT,
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        assert!(client.progress_reads().unwrap().is_empty());
-        if entered.try_recv().is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "cold authority lookup did not reach its worker"
-        );
-        thread::yield_now();
-    }
-    // The cold lookup occupies one worker. Occupy every other worker as well:
-    // a warm payload/authority hit must not need an unconditional worker hop.
-    let (blocked, blocking) = mpsc::sync_channel(1);
-    let (resume, resumed) = mpsc::sync_channel(1);
-    server.node.read_pool.spawn(move || {
-        if blocked.send(()).is_err() {
-            return;
-        }
-        let _ = resumed.recv();
-    });
-    blocking.recv_timeout(Duration::from_secs(2)).unwrap();
-    let fast = client
-        .submit_read(
-            1,
-            vec![references[1]],
-            Instant::now() + Duration::from_secs(2),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    let completed = collect(&mut client, 1).pop().unwrap();
-    assert_eq!(completed.id, fast);
-    assert_eq!(
-        completed.result.unwrap().0,
-        vec![batches[1].mutations()[0].clone()]
-    );
-    let after = client.read_io_stats().unwrap();
-    assert_eq!(after.wal_reads, before.wal_reads + 1);
-    if fenced {
-        server.client().fence_to(2).unwrap();
-    }
-    resume.send(()).unwrap();
-    release.send(()).unwrap();
-    let completed = collect(&mut client, 1).pop().unwrap();
-    assert_eq!(completed.id, slow);
-    if fenced {
-        assert!(
-            completed.result.is_err(),
-            "a cold plan must recheck its captured generation"
-        );
-    } else {
-        assert_eq!(
-            completed.result.unwrap().0,
-            vec![batches[0].mutations()[0].clone()]
-        );
-    }
-}
-
-#[test]
-fn tcp_cold_authority_preserves_hot_progress_and_rechecks_fencing() {
-    for fenced in [false, true] {
-        cold_authority_does_not_move_hot_reads_to_the_pool(Transport::Tcp, fenced);
-    }
-}
-
-#[cfg(feature = "experimental-fabric")]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn software_fabric_cold_authority_preserves_hot_progress_and_rechecks_fencing() {
-    for fenced in [false, true] {
-        cold_authority_does_not_move_hot_reads_to_the_pool(
-            software_transport(FabricSecurity::MutualTls),
-            fenced,
-        );
-    }
-}
-
-fn disconnect_retains_cold_planning_credits_until_the_worker_retires_for(transport: Transport) {
-    let server = Running::with_config(
-        transport.clone(),
-        WalMemberReadPolicy::Async,
-        default_read_bytes(),
-        default_device_reads(),
-        TcpLimits {
-            io_timeout: Duration::from_secs(3),
-            ..TcpLimits::default()
-        },
-        |config| {
-            config.partition.max_batches = 1;
-            config.partition.group_limits.max_batches = 1;
-        },
-    );
-    let mut client = server.client();
-    client.fence_to(1).unwrap();
-    let first = batch(&server.config, 1, 0);
-    let receipt = client
-        .append_many(1, std::slice::from_ref(&first))
-        .unwrap()
-        .remove(0);
-    client
-        .append_many(1, &[batch(&server.config, 1, 1)])
-        .unwrap();
-    let reference = first
-        .record_reference(receipt.appended().address(), 0)
-        .unwrap();
-    let log = server.node.inventory.lock().active(1).unwrap();
-    log.evict_authority_cache();
-    let (entered, release) = log.pause_next_authority_load();
-    let read_deadline = Instant::now() + Duration::from_secs(2);
-    client
-        .submit_read(1, vec![reference], read_deadline, false)
-        .unwrap()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        assert!(client.progress_reads().unwrap().is_empty());
-        if entered.try_recv().is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "cold authority worker did not start"
-        );
-        thread::yield_now();
-    }
-    let charged = server.node.read_admission.stats().inflight_bytes;
-    assert!(charged > 0);
-    assert_eq!(server.node.read_admission.stats().inflight_requests, 1);
-    assert_eq!(server.node.read_admission.stats().wal_reads, 0);
-    if transport.is_native() {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match client.progress_reads() {
-                Err(_) => {
-                    assert!(Instant::now() >= read_deadline);
-                    break;
-                }
-                Ok(completed) => assert!(completed.is_empty()),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "native outstanding read did not expire at its absolute deadline"
-            );
-        }
-        assert_eq!(server.node.read_admission.stats().inflight_bytes, charged);
-    }
-    drop(client);
-    assert_eq!(server.node.read_admission.stats().inflight_bytes, charged);
-    release.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while server.node.read_admission.stats().inflight_requests != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "cancelled cold planning retained reply credit"
-        );
-        thread::yield_now();
-    }
-    assert_eq!(server.node.read_admission.stats().inflight_bytes, 0);
-    assert_eq!(server.node.read_admission.stats().inflight_reads, 0);
-}
-#[test]
-fn disconnect_retains_cold_planning_credits_until_the_worker_retires() {
-    disconnect_retains_cold_planning_credits_until_the_worker_retires_for(Transport::Tcp);
-}
-
-#[cfg(feature = "experimental-fabric")]
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement() {
-    disconnect_retains_cold_planning_credits_until_the_worker_retires_for(software_transport(
-        FabricSecurity::Trusted,
-    ));
 }

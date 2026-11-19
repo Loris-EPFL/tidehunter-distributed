@@ -1,8 +1,8 @@
 // Submodules
 pub(crate) mod allocator;
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 mod external;
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(all(test, feature = "experimental-distributed", target_os = "linux"))]
 pub(crate) use external::fiemap;
 pub(crate) mod files;
 pub mod layout;
@@ -37,7 +37,7 @@ use crate::wal::mapper::WalMaps;
 use crate::wal_allocator::WalAllocator;
 use files::WalFiles;
 use layout::WalLayout;
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 pub(crate) use mapper::ExternalFilePreparer;
 use mapper::{INITIAL_MAPS_BUFFER, WalMapper};
 use position::{LastProcessed, MapId, WalPosition};
@@ -59,7 +59,7 @@ pub struct Wal {
     background_health: Arc<BackgroundHealth>,
     #[cfg(feature = "experimental-distributed")]
     retained: bool,
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     external_preparation: Arc<external::ExternalPreparation>,
     /// Files below this id hold only finished writes and are synced; see
     /// `sync_files_through`.
@@ -122,8 +122,10 @@ pub enum WalRandomRead {
 
 /// Native allocation pin for an externally written final frame. The tracker
 /// cannot advance over it until validated adoption explicitly releases it.
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 pub(crate) struct ExternalWalAllocation {
+    /// Allocated frame position; only tests inspect it after allocation.
+    #[cfg(test)]
     pub(crate) position: WalPosition,
     pub(crate) file: Arc<File>,
     pub(crate) path: std::path::PathBuf,
@@ -131,12 +133,12 @@ pub(crate) struct ExternalWalAllocation {
 }
 
 impl WalWriter {
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn external_file_preparer(&self) -> ExternalFilePreparer {
         self.wal_tracker.external_file_preparer()
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn reserve_external(&self, frame_len: u32) -> io::Result<ExternalWalAllocation> {
         let len = u64::from(frame_len);
         if len == 0
@@ -169,6 +171,7 @@ impl WalWriter {
         let path = self.wal.layout.wal_file_name(&files.base_path, file_id);
         let guard = self.wal_tracker.allocated_external(allocation)?;
         Ok(ExternalWalAllocation {
+            #[cfg(test)]
             position: WalPosition::new(position, frame_len),
             file,
             path,
@@ -400,14 +403,14 @@ impl Wal {
             layout,
             metrics,
             background_health,
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             false,
         )
     }
 
     /// Only newly created owner streams use this entry point. Recovery opens
     /// retained WALs instead: it must never zero acknowledged historical bytes.
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn open_external_prewrite(
         base_path: &Path,
         layout: WalLayout,
@@ -421,11 +424,11 @@ impl Wal {
         layout: WalLayout,
         metrics: Arc<Metrics>,
         background_health: Arc<BackgroundHealth>,
-        #[cfg(feature = "experimental-nvmeof")] prewrite: bool,
+        #[cfg(feature = "experimental-distributed")] prewrite: bool,
     ) -> io::Result<Arc<Self>> {
         layout.assert_layout();
         let files = WalFiles::new(base_path, &layout)?;
-        #[cfg(feature = "experimental-nvmeof")]
+        #[cfg(feature = "experimental-distributed")]
         let external_preparation = {
             let preparation = Arc::new(external::ExternalPreparation::new(prewrite));
             if prewrite {
@@ -444,7 +447,7 @@ impl Wal {
             background_health,
             #[cfg(feature = "experimental-distributed")]
             retained: false,
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             external_preparation,
             synced_below: AtomicU64::new(0),
             #[cfg(test)]
@@ -471,7 +474,7 @@ impl Wal {
             metrics,
             background_health: Arc::default(),
             retained: true,
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             external_preparation: Arc::new(external::ExternalPreparation::new(false)),
             synced_below: AtomicU64::new(0),
             #[cfg(test)]
@@ -479,7 +482,7 @@ impl Wal {
         }))
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn external_prewrite_stats(&self) -> (u64, u64, u64) {
         self.external_preparation.stats()
     }
@@ -1305,7 +1308,7 @@ impl WalIterator {
             syncer,
             self.wal.metrics.clone(),
             self.wal.background_health.clone(),
-            #[cfg(feature = "experimental-nvmeof")]
+            #[cfg(feature = "experimental-distributed")]
             self.wal.external_preparation.clone(),
         );
         // The writer doesn't use `self.map` directly — it looks up the
@@ -1644,7 +1647,7 @@ mod tests {
         assert_eq!(wal.read(position).unwrap().1.unwrap().as_ref(), &[5; 100]);
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(feature = "experimental-distributed")]
     #[test]
     fn external_reservation_reads_without_map_and_resumes_native_writes() {
         use std::os::unix::fs::MetadataExt;
@@ -1733,7 +1736,7 @@ mod tests {
         drop(preparer);
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(feature = "experimental-distributed")]
     #[test]
     fn external_unmapped_reservation_survives_watermark_at_its_file_start() {
         let dir = tempdir::TempDir::new("external-watermark").unwrap();
@@ -1778,7 +1781,7 @@ mod tests {
         drop(preparer);
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(feature = "experimental-distributed")]
     #[test]
     fn external_preparer_creates_only_the_next_file_and_preserves_writes() {
         for external in [false, true] {

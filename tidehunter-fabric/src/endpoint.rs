@@ -1,21 +1,15 @@
 //! Rust ownership and completion state over OFI's generated libfabric bindings.
 
-mod efa_direct;
 mod resources;
 use crate::{FabricBackend, FabricConfig};
-use efa_direct::{ControlWindow, SendWindow, StreamReceiver};
 use ofi_libfabric_sys::bindgen as ffi;
 use resources::{ADDRESS, Resources, error, invalid};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::{
-    any::Any,
     io::{self, IoSlice, Write},
     mem,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -24,7 +18,6 @@ const CHUNK: usize = 65_536;
 const SLOTS: usize = crate::DEFAULT_SLOTS;
 const PROGRESS_LIMIT: usize = 10_000_000;
 pub(crate) const ENDPOINTS: usize = 1024;
-pub(super) const RMA_CANCELLED: u64 = 1 << 63;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Bounded lifetime CQ counters. Poll-gap timing is opt-in and measures the
@@ -73,12 +66,6 @@ pub struct ProgressStats {
     pub cq_poll_gap_ns: u64,
     pub cq_poll_gap_samples: u64,
     pub cq_poll_gap_max_ns: u64,
-    /// Successful EFA-direct DATA packets, excluding EAGAIN attempts.
-    pub efa_direct_data_posts: u64,
-    /// Successful standalone EFA-direct CREDIT packets, excluding DATA-carried credit.
-    pub efa_direct_credit_posts: u64,
-    /// Successful DATA posts that advanced the advertised cumulative credit frontier.
-    pub efa_direct_credit_piggyback_advances: u64,
     /// Successful `fi_send` posts by posted message length. Always on: plain
     /// counter increments, no clock reads. Every normal post is at most 64 KiB,
     /// so the last bucket stays zero except for a future larger chunk size.
@@ -119,40 +106,6 @@ pub struct OpenProfile {
     pub mtu: usize,
     pub provider_version: u32,
 }
-/// Fixed per-endpoint bounds for registered one-sided reads.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RmaConfig {
-    pub source_bytes: usize,
-    pub source_region_slots: usize,
-    pub destination_bytes: usize,
-    pub destination_slots: usize,
-    pub max_read_bytes: usize,
-    pub require_device_read: bool,
-}
-
-/// The provider's selected memory addressing and read implementation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RmaCapabilities {
-    pub address_mode: RmaAddressMode,
-    pub read_mode: RmaReadMode,
-    pub max_read_bytes: usize,
-    pub max_iov: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RmaAddressMode {
-    Virtual,
-    Offset,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RmaReadMode {
-    Native,
-    Emulated,
-    Unknown,
-}
 
 /// Observed provider setup and the provenance of its advertised capabilities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -166,7 +119,6 @@ pub struct ProviderInfo {
     pub device: Option<String>,
     pub driver: Option<String>,
     pub bus_address: Option<String>,
-    pub rma_capabilities: Option<RmaCapabilities>,
     pub capability_evidence: String,
     /// Effective provider and geometry facts read once during open.
     #[serde(default)]
@@ -226,173 +178,18 @@ pub struct ProviderGeometry {
     pub rxm_parameters: Vec<ProviderParameter>,
 }
 
-/// Wire-safe remote address; contains no process-local MR descriptor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RemoteReadRegion {
-    pub region_id: u64,
-    pub generation: u64,
-    /// Peer-defined window base: a virtual address or an MR-relative offset.
-    pub remote_address: u64,
-    pub key: u64,
-    pub len: u64,
-}
-
-/// Opaque attestation that a peer/session grant has been drained.
-/// Its constructor is unsafe because remote-DMA quiescence cannot be inferred
-/// from local CQ, timeout, endpoint close, or MR close state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PeerDrainToken {
-    session_id: u64,
-    grant_generation: u64,
-}
-
-impl PeerDrainToken {
-    /// Creates an attestation after the exact peer's grant has been drained.
-    ///
-    /// # Safety
-    /// The caller must have closed admission for this session and grant, and
-    /// validated an acknowledgement on that exact peer session proving every accepted
-    /// `FI_READ` for this grant reached terminal completion. A timeout,
-    /// local endpoint/MR close, failed operation, unknown CQ context, or assumed
-    /// idle interval is not sufficient.
-    #[must_use]
-    pub const unsafe fn after_ack(session_id: u64, grant_generation: u64) -> Self {
-        Self {
-            session_id,
-            grant_generation,
-        }
-    }
-}
-
-/// Endpoint-local handle for a reserved or registered immutable source region.
-#[derive(Debug, Eq, PartialEq)]
-pub struct RegisteredReadRegion {
-    owner_id: u64,
-    region_id: u64,
-    generation: u64,
-    session_id: u64,
-    grant_generation: u64,
-}
-
-impl RegisteredReadRegion {
-    /// Stable identity to include in the immutable member envelope.
-    #[must_use]
-    pub const fn region_id(&self) -> u64 {
-        self.region_id
-    }
-
-    /// Generation paired with `region_id` in the immutable member envelope.
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
-}
-
-/// Identifier for one accepted `FI_READ`. Dropping it never cancels provider
-/// work or releases its registered destination.
-pub struct ReadOperation {
-    slot: usize,
-    generation: u64,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    finished: bool,
-}
-
-impl Drop for ReadOperation {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.cancelled.fetch_or(RMA_CANCELLED, Ordering::Release);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ReadBufferStorage {
-    bytes: Box<[std::cell::UnsafeCell<u8>]>,
-    len: AtomicUsize,
-    charged_bytes: usize,
-    charged_slots: usize,
-}
-
-// SAFETY: Shared byte slices are exposed only after a successful terminal CQE.
-// Resources requires exclusive Arc ownership before posting another DMA write,
-// so no provider write can overlap a consumer's immutable slice. len is atomic.
-unsafe impl Sync for ReadBufferStorage {}
-
-impl Drop for ReadBufferStorage {
-    fn drop(&mut self) {
-        resources::release_destination_charge(self.charged_bytes, self.charged_slots);
-    }
-}
-
-/// Stable owned bytes whose backing DMA slot remains unavailable until drop.
-#[derive(Clone, Debug)]
-pub struct ReadBuffer {
-    storage: std::sync::Arc<ReadBufferStorage>,
-}
-
-impl AsRef<[u8]> for ReadBufferStorage {
-    fn as_ref(&self) -> &[u8] {
-        // SAFETY: Resources stores len <= bytes.len() before exposing a completed
-        // DMA slot. UnsafeCell<u8> has the layout of u8, and the Arc lease blocks
-        // slot reuse while this immutable slice borrows the live allocation.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.bytes.as_ptr().cast::<u8>(),
-                self.len.load(Ordering::Acquire),
-            )
-        }
-    }
-}
-
-impl minibytes::BytesOwner for ReadBufferStorage {}
-
-impl AsRef<[u8]> for ReadBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.storage.as_ref().as_ref()
-    }
-}
-
-impl ReadBuffer {
-    /// Transfers the preallocated destination-slot lease into a zero-copy owner.
-    #[must_use]
-    pub fn into_minibytes_bytes(self) -> minibytes::Bytes {
-        minibytes::Bytes::from_shared_owner(self.storage)
-    }
-}
-
 /// One exclusively operated `FI_EP_RDM` endpoint with `slots` 64 KiB slots each
 /// for sends and receives (default four, 512 KiB total; at most 64 each).
 /// Buffers and provider contexts have stable allocations across thread moves.
 pub struct Endpoint {
     resources: Option<Box<Resources>>,
-    direct: Option<Box<DirectState>>,
     failed: bool,
-}
-
-struct DirectState {
-    mtu: usize,
-    send: SendWindow,
-    receive: StreamReceiver,
-    control: ControlWindow,
-    pending_control: Option<u64>,
-}
-
-impl DirectState {
-    fn new(mtu: usize) -> io::Result<Self> {
-        Ok(Self {
-            mtu,
-            send: SendWindow::default(),
-            receive: StreamReceiver::new(mtu)?,
-            control: ControlWindow::default(),
-            pending_control: None,
-        })
-    }
 }
 
 // SAFETY: Provider operations require &mut self and use a domain negotiated as
 // FI_THREAD_DOMAIN or FI_THREAD_SAFE, so moving the sole endpoint owner preserves
-// serialized access. Provider handles, buffers and contexts keep stable addresses;
-// retained ReadBuffer leases prevent DMA slot reuse across thread moves.
+// serialized access. Provider handles, buffers and contexts keep stable addresses
+// across thread moves.
 unsafe impl Send for Endpoint {}
 
 impl Endpoint {
@@ -401,8 +198,8 @@ impl Endpoint {
     /// # Errors
     /// Reports invalid configuration, unavailable providers, unsupported
     /// capabilities, exhausted admission or native resource-setup failures.
-    pub fn open(config: &FabricConfig, rma: Option<RmaConfig>) -> io::Result<Self> {
-        Self::open_checked(config, rma, false)
+    pub fn open(config: &FabricConfig) -> io::Result<Self> {
+        Self::open_checked(config, false)
     }
 
     /// Like [`Endpoint::open`], for an owner that parks while idle: `verbs`
@@ -412,44 +209,12 @@ impl Endpoint {
     ///
     /// # Errors
     /// Same as [`Endpoint::open`].
-    pub fn open_idle_parking(config: &FabricConfig, rma: Option<RmaConfig>) -> io::Result<Self> {
-        Self::open_checked(config, rma, true)
+    pub fn open_idle_parking(config: &FabricConfig) -> io::Result<Self> {
+        Self::open_checked(config, true)
     }
 
-    fn open_checked(
-        config: &FabricConfig,
-        rma: Option<RmaConfig>,
-        park_idle: bool,
-    ) -> io::Result<Self> {
+    fn open_checked(config: &FabricConfig, park_idle: bool) -> io::Result<Self> {
         config.validate()?;
-        if config.backend == FabricBackend::Efa && rma.is_some() {
-            return Err(invalid(
-                "regular EFA RMA is unsupported; select the explicit efa-direct backend",
-            ));
-        }
-        Self::open_inner(config, rma, park_idle)
-    }
-
-    /// Test-only packet-protocol exercise over the explicitly selected software provider.
-    #[cfg(test)]
-    fn open_software_packet_test(domain: Option<&str>) -> io::Result<Self> {
-        let config = FabricConfig {
-            backend: FabricBackend::SoftwareTcp,
-            domain: domain.map(str::to_owned),
-            source_address: None,
-            slots: None,
-        };
-        let mut endpoint = Self::open(&config, None)?;
-        endpoint.inner().enable_test_packet_adapter();
-        endpoint.direct = Some(Box::new(DirectState::new(4096)?));
-        Ok(endpoint)
-    }
-
-    fn open_inner(
-        config: &FabricConfig,
-        rma: Option<RmaConfig>,
-        park_idle: bool,
-    ) -> io::Result<Self> {
         LIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
             (live < ENDPOINTS).then_some(live + 1)
         })
@@ -457,14 +222,10 @@ impl Endpoint {
         let allocation = Instant::now();
         let mut endpoint = Self {
             resources: Some(Box::default()),
-            direct: None,
             failed: false,
         };
         endpoint.inner().open_profile.allocation_ns = resources::elapsed_ns(allocation);
-        endpoint.inner().open_mode(config, rma, park_idle)?;
-        if config.backend.is_direct() {
-            endpoint.direct = Some(Box::new(DirectState::new(endpoint.open_profile().mtu)?));
-        }
+        endpoint.inner().open_mode(config, park_idle)?;
         Ok(endpoint)
     }
 
@@ -495,211 +256,6 @@ impl Endpoint {
     /// Reports invalid provider address data.
     pub fn address(&mut self) -> io::Result<Vec<u8>> {
         Ok(self.inner().address().to_vec())
-    }
-
-    /// Returns negotiated RMA capabilities, or `None` for message-only opens.
-    #[must_use]
-    pub fn rma_capabilities(&self) -> Option<RmaCapabilities> {
-        self.resources
-            .as_deref()
-            .and_then(Resources::rma_capabilities)
-    }
-    /// Counts currently reusable destination slots; this is advisory only.
-    /// The subsequent post is authoritative and can still return `WouldBlock`.
-    /// # Errors
-    /// Reports a failed endpoint or unavailable RMA state.
-    pub fn available_read_slots(&mut self) -> io::Result<usize> {
-        self.ready()?;
-        self.inner().available_read_slots()
-    }
-
-    /// Reserves an immutable source-region identity before encoding its envelope.
-    ///
-    /// The reservation consumes one bounded source-region slot but does not
-    /// allocate or register bytes. Finalize the envelope using its identity,
-    /// then call `register_read_region`.
-    /// # Errors
-    /// Rejects invalid identities, failed endpoints and exhausted source slots.
-    pub fn reserve_read_region(
-        &mut self,
-        session_id: u64,
-        grant_generation: u64,
-    ) -> io::Result<RegisteredReadRegion> {
-        self.ready()?;
-        self.inner()
-            .reserve_read_region(session_id, grant_generation)
-    }
-
-    /// Registers the finalized immutable envelope for its prior reservation.
-    /// # Errors
-    /// Rejects foreign or inactive reservations and exhausted byte budgets.
-    /// Provider registration errors retain any uncertain native ownership.
-    pub fn register_read_region(
-        &mut self,
-        region: &RegisteredReadRegion,
-        bytes: Vec<u8>,
-    ) -> io::Result<RemoteReadRegion> {
-        self.ready()?;
-        let result = self.inner().register_read_region(region, bytes);
-        if result.as_ref().is_err_and(|error| {
-            !matches!(
-                error.kind(),
-                io::ErrorKind::InvalidInput | io::ErrorKind::WouldBlock
-            )
-        }) {
-            self.failed = true;
-        }
-        result
-    }
-
-    /// Registers a finalized immutable envelope and retains its original source
-    /// owner for exactly as long as the provider-owned region is retained.
-    ///
-    /// Use this for buffers whose native authority or backing storage must stay
-    /// pinned while remote DMA may still address the registration. The owner is
-    /// retained on uncertain registration teardown and endpoint quarantine, and
-    /// released after exact peer drain and successful MR retirement.
-    /// The optional observation records only the provider `fi_mr_reg` call;
-    /// pre-registration admission errors leave it unchanged. Provider caching
-    /// means a successful call does not prove a new hardware pin.
-    ///
-    /// # Errors
-    /// Rejects foreign or inactive reservations and exhausted source budgets.
-    /// Provider errors retain the owner whenever native ownership is uncertain.
-    pub fn register_read_region_with_owner_profiled(
-        &mut self,
-        region: &RegisteredReadRegion,
-        bytes: Vec<u8>,
-        owner: Arc<dyn Any + Send + Sync>,
-        observation: Option<&mut Option<(u64, bool)>>,
-    ) -> io::Result<RemoteReadRegion> {
-        self.ready()?;
-        let result =
-            self.inner()
-                .register_read_region_with_owner(region, bytes, Some(owner), observation);
-        if result.as_ref().is_err_and(|error| {
-            !matches!(
-                error.kind(),
-                io::ErrorKind::InvalidInput | io::ErrorKind::WouldBlock
-            )
-        }) {
-            self.failed = true;
-        }
-        result
-    }
-
-    /// Registers a source and retains its owner until safe retirement.
-    /// # Errors
-    /// Rejects invalid reservations and exhausted budgets; uncertain ownership is retained.
-    pub fn register_read_region_with_owner(
-        &mut self,
-        region: &RegisteredReadRegion,
-        bytes: Vec<u8>,
-        owner: Arc<dyn Any + Send + Sync>,
-    ) -> io::Result<RemoteReadRegion> {
-        self.register_read_region_with_owner_profiled(region, bytes, owner, None)
-    }
-
-    /// Retires a source region only after the matching peer drain acknowledgement.
-    /// # Errors
-    /// Rejects foreign regions, inactive identities and mismatched drain tokens.
-    /// Native close failures quarantine the registered source.
-    pub fn retire_read_region(
-        &mut self,
-        region: RegisteredReadRegion,
-        token: PeerDrainToken,
-    ) -> io::Result<()> {
-        self.ready()?;
-        let result = self.inner().retire_read_region(region, token);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() != io::ErrorKind::InvalidInput)
-        {
-            self.failed = true;
-        }
-        result
-    }
-    /// Reclaims a source registered for a grant that was never published.
-    ///
-    /// # Errors
-    /// Reports invalid region identity, failed endpoints or native close failure.
-    /// Uncertain ownership remains quarantined.
-    ///
-    /// # Safety
-    /// The caller must prove that neither this region's descriptor nor any
-    /// equivalent address/key/length was ever exposed to the remote peer.
-    pub unsafe fn retire_unpublished_read_region(
-        &mut self,
-        region: RegisteredReadRegion,
-    ) -> io::Result<()> {
-        self.ready()?;
-        // SAFETY: The caller proves this exact region's address/key/length never
-        // reached the peer. Forwarding the region preserves that proof.
-        let result = unsafe { self.inner().retire_unpublished_read_region(region) };
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() != io::ErrorKind::InvalidInput)
-        {
-            self.failed = true;
-        }
-        result
-    }
-
-    /// Posts one actual `FI_READ` from a previously registered peer region.
-    /// `WouldBlock` means no operation was accepted and ownership was not taken.
-    /// # Errors
-    /// Rejects invalid ranges and failed endpoints. Exhausted destinations or
-    /// provider backpressure return `WouldBlock` without accepting a read.
-    pub fn try_post_read(
-        &mut self,
-        remote: &RemoteReadRegion,
-        offset: usize,
-        len: usize,
-    ) -> io::Result<ReadOperation> {
-        self.ready()?;
-        let result = self.inner().try_post_read(remote, offset, len);
-        match result {
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
-            result => self.finish_try(result),
-        }
-    }
-
-    /// Polls the shared CQ once and returns the exact operation's terminal bytes.
-    /// The destination remains unavailable until every returned `ReadBuffer`
-    /// clone is dropped. Dropping the operation before completion never cancels DMA.
-    /// # Errors
-    /// The outer result reports foreign operations or endpoint/progress errors.
-    /// The inner result reports the accepted operation's terminal provider error.
-    pub fn try_read_completion(
-        &mut self,
-        operation: &mut ReadOperation,
-    ) -> io::Result<Option<io::Result<ReadBuffer>>> {
-        self.ready()?;
-        self.inner().validate_read_operation(operation)?;
-        let result = self
-            .inner()
-            .poll()
-            .and_then(|_| self.inner().take_read_completion(operation));
-        self.finish_try(result)
-    }
-
-    /// Takes a previously progressed operation without polling the shared CQ.
-    ///
-    /// Batch owners can call `try_progress` once and then harvest each operation.
-    /// Destination ownership and generation checks match `try_read_completion`.
-    /// # Errors
-    /// The outer result reports foreign operations or a failed endpoint.
-    /// The inner result reports the accepted operation's terminal provider error.
-    pub fn take_read_completion(
-        &mut self,
-        operation: &mut ReadOperation,
-    ) -> io::Result<Option<io::Result<ReadBuffer>>> {
-        self.ready()?;
-        let result = self.inner().take_read_completion(operation);
-        match result {
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
-            result => self.finish_try(result),
-        }
     }
 
     /// Installs one authenticated peer and posts the initial receive buffer.
@@ -750,170 +306,16 @@ impl Endpoint {
         if bytes.iter().all(|slice| slice.is_empty()) {
             return Ok(0);
         }
-        let result = if self.direct.is_some() {
-            self.direct_send_vectored(bytes, poll)
-        } else {
-            (|| {
-                let state = self.inner();
-                if poll {
-                    state.poll()?;
-                }
-                state.send_copied(bytes)
-            })()
-        };
+        let result = (|| {
+            let state = self.inner();
+            if poll {
+                state.poll()?;
+            }
+            state.send_copied(bytes)
+        })();
         self.finish_try(result)
     }
 
-    fn direct_send_vectored(&mut self, slices: &[IoSlice<'_>], poll: bool) -> io::Result<usize> {
-        if poll {
-            self.direct_progress(true)?;
-        }
-        let direct = self
-            .direct
-            .as_mut()
-            .ok_or_else(|| invalid("missing EFA-direct state"))?;
-        if slices.iter().all(|slice| slice.is_empty()) {
-            return Ok(0);
-        }
-        let ordinal = direct.send.next_ordinal()?;
-        let credit = direct.receive.consumed();
-        let mtu = direct.mtu;
-        let state = self
-            .resources
-            .as_deref_mut()
-            .ok_or_else(|| invalid("missing fabric resources"))?;
-        let slot = state.free_send_slot().ok_or(io::ErrorKind::WouldBlock)?;
-        let packet_len = state.prepare_direct_send(slot, |output| {
-            efa_direct::encode_data_vectored(output, ordinal, credit, slices, mtu)
-        })?;
-        if !state.post_send(slot, packet_len)? {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        let direct = self
-            .direct
-            .as_mut()
-            .ok_or_else(|| invalid("missing EFA-direct state"))?;
-        direct.send.posted(ordinal)?;
-        let piggyback_advanced = direct.control.advertised_by_data(credit);
-        state.record_direct_data_post(piggyback_advanced);
-        Ok(packet_len - efa_direct::HEADER_LEN)
-    }
-
-    fn direct_receive(
-        &mut self,
-        output: &mut [u8],
-        poll: bool,
-        defer_credit: bool,
-    ) -> io::Result<usize> {
-        if poll {
-            self.direct_progress(true)?;
-        }
-        let result = self
-            .direct
-            .as_mut()
-            .ok_or_else(|| invalid("missing EFA-direct state"))?
-            .receive
-            .read(output);
-        match result {
-            Ok((len, Some(_credit))) => {
-                // The reactor's sweep adapter defers CREDIT so queued DATA can
-                // piggyback its cumulative frontier. Blocking helpers retain
-                // eager control progress before returning consumed bytes.
-                if !defer_credit {
-                    let _ = self.queue_direct_control()?;
-                }
-                Ok(len)
-            }
-            Ok((len, None)) => Ok(len),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn queue_direct_control(&mut self) -> io::Result<bool> {
-        let direct = self
-            .direct
-            .as_mut()
-            .ok_or_else(|| invalid("missing EFA-direct state"))?;
-        let state = self
-            .resources
-            .as_deref_mut()
-            .ok_or_else(|| invalid("missing fabric resources"))?;
-        if let Some(ordinal) = direct.pending_control {
-            if state.free_control_slot().is_none() {
-                return Ok(false);
-            }
-            direct.control.complete(ordinal)?;
-            direct.pending_control = None;
-        }
-        let consumed = direct.receive.consumed();
-        let Some(ordinal) = direct.control.prepare(consumed)? else {
-            return Ok(false);
-        };
-        let Some(slot) = state.free_control_slot() else {
-            return Ok(false);
-        };
-        let len = state.prepare_direct_send(slot, |output| {
-            efa_direct::encode_credit(output, ordinal, consumed)
-        })?;
-        if !state.post_send(slot, len)? {
-            return Ok(false);
-        }
-        direct.control.posted(ordinal, consumed)?;
-        direct.pending_control = Some(ordinal);
-        state.record_direct_credit_post();
-        Ok(true)
-    }
-
-    fn direct_progress(&mut self, flush_credit: bool) -> io::Result<bool> {
-        let direct = self
-            .direct
-            .as_mut()
-            .ok_or_else(|| invalid("missing EFA-direct state"))?;
-        let state = self
-            .resources
-            .as_deref_mut()
-            .ok_or_else(|| invalid("missing fabric resources"))?;
-        let mut progressed = state.poll()?;
-        loop {
-            let packet = state.process_direct_packet(|bytes| {
-                match efa_direct::decode(bytes, direct.mtu)? {
-                    efa_direct::Packet::Data {
-                        ordinal,
-                        credit,
-                        payload,
-                    } => {
-                        direct.send.credit(credit)?;
-                        direct.receive.accept_data(ordinal, payload)
-                    }
-                    efa_direct::Packet::Credit { consumed, .. } => {
-                        // Cumulative control is idempotent; an older reordered
-                        // credit cannot release more than its stated frontier.
-                        direct.send.credit(consumed)
-                    }
-                }
-            })?;
-            if !packet {
-                break;
-            }
-            progressed = true;
-        }
-        if let Some(ordinal) = direct.pending_control
-            && state.free_control_slot().is_some()
-        {
-            direct.control.complete(ordinal)?;
-            direct.pending_control = None;
-            progressed = true;
-        }
-        match state.try_post_receive() {
-            Ok(posted) => progressed |= posted,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-        if flush_credit && self.queue_direct_control()? {
-            progressed = true;
-        }
-        Ok(progressed)
-    }
     /// Copies bytes from the next completed receive in stream order. Reads at
     /// most one CQ batch and attempts at most one receive repost, without waiting.
     /// Consumed slots whose repost gets EAGAIN are retried by later receive or
@@ -927,7 +329,7 @@ impl Endpoint {
 
     /// Consumes one already-completed receive and attempts one repost, without
     /// reading the CQ. Sweep callers pair this with
-    /// `try_progress_for_sweep`; standalone `try_progress` keeps eager control progress.
+    /// `try_progress_for_sweep`.
     /// # Errors
     /// Same ownership, `WouldBlock` and poisoning rules as `try_receive`.
     pub fn try_receive_no_poll(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -939,23 +341,19 @@ impl Endpoint {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let result = if self.direct.is_some() {
-            self.direct_receive(bytes, poll, !poll)
-        } else {
-            (|| {
-                let state = self.inner();
-                if poll {
-                    state.poll()?;
-                }
-                let len = state.copy_receive(bytes);
-                if let Err(error) = state.try_post_receive()
-                    && error.kind() != io::ErrorKind::WouldBlock
-                {
-                    return Err(error);
-                }
-                len.ok_or_else(|| io::ErrorKind::WouldBlock.into())
-            })()
-        };
+        let result = (|| {
+            let state = self.inner();
+            if poll {
+                state.poll()?;
+            }
+            let len = state.copy_receive(bytes);
+            if let Err(error) = state.try_post_receive()
+                && error.kind() != io::ErrorKind::WouldBlock
+            {
+                return Err(error);
+            }
+            len.ok_or_else(|| io::ErrorKind::WouldBlock.into())
+        })();
         self.finish_try(result)
     }
 
@@ -967,20 +365,16 @@ impl Endpoint {
     /// already have progressed). Other progress/post errors poison the endpoint.
     pub fn try_progress(&mut self) -> io::Result<bool> {
         self.ready()?;
-        let result = if self.direct.is_some() {
-            self.direct_progress(true)
-        } else {
-            let state = self.inner();
-            state
-                .poll()
-                .and_then(|completed| state.try_post_receive().map(|posted| completed || posted))
-        };
+        let state = self.inner();
+        let result = state
+            .poll()
+            .and_then(|completed| state.try_post_receive().map(|posted| completed || posted));
         self.finish_try(result)
     }
 
     /// One CQ acquisition for a reactor sweep. An idle deadline permits a
     /// provider-managed bounded wait only when the message endpoint is fully
-    /// quiescent; it never changes direct or RMA progress.
+    /// quiescent.
     /// Returns `(made_progress, used_bounded_wait)`.
     /// # Errors
     /// Returns nonpoisoning `WouldBlock` for receive repost backpressure; other
@@ -990,19 +384,14 @@ impl Endpoint {
         idle_deadline: Option<Instant>,
     ) -> io::Result<(bool, bool)> {
         self.ready()?;
-        let result = if self.direct.is_some() {
-            self.direct_progress(false)
-                .map(|progress| (progress, false))
-        } else {
-            let state = self.inner();
-            state
-                .poll_for_sweep(idle_deadline)
-                .and_then(|(completed, waited)| {
-                    state
-                        .try_post_receive()
-                        .map(|posted| (completed || posted, waited))
-                })
-        };
+        let state = self.inner();
+        let result = state
+            .poll_for_sweep(idle_deadline)
+            .and_then(|(completed, waited)| {
+                state
+                    .try_post_receive()
+                    .map(|posted| (completed || posted, waited))
+            });
         self.finish_try(result)
     }
 
@@ -1011,25 +400,10 @@ impl Endpoint {
     #[must_use]
     pub fn supports_idle_wait(&self) -> bool {
         !self.failed
-            && self.direct.is_none()
             && self
                 .resources
                 .as_deref()
                 .is_some_and(Resources::supports_idle_wait)
-    }
-
-    /// Sends standalone EFA-direct credit debt without acquiring the CQ.
-    /// # Errors
-    /// Returns provider/packet errors; a nonfatal unavailable slot or EAGAIN
-    /// leaves credit debt pending for the next sweep.
-    pub fn finish_sweep_no_poll(&mut self) -> io::Result<bool> {
-        self.ready()?;
-        let result = if self.direct.is_some() {
-            self.queue_direct_control()
-        } else {
-            Ok(false)
-        };
-        self.finish_try(result)
     }
 
     /// Derived ordered-stream readiness; never polls, copies or posts.
@@ -1037,11 +411,7 @@ impl Endpoint {
     /// Fails if the endpoint is unbound or poisoned.
     pub fn receive_ready(&mut self) -> io::Result<bool> {
         self.ready()?;
-        if let Some(direct) = &self.direct {
-            Ok(direct.receive.receive_ready())
-        } else {
-            Ok(self.inner().receive_ready())
-        }
+        Ok(self.inner().receive_ready())
     }
 
     /// Whether a successful send post still owns any local TX slot. Application
@@ -1150,19 +520,6 @@ impl Endpoint {
     }
 
     fn queue_send_inner(&mut self, bytes: &[IoSlice<'_>], deadline: Instant) -> io::Result<usize> {
-        if self.direct.is_some() {
-            for _ in 0..PROGRESS_LIMIT {
-                remaining(deadline)?;
-                match self.direct_send_vectored(bytes, false) {
-                    Ok(len) => return Ok(len),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        self.direct_progress(true)?;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            return Err(error("efa-direct send progress limit", ffi::FI_ETIMEDOUT));
-        }
         let state = self.inner();
         let mut copied = None;
         let mut progress = Progress::new(false);
@@ -1192,11 +549,7 @@ impl Endpoint {
     pub fn progress(&mut self, deadline: Instant) -> io::Result<()> {
         self.ready()?;
         remaining(deadline)?;
-        let result = if self.direct.is_some() {
-            self.direct_progress(true).map(|_| ())
-        } else {
-            self.inner().poll().map(|_| ())
-        };
+        let result = self.inner().poll().map(|_| ());
         self.failed = result.is_err();
         result
     }
@@ -1215,21 +568,6 @@ impl Endpoint {
     }
 
     fn flush_inner(&mut self, deadline: Instant) -> io::Result<()> {
-        if self.direct.is_some() {
-            for _ in 0..PROGRESS_LIMIT {
-                remaining(deadline)?;
-                self.direct_progress(true)?;
-                let sends_pending = self.inner().sends_pending();
-                let control_pending = self
-                    .direct
-                    .as_ref()
-                    .is_some_and(|direct| direct.control.needs_send(direct.receive.consumed()));
-                if !sends_pending && !control_pending {
-                    return Ok(());
-                }
-            }
-            return Err(error("efa-direct flush progress limit", ffi::FI_ETIMEDOUT));
-        }
         let state = self.inner();
         let mut progress = Progress::new(false);
         for _ in 0..PROGRESS_LIMIT {
@@ -1302,30 +640,6 @@ impl Endpoint {
         idle: bool,
         check_peer: &mut impl FnMut() -> io::Result<()>,
     ) -> io::Result<usize> {
-        if self.direct.is_some() {
-            for poll in 0..PROGRESS_LIMIT {
-                remaining(deadline)?;
-                if poll % 1024 == 0 {
-                    check_peer()?;
-                }
-                match self.direct_receive(bytes, false, false) {
-                    Ok(len) => return Ok(len),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        self.direct_progress(true)?;
-                        if idle && poll >= 64 {
-                            std::thread::sleep(Duration::from_micros(50));
-                        } else {
-                            std::thread::yield_now();
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            return Err(error(
-                "efa-direct receive progress limit",
-                ffi::FI_ETIMEDOUT,
-            ));
-        }
         let state = self.inner();
         let mut progress = Progress::new(idle);
         for poll in 0..PROGRESS_LIMIT {
@@ -1363,17 +677,6 @@ impl Endpoint {
 impl Drop for Endpoint {
     fn drop(&mut self) {
         if let Some(mut resources) = self.resources.take() {
-            if resources.has_live_read_regions() {
-                // A successful local endpoint close does not prove that remote
-                // initiators have stopped reading a published registered region.
-                // Retain the entire domain, MR, bytes and admission permit.
-                mem::forget(resources);
-                let _ = writeln!(
-                    io::stderr(),
-                    "fabric source region not peer-drained; bounded resources quarantined"
-                );
-                return;
-            }
             if let Err(error) = resources.close() {
                 // A provider may still access registered memory after failed
                 // close. Retain its buffers, contexts and admission permit.

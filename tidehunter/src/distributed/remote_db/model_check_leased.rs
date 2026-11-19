@@ -1,10 +1,8 @@
 //! Local-file LiveIo exercises the production leased worker, not a kernel target.
 use super::*;
 use crate::distributed::durability::DurabilityTier;
-use crate::distributed::nvmeof::{
-    LiveTargetConfig, NvmeofTransport, live_metrics::LiveNvmeMetrics,
-};
-use crate::distributed::tcp::{LeasedSync, LiveClientConfig, LiveWriteMode, StorageNode};
+use crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics;
+use crate::distributed::tcp::{LeasedSync, LiveClientConfig};
 
 const LEASED_BOUNDARIES: &[&str] = &[
     "write_submitted_to_kernel",
@@ -38,9 +36,6 @@ pub(super) fn profile(index: usize) -> LeasedCase {
 }
 
 pub(super) fn boundaries(case: &Case) -> Vec<&'static str> {
-    if case.leased.is_none() {
-        return BOUNDARIES.to_vec();
-    }
     let mut boundaries = LEASED_BOUNDARIES.to_vec();
     if case.flush_probe() {
         boundaries.extend_from_slice(FLUSH_BOUNDARIES);
@@ -54,9 +49,11 @@ pub(super) fn configure(config: &mut RemoteDatabaseConfig, profile: LeasedCase) 
     config.storage.group_limits.max_batches = 1;
     config.storage.fragment_bytes = 256 * 1024;
     config.storage.wal_file_bytes = 8 * 1024 * 1024;
-    config.max_pending_bytes = 4 * 1024 * 1024;
+    // Recovery pages need one bounded batch per owner (`recovery_page_limit`):
+    // 4 MiB holds up to 15 owners at this batch size; 16 owners need more.
+    config.max_pending_bytes = (4 * 1024 * 1024).max(config.storage.partitions.len() * 320 * 1024);
     config.owner_append_occupancy = 4;
-    config.live_nvme = Some(LiveClientConfig {
+    config.live_nvme = LiveClientConfig {
         host_nqn: "nqn.2026-01.test:write-model".into(),
         host_id: [1; 16],
         owner_identities: Default::default(),
@@ -71,90 +68,16 @@ pub(super) fn configure(config: &mut RemoteDatabaseConfig, profile: LeasedCase) 
         max_inflight_bytes: 4 * 1024 * 1024,
         connect_timeout_ms: 5000,
         io_timeout_ms: 5000,
-        write_mode: LiveWriteMode::Leased,
-        leased_durability: Some(if profile.synchronous {
+        leased_durability: if profile.synchronous {
             DurabilityTier::Synchronous
         } else {
             DurabilityTier::Native
-        }),
+        },
         lease_ahead: true,
         polled_writes: false,
         inline_reads: false,
         queue_geometry: Default::default(),
-        export_mode: Default::default(),
-    });
-}
-
-pub(super) fn open_node(config: super::super::super::tcp::NodeConfig) -> Arc<StorageNode> {
-    try_open_node(config).unwrap()
-}
-
-fn try_open_node(
-    mut config: super::super::super::tcp::NodeConfig,
-) -> Result<Arc<StorageNode>, super::super::super::tcp::TcpError> {
-    let state_dir = config.root.with_extension("model-target");
-    let configfs = config.root.with_extension("model-configfs");
-    fs::create_dir_all(&state_dir).unwrap();
-    for name in ["hosts", "ports", "subsystems"] {
-        fs::create_dir_all(configfs.join(name)).unwrap();
-    }
-    config.live_target = Some(LiveTargetConfig {
-        address: "127.0.0.1".into(),
-        service: 4420,
-        transport: NvmeofTransport::Tcp,
-        host_nqn: "nqn.2026-01.test:write-model".into(),
-        port_id: 42,
-        state_dir,
-        commissioning_port_id: 43,
-        commissioning_service: 4421,
-        spdk: None,
-        export_mode: Default::default(),
-    });
-    StorageNode::bench_open_live_fixture(config, recovery_metrics(), configfs)
-}
-
-pub(super) fn prepare_database(db: &mut RemoteDatabase) {
-    for worker in &db.core.clients {
-        worker.client.lock().bench_local_live_fixture(false);
-    }
-}
-
-pub(super) type RecoveryReadPin = (Arc<Mutex<Client>>, [u8; 16]);
-
-/// Recovery has no write-created local controller to share with live readers.
-/// Register actual owner-resolved WAL paths in the existing file-backed pool
-/// fixture; product read planning, pinning, I/O and validation remain unchanged.
-pub(super) fn prepare_recovery_reads(db: &RemoteDatabase) -> Vec<RecoveryReadPin> {
-    let page = db
-        .index_page(KeySpace(0), None, false, db.published_cut().unwrap())
-        .unwrap();
-    assert!(page.len() <= KEYS);
-    let mut by_owner = BTreeMap::<_, Vec<_>>::new();
-    for (_, reference) in page {
-        by_owner
-            .entry(reference.batch_address.partition)
-            .or_default()
-            .push(reference);
-    }
-    let pool = db.core.live_pool.as_ref().unwrap();
-    let mut pins = Vec::with_capacity(by_owner.len());
-    for (partition, references) in by_owner {
-        let client = db.core.clients[db.core.partition_indexes[&partition]]
-            .client
-            .clone();
-        let resolved = client
-            .lock()
-            .resolve_live_records(db.epoch(), &references)
-            .unwrap();
-        for location in resolved.entries {
-            pool.register_local_target(&location.binding.nqn, location.segment.path);
-        }
-        // Retain the preparation pin until product reads acquired their own
-        // pins. Otherwise re-export can replace the NQN before the local
-        // controller fixture connects to the registered identity.
-        pins.push((client, resolved.epoch_pin_token));
-    }
-    pins
+    };
 }
 
 pub(super) fn quiesce(clients: &[Arc<Mutex<Client>>]) {
@@ -236,10 +159,12 @@ pub(super) fn verify_counts(profile: LeasedCase, metrics: &LiveNvmeMetrics, dire
 #[test]
 fn write_model_leased_seeded_crashes() {
     for index in 0..8 {
-        let case = Case {
-            leased: Some(profile(index)),
-            ..Case::rpc(0x5a17 + index as u64, [1, 2, 4][index % 3], index % 2 != 0)
-        };
+        let case = Case::new(
+            0x5a17 + index as u64,
+            [1, 2, 4][index % 3],
+            index % 2 != 0,
+            profile(index),
+        );
         run_case(&case);
         for boundary in boundaries(&case) {
             run_case(&Case {
@@ -259,17 +184,18 @@ fn write_model_leased_reopen_rejects_missing_registry() {
         KeyShape::new_single(4, 8, KeyType::uniform(8)),
         2,
         |config| configure(config, profile(0)),
-        open_node,
+        |_| {},
     );
     let config = fixture.startups[0].0.clone();
+    let host_nqn = fixture.config.live_nvme.host_nqn.clone();
     fixture.stop_owners();
     let registry = config
         .root
-        .with_extension("model-target")
+        .with_extension("live-target")
         .join("live-target.json");
     assert!(registry.is_file());
     fs::remove_file(&registry).unwrap();
-    let error = match try_open_node(config) {
+    let error = match open_live_node(config, &host_nqn) {
         Ok(_) => panic!("owner reopened with a missing commissioned target registry"),
         Err(error) => error,
     };

@@ -1,10 +1,7 @@
 //! Authenticated, metadata-only control for direct live WAL access.
 
 use super::*;
-use crate::distributed::nvmeof::live_storage::{
-    LiveAdoption, LiveGroupDescriptor, LiveWalSegment, LiveWriteExtent, LiveWriteReservation,
-};
-use crate::distributed::nvmeof::live_target::LiveTargetBinding;
+use crate::distributed::nvmeof::live_storage::{LiveTargetBinding, LiveWalSegment};
 
 /// Immutable authenticated connection recipe shared by cold pool operations.
 pub(crate) struct LivePinRecipe {
@@ -179,98 +176,6 @@ impl LiveExportPin {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveExportInfo {
-    pub mode: LiveExportMode,
-    pub address: String,
-    pub service: u16,
-    pub transport: super::super::nvmeof::NvmeofTransport,
-    pub wal_file_bytes: u64,
-    pub block_size: u32,
-    pub exported_files: u64,
-}
-
-/// Writable binding for one fragment remainder; never a durability proof.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveLeased {
-    pub extent: LiveWriteExtent,
-    pub binding: LiveTargetBinding,
-    /// Authoritative, immutable policy of the stream whose frontier is started.
-    pub tier: crate::distributed::durability::DurabilityTier,
-    pub profile: LeaseProfile,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveAdopted {
-    pub adoption: LiveAdoption,
-    pub next: Option<LiveLeased>,
-    pub profile: AdoptProfile,
-}
-
-/// Owner-local intervals; they must not be subtracted from coordinator clocks.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct LeaseProfile {
-    pub reserve_ns: u64,
-    pub namespace_sync_ns: u64,
-    pub publish_ns: u64,
-}
-
-/// Adoption time includes close scanning. Frames counts only newly adopted frames.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct AdoptProfile {
-    pub frames: u64,
-    pub adopt_ns: u64,
-    pub close_scan_ns: u64,
-    pub close_scan_bytes: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveReserved {
-    pub reservation: LiveWriteReservation,
-    pub binding: LiveTargetBinding,
-}
-
-pub enum LiveReserveResponse {
-    Existing(Vec<DurableBatch>),
-    Reserved(LiveReserved),
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) enum LiveReserveWire {
-    Existing(Vec<Receipt>),
-    Reserved(LiveReserved),
-}
-/// Owner-side validation and persistence observations, separate from RPC RTT.
-pub struct LiveCompletion {
-    pub receipts: Vec<DurableBatch>,
-    pub validation_ns: u64,
-    pub validation_samples: u64,
-    pub persistence: crate::distributed::storage::StorageWriteProfile,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct LiveCompletionWire {
-    pub(super) receipts: Vec<Receipt>,
-    pub(super) validation_ns: u64,
-    pub(super) validation_samples: u64,
-    pub(super) persistence: crate::distributed::storage::StorageWriteProfile,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveRecordLocation {
-    pub reference: ValueRecordReference,
-    pub segment: LiveWalSegment,
-    pub binding: LiveTargetBinding,
-    pub offset: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveRecordLocations {
-    pub entries: Vec<LiveRecordLocation>,
-    pub epoch_pin_token: [u8; 16],
-}
-
 pub struct LiveRecoveryEntry {
     pub receipt: DurableBatch,
     pub segment: LiveWalSegment,
@@ -283,22 +188,6 @@ pub struct LiveRecoveryPage {
     pub entries: Vec<LiveRecoveryEntry>,
     pub next: Option<usize>,
     pub epoch_pin_token: [u8; 16],
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct LiveRecoveryEntryWire {
-    pub(super) receipt: Receipt,
-    pub(super) segment: LiveWalSegment,
-    pub(super) binding: LiveTargetBinding,
-    pub(super) offset: u64,
-    pub(super) len: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct LiveRecoveryWire {
-    pub(super) entries: Vec<LiveRecoveryEntryWire>,
-    pub(super) next: Option<usize>,
-    pub(super) epoch_pin_token: [u8; 16],
 }
 
 impl Client {
@@ -349,15 +238,9 @@ impl Client {
         let Response::LiveExports(info) = response else {
             return self.wrong_variant("OpenLiveExports", &response, "LiveExports");
         };
-        if self
-            .live_config
-            .as_ref()
-            .is_none_or(|config| info.mode != config.export_mode)
-        {
+        if self.live_config.is_none() {
             self.broken = true;
-            return Err(TcpError::new(
-                "live export mode differs between owner and coordinator",
-            ));
+            return Err(TcpError::new("live NVMe is not configured"));
         }
         if info.wal_file_bytes != self.expected.wal_file_bytes {
             self.broken = true;
@@ -418,23 +301,19 @@ impl Client {
         let extent = &leased.extent;
         let fragment = self.expected.fragment_bytes;
         self.valid_live_segment(&extent.segment, &leased.binding, epoch, extent.start)
-            && self
-                .live_config
-                .as_ref()
-                .and_then(|config| config.export_mode.files_per_subsystem())
-                .is_none_or(|files| {
-                    let name = super::super::nvmeof::live_storage::wal_export_name(
-                        files,
-                        extent.segment.database,
-                        extent.segment.partition,
-                        epoch,
-                        extent.segment.file_index,
-                    );
-                    leased.binding.permanent
-                        && leased.binding.nqn == name.nqn
-                        && leased.binding.nsid == name.nsid
-                        && leased.binding.uuid == name.uuid
-                })
+            && (self.live_config.is_none() || {
+                let name = super::super::nvmeof::live_storage::wal_export_name(
+                    super::super::nvmeof::live_storage::FILES_PER_SUBSYSTEM,
+                    extent.segment.database,
+                    extent.segment.partition,
+                    epoch,
+                    extent.segment.file_index,
+                );
+                leased.binding.permanent
+                    && leased.binding.nqn == name.nqn
+                    && leased.binding.nsid == name.nsid
+                    && leased.binding.uuid == name.uuid
+            })
             && extent.token != [0; 16]
             && !leased.binding.readonly
             && extent.segment.block_size == 4096
@@ -642,125 +521,6 @@ impl Client {
             && offset.checked_add(len).is_some_and(|end| end <= file_bytes)
     }
 
-    pub fn reserve_live_group(
-        &mut self,
-        epoch: u64,
-        descriptor: LiveGroupDescriptor,
-    ) -> Result<LiveReserveResponse, TcpError> {
-        let expected = descriptor.clone();
-        match self.request(Request::ReserveLiveGroup { epoch, descriptor })? {
-            Response::LiveReserved(LiveReserveWire::Reserved(reserved)) => {
-                let reservation = &reserved.reservation;
-                if !self.valid_live_segment(
-                    &reservation.segment,
-                    &reserved.binding,
-                    epoch,
-                    reservation.frame_offset,
-                ) || reservation.token == [0; 16]
-                    || reservation.frame_len != expected.frame_len
-                    || reservation.frame_offset % u64::from(reservation.segment.block_size) != 0
-                    || (reservation.frame_offset % reservation.segment.bytes)
-                        .checked_add(u64::from(reservation.frame_len))
-                        .is_none_or(|end| end > reservation.segment.bytes)
-                {
-                    return self.wrong_response("ReserveLiveGroup", "reservation authority, token, frame length, alignment or file range differs");
-                }
-                Ok(LiveReserveResponse::Reserved(reserved))
-            }
-            Response::LiveReserved(LiveReserveWire::Existing(receipts)) => {
-                if receipts.len() != expected.batches.len() {
-                    return self.wrong_response(
-                        "ReserveLiveGroup",
-                        format_args!(
-                            "existing receipts.len()={}, expected {}",
-                            receipts.len(),
-                            expected.batches.len()
-                        ),
-                    );
-                }
-                let mut durable = Vec::with_capacity(receipts.len());
-                for (receipt, summary) in receipts.into_iter().zip(expected.batches) {
-                    if receipt.id != summary.id
-                        || receipt.version != summary.version
-                        || receipt.digest != summary.digest
-                        || receipt.version.epoch != epoch
-                        || receipt.id.database != self.expected.inventory.database
-                        || self
-                            .expected
-                            .inventory
-                            .partition_for(receipt.id)
-                            .map_err(TcpError::component)?
-                            != self.expected.partition
-                        || receipt.address.partition != self.expected.partition
-                        || receipt.address.segment_generation != epoch
-                        || receipt.address.len != summary.encoded_len.saturating_add(8)
-                    {
-                        return self.wrong_response("ReserveLiveGroup", "existing receipt identity, version, digest, partition or length differs");
-                    }
-                    durable.push(receipt.durable());
-                }
-                Ok(LiveReserveResponse::Existing(durable))
-            }
-            response => self.invalid_live_response(epoch, response),
-        }
-    }
-
-    pub fn complete_live_group(
-        &mut self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<Vec<DurableBatch>, TcpError> {
-        self.complete_live_group_profiled(epoch, token)
-            .map(|completion| completion.receipts)
-    }
-
-    /// Returns owner validation and actual persistence timings, not wire RTT.
-    pub fn complete_live_group_profiled(
-        &mut self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<LiveCompletion, TcpError> {
-        match self.request(Request::CompleteLiveGroup { epoch, token })? {
-            Response::LiveCompleted(completion)
-                if !completion.receipts.is_empty()
-                    && completion.receipts.len()
-                        <= self.expected.group_limits.max_batches as usize
-                    && completion.validation_samples <= 1
-                    && (completion.validation_samples != 0 || completion.validation_ns == 0) =>
-            {
-                let mut durable = Vec::with_capacity(completion.receipts.len());
-                for receipt in completion.receipts {
-                    if receipt.version.epoch != epoch
-                        || receipt.id.database != self.expected.inventory.database
-                        || self
-                            .expected
-                            .inventory
-                            .partition_for(receipt.id)
-                            .map_err(TcpError::component)?
-                            != self.expected.partition
-                        || receipt.address.partition != self.expected.partition
-                        || receipt.address.segment_generation != epoch
-                        || receipt
-                            .address
-                            .offset
-                            .checked_add(u64::from(receipt.address.len))
-                            .is_none()
-                    {
-                        return self.wrong_response("CompleteLiveGroup", "receipt epoch, database, partition, segment generation or offset range differs");
-                    }
-                    durable.push(receipt.durable());
-                }
-                Ok(LiveCompletion {
-                    receipts: durable,
-                    validation_ns: completion.validation_ns,
-                    validation_samples: completion.validation_samples,
-                    persistence: completion.persistence,
-                })
-            }
-            response => self.invalid_live_response(epoch, response),
-        }
-    }
-
     pub fn resolve_live_records(
         &mut self,
         authority_epoch: u64,
@@ -800,58 +560,24 @@ impl Client {
         }
     }
 
-    pub fn recover_live_metadata(
-        &mut self,
-        authority_epoch: u64,
-        source_epoch: u64,
-        cursor: usize,
-        limit: usize,
-    ) -> Result<LiveRecoveryPage, TcpError> {
-        if limit == 0 || limit > self.page_limit {
-            return Err(TcpError::new("invalid live recovery page limit"));
-        }
-        let response = self.request(Request::RecoverLiveMetadata {
-            authority_epoch,
-            source_epoch,
-            cursor,
-            limit: limit.min(256),
-        })?;
-        self.validate_live_recovery_page(
-            response,
-            authority_epoch,
-            source_epoch,
-            cursor,
-            limit,
-            false,
-        )
-    }
-
+    /// Validate one `ReplayLiveWal` page: `next` is a WAL byte offset beyond
+    /// `from`, and a page may exceed `limit` by at most one whole group.
     pub(super) fn validate_live_recovery_page(
         &mut self,
         response: Response,
         authority_epoch: u64,
         source_epoch: u64,
-        cursor: usize,
+        from: usize,
         limit: usize,
-        replay: bool,
     ) -> Result<LiveRecoveryPage, TcpError> {
         match response {
             Response::LiveRecovery(page) => {
                 if page.epoch_pin_token == [0; 16]
                     || page.entries.len()
-                        > if replay {
-                            limit.max(self.expected.group_limits.max_batches as usize)
-                        } else {
-                            limit.min(256)
-                        }
-                    || !page.next.is_none_or(|next| {
-                        !page.entries.is_empty()
-                            && if replay {
-                                next > cursor
-                            } else {
-                                cursor.checked_add(page.entries.len()) == Some(next)
-                            }
-                    })
+                        > limit.max(self.expected.group_limits.max_batches as usize)
+                    || !page
+                        .next
+                        .is_none_or(|next| !page.entries.is_empty() && next > from)
                 {
                     return self.invalid_live_metadata(authority_epoch, Some(page.epoch_pin_token));
                 }

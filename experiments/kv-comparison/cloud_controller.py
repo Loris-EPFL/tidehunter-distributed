@@ -166,6 +166,11 @@ def case_owner_job(config, case):
     return {}
 
 
+def requests_archived_owner_history(job):
+    """Only the sealed Q0 binaries can still produce history-maintenance evidence."""
+    return job.get("selection") == cloud_campaign.Q0_SELECTION and job.get("owner_history_diagnostics", False)
+
+
 def owner_process_budget(config, job, index):
     shares = sum(owner_host_index(config, job, owner) == owner_host_index(config, job, index)
                  for owner in range(job["owner_count"])) if job.get("owner_topology") else 1
@@ -1167,17 +1172,16 @@ def verify_package(config):
 
 def environment(config):
     result = dict(os.environ)
-    for key in ("LD_PRELOAD", "LD_AUDIT"):
+    for key in ("LD_PRELOAD", "LD_AUDIT", "FI_EFA_USE_DEVICE_RDMA"):
         result.pop(key, None)
-    if platform_module(config):
-        result.update(LD_LIBRARY_PATH=config["fdb_library_dir"],
-                      FDB_CLIENT_LIB_DIR=config["fdb_library_dir"],
-                      FDB_CLIENT_LIB_PATH=config["fdb_library_dir"])
-        result.pop("FI_EFA_USE_DEVICE_RDMA", None)
-        return result
-    result.update(LD_LIBRARY_PATH=config["fdb_library_dir"] + ":/opt/amazon/efa/lib",
-                  FDB_CLIENT_LIB_DIR=config["fdb_library_dir"], FDB_CLIENT_LIB_PATH=config["fdb_library_dir"],
-                  FI_EFA_USE_DEVICE_RDMA="1")
+    library_path = config["fdb_library_dir"]
+    if not platform_module(config):
+        # The sealed AWS package still links libfabric from the pinned installer.
+        # Its path is linkage provenance, not an EFA transport selection.
+        library_path += ":/opt/amazon/efa/lib"
+    result.update(LD_LIBRARY_PATH=library_path,
+                  FDB_CLIENT_LIB_DIR=config["fdb_library_dir"],
+                  FDB_CLIENT_LIB_PATH=config["fdb_library_dir"])
     return result
 
 
@@ -1192,46 +1196,14 @@ def admit_fabrics(config, index, clients, root):
     platform = platform_module(config)
     if platform:
         return platform.admit_fabrics(config, index, clients, root)
-    # Pinned util/info.c maps -p to prov_name, -f to fabric name, and -c/-m
-    # to caps/mode. efa-direct is a fabric of provider efa, not a provider:
-    # https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/util/info.c
-    # Match resources.rs::Info::hints. Direct TLS/native messages need no RMA;
-    # only registered-RAM adds read caps and RX_CQ_DATA. Rust still checks
-    # endpoint geometry and FI_OPT_EFA_EMULATED_READ after endpoint enable.
-    profiles = (
-        ("efa_message", "efa", "FI_MSG|FI_DIRECTED_RECV", "FI_CONTEXT"),
-        ("efa_direct_message", "efa-direct", "FI_MSG", "FI_CONTEXT2"),
-        ("efa_direct_read", "efa-direct", "FI_MSG|FI_RMA|FI_READ|FI_REMOTE_READ", "FI_CONTEXT2|FI_RX_CQ_DATA"),
-    )
     host = config["fleet"]["coordinator"] if index == -1 else config["fleet"]["nodes"][index]
-    receipt = {"complete": False, "run_id": config["prefix"], "instance_id": host["instance_id"],
+    receipt = {"complete": True, "run_id": config["prefix"], "instance_id": host["instance_id"],
                "source_sha256": config["source_sha256"], "binary_sha256": config["binary_sha256"],
-               "scope": "fi_getinfo discovery only; not endpoint/native-read or workload qualification", "probes": {}}
-    failure = None
-    for name, fabric, caps, mode in profiles:
-        argv = ["/opt/amazon/efa/bin/fi_info", "-p", "efa", "-f", fabric,
-                "-t", "FI_EP_RDM", "-c", caps, "-m", mode, "-v"]
-        probe = {"argv": argv}
-        receipt["probes"][name] = probe
-        try:
-            probe["stdout"] = command(argv, timeout=30, env=environment(config))
-            probe["status"] = "discovered"
-        except Exception as exc:
-            probe.update(status="failed", error=type(exc).__name__ + ": " + str(exc))
-            failure = exc
-            break
-    receipt["complete"] = failure is None
+               "scope": "TCP control; no OFI provider probes required", "probes": {}}
     dump(Path(root) / "fabric-admission.json", receipt)
     key = config["prefix"] + ("/results/fabric-admission.json" if index == -1
                               else f"/results/cells/startup/storage/{index}/fabric-admission.json")
-    try:
-        persist_json(clients, config, key, receipt)
-    except Exception as exc:
-        if failure is not None:
-            raise failure from exc
-        raise
-    if failure is not None:
-        raise failure
+    persist_json(clients, config, key, receipt)
     return receipt
 
 
@@ -1485,7 +1457,7 @@ def systemd_argv(config, case, role, cpus, memory, seconds, executable, setenv=N
             "--property=KillMode=control-group", "--property=RemainAfterExit=yes",
             "--property=CPUAccounting=yes", "--property=MemoryAccounting=yes", "--property=IOAccounting=yes",
             "--property=WorkingDirectory=" + config["repository_root"],
-            *["--setenv=" + key + "=" + env[key] for key in ("LD_LIBRARY_PATH", "FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH", "FI_EFA_USE_DEVICE_RDMA") if key in env],
+            *["--setenv=" + key + "=" + env[key] for key in ("LD_LIBRARY_PATH", "FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH") if key in env],
             *["--setenv=" + key + "=" + str(value) for key, value in (setenv or {}).items()],
             "--", *map(str, executable)]
 
@@ -1849,13 +1821,8 @@ def planned_write_batches_per_partition(job):
 
 def owner_control_settings(job):
     """Keep owner preparation and its receipt on the same control transport."""
-    backend = job["backend"]
-    if (job.get("case_kind") is not None and backend in cloud_campaign.NVME_BACKENDS
-            and (job.get("nvmeof_route") == "sealed_read"
-                 or job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads",
-                                              *cloud_campaign.NVMEOF_PATH_SELECTIONS))):
-        backend = "tidehunter_verbs_native"
-    transport = cloud_campaign.TRANSPORTS[backend]
+    backend = cloud_campaign.owner_control_backend(job)
+    transport = cloud_campaign.CONTROL_TRANSPORTS[backend]
     return {"owner_polling": job.get("owner_polling", "adaptive"),
             "owner_control_backend": backend, "owner_transport": copy.deepcopy(transport),
             "owner_transport_security_label":
@@ -1867,8 +1834,7 @@ def admitted_live_campaign(config, case):
     if spec.get("mode") == "standard-with-live-nvmeof":
         return True
     if (spec.get("mode") != "focused"
-            or not (spec.get("selection") in ("leased_ab_compact", "valkey_rdma_reads")
-                    or spec.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)):
+            or spec.get("selection") not in cloud_campaign.FOCUSED_SELECTIONS):
         return False
     return any(job["case_id"] == case and job.get("nvmeof_route") == "live"
                for job in cloud_campaign.make_focused_matrix(spec["selection"]))
@@ -1926,10 +1892,10 @@ def admit_prepared_live_client(live_client, prep, tier):
                             "host_id": live_host_identity(identity.get("host_nqn"))}:
                 raise SafetyError("live owner UUID differs from its NQN")
         expected["owner_identities"] = identities
-    expected.update(host_nqn=host_nqn, host_id=host_id, write_mode=prep["write_mode"],
-                    leased_durability=tier if prep["write_mode"] == "leased" else None,
-                    inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"],
-                    export_mode=prep["export_mode"])
+    expected.update(host_nqn=host_nqn, host_id=host_id, leased_durability=tier,
+                    inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"])
+    if "export_mode" in prep:
+        expected["export_mode"] = "per_owner"
     for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
@@ -1937,6 +1903,8 @@ def admit_prepared_live_client(live_client, prep, tier):
                          ("leased_flush_min_frame_bytes", 65536)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
+    if "write_mode" in prep:  # Only an admitted archive binary requests this key.
+        expected["write_mode"] = "leased"
     if live_client != expected:
         raise SafetyError("prepared live client differs from admitted configuration")
     return host_nqn
@@ -1952,15 +1920,11 @@ def live_target_for_owner(config, case, index, transport, host_nqn, target="kern
             "state_dir": str(Path(config["fleet"]["data_root"]) / "cells" / case
                              / f"node-{index}" / "live-nvmeof"),
             "commissioning_port_id": prep["commissioning_port_id"] + offset,
-            "commissioning_service": prep["commissioning_service"] + offset, "export_mode": export_mode}
-    if target == "spdk":
-        if transport != "rdma" or config["spec"].get("spdk_comparison") is not True:
-            raise SafetyError("live SPDK requires explicitly admitted RDMA comparison")
-        token = hashlib.sha256((config["prefix"] + "\0" + case + "\0" + str(index)).encode()).hexdigest()[:32]
-        result["spdk"] = {"rpc_socket": "/run/tidehunter-spdk-live/" + token + "/rpc.sock",
-                          "executable": str(Path(config["binary"]).parent.parent / "spdk/bin/nvmf_tgt")}
-    elif target != "kernel":
-        raise SafetyError("unknown live target")
+            "commissioning_service": prep["commissioning_service"] + offset}
+    if target != "kernel":
+        raise SafetyError("only the kernel live target is supported")
+    if config["spec"].get("selection") == q0_campaign.SELECTION:
+        result["export_mode"] = export_mode
     return result
 
 
@@ -2026,9 +1990,13 @@ def validate_launch(config, launch, case, index, polling=None):
         transport = validate_transport(tls.get("transport"))
     except ValueError as error:
         raise SafetyError("invalid typed transport") from error
+    expected_transport = (owner_control_settings(job)["owner_transport"]
+                          if job.get("backend") in cloud_campaign.NVME_BACKENDS else None)
+    if expected_transport is not None and protocol_key(transport) != protocol_key(expected_transport):
+        raise SafetyError("typed transport differs from the planned leased owner control protocol")
     if protocol_key(transport) not in {
-            protocol_key(value) for value in cloud_campaign.TRANSPORTS.values()}:
-        raise SafetyError("transport protocol is not admitted by the AWS comparison")
+            protocol_key(value) for value in cloud_campaign.CONTROL_TRANSPORTS.values()}:
+        raise SafetyError("typed transport is not admitted for leased owner control")
     if is_trusted(transport):
         if any(tls.get(field) != "" for field in ("ca", "cert", "key")):
             raise SafetyError("trusted native transport must have empty TLS paths")
@@ -3793,19 +3761,9 @@ class Controller:
         import yaml
         case = job["case_id"]
         guest_root = str(Path(self.config["fleet"]["data_root"]) / "cells" / case)
-        if job.get("history_persistence", "on_disk") not in ("on_disk", "memory_only", "wal_replay"):
-            raise SafetyError("unknown owner history persistence")
-        if (job.get("history_persistence") == "memory_only"
-                and any(job.get("mix", {}).get(kind, 0) for kind in ("read", "get_many"))
-                and (job.get("nvmeof_route") != "live"
-                     or job.get("live_export_mode", "on_demand") not in ("per_owner", "per_file"))):
-            raise SafetyError("memory-only history admits reads only with permanent live export")
-        owner_memory = (owner_process_budget(self.config, job, 0)[1] if job.get("owner_topology")
-                        else self.config["fleet"]["server_memory_mib"])
-        allowance = job.get("owner_read_memory_allowance_bytes",
-            min(512 * 1024**2, int(owner_memory * 1024**2 // 4)))
-        if allowance + 64 * 1024**2 > owner_memory * 1024**2:
-            raise SafetyError("owner read allowance exceeds its co-located process share")
+        if (job.get("nvmeof_route") != "live" or job.get("nvmeof_target", "kernel") != "kernel"
+                or job.get("target_io", "buffered") != "buffered"):
+            raise SafetyError("Tidehunter owner cases require leased NVMe-oF with a buffered kernel target")
         owner_count = job.get("owner_count", len(self.config["fleet"]["nodes"]))
         polling = job.get("owner_polling", "adaptive")
         if polling not in ("adaptive", "busy"):
@@ -3820,10 +3778,7 @@ class Controller:
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"],
                 "owner_wal_member_read": "async",
-                "owner_read_resident_first": job.get("owner_read_resident_first", False),
-                "owner_read_memory_allowance_bytes": allowance,
-                "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research"),
-                "history_persistence": job.get("history_persistence", "on_disk")}
+                "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research")}
         if "owner_wal_file_bytes" in job:
             prep["owner_wal_file_bytes"] = job["owner_wal_file_bytes"]
         tier = cloud_campaign.durability_tier(job)
@@ -3833,12 +3788,11 @@ class Controller:
                         database=list(hashlib.blake2b(case.encode(), digest_size=16).digest()),
                         batch_limits={"max_operations": 519, "max_encoded_bytes": 500000})
         receipts, nonces = {}, {}
+        executable, binary_seal = resolve_case_binary(self.config, job)
         if job.get("nvmeof_route") == "live":
             live_transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}.get(job["backend"])
             prep["live_nvmeof"] = live_nvme_preparation(self.config, case, live_transport)
-            prep["live_nvmeof"].update(write_mode=job.get("live_write_mode", "reserved"),
-                                       inline_reads=job.get("live_inline_reads", True),
-                                       export_mode=job.get("live_export_mode", "on_demand"),
+            prep["live_nvmeof"].update(inline_reads=job.get("live_inline_reads", True),
                                        lease_ahead=job.get("live_lease_ahead", True),
                                        polled_writes=job.get("live_polled_writes", False),
                                        leased_write_window=job.get("live_leased_write_window"),
@@ -3848,16 +3802,21 @@ class Controller:
             for key in ("leased_sync", "leased_flush_min_frame_bytes", "leased_write_lanes"):
                 if "live_" + key in job:
                     prep["live_nvmeof"][key] = job["live_" + key]
+            if binary_seal is not None:
+                owner_memory = (owner_process_budget(self.config, job, 0)[1] if job.get("owner_topology")
+                                else self.config["fleet"]["server_memory_mib"])
+                allowance = job.get("owner_read_memory_allowance_bytes",
+                    min(512 * 1024**2, int(owner_memory * 1024**2 // 4)))
+                if allowance + 64 * 1024**2 > owner_memory * 1024**2:
+                    raise SafetyError("owner read allowance exceeds its co-located process share")
+                prep.update(owner_read_resident_first=job.get("owner_read_resident_first", False),
+                            owner_read_memory_allowance_bytes=allowance)
+                prep["history_persistence"] = "wal_replay"
+                prep["live_nvmeof"].update(write_mode="leased", export_mode="per_owner")
         if "live_pin_read_lanes" in job:
             prep["pin_read_lanes"] = job["live_pin_read_lanes"]
         if "read_lanes" in job:
             prep["read_lanes"] = job["read_lanes"]
-        if "sealed_dataset" in job:
-            # Preparation and each planned reader consume one retained epoch.
-            source = job["sealed_dataset"]["source_id"]
-            prep["max_epochs"] = 1 + sum(
-                candidate.get("sealed_dataset", {}).get("source_id") == source
-                for candidate in controller_matrix(self.config["spec"]))
         if "coordinator_read_memory_allowance_bytes" in job:
             memory = job["coordinator_read_memory_allowance_bytes"]
             if (job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS
@@ -3868,7 +3827,6 @@ class Controller:
             prep = platform_module(self.config).prepare_transport(self.config, prep)
         dump(directory / "prepare-input.json", prep)
         prepared = directory / "prepared"
-        executable, binary_seal = resolve_case_binary(self.config, job)
         command([str(executable), "--prepare-external-case", directory / "prepare-input.json", "--output", prepared],
                 timeout=min(60, self.remaining()), env=environment(self.config))
         geometry = {"native_default": (134217728, 10737418240), "research": (4194304, 1073741824),
@@ -3883,8 +3841,6 @@ class Controller:
             partition = (launch or {}).get("node", {}).get("partition", {})
             if geometry is None or (partition.get("fragment_bytes"), partition.get("wal_file_bytes")) != geometry:
                 raise SafetyError("prepared owner WAL geometry differs from the planned case")
-            if (launch or {}).get("history_persistence", "on_disk") != job.get("history_persistence", "on_disk"):
-                raise SafetyError("prepared owner history persistence differs from the planned case")
         self.active_tide = (job, directory, [])
         remote = json.loads((prepared / "remote.json").read_text())
         if (remote.get("storage", {}).get("fragment_bytes"), remote.get("storage", {}).get("wal_file_bytes")) != geometry:
@@ -3913,20 +3869,13 @@ class Controller:
         def start(index):
             launch_path = prepared / f"node-{index}" / "launch.yaml"
             launch = load_owner_launch(job, launch_path)
-            if job.get("nvmeof_route") == "live" and job.get("nvmeof_target") == "spdk":
-                validate_launch(self.config, launch, case, index, polling)
-                nqn = owner_identities.get(str(index), {}).get("host_nqn", host_nqn)
-                expected = live_target_for_owner(self.config, case, index, live_transport, nqn, "spdk", job.get("live_export_mode", "on_demand"))
-                launch["node"]["live_target"]["spdk"] = expected["spdk"]
-                launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
             validate_launch(self.config, launch, case, index, polling)
             if job.get("nvmeof_route") == "live":
                 selected = launch.get("node", {}).get("live_target") or {}
-                selected = {key: value for key, value in selected.items() if key != "spdk" or value is not None}
                 if selected != live_target_for_owner(
                         self.config, case, index, live_transport,
                         owner_identities.get(str(index), {}).get("host_nqn", host_nqn), job.get("nvmeof_target", "kernel"),
-                        job.get("live_export_mode", "on_demand")):
+                        "per_owner"):
                     raise SafetyError("prepared live target is missing or differs from selected transport")
             elif launch.get("node", {}).get("live_target") is not None:
                 raise SafetyError("unexpected live target in non-live campaign case")
@@ -3955,7 +3904,7 @@ class Controller:
             service_seconds = tide_owner_service_seconds(self.config["spec"], job, owner_count, self.remaining())
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
                 "sha256": digest(archive), "files": list(files), "timeout": service_seconds,
-                "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
+                "owner_history_diagnostics": requests_archived_owner_history(job),
                 **({"case_binary": binary_seal} if binary_seal is not None else {}),
                 "owner_trace": job.get("owner_trace", False)}, case=case, timeout=120)
             dump(directory / "server-proofs" / f"start-{index}.json", proof)
@@ -3974,11 +3923,13 @@ class Controller:
         options = {"path": str(directory / "database"), "evidence": str(directory / "read-evidence"), "owners": owner_count,
                 "key_count": max(1048576, job["keys"]), "max_batches_per_partition": prep["max_batches_per_partition"],
                 "coordinator_read_cache_bytes": job["coordinator_cache_bytes"],
-                "owner_read_resident_first": prep["owner_read_resident_first"],
                 "external_remote_config": remote,
                 "durability_tier": tier,
-                "external_owner_durability_receipts": receipt_paths,
-                "external_owner_read_config": json.loads((prepared / "external_owner_read_config.json").read_text())}
+                "external_owner_durability_receipts": receipt_paths}
+        if binary_seal is not None:
+            options.update(owner_read_resident_first=prep["owner_read_resident_first"],
+                           external_owner_read_config=json.loads(
+                               (prepared / "external_owner_read_config.json").read_text()))
         if job.get("selection") in cloud_campaign.M3_SELECTIONS and job.get("case_kind") != "mainnet_replay":
             self.admit_logical_owners(job, directory, options)
         return options
@@ -4007,7 +3958,7 @@ class Controller:
         keys = 16 * job["owner_count"]
         dump(cell / "config.json", config)
         began = self.clock()
-        executable, _ = resolve_case_binary(self.config, job)
+        executable, binary_seal = resolve_case_binary(self.config, job)
         command([str(executable), "--config", cell / "config.json", "--output", cell / "result"],
                 timeout=min(cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, self.remaining()), env=environment(self.config))
         elapsed = self.clock() - began
@@ -4031,7 +3982,8 @@ class Controller:
                 or any(sample.get("operation") != "read" for sample in reads)
                 or any(sample.get("outcome") not in ("ok", "success") for sample in samples)
                 or live.get("completed_read_ops", 0) < keys or live.get("completed_write_ops", 0) <= 0
-                or live.get("errors") != 0 or live.get("payload_rpc_requests") != 0
+                or live.get("errors") != 0
+                or (binary_seal is not None and live.get("payload_rpc_requests") != 0)
                 or live.get("route_evidence_dropped", 0) != 0
                 or read_nqns != expected_nqns or write_nqns != expected_nqns):
             raise SafetyError("full-inventory logical owner write/read admission failed")
@@ -4071,6 +4023,7 @@ class Controller:
         if not self.active_tide:
             return
         job, directory, indices = self.active_tide
+        history_diagnostics = requests_archived_owner_history(job)
         if self.shared_tide is not None and self.shared_tide.get("ready") is not None:
             cleanup = self.owner_batch("nvme_owner_cleanup_export", job["case_id"], timeout=120,
                                        export=True, no_targets_published=not self.shared_tide.get("target_attempted", False))
@@ -4081,13 +4034,13 @@ class Controller:
         def stop(index):
             result = self.request(index, {"action": "tide_stop", "case_id": job["case_id"],
                                           "initiator_drained": True,
-                                          "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
+                                          "owner_history_diagnostics": history_diagnostics,
                                           "owner_trace": job.get("owner_trace", False)},
                                   case=job["case_id"], timeout=self.cleanup_timeout(deadline), export=True)
             dump(directory / "server-proofs" / f"stop-{index}.json", result)
             if job.get("owner_trace"):
                 dump(directory / "owner-events" / f"node-{index}.json", result["owner_events"])
-            if job.get("owner_history_diagnostics"):
+            if history_diagnostics:
                 dump(directory / "owner-durability" / f"node-{index}.history-maintenance.json", result["history_maintenance"])
 
         with ThreadPoolExecutor(max_workers=5) as pool:
@@ -4879,36 +4832,10 @@ class Controller:
                 raise ValueError("case is not in the reviewed compact selection")
         if type(owner_count) is not int or owner_count not in cloud_layout.LOGICAL_OWNER_COUNTS:
             raise ValueError("unsupported logical owner_count")
-        if owner_count not in (1, 5):
+        if ("owner_count" in job or owner_count == 1 and job.get("backend") in cloud_campaign.NVME_BACKENDS):
             cloud_campaign.active_owner_count(job)
-        read_case = (host_count == 1 and self.config["spec"].get("selection") == "remote_rw_compact"
-                     and job.get("case_kind") in ("media_read", "sealed_knee")
-                     and job.get("backend") in ("tidehunter_tcp", "tidehunter_verbs_native")
-                     and job.get("durability_tier") == "synchronous"
-                     and "sealed_dataset" in job and "nvmeof_route" not in job)
-        fabric_read = (host_count == 1 and self.config["spec"].get("selection") == "fabric_ab_compact"
-                       and job.get("selection") == "fabric_ab_compact"
-                       and job.get("case_kind") in ("media_read", "sealed_knee")
-                       and job.get("durability_tier") == "synchronous" and "sealed_dataset" in job
-                       and ((job.get("backend") in ("tidehunter_tcp", "tidehunter_tcp_trusted", "tidehunter_verbs_native")
-                             and "nvmeof_route" not in job)
-                            or (job.get("case_kind") == "media_read" and job.get("nvmeof_route") == "sealed_read"
-                                and ((job.get("backend") == "tidehunter_nvme_rdma"
-                                      and job.get("nvmeof_target") in ("kernel", "spdk"))
-                                     or (job.get("backend") == "tidehunter_nvme_tcp"
-                                         and job.get("nvmeof_target") == "kernel")))))
-        if owner_count == 1 and ("owner_count" in job or
-                (job.get("backend") in cloud_campaign.TRANSPORTS and job.get("case_kind") not in
-                 ("ssd_write_floor", "ssd_floor", "net_floor"))) and not (read_case or fabric_read or (
-                     host_count == 1 and (
-                         self.config["spec"].get("selection") in ("leased_ab_compact", "valkey_rdma_reads")
-                         or self.config["spec"].get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)
-                     and cloud_campaign._focused_exact(job, expected))) and (
-                job.get("case_kind") not in cloud_campaign.ONE_OWNER_CASE_KINDS
-                or job.get("backend") not in ("tidehunter_tcp", "tidehunter_verbs_native")
-                or job.get("durability_tier") != "synchronous"
-                or "sealed_dataset" in job or "nvmeof_route" in job):
-            raise ValueError("one owner requires a synchronous ordinary owner RPC case")
+        if job.get("backend") in cloud_campaign.NVME_BACKENDS and job.get("nvmeof_route") != "live":
+            raise ValueError("Tidehunter NVMe-oF cases require the leased live route")
         if job.get("case_kind") in ("net_floor", "ssd_floor", "ssd_write_floor"):
             return self.run_floor_case(job)
         if job.get("case_kind") == "fio_floor":
@@ -5049,19 +4976,6 @@ class Controller:
                 else:
                     options = record_phase_span(focused_spans if "case_kind" in job else None,
                                                 "backend_deploy", self.prepare_tide, job, directory)
-                if backend in cloud_campaign.NVME_BACKENDS and job.get("nvmeof_route") != "live":
-                    target_started = time.monotonic_ns()
-                    target_status = "failed"
-                    try:
-                        options["nvmeof_readers"] = self.connect_nvme(job, directory)
-                        target_status = "completed"
-                    finally:
-                        if "case_kind" in job:
-                            focused_spans.append({"operation": "target_setup", "host_index": 0,
-                                "monotonic_start_ns": target_started, "monotonic_end_ns": time.monotonic_ns(),
-                                "status": target_status})
-                    receipt["nvmeof_target_evidence"] = {"path": "nvme-targets.json",
-                                                        "sha256": digest(directory / "nvme-targets.json")}
                 if job.get("nvmeof_route") == "live":
                     transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}[backend]
                     prep = live_nvme_preparation(self.config, job["case_id"], transport)
@@ -5507,9 +5421,10 @@ class Controller:
                         verify_counter_evidence(job, observed, owner_count)
                         receipt["counter_evidence"] = {"path": str(evidence.relative_to(directory)), "sha256": digest(evidence),
                                                        "coordinator_scope": "cumulative_adapter_lifetime_not_measurement_interval",
-                                                       "owner_io_scope": "latest_passive_sample_may_be_stale_not_measurement_interval",
+                                                       **({"owner_io_scope": "latest_passive_sample_may_be_stale_not_measurement_interval"}
+                                                          if "owner_io" in observed else {}),
                                                        "observed": observed}
-                        if "read_tier" in job:
+                        if "read_tier" in job and "owner_read_configuration" in observed:
                             receipt["read_tier_effective"] = {
                                 "coordinator_cache_bytes": observed["coordinator"]["cache"]["budget_bytes"],
                                 "coordinator_read_memory_allowance_bytes": observed.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes"),
@@ -5755,8 +5670,7 @@ class Controller:
                     receipt["database_files_retained"] = database.exists()
             except Exception as exc:
                 record_cleanup_error("owner_storage", exc)
-            if (job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS
-                    and job.get("owner_history_diagnostics")):
+            if requests_archived_owner_history(job):
                 try:
                     require_zero_owner_history_waits(directory, owner_count)
                 except RuntimeError as exc:
@@ -6044,7 +5958,6 @@ def validate_physical_proofs(proofs, *, provider="aws", expected_instance_ids=No
 
 def verify_counter_evidence(job, evidence, owner_count=None):
     coordinator = evidence.get("coordinator")
-    owners = evidence.get("owner_read_configuration")
     expected_backend = cloud_campaign.diagnostic_backend(job)
     if evidence.get("schema_version") != 1 or evidence.get("backend") != expected_backend or not isinstance(coordinator, dict):
         raise SafetyError("actual coordinator counter evidence has wrong backend/schema")
@@ -6053,20 +5966,25 @@ def verify_counter_evidence(job, evidence, owner_count=None):
         raise SafetyError("actual RPC/cache counters are missing")
     if coordinator["cache"].get("budget_bytes") != job["coordinator_cache_bytes"]:
         raise SafetyError("actual coordinator cache budget differs from declared cohort")
-    owner_count = job.get("owner_count", 5) if owner_count is None else owner_count
-    if (not isinstance(owners, list) or len(owners) != owner_count or
-            {owner.get("partition") for owner in owners} != set(range(owner_count))):
-        raise SafetyError("actual owner configurations differ from declared partitions")
     if "coordinator_read_memory_allowance_bytes" in job:
         actual = evidence.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes")
         if actual != job["coordinator_read_memory_allowance_bytes"]:
             raise SafetyError("actual coordinator read allowance differs from declared cohort")
-    if "owner_read_memory_allowance_bytes" in job:
-        if any(owner.get("read_memory_allowance_bytes") != job["owner_read_memory_allowance_bytes"] for owner in owners):
+    # Frozen job metadata may still describe the retired owner read settings.
+    # Only archived evidence carries that population.
+    if "owner_read_configuration" in evidence or job.get("selection") == cloud_campaign.Q0_SELECTION:
+        owners = evidence.get("owner_read_configuration")
+        owner_count = job.get("owner_count", 5) if owner_count is None else owner_count
+        if (not isinstance(owners, list) or len(owners) != owner_count
+                or {owner.get("partition") for owner in owners} != set(range(owner_count))):
+            raise SafetyError("actual owner configurations differ from declared partitions")
+        if "owner_read_memory_allowance_bytes" in job and any(
+                owner.get("read_memory_allowance_bytes") != job["owner_read_memory_allowance_bytes"]
+                for owner in owners):
             raise SafetyError("actual owner read allowance differs from declared cohort")
-    if "owner_read_resident_first" in job and any(
-            owner.get("read_resident_first") != job["owner_read_resident_first"] for owner in owners):
-        raise SafetyError("actual owner NOWAIT policy differs from declared cohort")
+        if "owner_read_resident_first" in job and any(
+                owner.get("read_resident_first") != job["owner_read_resident_first"] for owner in owners):
+            raise SafetyError("actual owner NOWAIT policy differs from declared cohort")
     # Hit counts and passive sample availability are observations, not admission
     # requirements. Configuring a cache must never manufacture a hit population.
     return evidence

@@ -10,6 +10,7 @@ import ssl
 import subprocess
 from pathlib import Path
 import tempfile
+import threading
 import time
 import urllib.error
 import unittest
@@ -35,12 +36,6 @@ QUOTAS = [
     {'metric': 'LOCAL_SSD_TOTAL_GB', 'limit': 9.223372036854776e+18, 'usage': 0.0},
     {'metric': 'INSTANCES', 'limit': 24000.0, 'usage': 3.0},
 ]
-
-SPDK_IDENTITY = {
-    'target_scope': 'file_aio_direct_live_and_sealed',
-    'source_patch_sha256': 'ba21692d7ac70190a505a7b94dc749c8f544d6eef8632a38980f4acf5e987373',
-}
-
 
 class Store:
     def __init__(self):
@@ -119,25 +114,25 @@ class ManualCampaignTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'machine type differs'):
             manual._check_config(config, manual.REVIEWED_SPEC, 0)
 
-    def test_existing_standard_matrix_hash_is_unchanged(self):
+    def test_reviewed_standard_leased_matrix_digest(self):
         jobs = manual._reviewed_jobs(manual.REVIEWED_SPEC)
-        self.assertEqual(len(jobs), 652)
+        self.assertEqual(len(jobs), 285)
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
                          separators=(',', ':')).encode()).hexdigest(),
-                         'f48f60156261589c539ca030d535d80cba8a0d987df30184d597a419f82adb9d')
+                         'fecb54b7c9591170ddc490cf8532982b664078e540d28678499a8a9f2797865c')
 
     def test_reviewed_contract_spec_exact_admission_and_matrix(self):
         spec = manual.REVIEWED_CONTRACT_SPEC
         self.assertNotIn('valkey_reproduction_profiles', spec)
-        self.assertFalse(spec['spdk_comparison'])
+        self.assertNotIn('spdk_comparison', spec)
         self.assertTrue(spec['native_durability_cohort'])
         jobs = manual._reviewed_jobs(spec)
-        self.assertEqual(len(jobs), 156)
+        self.assertEqual(len(jobs), 130)
         self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
                          separators=(',', ':')).encode()).hexdigest(),
-                         '32cda41becb0128f3d7f50cf02a4ffc4c9c9650ce9e708226516d862e1cca8e2')
+                         '4f0d1a53831a162cb6267be34eb04a26917003c89b32143d3e98e6818002c149')
         self.assertEqual(Counter(job['backend'] for job in jobs), {
-            'native': 26, 'tidehunter_verbs_native': 26, 'tidehunter_nvme_rdma': 26,
+            'native': 26, 'tidehunter_nvme_rdma': 26,
             'valkey_tcp': 17, 'valkey_rdma': 35, 'kvrocks': 26})
         for key in spec:
             changed = copy.deepcopy(spec)
@@ -150,23 +145,19 @@ class ManualCampaignTest(unittest.TestCase):
     def test_reviewed_contract_mid_spec_exact_admission_and_matrix(self):
         spec = manual.REVIEWED_CONTRACT_MID_SPEC
         jobs = manual._reviewed_jobs(spec)
-        self.assertEqual(len(jobs), 182)
+        self.assertEqual(len(jobs), 130)
         digest = lambda value: hashlib.sha256(json.dumps(
             value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        self.assertEqual(digest(spec), manual.REVIEWED_CONTRACT_MID_SPEC_SHA256)
-        self.assertEqual(digest(jobs), manual.REVIEWED_CONTRACT_MID_MATRIX_SHA256)
+        self.assertEqual(digest(jobs), '56d002cee5abe96e771abf0630cf0c4c2508c0f383e454b9e5393a3d6e7c0291')
         sealed = {**spec, 'reservation_hours': 2, 'hard_deadline_seconds': 7200,
                   'machine_type': 'z4m-highmem-16'}
-        self.assertEqual(digest(sealed), manual.REVIEWED_CONTRACT_MID_SEALED_SPEC_SHA256)
         self.assertEqual(manual._reviewed_jobs(sealed), jobs)
         self.assertEqual({key: value for key, value in spec.items()
                           if key not in ('backends', 'arms', 'value_sizes')},
                          {key: value for key, value in manual.REVIEWED_CONTRACT_SPEC.items()
                           if key not in ('backends', 'arms', 'value_sizes')})
-        self.assertEqual(spec['backends'], ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
-                                          'tidehunter_nvme_rdma', 'valkey_tcp', 'valkey_rdma', 'kvrocks'])
-        self.assertEqual(spec['arms'], {**manual.REVIEWED_CONTRACT_SPEC['arms'],
-                                       'tidehunter_tcp': ['synchronous', 'native']})
+        self.assertEqual(spec['backends'], manual.REVIEWED_CONTRACT_SPEC['backends'])
+        self.assertEqual(spec['arms'], manual.REVIEWED_CONTRACT_SPEC['arms'])
         self.assertEqual({job['value_size'] for job in jobs}, {512, 4096})
         self.assertEqual({job['concurrency'] for job in jobs}, {1, 16})
         self.assertEqual({job['repeat'] for job in jobs}, {0, 1})
@@ -177,22 +168,13 @@ class ManualCampaignTest(unittest.TestCase):
             expected.append({**old, 'value_size': size,
                              'case_id': old['case_id'].split('-', 1)[1].replace(
                                  f"-{old['value_size']}-", f"-{size}-")})
-        retained = [{**job, 'case_id': job['case_id'].split('-', 1)[1]}
-                    for job in jobs if job['backend'] != 'tidehunter_tcp']
+        retained = [{**job, 'case_id': job['case_id'].split('-', 1)[1]} for job in jobs]
         self.assertEqual(sorted(map(manual._json, expected)), sorted(map(manual._json, retained)))
-        tcp = [job for job in jobs if job['backend'] == 'tidehunter_tcp']
-        self.assertEqual(len(tcp), 26)
-        def comparable(job):
-            return {key: value for key, value in job.items() if key not in ('backend', 'case_id')}
-        self.assertEqual(sorted(manual._json(comparable(job)) for job in tcp),
-                         sorted(manual._json(comparable(job)) for job in jobs
-                                if job['backend'] == 'tidehunter_verbs_native'))
         for job in jobs:
             self.assertEqual(job['coordinator_cache_bytes'], 0)
             self.assertEqual(job['keys'], 4096)
-        for backend in ('tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'):
-            self.assertEqual({job['durability_tier'] for job in jobs
-                              if job['backend'] == backend}, {'native', 'synchronous'})
+        self.assertEqual({job['durability_tier'] for job in jobs
+                          if job['backend'] == 'tidehunter_nvme_rdma'}, {'native', 'synchronous'})
         for key in spec:
             changed = copy.deepcopy(spec)
             changed[key] = None
@@ -206,7 +188,7 @@ class ManualCampaignTest(unittest.TestCase):
         jobs = manual._reviewed_jobs(spec)
         estimate = sum((job['keys'] + job['warmup_operations'] + job['measurement_operations'])
                        * 256 + 8 * 1024**2 for job in jobs) + 256 * 1024**2
-        self.assertEqual(estimate, 2961539072)
+        self.assertEqual(estimate, 2192080896)
         self.assertLessEqual(estimate, 3_000_000_000)
 
     def test_contract_mid_sizes_require_the_contract_shape(self):
@@ -222,20 +204,22 @@ class ManualCampaignTest(unittest.TestCase):
 
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
+            if selection == manual.q0_campaign.SELECTION:
+                continue  # Q0's digest and budget are pinned in test_q0_campaign.
             expected_count = manual.workflow_input.cloud_campaign.FOCUSED_COUNTS[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
                 self.assertEqual(spec['backends'],
-                                 ['tidehunter_nvme_rdma'] if selection in manual.workflow_input.cloud_campaign.M3_SELECTIONS or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
-                self.assertFalse(spec['spdk_comparison'])
+                                 ['tidehunter_nvme_rdma'] if selection in manual.workflow_input.cloud_campaign.M3_SELECTIONS or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_nvme_rdma'])
+                self.assertNotIn('spdk_comparison', spec)
                 self.assertEqual(spec['matrix_sha256'], manual.FOCUSED_MATRIX_SHA256[selection])
                 self.assertEqual(spec['matrix_sha256'], {
-                    'nvmeof_path_compact': '8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036',
-                    'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
-                    'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
+                    'nvmeof_path_compact': 'd830e7c32fd715a794328445a26c2d9e62a76188d5dbd12a9471712a90212772',
+                    'nvmeof_path_core': 'f59942def5dc313b09c41dffa0df4d604f57e110f359dd12b2af75f5deea121c',
+                    'nvmeof_path_fix': 'a6c9f07e1d9b60c3145e261014250fb61e655517268c6755585100078303f9ae',
                     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
-                    'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
+                    'nvmeof_contracts_crossing2': 'a51a42c7606fbc98afa436fca1695ce621cce20603f6497b9baa2b75a4af2ea9',
                     'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
                     'nvmeof_single_caller': '294b50957b21d6acafadcf1b682c71d1b424524a144ecd6c2c18e2b1cc40fd4e',
                     'nvmeof_f6': '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7',
@@ -247,14 +231,14 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
                     'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
                     'nvmeof_p13_write_engine': '674cd71e117824550abb4624747e462b739cb9535912b5a6415782e186e03d18',
-                    'nvmeof_p16_redrain_ab': '33349d644ad5295f39bc88d23d0fcd8dbf088a6fb9e2dec429545a792f631808',
+                    'nvmeof_p16_redrain_ab': '36681e83990a39f3c36e730d805e05f1f58f3ecf5a67bf64b49888e45795e152',
                     'nvmeof_q0': 'ec7b1e585125b53a952b97f8da54b4fb10376c9b54db1f45163c8d442b9a82ec',
                     'nvmeof_f7_highmem32': '25ef27bc334edc0d07a84061427893063e162f16f8f1a986ea99d758ca2c05dd',
                     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
                     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
                     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
-                    'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
-                    'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
+                    'nvmeof_contracts_crossing': 'df39156bd7680bb8702a4270f87ea98a68af9321564e2634f54a7d09170db150',
+                    'nvmeof_contracts': 'cb960b1bcddd75fe950d5648b79644b217f3243e1fa6e45b3b427c5964ea699a',
                 }[selection])
 
     def test_state_save_retries_transient_with_original_generation(self):
@@ -365,24 +349,13 @@ class ManualCampaignTest(unittest.TestCase):
         self.assertEqual({job['case_id'] for job in previous},
                          {job['case_id'] for job in jobs if job['cohort'] != 'valkey_client_diagnostics'})
         self.assertEqual({job['backend'] for job in jobs}, set(manual.REVIEWED_SPEC['backends']))
-        live = [job for job in jobs if job.get('nvmeof_route') == 'live']
-        kernel = [job for job in live if job.get('nvmeof_target', 'kernel') == 'kernel']
-        spdk = [job for job in live if job.get('nvmeof_target') == 'spdk']
-        self.assertEqual((len(kernel), len(spdk)), (52, 52))
-        self.assertTrue(all(job['backend'] == 'tidehunter_nvme_rdma' for job in live))
-        def workload(job):
-            return json.dumps({key: value for key, value in job.items()
-                               if key not in ('case_id', 'nvmeof_target')}, sort_keys=True)
-        self.assertEqual(Counter(map(workload, kernel)), Counter(map(workload, spdk)))
-        native = [job for job in jobs if job.get('durability_tier') == 'native']
-        self.assertEqual(len(native), 116)
-        self.assertEqual({job['backend'] for job in native},
-                         {'tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'})
+        live = [job for job in jobs if job['backend'] in manual.workflow_input.cloud_campaign.NVME_BACKENDS]
+        self.assertEqual(len(live), 52)
+        self.assertEqual({job.get('nvmeof_target', 'kernel') for job in live}, {'kernel'})
+        self.assertEqual({job.get('nvmeof_route') for job in live}, {'live'})
+        native = [job for job in live if job['durability_tier'] == 'native']
+        self.assertEqual(len(native), 15)
         self.assertTrue(all(job['case_id'].endswith('-durability-native') for job in native))
-        self.assertTrue(all(job['sealed_dataset']['source_id'].endswith('-durability-native')
-                            for job in native if 'sealed_dataset' in job))
-        self.assertTrue(all(job['mix']['put'] == job['mix']['put_batch'] == 0
-                            for job in native if job.get('nvmeof_route') == 'sealed_read'))
         self.assertEqual(len({job['case_id'] for job in jobs}), len(jobs))
 
     def test_expansion_preserves_original_jobs_and_external_standard_profiles(self):
@@ -436,8 +409,7 @@ class ManualCampaignTest(unittest.TestCase):
     def test_manual_package_checks_directory_archive_and_qualification_identity(self):
         revision = 'a' * 40
         verified = {'source_sha256': 'b' * 64, 'binary_sha256': 'c' * 64,
-                    'binary_blake2b512': 'd' * 128, 'manifest_sha256': 'e' * 64, 'abi': {},
-                    'spdk': dict(SPDK_IDENTITY)}
+                    'binary_blake2b512': 'd' * 128, 'manifest_sha256': 'e' * 64, 'abi': {}}
         proof = {'engine_sha': revision, 'binary_sha256': verified['binary_sha256'],
                  'binary_blake2b512': verified['binary_blake2b512']}
         source = {'dirty': True}
@@ -445,12 +417,7 @@ class ManualCampaignTest(unittest.TestCase):
             root = Path(tmp) / 'package'
             root.mkdir()
             (root / 'bundle.tar.gz').write_bytes(b'archive')
-            files = ('runtime/spdk/spdk.json', 'runtime/spdk/bin/nvmf_tgt',
-                     'source/experiments/nvmeof/spdk_targets.py',
-                     'source/experiments/nvmeof/spdk_artifacts.py',
-                     'source/experiments/nvmeof/spdk_measurement.py',
-                     'source/experiments/nvmeof/live_spdk_daemon.py',
-                     'source/experiments/kv-comparison/nvme_campaign_owner.py',
+            files = ('source/experiments/kv-comparison/nvme_campaign_owner.py',
                      'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json',
                      'source/experiments/kv-comparison/valkey_cloud.py',
                      'source/experiments/kv-comparison/valkey_reproduction.py',
@@ -479,7 +446,7 @@ class ManualCampaignTest(unittest.TestCase):
                  patch.object(package, 'verify_archive', return_value=focused_verified), \
                  patch.object(manual, '_check_snapshot'), \
                  patch.object(manual.prepare.ci_prepare, 'admit_qualification'):
-                focused_spec = manual.REVIEWED_SPECS['recommended']
+                focused_spec = manual.REVIEWED_SPECS['nvmeof_path_core']
                 with self.assertRaisesRegex(ValueError, 'must not contain Valkey'):
                     manual._admit_package(tmp, revision, focused_spec)
                 focused_files = {name: {} for name in files
@@ -494,11 +461,6 @@ class ManualCampaignTest(unittest.TestCase):
                 (root / 'manifest.json').write_text(json.dumps({'build_profile': 'focused',
                     'features': package.FOCUSED_FEATURES, 'files': focused_files}))
                 manual._admit_package(tmp, revision, tools_spec)
-            for identity in (None, {**SPDK_IDENTITY, 'source_patch_sha256': '0' * 64},
-                             {**SPDK_IDENTITY, 'target_scope': 'sealed_read_only_file_aio_direct'}):
-                with patch.object(package, 'verify_directory', return_value={**verified, 'spdk': identity}), \
-                     self.assertRaisesRegex(ValueError, 'reviewed writable target'):
-                    manual._admit_package(tmp, revision, manual.REVIEWED_SPEC)
             with patch.object(package, 'verify_directory', return_value=verified), \
                  patch.object(package, 'admit_source', return_value=source), \
                  patch.object(package, 'verify_archive', return_value=dict(verified, binary_sha256='f' * 64)), \
@@ -957,7 +919,29 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                 state['policy'] = {'name': state['run_id'] + '-placement', 'id': '42'}
                 state['deadline'] = manual._utc(time.time() + 7200)
                 package = {'manifest_sha256': 'b' * 64}
+                loop = asyncio.get_running_loop()
+                deadline = asyncio.timeout(30)
+                release = threading.Event()
+                probe_finished = threading.Event()
+                missing_key = f'runs/{state["run_id"]}/qualification/{fleet[0]["name"]}/startup-error.json'
+
+                def expire_readiness():
+                    # Queue the already-expired deadline before releasing the I/O.
+                    deadline.reschedule(loop.time())
+                    loop.call_soon(release.set)
+
                 class GuestStore(Store):
+                    def head(self, key):
+                        if failure == 'missing' and key == missing_key:
+                            loop.call_soon_threadsafe(expire_readiness)
+                            if not release.wait(5):
+                                raise AssertionError('readiness timeout did not release status probe')
+                            try:
+                                return super().head(key)
+                            finally:
+                                probe_finished.set()
+                        return super().head(key)
+
                     def put(self, key, data, **kwargs):
                         result = super().put(key, data, **kwargs)
                         if key.endswith('/runtime.json'):
@@ -980,12 +964,14 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                 store = GuestStore()
                 path = gcp_campaign.StateFile(Path(tmp) / 'state.json', store, state['run_id'])
                 with patch.object(manual.gcp_runtime, 'build_runtime_config',
-                                  return_value={'package_root': '/package'}) as build_runtime, \
-                     patch.object(manual, 'WORKER_READY_SECONDS', 0.02 if failure == 'missing' else 180):
+                                  return_value={'package_root': '/package'}) as build_runtime:
                     if failure == 'missing':
                         with self.assertRaises(TimeoutError):
-                            await asyncio.wait_for(manual._suite(
-                                store, CONFIG, state, path, fleet, package, manual.REVIEWED_SPEC, tmp, 'irdma0'), 30)
+                            async with deadline:
+                                await manual._suite(
+                                    store, CONFIG, state, path, fleet, package, manual.REVIEWED_SPEC, tmp, 'irdma0')
+                        self.assertTrue(deadline.expired())
+                        self.assertTrue(probe_finished.is_set())
                     else:
                         message = 'worker unit refused' if failure == 'startup-error' else 'identity mismatch'
                         with self.assertRaisesRegex(RuntimeError, message):
@@ -1373,15 +1359,15 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
             observer = kv / 'observability/campaign_exporter.py'
             text = observer.read_text()
             text = text.replace('def context(run_id, job):', 'def context(run_id, job):\n'
-                '    if job is not None and job.get("nvmeof_target") == "spdk" and job.get("nvmeof_route") == "live":\n'
-                '        raise ValueError("unsupported live SPDK target")', 1)
+                '    if job is not None and job.get("nvmeof_route") == "live":\n'
+                '        raise ValueError("unsupported live NVMe-oF target")', 1)
             observer.write_text(text)
             (package_dir / 'spec.json').write_text(json.dumps(manual.REVIEWED_SPEC))
             async def execute(argv):
                 self.fail('cloud operation reached before observer qualification')
             with patch.object(manual, '_admit_package', return_value=(receipt, {})), \
                  patch.object(manual.gcp_manual_preflight, 'permission_preflight') as preflight:
-                with self.assertRaisesRegex(ValueError, 'unsupported live SPDK target'):
+                with self.assertRaisesRegex(ValueError, 'unsupported live NVMe-oF target'):
                     await manual.run(CONFIG, package_dir=package_dir, revision=revision, spec=manual.REVIEWED_SPEC,
                                      wheels=[], base_image=image, base_image_id='42', rdma_device='irdma0',
                                      output=Path(tmp) / 'out', execute=execute, surcharge_cents=0)
@@ -1444,7 +1430,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
         image = 'projects/mysten-research/global/images/base-image'
         receipt = {'source_revision': revision, 'source_sha256': source,
                    'manifest_sha256': 'c' * 64, 'sha256': 'd' * 64}
-        spec = manual.REVIEWED_SPECS['parity_compact']
+        spec = manual.REVIEWED_SPECS['nvmeof_path_core']
         operations = []
 
         async def execute(argv):
@@ -1761,7 +1747,6 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                         'nvme_ioctl': {'local-ssd-0': 'NVMe Identify Controller'},
                         'package': {'manifest_sha256': manifest, 'runtime_checked': True, 'abi': abi,
                             'fabric_library': fabric, 'linkage': linkage,
-                            'spdk': dict(SPDK_IDENTITY), 'spdk_runtime_linkage': linkage,
                             'valkey_runtime_linkage': {'valkey-server': linkage, 'valkey-cli': linkage, 'valkey-benchmark': linkage}},
                         'libfabric_sha256': 'a' * 64, 'fi_info_fabric': fabric,
                         'fi_info_ldd': 'libfabric.so.1 => /lib/libfabric.so.1', 'libfabric_api_version': 65541,
@@ -1779,22 +1764,6 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                         'rdma_read': latency, 'rdma_send': latency,
                         'valkey': {'endpoint': peer_ip + ':6380', 'value': value,
                                    'get': value, 'set': 'OK', 'del': '1'}}}
-
-        sample_hosts = [{'id': '1', 'rdma_ip': '10.3.0.1'},
-                        {'id': '2', 'rdma_ip': '10.3.0.2'}]
-        records = [proof(sample_hosts[i], sample_hosts[1 - i]) for i in range(2)]
-        gcp_image.admit_spdk({'_records': records}, manual.REVIEWED_SPEC)
-        for alteration in ('missing', 'different', 'linkage'):
-            invalid = copy.deepcopy(records)
-            package = invalid[1]['outputs']['package']
-            if alteration == 'missing':
-                del package['spdk']
-            elif alteration == 'different':
-                package['spdk']['source_patch_sha256'] = '0' * 64
-            else:
-                package['spdk_runtime_linkage']['ldd'] = 'libaio.so.1 => not found'
-            with self.subTest(alteration=alteration), self.assertRaises(ValueError):
-                gcp_image.admit_spdk({'_records': invalid}, manual.REVIEWED_SPEC)
 
         class GuestStore(Store):
             def put(self, key, data, **kwargs):
@@ -2023,9 +1992,9 @@ class ReviewedKvMatrixRegressionTests(unittest.TestCase):
         # Digests of the generated matrices before native became the matrix default.
         campaign = manual.workflow_input.cloud_campaign
         for spec, count, digest, relies_on_spec_tier in (
-                (manual.REVIEWED_SPEC, 652, 'f48f60156261589c539ca030d535d80cba8a0d987df30184d597a419f82adb9d', True),
+                (manual.REVIEWED_SPEC, 285, 'fecb54b7c9591170ddc490cf8532982b664078e540d28678499a8a9f2797865c', True),
                 # Contract arms name every Tidehunter tier, so it never used the spec default.
-                (manual.REVIEWED_CONTRACT_SPEC, 156, '32cda41becb0128f3d7f50cf02a4ffc4c9c9650ce9e708226516d862e1cca8e2',
+                (manual.REVIEWED_CONTRACT_SPEC, 130, '4f0d1a53831a162cb6267be34eb04a26917003c89b32143d3e98e6818002c149',
                  False)):
             with self.subTest(shapes=spec.get('shapes')):
                 self.assertEqual(spec['durability_tier'], 'synchronous')

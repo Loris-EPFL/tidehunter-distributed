@@ -15,7 +15,7 @@ bytes = {workspace = true}
 bincode = "1.3.3"
 serde = { version = "1.0.208", features = ["derive", "rc"] }
 serde_yaml = "0.9.21"
-# The existing locked serializer is used only for opt-in fabric diagnostic output.
+# The existing locked serializer; used only by the distributed build.
 serde_json = { version = "1.0.140", optional = true }
 rand = {workspace = true}
 prometheus = {workspace = true}
@@ -48,41 +48,17 @@ serde_json = "1.0.140"
 tokio = { version = "1.36.0", features = ["rt-multi-thread", "sync", "time"] }
 
 [features]
-experimental-fabric = ["experimental-distributed", "tidehunter-fabric/native", "dep:serde_json"]
-experimental-distributed = ["dep:blake2b_simd", "dep:rustls", "dep:io-uring"]
-# Linux kernel NVMe-oF read integration; native and existing transports stay unchanged.
-experimental-nvmeof = ["experimental-distributed", "dep:serde_json"]
+experimental-fabric = ["experimental-distributed", "tidehunter-fabric/native"]
+# Always includes the leased live NVMe-oF route. It runs on Linux only: remote
+# and owner opens on other targets fail with a named error.
+experimental-distributed = ["dep:blake2b_simd", "dep:rustls", "dep:io-uring", "dep:serde_json"]
 tokio = ["dep:tokio"]
 test_methods = []
 test-utils = []
 
 [[example]]
-name = "sharded_wal_local"
-required-features = ["experimental-distributed"]
-
-[[example]]
-name = "sharded_wal_bench"
-required-features = ["experimental-distributed"]
-
-[[example]]
 name = "sharded_wal_recovery_bench"
 required-features = ["experimental-distributed"]
-
-[[example]]
-name = "sharded_wal_cluster_check"
-required-features = ["experimental-distributed", "test-utils"]
-
-[[example]]
-name = "sharded_wal_transport_bench"
-required-features = ["experimental-distributed", "test-utils"]
-
-[[example]]
-name = "sharded_wal_adapter_bench"
-required-features = ["experimental-distributed", "test-utils"]
-
-[[example]]
-name = "sharded_wal_lifecycle_check"
-required-features = ["experimental-distributed", "test-utils"]
 
 [[example]]
 name = "sharded_wal_codec_probe"

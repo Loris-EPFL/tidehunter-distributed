@@ -101,7 +101,7 @@ fn independent_position_slots_merge_roots_in_reverse_completion_order() {
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            client.progress_appends().unwrap();
+            client.progress_session().unwrap();
             if entered.try_recv().is_ok() {
                 break;
             }
@@ -118,7 +118,7 @@ fn independent_position_slots_merge_roots_in_reverse_completion_order() {
         release.send(()).unwrap();
         let newer = newer.unwrap();
         let older = loop {
-            client.progress_appends().unwrap();
+            client.progress_session().unwrap();
             if let Some(result) = client.take_checkpoint_position(1, through(first)) {
                 break result.unwrap();
             }
@@ -148,7 +148,7 @@ fn position_deadline_poison_clears_both_slots() {
                 .unwrap()
         );
         loop {
-            client.progress_appends().unwrap();
+            client.progress_session().unwrap();
             if entered.try_recv().is_ok() {
                 break;
             }
@@ -158,7 +158,7 @@ fn position_deadline_poison_clears_both_slots() {
         client.submit_leased_adoption().unwrap();
         assert!(client.checkpoint_control_pending());
         client.expire_position_for_test();
-        let failed = client.progress_appends();
+        let failed = client.progress_session();
         release.send(()).unwrap();
         assert!(matches!(failed, Err(error) if error.to_string().contains("deadline expired")));
         assert!(!client.checkpoint_control_pending());
@@ -245,7 +245,7 @@ fn prepared_prelease_completes_during_serialized_root_install() {
         .submit_checkpoint_position(1, 1, through(first), deadline)
         .unwrap();
     loop {
-        client.progress_appends().unwrap();
+        client.progress_session().unwrap();
         if entered.try_recv().is_ok() {
             break;
         }
@@ -254,7 +254,7 @@ fn prepared_prelease_completes_during_serialized_root_install() {
     }
     client.submit_leased_adoption().unwrap();
     let completed = loop {
-        client.progress_appends().unwrap();
+        client.progress_session().unwrap();
         if client.harvest_leased_adoption().unwrap() {
             break true;
         }
@@ -280,7 +280,7 @@ fn prepared_prelease_completes_during_serialized_root_install() {
     client.wait_leased_control(&mut Vec::new(), None).unwrap();
     assert!(client.leased_test_ahead_state().1);
     loop {
-        client.progress_appends().unwrap();
+        client.progress_session().unwrap();
         if let Some(proof) = client.take_checkpoint_position(1, through(first)) {
             assert_eq!(proof.unwrap().durable_end, through(first));
             break;

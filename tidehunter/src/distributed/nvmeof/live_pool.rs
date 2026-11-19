@@ -163,7 +163,6 @@ fn cache_local_member(
         bytes: target.bytes,
         block_size: target.block_size,
         access,
-        spdk: None,
     };
     lease
         .namespaces
@@ -251,7 +250,6 @@ impl LiveControllerPool {
                 bytes: target.bytes,
                 block_size: target.block_size,
                 access: LiveNamespaceAccess::ReadShared,
-                spdk: None,
             },
             pin: Arc::new(()),
             instance: 0,
@@ -468,11 +466,12 @@ impl LiveControllerPool {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn register_local_target(&self, nqn: &str, path: std::path::PathBuf) {
+        // A poisoned map holds only fixture paths; recover it rather than panic.
         self.local_targets
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(nqn.to_owned(), path);
     }
 
@@ -499,7 +498,7 @@ impl LiveControllerPool {
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if let Some(path) = self
             .local_targets
             .lock()
@@ -520,7 +519,6 @@ impl LiveControllerPool {
                     bytes: target.bytes,
                     block_size: target.block_size,
                     access,
-                    spdk: None,
                 },
             ));
         }
@@ -1010,7 +1008,6 @@ mod tests {
             address: "127.0.0.1".into(),
             service: 4420,
             transport: NvmeofTransport::Tcp,
-            spdk: None,
             geometry: Default::default(),
         };
         LiveController::deleted_for_test(&registry, dir, &target)
@@ -1091,7 +1088,6 @@ mod tests {
             address: "127.0.0.1".into(),
             service: 4420,
             transport: NvmeofTransport::Tcp,
-            spdk: None,
             geometry: Default::default(),
         };
         let identity = Identity {
@@ -1110,13 +1106,7 @@ mod tests {
         other.nqn = "nqn.2026-01.test:two".into();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         let mut different_proof = target.clone();
-        different_proof.spdk = Some(std::sync::Arc::new(super::super::SpdkTarget {
-            rpc_socket: dir.path().join("rpc.sock"),
-            pid: 1,
-            process_start_ticks: 1,
-            bdev_name: "test".into(),
-            image_path: dir.path().join("wal"),
-        }));
+        different_proof.bytes = 8192;
         assert!(matches!(
             pool.get_or_connect(&different_proof, "nqn.2026-01.test:host", [2; 16], LiveNamespaceAccess::ReadWrite, deadline),
             Err(e) if e.kind() == io::ErrorKind::InvalidData
@@ -1177,7 +1167,6 @@ mod tests {
                 bytes: 4096,
                 block_size: 4096,
                 access: LiveNamespaceAccess::ReadWrite,
-                spdk: None,
             },
             pin: Arc::new(()),
             instance: 0,
@@ -1212,7 +1201,6 @@ mod tests {
             address: "127.0.0.1".into(),
             service: 4420,
             transport: NvmeofTransport::Tcp,
-            spdk: None,
             geometry: Default::default(),
         };
         let lease = Arc::new(LiveControllerLease {
@@ -1225,7 +1213,6 @@ mod tests {
                 bytes: 4096,
                 block_size: 4096,
                 access: LiveNamespaceAccess::ReadWrite,
-                spdk: None,
             },
             pin: Arc::new(()),
             instance: 0,

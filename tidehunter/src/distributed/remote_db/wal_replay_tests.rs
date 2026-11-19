@@ -4,18 +4,21 @@ use super::tests::{checkpoint_put, fail_stop_without_checkpoint, reopen_result};
 use super::*;
 
 #[test]
-fn sui_database_document_selects_history_mode_and_preserves_legacy_default() {
+fn removed_mode_keys_fail_config_parse() {
     let fixture = Fixture::new();
-    let mut document = serde_json::to_value(&fixture.config).unwrap();
-    assert_eq!(document["history_persistence"], "wal_replay");
-    let config: RemoteDatabaseConfig = serde_json::from_value(document.clone()).unwrap();
-    assert_eq!(config.history_persistence, HistoryPersistence::WalReplay);
-    document
-        .as_object_mut()
-        .unwrap()
-        .remove("history_persistence");
-    let config: RemoteDatabaseConfig = serde_json::from_value(document).unwrap();
-    assert_eq!(config.history_persistence, HistoryPersistence::OnDisk);
+    let document = serde_json::to_value(&fixture.config).unwrap();
+    for key in ["history_persistence", "checkpoint_mode"] {
+        assert!(document.get(key).is_none());
+        let mut legacy = document.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert(key.into(), "on_disk".into());
+        let error = serde_json::from_value::<RemoteDatabaseConfig>(legacy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field"), "{key}: {error}");
+    }
 }
 
 #[test]
@@ -32,7 +35,6 @@ fn wal_replay_retry_older_than_window_is_written_again_and_newest_wins() {
             .unwrap();
     }
     db.flush_index().unwrap();
-    assert!(db.core.publisher.lock().receipt_history.is_none());
     assert!(!db.core.path.join("receipt-history-v2").exists());
     assert_eq!(
         db.core.publisher.lock().recent.len(),
@@ -69,15 +71,21 @@ fn wal_replay_retry_older_than_window_is_written_again_and_newest_wins() {
     assert!(!reopened.core.path.join("receipt-history-v2").exists());
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
-fn wal_replay_checkpointed_dataset_exports_all_keys_and_owner_restart_reads_them() {
-    use crate::distributed::nvmeof::ExportConfig;
-    use crate::distributed::tcp::SealedOwnerExport;
-    use std::collections::HashSet;
-    use std::os::unix::fs::FileExt;
-
-    let mut fixture = Fixture::new_with_capacity(8192).synchronous();
+fn wal_replay_checkpointed_dataset_owner_restart_reads_all_keys() {
+    // Leased extents hold many frames only with room: at the default 4 KiB
+    // fragment and 8 KiB file every write would lease a fresh extent and every
+    // second write would roll a WAL file.
+    let mut fixture = Fixture::new_with_config(
+        8192,
+        KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
+        2,
+        |config| {
+            config.storage.fragment_bytes = 64 * 1024;
+            config.storage.wal_file_bytes = 1024 * 1024;
+        },
+    )
+    .synchronous();
     fixture.config.max_index_bytes = 64 * 1024 * 1024;
     fixture.config.read_cache_bytes = 0;
     let db = fixture.open();
@@ -98,70 +106,6 @@ fn wal_replay_checkpointed_dataset_exports_all_keys_and_owner_restart_reads_them
     db.shutdown().unwrap();
     drop(db);
     fixture.stop_owners();
-
-    let owner = SealedOwnerExport::open(
-        &fixture.startups[0].0,
-        epoch,
-        super::tests::recovery_metrics(),
-    )
-    .unwrap();
-    assert_eq!(
-        owner.log().history_persistence(),
-        HistoryPersistence::WalReplay
-    );
-    let mut by_file: BTreeMap<u64, Vec<ValueRecordReference>> = BTreeMap::new();
-    let mut ids = HashSet::new();
-    let mut from = 0;
-    loop {
-        let page = owner.log().replay_page(from, 256, usize::MAX, 0).unwrap();
-        for decoded in page.groups {
-            for (batch, receipt) in decoded.group.batches().iter().zip(decoded.receipts) {
-                let reference = owner.log().record_reference(receipt, 0).unwrap();
-                let key = batch.mutations()[0].key();
-                assert!(ids.insert(u32::from_be_bytes(key.as_ref().try_into().unwrap())));
-                by_file
-                    .entry(reference.batch_address.offset / fixture.config.storage.wal_file_bytes)
-                    .or_default()
-                    .push(reference);
-            }
-        }
-        let Some(next) = page.next else { break };
-        from = next;
-    }
-    assert_eq!(ids.len(), 5000);
-    assert!((0..5000).all(|id| ids.contains(&id)));
-    let mut exported = 0;
-    for (file, references) in by_file {
-        let mut uuid = [7; 16];
-        uuid[..8].copy_from_slice(&file.to_le_bytes());
-        let directory = fixture.temp.path().join(format!("offline-export-{file}"));
-        let manifest = owner
-            .export_sealed_readset(
-                &directory,
-                &references,
-                &ExportConfig {
-                    export_uuid: uuid,
-                    nqn: format!("nqn.2026-01.test:checkpointed-{file}"),
-                    nsid: 1,
-                    block_size: 512,
-                    max_catalog_bytes: references.len() * 4096 + 16384,
-                },
-            )
-            .unwrap();
-        assert_eq!(manifest.catalog.len(), references.len());
-        let image = fs::File::open(directory.join("image.wal")).unwrap();
-        for (entry, reference) in manifest.catalog.iter().zip(&references) {
-            let mut bytes = vec![0; entry.len];
-            image.read_exact_at(&mut bytes, entry.offset).unwrap();
-            let mutation =
-                CompleteBatch::decode_record(&fixture.shape, reference, bytes.into()).unwrap();
-            let id = u32::from_be_bytes(mutation.key().as_ref().try_into().unwrap());
-            assert_eq!(mutation, checkpoint_put(id, id as u8));
-            exported += 1;
-        }
-    }
-    assert_eq!(exported, 5000);
-    drop(owner);
     fixture.restart_owners().unwrap();
     let mut reopened = fixture.open();
     for id in [0u32, 1, 899, 2499, 2500, 4095, 4096, 4999] {
@@ -175,33 +119,6 @@ fn wal_replay_checkpointed_dataset_exports_all_keys_and_owner_restart_reads_them
         );
     }
     reopened.shutdown().unwrap();
-}
-
-#[test]
-fn wal_replay_mode_mismatch_fails_open() {
-    let mut fixture = Fixture::new();
-    let db = fixture.open();
-    fail_stop_without_checkpoint(db);
-    fixture.config.history_persistence = HistoryPersistence::OnDisk;
-    assert!(
-        reopen_result(&fixture)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("authority manifest history persistence differs")
-    );
-
-    let fixture = Fixture::new();
-    fixture.nodes[0]
-        .set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    assert!(
-        reopen_result(&fixture)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("owner history persistence differs from the coordinator")
-    );
 }
 
 #[test]
@@ -225,9 +142,52 @@ fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
         .unwrap()
         .set_len(0)
         .unwrap();
-    // The owner scan must fail below synced_end. There is no serving coordinator.
+    // The owner must fail before serving: the leased target binding detects
+    // the truncated backing file before the WAL scan reaches its end.
     let error = fixture.restart_owners().err().unwrap();
-    assert!(error.to_string().contains("UnexpectedEof"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("WAL backing file identity, size or allocation changed"),
+        "{error}"
+    );
+}
+
+/// The scan half of the test above: the WAL file keeps its identity, size
+/// and allocation (so the leased target binding accepts it), but its frames
+/// below the persisted position root are gone, as after dropped pages on a
+/// preallocated file. The owner scan finds no frame where the root says one
+/// ends and fails before it serves; there is no serving coordinator.
+#[test]
+fn wal_replay_reopen_fails_when_owner_wal_content_ends_below_checkpoint_position() {
+    let mut fixture = Fixture::new();
+    let db = fixture.open();
+    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
+        .unwrap();
+    db.flush_index().unwrap();
+    let position = db.core.publisher.lock().positions[&(0, 1)].clone();
+    assert!(position.durable_end > 0);
+    fail_stop_without_checkpoint(db);
+    fixture.stop_owners();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(
+            fixture
+                .temp
+                .path()
+                .join("node-0/epoch_0000000000000001/wal_0000000000000000"),
+        )
+        .unwrap();
+    let len = file.metadata().unwrap().len();
+    std::os::unix::fs::FileExt::write_all_at(&file, &vec![0; len as usize], 0).unwrap();
+    drop(file);
+    let error = fixture.restart_owners().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("replay position is not a frame boundary"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -390,11 +350,10 @@ fn wal_replay_second_crash_repeats_suffix_before_committing_completion() {
             .unwrap();
     }
     fail_stop_without_checkpoint(db);
-    let error = RemoteDatabase::open_inner(
+    let error = RemoteDatabase::open_inner_local_fixture(
         &fixture.temp.path().join("authority"),
         &fixture.shape,
         fixture.config.clone(),
-        None,
         Some(OpenInterruption::DuringReplay),
     )
     .err()
@@ -492,47 +451,11 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         let error = reopen_result(&fixture).err().unwrap().to_string();
         assert!(
             error.contains(if wrong_format {
-                "checkpoint image format differs from the history persistence"
+                "checkpoint image format is not the WAL-replay format 3"
             } else {
                 "sealed WAL ends below the required position"
             }),
             "{error}"
         );
     }
-}
-
-#[cfg(feature = "test-utils")]
-#[test]
-fn memory_only_coordinator_keeps_format_two_and_receipt_history() {
-    let fixture = Fixture::new().history(HistoryPersistence::MemoryOnly);
-    let db = fixture.open();
-    let operation = fixture.operation(0, 1);
-    let version = db
-        .write_batch(operation, vec![checkpoint_put(1, 1)])
-        .unwrap();
-    db.flush_index().unwrap();
-    assert!(
-        db.core
-            .path
-            .join("receipt-history-v2/nodes.pages")
-            .is_file()
-    );
-    let metadata_name = db
-        .core
-        .publisher
-        .lock()
-        .manifest
-        .checkpoint
-        .as_ref()
-        .unwrap()
-        .metadata_name();
-    let image: CheckpointImage = read_checkpoint(&db.core.path.join(metadata_name)).unwrap();
-    assert_eq!(image.format, 2);
-    fail_stop_without_checkpoint(db);
-    let db = fixture.open();
-    assert_eq!(
-        db.write_batch(operation, vec![checkpoint_put(1, 1)])
-            .unwrap(),
-        version
-    );
 }

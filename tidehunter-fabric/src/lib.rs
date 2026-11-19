@@ -8,7 +8,5 @@ compile_error!("the fabric backend requires Linux");
 mod endpoint;
 #[cfg(feature = "native")]
 pub use endpoint::{
-    Endpoint, OpenProfile, PeerDrainToken, ProgressStats, ProviderGeometry, ProviderInfo,
-    ProviderParameter, ReadBuffer, ReadOperation, RegisteredReadRegion, RemoteReadRegion,
-    RmaAddressMode, RmaCapabilities, RmaConfig, RmaReadMode,
+    Endpoint, OpenProfile, ProgressStats, ProviderGeometry, ProviderInfo, ProviderParameter,
 };

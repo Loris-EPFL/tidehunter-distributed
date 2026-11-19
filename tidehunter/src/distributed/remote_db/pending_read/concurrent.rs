@@ -54,7 +54,6 @@ impl ConcurrentRemoteDatabase {
     pub fn read_profile_monitor(&self) -> ReadProfileMonitor {
         ReadProfileMonitor {
             state: self.reads.state.clone(),
-            fabric: self.config.tls.transport.is_fabric(),
         }
     }
     pub fn read_trace_snapshot(&self) -> ReadTraceSnapshot {
@@ -687,7 +686,6 @@ impl ConcurrentRemoteDatabase {
                 self.epoch,
                 &reference,
                 key.len(),
-                None,
                 Some(pin.clone()),
                 trace.as_ref(),
             )?
@@ -706,7 +704,7 @@ impl ConcurrentRemoteDatabase {
                 .fetch_add(elapsed(started), Ordering::Relaxed);
             GetState::Ready(self.complete_concurrent_get(reference, ks, key, values)?)
         } else {
-            let read = self.reads.submit_until_owned(
+            let read = self.reads.submit_until_planned(
                 node,
                 std::slice::from_ref(&reference),
                 key.len(),
@@ -716,7 +714,6 @@ impl ConcurrentRemoteDatabase {
                     pin: Some(pin),
                     trace,
                 },
-                None,
                 planned,
             )?;
             GetState::Pending {
@@ -750,7 +747,7 @@ impl ConcurrentRemoteDatabase {
         let result = match completed.pending.state {
             GetState::Ready(value) => Ok(value),
             GetState::Resolved { reference, ks, key } => {
-                let (values, _) = completed
+                let values = completed
                     .result
                     .expect("resolved read has completion")
                     .inspect_err(|error| self.poison(error))?;

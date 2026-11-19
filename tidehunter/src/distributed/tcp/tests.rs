@@ -25,123 +25,6 @@ fn default_owner_limits_admit_an_automatic_coordinator_and_its_reopen() {
 }
 
 #[test]
-fn production_wire_variant_tags_do_not_depend_on_features() {
-    fn tag(value: &impl Serialize) -> u32 {
-        let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(value).unwrap();
-        u32::from_le_bytes(bytes[..4].try_into().unwrap())
-    }
-    assert_eq!(
-        tag(&Request::Checkpoint {
-            authority_epoch: 0,
-            epoch: 0,
-            prefix: 0
-        }),
-        0
-    );
-    assert_eq!(
-        tag(&Request::CheckpointPosition {
-            authority_epoch: 0,
-            epoch: 0,
-            through: 0
-        }),
-        17
-    );
-    assert_eq!(
-        tag(&Request::ReplayWal {
-            authority_epoch: 0,
-            source_epoch: 0,
-            from: 0,
-            limit: 0,
-            require_end: 0,
-        }),
-        18
-    );
-    assert_eq!(
-        tag(&Request::RetireWalFiles {
-            authority_epoch: 0,
-            epoch: 0,
-            files: Vec::new()
-        }),
-        19
-    );
-    assert_eq!(
-        tag(&Request::DurableProgress {
-            authority_epoch: 0,
-            epoch: 0,
-            after: 0,
-            max_wait_ms: 0,
-            sync: false,
-        }),
-        20
-    );
-    assert_eq!(tag(&Request::PartitionStats), 21);
-    assert_eq!(
-        tag(&Response::Checkpoint(checkpoint::CheckpointProof {
-            database: [0; 16],
-            partition: 0,
-            epoch: 0,
-            prefix: 0,
-            retained: 0,
-            digest: [0; 32],
-        })),
-        0
-    );
-    assert_eq!(
-        tag(&Response::OwnerTimelinePage {
-            records: Vec::new(),
-            dropped: 0,
-            incomplete: 0,
-            more: false,
-        }),
-        18
-    );
-    assert_eq!(
-        tag(&Response::DurableProgress(DurableProgressReport {
-            database: [0; 16],
-            partition: 0,
-            authority_epoch: 0,
-            epoch: 0,
-            generation: 0,
-            synced: None,
-            appended: None,
-            synced_end: 0,
-            appended_end: 0,
-            idle: true,
-            incarnation: [0; 16],
-        })),
-        19
-    );
-    assert_eq!(tag(&Response::PartitionStats(Box::default())), 20);
-    #[cfg(feature = "experimental-nvmeof")]
-    assert_eq!(tag(&Response::ValidatedRecordReferences(Vec::new())), 21);
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    {
-        assert_eq!(
-            tag(&Request::ReplayLiveWal {
-                authority_epoch: 0,
-                source_epoch: 0,
-                from: 0,
-                limit: 0,
-                require_end: 0,
-            }),
-            38
-        );
-        assert_eq!(
-            tag(&Response::LiveExports(live_control::LiveExportInfo {
-                mode: LiveExportMode::OnDemand,
-                address: String::new(),
-                service: 0,
-                transport: super::super::nvmeof::NvmeofTransport::Tcp,
-                wal_file_bytes: 0,
-                block_size: 0,
-                exported_files: 0,
-            })),
-            33
-        );
-    }
-}
-
-#[test]
 fn structured_transport_identity_ignores_local_selectors_only() {
     let left = Transport::Ofi {
         fabric: FabricConfig {
@@ -164,7 +47,7 @@ fn structured_transport_identity_ignores_local_selectors_only() {
     };
     assert!(left.same_protocol(&right));
     assert!(!left.same_protocol(&Transport::ofi(
-        FabricBackend::Efa,
+        FabricBackend::SoftwareTcp,
         FabricSecurity::MutualTls,
     )));
     assert!(!left.same_protocol(&Transport::Ofi {
@@ -179,6 +62,31 @@ fn structured_transport_identity_ignores_local_selectors_only() {
         serde_json::json!({"kind": "tcp"}),
     );
     assert!(serde_json::from_value::<Transport>(serde_json::json!({"kind": "efa"})).is_err());
+}
+
+#[test]
+fn removed_efa_backends_are_rejected_and_their_mode_ids_stay_retired() {
+    let ofi = |backend: &str| {
+        serde_json::from_value::<Transport>(serde_json::json!({
+            "kind": "ofi",
+            "fabric": {"backend": backend},
+            "security": "mutual-tls",
+        }))
+    };
+    assert!(ofi("verbs").is_ok());
+    assert!(ofi("efa").is_err());
+    assert!(ofi("efa-direct").is_err());
+    let mut ids = vec![
+        transport_mode_id(&Transport::Tcp),
+        transport_mode_id(&Transport::TcpTrusted),
+    ];
+    for backend in [FabricBackend::Verbs, FabricBackend::SoftwareTcp] {
+        for security in [FabricSecurity::MutualTls, FabricSecurity::Trusted] {
+            ids.push(transport_mode_id(&Transport::ofi(backend, security)));
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 6, 7, 8, 9, 10]);
 }
 fn shape() -> KeyShape {
     KeyShape::new_single(4, 1, KeyType::uniform(1))
@@ -212,45 +120,13 @@ pub(super) fn config(root: &Path) -> NodeConfig {
             max_batches: 64,
             max_reference_metadata_bytes: 1024 * 1024,
         },
-        read_workers: Some(2),
         wal_member_read: Default::default(),
         // Shared fixture keeps fallocated, unwritten WAL extents; prewrite tests opt in.
         wal_prewrite: false,
-        read_resident_first: false,
-        read_memory_allowance_bytes: default_read_memory_allowance_bytes(),
-        read_max_inflight_requests: default_read_requests(),
-        read_max_inflight_bytes: default_read_bytes(),
         read_max_device_reads: default_device_reads(),
         live_target: None,
     }
 }
-
-#[test]
-fn read_workers_default_to_parallelism_and_validate_bounds() {
-    let mut serialized = serde_json::to_value(config(Path::new("/unused"))).unwrap();
-    serialized.as_object_mut().unwrap().remove("read_workers");
-    let mut config: NodeConfig = serde_json::from_value(serialized).unwrap();
-    assert_eq!(config.read_workers, None);
-    assert_eq!(
-        config.effective_read_workers(),
-        crate::parallelism::available()
-    );
-    assert!(
-        serde_json::to_value(&config)
-            .unwrap()
-            .get("read_workers")
-            .is_none()
-    );
-    for workers in [1, 1024] {
-        config.read_workers = Some(workers);
-        config.validate().unwrap();
-    }
-    for workers in [0, 1025] {
-        config.read_workers = Some(workers);
-        assert!(config.validate().is_err());
-    }
-}
-
 #[test]
 fn static_node_validation_opens_no_runtime_resources() {
     let temp = tempdir::TempDir::new("static-node-config").unwrap();
@@ -259,10 +135,10 @@ fn static_node_validation_opens_no_runtime_resources() {
     for fault in 0..5 {
         let mut invalid = config.clone();
         match fault {
-            0 => invalid.read_workers = Some(0),
+            0 => invalid.read_max_device_reads = 0,
             1 => invalid.partition.inventory.epoch = 2,
             2 => invalid.max_epochs = 0,
-            3 => invalid.read_max_inflight_bytes = usize::MAX,
+            3 => invalid.read_max_device_reads = 4097,
             _ => invalid.shape_yaml = "invalid shape".into(),
         }
         assert!(invalid.validate().is_err());
@@ -276,23 +152,16 @@ fn static_node_validation_opens_no_runtime_resources() {
         state_dir: temp.path().join("absent-target-state"),
         commissioning_port_id: 43,
         commissioning_service: 4421,
-        spdk: None,
-        export_mode: Default::default(),
     });
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    {
-        assert!(config.validate().is_ok());
-        config.live_target.as_mut().unwrap().commissioning_port_id = 42;
-        assert!(config.validate().is_err());
-    }
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+    assert!(config.validate().is_ok());
+    config.live_target.as_mut().unwrap().commissioning_port_id = 42;
     assert!(config.validate().is_err());
     assert!(!config.root.exists());
     assert!(!config.live_target.unwrap().state_dir.exists());
 }
 
 #[test]
-fn old_owner_launch_target_defaults_to_on_demand() {
+fn owner_launch_target_rejects_removed_export_keys() {
     let temp = tempdir::TempDir::new("old-live-launch").unwrap();
     let config = config(&temp.path().join("node"));
     let mut launch = serde_json::to_value(&config).unwrap();
@@ -302,40 +171,41 @@ fn old_owner_launch_target_defaults_to_on_demand() {
         "state_dir": temp.path().join("target"), "commissioning_port_id": 43,
         "commissioning_service": 4421
     });
+    // A launch file without the removed keys keeps parsing (per-owner export).
     let serialized = serde_yaml::to_string(&launch).unwrap();
     let restored: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
-    assert_eq!(
-        restored.live_target.unwrap().export_mode,
-        LiveExportMode::OnDemand
-    );
+    assert!(restored.live_target.is_some());
+    for (key, value) in [
+        ("export_mode", serde_json::json!("on_demand")),
+        ("spdk", serde_json::Value::Null),
+    ] {
+        let mut removed = launch.clone();
+        removed["live_target"][key] = value;
+        let serialized = serde_yaml::to_string(&removed).unwrap();
+        assert!(
+            serde_yaml::from_str::<NodeConfig>(&serialized).is_err(),
+            "{key}"
+        );
+    }
 }
 
-#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+/// Compiled and run only off Linux; on this Linux workstation it is checked by
+/// `cargo check --tests --target x86_64-apple-darwin` and never executed.
+#[cfg(not(target_os = "linux"))]
 #[test]
-fn unsupported_live_target_is_rejected_before_node_creation() {
-    let temp = tempdir::TempDir::new("unsupported-live-target").unwrap();
-    let mut config = config(&temp.path().join("node"));
-    config.live_target = Some(crate::distributed::nvmeof::LiveTargetConfig {
-        export_mode: Default::default(),
-        address: "127.0.0.1".into(),
-        service: 4420,
-        transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
-        host_nqn: "nqn.2026-01.test:host".into(),
-        port_id: 42,
-        state_dir: temp.path().join("target"),
-        commissioning_port_id: 43,
-        commissioning_service: 4421,
-        spdk: None,
-    });
-    let serialized = serde_yaml::to_string(&config).unwrap();
-    let parsed: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
-    assert_eq!(parsed.live_target, config.live_target);
-    let error = match StorageNode::open(parsed, metrics()) {
-        Ok(_) => panic!("unsupported target was accepted"),
-        Err(error) => error,
+fn owner_open_off_linux_fails_with_named_error() {
+    let temp = tempdir::TempDir::new("owner-open-off-linux").unwrap();
+    let config = config(&temp.path().join("node"));
+    let root = config.root.clone();
+    let Err(error) = StorageNode::open(config, metrics()) else {
+        panic!("owner open succeeded off Linux");
     };
-    assert!(error.to_string().contains("requires experimental-nvmeof"));
-    assert!(!config.root.exists());
+    let expected = format!(
+        "distributed route requires Linux (leased NVMe-oF): {}",
+        std::env::consts::OS
+    );
+    assert!(error.to_string().contains(&expected), "{error}");
+    assert!(!root.exists(), "the refused open must not create its root");
 }
 
 #[test]
@@ -372,219 +242,19 @@ pub(super) fn batch(config: &NodeConfig, epoch: u64, sequence: u64) -> CompleteB
     )
     .unwrap()
 }
-fn append(node: &StorageNode, epoch: u64, batches: &[CompleteBatch]) -> Vec<Receipt> {
-    match node
-        .handle(
-            Request::Append {
-                epoch,
-                batches: batches.iter().map(|b| b.encoded().clone().into()).collect(),
-            },
-            TcpLimits::default(),
-        )
-        .unwrap()
-    {
-        Response::Appended(receipts) => receipts,
-        _ => panic!("wrong response"),
-    }
-}
-
 #[test]
-fn bounded_server_pool_overlaps_members_preserves_order_and_rechecks_fences() {
-    let temp = tempdir::TempDir::new("parallel-member-read").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let batches = vec![batch(&config, 1, 0), batch(&config, 1, 1)];
-    let receipts = append(&node, 1, &batches);
-    let references: Vec<_> = batches
-        .iter()
-        .zip(receipts)
-        .map(|(batch, receipt)| batch.record_reference(receipt.address, 0).unwrap())
-        .collect();
-    for fenced in [false, true] {
-        let (entered, entries) = std::sync::mpsc::sync_channel(2);
-        let (release, released) = std::sync::mpsc::sync_channel(1);
-        let released = Mutex::new(released);
-        *node.read_hook.lock() = Some(Arc::new(move |reference| {
-            entered.send(reference.batch_version.sequence).unwrap();
-            if reference.batch_version.sequence == 0 {
-                // Held across the fenced pass's `fence_to(2)`, a lifecycle
-                // operation (tens of fsyncs) that clients grant
-                // LIFECYCLE_TIMEOUT; a data budget would assert fence latency.
-                released.lock().recv_timeout(LIFECYCLE_TIMEOUT).unwrap();
-            }
-        }));
-        let limits = TcpLimits {
-            max_frame_bytes: 16,
-            ..TcpLimits::default()
-        };
-        assert!(
-            node.read_response::<false>(1, references.clone(), limits)
-                .is_err()
-        );
-        assert!(matches!(
-            entries.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        let mut forged = references.clone();
-        forged[1].descriptor.offset += 1;
-        assert!(
-            node.read_response::<false>(1, forged, TcpLimits::default())
-                .is_err()
-        );
-        assert!(matches!(
-            entries.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        let reading = node.clone();
-        let requested = references.clone();
-        let worker = thread::spawn(move || {
-            reading.read_response::<false>(1, requested, TcpLimits::default())
-        });
-        let mut seen = vec![
-            entries.recv_timeout(Duration::from_secs(5)).unwrap(),
-            entries.recv_timeout(Duration::from_secs(5)).unwrap(),
-        ];
-        seen.sort_unstable();
-        assert_eq!(seen, vec![0, 1]); // second member enters while first is blocked
-        if fenced {
-            node.inventory.lock().fence_to(2).unwrap();
-        }
-        release.send(()).unwrap();
-        let result = worker.join().unwrap();
-        if fenced {
-            assert!(result.is_err());
-        } else {
-            let Response::Records(records) = result.unwrap() else {
-                panic!("wrong response")
-            };
-            for ((record, reference), batch) in records.into_iter().zip(&references).zip(&batches) {
-                assert_eq!(
-                    CompleteBatch::decode_record(&shape(), reference, record.into_bytes()).unwrap(),
-                    batch.mutations()[0]
-                );
-            }
-        }
-        node.read_hook.lock().take();
-    }
-}
-#[test]
-fn reads_progress_while_durable_append_holds_inventory() {
-    let temp = tempdir::TempDir::new("read-during-durable-append").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let first = batch(&config, 1, 0);
-    let receipt = append(&node, 1, std::slice::from_ref(&first)).remove(0);
-    let reference = first.record_reference(receipt.address, 0).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, release) = log.pause_next_persist();
-    let writing = node.clone();
-    let second = batch(&config, 1, 1);
-    let unpersisted = second.clone();
-    let writer = thread::spawn(move || append(&writing, 1, &[second]));
-    entered
-        .recv_timeout(Duration::from_secs(5))
-        .expect("append did not reach the durable-persist pause");
-    let pending = log.lookup(unpersisted.id()).unwrap().unwrap();
-    let pending_reference = unpersisted.record_reference(pending.address(), 0).unwrap();
-    assert!(
-        log.validate_durable_record_reference(&pending_reference)
-            .is_err()
-    );
-    assert!(
-        node.read_response::<false>(1, vec![pending_reference], TcpLimits::default())
-            .is_err()
-    );
-
-    let result = node
-        .read_response::<false>(1, vec![reference], TcpLimits::default())
-        .expect("unrelated committed read waited for append ownership");
-    let Response::Records(records) = result else {
-        panic!("wrong read response");
-    };
-    assert_eq!(
-        CompleteBatch::decode_record(&shape(), &reference, records[0].clone().into_bytes())
-            .unwrap(),
-        first.mutations()[0]
-    );
-
-    release.send(()).unwrap();
-    assert_eq!(writer.join().unwrap().len(), 1);
-}
-#[test]
-fn unknown_append_io_and_panic_fence_reader_authority() {
-    #[derive(Clone, Copy)]
-    enum Failure {
-        FileSync,
-        NamespaceSync,
-        PanicAfterAppend,
-    }
-
-    for failure in [
-        Failure::FileSync,
-        Failure::NamespaceSync,
-        Failure::PanicAfterAppend,
-    ] {
-        let temp = tempdir::TempDir::new("append-fail-stop").unwrap();
-        let config = config(&temp.path().join("node"));
-        let node = StorageNode::open(config.clone(), metrics()).unwrap();
-        node.inventory.lock().fence_to(1).unwrap();
-        let first = batch(&config, 1, 0);
-        let receipt = append(&node, 1, std::slice::from_ref(&first)).remove(0);
-        let reference = first.record_reference(receipt.address, 0).unwrap();
-        let second = batch(&config, 1, 1);
-        let log = node.inventory.lock().active(1).unwrap();
-        match failure {
-            Failure::FileSync => log.fail_next_persist(),
-            Failure::NamespaceSync => log.fail_next_namespace_persist(),
-            Failure::PanicAfterAppend => node.inject_panic_after_next_append(),
-        }
-        let request = Request::Append {
-            epoch: 1,
-            batches: vec![second.encoded().clone().into()],
-        };
-        assert!(
-            node.handle_caught(request, TcpLimits::default(), None)
-                .is_err()
-        );
-        let unpersisted = log.lookup(second.id()).unwrap().unwrap();
-        let unpersisted_reference = second.record_reference(unpersisted.address(), 0).unwrap();
-        assert!(matches!(
-            log.validate_durable_record_reference(&unpersisted_reference),
-            Err(StorageError::NeedsPersistence)
-        ));
-        assert!(node.reader_snapshot(1, &[]).is_err());
-        assert!(
-            node.read_response::<false>(1, vec![reference], TcpLimits::default())
-                .is_err()
-        );
-    }
-}
-
-#[test]
-fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
+fn node_restart_seals_and_never_reactivates_old_epoch() {
     let temp = tempdir::TempDir::new("tcp-node-restart").unwrap();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
     assert_eq!(node.status().unwrap().active_epoch, None);
     node.inventory.lock().fence_to(7).unwrap();
     assert_eq!(
         node.inventory.lock().fence_to(7).unwrap().active_epoch,
         Some(7)
     );
-    let batches = vec![batch(&config, 7, 0), batch(&config, 7, 4)];
-    let receipts = append(&node, 7, &batches);
-    assert_eq!(
-        node.inventory.lock().stats().unwrap().persistence_barriers,
-        1
-    );
     drop(node);
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
     assert_eq!(
         node.status().unwrap().epochs,
         vec![NodeEpoch {
@@ -594,55 +264,7 @@ fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
     );
     assert!(node.inventory.lock().fence_to(7).is_err());
     node.inventory.lock().fence_to(9).unwrap();
-    assert!(
-        node.handle(
-            Request::Append {
-                epoch: 7,
-                batches: vec![batches[0].encoded().clone().into()]
-            },
-            TcpLimits::default()
-        )
-        .is_err()
-    );
-    let page = node
-        .handle(
-            Request::Recover {
-                epoch: 7,
-                cursor: 0,
-                limit: 1,
-            },
-            TcpLimits::default(),
-        )
-        .unwrap();
-    assert!(matches!(page, Response::Recovery { next: Some(1), .. }));
-    let reference = batches[0].record_reference(receipts[0].address, 0).unwrap();
-    assert!(
-        node.handle(
-            Request::Read {
-                epoch: 7,
-                references: vec![reference],
-            },
-            TcpLimits::default()
-        )
-        .is_err()
-    );
-    match node
-        .handle(
-            Request::Read {
-                epoch: 9,
-                references: vec![reference],
-            },
-            TcpLimits::default(),
-        )
-        .unwrap()
-    {
-        Response::Records(bytes) => assert_eq!(
-            CompleteBatch::decode_record(&shape(), &reference, bytes[0].clone().into_bytes())
-                .unwrap(),
-            batches[0].mutations()[0]
-        ),
-        _ => panic!("wrong response"),
-    };
+    assert_eq!(node.status().unwrap().active_epoch, Some(9));
 }
 
 #[test]
@@ -678,127 +300,17 @@ fn wire_frame_rejects_oversize_truncation_and_trailing_bytes() {
 }
 
 #[test]
-fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
-    let temp = tempdir::TempDir::new("tcp-profiled-read").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let batch = batch(&config, 1, 0);
-    let receipt = append(&node, 1, std::slice::from_ref(&batch))[0];
-    let reference = batch.record_reference(receipt.address, 0).unwrap();
-    let request = |epoch, references| Request::ReadProfiled { epoch, references };
-    let limits = TcpLimits::default();
-    let response = node.handle(request(1, vec![reference]), limits).unwrap();
-    match response {
-        Response::RecordsProfiled { records, profile } => {
-            assert_eq!(records.len(), 1);
-            assert_eq!(
-                CompleteBatch::decode_record(&shape(), &reference, records[0].clone().into_bytes())
-                    .unwrap(),
-                batch.mutations()[0]
-            );
-            assert!(profile.handler_ns > 0 && profile.record_read_ns > 0);
-            assert!(profile.handler_ns >= profile.authority_lookup_ns + profile.record_read_ns);
-            assert_eq!(
-                wire_codec(HARD_FRAME_LIMIT)
-                    .serialized_size(&profile)
-                    .unwrap() as usize,
-                SERVER_READ_PROFILE_BYTES
-            );
-        }
-        _ => panic!("missing server profile"),
-    }
-    assert!(matches!(
-        node.handle(request(1, vec![]), limits),
-        Ok(Response::ReadErrorProfiled { .. })
-    ));
-    assert!(matches!(
-        node.handle(request(1, vec![reference; limits.max_reads + 1]), limits),
-        Ok(Response::ReadErrorProfiled { .. })
-    ));
-    assert!(matches!(
-        node.handle(request(2, vec![reference]), limits),
-        Ok(Response::ReadErrorProfiled { .. })
-    ));
-    let mut forged = reference;
-    forged.descriptor.checksum.0 ^= 1;
-    assert!(matches!(
-        node.handle(request(1, vec![forged]), limits),
-        Ok(Response::ReadErrorProfiled { .. })
-    ));
-    let mut outside = reference;
-    outside.descriptor.len = u32::MAX;
-    assert!(matches!(
-        node.handle(request(1, vec![outside]), limits),
-        Ok(Response::ReadErrorProfiled { .. })
-    ));
-
-    // A response budget that admits a normal record must still reserve the
-    // diagnostic payload. Both variants retain their ordinary frame limits.
-    let small = TcpLimits {
-        max_frame_bytes: 16 + 8 + reference.descriptor.len as usize,
-        ..limits
-    };
-    assert!(matches!(
-        node.handle(
-            Request::Read {
-                epoch: 1,
-                references: vec![reference],
-            },
-            small
-        )
-        .unwrap(),
-        Response::Records(_)
-    ));
-    let Response::ReadErrorProfiled { profile, .. } =
-        node.handle(request(1, vec![reference]), small).unwrap()
-    else {
-        panic!("profiled frame-bound error was not retained");
-    };
-    assert!(profile.handler_ns > 0 && profile.record_read_ns > 0);
-    node.inventory.lock().fence_to(2).unwrap();
-    assert!(matches!(
-        node.handle(request(1, vec![reference]), limits),
-        Ok(Response::ReadErrorProfiled { .. })
-    ));
-    assert!(node.handle(request(2, vec![reference]), limits).is_ok());
-}
-
-#[test]
-fn bulk_byte_buffers_roundtrip_correlated_envelopes() {
+fn correlated_envelopes_roundtrip_and_reject_the_uncorrelated_v1_schema() {
     use reactor::Envelope;
-    for length in [0, 1, 255, 8192] {
-        let values = vec![vec![17u8; length], vec![231u8; length]];
-        let request = Envelope {
-            protocol: PROTOCOL,
-            id: 19,
-            body: Request::Append {
-                epoch: 7,
-                batches: values.iter().cloned().map(Into::into).collect(),
-            },
-        };
-        let encoded = wire_codec(HARD_FRAME_LIMIT).serialize(&request).unwrap();
-        let decoded: Envelope<Request> =
-            wire_codec(HARD_FRAME_LIMIT).deserialize(&encoded).unwrap();
-        assert_eq!(decoded.id, 19);
-        let Request::Append { epoch, batches } = decoded.body else {
-            panic!("wrong request")
-        };
-        assert_eq!(epoch, 7);
-        assert!(batches.iter().zip(&values).all(|(a, b)| a.as_slice() == b));
-        let response = Envelope {
-            protocol: PROTOCOL,
-            id: 19,
-            body: Response::Records(values.iter().cloned().map(Into::into).collect()),
-        };
-        let encoded = wire_codec(HARD_FRAME_LIMIT).serialize(&response).unwrap();
-        let decoded: Envelope<Response> =
-            wire_codec(HARD_FRAME_LIMIT).deserialize(&encoded).unwrap();
-        let Response::Records(records) = decoded.body else {
-            panic!("wrong response")
-        };
-        assert!(records.iter().zip(&values).all(|(a, b)| a.as_slice() == b));
-    }
+    let request = Envelope {
+        protocol: PROTOCOL,
+        id: 19,
+        body: Request::Stats,
+    };
+    let encoded = wire_codec(HARD_FRAME_LIMIT).serialize(&request).unwrap();
+    let decoded: Envelope<Request> = wire_codec(HARD_FRAME_LIMIT).deserialize(&encoded).unwrap();
+    assert_eq!((decoded.protocol, decoded.id), (PROTOCOL, 19));
+    assert!(matches!(decoded.body, Request::Stats));
     // V1's uncorrelated schema is not a supported compatibility path.
     let old = wire_codec(1024)
         .serialize(&(2u32, 7u64, 1u64, 1_000_000u64))
@@ -951,105 +463,15 @@ pub(super) fn certificates(root: &Path) -> TlsFiles {
         server_name: "localhost".into(),
     }
 }
-
 #[test]
-fn pending_checkpoint_does_not_hide_prior_durable_append_completion() {
-    let temp = tempdir::TempDir::new("tcp-checkpoint-append-progress").unwrap();
-    let tls = certificates(temp.path());
-    let config = config(&temp.path().join("node"));
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
-        crate::distributed::durability::DurabilityTier::Synchronous,
-    ))
-    .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = listener.local_addr().unwrap().to_string();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let server = node.clone();
-    let stop = shutdown.clone();
-    let server_tls = tls.clone();
-    let limits = TcpLimits::default();
-    let timeout = limits.io_timeout;
-    let server_thread =
-        thread::spawn(move || server.serve(listener, server_tls, limits, stop).unwrap());
-    let mut client =
-        Client::connect(&endpoint, &tls, timeout, config.partition.clone(), &shape()).unwrap();
-    client.fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, release) = log.pause_next_persist();
-    let item = batch(&config, 1, 0);
-    let id = client
-        .submit_append_many(1, std::slice::from_ref(&item))
-        .unwrap()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while entered.try_recv().is_err() && Instant::now() < deadline {
-        client.progress_appends().unwrap();
-        thread::yield_now();
-    }
-    assert!(
-        Instant::now() < deadline,
-        "append did not enter persistence"
-    );
-    // This blocks only checkpoint proof lookup, not the already accepted
-    // append's flusher. Its barrier remains in the normal FIFO order.
-    let inventory = node.inventory.lock();
-    let control_deadline = client.checkpoint_deadline();
-    assert!(client.submit_checkpoint(1, 1, 1, control_deadline).unwrap());
-    release.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut completion = None;
-    while completion.is_none() && Instant::now() < deadline {
-        for done in client.progress_appends().unwrap() {
-            if done.id == id {
-                completion = Some(done.result);
-            }
-        }
-        thread::yield_now();
-    }
-    let proof_still_pending = client.take_checkpoint(1, 1).is_none();
-    drop(inventory);
-    let completion = completion
-        .expect("durable append reply was blocked behind checkpoint")
-        .unwrap();
-    assert_eq!(completion.len(), 1);
-    assert!(proof_still_pending);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let proof = loop {
-        client.progress_appends().unwrap();
-        if let Some(proof) = client.take_checkpoint(1, 1) {
-            break proof.unwrap();
-        }
-        assert!(Instant::now() < deadline, "checkpoint did not finish");
-        thread::yield_now();
-    };
-    assert_eq!(proof.prefix, 1);
-    assert!(proof.retained >= 1);
-    assert_eq!(
-        proof.digest,
-        checkpoint::prefix_digest(
-            proof.database,
-            proof.partition,
-            1,
-            std::iter::once(completion[0].appended().into()),
-        )
-    );
-    drop(client);
-    shutdown.store(true, Ordering::Release);
-    server_thread.join().unwrap();
-}
-
-#[test]
-fn mtls_roundtrip_authentication_lost_response_and_recovery() {
+fn mtls_roundtrip_authentication_and_fencing() {
     authenticated_roundtrip(Transport::Tcp);
 }
 
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-fn fabric_mtls_authentication_lost_response_and_recovery() {
+fn fabric_mtls_authentication_and_fencing() {
     authenticated_roundtrip(Transport::ofi(
         FabricBackend::SoftwareTcp,
         FabricSecurity::MutualTls,
@@ -1062,8 +484,6 @@ fn authenticated_roundtrip(transport: Transport) {
     tls.transport = transport.clone();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
     node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
         crate::distributed::durability::DurabilityTier::Synchronous,
     ))
@@ -1158,86 +578,7 @@ fn authenticated_roundtrip(transport: Transport) {
     }
     client.fence_to(1).unwrap();
     assert_eq!(client.connection_profile(true, true).unwrap().requests, 0);
-    let batches = vec![batch(&config, 1, 0), batch(&config, 1, 2)];
-    let receipts = client.append_many(1, &batches).unwrap();
-    let append_socket = client.stream.sock.profile.unwrap_or_default();
-    let append_profile = client.connection_profile(true, false).unwrap();
-    assert_eq!(append_profile.client.requests, 1);
-    assert_eq!(append_profile.client.request_encode_count, 1);
-    assert_eq!(append_profile.client.exchange_count, 1);
-    assert_eq!(append_profile.client.response_decode_count, 1);
-    assert_eq!(
-        append_profile.client.socket.read_calls,
-        append_socket.read_calls
-    );
-    assert_eq!(
-        append_profile.client.socket.write_calls,
-        append_socket.write_calls
-    );
-    let reference = batches[0]
-        .record_reference(receipts[0].appended().address(), 0)
-        .unwrap();
-    assert_eq!(
-        client.read_records(1, &[reference, reference]).unwrap(),
-        vec![batches[0].mutations()[0].clone(); 2]
-    );
-    let (profiled, profile) = client.read_record_profiled(1, &reference).unwrap();
-    assert_eq!(profiled, batches[0].mutations()[0]);
-    assert_eq!(profile.requests, 1);
-    assert_eq!(profile.request_encode_count, 1);
-    assert_eq!(profile.exchange_count, 1);
-    assert_eq!(profile.response_decode_count, 1);
-    assert!(
-        profile.request_encode_ns > 0
-            && profile.exchange_ns > 0
-            && profile.response_decode_ns > 0
-            && profile.record_verify_ns > 0
-    );
-    assert!(profile.server_handler_ns > 0 && profile.server_record_read_ns > 0);
-    assert!(
-        profile.server_handler_ns
-            >= profile.server_authority_lookup_ns + profile.server_record_read_ns
-    );
-    assert!(profile.exchange_ns >= profile.server_handler_ns);
-    // Interleaved TLS writes/reads are not attributed to one request.
-    assert_eq!(profile.request_send_ns, 0);
-    assert_eq!(profile.response_header_ns, 0);
-    assert_eq!(profile.response_body_ns, 0);
-    assert_eq!(profile.socket.read_calls, 0);
-    assert_eq!(profile.socket.write_calls, 0);
-    let stats = client.stats().unwrap();
-    assert_eq!(stats.appended_groups, 1);
-    assert_eq!(stats.persistence_barriers, 1);
-    assert_eq!(stats.namespace_syncs, 1);
-    assert_eq!(stats.inventory_witnesses, 1);
-    let server = client.connection_profile(false, false).unwrap();
-    assert_eq!(server.requests, 3); // append, grouped read, profiled read
-    assert_eq!(server.client.requests, 3);
-    assert_eq!(server.client.request_encode_count, 3);
-    assert_eq!(server.client.exchange_count, 3);
-    assert_eq!(server.client.response_decode_count, 3);
-    assert!(server.client.request_encode_ns > 0 && server.client.exchange_ns > 0);
-    assert!(server.client.response_decode_ns > 0 && server.client.socket.read_calls > 0);
-    assert!(
-        server.request_decode_ns > 0
-            && server.response_encode_ns > 0
-            && server.response_send_ns > 0
-    );
-    assert!(
-        server.append_decode_ns > 0
-            && server.append_group_build_ns > 0
-            && server.append_wal_ns > 0
-            && server.append_persist_ns > 0
-    );
-    assert_eq!(server.storage_write.append_calls, 1);
-    assert_eq!(server.storage_write.append_errors, 0);
-    assert_eq!(server.storage_write.file_persist_calls, 1);
-    assert_eq!(server.storage_write.file_persist_successes, 1);
-    assert_eq!(server.storage_write.namespace_persist_calls, 1);
-    assert_eq!(server.storage_write.namespace_persist_successes, 1);
-    assert_eq!(server.storage_write.durable_publications, 1);
-    assert!(server.socket.read_calls > 0 && server.socket.write_calls > 0);
-    assert_eq!(client.connection_profile(false, true).unwrap().requests, 0);
+    assert_eq!(client.status().unwrap().active_epoch, Some(1));
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     {
         client.connection_profile(true, true).unwrap();
@@ -1251,77 +592,9 @@ fn authenticated_roundtrip(transport: Transport) {
         assert!(client.read_evidence_for_benchmark(0, true).is_err());
         let evidence = client.read_evidence_for_benchmark(1, true).unwrap();
         assert!(evidence.file_bytes > 0 && evidence.resident_bytes <= evidence.file_bytes);
-        assert_eq!(
-            client.read_record(1, &reference).unwrap(),
-            batches[0].mutations()[0]
-        );
     }
-    // More request metadata than one negotiated frame: client splits bounded
-    // requests and preserves the caller's record order.
-    assert_eq!(
-        client.read_records(1, &[reference; 256]).unwrap(),
-        vec![batches[0].mutations()[0].clone(); 256]
-    );
-    let (profiled, profile) = client.read_records_profiled(1, &[reference; 256]).unwrap();
-    assert_eq!(profiled, vec![batches[0].mutations()[0].clone(); 256]);
-    assert!(profile.requests > 1);
-    assert!(profile.server_handler_ns > 0 && profile.server_record_read_ns > 0);
-    let changed = CompleteBatch::new(
-        &shape(),
-        batches[0].id(),
-        batches[0].version(),
-        vec![Mutation::Put {
-            keyspace: KeySpace(0),
-            key: b"key1"[..].into(),
-            value: b"changed"[..].into(),
-        }],
-        config.partition.batch_limits,
-    )
-    .unwrap();
-    assert!(client.append_many(1, &[changed]).is_err());
-    assert_eq!(client.status().unwrap().active_epoch, Some(1));
-    node.inject_drop_next_append_response();
-    let uncertain = batch(&config, 1, 3);
-    assert!(
-        client
-            .append_many(1, std::slice::from_ref(&uncertain))
-            .is_err()
-    );
-    assert!(client.status().is_err());
-    let mut client =
-        Client::connect(&endpoint, &tls, timeout, config.partition.clone(), &shape()).unwrap();
-    // Exact retry on a fresh authenticated connection discovers the same frame.
-    let retry = client
-        .append_many(1, std::slice::from_ref(&uncertain))
-        .unwrap();
-    assert_eq!(retry[0].appended().id(), uncertain.id());
-    let stats = client.stats().unwrap();
-    assert_eq!(stats.appended_groups, 2);
-    assert_eq!(stats.persistence_barriers, 2);
-    assert_eq!(stats.namespace_syncs, 1);
-    assert_eq!(
-        stats.inventory_witnesses, 1,
-        "same-file groups and exact retries reuse the witness"
-    );
-    // The compact statistics endpoint carries the same protocol-8 witness count.
-    assert!(matches!(
-        client.request(Request::Stats).unwrap(),
-        Response::Stats {
-            groups: 2,
-            barriers: 2,
-            inventory_witnesses: 1,
-            ..
-        }
-    ));
     client.fence_to(2).unwrap();
-    let page = client.recovery_page(1, 0, 128).unwrap();
-    assert_eq!(page.batches.len(), 3);
-    assert_eq!(page.next, None);
-    assert_eq!(
-        client.read_record(2, &reference).unwrap(),
-        batches[0].mutations()[0]
-    );
-    assert!(client.read_record(1, &reference).is_err());
+    assert_eq!(client.status().unwrap().active_epoch, Some(2));
     client.seal(2).unwrap();
     assert!(client.fence_to(2).is_err());
     drop(client);
@@ -1330,25 +603,20 @@ fn authenticated_roundtrip(transport: Transport) {
 }
 
 #[test]
-fn server_read_profile_wire_size_matches_native_segment_layout() {
-    let profile = ServerReadProfile::default();
-    let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(&profile).unwrap();
-    assert_eq!(bytes.len(), SERVER_READ_PROFILE_BYTES);
-}
-
-#[test]
 fn node_yaml_rejects_removed_cache_and_resident_settings() {
     let temp = tempdir::TempDir::new("node-memory-envelope").unwrap();
     let config = config(temp.path());
     let yaml = serde_yaml::to_string(&config).unwrap();
-    let parsed: NodeConfig = serde_yaml::from_str(&yaml).unwrap();
-    assert_eq!(
-        parsed.read_memory_allowance_bytes,
-        config.read_memory_allowance_bytes
-    );
+    serde_yaml::from_str::<NodeConfig>(&yaml).unwrap();
     for field in [
         "read_cache_bytes: 4096",
         "read_cache_metadata_bytes: 1024",
+        // Owner read-executor settings removed with the owner-RPC read path.
+        "read_workers: 2",
+        "read_resident_first: false",
+        "read_memory_allowance_bytes: 4096",
+        "read_max_inflight_requests: 32",
+        "read_max_inflight_bytes: 4096",
         "resident_reads: {}",
     ] {
         assert!(serde_yaml::from_str::<NodeConfig>(&format!("{yaml}\n{field}\n")).is_err());
@@ -1364,188 +632,6 @@ fn node_yaml_rejects_removed_cache_and_resident_settings() {
     assert!(
         serde_yaml::from_str::<TlsFiles>(&format!("{tls_yaml}\nresident_reads: {{}}\n")).is_err()
     );
-}
-
-#[test]
-fn append_residence_contains_stage_spans_on_success_and_rejection() {
-    let temp = tempdir::TempDir::new("append-stage-profile").unwrap();
-    let config = config(temp.path());
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let batch = batch(&config, 1, 0);
-    let mut profile = ConnectionProfile::default();
-    let response = node
-        .handle_profiled(
-            Request::Append {
-                epoch: 1,
-                batches: vec![batch.encoded().to_vec().into()],
-            },
-            TcpLimits::default(),
-            Some(&mut profile),
-        )
-        .unwrap();
-    assert!(matches!(response, Response::Appended(_)));
-    assert!(
-        profile.append_decode_ns > 0
-            && profile.append_group_build_ns > 0
-            && profile.append_wal_ns > 0
-            && profile.append_persist_ns > 0
-    );
-    let mut rejected = ConnectionProfile::default();
-    assert!(
-        node.handle_profiled(
-            Request::Append {
-                epoch: 1,
-                batches: vec![vec![0u8; 8].into()]
-            },
-            TcpLimits::default(),
-            Some(&mut rejected),
-        )
-        .is_err()
-    );
-    assert!(rejected.append_decode_ns > 0);
-    assert_eq!(rejected.append_wal_ns, 0);
-    assert_eq!(rejected.append_persist_ns, 0);
-    assert!(node.inventory.lock().healthy);
-}
-
-#[test]
-fn history_failure_fences_existing_reads_and_recovery_preserves_acknowledged_value() {
-    let temp = tempdir::TempDir::new("history-failure-reader-fence").unwrap();
-    let mut config = config(&temp.path().join("node"));
-    config.partition.max_batches = 2;
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    node.set_history_maintenance_diagnostics(true);
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, resume) = log.pause_next_history();
-    log.fail_next_history_after_root();
-    let batch = batch(&config, 1, 0);
-    let receipt = append(&node, 1, std::slice::from_ref(&batch)).remove(0);
-    let reference = batch.record_reference(receipt.address, 0).unwrap();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let read = |node: &StorageNode, epoch| {
-        let Response::Records(mut records) =
-            node.read_response::<false>(epoch, vec![reference], TcpLimits::default())?
-        else {
-            return Err(TcpError::new("unexpected read response"));
-        };
-        CompleteBatch::decode_record(&shape(), &reference, records.remove(0).into_bytes())
-            .map_err(TcpError::component)
-    };
-    assert_eq!(read(&node, 1).unwrap(), batch.mutations()[0]);
-    resume.send(()).unwrap();
-    assert!(matches!(log.wait_history(), Err(StorageError::Poisoned)));
-    // No later append/control request is needed to close reader authority.
-    assert!(read(&node, 1).is_err());
-    assert!(node.terminal.load(Ordering::Acquire));
-    drop(log);
-    drop(node);
-
-    let reopened = StorageNode::open(config, metrics()).unwrap();
-    reopened
-        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    reopened.inventory.lock().fence_to(2).unwrap();
-    assert_eq!(read(&reopened, 2).unwrap(), batch.mutations()[0]);
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-#[test]
-fn poison_rejects_reads_before_nvme_epoch_pin_drains() {
-    let temp = tempdir::TempDir::new("poison-nvme-pin").unwrap();
-    let configfs = temp.path().join("configfs");
-    std::fs::create_dir_all(&configfs).unwrap();
-    let node = StorageNode::open(config(&temp.path().join("node")), metrics()).unwrap();
-    node.set_nvmeof_lease_fixture(&configfs).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let Response::NvmeofEpochPinned(token) = node
-        .handle(
-            Request::RegisterNvmeofEpochPin { epoch: 1 },
-            TcpLimits::default(),
-        )
-        .unwrap()
-    else {
-        panic!("expected epoch pin");
-    };
-    node.poison_readers();
-    assert!(!node.terminal.load(Ordering::Acquire));
-    assert!(!node.reader_authority_valid(1, None));
-    assert!(
-        node.handle(Request::Status { protocol: PROTOCOL }, TcpLimits::default())
-            .is_err()
-    );
-    assert!(matches!(
-        node.handle(
-            Request::ReleaseNvmeofEpochPin { epoch: 1, token },
-            TcpLimits::default()
-        ),
-        Ok(Response::NvmeofEpochReleased)
-    ));
-    assert!(node.terminal.load(Ordering::Acquire));
-}
-
-#[cfg(feature = "test-utils")]
-#[test]
-fn memory_only_owner_rpc_accepts_4096_puts_and_checkpoint() {
-    let temp = tempdir::TempDir::new("memory-history-rpc").unwrap();
-    let mut config = config(&temp.path().join("node"));
-    config.partition.fragment_bytes = 4 * 1024 * 1024;
-    config.partition.wal_file_bytes = 16 * 1024 * 1024;
-    config.partition.max_batches = 4096;
-    config.partition.max_reference_metadata_bytes = 64 * 1024 * 1024;
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::MemoryOnly)
-        .unwrap();
-    node.set_history_maintenance_diagnostics(true);
-    let tls = TlsFiles {
-        transport: Transport::TcpTrusted,
-        ca: Default::default(),
-        cert: Default::default(),
-        key: Default::default(),
-        server_name: "trusted-test-cluster".into(),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = listener.local_addr().unwrap().to_string();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let server = node.clone();
-    let stop = shutdown.clone();
-    let server_tls = tls.clone();
-    let server_thread = thread::spawn(move || {
-        server
-            .serve(listener, server_tls, TcpLimits::default(), stop)
-            .unwrap()
-    });
-    let mut client = Client::connect(
-        &endpoint,
-        &tls,
-        Duration::from_secs(10),
-        config.partition.clone(),
-        &shape(),
-    )
-    .unwrap();
-    client.fence_to(1).unwrap();
-    for sequence in 0..4096 {
-        client
-            .append_many(1, &[batch(&config, 1, sequence)])
-            .unwrap();
-    }
-    let proof = client.checkpoint(1, 1, 4096).unwrap();
-    assert_eq!(proof.prefix, 4096);
-    assert_eq!(
-        node.inventory
-            .lock()
-            .active(1)
-            .unwrap()
-            .history_maintenance_stats()
-            .waits,
-        0
-    );
-    drop(client);
-    shutdown.store(true, Ordering::Release);
-    server_thread.join().unwrap();
 }
 
 #[test]

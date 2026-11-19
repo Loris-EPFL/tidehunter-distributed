@@ -14,7 +14,6 @@ fn submit(
         request,
         limits: TcpLimits::default(),
         measured: false,
-        trace_shape: None,
         queued: None,
         submitted: None,
         charge: 1,
@@ -23,11 +22,16 @@ fn submit(
     assert!(admitted.is_ok(), "control queue rejected request {id}");
 }
 
-fn append(config: &NodeConfig, sequence: u64) -> Request {
-    Request::Append {
-        epoch: 1,
-        batches: vec![batch(config, 1, sequence).encoded().clone().into()],
-    }
+/// Appends one batch to stream 1 with its frontier and syncer attached, as an
+/// adopted leased frame does (the owner-RPC append was removed with the
+/// payload route). Native tier: nothing waits for a sync.
+fn append(node: &StorageNode, config: &NodeConfig, sequence: u64) {
+    node.stream_log_for_test(1)
+        .append_complete_batch(
+            crate::distributed::types::RequestAuthority { epoch: 1 },
+            &batch(config, 1, sequence),
+        )
+        .unwrap();
 }
 
 fn poll(authority_epoch: u64, epoch: u64, after: u64, max_wait_ms: u32, sync: bool) -> Request {
@@ -84,11 +88,7 @@ fn nudge_reports_the_captured_tail_only_after_its_sync() {
     let (config, node) = native_node(&temp);
     let log = node.log_for_test(1);
     let (completed, completions) = mpsc::sync_channel(8);
-    submit(&node, 1, append(&config, 0), &completed);
-    assert!(matches!(
-        receive(&completions, 1),
-        Ok(Response::Appended(_))
-    ));
+    append(&node, &config, 0);
     let before = node.durable_progress_for_test(1, 1).unwrap();
     assert_eq!(
         (
@@ -104,11 +104,7 @@ fn nudge_reports_the_captured_tail_only_after_its_sync() {
     submit(&node, 2, poll(1, 1, 0, WAIT_MS, true), &completed);
     // The syncer captured the tail at version 0 and holds before its file sync.
     entered.recv_timeout(RECEIVE).unwrap();
-    submit(&node, 3, append(&config, 1), &completed);
-    assert!(matches!(
-        receive(&completions, 3),
-        Ok(Response::Appended(_))
-    ));
+    append(&node, &config, 1);
     assert!(
         completions.try_recv().is_err(),
         "nudge replied before its sync"
@@ -155,11 +151,7 @@ fn failed_sync_never_advances_the_synced_tail() {
         let (config, node) = native_node(&temp);
         let log = node.log_for_test(1);
         let (completed, completions) = mpsc::sync_channel(4);
-        submit(&node, 1, append(&config, 0), &completed);
-        assert!(matches!(
-            receive(&completions, 1),
-            Ok(Response::Appended(_))
-        ));
+        append(&node, &config, 0);
         match failure {
             0 => log.fail_next_persist(),
             1 => log.fail_next_namespace_persist(),
@@ -202,11 +194,7 @@ fn stale_authority_and_unknown_epoch_fail_and_a_sealed_stream_reports_its_seal()
     assert!(receive(&completions, 1).is_err());
     submit(&node, 2, poll(1, 7, 0, 0, false), &completed);
     assert!(receive(&completions, 2).is_err());
-    submit(&node, 3, append(&config, 0), &completed);
-    assert!(matches!(
-        receive(&completions, 3),
-        Ok(Response::Appended(_))
-    ));
+    append(&node, &config, 0);
     submit(&node, 4, Request::Fence { epoch: 2 }, &completed);
     assert!(matches!(receive(&completions, 4), Ok(Response::Status(_))));
     submit(&node, 5, poll(1, 1, 0, 0, false), &completed);
@@ -224,11 +212,7 @@ fn parked_poll_wakes_on_a_sync_and_a_fence_answers_parked_polls() {
     let temp = tempdir::TempDir::new("progress-long-poll").unwrap();
     let (config, node) = native_node(&temp);
     let (completed, completions) = mpsc::sync_channel(8);
-    submit(&node, 1, append(&config, 0), &completed);
-    assert!(matches!(
-        receive(&completions, 1),
-        Ok(Response::Appended(_))
-    ));
+    append(&node, &config, 0);
     submit(&node, 2, poll(1, 1, 0, WAIT_MS, false), &completed);
     submit(&node, 3, poll(1, 1, 0, WAIT_MS, true), &completed);
     let mut replies = HashMap::new();
@@ -333,11 +317,7 @@ fn failed_sync_is_unclean_until_the_owner_restarts() {
     let incarnation = node.status().unwrap().incarnation;
     let log = node.log_for_test(1);
     let (completed, completions) = mpsc::sync_channel(4);
-    submit(&node, 1, append(&config, 0), &completed);
-    assert!(matches!(
-        receive(&completions, 1),
-        Ok(Response::Appended(_))
-    ));
+    append(&node, &config, 0);
     assert!(node.status().unwrap().recovery_clean);
     log.fail_next_persist();
     submit(&node, 2, poll(1, 1, 0, WAIT_MS, true), &completed);
@@ -387,9 +367,7 @@ fn client_polls_over_a_dedicated_connection() {
         Client::connect(&endpoint, &tls, timeout, config.partition.clone(), &shape).unwrap();
     let status = writer.fence_to(1).unwrap();
     assert_eq!(status.durability_tier, DurabilityTier::Native);
-    writer
-        .append_many(1, std::slice::from_ref(&batch(&config, 1, 0)))
-        .unwrap();
+    append(&node, &config, 0);
     // The Status handshake of this session flushes the owner's logs, so the nudge
     // finds nothing to sync and answers at once.
     let mut progress =
@@ -418,7 +396,6 @@ fn client_polls_over_a_dedicated_connection() {
     server_thread.join().unwrap();
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn leased_owner_reports_the_adopted_and_synced_prefix() {
     use crate::distributed::write_timeline::WriteTimeline;

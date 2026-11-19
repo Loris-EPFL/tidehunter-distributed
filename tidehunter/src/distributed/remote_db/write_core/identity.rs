@@ -24,11 +24,6 @@ type Identities = HashMap<[u8; 16], IdentityEntry>;
 #[derive(Default)]
 struct IdentityShard {
     entries: Identities,
-    /// Advances, under this shard's lock, whenever checkpoint retirement
-    /// removes an entry. A negative lookup captured at generation `g` is still
-    /// valid under the same lock only while the generation is `g`: otherwise
-    /// a retired identity may have moved to a newer receipt-history root.
-    retirements: u64,
 }
 
 pub(super) struct IdentityTable {
@@ -60,10 +55,12 @@ impl IdentityTable {
         apply(&mut self.shard(operation).lock().entries)
     }
 
-    /// The entry and its shard's retirement generation, read under one lock.
-    pub(super) fn lookup(&self, operation: [u8; 16]) -> (Option<IdentityEntry>, u64) {
-        let shard = self.shard(operation).lock();
-        (shard.entries.get(&operation).copied(), shard.retirements)
+    pub(super) fn lookup(&self, operation: [u8; 16]) -> Option<IdentityEntry> {
+        self.shard(operation)
+            .lock()
+            .entries
+            .get(&operation)
+            .copied()
     }
 
     fn shard(&self, operation: [u8; 16]) -> &Mutex<IdentityShard> {
@@ -107,7 +104,6 @@ impl IdentityTable {
         let mut returned = 0;
         for shard in &self.shards {
             let mut shard = shard.lock();
-            let held = shard.entries.len();
             shard.entries.retain(|operation, entry| {
                 if entry.class != IdentityClass::Recent
                     && cut.is_some_and(|cut| entry.version <= cut)
@@ -123,9 +119,6 @@ impl IdentityTable {
                         *version == entry.version && Some(*digest) == entry.digest
                     })
             });
-            if shard.entries.len() != held {
-                shard.retirements += 1;
-            }
             // Same policy as DependencyRegistry cleanup, on this cold path:
             // retired completed identities must not pin a shard's historical
             // peak, so retained buckets stay tied to live entries.
@@ -164,6 +157,17 @@ impl IdentityTable {
         shard.capacity() * std::mem::size_of::<([u8; 16], IdentityEntry)>()
     }
 
+    /// Bytes per resident slot, as charged by `resident_bytes`.
+    #[cfg(test)]
+    pub(super) const fn entry_bytes() -> usize {
+        std::mem::size_of::<([u8; 16], IdentityEntry)>()
+    }
+
+    #[cfg(test)]
+    pub(super) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     #[cfg(test)]
     pub(super) fn count(&self, class: IdentityClass) -> usize {
         self.shards
@@ -194,11 +198,6 @@ impl LockedIdentities<'_> {
 
     pub(super) fn get(&mut self, operation: [u8; 16]) -> Option<IdentityEntry> {
         self.locked(operation).entries.get(&operation).copied()
-    }
-
-    /// The shard's retirement generation, stable while this window is locked.
-    pub(super) fn retirements(&mut self, operation: [u8; 16]) -> u64 {
-        self.locked(operation).retirements
     }
 
     pub(super) fn insert(&mut self, operation: [u8; 16], entry: IdentityEntry) {
@@ -243,12 +242,9 @@ mod tests {
         };
         assert_eq!(table.checkpoint(Some(below), &recent), 0);
         table.with_operation([1; 16], |entries| assert_eq!(entries.len(), 1));
-        // Only a removal advances the shard's retirement generation.
-        assert_eq!(table.lookup([1; 16]).1, 0);
+        assert!(table.lookup([1; 16]).is_some());
         assert_eq!(table.checkpoint(Some(version), &recent), 1);
-        let (entry, retirements) = table.lookup([1; 16]);
-        assert!(entry.is_none());
-        assert_eq!(retirements, 1);
+        assert!(table.lookup([1; 16]).is_none());
         // Retirement also frees the emptied shard's buckets, so resident
         // bookkeeping does not keep a lifetime high-water mark.
         table.with_operation([1; 16], |entries| {

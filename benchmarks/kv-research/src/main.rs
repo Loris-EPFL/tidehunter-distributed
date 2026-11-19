@@ -24,13 +24,10 @@ fn entry() -> BackendResult<()> {
         if arguments.len() != 3 {
             return Err("qualification child requires INPUT.json and a fresh READY.json".into());
         }
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         return backends::tidehunter::qualify_live_nvmeof_child(
             Path::new(&arguments[1]),
             Path::new(&arguments[2]),
         );
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
     }
     if arguments
         .first()
@@ -39,30 +36,10 @@ fn entry() -> BackendResult<()> {
         if arguments.len() != 4 || arguments[2] != "--output" {
             return Err("usage: kv-research --experimental-live-nvmeof-qualification INPUT.json --output FRESH_DIR".into());
         }
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         return backends::tidehunter::qualify_live_nvmeof(
             Path::new(&arguments[1]),
             Path::new(&arguments[3]),
         );
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
-    }
-    if arguments
-        .first()
-        .is_some_and(|arg| arg == "prepare-nvmeof-dataset" || arg == "export-nvmeof-dataset")
-    {
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-        {
-            return match (arguments[0].as_str(), arguments.as_slice()) {
-                ("prepare-nvmeof-dataset", [_, input, output]) =>
-                    backends::tidehunter::prepare_nvmeof_dataset(Path::new(input), Path::new(output)),
-                ("export-nvmeof-dataset", [_, launch, prepared, output]) =>
-                    backends::tidehunter::export_nvmeof_dataset(Path::new(launch), Path::new(prepared), Path::new(output)),
-                _ => Err("usage: prepare-nvmeof-dataset RUN_CONFIG.json OUTPUT.json | export-nvmeof-dataset NODE_LAUNCH.yaml PREPARED.json OUTPUT_DIR".into()),
-            };
-        }
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        return Err("NVMe-oF campaign tools require Linux and the nvmeof feature".into());
     }
     if arguments
         .first()

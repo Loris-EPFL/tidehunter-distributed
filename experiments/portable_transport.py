@@ -11,10 +11,6 @@ from pathlib import Path
 CASE_TRANSPORTS = {
     'tidehunter_tcp': ('tcp', None),
     'tidehunter_tcp_trusted': ('tcp-trusted', None),
-    'tidehunter_efa': ('efa', 'mutual-tls'),
-    'tidehunter_efa_direct': ('efa-direct', 'mutual-tls'),
-    'tidehunter_efa_native': ('efa-direct', 'trusted'),
-    'tidehunter_efa_trusted': ('efa', 'trusted'),
     'tidehunter_verbs': ('verbs', 'mutual-tls'),
     'tidehunter_verbs_native': ('verbs', 'trusted'),
     'tidehunter_software_tcp': ('software-tcp', 'mutual-tls'),
@@ -22,10 +18,8 @@ CASE_TRANSPORTS = {
 }
 # These are existing driver/research selections, not Rust config aliases.
 DRIVER_CASES = {
-    'tcp': 'tidehunter_tcp', 'efa': 'tidehunter_efa',
-    'efa-direct': 'tidehunter_efa_direct', 'efa-native': 'tidehunter_efa_native',
+    'tcp': 'tidehunter_tcp',
     'fabric-tcp': 'tidehunter_software_tcp',
-    'efa-trusted': 'tidehunter_efa_trusted',
     'fabric-tcp-native': 'tidehunter_software_tcp_native',
 }
 
@@ -70,7 +64,7 @@ def validate_transport(value):
     fabric = value.get('fabric')
     if not isinstance(fabric, dict) or set(fabric) - {'backend', 'domain', 'source_address'}:
         raise ValueError('OFI fabric requires explicit backend and known selectors')
-    if fabric.get('backend') not in ('efa', 'efa-direct', 'verbs', 'software-tcp'):
+    if fabric.get('backend') not in ('verbs', 'software-tcp'):
         raise ValueError('unsupported canonical fabric backend')
     domain = fabric.get('domain')
     if domain is not None and (not isinstance(domain, str) or not domain or '\0' in domain or len(domain.encode()) > 255):
@@ -83,8 +77,6 @@ def validate_transport(value):
         address = ipaddress.ip_address(source)
         if address.is_unspecified or address.is_multicast:
             raise ValueError('source_address must identify a unicast local NIC')
-        if fabric['backend'] in ('efa', 'efa-direct'):
-            raise ValueError('EFA providers cannot attest a selected source_address')
         if fabric['backend'] == 'verbs' and address.version != 4:
             raise ValueError('verbs source_address must be IPv4 in the pinned RxM profile')
     security = value.get('security', 'mutual-tls')

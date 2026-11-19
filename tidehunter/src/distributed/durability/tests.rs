@@ -699,39 +699,31 @@ fn config_defaults_to_native_and_parses_from_yaml() {
 }
 
 #[test]
-fn durable_cut_config_defaults_to_extended_durable_prefix() {
-    use super::{CutRecovery, DurableCutConfig, NativeRecovery};
+fn durable_cut_config_defaults_and_rejects_removed_recovery_modes() {
+    use super::DurableCutConfig;
     let default = DurableCutConfig::default();
     assert_eq!(
-        (
-            default.recovery,
-            default.cut,
-            default.lag_ms,
-            default.lag_bytes
-        ),
-        (
-            NativeRecovery::DurablePrefix,
-            CutRecovery::Extend,
-            1000,
-            64 * 1024 * 1024
-        )
+        (default.lag_ms, default.lag_bytes),
+        (1000, 64 * 1024 * 1024)
     );
     assert!(default.is_default() && default.validate().is_ok());
     let empty: DurableCutConfig = serde_yaml::from_str("{}").unwrap();
     assert_eq!(empty, default);
-    let parsed: DurableCutConfig =
-        serde_yaml::from_str("recovery: per_owner\ncut: strict\nlag_ms: 5\nlag_bytes: 7\n")
-            .unwrap();
-    assert_eq!(
-        (parsed.recovery, parsed.cut, parsed.lag_ms, parsed.lag_bytes),
-        (NativeRecovery::PerOwner, CutRecovery::Strict, 5, 7)
-    );
+    let parsed: DurableCutConfig = serde_yaml::from_str("lag_ms: 5\nlag_bytes: 7\n").unwrap();
+    assert_eq!((parsed.lag_ms, parsed.lag_bytes), (5, 7));
     assert!(!parsed.is_default());
     for invalid in ["lag_ms: 0", "lag_bytes: 0", "lag_ms: 3600001"] {
         let config: DurableCutConfig = serde_yaml::from_str(invalid).unwrap();
         assert!(config.validate().is_err(), "{invalid}");
     }
-    assert!(serde_yaml::from_str::<DurableCutConfig>("cut: loose").is_err());
+    // The removed per-owner and strict modes are unknown keys now.
+    for removed in [
+        "recovery: per_owner",
+        "recovery: durable_prefix",
+        "cut: strict",
+    ] {
+        assert!(serde_yaml::from_str::<DurableCutConfig>(removed).is_err());
+    }
     assert!(serde_yaml::from_str::<DurableCutConfig>("unknown: 1").is_err());
 }
 

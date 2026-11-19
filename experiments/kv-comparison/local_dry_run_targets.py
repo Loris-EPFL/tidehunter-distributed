@@ -4,6 +4,7 @@ The caller owns the fixture directory, prepared exports and live owner processes
 The helpers own target and initiator identities. No global cleanup is performed.
 """
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -29,27 +30,47 @@ class TargetError(RuntimeError):
 SYSFS_NVME = Path("/sys/class/nvme")
 SYSFS_BLOCK = Path("/sys/class/block")
 NVMET_CONFIGFS = Path("/sys/kernel/config/nvmet")
+# Shared by all qualification workers on the host, even with different output roots.
+KERNEL_PORT_STATE = Path("/run/tidehunter-kernel-live-ports")
+IPV4_PORT_SYSCTLS = Path("/proc/sys/net/ipv4")
+KERNEL_SERVICE_PORTS = range(20000, 65535, 2)
 # Bound every diagnostic listing; evidence must not grow with host state.
 DIAGNOSTIC_ENTRIES = 256
 
 
-def _owned_controllers(sysfs, transport, address, services, hostnqn):
+def _owned_controllers(sysfs, transport, address, services, hostnqn, *, sample_errors=None):
     """Initiator controllers of this run: the host NQN is fresh per run."""
     rows = []
     for path in sysfs.glob("nvme*"):
         if not re.fullmatch(r"nvme[0-9]+", path.name):
             continue
+        attrs, attribute = {}, path
         try:
-            attrs = {name: (path / name).read_text().strip() for name in
-                     ("transport", "address", "subsysnqn", "hostnqn", "hostid", "queue_count", "sqsize")}
+            for name in ("transport", "address", "subsysnqn", "hostnqn", "hostid", "queue_count", "sqsize"):
+                attribute = path / name
+                attrs[name] = attribute.read_text().strip()
             fields = dict(p.split("=", 1) for p in attrs["address"].split(",") if "=" in p)
             if (attrs["transport"] == transport and fields.get("traddr") == address
                     and fields.get("trsvcid") in {str(s) for s in services}
                     and attrs["hostnqn"] == hostnqn):
+                attribute = path
                 stat = path.stat()
                 rows.append(dict(attrs, controller=path.name, device=stat.st_dev, inode=stat.st_ino))
         except FileNotFoundError:
             continue
+        except OSError as error:
+            if sample_errors is None:
+                raise
+            disappeared = False
+            if error.errno == errno.ENODEV:
+                try:
+                    path.stat()
+                except OSError as probe:
+                    disappeared = probe.errno in (errno.ENOENT, errno.ENODEV)
+            sample_errors.append({"path": str(attribute), "errno": error.errno, "disappeared": disappeared,
+                                  "identity": dict(controller=path.name, **{
+                                      key: attrs[key] for key in ("transport", "address", "subsysnqn", "hostnqn", "hostid")
+                                      if key in attrs})})
     return rows
 
 
@@ -441,10 +462,7 @@ class LiveSpdkDaemon:
         _write(self.stopped, result)
         return result
 
-KERNEL_LIVE_HISTORIES = ("on_disk", "wal_replay")
-
-
-def qualify_kernel_live(fixture, binary, *, history_persistence, transport="rdma",
+def qualify_kernel_live(fixture, binary, *, transport="rdma",
                         deadline_seconds=600, library_path=None):
     """Run both real single-owner durability tiers in a root-owned private fixture.
 
@@ -458,8 +476,6 @@ def qualify_kernel_live(fixture, binary, *, history_persistence, transport="rdma
         raise ValueError("absolute existing output directory and binary required")
     if transport not in ("rdma", "tcp") or not 120 <= deadline_seconds <= 1200:
         raise ValueError("invalid transport or qualification deadline")
-    if history_persistence not in KERNEL_LIVE_HISTORIES:
-        raise ValueError("invalid qualification history persistence")
     container = ROOT
     if library_path is not None:
         library_path = _inside(fixture, library_path).resolve(strict=True)
@@ -468,8 +484,7 @@ def qualify_kernel_live(fixture, binary, *, history_persistence, transport="rdma
         container = ROOT + ["env", "LD_LIBRARY_PATH=" + str(library_path)]
     deadline_epoch = time.time() + deadline_seconds
     argv = container + ["python3", "-B", str(Path(__file__).resolve()), "--kernel-live-worker",
-                        str(fixture), str(binary), transport, str(deadline_seconds), str(deadline_epoch),
-                        history_persistence]
+                        str(fixture), str(binary), transport, str(deadline_seconds), str(deadline_epoch)]
     result = subprocess.run(argv, capture_output=True, text=True, timeout=deadline_seconds)
     if result.returncode:
         raise TargetError("kernel live qualification failed; evidence retained: "
@@ -477,35 +492,99 @@ def qualify_kernel_live(fixture, binary, *, history_persistence, transport="rdma
     return json.loads(result.stdout)
 
 
-def _kernel_live_ports(address, *, commissioning_address, control_address):
-    """Bind-check each actual listener and the preparer's consecutive pair."""
-    for _ in range(32):
-        with socket.socket() as control, socket.socket() as service, socket.socket() as commissioning:
+def _kernel_port_exclusions(sysctls, configfs):
+    first, last = map(int, (sysctls / "ip_local_port_range").read_text().split())
+    if not 1 <= first <= last <= 65535:
+        raise TargetError("invalid ip_local_port_range")
+    excluded = set(range(first, last + 1))
+    reserved = (sysctls / "ip_local_reserved_ports").read_text().strip()
+    for item in reserved.split(",") if reserved else ():
+        low, sep, high = item.partition("-")
+        start, end = int(low), int(high if sep else low)
+        if not 1 <= start <= end <= 65535:
+            raise TargetError("invalid ip_local_reserved_ports")
+        excluded.update(range(start, end + 1))
+    for port in (configfs / "ports").iterdir():
+        # Use the service as configfs ID too. Reject either collision, even if
+        # the existing port has no subsystem linked and no listener to probe.
+        service = (port / "addr_trsvcid").read_text().strip()
+        excluded.add(int(port.name))
+        if service.isdecimal():
+            excluded.add(int(service))
+    return excluded
+
+
+def _kernel_live_ports(address, *, commissioning_address, control_address, state, evidence,
+                       deadline, sysctls=IPV4_PORT_SYSCTLS, configfs=NVMET_CONFIGFS):
+    """Claim a host-wide service pair; release only after verified cleanup."""
+    with (state / "allocate.lock").open("a") as lock:
+        while time.monotonic() < deadline:
             try:
-                control.bind((control_address, 0))
-                service.bind((address, 0))
-                control_port = control.getsockname()[1]
-                service_port = service.getsockname()[1]
-                if service_port == 65535 or control_port in (service_port, service_port + 1):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(.05)
+        else:
+            raise TimeoutError("kernel NVMe port pool lock deadline expired")
+
+        excluded = _kernel_port_exclusions(sysctls, configfs)
+        with socket.socket() as control:
+            control.bind((control_address, 0))
+            control_port = control.getsockname()[1]
+            excluded.add(control_port)
+            busy = 0
+            for service in KERNEL_SERVICE_PORTS:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("kernel NVMe port pool allocation deadline expired")
+                commissioning = service + 1
+                claim = state / f"{service}.claim"
+                if service in excluded or commissioning in excluded or claim.exists():
                     continue
-                commissioning.bind((commissioning_address, service_port + 1))
-                return control_port, service_port, service_port + 1
-            except OSError as error:
-                if error.errno != errno.EADDRINUSE:
-                    raise
-    raise TargetError("could not bind a distinct control port and consecutive "
-                      "service/commissioning pair after 32 attempts")
+                try:
+                    # These probes detect current address conflicts only. They
+                    # cannot hold the endpoints open for the kernel target.
+                    with socket.socket() as public, socket.socket() as private:
+                        public.bind((address, service))
+                        private.bind((commissioning_address, commissioning))
+                except OSError as error:
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                    busy += 1
+                    continue
+                # Persistent for this boot, unlike flock: a killed worker may
+                # leave a service or a target that has temporarily unbound it.
+                with claim.open("x") as stream:
+                    stream.write(f"{evidence}\n")
+                return control_port, service, commissioning, claim
+    raise TargetError(f"no free adjacent non-ephemeral kernel NVMe services ({busy} bind conflicts)")
 
 
-def _admit_kernel_leased_route(remote, target, tier):
-    live = remote.get("live_nvme") or {}
-    if (live.get("write_mode") != "leased" or live.get("export_mode") != "per_owner"
-            or live.get("leased_durability") != tier or target.get("export_mode") != "per_owner"):
-        raise TargetError("prepared kernel qualification is not leased per-owner at the requested durability tier")
+def _queue_identity(row):
+    return row["controller"], row["subsysnqn"], row["hostid"]
+
+
+def _admit_kernel_geometry(record, proof, hostid, samples):
+    routes = proof.get("member_transition", {}).get("writer_routes", [])
+    expected = {(f"nvme{r['namespace_identity']['controller_instance']}",
+                 r["namespace_identity"]["nqn"], hostid) for r in routes}
+    matched = [r for r in samples if _queue_identity(r) in expected]
+    missing = sorted(expected - {_queue_identity(r) for r in matched})
+    invalid = [r for r in matched if (r["queue_count"], r["sqsize"]) != ("2", "31")]
+    record.update(queue_samples=matched, missing_queue_identities=missing, invalid_queue_samples=invalid)
+    hard_errors = len(record["sample_errors"])
+    truncated = record["sample_errors_truncated"]
+    if not expected or missing or invalid or hard_errors or truncated:
+        raise TargetError(f"live 1x32 controller geometry not proven; missing identities: {missing!r}; "
+                          f"wrong geometry: {len(invalid)}; sampling errors: {hard_errors}; truncated: {truncated}")
+
+
+def _admit_kernel_durability(remote, tier):
+    if (remote.get("live_nvme") or {}).get("leased_durability") != tier:
+        raise TargetError("prepared kernel qualification durability differs from the requested tier")
 
 
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
-                        history_persistence, owner_wal_file_bytes=None):
+                        owner_wal_file_bytes=None):
     import hashlib
     import shutil
     import signal
@@ -520,10 +599,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
 
     if os.geteuid() != 0:
         raise TargetError("kernel live worker requires root")
-    if history_persistence not in KERNEL_LIVE_HISTORIES:
-        raise ValueError("invalid qualification history persistence")
     output = Path(output).resolve(strict=True)
     owner._trusted_dir(output)
+    KERNEL_PORT_STATE.mkdir(mode=0o700, exist_ok=True)
+    owner._trusted_dir(KERNEL_PORT_STATE)
     binary = Path(binary).resolve(strict=True)
     deadline = time.monotonic() + max(0, deadline_epoch - time.time() - 5)
     with binary.open("rb") as stream:
@@ -536,7 +615,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
     out.mkdir(mode=0o700)
     overall = {"scope": "single owner kernel live NVMe-oF qualification, not performance",
                "root": str(root), "transport": transport, "binary_sha256": binary_sha256,
-               "history_persistence": history_persistence,
                "tiers": {}, "complete": False}
 
     def run(argv, timeout, log=None):
@@ -560,28 +638,30 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
     def controllers(address, services, hostnqn):
         return _owned_controllers(SYSFS_NVME, transport, address, services, hostnqn)
 
-    def tier_run(tier, index):
+    def tier_run(tier):
         directory = root / tier
         directory.mkdir(mode=0o700)
         evidence = out / tier
         evidence.mkdir(mode=0o700)
         guest, prepared = directory / "guest", directory / "prepared"
         node = guest / "node-0"
-        # Unique candidate IDs; the Rust target refuses existing configfs objects.
-        port_id = 20000 + int(token[index * 4:index * 4 + 4], 16) % 20000
         # The kernel target commissions locally, on the same loopback as control.
         control_address = "127.0.0.1"
         addr = control_address if transport == "tcp" else "10.99.0.2"
-        control, service, commissioning = _kernel_live_ports(
-            addr, commissioning_address=control_address, control_address=control_address)
+        control, service, commissioning, claim = _kernel_live_ports(
+            addr, commissioning_address=control_address, control_address=control_address,
+            state=KERNEL_PORT_STATE, evidence=evidence, deadline=deadline)
+        port_id = service
         unit = "tidehunter-local-kernel-" + token + "-" + tier
         description = "Tidehunter local kernel " + token + " " + tier
-        record = {"tier": tier, "unit": unit, "cleanup_complete": False, "errors": []}
+        record = {"tier": tier, "unit": unit, "cleanup_complete": False, "errors": [],
+                  "port_claim": str(claim), "public_service": service, "commissioning_service": commissioning}
         attempted = captured = False
         client = None
         sampler = None
         stop = threading.Event()
-        samples, sample_errors = {}, []
+        samples = {}
+        record.update(sample_errors=[], sample_errors_truncated=False)
         launch = remote = None
 
         def remaining(cap):
@@ -601,14 +681,24 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
 
         def sample():
             while not stop.wait(.02):
+                errors = []
                 try:
-                    for row in controllers(addr, (service, commissioning), remote["live_nvme"]["host_nqn"]):
-                        key = (row["controller"], row["device"], row["inode"])
-                        if len(samples) < 4096:
-                            samples[key] = row
+                    rows = _owned_controllers(SYSFS_NVME, transport, addr, (service, commissioning),
+                                              remote["live_nvme"]["host_nqn"], sample_errors=errors)
                 except OSError as error:
-                    if len(sample_errors) < 20:
-                        sample_errors.append(repr(error))
+                    rows = []
+                    errors.append({"path": str(error.filename or SYSFS_NVME), "errno": error.errno,
+                                   "disappeared": False, "identity": {}})
+                for row in rows:
+                    key = (row["controller"], row["device"], row["inode"])
+                    if len(samples) < 4096:
+                        samples[key] = row
+                if errors:
+                    seen = sorted({_queue_identity(row) for row in rows})
+                    kept = record["sample_errors"]
+                    available = 20 - len(kept)
+                    kept.extend(dict(error, observed_identities=seen) for error in errors[:available])
+                    record["sample_errors_truncated"] |= len(errors) > available
 
         def diagnose(name, capture):
             # Failure evidence is best-effort; it never replaces the failure.
@@ -625,16 +715,13 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             prep = {"guest_root": str(guest), "addresses": [f"{control_address}:{control}"],
                 "transport": {"kind": "tcp"}, "durability_tier": tier,
                 "owner_wal_geometry": "research",
-                "history_persistence": history_persistence,
                 "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
                 "max_index_bytes": 128 * 1024**2, "max_epochs": 4,
-                "coordinator_cache_bytes": 4 * 1024**2, "owner_read_workers": 2,
-                "owner_wal_member_read": "async", "owner_read_resident_first": False,
-                "owner_read_memory_allowance_bytes": 512 * 1024**2, "polling": "adaptive",
+                "coordinator_cache_bytes": 4 * 1024**2,
+                "owner_wal_member_read": "async", "polling": "adaptive",
                 "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
                     "port_id": port_id, "commissioning_service": commissioning,
                     "commissioning_port_id": port_id + 1, "max_inflight_requests": 32,
-                    "write_mode": "leased", "export_mode": "per_owner",
                     "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
                     "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
             if owner_wal_file_bytes is not None:
@@ -646,17 +733,14 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             remote = json.loads((prepared / "remote.json").read_text())
             launch = yaml.safe_load((prepared / "node-0/launch.yaml").read_text())
             launch["launch_nonce"] = uuid.uuid4().hex
-            if (remote.get("history_persistence") != history_persistence
-                    or launch.get("history_persistence") != history_persistence):
-                raise TargetError("prepared qualification history persistence differs from request")
             if owner_wal_file_bytes is not None and (
                     remote["storage"]["wal_file_bytes"] != owner_wal_file_bytes
                     or launch["node"]["partition"]["wal_file_bytes"] != owner_wal_file_bytes):
                 raise TargetError("prepared qualification WAL member size differs from request")
             target = launch["node"]["live_target"]
-            _admit_kernel_leased_route(remote, target, tier)
+            _admit_kernel_durability(remote, tier)
             if (launch["listen"] != f"{control_address}:{control}" or target["address"] != addr
-                    or target["transport"] != transport or target.get("spdk") is not None
+                    or target["transport"] != transport
                     or target["port_id"] != port_id or target["commissioning_port_id"] != port_id + 1):
                 raise TargetError("generated kernel owner identity differs from requested fixture")
             node.mkdir(mode=0o700, parents=True)
@@ -720,7 +804,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             input_path = directory / "qualification.json"
             input_path.write_text(json.dumps({"remote_config": remote, "coordinator_path": str(directory / "database"),
                 "namespace": list(uuid.uuid4().bytes), "expected_route": transport,
-                "target_implementation": "kernel", "durability_tier": tier, "value_bytes": 1024}))
+                "durability_tier": tier, "value_bytes": 1024}))
             sampler = threading.Thread(target=sample, daemon=True)
             sampler.start()
             budget = remaining(seconds) - 75
@@ -754,25 +838,15 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         "checkpoint_iteration", "cache_miss_hit", "flush_reopen",
                         "abrupt_tail_recovery", "fence_drain")
             if (proof.get("kind") != "live_nvmeof_qualification" or proof.get("expected_route") != transport
-                    or proof.get("target_implementation") != "kernel"
                     or proof.get("durability_tier") != receipt["durability"]["tier"]
-                    or any(checks.get(k) is not True for k in required)
-                    or checks.get("payload_rpc_fallback") is not False):
+                    or any(checks.get(k) is not True for k in required)):
                 raise TargetError("kernel qualification proof incomplete")
-            routes = proof.get("member_transition", {}).get("writer_routes", [])
-            identities = {(f"nvme{r['namespace_identity']['controller_instance']}",
-                           r["namespace_identity"]["nqn"]) for r in routes}
+            stop.set()
+            sampler.join(timeout=5)
+            if sampler.is_alive():
+                raise TargetError("controller sampler did not stop")
             hostid = str(uuid.UUID(bytes=bytes(remote["live_nvme"]["host_id"])))
-            matched = [r for r in samples.values()
-                       if (r["controller"], r["subsysnqn"]) in identities and r["hostid"] == hostid]
-            record["queue_samples"] = matched
-            observed = {(r["controller"], r["subsysnqn"]) for r in matched}
-            missing = sorted(identities - observed)
-            record["missing_queue_identities"] = missing
-            if not identities or missing or sample_errors or any(
-                    r["queue_count"] != "2" or r["sqsize"] != "31" for r in matched):
-                raise TargetError("live 1x32 controller geometry not proven; missing identities: "
-                                  + repr(missing))
+            _admit_kernel_geometry(record, proof, hostid, samples.values())
             record["qualification_sha256"] = hashlib.sha256(
                 (evidence / "native/qualification.json").read_bytes()).hexdigest()
             record["qualified"] = True
@@ -827,6 +901,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         raise TargetError("owner unit remains active")
                 if remote and controllers(addr, (service, commissioning), remote["live_nvme"]["host_nqn"]):
                     raise TargetError("controller reappeared after owner shutdown")
+                if attempted and any((NVMET_CONFIGFS / "ports" / str(port)).exists()
+                                     for port in (service, commissioning)):
+                    raise TargetError("configfs port remains after owner shutdown")
+                claim.unlink()
                 record["cleanup_complete"] = True
             except Exception as error:
                 record["errors"].append({"phase": "cleanup", "error": repr(error), "traceback": traceback.format_exc()})
@@ -839,8 +917,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         return record
 
     try:
-        for index, tier in enumerate(("native", "synchronous")):
-            record = tier_run(tier, index)
+        for tier in ("native", "synchronous"):
+            record = tier_run(tier)
             overall["tiers"][tier] = record
             if not record["cleanup_complete"]:
                 break
@@ -861,10 +939,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) != 8 or sys.argv[1] != "--kernel-live-worker":
+    if len(sys.argv) != 7 or sys.argv[1] != "--kernel-live-worker":
         raise SystemExit("internal kernel live worker arguments required")
     result, evidence = _kernel_live_worker(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]),
-                                           float(sys.argv[6]), history_persistence=sys.argv[7])
+                                           float(sys.argv[6]))
     print(json.dumps({"complete": result["complete"], "fixture_removed": result["fixture_removed"],
                       "binary_sha256": result["binary_sha256"], "evidence": str(evidence)}, sort_keys=True))
     if not result["complete"] or not result["fixture_removed"]:

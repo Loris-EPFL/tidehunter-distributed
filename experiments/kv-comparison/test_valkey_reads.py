@@ -78,9 +78,9 @@ class ValkeyOwnerReceiptTests(unittest.TestCase):
                                  {key for key in ('read', 'put') if job['mix'][key]})
 
     def test_completed_tidehunter_owner_still_requires_receipt(self):
-        job = next(job for job in campaign.make_focused_matrix('fair_native')
-                   if job.get('owner_count') == 1)
+        spec = json.loads(Path(campaign.__file__).with_name('cloud-nvmeof-campaign.json').read_text())
+        job = next(job for job in campaign.make_matrix(spec) if job['backend'] in campaign.NVME_BACKENDS)
         with tempfile.TemporaryDirectory() as root:
             self.write_case(root, job)
-            with self.assertRaisesRegex(ValueError, 'lacks owner durability receipts'):
+            with self.assertRaisesRegex(ValueError, 'owner receipts did not confirm the planned durability_tier'):
                 campaign.summarize_case(root)

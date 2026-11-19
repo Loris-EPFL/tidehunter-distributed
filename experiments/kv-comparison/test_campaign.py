@@ -1,6 +1,5 @@
 import copy
 import csv
-import io
 import json
 from pathlib import Path
 import tempfile
@@ -60,41 +59,12 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             campaign.matrix(spec)
 
-    def test_tcp_retention_accounts_worst_case_and_rejects_over_limit(self):
-        base = {"dataset": {}, "phases": {"preload": True, "warmup_operations": 10,
-                                         "aging_operations": 0, "measurement_operations": 100},
-                "execution": {}, "limits": {}}
-        job = {"backend": "tidehunter_tcp", "profile": {"keys": 64, "aging_operations": 5}, "rate": 100}
-        config = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
-        self.assertEqual(config["backend"]["options"]["max_batches_per_partition"], 64 + 10 + 5 + 100 + 1024)
-        self.assertEqual(base["phases"]["aging_operations"], 0)
-        qualified = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, True)
-        self.assertEqual(qualified["backend"]["options"]["max_batches_per_partition"], 1024)
-        base["phases"]["measurement_operations"] = 1_000_000
-        with self.assertRaisesRegex(ValueError, "exceeds supported"):
-            campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
+    def test_local_campaign_rejects_retired_in_process_tidehunter_cases(self):
+        for backend in ("tidehunter", "tidehunter_tcp", "tidehunter_verbs",
+                        "tidehunter_efa", "tidehunter_software_tcp", "tidehunter_nvme_tcp"):
+            with self.subTest(backend=backend), self.assertRaisesRegex(ValueError, "supported backend"):
+                campaign.matrix(self.spec() | {"backends": [backend]})
 
-    def test_ci_rss_budget_covers_native_owner_wal_lookahead(self):
-        root = Path(__file__).resolve().parents[2]
-        spec = json.loads((Path(__file__).with_name("ci.json")).read_text())
-        base = json.loads((Path(__file__).parent / spec["base_config"]).read_text())
-        job = next(job for job in campaign.matrix(spec) if job["backend"] == "tidehunter_tcp")
-        config = campaign.build_config(base, job, None, Path("/tmp/unused"), spec["seed"], True)
-        owners = config["backend"]["options"]["owners"]
-        fragment_mib, initial_maps_buffer = 128, 2
-        # Keep this bound tied to the actual native geometry and mapper lookahead.
-        self.assertIn("pub const NATIVE_FRAGMENT_BYTES: u64 = 128 * 1024 * 1024;",
-                      (root / "tidehunter/src/distributed/storage.rs").read_text())
-        self.assertIn("pub(super) const INITIAL_MAPS_BUFFER: usize = 2;",
-                      (root / "tidehunter/src/wal/mapper.rs").read_text())
-        wal_mib = owners * (1 + initial_maps_buffer) * fragment_mib
-        # Measured RSS: about 428 MiB/owner (384 MiB WAL + 44 MiB runtime),
-        # plus 61 MiB coordinator. Reserve 64 MiB/owner and 128 MiB coordinator,
-        # then add 25% margin and round up to 256 MiB: 3072 MiB for five owners.
-        overhead_mib = owners * 64 + 128
-        with_margin_mib = ((wal_mib + overhead_mib) * 5 + 3) // 4
-        required_mib = (with_margin_mib + 255) // 256 * 256
-        self.assertEqual(spec["client_memory_mib"], required_mib)
 
     def test_native_local_geometry_and_acknowledgement_are_explicit(self):
         base = {"dataset": {}, "phases": {"preload": True, "warmup_operations": 10,
@@ -106,41 +76,6 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(qualified["backend"]["options"]["native_wal_geometry"], "small")
         self.assertEqual(measured["backend"]["options"]["durability"], "page_cache")
         self.assertEqual(qualified["backend"]["options"]["durability"], "page_cache")
-
-    def test_explicit_portable_transport_cannot_masquerade_as_another_case(self):
-        base = {"dataset": {"keys": 1}, "phases": {"preload": False, "warmup_operations": 0,
-                "aging_operations": 0, "measurement_operations": 1}, "execution": {}, "limits": {}}
-        job = {"backend": "tidehunter_verbs", "profile": {"keys": 8, "aging_operations": 0}, "rate": 100}
-        transport = {"kind": "ofi", "fabric": {"backend": "verbs", "domain": "mlx5_0",
-                     "source_address": "192.0.2.10"}, "security": "mutual-tls"}
-        configured = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False, transport)
-        self.assertEqual(configured["backend"]["kind"], "tidehunter")
-        self.assertEqual(configured["backend"]["options"]["transport"], transport)
-        default_job = job | {"backend": "tidehunter_tcp"}
-        default = campaign.build_config(base, default_job, None, Path("/tmp/unused"), 17, False)
-        self.assertEqual(default["backend"]["kind"], "tidehunter")
-        self.assertEqual(default["backend"]["options"]["transport"], {"kind": "tcp"})
-        with self.assertRaisesRegex(ValueError, "differs from the selected research case"):
-            campaign.build_config(base, default_job, None, Path("/tmp/unused"), 17, False, transport)
-        self.assertEqual(base["dataset"], {"keys": 1})
-
-    def test_local_rust_runtime_maps_all_transport_case_ids(self):
-        base = {"dataset": {"keys": 1}, "phases": {"preload": False, "warmup_operations": 0,
-                "aging_operations": 0, "measurement_operations": 1}, "execution": {}, "limits": {}}
-        for label in ("tidehunter_tcp", "tidehunter_tcp_trusted", "tidehunter_efa", "tidehunter_efa_direct",
-                      "tidehunter_efa_native", "tidehunter_efa_trusted", "tidehunter_verbs",
-                      "tidehunter_verbs_native", "tidehunter_software_tcp",
-                      "tidehunter_software_tcp_native"):
-            with self.subTest(label=label):
-                job = {"backend": label, "profile": {"keys": 8, "aging_operations": 0}, "rate": 100}
-                config = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
-                self.assertEqual(config["backend"]["kind"], "tidehunter")
-                self.assertIn("transport", config["backend"]["options"])
-        spec = self.spec() | {"backends": list(campaign.CASE_TRANSPORTS), "max_runs": 80}
-        jobs = campaign.matrix(spec)
-        self.assertEqual({job["backend"] for job in jobs}, set(campaign.CASE_TRANSPORTS))
-        self.assertEqual(len(jobs), 80)
-
 
     def test_valkey_local_qualification_and_five_primary_cluster_options(self):
         spec = self.spec() | {"backends": ["valkey_tcp"], "max_runs": 8}

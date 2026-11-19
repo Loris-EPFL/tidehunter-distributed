@@ -238,7 +238,8 @@ def _delta(before, after, source, peer, transport):
     return advancing
 
 
-def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coordinator_counters, owner_counters, *, target, tier, owner_launch, owner_receipt):
+def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coordinator_counters, owner_counters, *,
+          target, tier, owner_launch, owner_receipt, archive_binary=False):
     scope = ('verified_spdk_namespace_not_physical_media_performance' if target == 'spdk'
              else 'verified_kernel_namespace_not_physical_media_performance')
     _owner_receipt(owner_receipt, owner_launch, tier)
@@ -246,14 +247,16 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
             or not isinstance(proof, dict) or proof.get('schema_version') != 1
             or proof.get('kind') != 'live_nvmeof_qualification'
             or proof.get('expected_route') != transport or proof.get('scope') != scope
-            or proof.get('durability_tier') != tier or proof.get('target_implementation') != target):
+            or proof.get('durability_tier') != tier
+            or proof.get('target_implementation', 'kernel') != target):
         raise ValueError('live qualification receipt missing or mismatched')
     if owner_launch.get('listen') != owner_control + ':9400':
         raise ValueError('owner launch endpoint mismatch')
     checks = proof.get('checks', {})
     required = ('scalar_write_delete', 'mixed_batch', 'ordered_batch_missing_exists',
                 'checkpoint_iteration', 'flush_reopen', 'abrupt_tail_recovery', 'fence_drain', 'cache_miss_hit')
-    if not isinstance(checks, dict) or any(checks.get(name) is not True for name in required) or checks.get('payload_rpc_fallback') is not False:
+    if (not isinstance(checks, dict) or any(checks.get(name) is not True for name in required)
+            or (archive_binary and checks.get('payload_rpc_fallback') is not False)):
         raise ValueError('live write/read/fence/recovery checks incomplete')
     samples = [proof.get(name) for name in ('start', 'before_close', 'recovery', 'after_miss', 'after_hit')]
     if any(not isinstance(sample, dict) for sample in samples):
@@ -286,9 +289,12 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
             raise ValueError('live cache miss did not read the namespace')
     if counter(after_hit, 'completed_read_ops') != counter(after_miss, 'completed_read_ops'):
         raise ValueError('live repeat read was not a cache hit')
+    names = ('errors', 'unknown_writes', 'route_evidence_dropped', 'fence_evidence_dropped')
+    if archive_binary:
+        names += ('payload_rpc_requests',)
     for sample in (before_close, recovery, after_hit, abrupt['end'], crash_recovery):
-        if any(counter(sample, name) != 0 for name in ('errors', 'unknown_writes', 'payload_rpc_requests', 'route_evidence_dropped', 'fence_evidence_dropped')):
-            raise ValueError('live errors, fallback or dropped evidence')
+        if any(counter(sample, name) != 0 for name in names):
+            raise ValueError('live errors, unknown writes or dropped evidence')
     transition = proof.get('member_transition')
     if not isinstance(transition, dict):
         raise ValueError('member_transition evidence missing or invalid')
@@ -580,8 +586,8 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
     if transport not in ('tcp', 'rdma'):
         raise ValueError('invalid live qualification transport')
     target_kind = cfg.get('qualification_target', 'kernel')
-    if target_kind not in ('kernel', 'spdk') or target_kind == 'spdk' and transport != 'rdma':
-        raise ValueError('live SPDK qualification requires explicit RDMA')
+    if target_kind != 'kernel':
+        raise ValueError('only the kernel live target is supported')
     owner = max(own, cfg['peer_instance'])
     own_is_owner = own == owner
     peer_info = api.request('GET', f'zones/{zone}/instances/{cfg["peer_instance"]}')
@@ -621,6 +627,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
     prefix = 'runs/' + cfg['run_id'] + '/qualification/' + label + '/'
     capsule_key = 'runs/' + cfg['run_id'] + '/private-' + label + '.json'
     binary = package / 'runtime/bin/kv-research'
+    archive_binary = 'case_binaries' in json.loads((package / 'manifest.json').read_text())
     environment = dict(os.environ, LD_LIBRARY_PATH=str(package / 'runtime/lib'))
     def barrier(name):
         return bootstrap._wait(store, prefix + name + '.json', deadline, identity)
@@ -629,15 +636,18 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
     if not own_is_owner:
         preparation = {'guest_root': str(root), 'addresses': [owner_control + ':9400'], 'transport': {'kind': 'tcp'},
             'owner_wal_geometry': 'research',
-            'history_persistence': 'on_disk',
             'durability_tier': tier, 'max_batches_per_partition': 16384, 'max_admitted_batches': 16384, 'max_index_bytes': 128 * 1024**2,
-            'max_epochs': 4, 'coordinator_cache_bytes': 4 * 1024**2, 'owner_read_workers': 2,
-            'owner_wal_member_read': 'async', 'owner_read_resident_first': False,
-            'owner_read_memory_allowance_bytes': 512 * 1024**2, 'polling': 'adaptive',
+            'max_epochs': 4, 'coordinator_cache_bytes': 4 * 1024**2,
+            'owner_wal_member_read': 'async', 'polling': 'adaptive',
             'live_nvmeof': {'transport': transport, 'addresses': [owner_fabric], 'service': 4420, 'port_id': 1000,
                 'commissioning_service': 4421, 'commissioning_port_id': 1001,
                 'max_inflight_requests': 32, 'max_inflight_bytes': 16 * 1024**2,
                 'connect_timeout_ms': 30000, 'io_timeout_ms': 30000}}
+        if archive_binary:
+            preparation.update(owner_read_workers=2, owner_read_resident_first=False,
+                               owner_read_memory_allowance_bytes=512 * 1024**2)
+            preparation['history_persistence'] = 'wal_replay'
+            preparation['live_nvmeof'].update(write_mode='leased', export_mode='per_owner')
         input_path = root / 'prepare.json'
         input_path.write_text(json.dumps(preparation))
         prepared = root / 'prepared'
@@ -646,11 +656,6 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         remote = json.loads((prepared / 'remote.json').read_text())
         launch = yaml.safe_load((prepared / 'node-0/launch.yaml').read_text())
         launch['launch_nonce'] = secrets.token_hex(16)
-        if target_kind == 'spdk':
-            token = uuid.uuid5(uuid.NAMESPACE_URL, cfg['run_id'] + ':' + owner + ':spdk-qualification:' + tier).hex
-            launch['node']['live_target']['spdk'] = {
-                'rpc_socket': '/run/tidehunter-spdk-live/' + token + '/rpc.sock',
-                'executable': str(package / 'runtime/spdk/bin/nvmf_tgt')}
         if launch.get('listen') != owner_control + ':9400' or launch.get('ready_file') != str(root / 'node-0/ready'):
             raise ValueError('prepared owner launch identity mismatch')
         _copy_tls(prepared, root, remote['tls'])
@@ -680,7 +685,9 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         barrier('owner-before')
         command = {'remote_config': remote, 'coordinator_path': str(root / 'database'),
                    'namespace': list(uuid.uuid4().bytes), 'expected_route': transport, 'value_bytes': 1024,
-                   'target_implementation': target_kind, 'durability_tier': tier}
+                   'durability_tier': tier}
+        if archive_binary:
+            command['target_implementation'] = target_kind
         input_file = root / 'qualification-input.json'
         input_file.write_text(json.dumps(command))
         output = root / 'result'
@@ -702,7 +709,8 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
             raise ValueError('owner receipt changed during qualification')
         result = admit(proof, transport, owner_fabric, coordinator_fabric, owner_control,
                        {'before': before, 'after': after}, {'before': peer['before'], 'after': peer['after']},
-                       target=target_kind, tier=tier, owner_launch=launch, owner_receipt=peer.get('owner_receipt'))
+                       target=target_kind, tier=tier, owner_launch=launch,
+                       owner_receipt=peer.get('owner_receipt'), archive_binary=archive_binary)
         if target_kind == 'spdk':
             metadata = json.loads((package / 'runtime/spdk/spdk.json').read_text())
             observations, daemon = peer.get('spdk_observations'), peer.get('spdk_daemon')

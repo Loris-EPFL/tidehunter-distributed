@@ -33,8 +33,9 @@ fn grouped_routes_follow_immutable_flight_references() {
         .collect();
     // Bulk GET and scan both move Request.references into the transport. Each
     // operation must still record all eight members from the immutable flight.
+    // Route outcome 2 is the live NVMe-oF route (1 was the removed owner RPC).
     assert_eq!(routes.len(), 16);
-    assert!(routes.iter().all(|row| row[15] == "1"));
+    assert!(routes.iter().all(|row| row[15] == "2"));
     let distinct: std::collections::BTreeSet<_> = routes.iter().map(|row| row[16]).collect();
     assert_eq!(distinct.len(), 8);
     let status = std::fs::read_to_string(root.path().join("trace/final.status")).unwrap();

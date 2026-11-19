@@ -1,7 +1,6 @@
 use super::super::{CompleteBatch, MutationVersion, NativePublicationRouting};
 use super::Dependency;
-use crate::distributed::local_db::LocalDbError;
-use crate::distributed::storage::DurableBatch;
+use crate::distributed::storage::{DurableBatch, LocalDbError};
 use crate::distributed::types::{BatchId, BatchVersion, PayloadDigest};
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};

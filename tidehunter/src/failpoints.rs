@@ -61,13 +61,13 @@ impl FailPoint {
 /// initialization and recovery. Nothing in this module exists in production.
 #[cfg(all(test, feature = "experimental-distributed"))]
 pub(crate) mod write_model {
-    use std::fs::{File, OpenOptions};
+    use std::fs::File;
+    use std::fs::OpenOptions;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
     pub(crate) const CRASH_EXIT: i32 = 86;
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    #[cfg(feature = "experimental-nvmeof")]
     static FLUSH_SUBMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     struct State {
@@ -113,7 +113,6 @@ pub(crate) mod write_model {
         state.enabled = true;
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn submitted(write: bool, flush: bool) {
         if flush {
             // Relaxed: this is an independent test observation, not a hand-off.
@@ -128,13 +127,11 @@ pub(crate) mod write_model {
         }
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn flush_submissions() -> u64 {
         // Relaxed: callers observe this after draining their own I/O.
         FLUSH_SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn adoption(actual: bool, submitted: bool) {
         if actual {
             boundary(if submitted {

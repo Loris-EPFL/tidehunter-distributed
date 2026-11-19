@@ -27,6 +27,10 @@ use crate::distributed::types::{BatchId, BatchVersion, PayloadDigest};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// WAL files per permanent export subsystem: one subsystem per owner covers
+/// 1024 files of an epoch, one namespace each.
+pub const FILES_PER_SUBSYSTEM: u64 = 1024;
+
 /// Deterministic active-epoch subsystem and namespace identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalExportName {
@@ -148,6 +152,25 @@ pub struct LiveWalSegment {
     pub block_size: u32,
 }
 
+/// One live namespace exposing one owner WAL file. Returned by the owner for
+/// leases, record resolution and replay; also persisted in the live target
+/// registry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveTargetBinding {
+    pub nqn: String,
+    pub uuid: [u8; 16],
+    pub nsid: u32,
+    pub bytes: u64,
+    pub block_size: u32,
+    pub address: String,
+    pub service: u16,
+    pub transport: super::NvmeofTransport,
+    pub readonly: bool,
+    #[serde(default)]
+    pub permanent: bool,
+}
+
 /// Owner-local authority and inode pin. Keep it until namespace and read
 /// completions retire; it is not a transport message.
 pub struct LiveRecordLease {
@@ -161,21 +184,6 @@ impl Drop for LiveRecordLease {
     fn drop(&mut self) {
         self._plan._log.release_live_read_pin();
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LiveWriteReservation {
-    pub token: [u8; 16],
-    pub segment: LiveWalSegment,
-    /// Global native WAL offset; subtract file_index * segment.bytes for I/O.
-    pub frame_offset: u64,
-    pub frame_len: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum LiveReserveResult {
-    Existing(Vec<AppendedBatch>),
-    Reserved(LiveWriteReservation),
 }
 
 /// One fragment remainder granted to a single writer. Offsets are global WAL

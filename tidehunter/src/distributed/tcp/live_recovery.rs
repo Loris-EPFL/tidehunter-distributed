@@ -13,18 +13,8 @@ use crate::distributed::nvmeof::live_pool::LivePoolAcquisition;
 use std::time::{Duration, Instant};
 
 impl Client {
-    /// Runs during bounded open/recovery, never on the shared read reactor.
-    pub(crate) fn recover_live_page(
-        &mut self,
-        authority_epoch: u64,
-        source_epoch: u64,
-        cursor: usize,
-        limit: usize,
-    ) -> Result<RecoveryPage, TcpError> {
-        self.recover_live_page_inner(authority_epoch, source_epoch, cursor, limit, None)
-    }
-
     /// Replay whole WAL groups. `next` is a WAL byte offset, not a receipt ordinal.
+    /// Runs during bounded open/recovery, never on the shared read reactor.
     pub fn replay_live_wal_page(
         &mut self,
         authority_epoch: u64,
@@ -35,23 +25,6 @@ impl Client {
     ) -> Result<RecoveryPage, TcpError> {
         let cursor = usize::try_from(from)
             .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
-        self.recover_live_page_inner(
-            authority_epoch,
-            source_epoch,
-            cursor,
-            limit,
-            Some(require_end),
-        )
-    }
-
-    fn recover_live_page_inner(
-        &mut self,
-        authority_epoch: u64,
-        source_epoch: u64,
-        cursor: usize,
-        limit: usize,
-        require_end: Option<u64>,
-    ) -> Result<RecoveryPage, TcpError> {
         if limit == 0 || limit > 1024 {
             return Err(TcpError::new("invalid recovery page limit"));
         }
@@ -80,27 +53,20 @@ impl Client {
         }
         let page = {
             let _control = LiveReadTiming::start(&self.live_counters, LiveTimingStage::Control);
-            if let Some(require_end) = require_end {
-                let from = u64::try_from(cursor)
-                    .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
-                let response = self.request(super::Request::ReplayLiveWal {
-                    authority_epoch,
-                    source_epoch,
-                    from,
-                    limit: page_limit,
-                    require_end,
-                })?;
-                self.validate_live_recovery_page(
-                    response,
-                    authority_epoch,
-                    source_epoch,
-                    cursor,
-                    page_limit,
-                    true,
-                )?
-            } else {
-                self.recover_live_metadata(authority_epoch, source_epoch, cursor, page_limit)?
-            }
+            let response = self.request(super::Request::ReplayLiveWal {
+                authority_epoch,
+                source_epoch,
+                from,
+                limit: page_limit,
+                require_end,
+            })?;
+            self.validate_live_recovery_page(
+                response,
+                authority_epoch,
+                source_epoch,
+                cursor,
+                page_limit,
+            )?
         };
         let token = page.epoch_pin_token;
         let result = (|| {
@@ -118,7 +84,6 @@ impl Client {
                     address: binding.address.clone(),
                     service: binding.service,
                     transport: binding.transport,
-                    spdk: binding.spdk.clone(),
                     geometry: config.queue_geometry,
                 };
                 let access = if binding.readonly {
@@ -126,7 +91,7 @@ impl Client {
                 } else {
                     LiveNamespaceAccess::ReadWrite
                 };
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-utils"))]
                 if self.live_write_local_fixture {
                     // Use the real namespace I/O and CRC checks without a kernel target.
                     pool.cache_local_namespace(
@@ -175,11 +140,6 @@ impl Client {
                         service: binding.service,
                         host_nqn: config.host_nqn.clone(),
                         host_id: config.host_id,
-                        target_implementation:
-                            crate::distributed::nvmeof::live_metrics::target_implementation(
-                                &observed.spdk,
-                            ),
-                        spdk: observed.spdk.clone(),
                         writer: None,
                         namespace_identity: LiveNamespaceIdentity {
                             namespace_path: observed.namespace_path.clone(),
@@ -189,10 +149,6 @@ impl Client {
                             nsid: observed.nsid,
                             bytes: observed.bytes,
                             block_size: observed.block_size,
-                            target_implementation:
-                                crate::distributed::nvmeof::live_metrics::target_implementation(
-                                    &observed.spdk,
-                                ),
                         },
                     });
                 }

@@ -43,13 +43,22 @@ use std::ops::Bound;
 use std::path::Path;
 use typenum::U32;
 
-mod cell_contract;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
-use cell_contract::cell_flushers;
-pub(crate) use cell_contract::{CellRootHeader, PrefixCut};
+
+/// Fixed cap of the Exact checkpoint cell flusher pool. Not a measured optimum.
+pub(crate) const MAX_CELL_FLUSHERS: usize = 8;
+
+/// Flusher count `P = min(available parallelism, shards, MAX_CELL_FLUSHERS)`,
+/// at least one. Shard ranges, not cells, are assigned to flushers.
+pub(crate) fn cell_flushers(shards: usize) -> usize {
+    crate::parallelism::available()
+        .min(shards)
+        .clamp(1, MAX_CELL_FLUSHERS)
+}
+
 pub use retention::IndexReadPin;
 use retention::{CaptureLease, RetentionState, position, view_charge};
 pub(crate) use retention::{PublicationViewReservation, StandingViewBudget};

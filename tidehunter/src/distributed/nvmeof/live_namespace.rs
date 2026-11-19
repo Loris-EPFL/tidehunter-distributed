@@ -1,6 +1,7 @@
 //! Verified Linux live namespaces. Control-plane authentication and lease lifetime
 //! remain the caller's responsibility; a device identity is not an authority grant.
 use super::NvmeofTransport;
+use crate::distributed::sys;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -25,8 +26,6 @@ pub struct LiveNamespaceBinding {
     pub bytes: u64,
     pub block_size: u32,
     pub access: LiveNamespaceAccess,
-    /// Authenticated owner proof for the exact SPDK AIO export, if present.
-    pub spdk: Option<std::sync::Arc<super::SpdkTarget>>,
 }
 
 pub struct LiveNamespace {
@@ -131,8 +130,7 @@ struct NvmeAdminCommand {
 fn verify_access_policy(
     access: LiveNamespaceAccess,
     host_readonly: bool,
-    spdk: bool,
-    identify_readonly: Option<bool>,
+    identify_readonly: bool,
 ) -> io::Result<()> {
     if access == LiveNamespaceAccess::ReadShared {
         return Ok(());
@@ -141,7 +139,7 @@ fn verify_access_policy(
     if host_readonly != expected_ro {
         return Err(invalid("namespace access mismatch"));
     }
-    if !spdk && identify_readonly != Some(expected_ro) {
+    if identify_readonly != expected_ro {
         return Err(invalid("target write protection mismatch"));
     }
     Ok(())
@@ -171,7 +169,7 @@ impl LiveNamespace {
         OpenOptions::new()
             .read(true)
             .write(binding.access == LiveNamespaceAccess::ReadWrite)
-            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+            .custom_flags(sys::direct_io_flag()? | libc::O_CLOEXEC)
             .open(&binding.namespace_path)
     }
 
@@ -183,11 +181,9 @@ impl LiveNamespace {
         if !meta.file_type().is_block_device() {
             return Err(invalid("not a block namespace"));
         }
-        let dev = meta.rdev();
         let sysfs = PathBuf::from(format!(
-            "/sys/dev/block/{}:{}",
-            libc::major(dev),
-            libc::minor(dev)
+            "/sys/dev/block/{}",
+            sys::device_number(meta.rdev())
         ));
         let u = binding.uuid;
         let uuid = format!(
@@ -227,7 +223,7 @@ impl LiveNamespace {
         } else {
             libc::O_RDONLY
         };
-        if flags & libc::O_DIRECT == 0 || flags & libc::O_ACCMODE != expected_mode {
+        if flags & sys::direct_io_flag()? == 0 || flags & libc::O_ACCMODE != expected_mode {
             return Err(invalid("namespace descriptor access mismatch"));
         }
         let mut readonly: libc::c_int = 0;
@@ -256,34 +252,24 @@ impl LiveNamespace {
         {
             return Err(invalid("namespace geometry or access mismatch"));
         }
-        let identify_readonly = if binding.spdk.is_none() {
-            let mut identify = [0u8; 4096];
-            let mut cmd = NvmeAdminCommand {
-                opcode: 6,
-                nsid: binding.nsid,
-                addr: identify.as_mut_ptr() as u64,
-                data_len: 4096,
-                ..Default::default()
-            };
-            // SAFETY: cmd has the Linux NVMe passthrough layout. Its data_len
-            // matches the live 4096-byte identify buffer; ioctl is synchronous.
-            let result = unsafe { libc::ioctl(fd, 0xc0484e41, &mut cmd) };
-            if result < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if result != 0 {
-                return Err(invalid("target identify failed"));
-            }
-            Some(identify[99] & 1 != 0)
-        } else {
-            None
+        let mut identify = [0u8; 4096];
+        let mut cmd = NvmeAdminCommand {
+            opcode: 6,
+            nsid: binding.nsid,
+            addr: identify.as_mut_ptr() as u64,
+            data_len: 4096,
+            ..Default::default()
         };
-        verify_access_policy(
-            binding.access,
-            readonly != 0,
-            binding.spdk.is_some(),
-            identify_readonly,
-        )?;
+        // SAFETY: cmd has the Linux NVMe passthrough layout. Its data_len
+        // matches the live 4096-byte identify buffer; ioctl is synchronous.
+        let result = unsafe { libc::ioctl(fd, 0xc0484e41, &mut cmd) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if result != 0 {
+            return Err(invalid("target identify failed"));
+        }
+        verify_access_policy(binding.access, readonly != 0, identify[99] & 1 != 0)?;
         Ok(Self {
             file,
             bytes,
@@ -325,10 +311,11 @@ impl LiveNamespace {
         if !Self::valid_geometry(bytes, block_size) {
             return Err(invalid("invalid fixture geometry"));
         }
+        let direct = if direct { sys::direct_io_flag()? } else { 0 };
         let file = OpenOptions::new()
             .read(true)
             .write(access == LiveNamespaceAccess::ReadWrite)
-            .custom_flags(libc::O_CLOEXEC | if direct { libc::O_DIRECT } else { 0 })
+            .custom_flags(libc::O_CLOEXEC | direct)
             .open(path)?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() != bytes {
@@ -362,7 +349,7 @@ mod tests {
         let path = dir.path().join("wal");
         let file = File::create(&path).unwrap();
         file.set_len(4096).unwrap();
-        let mut binding = LiveNamespaceBinding {
+        let binding = LiveNamespaceBinding {
             namespace_path: path.clone(),
             transport: NvmeofTransport::Tcp,
             nqn: "nqn.2026-01.test:wal".to_owned(),
@@ -371,16 +358,7 @@ mod tests {
             bytes: 4096,
             block_size: 4096,
             access: LiveNamespaceAccess::ReadWrite,
-            spdk: None,
         };
-        assert!(LiveNamespace::open(&binding).is_err());
-        binding.spdk = Some(std::sync::Arc::new(super::super::SpdkTarget {
-            rpc_socket: dir.path().join("rpc.sock"),
-            pid: 1,
-            process_start_ticks: 1,
-            bdev_name: "test".into(),
-            image_path: path.clone(),
-        }));
         assert!(LiveNamespace::open(&binding).is_err());
         assert!(
             LiveNamespace::open_local_file(&path, 4096, 4096, LiveNamespaceAccess::ReadOnly)
@@ -395,24 +373,16 @@ mod tests {
     #[test]
     fn access_policy_keeps_kernel_protection_and_requires_host_access() {
         use LiveNamespaceAccess::{ReadOnly, ReadWrite};
-        assert!(verify_access_policy(ReadOnly, true, false, Some(true)).is_ok());
-        assert!(verify_access_policy(ReadOnly, true, false, Some(false)).is_err());
-        assert!(verify_access_policy(ReadOnly, true, false, None).is_err());
-        assert!(verify_access_policy(ReadWrite, false, false, Some(false)).is_ok());
-        assert!(verify_access_policy(ReadWrite, false, false, Some(true)).is_err());
-        assert!(verify_access_policy(ReadOnly, true, true, None).is_ok());
-        assert!(verify_access_policy(ReadWrite, false, true, None).is_ok());
-        assert!(verify_access_policy(ReadOnly, false, true, None).is_err());
-        assert!(verify_access_policy(ReadWrite, true, true, None).is_err());
-        for (host_readonly, identify) in [(true, Some(true)), (false, Some(false)), (false, None)] {
+        assert!(verify_access_policy(ReadOnly, true, true).is_ok());
+        assert!(verify_access_policy(ReadOnly, true, false).is_err());
+        assert!(verify_access_policy(ReadWrite, false, false).is_ok());
+        assert!(verify_access_policy(ReadWrite, false, true).is_err());
+        assert!(verify_access_policy(ReadOnly, false, true).is_err());
+        assert!(verify_access_policy(ReadWrite, true, false).is_err());
+        for (host_readonly, identify) in [(true, true), (false, false), (false, true)] {
             assert!(
-                verify_access_policy(
-                    LiveNamespaceAccess::ReadShared,
-                    host_readonly,
-                    false,
-                    identify
-                )
-                .is_ok()
+                verify_access_policy(LiveNamespaceAccess::ReadShared, host_readonly, identify)
+                    .is_ok()
             );
         }
     }

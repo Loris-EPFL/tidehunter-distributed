@@ -1,5 +1,6 @@
 //! Deterministic lifecycle cuts over real five-node authenticated WAL storage.
 //! These are recovery/retention regressions, not performance measurements.
+//! Every case opens the leased live fixture, so the module needs nvmeof.
 
 use super::pipeline_tests::Fixture;
 use super::*;
@@ -20,71 +21,17 @@ fn put_key(key: u32, value: u8) -> Mutation {
     }
 }
 
-#[test]
-fn control_monitor_waits_for_occupied_checkpoint_slot_and_stops_cleanly() {
-    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 70), vec![put(1)])
-        .unwrap();
-    let monitor = db.read_evidence_monitor();
-    let (entered, release) = fixture.nodes[0].pause_inventory();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (reply, proof) = mpsc::sync_channel(1);
-    db.core.clients[0]
-        .send(Command::Checkpoint(db.epoch(), db.epoch(), 1, reply))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if db.core.clients[0].client.lock().checkpoint_pending() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            drop(release);
-            panic!("checkpoint control was not submitted");
-        }
-        thread::yield_now();
-    }
-    let (called, called_rx) = mpsc::sync_channel(1);
-    let (done, completed) = mpsc::sync_channel(1);
-    db.core.clients[0]
-        .send(Command::Control(Box::new(move |client| {
-            let _ = called.send(());
-            let _ = done.send(client.read_io_stats());
-        })))
-        .unwrap();
-    assert!(called_rx.try_recv().is_err());
-    let monitoring = ReadEvidenceMonitor {
-        clients: monitor.clients.clone(),
-        reads: monitor.reads.clone(),
-    };
-    let (begun, starting) = mpsc::sync_channel(1);
-    let (finished, result) = mpsc::sync_channel(1);
-    let sampler = thread::spawn(move || {
-        let _ = begun.send(());
-        let _ = finished.send(monitoring.sample_owner_read_io());
-    });
-    starting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let early = result.recv_timeout(Duration::from_millis(100));
-    release.send(()).unwrap();
-    let checkpoint = proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-    assert_eq!(checkpoint.prefix, 1);
-    called_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    completed
-        .recv_timeout(Duration::from_secs(5))
+/// End of the frame that holds `version` in its owner WAL. A leased owner
+/// learns frame positions at adoption, so a position proof names this end
+/// instead of relying on an owner-appended frontier.
+fn written_end(db: &RemoteDatabase, version: BatchVersion) -> u64 {
+    let address = db
+        .core
+        .durable_receipt(version.sequence)
         .unwrap()
-        .unwrap();
-    let sampled = match early {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            result.recv_timeout(Duration::from_secs(5)).unwrap()
-        }
-        Err(error) => panic!("monitor disconnected: {error}"),
-    };
-    sampler.join().unwrap();
-    assert_eq!(sampled.unwrap().len(), 5);
-    assert_eq!(monitor.sample_owner_read_io().unwrap().len(), 5);
-    db.shutdown().unwrap();
-    assert!(monitor.sample_owner_read_io().is_err());
+        .appended()
+        .address();
+    address.offset + u64::from(address.len)
 }
 
 #[test]
@@ -94,22 +41,22 @@ fn public_diagnostic_controls_wait_for_checkpoint_without_consuming_proof() {
     #[cfg(not(all(target_os = "linux", feature = "test-utils")))]
     let cases = 2;
     for case in 0..cases {
-        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+        let fixture = Fixture::new();
         let mut db = fixture.open();
-        db.write_batch(fixture.operation(0, 73), vec![put(1)])
+        let version = db
+            .write_batch(fixture.operation(0, 73), vec![put(1)])
             .unwrap();
-        let receipt = *db.core.publisher.lock().known.values().next().unwrap();
-        let expected = super::super::tcp::checkpoint::prefix_digest(
-            db.core.config.storage.database,
-            0,
-            db.epoch(),
-            std::iter::once(receipt.into()),
-        );
+        let through = written_end(&db, version);
         let (entered, release) = fixture.nodes[0].pause_inventory();
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         let (reply, proof) = mpsc::sync_channel(1);
         db.core.clients[0]
-            .send(Command::Checkpoint(db.epoch(), db.epoch(), 1, reply))
+            .send(Command::CheckpointPosition(
+                db.epoch(),
+                db.epoch(),
+                through,
+                reply,
+            ))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !db.core.clients[0].client.lock().checkpoint_pending() {
@@ -124,7 +71,7 @@ fn public_diagnostic_controls_wait_for_checkpoint_without_consuming_proof() {
         let owner = thread::spawn(move || {
             let _ = started.send(());
             let outcome = match case {
-                0 => db.read_io_stats().map(|_| ()),
+                0 => db.storage_stats().map(|_| ()),
                 1 => db.connection_profiles(true, true).map(|_| ()),
                 #[cfg(all(target_os = "linux", feature = "test-utils"))]
                 2 => db.read_evidence_for_benchmark(false).map(|_| ()),
@@ -138,8 +85,7 @@ fn public_diagnostic_controls_wait_for_checkpoint_without_consuming_proof() {
         let early = result.recv_timeout(Duration::from_millis(100));
         release.send(()).unwrap();
         let proof = proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        assert_eq!(proof.prefix, 1);
-        assert_eq!(proof.digest, expected);
+        assert!(proof.durable_end > 0);
         let completed = match early {
             Ok(result) => Ok(result),
             Err(mpsc::RecvTimeoutError::Timeout) => result.recv_timeout(Duration::from_secs(5)),
@@ -219,16 +165,23 @@ fn write_behind_pending_checkpoint_is_durable_and_recoverable() {
 #[cfg(all(target_os = "linux", feature = "test-utils"))]
 #[test]
 fn concurrent_eviction_waits_for_pending_checkpoint_control() {
-    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+    let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
     let db = fixture.open();
-    db.write_batch(fixture.operation(0, 76), vec![put(1)])
+    let version = db
+        .write_batch(fixture.operation(0, 76), vec![put(1)])
         .unwrap();
+    let through = written_end(&db, version);
     let (entered, release) = fixture.nodes[0].pause_inventory();
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     let (reply, proof) = mpsc::sync_channel(1);
     db.core.clients[0]
-        .send(Command::Checkpoint(db.epoch(), db.epoch(), 1, reply))
+        .send(Command::CheckpointPosition(
+            db.epoch(),
+            db.epoch(),
+            through,
+            reply,
+        ))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !db.core.clients[0].client.lock().checkpoint_pending() {
@@ -249,13 +202,13 @@ fn concurrent_eviction_waits_for_pending_checkpoint_control() {
     starting.recv_timeout(Duration::from_secs(5)).unwrap();
     let early = result.recv_timeout(Duration::from_millis(100));
     release.send(()).unwrap();
-    assert_eq!(
+    assert!(
         proof
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap()
-            .prefix,
-        1
+            .durable_end
+            > 0
     );
     let completed = match early {
         Ok(result) => Ok(result),
@@ -319,13 +272,18 @@ fn scalar_write_uses_worker_while_checkpoint_awaits_verification() {
 
 #[test]
 fn cancelled_checkpoint_reply_drains_before_worker_shutdown() {
-    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+    let fixture = Fixture::new();
     let db = fixture.open();
     db.write_batch(fixture.operation(0, 51), vec![put(1)])
         .unwrap();
     let (reply, cancelled) = mpsc::sync_channel(1);
     db.core.clients[0]
-        .send(Command::Checkpoint(db.epoch(), db.epoch(), 1, reply))
+        .send(Command::CheckpointPosition(
+            db.epoch(),
+            db.epoch(),
+            0,
+            reply,
+        ))
         .unwrap();
     drop(cancelled);
     let operation = fixture.operation(0, 52);
@@ -373,8 +331,8 @@ fn failed_shutdown_joins_checkpoint_before_worker_senders() {
 }
 
 #[test]
-fn checkpoint_rejects_mismatched_captured_prefix_digest_before_adoption() {
-    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+fn checkpoint_rejects_mismatched_position_proof_before_adoption() {
+    let fixture = Fixture::new();
     let db = fixture.open();
     let operation = fixture.operation(0, 55);
     let version = db.write_batch(operation, vec![put(1)]).unwrap();
@@ -392,7 +350,7 @@ fn checkpoint_rejects_mismatched_captured_prefix_digest_before_adoption() {
     assert!(
         error
             .to_string()
-            .contains("checkpoint prefix differs from published receipts")
+            .contains("checkpoint position proof differs")
     );
     assert_eq!(
         db.core
@@ -415,8 +373,8 @@ fn checkpoint_rejects_mismatched_captured_prefix_digest_before_adoption() {
 }
 
 #[test]
-fn invalid_checkpoint_prefix_fails_without_adoption() {
-    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+fn invalid_checkpoint_position_fails_without_adoption() {
+    let fixture = Fixture::new();
     let db = fixture.open();
     db.write_batch(fixture.operation(0, 53), vec![put(1)])
         .unwrap();
@@ -430,10 +388,10 @@ fn invalid_checkpoint_prefix_fails_without_adoption() {
         .map(|checkpoint| (checkpoint.epoch, checkpoint.generation));
     let (reply, pending) = mpsc::sync_channel(1);
     db.core.clients[0]
-        .send(Command::Checkpoint(
+        .send(Command::CheckpointPosition(
             db.epoch(),
             db.epoch(),
-            usize::MAX,
+            u64::MAX,
             reply,
         ))
         .unwrap();
@@ -463,20 +421,7 @@ fn invalid_checkpoint_prefix_fails_without_adoption() {
 
 #[test]
 fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() {
-    checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity_mode(
-        HistoryPersistence::OnDisk,
-    );
-}
-#[test]
-fn wal_replay_checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() {
-    checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity_mode(
-        HistoryPersistence::WalReplay,
-    );
-}
-fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity_mode(
-    mode: HistoryPersistence,
-) {
-    let fixture = Fixture::new().history(mode);
+    let fixture = Fixture::new();
     let mut db = fixture.open();
     let baseline = fixture.operation(4, 30);
     db.write_batch(baseline, vec![put_key(0, 1)]).unwrap();
@@ -537,12 +482,19 @@ fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity_mo
 
     // The response loss happens after the stable image was adopted. Recovery
     // must merge both its acknowledged sparse suffix and this uncertain WAL.
-    fixture.nodes[2].inject_drop_next_append_response();
+    // The owner-2 frame reaches its WAL file but its completion reports EIO:
+    // the outcome is unknown to the authority, as for a lost reply.
+    db.core.clients[2]
+        .client
+        .lock()
+        .leased_test_fail_write(-libc::EIO);
     let uncertain = fixture.operation(2, 34);
     let uncertain_version = db.submit(uncertain, vec![put_key(4, 5)]).unwrap();
     assert!(db.drain().is_err());
     assert!(db.core.ensure_healthy().is_err());
     drop(db);
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop((connection, suffix_connection));
 
     let mut reopened = fixture.open();
     for (key, expected) in [(2u32, 3u8), (3, 4), (4, 5)] {
@@ -604,6 +556,8 @@ fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
         .begin_failure(&LocalDbError::new("injected coordinator loss"));
     drop(held);
     drop(db);
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop((connection, suffix_connection));
 
     let mut reopened = fixture.open();
     assert!(
@@ -641,21 +595,8 @@ fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
 
 #[test]
 fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
-    acknowledged_suffix_survives_every_background_checkpoint_adoption_stage_mode(
-        HistoryPersistence::OnDisk,
-    );
-}
-#[test]
-fn wal_replay_acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
-    acknowledged_suffix_survives_every_background_checkpoint_adoption_stage_mode(
-        HistoryPersistence::WalReplay,
-    );
-}
-fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage_mode(
-    mode: HistoryPersistence,
-) {
     for stage in 0..=8 {
-        let fixture = Fixture::new().history(mode);
+        let fixture = Fixture::new();
         let mut db = fixture.open();
         let first = fixture.operation(0, 1);
         let captured = fixture.operation(0, 2);
@@ -689,26 +630,6 @@ fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage_mode(
         );
         resume.send(()).unwrap();
         assert!(db.core.progress_checkpoint(true).is_err());
-        if stage == 4 && mode != HistoryPersistence::WalReplay {
-            use std::os::unix::fs::FileExt;
-            let ordinal = db
-                .core
-                .publisher
-                .lock()
-                .receipt_history
-                .as_ref()
-                .unwrap()
-                .counts[&(0, db.epoch())];
-            let stream = db
-                .core
-                .path
-                .join(format!("receipt-history-v2/stream-0-{}.pages", db.epoch()));
-            let file = fs::OpenOptions::new().write(true).open(stream).unwrap();
-            // Full-length torn metadata outside the adopted prefix is not
-            // authority. Recovery must rebuild it from durable complete WALs.
-            file.write_all_at(&[0; 256], ordinal as u64 * 256).unwrap();
-            file.sync_all().unwrap();
-        }
         drop(db);
 
         let mut reopened = fixture.open();
@@ -790,15 +711,22 @@ fn failed_staging_intent_fences_serving_without_authorizing_outputs() {
     );
 }
 
+/// Completed write bookkeeping is bounded by the fixed WAL-replay retry
+/// window, the only history since R3: `recent` keeps at most
+/// `WAL_REPLAY_WINDOW_BATCHES` receipts and identities follow it, so the
+/// resident charge stays within the window's static byte bound across
+/// lifetime history, capacity pressure and reopens. (On-disk receipt history,
+/// removed by R3, paged identities out instead.) The plateau once the window
+/// is full is `completed_owner_metadata_plateaus_once_the_retry_window_is_full`.
 #[test]
 fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
-    let fixture = Fixture::new_with_capacity(8).history(HistoryPersistence::OnDisk);
+    let fixture = Fixture::new_with_capacity(8);
     let original = fixture.operation(0, 100);
     let mut original_version = None;
-    let mut resident_bound = None;
     let mut next = 100u64;
     for _ in 0..3 {
         let db = fixture.open();
+        let bound = db.core.metadata_history_bound();
         for _ in 0..4 {
             for _ in 0..16 {
                 let operation = fixture.operation((next % 5) as u32, next);
@@ -820,12 +748,13 @@ fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
                 db.core.publisher.lock().known.is_empty(),
                 "completed outcomes must page out after durable adoption"
             );
+            assert!(db.core.publisher.lock().recent.len() <= WAL_REPLAY_WINDOW_BATCHES);
             let charge = db.metadata_history_bytes();
-            let bound = *resident_bound.get_or_insert(charge);
             assert!(
                 charge <= bound,
-                "resident completed bookkeeping grew with lifetime history"
+                "resident completed bookkeeping {charge} exceeds the retry-window bound {bound}"
             );
+            // Every write so far is inside the retry window.
             assert_eq!(
                 db.write_batch(original, vec![put(100)]).unwrap(),
                 original_version.unwrap()
@@ -835,38 +764,75 @@ fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
     }
 }
 
+/// Faithful plateau of the retry window: past `WAL_REPLAY_WINDOW_BATCHES`
+/// batches the retained bookkeeping stops growing. After each flush, once the
+/// window is full, `recent` and the identity table hold exactly the window
+/// (every write is checkpointed, so no Active or Suffix identity remains), and
+/// the resident charge stays within the static bound of that window, which
+/// does not depend on lifetime history. The charge itself is hash-table slot
+/// capacity: with a constant entry count it still moves up and down by a few
+/// percent as identity shards rehash around their per-shard counts (a
+/// RandomState spread), so a byte-for-byte comparison between windows would
+/// not be deterministic. Measured on 256 identity shards with 4,096 entries
+/// constant after the window filled, identity bytes at successive flushes
+/// were 526320, 556080, 580160, 586960, 594000, 594720, 598240, 608320,
+/// 610640, 597760, 598720, 614320; the publisher parts stayed constant (known
+/// capacity 224, recent 4,096) and dependencies were empty. Ignored in the
+/// normal suite for its length (three windows of writes); the gate's
+/// ignored-test stage runs it.
 #[test]
-fn absent_or_corrupt_pageable_retry_authority_fails_closed() {
-    for missing in [false, true] {
-        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-        let db = fixture.open();
-        let operation = fixture.operation(0, 1);
-        db.write_batch(operation, vec![put(1)]).unwrap();
-        db.flush_index().unwrap();
-        let nodes = db.core.path.join("receipt-history-v2/nodes.pages");
-        if missing {
-            fs::remove_file(&nodes).unwrap();
-        } else {
-            use std::os::unix::fs::FileExt;
-            let file = fs::OpenOptions::new().write(true).open(&nodes).unwrap();
-            file.write_all_at(&[0; 256], 0).unwrap();
-            file.sync_all().unwrap();
+#[ignore = "writes past the 4,096-batch retry window; run by the gate's ignored-test stage"]
+fn completed_owner_metadata_plateaus_once_the_retry_window_is_full() {
+    const FLUSH_EVERY: u64 = 256;
+    let window = WAL_REPLAY_WINDOW_BATCHES as u64;
+    // Wide fragments: a 4 KiB leased frame never closes its extent, so the
+    // run measures bookkeeping, not WAL file churn.
+    let fixture = Fixture::new_with_config(
+        64,
+        KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
+        2,
+        |config| {
+            config.storage.fragment_bytes = 1024 * 1024;
+            config.storage.wal_file_bytes = 8 * 1024 * 1024;
+        },
+    );
+    let db = fixture.open();
+    let bound = db.core.metadata_history_bound();
+    let mut written = 0u64;
+    while written < 3 * window {
+        let mut last = None;
+        for _ in 0..FLUSH_EVERY {
+            let operation = fixture.operation((written % 5) as u32, written);
+            let version = db.write_batch(operation, vec![put(written as u8)]).unwrap();
+            last = Some((operation, written, version));
+            written += 1;
         }
-        // Reopen, rather than a live external file mutation, is the supported
-        // authority-corruption boundary. Never treat a missing root as no IDs.
-        db.core
-            .begin_failure(&LocalDbError::new("injected crash before reopen"));
-        drop(db);
+        db.flush_index().unwrap();
+        let recent = db.core.publisher.lock().recent.len();
+        let charge = db.metadata_history_bytes();
         assert!(
-            RemoteDatabase::open(
-                &fixture.temp.path().join("authority"),
-                &fixture.shape,
-                fixture.config.clone(),
-                Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-            )
-            .is_err()
+            charge <= bound,
+            "resident completed bookkeeping {charge} exceeds the retry-window bound {bound}"
+        );
+        if written >= window {
+            assert_eq!(recent, WAL_REPLAY_WINDOW_BATCHES, "after {written} writes");
+            assert_eq!(
+                db.core.resident_identities(),
+                WAL_REPLAY_WINDOW_BATCHES,
+                "after {written} writes"
+            );
+        } else {
+            assert_eq!(recent as u64, written);
+            assert_eq!(db.core.resident_identities() as u64, written);
+        }
+        // The newest write is inside the window: its retry keeps its version.
+        let (operation, value, version) = last.unwrap();
+        assert_eq!(
+            db.write_batch(operation, vec![put(value as u8)]).unwrap(),
+            version
         );
     }
+    db.shutdown().unwrap();
 }
 
 /// Reserve one grant through the real caller Admission path. A blocked
@@ -1184,11 +1150,10 @@ fn open_fails_cleanly_when_index_bytes_cannot_hold_standing_view_budget() {
     fixture.config.max_index_bytes = budget - 1;
     assert!(fixture.config.max_index_bytes >= stats.charged_metadata_bytes);
     let open = |config: &RemoteDatabaseConfig| {
-        RemoteDatabase::open(
+        RemoteDatabase::open_local_live_fixture(
             &fixture.temp.path().join("authority"),
             &fixture.shape,
             config.clone(),
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
         )
     };
     let error = open(&fixture.config)
@@ -1332,6 +1297,8 @@ fn publication_failure_fences_and_recovers_dispatched_successor_group() {
     assert_eq!(db.core.published_next(), 0);
     assert!(db.core.admission.charges().slots > 0);
     drop(db);
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop((connection, predecessor_connection));
 
     let mut reopened = fixture.open();
     assert_eq!(reopened.recovery_stats().tail_batches, 5);

@@ -1,5 +1,4 @@
-use crate::distributed::local_db::LocalDbError;
-use crate::distributed::storage::DurableBatch;
+use crate::distributed::storage::{DurableBatch, LocalDbError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -80,7 +79,6 @@ pub(crate) enum DrainStop {
 impl DrainStop {
     pub(crate) const COUNT: usize = 5;
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn live(self) -> crate::distributed::nvmeof::live_metrics::OwnerDrainStop {
         use crate::distributed::nvmeof::live_metrics::OwnerDrainStop;
         match self {

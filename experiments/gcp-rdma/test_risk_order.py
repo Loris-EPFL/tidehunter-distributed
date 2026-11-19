@@ -28,7 +28,7 @@ class RiskOrderTests(unittest.TestCase):
 
     def setUp(self):
         self.jobs = [
-            {'case_id': 'a', 'backend': 'tidehunter_tcp', 'sealed_dataset': {'source_id': 's'}},
+            {'case_id': 'a', 'backend': 'tidehunter_nvme_tcp', 'sealed_dataset': {'source_id': 's'}},
             {'case_id': 'b', 'backend': 'tidehunter_nvme_rdma', 'sealed_dataset': {'source_id': 's'}},
             {'case_id': 'c', 'backend': 'native'},
         ]
@@ -66,31 +66,6 @@ class RiskOrderTests(unittest.TestCase):
         first = by_id[order['case_ids'][0]]
         self.assertEqual((first.get('nvmeof_route'), first['cohort']), ('live', 'cold_os_cache'))
         self.assertEqual(len(order['case_ids']), len(jobs))
-    def test_focused_order_preserves_matrix_and_canaries(self):
-        for selection in ('stages', 'unified', 'append_floors', 'fair_native', 'parity'):
-            with self.subTest(selection=selection):
-                jobs = risk_order.cloud_campaign.make_focused_matrix(selection)
-                order = risk_order.generate_order(jobs)
-                self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
-                self.assertTrue(risk_order.validate_order(jobs, order))
-
-    def test_fabric_ab_preserves_reviewed_order(self):
-        jobs = risk_order.cloud_campaign.make_focused_matrix('fabric_ab_compact')
-        self.assertEqual(len(jobs), 80)
-        order = risk_order.generate_order(jobs)
-        self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
-        self.assertTrue(risk_order.validate_order(jobs, order))
-        order['case_ids'][0], order['case_ids'][1] = order['case_ids'][1], order['case_ids'][0]
-        with self.assertRaisesRegex(ValueError, 'reviewed matrix'):
-            risk_order.validate_order(jobs, order)
-
-    def test_leased_ab_preserves_reviewed_order(self):
-        jobs = risk_order.cloud_campaign.make_focused_matrix('leased_ab_compact')
-        order = risk_order.generate_order(jobs)
-        self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
-        order['case_ids'][0], order['case_ids'][1] = order['case_ids'][1], order['case_ids'][0]
-        with self.assertRaisesRegex(ValueError, 'reviewed matrix'):
-            risk_order.validate_order(jobs, order)
     def test_nvmeof_path_preserves_canaries_and_group_order(self):
         for selection in risk_order.cloud_campaign.NVMEOF_PATH_SELECTIONS:
             expected_count = risk_order.cloud_campaign.FOCUSED_COUNTS[selection]
@@ -121,32 +96,10 @@ class RiskOrderTests(unittest.TestCase):
             risk_order.validate_order(jobs, {})
 
 
-    def test_fair_native_canary_cannot_move(self):
-        for selection in ('fair_native', 'parity'):
-            jobs = risk_order.cloud_campaign.make_focused_matrix(selection)
-            order = risk_order.generate_order(jobs)
-            self.assertEqual(order['case_ids'][0], 'G14N-r0-676ab5a538a3ed589fff')
-            order['case_ids'][0], order['case_ids'][1] = order['case_ids'][1], order['case_ids'][0]
-            with self.subTest(selection=selection), self.assertRaisesRegex(ValueError, 'canary'):
-                risk_order.validate_order(jobs, order)
-
-    def test_floors_order_preserves_matrix_and_canaries(self):
-        jobs = risk_order.cloud_campaign.make_focused_matrix('floors')
-        order = risk_order.generate_order(jobs)
-        self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
-        self.assertTrue(risk_order.validate_order(jobs, order))
-
-    def test_device_order_preserves_matrix_and_canaries(self):
-        jobs = risk_order.cloud_campaign.make_focused_matrix('device')
-        order = risk_order.generate_order(jobs)
-        self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
-        self.assertTrue(risk_order.validate_order(jobs, order))
-
-
     def test_focused_cli_generates_and_validates_selection_bound_orders(self):
         import manual_campaign
         with tempfile.TemporaryDirectory() as directory:
-            for selection in ('recommended', 'full'):
+            for selection in ('nvmeof_path_compact', 'nvmeof_path_core'):
                 with self.subTest(selection=selection):
                     path = Path(directory) / (selection + '.json')
                     output = io.StringIO()
@@ -158,14 +111,11 @@ class RiskOrderTests(unittest.TestCase):
                     self.assertEqual(document['matrix_sha256'], reviewed['matrix_sha256'])
                     self.assertEqual(document['planned_cases'], reviewed['job_count'])
                     jobs = risk_order.cloud_campaign.make_focused_matrix(selection)
-                    direct_ids = {job['case_id'] for job in jobs if job.get('target_io') == 'direct'}
-                    self.assertEqual(len(direct_ids), 9)
-                    self.assertTrue(direct_ids <= set(document['case_ids']))
                     self.assertEqual(json.loads(output.getvalue())['cases'], reviewed['job_count'])
                     with patch.object(sys, 'argv', ['risk_order', str(path), '--selection', selection]), \
                             patch('sys.stdout', io.StringIO()):
                         risk_order.main()
-                    other = 'full' if selection == 'recommended' else 'recommended'
+                    other = 'nvmeof_path_core' if selection == 'nvmeof_path_compact' else 'nvmeof_path_compact'
                     with patch.object(sys, 'argv', ['risk_order', str(path), '--selection', other]), \
                             self.assertRaisesRegex(ValueError, 'does not bind'):
                         risk_order.main()
