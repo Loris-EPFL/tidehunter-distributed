@@ -998,13 +998,18 @@ impl LargeTable {
         let mut overlay = IndexTable::clone(&entry.data);
         overlay.retain_processed(last_processed);
 
-        // Base = the on-disk levels the overlay sits on. Load L1; for an unloaded
-        // cell L0 is still on disk (not folded into `entry.data`), so merge it over
-        // L1. For a loaded cell L0 already lives in `entry.data` (and thus `overlay`).
+        // Base = the on-disk levels the overlay sits on. Load L1, or every shard
+        // of a sharded cell (disjoint key ranges, in place of L1); for an
+        // unloaded cell L0 is still on disk (not folded into `entry.data`), so
+        // merge it over that. For a loaded cell L0 already lives in `entry.data`
+        // (and thus `overlay`).
         let mut merged = match entry.levels().l1() {
             Some(l1_pos) => loader.load(&entry.context.ks_config, l1_pos)?,
             None => IndexTable::default(),
         };
+        for shard in entry.levels().shards().values() {
+            merged.merge_dirty_and_clean(&loader.load(&entry.context.ks_config, shard.position)?);
+        }
         if entry.as_unloaded_state().is_some()
             && let Some(l0_pos) = entry.levels().l0()
         {

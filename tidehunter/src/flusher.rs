@@ -349,16 +349,21 @@ impl IndexFlusherThread {
         // `RelocationUpdates::apply` uses compare-and-set semantics — it can
         // only rewrite positions for keys already in `merged_l0`. Keys that
         // live only in L1 (the common case for post-promote `[INVALID, L1]`
-        // cells) would be silently dropped. Pre-load L1 into `merged_l0` so
-        // apply sees the full key set. The subsequent promote branch still
-        // re-loads L1 from disk; the duplication is acceptable on the
-        // relocation path — correctness first, optimize later.
-        if relocation_updates.is_some() {
-            assert!(
-                !current_levels.is_sharded(),
-                "RelocationUpdates on sharded cells is not yet supported",
-            );
-            if existing_l1.is_some() {
+        // cells) or in an L1 shard would be silently dropped. Pre-load L1 into
+        // `merged_l0` so apply sees the full key set. The subsequent promote
+        // branch still re-loads L1 from disk; the duplication is acceptable on
+        // the relocation path — correctness first, optimize later. A sharded
+        // cell lifts only the shard entries of the relocated keys.
+        if let Some(relocation_updates) = &relocation_updates {
+            if current_levels.is_sharded() {
+                Self::lift_shard_entries(
+                    loader,
+                    ctx,
+                    current_levels.shards(),
+                    relocation_updates,
+                    &mut merged_l0,
+                );
+            } else if existing_l1.is_some() {
                 let mut combined = Self::load_l1_or_default(loader, ctx, existing_l1);
                 // `merged_l0` is the fresher overlay (L0 + dirty) — it wins
                 // on overlapping keys, so treat it as the "dirty" side.
@@ -372,9 +377,18 @@ impl IndexFlusherThread {
 
         match relocation_cutoff {
             Some(cutoff) => {
-                let length = merged_l0.len();
-                merged_l0.retain_above_position(cutoff);
-                if merged_l0.len() == length {
+                // Over a deeper level, dropping an entry below the cutoff
+                // would expose an older version of its key (or a deleted row)
+                // whose file the pass does not reclaim. Hide it instead: a
+                // removed version never falls back to an older one.
+                let changed = if existing_l1.is_some() || current_levels.is_sharded() {
+                    merged_l0.tombstone_below_position(cutoff)
+                } else {
+                    let length = merged_l0.len();
+                    merged_l0.retain_above_position(cutoff);
+                    merged_l0.len() != length
+                };
+                if !changed {
                     return None;
                 }
             }
@@ -475,6 +489,47 @@ impl IndexFlusherThread {
                 .load(&ctx.ks_config, pos)
                 .expect("Failed to load L1 index in flusher thread"),
             None => IndexTable::default(),
+        }
+    }
+
+    /// Copies into `merged_l0` the shard entry of every relocated key that
+    /// `merged_l0` lacks, so the compare-and-set in `RelocationUpdates::apply`
+    /// sees it. A key in `merged_l0`, live or tombstone, is newer than its
+    /// shard entry and stays. Shard blobs hold no tombstones. Relocation
+    /// emits keys in index order, so one cached shard loads each shard once.
+    fn lift_shard_entries<L: Loader>(
+        loader: &L,
+        ctx: &KsContext,
+        shards: &BTreeMap<Vec<u8>, IndexShard>,
+        relocation_updates: &RelocationUpdates,
+        merged_l0: &mut IndexTable,
+    ) {
+        let mut cached: Option<(&[u8], IndexTable)> = None;
+        for key in relocation_updates.reduced_keys() {
+            if merged_l0.get_update_position(key).is_some() {
+                continue;
+            }
+            // Owner = largest shard btree key (its smallest content key) <= key.
+            let Some((owner, shard)) = shards
+                .range::<[u8], _>((Bound::Unbounded, Bound::Included(key.as_ref())))
+                .next_back()
+            else {
+                continue;
+            };
+            if cached
+                .as_ref()
+                .is_none_or(|(cached_owner, _)| *cached_owner != owner.as_slice())
+            {
+                let table = loader
+                    .load(&ctx.ks_config, shard.position)
+                    .expect("Failed to load shard for relocation updates");
+                cached = Some((owner.as_slice(), table));
+            }
+            if let Some((_, table)) = &cached
+                && let Some(position) = table.get(key)
+            {
+                merged_l0.insert(key.clone(), position);
+            }
         }
     }
 
@@ -1704,6 +1759,70 @@ mod tests {
             0,
             "cutoff cleanup must not rewrite L1 eagerly"
         );
+    }
+
+    #[test]
+    fn relocation_cutoff_hides_entries_over_a_deeper_level() {
+        // Over L1, an overlay entry below the cutoff becomes a tombstone so
+        // the older L1 version of its key stays hidden. With no deeper level
+        // the entry is dropped.
+        let ctx = make_ctx(false, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let l1_pos = WalPosition::new(7_000, 64);
+        loader.seed(l1_pos, build_dirty(&[(1, Some(100))]));
+        let key = |k: u64| k.to_be_bytes();
+        let overlay = || build_dirty(&[(1, Some(150)), (2, Some(300))]);
+
+        let cmd = flush_command(ctx.id(), overlay(), IndexLevels::promoted(l1_pos));
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, Some(200)).unwrap();
+        assert_eq!(new_levels.l1(), Some(l1_pos));
+        let l0 = loader.blobs.lock()[&new_levels.l0().unwrap().offset()].clone();
+        assert_eq!(l0.get(&key(1)), Some(WalPosition::INVALID));
+        assert_eq!(l0.get(&key(2)), Some(WalPosition::test_value(300)));
+
+        let cmd = flush_command(ctx.id(), overlay(), IndexLevels::new());
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, Some(200)).unwrap();
+        let l0 = loader.blobs.lock()[&new_levels.l0().unwrap().offset()].clone();
+        assert_eq!(l0.get(&key(1)), None);
+        assert_eq!(l0.get(&key(2)), Some(WalPosition::test_value(300)));
+    }
+
+    #[test]
+    fn relocation_updates_repoint_shard_entries() {
+        // Relocated keys that live only in a shard are re-pointed. A newer
+        // write or a tombstone in the overlay wins over the relocated copy.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, _) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
+        let dirty = build_dirty(&[(7, Some(2_000)), (9, None)]);
+        let mut updates = RelocationUpdates::new(1_000);
+        for k in [5u64, 250, 7, 9] {
+            updates.add(
+                Bytes::from(k.to_be_bytes().to_vec()),
+                WalPosition::test_value(10_000 + k),
+            );
+        }
+        let cmd = flush_command(ctx.id(), dirty, current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, Some(updates), None).unwrap();
+
+        let l0 = loader.blobs.lock()[&new_levels.l0().unwrap().offset()].clone();
+        let lookup = |k: u64| {
+            let key = k.to_be_bytes();
+            if l0.get_update_position(&Bytes::from(key.to_vec())).is_some() {
+                return l0.get(&key).filter(|p| p.is_valid()).map(|p| p.offset());
+            }
+            let shard = new_levels.shard_for(&key)?;
+            let table = loader.blobs.lock()[&shard.position.offset()].clone();
+            table.get(&key).map(|p| p.offset())
+        };
+        assert_eq!(lookup(5), Some(10_005), "shard entry re-pointed");
+        assert_eq!(lookup(250), Some(10_250), "second shard re-pointed");
+        assert_eq!(lookup(7), Some(2_000), "newer write wins");
+        assert_eq!(lookup(9), None, "tombstone wins");
+        assert_eq!(lookup(6), Some(6), "untouched key keeps its position");
     }
 
     #[test]

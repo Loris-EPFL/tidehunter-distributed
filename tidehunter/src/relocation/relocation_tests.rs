@@ -31,14 +31,6 @@ fn index_based_config() -> Arc<Config> {
     force_unload_config(&config)
 }
 
-fn relocation_removed(metrics: &Metrics, name: &str) -> u64 {
-    metrics
-        .relocation_removed
-        .get_metric_with_label_values(&[name])
-        .unwrap()
-        .get()
-}
-
 fn relocation_cells_processed(metrics: &Metrics, keyspace_name: &str) -> u64 {
     metrics
         .relocation_cells_processed
@@ -597,12 +589,21 @@ fn test_index_based_relocation_filter() {
     assert_eq!(db.get(ks, &sample_key).unwrap(), Some(vec![0, 1, 2].into()));
 }
 
+// Both strategies reclaim the same WAL prefix and must leave identical
+// visible contents. WAL-based relocation copies the live entries below its
+// target and drops the rest with their files; it evaluates no per-entry
+// removal for a keyspace without a filter, so it reports copies
+// (`relocation_kept`), not removals.
 #[test]
-#[ignore]
 fn test_relocation_strategies_produce_identical_results() {
     let dir1 = tempdir::TempDir::new("test_wal_strategy").unwrap();
     let dir2 = tempdir::TempDir::new("test_index_strategy").unwrap();
-    let config = Arc::new(Config::small());
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    let config = Arc::new(config);
+    let mut index_config = Config::clone(&config);
+    index_config.relocation_strategy = RelocationStrategy::IndexBased(None);
+    let index_config = force_unload_config(&index_config);
 
     // Create identical keyspace configurations
     let mut ksb = KeyShapeBuilder::new();
@@ -612,6 +613,13 @@ fn test_relocation_strategies_produce_identical_results() {
 
     let metrics_wal = Metrics::new();
     let metrics_index = Metrics::new();
+    // Values large enough that the writes span several WAL files, so the
+    // WAL-based pass has a whole-file target and does work.
+    let value = |prefix: &str, key: u64| {
+        let mut value = format!("{prefix}_{key}").into_bytes();
+        value.resize(8 * 1024, 0);
+        value
+    };
 
     // Create identical databases with identical operations
     let (db_wal, db_index, ks) = {
@@ -625,7 +633,7 @@ fn test_relocation_strategies_produce_identical_results() {
         let db_index = Db::open(
             dir2.path(),
             key_shape.clone(),
-            index_based_config(),
+            index_config,
             metrics_index.clone(),
         )
         .unwrap();
@@ -633,7 +641,7 @@ fn test_relocation_strategies_produce_identical_results() {
 
         // Apply identical operations to both databases
         for key in 0..1000u64 {
-            let value = format!("value_{}", key).into_bytes();
+            let value = value("value", key);
             db_wal
                 .insert(ks, key.to_be_bytes().to_vec(), value.clone())
                 .unwrap();
@@ -644,7 +652,7 @@ fn test_relocation_strategies_produce_identical_results() {
 
         // Update some entries
         for key in (0..500u64).step_by(2) {
-            let value = format!("updated_value_{}", key).into_bytes();
+            let value = value("updated_value", key);
             db_wal
                 .insert(ks, key.to_be_bytes().to_vec(), value.clone())
                 .unwrap();
@@ -661,6 +669,10 @@ fn test_relocation_strategies_produce_identical_results() {
 
         (db_wal, db_index, ks)
     };
+    let first_wal_file = dir1.path().join(format!(
+        "wal_{:016x}",
+        db_wal.wal.min_wal_position() / config.wal_file_size
+    ));
 
     // Run different relocation strategies
     db_wal.rebuild_control_region().unwrap();
@@ -678,20 +690,24 @@ fn test_relocation_strategies_produce_identical_results() {
         assert_eq!(val_wal, val_index, "Databases differ for key {}", key);
     }
 
-    // Verify both processed data (metrics may differ but both should have done work)
-    let wal_removed = relocation_removed(&metrics_wal, "test");
+    // Both strategies must have done work: WAL-based copied live entries
+    // below its target, index-based processed cells.
+    let wal_kept = metrics_wal
+        .relocation_kept
+        .with_label_values(&["test"])
+        .get();
     let index_processed = relocation_cells_processed(&metrics_index, "test");
-
-    // WAL-based counts removed entries, index-based counts processed cells
-    // Both should be > 0 indicating work was done
-    assert!(
-        wal_removed > 0,
-        "WAL-based should have processed removed entries"
-    );
+    assert!(wal_kept > 0, "WAL-based should have copied live entries");
     assert!(
         index_processed > 0,
         "Index-based should have processed some cells"
     );
+    db_wal.wait_for_background_threads_to_finish();
+    assert!(
+        !first_wal_file.exists(),
+        "WAL-based should have reclaimed the first WAL file"
+    );
+    db_index.wait_for_background_threads_to_finish();
 }
 
 #[test]
@@ -1462,4 +1478,397 @@ fn test_compute_target_position_from_ratio() {
     // Read fresh last_pos again
     let last_pos_at_over = db.wal_writer.last_processed().as_u64();
     assert_eq!(target_over_one, last_pos_at_over);
+}
+
+const KEEP: u8 = 0;
+const REMOVE: u8 = 1;
+const STOP: u8 = 2;
+
+fn class_key(class: u8, number: u32) -> Vec<u8> {
+    let mut key = vec![class, 0, 0, 0];
+    key.extend_from_slice(&number.to_be_bytes());
+    key
+}
+
+fn class_decision(key: &[u8]) -> Decision {
+    match key[0] {
+        KEEP => Decision::Keep,
+        REMOVE => Decision::Remove,
+        _ => Decision::StopRelocation,
+    }
+}
+
+fn keep_below_stop_config() -> Arc<Config> {
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    config.snapshot_written_bytes = u64::MAX;
+    Arc::new(config)
+}
+
+fn keep_below_stop_shape(
+    filter: impl Fn(&[u8], &[u8]) -> Decision + Send + Sync + 'static,
+) -> crate::key_shape::KeyShape {
+    let mut builder = KeyShapeBuilder::new();
+    builder.add_key_space_config(
+        "k",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().with_relocation_filter(filter),
+    );
+    builder.build()
+}
+
+/// Writes a Keep row in the first WAL file, Remove rows past the second
+/// file, then one batch of a Keep row and a Stop row. The Stop's whole-file
+/// target covers the first file. Returns the value of every row.
+fn write_keep_below_stop(db: &Arc<Db>, config: &Config) -> Vec<u8> {
+    let ks = db.ks("k");
+    let value = vec![7u8; 64 * 1024];
+    db.insert(ks, class_key(KEEP, 0), value.clone()).unwrap();
+    db.insert(ks, class_key(REMOVE, 0), value.clone()).unwrap();
+    let mut number = 1;
+    while db.wal_writer.position() < config.wal_file_size + config.frag_size {
+        db.insert(ks, class_key(REMOVE, number), value.clone())
+            .unwrap();
+        number += 1;
+    }
+    let mut batch = db.write_batch();
+    batch.write(ks, class_key(KEEP, 1), value.clone());
+    batch.write(ks, class_key(STOP, 0), value.clone());
+    batch.commit().unwrap();
+    db.wal_writer.wal_tracker_barrier();
+    value
+}
+
+fn assert_keep_rows(db: &Db, value: &[u8], phase: &str) {
+    let ks = db.ks("k");
+    for number in [0, 1] {
+        assert_eq!(
+            db.get(ks, &class_key(KEEP, number)).unwrap().as_deref(),
+            Some(value),
+            "Keep row {number} lost ({phase})"
+        );
+    }
+    assert!(
+        db.get(ks, &class_key(STOP, 0)).unwrap().is_some(),
+        "{phase}"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CrashAfter {
+    RelocatedWrites,
+    ControlRegion,
+    Reclaim,
+}
+
+// WalBased relocation copies the live rows of a filtered keyspace to the WAL
+// head before the index drops entries below the target, then stores the
+// control region, then reclaims files. A crash at each boundary must reopen
+// with every Keep row readable, and the next pass must complete.
+#[test]
+fn test_wal_relocation_keeps_filtered_keep_rows_across_crashes() {
+    let config = keep_below_stop_config();
+    let shape = keep_below_stop_shape(|key: &[u8], _: &[u8]| class_decision(key));
+    for crash in [
+        CrashAfter::RelocatedWrites,
+        CrashAfter::ControlRegion,
+        CrashAfter::Reclaim,
+    ] {
+        let phase = format!("{crash:?}");
+        let dir = tempdir::TempDir::new("wal_relocation_keep_crash").unwrap();
+        let open = |metrics| Db::open(dir.path(), shape.clone(), config.clone(), metrics).unwrap();
+        let db = open(Metrics::new());
+        let value = write_keep_below_stop(&db, &config);
+        let first_file_id = db.wal.min_wal_position() / config.wal_file_size;
+        let first_file = dir.path().join(format!("wal_{first_file_id:016x}"));
+        let first_file_end = i64::try_from((first_file_id + 1) * config.wal_file_size).unwrap();
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut driver = crate::relocation::RelocationDriver {
+            db: Arc::downgrade(&db),
+            path: dir.path().to_path_buf(),
+            receiver,
+            metrics: Metrics::new(),
+        };
+        match crash {
+            CrashAfter::RelocatedWrites => {
+                driver.relocate_wal_prefix(&db).unwrap().unwrap();
+            }
+            CrashAfter::ControlRegion => {
+                let target = driver.relocate_wal_prefix(&db).unwrap().unwrap();
+                db.rebuild_control_region_from(target).unwrap();
+            }
+            CrashAfter::Reclaim => driver.wal_based_relocation(db.clone()).unwrap(),
+        }
+        assert_keep_rows(&db, &value, &phase);
+        // No later relocation step runs: the reopen sees the crash state.
+        db.wait_for_background_threads_to_finish();
+
+        let metrics = Metrics::new();
+        let db = open(metrics.clone());
+        assert_keep_rows(&db, &value, &format!("{phase}, reopen"));
+        let ks = db.ks("k");
+        let remove_row = db.get(ks, &class_key(REMOVE, 0)).unwrap();
+        match crash {
+            // The old control region and WAL replay give the state before the pass.
+            CrashAfter::RelocatedWrites => assert!(remove_row.is_some(), "{phase}"),
+            CrashAfter::ControlRegion => {}
+            CrashAfter::Reclaim => assert!(remove_row.is_none(), "{phase}"),
+        }
+        assert_eq!(
+            first_file.exists(),
+            !matches!(crash, CrashAfter::Reclaim),
+            "{phase}"
+        );
+
+        db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
+        assert_keep_rows(&db, &value, &format!("{phase}, next pass"));
+        if !matches!(crash, CrashAfter::Reclaim) {
+            // The unlink itself can lag: the mapper skips files that the
+            // reopened writer still maps writeable (`wal/mapper.rs`).
+            assert!(
+                metrics.gc_position.with_label_values(&["wal"]).get() >= first_file_end,
+                "{phase}"
+            );
+        }
+        db.wait_for_background_threads_to_finish();
+
+        let db = open(Metrics::new());
+        assert_keep_rows(&db, &value, &format!("{phase}, final reopen"));
+        assert!(
+            db.get(ks, &class_key(REMOVE, 0)).unwrap().is_none(),
+            "{phase}"
+        );
+        db.wait_for_background_threads_to_finish();
+    }
+}
+
+// A write that lands after the pass captures its as-of view but before it
+// installs the relocated copy wins: the copy only replaces an index entry
+// still below the target.
+#[test]
+fn test_wal_relocation_concurrent_overwrite_wins_over_kept_copy() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{OnceLock, Weak};
+
+    let config = keep_below_stop_config();
+    let newer = vec![9u8; 1024];
+    let db_slot = Arc::new(OnceLock::<Weak<Db>>::new());
+    let keep_calls = Arc::new(AtomicUsize::new(0));
+    let shape = {
+        let db_slot = db_slot.clone();
+        let keep_calls = keep_calls.clone();
+        let newer = newer.clone();
+        keep_below_stop_shape(move |key: &[u8], _: &[u8]| {
+            if key == class_key(KEEP, 0).as_slice() {
+                keep_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            // The scan reaches the Stop after it kept the row and before the
+            // copy loop runs.
+            if key == class_key(STOP, 0).as_slice() {
+                let db = db_slot.get().unwrap().upgrade().unwrap();
+                db.insert(db.ks("k"), class_key(KEEP, 0), newer.clone())
+                    .unwrap();
+            }
+            class_decision(key)
+        })
+    };
+    let dir = tempdir::TempDir::new("wal_relocation_keep_overwrite").unwrap();
+    let open = || Db::open(dir.path(), shape.clone(), config.clone(), Metrics::new()).unwrap();
+    let db = open();
+    db_slot.set(Arc::downgrade(&db)).unwrap();
+    let ks = db.ks("k");
+    let value = write_keep_below_stop(&db, &config);
+    let first_file = dir.path().join(format!(
+        "wal_{:016x}",
+        db.wal.min_wal_position() / config.wal_file_size
+    ));
+
+    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
+    assert_eq!(keep_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        db.get(ks, &class_key(KEEP, 0)).unwrap().as_deref(),
+        Some(&newer[..])
+    );
+    assert_eq!(
+        db.get(ks, &class_key(KEEP, 1)).unwrap().as_deref(),
+        Some(&value[..])
+    );
+    db.wait_for_background_threads_to_finish();
+    assert!(!first_file.exists());
+
+    let db = open();
+    assert_eq!(
+        db.get(ks, &class_key(KEEP, 0)).unwrap().as_deref(),
+        Some(&newer[..])
+    );
+    db.wait_for_background_threads_to_finish();
+}
+
+// A stateful filter answers Keep on its first call for a key and Remove after.
+// The pass must call it exactly once per scanned record and act on that
+// answer, so the Keep rows survive the pass and a reopen.
+#[test]
+fn test_wal_relocation_calls_filter_once_per_record() {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    let config = keep_below_stop_config();
+    let calls = Arc::new(Mutex::new(HashMap::<Vec<u8>, usize>::new()));
+    let shape = {
+        let calls = calls.clone();
+        keep_below_stop_shape(move |key: &[u8], _: &[u8]| {
+            let mut calls = calls.lock().unwrap();
+            let count = calls.entry(key.to_vec()).or_default();
+            *count += 1;
+            match class_decision(key) {
+                Decision::Keep if *count > 1 => Decision::Remove,
+                decision => decision,
+            }
+        })
+    };
+    let dir = tempdir::TempDir::new("wal_relocation_filter_once").unwrap();
+    let open = || Db::open(dir.path(), shape.clone(), config.clone(), Metrics::new()).unwrap();
+    let db = open();
+    let value = write_keep_below_stop(&db, &config);
+    let records = calls.lock().unwrap().len();
+    assert_eq!(records, 0, "writes do not call the filter");
+
+    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
+    {
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains_key(&class_key(KEEP, 0)));
+        assert!(calls.contains_key(&class_key(STOP, 0)));
+        for (key, count) in calls.iter() {
+            assert_eq!(*count, 1, "filter calls for key {key:?}");
+        }
+    }
+    assert_keep_rows(&db, &value, "after the pass");
+    db.wait_for_background_threads_to_finish();
+
+    let db = open();
+    assert_keep_rows(&db, &value, "after reopen");
+    db.wait_for_background_threads_to_finish();
+}
+
+// Removed rows that were promoted to L1 keep stale index entries into the
+// reclaimed files (the cutoff does not rewrite L1). `get` reads them as
+// absent; `exists` must agree, after the pass and after reopen.
+#[test]
+fn test_wal_relocation_exists_agrees_with_get_on_stale_l1() {
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    config.snapshot_written_bytes = u64::MAX;
+    config.l0_max_entries = Some(1);
+    let config = Arc::new(config);
+    let shape = keep_below_stop_shape(|key: &[u8], _: &[u8]| class_decision(key));
+    let dir = tempdir::TempDir::new("wal_relocation_exists").unwrap();
+    let open = || Db::open(dir.path(), shape.clone(), config.clone(), Metrics::new()).unwrap();
+    let db = open();
+    let ks = db.ks("k");
+    let mut rows = 0;
+    while db.wal_writer.position() < 2 * config.wal_file_size {
+        db.insert(ks, class_key(REMOVE, rows), vec![1u8; 64 * 1024])
+            .unwrap();
+        rows += 1;
+    }
+    db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
+    db.insert(ks, class_key(STOP, 0), vec![3u8; 1024]).unwrap();
+    db.wal_writer.wal_tracker_barrier();
+    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
+    let check = |db: &Db, phase: &str| {
+        let mut absent = 0;
+        for number in 0..rows {
+            let key = class_key(REMOVE, number);
+            let found = db.get(ks, &key).unwrap().is_some();
+            assert_eq!(
+                db.exists(ks, &key).unwrap(),
+                found,
+                "row {number} ({phase})"
+            );
+            absent += usize::from(!found);
+        }
+        assert!(absent > 0, "the pass must leave stale L1 entries ({phase})");
+    };
+    check(&db, "after the pass");
+    db.wait_for_background_threads_to_finish();
+    let db = open();
+    check(&db, "after reopen");
+    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
+    check(&db, "after a second pass");
+    db.wait_for_background_threads_to_finish();
+}
+
+// A row of an auto-sharded cell lives only in an L1 shard when the pass
+// copies it. The relocation view must include the shards, and the relocated
+// copy must re-point the shard entry.
+fn sharded_cell_keeps_rows(filtered: bool) {
+    let mut config = Config::small();
+    config.frag_size = 64 * 1024;
+    config.wal_file_size = 2 * config.frag_size;
+    config.max_dirty_keys = 8;
+    config.l0_max_entries = Some(16);
+    config.snapshot_unload_threshold = 0;
+    config.snapshot_written_bytes = u64::MAX;
+    config.with_index_auto_shard_threshold(1024);
+    let config = Arc::new(config);
+    let shape = if filtered {
+        keep_below_stop_shape(|key: &[u8], _: &[u8]| class_decision(key))
+    } else {
+        let mut builder = KeyShapeBuilder::new();
+        builder.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+        builder.build()
+    };
+    let dir = tempdir::TempDir::new("wal_relocation_sharded").unwrap();
+    let open = |metrics| Db::open(dir.path(), shape.clone(), config.clone(), metrics).unwrap();
+    let metrics = Metrics::new();
+    let db = open(metrics.clone());
+    let ks = db.ks("k");
+    let value = vec![7u8; 1024];
+    db.insert(ks, class_key(KEEP, 0), value.clone()).unwrap();
+    let mut number = 0;
+    while db.wal_writer.position() < config.wal_file_size + config.frag_size {
+        db.insert(ks, class_key(REMOVE, number), value.clone())
+            .unwrap();
+        number += 1;
+    }
+    let mut batch = db.write_batch();
+    batch.write(ks, class_key(KEEP, 1), value.clone());
+    batch.write(ks, class_key(STOP, 0), value.clone());
+    batch.commit().unwrap();
+    db.large_table.flusher.barrier();
+    db.wal_writer.wal_tracker_barrier();
+    assert!(
+        metrics.l1_shard_split_total.with_label_values(&["k"]).get() > 0,
+        "the fixture must shard the cell's L1"
+    );
+    let first_file = dir.path().join(format!(
+        "wal_{:016x}",
+        db.wal.min_wal_position() / config.wal_file_size
+    ));
+
+    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
+    assert_keep_rows(&db, &value, "after the pass");
+    assert_eq!(
+        db.get(ks, &class_key(REMOVE, 0)).unwrap().is_some(),
+        !filtered
+    );
+    db.wait_for_background_threads_to_finish();
+    assert!(!first_file.exists(), "the pass must reclaim the first file");
+
+    let db = open(Metrics::new());
+    assert_keep_rows(&db, &value, "after reopen");
+    db.wait_for_background_threads_to_finish();
+}
+
+#[test]
+fn test_wal_relocation_keeps_keep_row_in_sharded_cell() {
+    sharded_cell_keeps_rows(true);
+}
+
+#[test]
+fn test_wal_relocation_keeps_rows_in_sharded_unfiltered_cell() {
+    sharded_cell_keeps_rows(false);
 }

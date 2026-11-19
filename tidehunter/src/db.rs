@@ -745,7 +745,10 @@ impl Db {
                     // reduces to the same index key, so read the record to compare.
                     Ok(self.read_record_check_key(context, k, w)?.is_some())
                 } else {
-                    Ok(true)
+                    // An index entry into a reclaimed WAL file is stale (index
+                    // cleanup after relocation is eventual); `get` reads it as
+                    // absent, so `exists` must too.
+                    Ok(self.wal.is_reachable(w))
                 }
             }
             GetResult::NotFound => Ok(false),

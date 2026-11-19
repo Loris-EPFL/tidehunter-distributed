@@ -320,6 +320,23 @@ impl RelocationDriver {
     }
 
     fn wal_based_relocation(&mut self, db: Arc<Db>) -> DbResult<()> {
+        let Some(target_position) = self.relocate_wal_prefix(&db)? else {
+            return Ok(());
+        };
+        db.rebuild_control_region_from(target_position)?;
+        db.wal_writer.gc(std::cmp::min(
+            target_position,
+            db.control_region_store.lock().last_position(),
+        ))?;
+        Ok(())
+    }
+
+    /// Scans the WAL for the relocation terminal, then rewrites every live
+    /// entry below the whole-file target at the WAL head and re-points the
+    /// index to the copy. Returns the target, or `None` when no whole file
+    /// can be reclaimed. The caller persists the index, then reclaims the
+    /// files below the target.
+    fn relocate_wal_prefix(&self, db: &Arc<Db>) -> DbResult<Option<u64>> {
         // todo: support compressed-batch frames in the terminal_position scan
         // below. Today it only matches `WalEntry::Record(..)`, so records
         // buried inside a `CompressedBatch` never see the relocation filter
@@ -342,9 +359,24 @@ impl RelocationDriver {
                 .max(db.wal.wal_file_size());
         // find target cut-off position
         let mut terminal_position = 0;
+        // Per keyspace: its filter returned `Keep` for a record below the terminal.
+        let mut keep_seen = vec![false; db.key_shape.num_ks()];
+        // WAL offsets of those records below the reclaim cap, ascending. The
+        // copy loop selects survivors from them, so each record gets exactly
+        // one filter call. Bounded by the records in the reclaim span.
+        let mut kept_positions = Vec::new();
         loop {
             let entry = wal_iterator.next();
-            if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
+            if let Err(error @ (WalError::Crc(_) | WalError::EndOfWal)) = &entry {
+                // The scan read every frame below the processed frontier, and
+                // nothing is written at the frontier: the processed prefix is
+                // complete. A stop below the frontier, or a torn or corrupt
+                // frame at it, leaves the terminal at zero.
+                if wal_iterator.position() == upper_limit
+                    && (matches!(error, WalError::EndOfWal) || wal_iterator.is_zeroed_header())
+                {
+                    terminal_position = upper_limit;
+                }
                 break;
             }
             let (position, raw_entry) = entry?;
@@ -359,13 +391,21 @@ impl RelocationDriver {
                  understand its inner records (todo)",
                 position.offset()
             );
-            if let WalEntry::Record(ks, key, value, _relocated) = entry {
-                let ksd = db.key_shape.ks(ks);
-                if let Some(filter) = ksd.relocation_filter()
-                    && let Decision::StopRelocation = filter(&key, &value)
-                {
-                    terminal_position = position.offset();
-                    break;
+            if let WalEntry::Record(ks, key, value, _relocated) = entry
+                && let Some(filter) = db.key_shape.ks(ks).relocation_filter()
+            {
+                match filter(&key, &value) {
+                    Decision::Keep => {
+                        keep_seen[ks.as_usize()] = true;
+                        if position.offset() < max_target_position {
+                            kept_positions.push(position.offset());
+                        }
+                    }
+                    Decision::Remove => {}
+                    Decision::StopRelocation => {
+                        terminal_position = position.offset();
+                        break;
+                    }
                 }
             }
         }
@@ -379,14 +419,16 @@ impl RelocationDriver {
             .set(terminal_position as i64);
         // ensure the target position is big enough to cut
         if target_position < (db.wal.wal_file_size() + min_wal_position) {
-            return Ok(());
+            return Ok(None);
         }
-        let mut current_cell = CellReference::first(&db, KeySpace::first());
+        let mut current_cell = CellReference::first(db, KeySpace::first());
         while let Some(cell) = current_cell.take() {
-            current_cell = cell.next(&db);
+            current_cell = cell.next(db);
             let ks = db.key_shape.ks(cell.keyspace);
-            // For keyspaces with relocation filter, flush and clear stale entries
-            if ks.relocation_filter().is_some() {
+            let filter = ks.relocation_filter();
+            // Every record of this keyspace below the terminal scanned as
+            // `Remove`: drop its index entries below the terminal unread.
+            if filter.is_some() && !keep_seen[cell.keyspace.as_usize()] {
                 db.large_table.sync_flush_for_relocation(
                     db.ks_context(cell.keyspace),
                     &cell.cell_id,
@@ -396,7 +438,6 @@ impl RelocationDriver {
                 )?;
                 continue;
             }
-            // For keyspaces without relocation filter, relocate entries
             let batch_limit = db.config.relocation_batch_max_bytes();
             let mut batch =
                 RelocatedWriteBatch::new(cell.keyspace, cell.cell_id.clone(), target_position);
@@ -417,7 +458,11 @@ impl RelocationDriver {
                 .unwrap_or(IndexTable::default().into());
             let context = db.ks_context(cell.keyspace);
             for (reduced_key, position) in index.iter() {
+                // In a filtered keyspace, an entry is live only if the scan
+                // kept its record.
                 if position.offset() < target_position
+                    && (filter.is_none()
+                        || kept_positions.binary_search(&position.offset()).is_ok())
                     && let Some((key, value)) =
                         db.read_record_for_indexed_key(context, position, reduced_key.as_ref())?
                 {
@@ -439,13 +484,20 @@ impl RelocationDriver {
             if !batch.is_empty() {
                 db.write_relocated_batch(batch)?;
             }
+            if filter.is_some() {
+                // Kept entries now point to their copies at the WAL head.
+                // Drop the removed entries below the target. Entries from the
+                // target to the terminal stay: their files are not reclaimed.
+                db.large_table.sync_flush_for_relocation(
+                    context,
+                    &cell.cell_id,
+                    db.as_ref(),
+                    None,
+                    Some(target_position),
+                )?;
+            }
         }
-        db.rebuild_control_region_from(target_position)?;
-        db.wal_writer.gc(std::cmp::min(
-            target_position,
-            db.control_region_store.lock().last_position(),
-        ))?;
-        Ok(())
+        Ok(Some(target_position))
     }
 
     fn should_cancel_relocation(&self) -> bool {
