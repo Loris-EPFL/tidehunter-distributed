@@ -10,10 +10,13 @@
 //! starts at the cut ([`CutRecovery::Extend`]). Both keep an exact prefix of the
 //! coordinator's version order.
 //!
-//! Owner continuity (Extend): an owner is continuous when its kernel boot id at
-//! the recovery fence equals the boot id recorded for the epoch and its recovery
-//! found no hole (`NodeStatus::recovery_clean`). A continuous owner kept its page
-//! cache, so it lost nothing it appended. The continuity bound is the minimum
+//! Owner continuity (Extend): an owner is continuous when its incarnation at the
+//! recovery fence equals the incarnation recorded for the epoch and its recovery
+//! found no hole and it saw no persistence failure (`NodeStatus::recovery_clean`).
+//! The incarnation is random per owner open, so every owner process restart
+//! changes it: a failed fsync can drop dirty pages without a reboot, and the
+//! owner then stops. A continuous owner is the same process that appended, with
+//! no failed sync, so it lost nothing it appended. The continuity bound is the minimum
 //! recorded synced end over the other owners (unbounded when every owner is
 //! continuous). A sequence missing below the bound was never written (aborted):
 //! the run skips it. A sequence missing at or above it may have been lost: the run
@@ -46,9 +49,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Record file in the authority directory. Written by open before the epoch is
-/// activated, then by the actor only.
+/// activated, then by the actor only. The name stays fixed across formats, so an
+/// older record fails to load instead of reading as absent.
 pub(super) const RECORD: &str = "durable-cut.v1";
-const FORMAT: u32 = 1;
+/// 2: owner marks hold the owner incarnation instead of the kernel boot id.
+const FORMAT: u32 = 2;
 /// Lag samples kept by the tracker. When full, the newest sample absorbs new
 /// floors and keeps its older time: the age can only be overestimated.
 const MAX_SAMPLES: usize = 256;
@@ -66,9 +71,9 @@ pub(super) struct EpochCut {
 #[serde(deny_unknown_fields)]
 pub(super) struct OwnerMark {
     pub partition: u32,
-    /// The owner's kernel boot id at the epoch's fence. Zero once a report showed
-    /// another boot: such an owner is never continuous.
-    pub boot_id: [u8; 16],
+    /// The owner's incarnation at the epoch's fence. Zero once a report showed
+    /// another incarnation: such an owner is never continuous.
+    pub incarnation: [u8; 16],
     /// One above the highest sequence the owner reported synced.
     pub synced_next: u64,
 }
@@ -77,7 +82,7 @@ pub(super) struct OwnerMark {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct OwnerFence {
     pub partition: u32,
-    pub boot_id: [u8; 16],
+    pub incarnation: [u8; 16],
     pub recovery_clean: bool,
 }
 
@@ -207,7 +212,7 @@ fn continuity_bound(marks: &[OwnerMark], fenced: &[OwnerFence]) -> u64 {
         .map(|mark| {
             let continuous = fenced.iter().any(|owner| {
                 owner.partition == mark.partition
-                    && owner.boot_id == mark.boot_id
+                    && owner.incarnation == mark.incarnation
                     && owner.recovery_clean
             });
             if continuous {
@@ -308,7 +313,7 @@ impl RecoveryPlan {
     /// The record to persist before `epoch` activates, and the bound this
     /// recovery decided. No record is written when none existed and `epoch` is
     /// not tracked: behaviour is then exactly the per-owner recovery. A tracked
-    /// epoch starts with one mark per fenced owner (its boot id, nothing synced).
+    /// epoch starts with one mark per fenced owner (its incarnation, nothing synced).
     pub(super) fn finish(
         mut self,
         epoch: u64,
@@ -334,7 +339,7 @@ impl RecoveryPlan {
                     .iter()
                     .map(|owner| OwnerMark {
                         partition: owner.partition,
-                        boot_id: owner.boot_id,
+                        incarnation: owner.incarnation,
                         synced_next: 0,
                     })
                     .collect()
@@ -353,7 +358,7 @@ pub(super) fn persist_open_record(path: &Path, record: &CutRecord) -> Result<(),
     record.persist(path)
 }
 
-/// Test hook: edit the persisted owner marks (for example, to model a reboot).
+/// Test hook: edit the persisted owner marks (for example, to model an owner restart).
 #[cfg(test)]
 pub(super) fn rewrite_marks_for_test(path: &Path, edit: impl FnOnce(&mut [OwnerMark])) {
     let mut record: CutRecord = read_metadata(&path.join(RECORD)).unwrap();
@@ -537,7 +542,7 @@ enum Message {
         owner: usize,
         synced_next: u64,
         appended_end: u64,
-        boot_id: [u8; 16],
+        incarnation: [u8; 16],
     },
     /// Reply capacity 1; the requester waits for it.
     Certify {
@@ -820,7 +825,7 @@ fn poll_owner(
                 owner,
                 synced_next,
                 appended_end: report.appended_end,
-                boot_id: report.boot_id,
+                incarnation: report.incarnation,
             })
             .is_err()
         {
@@ -864,16 +869,16 @@ fn run_actor(
                     owner,
                     synced_next,
                     appended_end,
-                    boot_id,
+                    incarnation,
                 }) => {
                     tracker.report(owner, synced_next, appended_end);
                     // Persisted with the next cut. Pollers run in endpoint
                     // order, which is the order of the marks.
                     if let Some(mark) = record.owners.get_mut(owner) {
-                        if mark.boot_id != boot_id {
-                            // Another boot inside the epoch: the owner lost its
-                            // page cache at some point, so it is never continuous.
-                            mark.boot_id = [0; 16];
+                        if mark.incarnation != incarnation {
+                            // Another owner incarnation inside the epoch: the owner
+                            // may have lost unsynced appends, so it is never continuous.
+                            mark.incarnation = [0; 16];
                         }
                         mark.synced_next = mark.synced_next.max(synced_next);
                     }

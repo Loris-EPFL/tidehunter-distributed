@@ -56,6 +56,10 @@ pub(super) struct ControlContext {
     pub(super) readers: Arc<parking_lot::RwLock<inventory::ReaderAuthority>>,
     pub(super) terminal: Arc<AtomicBool>,
     pub(super) poison_pending: Arc<AtomicBool>,
+    /// Sticky for this owner incarnation: set by both poison funnels, never cleared,
+    /// not even by a successful live recovery fence. Shared with the inventory, which
+    /// reports `NodeStatus::recovery_clean = false` once it is set.
+    pub(super) persistence_failed: Arc<AtomicBool>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) recoverable_live_failure: AtomicBool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1330,7 +1334,7 @@ fn durable_progress_poll(
             partition: shared.context.partition.partition,
             authority_epoch,
             epoch,
-            boot_id: inventory.boot_id(),
+            incarnation: inventory.incarnation(),
         };
         (
             identity,
@@ -1848,6 +1852,9 @@ impl ControlContext {
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn poison_incomplete_live(&self) {
+        // Release: before the flags below, so a fence that observes the recoverable
+        // failure (Acquire) also observes the latch.
+        self.persistence_failed.store(true, Ordering::Release);
         {
             let _gate = self.poison_gate.lock();
             if !self.poison_pending.load(Ordering::Acquire) {
@@ -1863,6 +1870,8 @@ impl ControlContext {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.recoverable_live_failure
             .store(false, Ordering::Release);
+        // Release, before `poison_pending`: see `poison_incomplete_live`.
+        self.persistence_failed.store(true, Ordering::Release);
         self.poison_pending.store(true, Ordering::Release);
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         drop(_gate);

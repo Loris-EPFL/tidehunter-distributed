@@ -2,6 +2,9 @@
 use super::*;
 use bincode::Options;
 
+mod recovered_suffix;
+use recovered_suffix::SuffixRewrite;
+
 /// Recovery scans read beyond the durable frontier, where a frame can be absent or
 /// torn. Only these outcomes mean "no valid frame here": a missing file, a short
 /// file, or bytes that fail the frame, CRC, decode or batch checks. Any other I/O
@@ -982,6 +985,10 @@ impl PartitionLog {
         // tail. Unwritten space at the tail is not a hole.
         let mut gap = false;
         let mut recovery_hole = false;
+        // Restart durability guard (see `recovered_suffix`): every frame and skip
+        // marker accepted above the persisted root is written back from the bytes
+        // this scan validated. A sealed stream was synced whole before its seal.
+        let mut rewrite = recorded.is_none().then(SuffixRewrite::default);
         // Live streams stop globally at an invalid tail. Ordinary owner-RPC
         // streams scan fragments independently, including after a lost skip.
         // In both cases only present WAL files bound the uncheckpointed suffix.
@@ -1024,6 +1031,10 @@ impl PartitionLog {
                     if live {
                         break;
                     }
+                } else if cursor >= strict_end
+                    && let Some(rewrite) = rewrite.as_mut()
+                {
+                    log.rewrite_skip_marker(rewrite, cursor, fragment_end)?;
                 }
                 cursor = fragment_end;
                 continue;
@@ -1128,6 +1139,11 @@ impl PartitionLog {
             // early fragment end lies above a hole.
             recovery_hole |= gap;
             log.state.lock().references.publish_group(metadata)?;
+            if cursor >= strict_end
+                && let Some(rewrite) = rewrite.as_mut()
+            {
+                log.rewrite_validated_frame(rewrite, cursor, decoded.group.encoded())?;
+            }
             physical_end = physical_end.max(decoded.frame_end);
             cursor = decoded
                 .frame_end
@@ -1153,6 +1169,11 @@ impl PartitionLog {
         }
         if !tail_seen {
             return Err(StorageError::Invalid("missing live durable frontier tail"));
+        }
+        // The rewritten suffix reaches the device before the barrier below may
+        // certify it and before any root or seal is installed.
+        if let Some(rewrite) = rewrite {
+            log.finish_suffix_rewrite(rewrite)?;
         }
         log.wal.persist_registered_files()?;
         if live

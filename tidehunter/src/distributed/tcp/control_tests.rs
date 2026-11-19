@@ -2113,6 +2113,8 @@ mod live_fencing {
         };
         let (sync_entered, resume_sync) = log.pause_next_persist();
         drop(log);
+        let incarnation = node.inventory.lock().incarnation();
+        assert!(node.inventory.lock().status().unwrap().recovery_clean);
         let (completed, completions) = mpsc::sync_channel(1);
         assert!(
             command(
@@ -2153,6 +2155,26 @@ mod live_fencing {
         );
         assert!(node.control.shared.syncers.lock().is_empty());
         assert!(!node.control_context.terminal.load(Ordering::Acquire));
+        // The in-process recovery followed a persistence failure of this
+        // incarnation: it cannot prove the owner kept every acknowledged write,
+        // so the fence and every later status report it unclean.
+        assert_eq!(status.incarnation, incarnation);
+        assert!(!status.recovery_clean);
+        assert!(
+            command(
+                &node,
+                3,
+                Request::Status { protocol: PROTOCOL },
+                1,
+                &completed
+            )
+            .is_ok()
+        );
+        let Response::Status(status) = receive(&completions, 3).response.unwrap() else {
+            panic!("expected status")
+        };
+        assert_eq!(status.incarnation, incarnation);
+        assert!(!status.recovery_clean);
         assert_recovered(&node, &config, &[receipt]);
         shutdown(&node, 2);
     }
@@ -3052,7 +3074,7 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 27);
-    preface[4..6].copy_from_slice(&26u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 28);
+    preface[4..6].copy_from_slice(&27u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }

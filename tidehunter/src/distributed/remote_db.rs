@@ -1918,7 +1918,7 @@ impl RemoteDatabase {
                     status.durability_tier,
                     durable_cut::OwnerFence {
                         partition: config.endpoints[node].partition,
-                        boot_id: status.boot_id,
+                        incarnation: status.incarnation,
                         recovery_clean: status.recovery_clean,
                     },
                 ),

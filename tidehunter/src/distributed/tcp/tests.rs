@@ -107,7 +107,7 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
             synced_end: 0,
             appended_end: 0,
             idle: true,
-            boot_id: [0; 16],
+            incarnation: [0; 16],
         })),
         19
     );

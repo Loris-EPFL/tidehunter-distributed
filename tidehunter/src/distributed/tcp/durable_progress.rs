@@ -30,32 +30,21 @@ pub(super) fn capped_wait(max_wait_ms: u32) -> Duration {
     Duration::from_millis(u64::from(max_wait_ms)).min(DURABLE_PROGRESS_MAX_WAIT)
 }
 
-const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
-
-/// The kernel boot id. A changed id means the owner host rebooted, so its page cache
-/// (appended but unsynced WAL bytes) did not survive.
-pub(super) fn read_boot_id() -> Result<[u8; 16], TcpError> {
-    let text = fs::read_to_string(BOOT_ID_PATH)
-        .map_err(|error| TcpError::new(format!("read {BOOT_ID_PATH}: {error}")))?;
-    parse_boot_id(&text)
-        .ok_or_else(|| TcpError::new(format!("{BOOT_ID_PATH} is not a UUID: {text:?}")))
-}
-
-/// Parse the kernel's `8-4-4-4-12` hexadecimal UUID text.
-fn parse_boot_id(text: &str) -> Option<[u8; 16]> {
-    let text = text.trim();
-    let groups: Vec<_> = text.split('-').map(str::len).collect();
-    if groups != [8, 4, 4, 4, 12] {
-        return None;
+/// A new owner incarnation: 128 random bits from the OS generator, created once when the
+/// owner opens and never persisted. A process restart (or a reboot) always opens again,
+/// so a changed value means the owner may have lost appended but unsynced WAL bytes: a
+/// failed fsync drops dirty pages without a reboot and makes the owner stop. Never zero:
+/// the coordinator uses zero for an owner that is never continuous.
+pub(super) fn new_incarnation() -> Result<[u8; 16], TcpError> {
+    use rand::RngCore;
+    let mut incarnation = [0; 16];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut incarnation)
+        .map_err(|error| TcpError::new(format!("owner incarnation: {error}")))?;
+    if incarnation == [0; 16] {
+        return Err(TcpError::new("owner incarnation: zero random value"));
     }
-    let mut digits = text.bytes().filter(|byte| *byte != b'-');
-    let mut id = [0u8; 16];
-    for byte in &mut id {
-        let high = char::from(digits.next()?).to_digit(16)?;
-        let low = char::from(digits.next()?).to_digit(16)?;
-        *byte = u8::try_from(high << 4 | low).ok()?;
-    }
-    Some(id)
+    Ok(incarnation)
 }
 
 /// One owner's durable progress in stream `epoch`, the input of the coordinator's
@@ -71,8 +60,8 @@ fn parse_boot_id(text: &str) -> Option<[u8; 16]> {
 ///
 /// `generation` counts advances of the synced point on the owner's log handle and
 /// restarts with the handle. A recovered (sealed) handle reports no versions.
-/// `boot_id` is the owner's kernel boot id (see `NodeStatus::boot_id`): the coordinator
-/// records it with the report to judge owner continuity at recovery.
+/// `incarnation` is the owner's incarnation (see `NodeStatus::incarnation`): the
+/// coordinator records it with the report to judge owner continuity at recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DurableProgressReport {
     pub database: [u8; 16],
@@ -85,7 +74,7 @@ pub struct DurableProgressReport {
     pub synced_end: u64,
     pub appended_end: u64,
     pub idle: bool,
-    pub boot_id: [u8; 16],
+    pub incarnation: [u8; 16],
 }
 
 /// The request identity a report echoes.
@@ -95,7 +84,7 @@ pub(super) struct PollIdentity {
     pub(super) partition: u32,
     pub(super) authority_epoch: u64,
     pub(super) epoch: u64,
-    pub(super) boot_id: [u8; 16],
+    pub(super) incarnation: [u8; 16],
 }
 
 impl PollIdentity {
@@ -111,7 +100,7 @@ impl PollIdentity {
             synced_end: progress.synced_end,
             appended_end: progress.appended_end,
             idle: progress.idle(),
-            boot_id: self.boot_id,
+            incarnation: self.incarnation,
         }
     }
 }
@@ -380,7 +369,7 @@ impl StorageNode {
             partition: self.control_context.partition.partition,
             authority_epoch,
             epoch,
-            boot_id: inventory.boot_id(),
+            incarnation: inventory.incarnation(),
         };
         let log = inventory.durable_progress_log(authority_epoch, epoch)?;
         drop(inventory);

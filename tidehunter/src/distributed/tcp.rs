@@ -105,7 +105,9 @@ pub use inventory::SealedOwnerExport;
 /// 26 adds controller-lifetime pins for non-permanent live exports.
 /// 27 adds DurableProgress, the owner durability tier in NodeStatus, and PartitionStats
 /// (feature-stable tags after DurableProgress in both Request and Response).
-const PROTOCOL: u32 = 27;
+/// 28 replaces the kernel boot id in NodeStatus and DurableProgressReport with the owner
+/// incarnation, and makes `NodeStatus::recovery_clean` false after any persistence failure.
+const PROTOCOL: u32 = 28;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -384,10 +386,11 @@ pub struct NodeStatus {
     pub live_nvmeof: bool,
     /// The owner's write durability tier now; the default tier before configuration.
     pub durability_tier: super::durability::DurabilityTier,
-    /// Kernel boot id (`/proc/sys/kernel/random/boot_id`) read when the owner opened.
-    pub boot_id: [u8; 16],
-    /// False when a WAL recovery this owner process ran found a lost or damaged
-    /// frame with a valid frame after it (a hole below the recovered tail).
+    /// Owner incarnation: random, created when the owner opened, never persisted.
+    pub incarnation: [u8; 16],
+    /// False when a WAL recovery this owner incarnation ran found a lost or damaged
+    /// frame with a valid frame after it (a hole below the recovered tail), or once
+    /// this incarnation saw a persistence failure or a reader poison.
     pub recovery_clean: bool,
 }
 pub struct RecoveryPage {
@@ -1069,6 +1072,7 @@ impl StorageNode {
         let lifecycle = inventory.lifecycle.clone();
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
+        let persistence_failed = inventory.persistence_failed.clone();
         let append_shape = inventory.shape.clone();
         let append_batch_limits = inventory.config.partition.batch_limits;
         let append_group_limits = inventory.config.partition.group_limits;
@@ -1085,6 +1089,7 @@ impl StorageNode {
             readers: readers.clone(),
             terminal: terminal.clone(),
             poison_pending: Arc::new(AtomicBool::new(false)),
+            persistence_failed,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             recoverable_live_failure: AtomicBool::new(false),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
