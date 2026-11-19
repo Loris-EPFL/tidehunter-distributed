@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 class CampaignModeTests(unittest.TestCase):
     @staticmethod
     def f6_evidence(**values):
-        names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'reserve_exchanges', 'complete_exchanges',
+        names = (*cloud_campaign.LIVE_NVME_COUNTERS,
                  'leased_frames', 'leased_skip_markers', 'fua_writes', 'grant_misses',
                  'controller_connect_ns', 'controller_connect_samples', 'leased_flushes',
                  'leased_flush_covered_frames', 'read_lane_pin_failures')
@@ -275,6 +275,8 @@ class CampaignModeTests(unittest.TestCase):
 
     def test_permanent_export_measurement_and_configuration(self):
         for selection in cloud_campaign.NVMEOF_PATH_SELECTIONS:
+            if selection == cloud_campaign.Q0_SELECTION:
+                continue  # Sealed Q0 binaries use the archive evidence contract.
             with self.subTest(selection=selection):
                 self._permanent_export_measurement_and_configuration(selection)
 
@@ -287,8 +289,7 @@ class CampaignModeTests(unittest.TestCase):
         if selection in cloud_campaign.WRITE_ENGINE_SELECTIONS:
             job = next(j for j in cloud_campaign.make_focused_matrix(selection)
                        if j['case_kind'] == 'live_read' and j['arm'] == 'file')
-        names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'reserve_exchanges',
-                 'complete_exchanges', 'leased_frames', 'leased_skip_markers', 'fua_writes',
+        names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'leased_frames', 'leased_skip_markers', 'fua_writes',
                  'grant_misses', 'controller_connect_ns', 'controller_connect_samples')
         start = dict.fromkeys(names, 0)
         end = dict(start, completed_read_ops=1, completed_read_bytes=1024,
@@ -367,7 +368,7 @@ class CampaignModeTests(unittest.TestCase):
             self.assertIn(reason, cloud_campaign.qualify_live_nvme_measurement(bad, job, self.exported(job))['reasons'])
         info = {'configuration': {'live_export_mode': 'per_owner',
                 'live_queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0},
-                'live_write': {'write_mode': 'leased',
+                'live_write': {
                                'acknowledgement_contract': (
                                    'leased extent: page-cache write' if job['durability_tier'] == 'native'
                                    else 'synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous')}}}
@@ -485,62 +486,60 @@ class CampaignModeTests(unittest.TestCase):
 
     def test_prepared_live_client_exact_contract(self):
         host_nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
-        for mode in ('reserved', 'leased'):
-            for tier in ('native', 'synchronous'):
-                for inline in (False, True):
-                    prep = {'max_inflight_requests': 32, 'max_inflight_bytes': 16777216,
-                            'connect_timeout_ms': 30000, 'io_timeout_ms': 30000,
-                            'write_mode': mode, 'inline_reads': inline, 'export_mode': 'on_demand',
-                            'lease_ahead': True, 'polled_writes': False,
-                            'queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0}}
-                    client = {**prep, 'host_nqn': host_nqn, 'host_id': controller.live_host_identity(host_nqn),
-                              'leased_durability': tier if mode == 'leased' else None}
-                    exported = dict(client, leased_sync='group_flush', leased_flush_min_frame_bytes=65536)
-                    self.assertEqual(controller.admit_prepared_live_client(exported, prep, tier), host_nqn)
-                    polled_prep = dict(prep, polled_writes=True)
-                    polled_client = dict(exported, polled_writes=True)
-                    self.assertEqual(controller.admit_prepared_live_client(polled_client, polled_prep, tier), host_nqn)
+        for tier in ('native', 'synchronous'):
+            for inline in (False, True):
+                prep = {'max_inflight_requests': 32, 'max_inflight_bytes': 16777216,
+                        'connect_timeout_ms': 30000, 'io_timeout_ms': 30000,
+                        'write_mode': 'leased', 'inline_reads': inline, 'export_mode': 'per_owner',
+                        'lease_ahead': True, 'polled_writes': False,
+                        'queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0}}
+                client = {**prep, 'host_nqn': host_nqn, 'host_id': controller.live_host_identity(host_nqn),
+                          'leased_durability': tier}
+                exported = dict(client, leased_sync='group_flush', leased_flush_min_frame_bytes=65536)
+                self.assertEqual(controller.admit_prepared_live_client(exported, prep, tier), host_nqn)
+                polled_prep = dict(prep, polled_writes=True)
+                polled_client = dict(exported, polled_writes=True)
+                self.assertEqual(controller.admit_prepared_live_client(polled_client, polled_prep, tier), host_nqn)
+                with self.assertRaises(controller.SafetyError):
+                    controller.admit_prepared_live_client(
+                        dict(exported, leased_flush_min_frame_bytes=0), prep, tier)
+                self.assertEqual(controller.admit_prepared_live_client(client, prep, tier), host_nqn)
+                for key, value in (('leased_sync', 'group_flush'),):
+                    requested = dict(prep, **{key: value})
                     with self.assertRaises(controller.SafetyError):
-                        controller.admit_prepared_live_client(
-                            dict(exported, leased_flush_min_frame_bytes=0), prep, tier)
-                    self.assertEqual(controller.admit_prepared_live_client(client, prep, tier), host_nqn)
-                    for key, value in (('leased_sync', 'group_flush'),):
-                        requested = dict(prep, **{key: value})
-                        with self.assertRaises(controller.SafetyError):
-                            controller.admit_prepared_live_client(client, requested, tier)
-                        self.assertEqual(controller.admit_prepared_live_client(
-                            dict(client, **{key: value}), requested, tier), host_nqn)
-                    for field in client:
-                        changed = dict(client)
-                        changed[field] = None
-                        if changed[field] == client[field]:
-                            changed[field] = 'changed'
-                        with self.assertRaises(controller.SafetyError):
-                            controller.admit_prepared_live_client(changed, prep, tier)
+                        controller.admit_prepared_live_client(client, requested, tier)
+                    self.assertEqual(controller.admit_prepared_live_client(
+                        dict(client, **{key: value}), requested, tier), host_nqn)
+                for field in client:
+                    changed = dict(client)
+                    changed[field] = None
+                    if changed[field] == client[field]:
+                        changed[field] = 'changed'
+                    with self.assertRaises(controller.SafetyError):
+                        controller.admit_prepared_live_client(changed, prep, tier)
 
     def test_live_compact_admission_is_exact(self):
-        jobs = cloud_campaign.make_focused_matrix('leased_ab_compact')
+        jobs = cloud_campaign.make_focused_matrix('nvmeof_path_core')
         live = next(j for j in jobs if j.get('nvmeof_route') == 'live')
-        owner = next(j for j in jobs if j['backend'] == 'tidehunter_verbs_native')
-        config = {'spec': {'mode': 'focused', 'selection': 'leased_ab_compact',
-                           'backends': ['tidehunter_nvme_rdma']},
+        native = next(j for j in jobs if j['backend'] == 'native')
+        config = {'spec': {'mode': 'focused', 'selection': 'nvmeof_path_core',
+                           'backends': ['native', 'tidehunter_nvme_rdma']},
                   'fleet': {'nodes': [{'address': '10.0.0.2'}]}}
         with patch.object(controller, 'platform_module', return_value=None):
             prep = controller.live_nvme_preparation(config, live['case_id'], 'rdma')
             self.assertEqual(prep['addresses'], ['10.0.0.2'])
             with self.assertRaises(controller.SafetyError):
-                controller.live_nvme_preparation(config, owner['case_id'], 'rdma')
+                controller.live_nvme_preparation(config, native['case_id'], 'rdma')
             config['spec']['selection'] = 'fabric_ab_compact'
             with self.assertRaises(controller.SafetyError):
                 controller.live_nvme_preparation(config, live['case_id'], 'rdma')
 
     def test_leased_measurement_evidence_rejects_counter_changes(self):
-        job = next(j for j in cloud_campaign.make_focused_matrix('leased_ab_compact')
-                   if j.get('live_write_mode') == 'leased' and j['group'] == 'G17W'
-                   and j['durability_tier'] == 'synchronous')
+        job = next(j for j in cloud_campaign.make_focused_matrix('nvmeof_path_core')
+                   if j['group'] == 'G18W' and j['durability_tier'] == 'synchronous')
         job = dict(job, live_leased_sync='per_frame_fua')
-        names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'reserve_exchanges',
-                 'complete_exchanges', 'leased_frames', 'leased_skip_markers', 'fua_writes')
+        names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'grant_misses', 'controller_connect_ns',
+                 'controller_connect_samples', 'leased_frames', 'leased_skip_markers', 'fua_writes')
         start = {name: 0 for name in names}
         end = dict(start, completed_write_ops=2, completed_write_bytes=2048, leased_frames=2, fua_writes=2)
         evidence = {'measurement_attempted': True, 'measurement_drained': True,
@@ -562,8 +561,7 @@ class CampaignModeTests(unittest.TestCase):
         skipped['end']['live_nvmeof']['fua_writes'] = 2
         skipped['live_nvmeof']['counters']['fua_writes'] = 2
         self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(skipped, job)['qualified'])
-        for name, value in [('reserve_exchanges', 1), ('complete_exchanges', 1),
-                            ('leased_frames', 0), ('fua_writes', 1)]:
+        for name, value in [('leased_frames', 0), ('fua_writes', 1)]:
             changed = copy.deepcopy(evidence)
             changed['end']['live_nvmeof'][name] = value
             changed['live_nvmeof']['counters'][name] = value
@@ -581,21 +579,26 @@ class CampaignModeTests(unittest.TestCase):
         self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(native_evidence, native)['qualified'])
 
     def test_live_contract_and_inline_admission(self):
-        jobs = cloud_campaign.make_focused_matrix('leased_ab_compact')
+        jobs = cloud_campaign.make_focused_matrix('nvmeof_path_compact')
         for inline in (False, True):
-            job = next(j for j in jobs if j['group'] == 'G17R'
+            job = next(j for j in jobs if j['group'] == 'G18R'
                        and j.get('live_inline_reads') is inline and j['concurrency'] == 1
                        and j['mix']['read'] == 100)
-            info = {'configuration': {'live_write': {'write_mode': 'leased',
+            info = {'configuration': {
+                'live_export_mode': job['live_export_mode'], 'live_lease_ahead': True, 'live_polled_writes': False,
+                'live_queue_geometry': {'io_queues': job['live_io_queues'], 'queue_size': job['live_io_queue_size'],
+                                        'poll_queues': job['live_poll_queues']},
+                'live_write': {
                 'acknowledgement_contract': 'synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous'}}}
             cloud_campaign.admit_live_write_contract(job, info)
-            for field in ('write_mode', 'acknowledgement_contract'):
+            for field in ('acknowledgement_contract',):
                 bad = copy.deepcopy(info)
                 bad['configuration']['live_write'][field] = 'wrong'
                 with self.assertRaises(ValueError):
                     cloud_campaign.admit_live_write_contract(job, bad)
-            names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'reserve_exchanges',
-                     'complete_exchanges', 'leased_frames', 'leased_skip_markers', 'fua_writes')
+            names = (*cloud_campaign.LIVE_NVME_COUNTERS, 'grant_misses', 'controller_connect_ns',
+                     'controller_connect_samples',
+                     'leased_frames', 'leased_skip_markers', 'fua_writes')
             start = {name: 0 for name in names}
             end = dict(start, completed_read_ops=1, completed_read_bytes=1024)
             n = int(inline)
@@ -609,44 +612,14 @@ class CampaignModeTests(unittest.TestCase):
             evidence['deltas']['coordinator']['counters']['read_profile_live_inline'] = 1 - n
             self.assertFalse(cloud_campaign.qualify_live_nvme_measurement(evidence, job)['qualified'])
 
-    def test_focused_matrix_matches_read_sources_and_excludes_nvme_writes(self):
+    def test_standard_live_matrix_plans_only_leased_remote_payloads(self):
         spec = json.loads((HERE / 'cloud-nvmeof-campaign.json').read_text())
         jobs = cloud_campaign.make_matrix(spec)
-        self.assertEqual(len(jobs), 125)
-        reads = [job for job in jobs if job['cohort'] == 'sealed_read']
-        self.assertTrue(reads)
-        for size in (64, 256, 1024, 8192, 65536):
-            rows = [job for job in reads if job['value_size'] == size]
-            self.assertEqual(len({job['sealed_dataset']['data_id'] for job in rows}), 1)
-            self.assertEqual({job['backend'] for job in rows}, set(spec['backends']))
-            source = {job['backend']: job['sealed_dataset']['source_id'] for job in rows}
-            self.assertNotEqual(source['native'], source['tidehunter_tcp'])
-            for backend in cloud_campaign.NVME_BACKENDS & source.keys():
-                self.assertEqual(source[backend], source['tidehunter_tcp'])
-            for backend in source.keys() - {'native', 'tidehunter_tcp'} - cloud_campaign.NVME_BACKENDS:
-                self.assertNotEqual(source[backend], source['tidehunter_tcp'])
-                self.assertNotEqual(source[backend], source['native'])
-        self.assertFalse(any(job['backend'] in cloud_campaign.NVME_BACKENDS and
-                             job['cohort'] == 'native_write_regression' for job in jobs))
-
-    def test_selected_backend_order_cannot_reenter_physical_source(self):
-        spec = json.loads((HERE / 'cloud-nvmeof-campaign.json').read_text())
-        # Exercise the portable matrix, including both optional NVMe transports.
-        backends = ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
-                    'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma']
-        for order in itertools.permutations(backends):
-            with self.subTest(order=order):
-                jobs = cloud_campaign.make_matrix(dict(spec, backends=list(order), max_cases=2000))
-                reads = [job for job in jobs if job['cohort'] == 'sealed_read']
-                completed = set()
-                previous = None
-                for job in reads:
-                    source = job['sealed_dataset']['source_id']
-                    if source != previous:
-                        self.assertNotIn(source, completed)
-                        if previous is not None:
-                            completed.add(previous)
-                        previous = source
+        remote = [job for job in jobs if job['backend'] in cloud_campaign.NVME_BACKENDS]
+        self.assertTrue(any(job['mix']['put'] for job in remote))
+        self.assertTrue(any(job['mix']['read'] for job in remote))
+        self.assertEqual({job['nvmeof_route'] for job in remote}, {'live'})
+        self.assertFalse(any('sealed_dataset' in job for job in jobs))
 
     def test_nvme_backend_is_rejected_outside_focused_mode(self):
         spec = json.loads((HERE / 'cloud-nvmeof-campaign.json').read_text())
@@ -798,18 +771,6 @@ class ControllerBoundaryTests(unittest.TestCase):
         self.assertEqual(self.c.shared_tide['options'], options)
         self.c.prepare_tide.assert_not_called()
 
-    def test_shared_auto_reader_does_not_inherit_preparation_lane_pin(self):
-        options = {'external_remote_config': {'read_lanes': 64}, 'evidence': 'old'}
-        self.c.shared_tide = {'identity': ('source', 'tcp', 'synchronous', 'adaptive'),
-                              'options': copy.deepcopy(options)}
-        job = {'backend': 'tidehunter_tcp', 'sealed_dataset': {'source_id': 'source'},
-               'durability_tier': 'synchronous'}
-        actual = self.c.prepared_tide_options(job, self.root / 'case')
-        self.assertNotIn('read_lanes', actual['external_remote_config'])
-        self.assertEqual(self.c.shared_tide['options'], options)
-
-    def test_a_different_durability_tier_never_reuses_the_prepared_owners(self):
-        # Owners run one tier for their whole life; a case at another tier needs fresh owners.
         self.c.shared_tide = {'identity': ('source', 'tcp', 'native'), 'options': {}}
         job = {'backend': 'tidehunter_nvme_tcp', 'sealed_dataset': {'source_id': 'source'},
                'durability_tier': 'synchronous', 'read_lanes': 1, 'case_id': 'fresh'}
@@ -904,63 +865,6 @@ class ControllerBoundaryTests(unittest.TestCase):
             for field in ('state', 'ready_path', 'target_path'):
                 self.assertEqual(real_path(host[field]).exists(), host['index'] == 2)
             self.assertTrue(real_path(host['mirror']).exists())
-
-    def test_compact_sealed_targets_connect_trace_and_drain(self):
-        real_path = Path
-        jobs = cloud_campaign.make_focused_matrix('fabric_ab_compact')
-        arms = [next(j for j in jobs if j['backend'] == backend and j.get('nvmeof_target') == target)
-                for backend, target in (('tidehunter_nvme_rdma', 'kernel'),
-                                        ('tidehunter_nvme_rdma', 'spdk'),
-                                        ('tidehunter_nvme_tcp', 'kernel'))]
-        self.c.config['fleet']['nodes'] = self.c.config['fleet']['nodes'][:1]
-        for job in arms:
-            with self.subTest(backend=job['backend'], target=job['nvmeof_target']), \
-                 tempfile.TemporaryDirectory() as tmp:
-                base = real_path(tmp)
-                roots, targets = self.mirror_fixtures(base, [1, 2], {'catalog': [{}], 'nqn': 'test-nqn'})
-                transport = 'tcp' if job['backend'].endswith('_tcp') else 'rdma'
-                implementation = 'spdk' if job['nvmeof_target'] == 'spdk' else 'kernel_direct'
-                target = targets[0]['target']
-                target['transport'] = transport
-                entry = target['exports'][0]
-                entry['target'] = implementation
-                entry['target_receipt'] = {'selected_transport': transport, 'target_cache_verified': True,
-                    'target_cache': ('direct_file_bdev_no_OS_pagecache' if implementation == 'spdk'
-                                     else 'direct_file_no_OS_pagecache'),
-                    'buffered_io': 0, 'target_implementation': implementation,
-                    'direct_io_verified': True, 'read_only_verified': True}
-                self.c.shared_tide = {'job': {'case_id': 'source-case'}, 'ready': [{}],
-                    'mirror_roots': roots[:1], 'options': {'external_remote_config': {
-                        'read_memory_allowance_bytes': 256 * 1024**2,
-                        'read_cache_bytes': 0, 'max_pending_read_bytes': 0}}}
-                self.c.owner_batch = Mock(return_value=targets[:1])
-                self.c.active_nvme = None
-                result = {'phase': 'connected', 'transport': transport,
-                    'bindings': [{'export_uuid': [1, 2], 'namespace_path': '/dev/test',
-                                  'transport': transport, 'target': implementation}],
-                    'exports': [{'export_uuid': [1, 2], 'host_receipt': {'controller': 'nvme0'}}]}
-                def mapped_path(value):
-                    path = real_path(value)
-                    return base / 'control' if str(path) == '/var/lib/tidehunter-kv-control' else path
-                def command(argv, *, timeout):
-                    if argv[:2] == ['nvme', 'id-ctrl']:
-                        return json.dumps({'cntlid': 7})
-                    if 'host-disconnect' in argv:
-                        return json.dumps({'phase': 'disconnected'})
-                    real_path(argv[argv.index('--state') + 1]).mkdir()
-                    return json.dumps(result)
-                with patch.object(controller, 'Path', side_effect=mapped_path), \
-                     patch.object(controller, 'command', side_effect=command), \
-                     patch.object(controller, 'persist_json'):
-                    readers = self.c.connect_nvme(job, base)
-                    self.assertEqual(len(readers), 1)
-                    self.assertEqual(readers[0]['binding']['transport'], transport)
-                    self.assertEqual(self.c.nvme_trace('start', 10), [{'complete': True}])
-                    with self.assertRaises(controller.InfrastructureError):
-                        self.c.disconnect_nvme(drained=False)
-                    self.c.disconnect_nvme(drained=True)
-                    self.assertIsNone(self.c.active_nvme)
-                self.assertEqual(self.c.owner_batch.call_args.kwargs['transport'], transport)
 
     def test_rdma_transport_is_used_for_targets_and_namespace_bindings(self):
         real_path = Path

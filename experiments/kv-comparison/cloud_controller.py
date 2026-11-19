@@ -1849,13 +1849,8 @@ def planned_write_batches_per_partition(job):
 
 def owner_control_settings(job):
     """Keep owner preparation and its receipt on the same control transport."""
-    backend = job["backend"]
-    if (job.get("case_kind") is not None and backend in cloud_campaign.NVME_BACKENDS
-            and (job.get("nvmeof_route") == "sealed_read"
-                 or job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads",
-                                              *cloud_campaign.NVMEOF_PATH_SELECTIONS))):
-        backend = "tidehunter_verbs_native"
-    transport = cloud_campaign.TRANSPORTS[backend]
+    backend = cloud_campaign.owner_control_backend(job)
+    transport = cloud_campaign.CONTROL_TRANSPORTS[backend]
     return {"owner_polling": job.get("owner_polling", "adaptive"),
             "owner_control_backend": backend, "owner_transport": copy.deepcopy(transport),
             "owner_transport_security_label":
@@ -1867,8 +1862,7 @@ def admitted_live_campaign(config, case):
     if spec.get("mode") == "standard-with-live-nvmeof":
         return True
     if (spec.get("mode") != "focused"
-            or not (spec.get("selection") in ("leased_ab_compact", "valkey_rdma_reads")
-                    or spec.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)):
+            or spec.get("selection") not in cloud_campaign.FOCUSED_SELECTIONS):
         return False
     return any(job["case_id"] == case and job.get("nvmeof_route") == "live"
                for job in cloud_campaign.make_focused_matrix(spec["selection"]))
@@ -1926,8 +1920,7 @@ def admit_prepared_live_client(live_client, prep, tier):
                             "host_id": live_host_identity(identity.get("host_nqn"))}:
                 raise SafetyError("live owner UUID differs from its NQN")
         expected["owner_identities"] = identities
-    expected.update(host_nqn=host_nqn, host_id=host_id, write_mode=prep["write_mode"],
-                    leased_durability=tier if prep["write_mode"] == "leased" else None,
+    expected.update(host_nqn=host_nqn, host_id=host_id, write_mode="leased", leased_durability=tier,
                     inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"],
                     export_mode=prep["export_mode"])
     for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
@@ -2026,9 +2019,13 @@ def validate_launch(config, launch, case, index, polling=None):
         transport = validate_transport(tls.get("transport"))
     except ValueError as error:
         raise SafetyError("invalid typed transport") from error
+    expected_transport = (owner_control_settings(job)["owner_transport"]
+                          if job.get("backend") in cloud_campaign.NVME_BACKENDS else None)
+    if expected_transport is not None and protocol_key(transport) != protocol_key(expected_transport):
+        raise SafetyError("typed transport differs from the planned leased owner control protocol")
     if protocol_key(transport) not in {
-            protocol_key(value) for value in cloud_campaign.TRANSPORTS.values()}:
-        raise SafetyError("transport protocol is not admitted by the AWS comparison")
+            protocol_key(value) for value in cloud_campaign.CONTROL_TRANSPORTS.values()}:
+        raise SafetyError("typed transport is not admitted for leased owner control")
     if is_trusted(transport):
         if any(tls.get(field) != "" for field in ("ca", "cert", "key")):
             raise SafetyError("trusted native transport must have empty TLS paths")
@@ -3793,13 +3790,9 @@ class Controller:
         import yaml
         case = job["case_id"]
         guest_root = str(Path(self.config["fleet"]["data_root"]) / "cells" / case)
-        if job.get("history_persistence", "on_disk") not in ("on_disk", "memory_only", "wal_replay"):
-            raise SafetyError("unknown owner history persistence")
-        if (job.get("history_persistence") == "memory_only"
-                and any(job.get("mix", {}).get(kind, 0) for kind in ("read", "get_many"))
-                and (job.get("nvmeof_route") != "live"
-                     or job.get("live_export_mode", "on_demand") not in ("per_owner", "per_file"))):
-            raise SafetyError("memory-only history admits reads only with permanent live export")
+        if (job.get("nvmeof_route") != "live" or job.get("nvmeof_target", "kernel") != "kernel"
+                or job.get("target_io", "buffered") != "buffered"):
+            raise SafetyError("Tidehunter owner cases require leased NVMe-oF with a buffered kernel target")
         owner_memory = (owner_process_budget(self.config, job, 0)[1] if job.get("owner_topology")
                         else self.config["fleet"]["server_memory_mib"])
         allowance = job.get("owner_read_memory_allowance_bytes",
@@ -3823,7 +3816,7 @@ class Controller:
                 "owner_read_resident_first": job.get("owner_read_resident_first", False),
                 "owner_read_memory_allowance_bytes": allowance,
                 "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research"),
-                "history_persistence": job.get("history_persistence", "on_disk")}
+                "history_persistence": "wal_replay"}
         if "owner_wal_file_bytes" in job:
             prep["owner_wal_file_bytes"] = job["owner_wal_file_bytes"]
         tier = cloud_campaign.durability_tier(job)
@@ -3836,9 +3829,9 @@ class Controller:
         if job.get("nvmeof_route") == "live":
             live_transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}.get(job["backend"])
             prep["live_nvmeof"] = live_nvme_preparation(self.config, case, live_transport)
-            prep["live_nvmeof"].update(write_mode=job.get("live_write_mode", "reserved"),
+            prep["live_nvmeof"].update(write_mode="leased",
                                        inline_reads=job.get("live_inline_reads", True),
-                                       export_mode=job.get("live_export_mode", "on_demand"),
+                                       export_mode="per_owner",
                                        lease_ahead=job.get("live_lease_ahead", True),
                                        polled_writes=job.get("live_polled_writes", False),
                                        leased_write_window=job.get("live_leased_write_window"),
@@ -3852,12 +3845,6 @@ class Controller:
             prep["pin_read_lanes"] = job["live_pin_read_lanes"]
         if "read_lanes" in job:
             prep["read_lanes"] = job["read_lanes"]
-        if "sealed_dataset" in job:
-            # Preparation and each planned reader consume one retained epoch.
-            source = job["sealed_dataset"]["source_id"]
-            prep["max_epochs"] = 1 + sum(
-                candidate.get("sealed_dataset", {}).get("source_id") == source
-                for candidate in controller_matrix(self.config["spec"]))
         if "coordinator_read_memory_allowance_bytes" in job:
             memory = job["coordinator_read_memory_allowance_bytes"]
             if (job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS
@@ -3883,8 +3870,6 @@ class Controller:
             partition = (launch or {}).get("node", {}).get("partition", {})
             if geometry is None or (partition.get("fragment_bytes"), partition.get("wal_file_bytes")) != geometry:
                 raise SafetyError("prepared owner WAL geometry differs from the planned case")
-            if (launch or {}).get("history_persistence", "on_disk") != job.get("history_persistence", "on_disk"):
-                raise SafetyError("prepared owner history persistence differs from the planned case")
         self.active_tide = (job, directory, [])
         remote = json.loads((prepared / "remote.json").read_text())
         if (remote.get("storage", {}).get("fragment_bytes"), remote.get("storage", {}).get("wal_file_bytes")) != geometry:
@@ -3913,20 +3898,13 @@ class Controller:
         def start(index):
             launch_path = prepared / f"node-{index}" / "launch.yaml"
             launch = load_owner_launch(job, launch_path)
-            if job.get("nvmeof_route") == "live" and job.get("nvmeof_target") == "spdk":
-                validate_launch(self.config, launch, case, index, polling)
-                nqn = owner_identities.get(str(index), {}).get("host_nqn", host_nqn)
-                expected = live_target_for_owner(self.config, case, index, live_transport, nqn, "spdk", job.get("live_export_mode", "on_demand"))
-                launch["node"]["live_target"]["spdk"] = expected["spdk"]
-                launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
             validate_launch(self.config, launch, case, index, polling)
             if job.get("nvmeof_route") == "live":
                 selected = launch.get("node", {}).get("live_target") or {}
-                selected = {key: value for key, value in selected.items() if key != "spdk" or value is not None}
                 if selected != live_target_for_owner(
                         self.config, case, index, live_transport,
                         owner_identities.get(str(index), {}).get("host_nqn", host_nqn), job.get("nvmeof_target", "kernel"),
-                        job.get("live_export_mode", "on_demand")):
+                        "per_owner"):
                     raise SafetyError("prepared live target is missing or differs from selected transport")
             elif launch.get("node", {}).get("live_target") is not None:
                 raise SafetyError("unexpected live target in non-live campaign case")
@@ -4879,36 +4857,10 @@ class Controller:
                 raise ValueError("case is not in the reviewed compact selection")
         if type(owner_count) is not int or owner_count not in cloud_layout.LOGICAL_OWNER_COUNTS:
             raise ValueError("unsupported logical owner_count")
-        if owner_count not in (1, 5):
+        if ("owner_count" in job or owner_count == 1 and job.get("backend") in cloud_campaign.NVME_BACKENDS):
             cloud_campaign.active_owner_count(job)
-        read_case = (host_count == 1 and self.config["spec"].get("selection") == "remote_rw_compact"
-                     and job.get("case_kind") in ("media_read", "sealed_knee")
-                     and job.get("backend") in ("tidehunter_tcp", "tidehunter_verbs_native")
-                     and job.get("durability_tier") == "synchronous"
-                     and "sealed_dataset" in job and "nvmeof_route" not in job)
-        fabric_read = (host_count == 1 and self.config["spec"].get("selection") == "fabric_ab_compact"
-                       and job.get("selection") == "fabric_ab_compact"
-                       and job.get("case_kind") in ("media_read", "sealed_knee")
-                       and job.get("durability_tier") == "synchronous" and "sealed_dataset" in job
-                       and ((job.get("backend") in ("tidehunter_tcp", "tidehunter_tcp_trusted", "tidehunter_verbs_native")
-                             and "nvmeof_route" not in job)
-                            or (job.get("case_kind") == "media_read" and job.get("nvmeof_route") == "sealed_read"
-                                and ((job.get("backend") == "tidehunter_nvme_rdma"
-                                      and job.get("nvmeof_target") in ("kernel", "spdk"))
-                                     or (job.get("backend") == "tidehunter_nvme_tcp"
-                                         and job.get("nvmeof_target") == "kernel")))))
-        if owner_count == 1 and ("owner_count" in job or
-                (job.get("backend") in cloud_campaign.TRANSPORTS and job.get("case_kind") not in
-                 ("ssd_write_floor", "ssd_floor", "net_floor"))) and not (read_case or fabric_read or (
-                     host_count == 1 and (
-                         self.config["spec"].get("selection") in ("leased_ab_compact", "valkey_rdma_reads")
-                         or self.config["spec"].get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)
-                     and cloud_campaign._focused_exact(job, expected))) and (
-                job.get("case_kind") not in cloud_campaign.ONE_OWNER_CASE_KINDS
-                or job.get("backend") not in ("tidehunter_tcp", "tidehunter_verbs_native")
-                or job.get("durability_tier") != "synchronous"
-                or "sealed_dataset" in job or "nvmeof_route" in job):
-            raise ValueError("one owner requires a synchronous ordinary owner RPC case")
+        if job.get("backend") in cloud_campaign.NVME_BACKENDS and job.get("nvmeof_route") != "live":
+            raise ValueError("Tidehunter NVMe-oF cases require the leased live route")
         if job.get("case_kind") in ("net_floor", "ssd_floor", "ssd_write_floor"):
             return self.run_floor_case(job)
         if job.get("case_kind") == "fio_floor":

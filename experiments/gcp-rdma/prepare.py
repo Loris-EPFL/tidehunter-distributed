@@ -45,21 +45,13 @@ def admit_selected_features(spec, manifest):
                           'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json'}
     if gcp_runtime.live_mode(spec):
         artifacts.add('source/experiments/kv-comparison/nvme_campaign_owner.py')
-    if spec.get('spdk_comparison'):
-        artifacts |= {'runtime/spdk/spdk.json', 'runtime/spdk/bin/nvmf_tgt',
-                      'source/experiments/nvmeof/spdk_targets.py',
-                      'source/experiments/nvmeof/spdk_artifacts.py',
-                      'source/experiments/nvmeof/spdk_measurement.py'}
-        if gcp_runtime.live_mode(spec):
-            artifacts |= {'source/experiments/nvmeof/live_spdk_daemon.py',
-                          'source/experiments/kv-comparison/nvme_campaign_owner.py'}
     if spec.get('valkey_reproduction_profiles'):
         artifacts |= {'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json',
                       'source/experiments/kv-comparison/valkey_cloud.py',
                       'source/experiments/kv-comparison/valkey_reproduction.py',
                       'source/experiments/kv-comparison/valkey-public-reproduction.json'}
     if not artifacts <= set(manifest.get('files', {})):
-        raise ValueError('runtime omits selected SPDK or native Valkey artifacts')
+        raise ValueError('runtime omits selected leased or native Valkey artifacts')
 
 def admit_rocky9_abi(abi):
     for family, maximum in (('GLIBC', (2, 34)), ('GLIBCXX', (3, 4, 29))):
@@ -126,7 +118,7 @@ def container_build(engine, output, image_name, timeout, deadline, with_valkey, 
 
 
 def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, build_container=None,
-            manual_allow_dirty=False, spdk_prefix=None, nvmet_fix_prefix=None):
+            manual_allow_dirty=False, nvmet_fix_prefix=None):
     engine = Path(engine).resolve(strict=True)
     if engine != ROOT:
         raise ValueError('preparer must execute from the selected engine checkout')
@@ -152,13 +144,6 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     if focused:
         import manual_campaign
         manual_campaign._reviewed_jobs(spec)
-    requested_spdk = spec.get('spdk_comparison', False)
-    if requested_spdk != (spdk_prefix is not None):
-        raise ValueError('SPDK comparison requires exactly one locally qualified --spdk-prefix')
-    if spdk_prefix is not None:
-        import gcp_image
-        spdk = cloud_package.spdk_artifacts(spdk_prefix)
-        gcp_image.admit_spdk_scope(spec, spdk)
     if not 1800 <= deadline_seconds <= 14400:
         raise ValueError('deadline must be 1800..14400 seconds')
     output = Path(output).absolute()
@@ -211,13 +196,10 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
              [built['binary'], built['fdb']['elf'], built['fabric_build']]) +
             ([built['valkey_rdma']['server_elf'], built['valkey_rdma']['cli_elf'],
               built['valkey_rdma']['benchmark_elf']] if valkey_source else []) +
-            ([cloud_package.elf_identity(Path(spdk_prefix) / name, provider='gcp')
-              for name in spdk['files'] if name == 'bin/nvmf_tgt' or name.startswith('lib/')]
-             if spdk_prefix is not None else []) +
             ([built['admission_options']['binary']] if admission_options else [])))
     package = output / 'package'
     cloud_package.stage(engine, snapshot, build, fdb, package,
-                        valkey_source=valkey_source, spdk_prefix=spdk_prefix, nvmet_fix_prefix=nvmet_fix_prefix,
+                        valkey_source=valkey_source, nvmet_fix_prefix=nvmet_fix_prefix,
                         **profile_args)
     if (package / 'bundle.tar.gz').stat().st_size > 512 << 20:
         raise ValueError('compressed KV runtime exceeds guest download limit')
@@ -235,7 +217,7 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
                              engine / 'experiments/kv-comparison/ci.json', '--binary', package / 'runtime/bin/kv-research',
                              '--qualification', '--output', raw]
     if focused:
-        qualification_command.extend(['--backends', 'native,tidehunter_tcp'])
+        qualification_command.extend(['--backends', 'native'])
     ci_prepare.bounded(qualification_command, deadline, environment=env, cwd=engine)
     proof = output / 'qualification'
     proof.mkdir()
@@ -255,12 +237,8 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     manifest = json.loads((package / 'manifest.json').read_text())
     if spec is not None:
         admit_selected_features(spec, manifest)
-    diagnostic = ci_prepare.run_tcp_diagnostic(package / 'runtime/bin/kv-research', output / 'tcp-diagnostic-work',
-                                               proof / 'tcp-diagnostic', revision, deadline, env)
-    if diagnostic['binary_sha256'] != manifest['binary_sha256'] or diagnostic['binary_blake2b512'] != manifest['binary_blake2b512']:
-        raise ValueError('TCP proof is not from the packaged executable')
     ready = {'schema_version': 1, 'engine_sha': revision, 'binary_sha256': manifest['binary_sha256'],
-             'binary_blake2b512': manifest['binary_blake2b512'], 'tcp_diagnostic_sha256': diagnostic['tcp_diagnostic_sha256'],
+             'binary_blake2b512': manifest['binary_blake2b512'],
              'qualification_files': ci_prepare.proof_inventory(proof)}
     ci_prepare.admit_qualification(proof, ready, **({'focused': True} if focused else {}))
     verified = cloud_package.verify_directory(package)
@@ -319,7 +297,6 @@ def main():
     parser.add_argument('--build-container', help='local Rocky 9 build image; builds fabric and Valkey inside it')
     parser.add_argument('--deadline', type=int, default=10800)
     parser.add_argument('--spec', type=Path)
-    parser.add_argument('--spdk-prefix', type=Path, help='locally built and qualified SPDK target prefix')
     parser.add_argument('--nvmet-fix-prefix', type=Path, help='statically admitted nvmet kernel fix prefix')
     parser.add_argument('--admit-transfer', action='store_true')
     parser.add_argument('--manual-allow-dirty', action='store_true',
@@ -335,7 +312,7 @@ def main():
         if bool(args.fabric_prefix) == bool(args.build_container):
             parser.error('KV preparation requires exactly one of --fabric-prefix and --build-container')
         result = prepare(args.engine, args.output, args.revision, args.fabric_prefix, args.deadline, args.spec,
-                         args.build_container, manual_allow_dirty=args.manual_allow_dirty, spdk_prefix=args.spdk_prefix,
+                         args.build_container, manual_allow_dirty=args.manual_allow_dirty,
                          nvmet_fix_prefix=args.nvmet_fix_prefix)
     print(json.dumps(result, sort_keys=True))
 

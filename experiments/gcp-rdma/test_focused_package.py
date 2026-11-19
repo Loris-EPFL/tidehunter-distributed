@@ -155,10 +155,10 @@ class FocusedPackageTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'loaded FoundationDB'):
                         package.verify_directory(root, runtime=True, provider='gcp')
 
-    def test_focused_qualification_requires_only_two_exact_same_binary_adapters(self):
+    def test_focused_qualification_requires_exact_same_binary_native_adapter(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for backend in ('native', 'tidehunter_tcp'):
+            for backend in ('native',):
                 case = root / backend
                 (case / 'result').mkdir(parents=True)
                 (case / 'receipt.json').write_text(json.dumps({'job': {'backend': backend}, 'status': 'completed',
@@ -167,10 +167,8 @@ class FocusedPackageTest(unittest.TestCase):
                 (case / 'normalized-config.json').write_text(json.dumps({'qualification_only': True, 'source_revision': 'b' * 40}))
             ready = {'binary_sha256': 'a' * 64, 'engine_sha': 'b' * 40, 'qualification_files': {}}
             with patch.object(ci_prepare, 'proof_inventory', return_value={}), \
-                    patch.object(ci_prepare, 'sha', return_value='digest'), \
-                    patch.object(ci_prepare, 'admit_tcp_diagnostic') as tcp:
+                    patch.object(ci_prepare, 'sha', return_value='digest'):
                 ci_prepare.admit_qualification(root, ready, focused=True)
-                tcp.assert_called_once()
                 with self.assertRaisesRegex(ValueError, 'every software-admissible'):
                     ci_prepare.admit_qualification(root, ready)
                 extra = root / 'foundationdb'

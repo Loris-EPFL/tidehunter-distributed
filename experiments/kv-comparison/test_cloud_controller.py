@@ -180,7 +180,7 @@ class OwnerCountTests(unittest.TestCase):
     def test_compact_rejects_five_owner_and_unsupported_cases_before_dispatch(self):
         config = config_fixture()
         config["fleet"]["nodes"] = config["fleet"]["nodes"][:1]
-        config["spec"].update(mode="focused", selection="parity_compact")
+        config["spec"].update(mode="focused", selection="nvmeof_path_core")
         runtime = controller.Controller(config, clients_fixture(config))
         runtime.run_floor_case = Mock()
         runtime.run_fio_case = Mock()
@@ -190,15 +190,13 @@ class OwnerCountTests(unittest.TestCase):
                  {**base, "owner_count": 1, "case_kind": "interference"},
                  {**base, "owner_count": 1, "case_kind": "fio_floor"},
                  {**base, "owner_count": 1, "case_kind": "unknown"}]
-        matrix = controller.cloud_campaign.make_focused_matrix("parity_compact")
-        cases.append(next(job for job in controller.cloud_campaign.make_focused_matrix("fair_five_owner")
-                          if job["case_kind"] == "remote_put"))
+        matrix = controller.cloud_campaign.make_focused_matrix("nvmeof_path_core")
         valid_owner = next(job for job in matrix if job["case_kind"] == "remote_put")
         cases.extend(({**valid_owner, "case_id": "unknown"}, {**valid_owner, "keys": valid_owner["keys"] + 1},
                       {key: value for key, value in valid_owner.items() if key != "owner_count"}))
-        for kind in ("native_op", "ssd_write_floor", "remote_put"):
+        for kind in ("native_op", "remote_put"):
             valid = next(job for job in matrix if job["case_kind"] == kind)
-            cases.extend(({**valid, "sealed_dataset": {}}, {**valid, "nvmeof_route": "live"},
+            cases.extend(({**valid, "sealed_dataset": {}, "nvmeof_route": "sealed_read"},
                           {**valid, "interference": {}}, {**valid, "fio": {}}))
         cases += [{"case_id": "bad", "case_kind": "native_op", "backend": "tidehunter_tcp",
                    "owner_count": 1},
@@ -231,21 +229,17 @@ class OwnerCountTests(unittest.TestCase):
         self.assertEqual(result, [{"index": -1}, {"index": 0}])
         self.assertEqual(sorted(call.args[0] for call in runtime.request.call_args_list), [-1, 0])
 
-    def test_compact_accepts_native_and_owner_floor_without_extra_hosts(self):
+    def test_compact_accepts_native_and_leased_cases_without_extra_hosts(self):
         config = config_fixture()
         config["fleet"]["nodes"] = config["fleet"]["nodes"][:1]
-        config["spec"].update(mode="focused", selection="parity_compact")
+        config["spec"].update(mode="focused", selection="nvmeof_path_core")
         runtime = controller.Controller(config, clients_fixture(config))
-        runtime.run_floor_case = Mock(return_value="floor")
-        matrix = controller.cloud_campaign.make_focused_matrix("parity_compact")
-        floor = next(job for job in matrix if job["case_kind"] == "ssd_write_floor")
-        self.assertEqual(runtime.run_case(floor), "floor")
+        matrix = controller.cloud_campaign.make_focused_matrix("nvmeof_path_core")
         native = next(job for job in matrix if job["case_kind"] == "native_op")
-        remotes = [next(job for job in matrix if job["case_kind"] == "remote_put" and job["backend"] == backend)
-                   for backend in ("tidehunter_tcp", "tidehunter_verbs_native")]
+        remote = next(job for job in matrix if job["case_kind"] == "remote_put")
         with tempfile.TemporaryDirectory() as tmp:
             runtime.root = Path(tmp)
-            for job in (native, *remotes):
+            for job in (native, remote):
                 with self.subTest(kind=job["case_kind"]), \
                      patch.object(controller, "guarded", side_effect=RuntimeError("guard reached")):
                     with self.assertRaisesRegex(RuntimeError, "guard reached"):
@@ -287,16 +281,6 @@ class OwnerCountTests(unittest.TestCase):
         runtime.run_floor_case.assert_not_called()
         runtime.run_fio_case.assert_not_called()
 
-    def test_synchronous_one_owner_rpc_passes_entry_guard(self):
-        runtime = controller.Controller(config_fixture(), clients_fixture(config_fixture()))
-        job = {"owner_count": 1, "backend": "tidehunter_tcp", "case_kind": "remote_put",
-               "durability_tier": "synchronous", "case_id": "case"}
-        with tempfile.TemporaryDirectory() as tmp:
-            runtime.root = Path(tmp)
-            with patch.object(controller, "guarded", side_effect=RuntimeError("guard reached")):
-                with self.assertRaisesRegex(RuntimeError, "guard reached"):
-                    runtime.run_case(job)
-
     def test_preparation_launches_and_receipts_only_selected_owners(self):
         import yaml
         for count in (1, 5):
@@ -304,8 +288,8 @@ class OwnerCountTests(unittest.TestCase):
             runtime = controller.Controller(config, clients_fixture(config))
             runtime.remaining = Mock(return_value=300)
             runtime.request = Mock(return_value={"receipt": "proof"})
-            job = {"case_id": "case", "backend": "tidehunter_tcp", "owner_count": count,
-                   "keys": 16, "warmup_operations": 1, "measurement_operations": 2,
+            job = {"case_id": "case", "backend": "tidehunter_nvme_tcp", "owner_count": count,
+                   "nvmeof_route": "live", "keys": 16, "warmup_operations": 1, "measurement_operations": 2,
                    "coordinator_cache_bytes": 0}
             with tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
@@ -316,7 +300,8 @@ class OwnerCountTests(unittest.TestCase):
                         host["address"] + ":9400" for host in config["fleet"]["nodes"][:count]])
                     prepared = directory / "prepared"
                     prepared.mkdir()
-                    (prepared / "remote.json").write_text(json.dumps({"tls": {}, "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}))
+                    (prepared / "remote.json").write_text(json.dumps({"tls": {}, "live_nvme": {},
+                        "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}))
                     (prepared / "external_owner_read_config.json").write_text("[]")
                     for index in range(count):
                         node = prepared / f"node-{index}"
@@ -324,6 +309,9 @@ class OwnerCountTests(unittest.TestCase):
                         (node / "launch.yaml").write_text(yaml.safe_dump({"tls": {}, "node": {"partition": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}}))
                 with patch.object(controller, "command", side_effect=prepare), \
                      patch.object(controller, "validate_launch"), \
+                     patch.object(controller, "live_nvme_preparation", return_value={}), \
+                     patch.object(controller, "admit_prepared_live_client", return_value="host"), \
+                     patch.object(controller, "live_target_for_owner", return_value={}), \
                      patch.object(controller, "upload_object"), \
                      patch.object(controller, "confirm_owner_durability",
                                   side_effect=lambda proof, tier, index, nonce: {"partition": index}):
@@ -332,7 +320,8 @@ class OwnerCountTests(unittest.TestCase):
                     "path": str(directory / "database"), "evidence": str(directory / "read-evidence"),
                     "owners": count, "key_count": 1048576, "max_batches_per_partition": 16384,
                     "coordinator_read_cache_bytes": 0, "owner_read_resident_first": False,
-                    "external_remote_config": {"tls": {}, "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}, "durability_tier": "native",
+                    "external_remote_config": {"tls": {}, "live_nvme": {},
+                        "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}, "durability_tier": "native",
                     "external_owner_durability_receipts": [
                         str((directory / "owner-durability" / f"node-{i}.durability.json").absolute())
                         for i in range(count)], "external_owner_read_config": []})
@@ -371,7 +360,8 @@ class OwnerCountTests(unittest.TestCase):
 
     def test_inactive_hosts_have_no_owner_cgroup(self):
         config = config_fixture()
-        job = {"backend": "tidehunter_tcp", "case_id": "case", "owner_count": 1}
+        job = next(job for job in controller.cloud_campaign.make_focused_matrix("nvmeof_path_core")
+                   if job["backend"] in controller.cloud_campaign.NVME_BACKENDS)
         with patch.object(controller, "unit_status", side_effect=lambda name: {"ControlGroup": "/system.slice/" + name}):
             self.assertEqual(len(controller.owned_monitor_processes(config, 0, job)["processes"]), 1)
         for index in range(1, 5):
@@ -565,23 +555,6 @@ class NvmeActionAdmissionTests(unittest.TestCase):
                 if route is not None:
                     job["nvmeof_route"] = route
                 controller.require_supported_nvme_route(job)
-    def test_direct_device_route_and_native_put_admission(self):
-        jobs = controller.cloud_campaign.make_focused_matrix("device")
-        direct = next(job for job in jobs if job.get("target_io") == "direct")
-        controller.require_supported_nvme_route(direct)
-        for change in ([{"group": group} for group in ("G4", "G5", "G7", "G9")]
-                       + [{"nvmeof_target": "spdk"}, {"nvmeof_route": "live"},
-                          {"backend": "tidehunter_tcp"}]):
-            with self.subTest(change=change), self.assertRaises(controller.SafetyError):
-                controller.require_supported_nvme_route({**direct, **change})
-        with tempfile.TemporaryDirectory() as tmp:
-            manifest = Path(tmp) / "manifest.json"
-            manifest.write_text(json.dumps({"durability": {"confirmed_by_backend_receipt": "native"}}))
-            for job in jobs:
-                if job["case_kind"] == "remote_put" and job["durability_tier"] == "native":
-                    controller.require_supported_nvme_route(job)
-                    controller.cloud_campaign.admit_durability_tier(job, {"durability_tier": "native"}, manifest)
-
 
     def test_spdk_live_requires_rdma_and_remains_distinct_from_sealed(self):
         controller.require_supported_nvme_route({"backend": "tidehunter_nvme_rdma",
@@ -1752,8 +1725,7 @@ class CapsuleAndExportTests(unittest.TestCase):
                 controller.validate_launch(config, broken, case, 0)
         trusted = copy.deepcopy(launch)
         trusted["tls"].update(
-            transport={"kind": "ofi", "fabric": {"backend": "efa-direct", "domain": "efa0"},
-                       "security": "trusted"},
+            transport=controller.cloud_campaign.CONTROL_TRANSPORTS[controller.cloud_campaign.OFI_CONTROL],
             ca="", cert="", key="")
         controller.validate_launch(config, trusted, case, 0)
         for field in ("ca", "cert", "key"):
@@ -2242,14 +2214,14 @@ class OwnerDurabilityReceiptTests(unittest.TestCase):
             controller.publish_synced(target, b"{}\n")
 
     def test_a_job_planned_before_tiers_is_native_and_needs_no_synchronous_proof(self):
-        self.assertEqual(controller.cloud_campaign.durability_tier({"backend": "tidehunter_tcp"}), "native")
+        self.assertEqual(controller.cloud_campaign.durability_tier({"backend": "tidehunter_nvme_tcp"}), "native")
         self.assertIsNone(controller.cloud_campaign.durability_tier({"backend": "native"}))
 
     def test_admission_never_infers_an_executed_tier_from_the_plan(self):
         admit = controller.cloud_campaign.admit_durability_tier
         manifest = Path(self.directory.name) / "manifest.json"
         manifest.write_text(json.dumps({"durability": {"confirmed_by_backend_receipt": "synchronous"}}))
-        planned = {"backend": "tidehunter_tcp", "durability_tier": "synchronous"}
+        planned = {"backend": "tidehunter_nvme_tcp", "durability_tier": "synchronous"}
         admit(planned, {"durability_tier": "synchronous"}, manifest)
         # Missing executed option is native, so a synchronous plan is refused.
         with self.assertRaisesRegex(ValueError, "differs from the planned"):
@@ -2260,9 +2232,9 @@ class OwnerDurabilityReceiptTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "did not confirm"):
                 admit(planned, {"durability_tier": "synchronous"}, manifest)
         # Historical artifact: no tier in the job, none executed, no manifest evidence required.
-        admit({"backend": "tidehunter_tcp"}, {}, Path(self.directory.name) / "absent.json")
+        admit({"backend": "tidehunter_nvme_tcp"}, {}, Path(self.directory.name) / "absent.json")
         with self.assertRaises(ValueError):
-            admit({"backend": "tidehunter_tcp"}, {"durability_tier": "synchronous"}, manifest)
+            admit({"backend": "tidehunter_nvme_tcp"}, {"durability_tier": "synchronous"}, manifest)
         admit({"backend": "native"}, {}, manifest)
 
 

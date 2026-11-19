@@ -2,7 +2,7 @@ name: Rust Tests
 
 on:
   push:
-    branches: ["main", "feat/sharded-value-wal", "feat/two-vm-remote-read-write", "p8-ci"]
+    branches: ["main", "feat/nvmeof-only"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
@@ -311,13 +311,13 @@ jobs:
             name: Run Tests
             setup: core
           - profile: distributed
-            name: Distributed Tests
+            name: Leased Distributed Tests
             setup: core
           - profile: fabric
-            name: Fabric Tests
+            name: Leased OFI Tests
             setup: fabric
           - profile: software-fabric
-            name: Software Fabric Tests
+            name: Software OFI Tests
             setup: fabric
           - profile: harness
             name: Harness Tests
@@ -391,24 +391,15 @@ jobs:
           echo "$venv/bin" >> "$GITHUB_PATH"
 
       # Software providers and deterministic fixtures are correctness checks,
-      # not evidence of EFA/RDMA hardware activity or network performance.
+      # not evidence of RDMA hardware activity or network performance.
       - name: Run selected profile
         run: python3 .github/scripts/checks.py "${{ matrix.profile }}"
 
-      # Keep extra CI coverage out of the shared native/distributed profiles,
-      # which are also used within the separately bounded paid cloud campaign.
       - name: Run default adapter suite
         if: matrix.profile == 'native'
-        run: cargo +1.90 test --locked --offline -p kv-research
-
-      - name: Run file-backed NVMe engine and adapter suites
-        if: matrix.profile == 'distributed'
-        # write_model uses local-file LiveIo, not an NVMe-oF kernel target.
-        run: |
-          cargo +1.90 test --locked --offline -p tidehunter --features experimental-nvmeof,test-utils
-          cargo +1.90 test --locked --offline -p kv-research --features nvmeof,test-utils
+        run: cargo +1.90 test --locked --offline -p kv-research --no-default-features
       - name: Gate distributed mainnet replay and public CLI
-        if: matrix.profile == 'fabric'
+        if: matrix.profile == 'distributed'
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -417,7 +408,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/distributed-mainnet/run.log"
 
       - name: Retain distributed replay failures
-        if: always() && matrix.profile == 'fabric'
+        if: always() && matrix.profile == 'distributed'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distributed-mainnet-${{ github.run_id }}-${{ github.run_attempt }}
@@ -425,17 +416,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-
-      - name: Run comparison and deployment harnesses
-        if: matrix.profile == 'harness'
-        run: |
-          for directory in experiments/kv-comparison experiments/kv-comparison/observability experiments/gcp-rdma; do
-            python3 -m unittest discover -s "$directory" -p 'test_*.py' -v
-          done
-
       - name: Report hardware-only exclusions
         if: always() && (matrix.profile == 'distributed' || matrix.profile == 'fabric')
         run: |
-          echo "::notice::efa_direct_opens_only_the_negotiated_hardware_fabric stays ignored: GitHub-hosted runners have no EFA device."
           echo "::notice::Kernel NVMe-oF/RDMA campaigns are excluded: they need an owned nvmet target, initiator modules and RDMA hardware."
-          echo "Local-file LiveIo and write_model run in Distributed Tests and Fabric Tests; no nvme-cli or kernel target is needed." >> "$GITHUB_STEP_SUMMARY"
+          echo "Local-file LiveIo and write_model exercise leased I/O; no kernel target is needed." >> "$GITHUB_STEP_SUMMARY"

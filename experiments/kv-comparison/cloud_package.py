@@ -89,13 +89,11 @@ REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.to
             "experiments/kv-comparison/nvme_campaign_owner.py",
             "experiments/kv-comparison/nvme_campaign_native.py",
             "experiments/kv-comparison/nvme_campaign_trace.py",
-            "experiments/kv-comparison/mcp_nvmeof_campaign.py",
             "benchmarks/kv-research/src/backends/tidehunter/nvmeof_campaign.rs",
             "benchmarks/kv-research/src/backends/tidehunter/live_qualification.rs",
             "tidehunter/src/distributed/nvmeof/live_storage.rs",
             "tidehunter/src/distributed/nvmeof/live_io.rs",
             "tidehunter/src/distributed/nvmeof/live_target.rs",
-            "tidehunter/src/distributed/nvmeof/live_target/spdk.rs",
             "tidehunter/src/distributed/nvmeof/live_connect.rs",
             "tidehunter/src/distributed/nvmeof/live_metrics.rs",
             "tidehunter/src/distributed/nvmeof/live_pool.rs",
@@ -105,11 +103,7 @@ REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.to
             "tidehunter/src/distributed/tcp/live_recovery.rs",
             "tidehunter/src/distributed/nvmeof/live_namespace.rs",
             "experiments/nvmeof/manage.py", "experiments/nvmeof/trace.py",
-            "experiments/nvmeof/collect.py", "experiments/nvmeof/campaign_targets.py",
-            "experiments/nvmeof/spdk_targets.py", "experiments/nvmeof/spdk_artifacts.py",
-            "experiments/nvmeof/spdk_measurement.py", "experiments/nvmeof/live_spdk_daemon.py",
-            "experiments/nvmeof/patches/spdk-26.01-nvmf-remove-ns-status.patch",
-            "experiments/nvmeof/test_spdk_remove_ns_status.c"}
+            "experiments/nvmeof/collect.py", "experiments/nvmeof/campaign_targets.py"}
 REPLAY_FIXTURE_FILES = {
     "experiments/sui-mainnet/fixture/" + name
     for name in ("manifest.json", "trace.bin", "preload.bin", "profile.json", "345683547.binpb.zst")

@@ -55,8 +55,8 @@ def validate_spec(spec):
     if (not isinstance(backends, list) or not backends
             or any(not isinstance(item, str) or item not in workflow_input.BACKENDS for item in backends)
             or len(backends) != len(set(backends))):
-        raise ValueError('invalid GCP backend selection; EFA is unavailable')
-    if spec.get('mode') not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
+        raise ValueError('invalid GCP backend selection')
+    if spec.get('mode') not in {'standard', 'standard-with-live-nvmeof', 'focused'}:
         raise ValueError('invalid campaign mode')
     _require_six_host_spec(spec)
     if spec['mode'] == 'focused':

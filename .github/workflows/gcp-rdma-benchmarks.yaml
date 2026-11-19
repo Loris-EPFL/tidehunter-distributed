@@ -13,14 +13,14 @@ on:
         default: preflight
         required: true
       backends:
-        description: 'Comma-separated IDs: native,tidehunter_tcp,tidehunter_verbs,tidehunter_verbs_native,tidehunter_nvme_tcp,tidehunter_nvme_rdma,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks'
+        description: 'Comma-separated IDs: native,tidehunter_nvme_tcp,tidehunter_nvme_rdma,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks'
         type: string
-        default: 'native,tidehunter_tcp,tidehunter_verbs_native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks'
+        default: 'native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks'
         required: true
       mode:
-        description: 'NVMe arms require nvmeof-focused. For portable RDMA compare native,tidehunter_tcp,tidehunter_verbs_native,tidehunter_nvme_rdma; NVMe/TCP optional.'
+        description: 'Distributed Tidehunter requires standard-with-live-nvmeof and an explicit NVMe backend.'
         type: choice
-        options: [standard, nvmeof-focused]
+        options: [standard, standard-with-live-nvmeof]
         default: standard
         required: true
 
@@ -55,7 +55,7 @@ jobs:
           python -m unittest discover -s experiments/kv-comparison -p 'test_cloud_controller.py'
           python -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
           python experiments/gcp-rdma/workflow_input.py spec --suite kv \
-            --backends native,tidehunter_tcp,tidehunter_verbs_native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks \
+            --backends native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks \
             --mode standard --output "$RUNNER_TEMP/gcp-spec.json"
           python -c 'import json,sys; sys.path.insert(0,"experiments/kv-comparison"); import cloud_campaign; spec=json.load(open(sys.argv[1])); jobs=cloud_campaign.make_matrix({k:v for k,v in spec.items() if k != "suite"}); assert jobs and {job["backend"] for job in jobs} == set(spec["backends"])' "$RUNNER_TEMP/gcp-spec.json"
           if python experiments/gcp-rdma/workflow_input.py spec --suite kv --backends native,native --mode standard --output "$RUNNER_TEMP/invalid-spec.json"; then
@@ -102,7 +102,7 @@ jobs:
       GCP_BENCH_IMAGE: ${{ vars.GCP_BENCH_IMAGE }}
       GCP_BENCH_IMAGE_QUALIFICATION: ${{ vars.GCP_BENCH_IMAGE_QUALIFICATION }}
       OPERATION: ${{ inputs.operation || 'launch' }}
-      BACKENDS: ${{ inputs.backends || 'native,tidehunter_tcp,tidehunter_verbs_native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks' }}
+      BACKENDS: ${{ inputs.backends || 'native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks' }}
       MATRIX_MODE: ${{ inputs.mode || 'standard' }}
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_RELEASE_DEBUG: '0'

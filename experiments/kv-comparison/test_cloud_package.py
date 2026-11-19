@@ -187,7 +187,6 @@ class PackageTests(unittest.TestCase):
         names = ("tidehunter/src/distributed/nvmeof/live_storage.rs",
                  "tidehunter/src/distributed/nvmeof/live_io.rs",
                  "tidehunter/src/distributed/nvmeof/live_target.rs",
-                 "tidehunter/src/distributed/nvmeof/live_target/spdk.rs",
                  "tidehunter/src/distributed/nvmeof/live_connect.rs",
                  "tidehunter/src/distributed/nvmeof/live_namespace.rs")
         self.git("rm", "--cached", "--", *names)
@@ -196,17 +195,6 @@ class PackageTests(unittest.TestCase):
             for name in names:
                 self.assertIn(name, snapshot["sha256"])
                 self.assertEqual(archive.read(name), (self.repo / name).read_bytes())
-        (self.repo / names[0]).unlink()
-        with self.assertRaisesRegex(ValueError, "required source closure"):
-            package.source_paths(self.repo)
-
-    def test_live_spdk_helpers_are_required_in_source_closure(self):
-        names = ("experiments/nvmeof/live_spdk_daemon.py",
-                 "experiments/nvmeof/spdk_targets.py",
-                 "experiments/nvmeof/spdk_artifacts.py",
-                 "experiments/nvmeof/spdk_measurement.py")
-        for name in names:
-            self.assertIn(name, package.REQUIRED)
         (self.repo / names[0]).unlink()
         with self.assertRaisesRegex(ValueError, "required source closure"):
             package.source_paths(self.repo)

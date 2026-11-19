@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -70,7 +69,6 @@ class ReplayCITests(unittest.TestCase):
                                ([success(6), success(0)], False),
                                ([success(6), success(2)], False)):
             with self.subTest(output=output), \
-                    patch.object(distributed, "fabric_environment", return_value=dict(os.environ)), \
                     patch.object(distributed, "cargo", side_effect=output):
                 if passes:
                     self.assertEqual(distributed.main(), 0)

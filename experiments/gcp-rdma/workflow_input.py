@@ -11,17 +11,15 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
 import cloud_campaign
 
-BACKENDS = {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native',
-            'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma',
-            'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
+BACKENDS = set(cloud_campaign.BACKENDS) | cloud_campaign.PORTABLE_BACKENDS | cloud_campaign.NVME_BACKENDS
 
 
 def specification(suite, backends, mode, selection=None, *, case_binaries=None):
     selected = backends.split(',')
-    if suite != 'kv' or mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
+    if suite != 'kv' or mode not in {'standard', 'standard-with-live-nvmeof', 'focused'}:
         raise ValueError('unsupported suite or matrix mode')
     if not selected or len(set(selected)) != len(selected) or any(x not in BACKENDS for x in selected):
-        raise ValueError('select unique supported backend IDs; EFA is not a GCP backend')
+        raise ValueError('select unique supported backend IDs')
     if selection == cloud_campaign.Q0_SELECTION:
         if mode != 'focused' or selected != ['tidehunter_nvme_rdma']:
             raise ValueError('Q0 requires the exact focused NVMe-oF RDMA selection')

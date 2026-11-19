@@ -101,25 +101,6 @@ class FocusedEvidenceTests(unittest.TestCase):
         self.bind("device_counters", {"before": [row], "after": [{**row, "write_sectors": 8}]})
         self.assertEqual(self.admit()["device_counters"]["after"][0]["write_sectors"], 8)
 
-    def test_completed_device_artifacts_accept_read_and_put(self):
-        jobs = cloud_campaign.make_focused_matrix("device")
-        for kind in ("media_read", "remote_put"):
-            self.job = next(job for job in jobs if job["case_kind"] == kind)
-            self.receipt = {"measurement_evidence": {
-                "gate_released": True, "completion_gate_observed": True,
-                "os_caches_dropped": True, "mapped_wal_eviction": "completed_before_gate",
-                "engine_caches_evicted": None}}
-            self.bind("phase_timing", {"schema_version": 1, "case_id": self.job["case_id"], "spans": []})
-            if kind == "media_read":
-                media = self.media(89)
-                media.update(case_id=self.job["case_id"], status="unqualified", reason_codes=["below_threshold"])
-                self.bind("media_evidence", media)
-            admitted = self.admit()
-            self.assertIn("phase_timing", admitted)
-            if kind == "media_read":
-                self.assertEqual(admitted["media_evidence"]["status"], "unqualified")
-
-
     def test_media_rejects_inactive_owner_device(self):
         self.job["owner_count"] = 1
         value = self.media()

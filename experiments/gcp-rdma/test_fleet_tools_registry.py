@@ -22,7 +22,7 @@ class FleetToolsRegistryTests(unittest.TestCase):
         self.assertEqual(spec['owner_hosts'], 1)
         self.assertEqual(spec['machine_type'], 'z4m-highmem-16')
         self.assertEqual(spec['repeats'], 1)
-        self.assertFalse(spec['spdk_comparison'])
+        self.assertNotIn('spdk_comparison', spec)
         digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         self.assertEqual(spec['matrix_sha256'], digest)
         bad = copy.deepcopy(spec); bad['tool_parameters'] = {'repeats': 3}
