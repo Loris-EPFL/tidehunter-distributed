@@ -29,6 +29,7 @@ use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -60,7 +61,16 @@ pub struct Wal {
     retained: bool,
     #[cfg(feature = "experimental-nvmeof")]
     external_preparation: Arc<external::ExternalPreparation>,
+    /// Files below this id hold only finished writes and are synced; see
+    /// `sync_files_through`.
+    synced_below: AtomicU64,
+    #[cfg(test)]
+    file_sync_hook: parking_lot::Mutex<Option<FileSyncHook>>,
 }
+
+/// Test hook run after a file sync, with the synced file id.
+#[cfg(test)]
+type FileSyncHook = Box<dyn Fn(position::WalFileId) + Send>;
 
 /// Sampled native benchmark barrier work, not isolated device latency.
 /// Counts include failed attempts; nanoseconds cover the same attempts.
@@ -436,6 +446,9 @@ impl Wal {
             retained: false,
             #[cfg(feature = "experimental-nvmeof")]
             external_preparation,
+            synced_below: AtomicU64::new(0),
+            #[cfg(test)]
+            file_sync_hook: Default::default(),
         };
         Ok(Arc::new(wal))
     }
@@ -460,6 +473,9 @@ impl Wal {
             retained: true,
             #[cfg(feature = "experimental-nvmeof")]
             external_preparation: Arc::new(external::ExternalPreparation::new(false)),
+            synced_below: AtomicU64::new(0),
+            #[cfg(test)]
+            file_sync_hook: Default::default(),
         }))
     }
 
@@ -830,7 +846,55 @@ impl Wal {
 
     /// Ensure the file is written to disk (blocking call).
     pub fn fsync(&self) -> io::Result<()> {
-        self.files.load().current_file().sync_all()
+        let files = self.files.load();
+        files.current_file().sync_all()?;
+        #[cfg(test)]
+        self.run_file_sync_hook(files.current_file_id());
+        Ok(())
+    }
+
+    /// Persist every registered file up to and including `last`, then the
+    /// directory entries. A snapshot calls this before it stores a control
+    /// region that depends on these files: the map syncer runs asynchronously
+    /// and gives no order relative to the snapshot.
+    ///
+    /// Every write below `complete_below` has finished, so files below it are
+    /// never written again. A later call skips the files this call syncs below
+    /// that id; the others it syncs again.
+    pub(crate) fn sync_files_through(
+        &self,
+        last: position::WalFileId,
+        complete_below: position::WalFileId,
+    ) -> io::Result<()> {
+        let files = self.files.load_full();
+        // Acquire pairs with the Release below: a raised floor follows the
+        // completed syncs of the files under it.
+        let floor = position::WalFileId(self.synced_below.load(Ordering::Acquire));
+        if floor <= last {
+            for (_id, file) in files.files.range(floor..=last) {
+                file.sync_all()?;
+                #[cfg(test)]
+                self.run_file_sync_hook(*_id);
+            }
+        }
+        File::open(&files.base_path)?.sync_all()?;
+        let synced_below = complete_below.0.min(last.0.saturating_add(1));
+        self.synced_below.fetch_max(synced_below, Ordering::Release);
+        Ok(())
+    }
+
+    /// Installs a hook that runs after each file sync by `fsync` or
+    /// `sync_files_through`.
+    #[cfg(test)]
+    pub(crate) fn set_file_sync_hook(&self, hook: FileSyncHook) {
+        *self.file_sync_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_file_sync_hook(&self, id: position::WalFileId) {
+        if let Some(hook) = self.file_sync_hook.lock().as_ref() {
+            hook(id);
+        }
     }
 
     /// Complete deletion authorized by a durable distributed recovery root.

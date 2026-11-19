@@ -1692,8 +1692,26 @@ impl Db {
             // must keep every file the writer might traverse.
             None => Vec::new(),
         };
-        self.indexes.fsync()?;
-        self.wal.fsync()?;
+        // The new control region depends on the index files it references and
+        // on the value WAL entries those index files point to. Those entries
+        // can lie above `replay_from` (a cell flushed after the oldest dirty
+        // cell) and above the processed frontier (an earlier allocation still
+        // in flight), but below the current allocation position. Persist
+        // those files before the control region can become durable: the map
+        // syncer works asynchronously and gives no such order. The processed
+        // frontiers are captured before the syncs, so writes below them have
+        // finished.
+        let index_complete_below = layout.locate_file(self.index_writer.last_processed().as_u64());
+        if let Some(max_live_file) = max_live_file {
+            self.indexes
+                .sync_files_through(max_live_file, index_complete_below)?;
+        }
+        let wal_layout = self.wal.layout();
+        let wal_complete_below = wal_layout.locate_file(self.wal_writer.last_processed().as_u64());
+        self.wal.sync_files_through(
+            wal_layout.locate_file(self.wal_writer.position()),
+            wal_complete_below,
+        )?;
         // Persist the control region BEFORE unlinking files. A crash between
         // these steps must leave the on-disk CR consistent with the files
         // still present: extra (un-deleted) files are tolerated by the next
