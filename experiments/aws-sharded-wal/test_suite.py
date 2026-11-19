@@ -96,7 +96,7 @@ class SuiteTests(unittest.TestCase):
         local = yaml.load((ROOT / '.github/workflows/kv-comparison.yaml').read_text(), Loader=yaml.BaseLoader)
         # Correctness pushes must never overlap the paid fleet's push branch.
         self.assertEqual(local['on']['push']['branches'],
-                         ['feat/two-vm-remote-read-write', 'p8-ci'])
+                         ['feat/two-vm-remote-read-write', 'p8-ci', 'q0/land4-fleet-fix'])
         self.assertNotIn('bench/aws-efa', local['on']['push']['branches'])
         self.assertEqual(local['permissions'], {'contents': 'read'})
         for local_job in local['jobs'].values():
