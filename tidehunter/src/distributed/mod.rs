@@ -6,6 +6,7 @@
 //! for the recovery and publication contract, and the implementation record for
 //! the supported subset. No wire format or disk-format stability is promised yet.
 
+pub mod capacity;
 pub mod codec;
 pub mod durability;
 pub mod group;

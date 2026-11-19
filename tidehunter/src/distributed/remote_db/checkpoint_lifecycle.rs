@@ -452,6 +452,8 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_install_before");
+    // R0 observers walk the installed image only between installs (seqlock).
+    core.capacity.begin_install();
     {
         let mut writer = core.index.writer();
         let _publisher = core.publisher.lock();
@@ -501,6 +503,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         *state.checkpoint_tail_bytes = bytes;
         state.recent.clone()
     };
+    core.capacity.end_install(completed.cut);
     // Identity retirement can take shard locks. It and Admission must run after
     // writer/publisher, and Active→Suffix must not resurrect a Recent identity.
     credits.identities = core.retire_checkpoint_identities(completed.cut, &recent);
@@ -657,6 +660,11 @@ pub(super) fn core_retire_history_before(
             core_progress_checkpoint(core, true)?;
         }
         core_commit_checkpoint(core)?;
+        // R0 shadow mode keeps logical pruning, checkpoints and the floor, and
+        // suppresses only physical retirement; the observer samples this prune.
+        if core.capacity.shadow_prune(core) {
+            return Ok(());
+        }
         core_retire_unreachable_sealed_files(core)
     })();
     drop(retirement);

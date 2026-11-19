@@ -59,6 +59,7 @@ fn config(root: &Path) -> ReplayConfig {
         measurement_gate: None,
         measurement_completion_gate: None,
         diagnostics: DiagnosticsConfig::default(),
+        capacity_r0: None,
     }
 }
 #[test]

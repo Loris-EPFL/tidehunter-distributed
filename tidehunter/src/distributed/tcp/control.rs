@@ -1950,6 +1950,19 @@ impl ControlContext {
                     durable_end,
                 })
             }
+            Request::FileInventoryPage {
+                authority_generation,
+                source_generation,
+                after,
+                limit,
+            } => NodeInventory::file_inventory_page(
+                &self.inventory,
+                authority_generation,
+                source_generation,
+                after,
+                limit,
+            )
+            .map(|reply| Response::FileInventoryPage(Box::new(reply))),
             Request::RetirementFiles {
                 authority_epoch,
                 epoch,

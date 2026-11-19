@@ -615,6 +615,24 @@ impl Db {
         }
     }
 
+    /// Start R0 shadow capacity observation on a remote database. Physical WAL
+    /// retirement is suppressed while the observer runs; logical pruning,
+    /// checkpoints and floor advancement are unchanged. Finish the returned
+    /// observer before closing the database.
+    pub fn start_capacity_observer(
+        &self,
+        config: super::capacity::CapacityObserverConfig,
+        sink: Box<dyn super::capacity::R0Sink>,
+    ) -> Result<super::remote_db::CapacityObserver> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .db
+                .start_capacity_observer(config, sink)
+                .map_err(error),
+            Backend::Native(_) => Err(error("capacity observation requires a remote database")),
+        }
+    }
+
     /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
     /// live target's exported namespaces and is not a reopen operation.
     pub fn shutdown_live_target_final(

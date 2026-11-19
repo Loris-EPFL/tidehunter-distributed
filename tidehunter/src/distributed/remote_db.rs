@@ -46,6 +46,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use typenum::U32;
 
+mod capacity_observer;
+pub use capacity_observer::CapacityObserver;
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
@@ -3386,6 +3388,8 @@ fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod capacity_observer_tests;
 #[cfg(test)]
 mod leased_tests;
 #[cfg(test)]

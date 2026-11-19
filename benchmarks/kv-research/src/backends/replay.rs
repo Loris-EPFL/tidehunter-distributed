@@ -111,6 +111,17 @@ pub trait ReplayBackend: Send + Sync + 'static {
     fn physical_counts(&self) -> serde_json::Value {
         serde_json::json!({"available":false,"reason":"backend does not expose physical command counters"})
     }
+    /// Start R0 shadow capacity observation on every node database (design
+    /// CAPACITY-R0-R1.md §2). Physical WAL retirement stays suppressed until
+    /// each returned session finishes. Only distributed Tidehunter supports it.
+    fn capacity_r0_start(
+        &self,
+        _request: &crate::capacity_r0::R0Request,
+        _header: &crate::capacity_r0::R0Header,
+        _output: &std::path::Path,
+    ) -> BackendResult<Vec<crate::capacity_r0::R0Session>> {
+        Err("R0 capacity observation requires a distributed Tidehunter backend".into())
+    }
 }
 
 pub fn verify_rows<B: ReplayBackend + ?Sized>(

@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod backends;
+pub mod capacity_r0;
 pub mod config;
 pub mod report;
 pub mod runner;

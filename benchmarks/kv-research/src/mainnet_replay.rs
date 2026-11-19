@@ -67,6 +67,9 @@ pub struct ReplayConfig {
     pub measurement_completion_gate: Option<MeasurementGateConfig>,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    /// R0 shadow capacity measurement; absent stays absent when echoed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_r0: Option<crate::capacity_r0::R0Request>,
 }
 /// Largest admitted checkpoint pipeline depth; Sui's default is 4 (sui-config node.rs).
 const MAX_PIPELINE_DEPTH: u32 = 64;
@@ -1869,6 +1872,8 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
     let mut elapsed = Duration::ZERO;
     let mut physical_before = serde_json::Value::Null;
     let mut physical_after = serde_json::Value::Null;
+    let mut capacity_sessions = Vec::new();
+    let mut capacity_r0 = serde_json::Value::Null;
     let mut result: BackendResult<()> = async {
         for rep in 0..prepared.len() {
             pool.dispatch(0, rep, Operation::Preload, Instant::now(), deadline)?;
@@ -1881,6 +1886,34 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         }
         backend.check_background_health()?;
         physical_before = backend.physical_counts();
+        // R0 is telemetry: a start or begin failure is reported, never fails
+        // the replay. The initial inventory follows preload, before timing.
+        if let Some(request) = &config.capacity_r0 {
+            let header = crate::capacity_r0::R0Header {
+                run_id: config
+                    .case_id
+                    .clone()
+                    .unwrap_or_else(|| format!("{started_unix:.3}")),
+                engine_revision: resources["binary"].clone(),
+                workload: request.workload,
+                input_digest: Some(config.workload.manifest_sha256.clone()),
+                durability_tier: serde_json::Value::Null,
+                route: serde_json::Value::Null,
+                fixture: serde_json::Value::Null,
+                prewrite: None,
+            };
+            match backend.capacity_r0_start(request, &header, output) {
+                Ok(sessions) => {
+                    capacity_sessions = sessions;
+                    for session in &capacity_sessions {
+                        if let Err(error) = session.begin() {
+                            capacity_r0 = serde_json::json!({"begin_error": error.to_string()});
+                        }
+                    }
+                }
+                Err(error) => capacity_r0 = serde_json::json!({"start_error": error.to_string()}),
+            }
+        }
         reporter.set_phase("measurement");
         let begin = Instant::now();
         window_start = Some(begin);
@@ -1921,6 +1954,23 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         .await?;
     }
     let unresolved_workers = pool.close().await?;
+    // Finish (end inventory, join) before the caller tears the fixture down.
+    if !capacity_sessions.is_empty() {
+        let begin_error = capacity_r0.take();
+        capacity_r0 = serde_json::json!({
+            "begin_error": begin_error.get("begin_error"),
+            "reports": capacity_sessions
+                .into_iter()
+                .map(|session| {
+                    let path = session.path().to_owned();
+                    match session.finish() {
+                        Ok(summary) => serde_json::json!({"path": path, "summary": summary}),
+                        Err(error) => serde_json::json!({"path": path, "error": error.to_string()}),
+                    }
+                })
+                .collect::<Vec<_>>(),
+        });
+    }
     let mut final_verification = serde_json::Value::Null;
     if result.is_ok() {
         let expected = expected_final_rows(&prepared);
@@ -1962,6 +2012,7 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         result.is_ok(),
     );
     metrics["final_verification"] = final_verification;
+    metrics["capacity_r0"] = capacity_r0;
     metrics["functional_qualification"] =
         serde_json::json!(result.is_ok() && unresolved_workers == 0);
     metrics["minimum_measurement_seconds"] =

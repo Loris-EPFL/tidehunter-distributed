@@ -536,3 +536,79 @@ async fn real_local_file_live_replay_records_logical_wal_amplification() {
     drop(owners);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// R0 on the leased ordinary-file fixture through `run_prepared`: the report
+/// is written, nothing is unlinked, and a replay without a retention prune is
+/// labeled nonrepresentative instead of yielding a slope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_local_file_live_replay_writes_r0_json() {
+    let root = root();
+    let mut trace = trace();
+    trace.select_node_databases(&[0]).unwrap();
+    let prepared = Arc::new(prepare(&trace, 2).unwrap());
+    let (backend, owners) = fixture(&root, &trace);
+    let config: crate::mainnet_replay::ReplayConfig = serde_json::from_value(serde_json::json!({
+        "schema_version":1,"backend":{"kind":"tidehunter_tcp","options":{}},
+        "workload":{"kind":"sui_mainnet_replay",
+            "manifest_path":Path::new(env!("CARGO_MANIFEST_DIR")).join("../../experiments/sui-mainnet/fixture/manifest.json"),
+            "manifest_sha256":"4264e79e0cbe4a1e36d94468df2f049f988eac57877c9bf2e7e175489dc922fa",
+            "repetitions":2,"minimum_measurement_seconds":0.0,"node_databases":[0]},
+        "execution":{"mode":"closed_loop","concurrency":4,"client_shards":1,"queue_capacity":8,
+            "request_timeout_ms":30000,"offered_ops_per_second":null},
+        "limits":{"max_keys":10000,"max_bytes":67108864,"max_operations":10000,
+            "deadline_seconds":120,"shutdown_grace_seconds":5},
+        "capacity_r0":{"workload":"sui_mainnet_retention"}
+    }))
+    .unwrap();
+    let output = root.join("result");
+    let info = backend.info();
+    crate::mainnet_replay::run_prepared(
+        config,
+        &output,
+        trace,
+        prepared,
+        Arc::clone(&backend),
+        serde_json::json!({"binary":{"sha256":"test"}}),
+        (Instant::now(), 0.0, Some(info)),
+    )
+    .await
+    .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("r0.json")).unwrap()).unwrap();
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(report["value_wal_unlinks"], 0, "{report}");
+    assert_eq!(report["complete"], true, "{report}");
+    assert_eq!(report["fixture"], "leased");
+    assert_eq!(report["prune_events"], 0);
+    assert_eq!(
+        report["worst_owner"]["net_allocated_growth_bytes_per_day"],
+        serde_json::Value::Null
+    );
+    let samples = report["samples"].as_array().unwrap();
+    assert_eq!(samples.first().unwrap()["event"], "begin");
+    assert_eq!(samples.last().unwrap()["event"], "end");
+    // The leased writer allocated at least one owner WAL file, observed by stat.
+    let end_files = samples.last().unwrap()["files"].as_array().unwrap();
+    assert!(
+        end_files
+            .iter()
+            .any(|file| file["allocated_bytes"].as_u64().unwrap_or(0) > 0),
+        "{report}"
+    );
+    // The open file is still leased: never an empty proven blocker set.
+    assert!(
+        end_files
+            .iter()
+            .any(|file| file["shadow_eligible"] == false)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("summary.json")).unwrap()).unwrap();
+    let capacity = &summary["phase_counts"]["profile"]["capacity_r0"];
+    assert_eq!(
+        capacity["reports"][0]["summary"]["value_wal_unlinks"], 0,
+        "{capacity}"
+    );
+    drop(backend);
+    drop(owners);
+    std::fs::remove_dir_all(root).unwrap();
+}

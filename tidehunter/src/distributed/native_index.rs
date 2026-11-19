@@ -897,6 +897,59 @@ impl NativeIndex {
         })
     }
 
+    /// Visit every retained version of the installed immutable image: each
+    /// cell base, including floor anchors, overwritten history and destroyed
+    /// keyspaces. Overlay, captured and pending layers are not part of the image.
+    /// A shard lock is held only to clone block handles (reference counts, no
+    /// payload); decoding runs unlocked. `visit(None)` follows each cell.
+    pub(crate) fn visit_installed_references(
+        &self,
+        mut visit: impl FnMut(Option<&ValueRecordReference>),
+    ) -> Result<(), NativeIndexError> {
+        let mut blocks: Vec<(Bytes, usize)> = Vec::new();
+        for shard in self.shards.iter() {
+            blocks.clear();
+            blocks.extend(
+                shard
+                    .read()
+                    .values()
+                    .filter_map(|cell| cell.base.as_ref())
+                    .map(|block| (block.bytes.clone(), block.count)),
+            );
+            for (bytes, count) in &blocks {
+                for index in 0..*count {
+                    let values = installed_entry_values(bytes, index)
+                        .ok_or(NativeIndexError::Invalid("installed cell entry bounds"))?;
+                    for value in values.chunks_exact(REFERENCE_BYTES) {
+                        visit(Some(&decode_reference(value)?));
+                    }
+                }
+                visit(None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit references held only by volatile layers: the live overlay and a
+    /// captured generation. References are copied per shard under its read
+    /// lock and visited after it is released.
+    pub(crate) fn visit_volatile_references(
+        &self,
+        mut reference: impl FnMut(&ValueRecordReference),
+    ) {
+        let mut copied: Vec<ValueRecordReference> = Vec::new();
+        for shard in self.shards.iter() {
+            copied.clear();
+            for cell in shard.read().values() {
+                copied.extend(cell.overlay.values().flatten().copied());
+                if let Some(sealed) = &cell.sealed {
+                    copied.extend(sealed.values().flatten().copied());
+                }
+            }
+            copied.iter().for_each(&mut reference);
+        }
+    }
+
     pub fn open_snapshot(
         path: &Path,
         shape: &KeyShape,
@@ -1380,6 +1433,23 @@ fn encode_reference(reference: &ValueRecordReference, output: &mut Vec<u8>) {
     output.extend_from_slice(&d.checksum.0.to_be_bytes());
     debug_assert_eq!(output.len() - before, REFERENCE_BYTES);
 }
+
+/// Checked form of `SortedBlock::entry` for a cloned block handle: the encoded
+/// reference list of entry `index`, or `None` if any bound is out of range.
+fn installed_entry_values(bytes: &[u8], index: usize) -> Option<&[u8]> {
+    let u32_at = |at: usize| -> Option<usize> {
+        let end = at.checked_add(4)?;
+        let word: [u8; 4] = bytes.get(at..end)?.try_into().ok()?;
+        usize::try_from(u32::from_be_bytes(word)).ok()
+    };
+    let offset = u32_at(index.checked_mul(4)?.checked_add(4)?)?;
+    let key_len = u32_at(offset)?;
+    let count_at = offset.checked_add(4)?.checked_add(key_len)?;
+    let count = u32_at(count_at)?;
+    let start = count_at.checked_add(4)?;
+    bytes.get(start..start.checked_add(count.checked_mul(REFERENCE_BYTES)?)?)
+}
+
 fn decode_reference(bytes: &[u8]) -> Result<ValueRecordReference, NativeIndexError> {
     let mut c = Cursor::new(bytes);
     let id = BatchId {

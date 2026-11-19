@@ -19,6 +19,7 @@
 //! 40 and 41 retired (the removed RAM probe), 42 acquire_live_export_pin,
 //! 43 release_live_export_pin, 44 durable_progress, 45 partition_stats,
 //! 46 inventory_page, 47 check_trim_generation, 48 trim_generation.
+//! 49 file_inventory_page.
 //! Control `a` is the envelope id.
 
 use parking_lot::Mutex;

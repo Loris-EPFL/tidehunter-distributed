@@ -12,6 +12,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod capacity;
+
 const MANIFEST: &str = "tcp-node-inventory-v1";
 const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
 /// Registry of the removed sealed-export route; see `reject_legacy_owner_state`.
@@ -236,6 +238,9 @@ pub struct NodeInventory {
     revision: u64,
     #[cfg(test)]
     trim_crash: Option<super::generation_control::OwnerTrimCrash>,
+    /// Value WAL files passed to a successful retirement unlink step by this
+    /// process. Read by the R0 inventory page; R0 asserts it does not move.
+    value_wal_unlinks: u64,
     /// Whether a live target is installed. Immutable after installation, so
     /// reading it needs no gate.
     pub(super) live_target_configured: bool,
@@ -542,6 +547,7 @@ impl NodeInventory {
             revision: 0,
             #[cfg(test)]
             trim_crash: None,
+            value_wal_unlinks: 0,
             live_target_configured: live_target.is_some(),
             lifecycle: Arc::new(Mutex::new(live_target)),
             live_shutdown: false,
@@ -1477,6 +1483,11 @@ impl NodeInventory {
         } else {
             Vec::new()
         };
+        // Counted on submission, before any root install or unlink, so a
+        // partially failed retirement still shows that unlinks were attempted.
+        inventory.value_wal_unlinks = inventory
+            .value_wal_unlinks
+            .saturating_add(u64::try_from(files.len()).unwrap_or(u64::MAX));
         inventory.released(|| {
             log.retire_wal_files(files).map_err(TcpError::component)?;
             // Each tombstone release syncs the WAL directory before its marker

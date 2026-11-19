@@ -1250,6 +1250,16 @@ impl ConcurrentRemoteDatabase {
         self.database.core.retire_history_before(floor)
     }
 
+    /// Enable R0 shadow capacity observation (read-only; suppresses physical
+    /// retirement until the observer finishes). One observer per database.
+    pub fn start_capacity_observer(
+        &self,
+        config: crate::distributed::capacity::CapacityObserverConfig,
+        sink: Box<dyn crate::distributed::capacity::R0Sink>,
+    ) -> Result<super::CapacityObserver, crate::distributed::capacity::R0Error> {
+        super::CapacityObserver::start(&self.database.core, config, sink)
+    }
+
     pub fn read_cache_stats(&self) -> ReadCacheStats {
         self.cache.stats()
     }

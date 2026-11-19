@@ -50,6 +50,7 @@ pub use wal_replay::{DecodedGroup, ReplayPage};
 mod durable_progress;
 pub use durable_progress::LogDurableProgress;
 use durable_progress::ProgressTail;
+mod capacity_inventory;
 mod local_types;
 pub use local_types::{LocalCheckpoint, LocalDbError, LocalDbStats, LocalInventoryConfig};
 

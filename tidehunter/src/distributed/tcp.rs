@@ -14,6 +14,7 @@
 //! `FabricSecurity::MutualTls` (both mutual TLS), and `Transport::TcpTrusted`
 //! against OFI with `FabricSecurity::Trusted` (both trusted-network/no-TLS).
 
+mod capacity;
 pub mod checkpoint;
 mod diagnostics;
 mod fabric;
@@ -109,7 +110,8 @@ pub use inventory::NodeInventory;
 /// 30 (L1) replaces the retained generation vector and `max_epochs` in
 /// `NodeStatus` with the owner high-water and inventory revision, and appends
 /// InventoryPage, CheckTrimGeneration and TrimGeneration.
-const PROTOCOL: u32 = 30;
+/// 31 (R0) appends FileInventoryPage (request tag 29, response tag 26).
+const PROTOCOL: u32 = 31;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -521,6 +523,13 @@ enum Request {
     CheckTrimGeneration(generation_control::CheckTrimRequest),
     /// Tag 28.
     TrimGeneration(generation_control::TrimRequest),
+    /// Tag 29. Read-only owner WAL file inventory for capacity accounting.
+    FileInventoryPage {
+        authority_generation: u64,
+        source_generation: u64,
+        after: Option<u64>,
+        limit: u16,
+    },
 }
 impl Request {
     /// Startup/recovery negotiation, durable epoch/retirement maintenance and
@@ -533,7 +542,9 @@ impl Request {
             | Self::Status { .. }
             | Self::Fence { .. }
             | Self::Seal { .. }
-            | Self::RetireWalFiles { .. } => true,
+            | Self::RetireWalFiles { .. }
+            // A directory scan with `lstat` per file, like retirement pages.
+            | Self::FileInventoryPage { .. } => true,
             Self::Stats
             | Self::StatsDetailed
             | Self::PartitionStats
@@ -697,6 +708,8 @@ enum Response {
     CheckTrimGeneration(generation_control::CheckTrimReply),
     /// Tag 25.
     TrimGeneration(generation_control::TrimReply),
+    /// Tag 26. Boxed so ordinary responses do not grow.
+    FileInventoryPage(Box<super::capacity::FileInventoryReply>),
 }
 
 /// Named error of a benchmark evidence request this owner build cannot serve.
