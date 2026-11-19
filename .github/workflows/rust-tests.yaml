@@ -2,7 +2,7 @@ name: Rust Tests
 
 on:
   push:
-    branches: ["main", "feat/sharded-value-wal", "feat/two-vm-remote-read-write", "p8-ci"]
+    branches: ["main", "feat/sharded-value-wal", "feat/two-vm-remote-read-write", "p8-ci", "q0/land4-fleet-fix"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:

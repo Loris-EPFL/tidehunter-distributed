@@ -2,7 +2,7 @@ name: Local KV adapter qualification
 
 on:
   push:
-    branches: [feat/two-vm-remote-read-write, p8-ci]
+    branches: [feat/two-vm-remote-read-write, p8-ci, q0/land4-fleet-fix]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
