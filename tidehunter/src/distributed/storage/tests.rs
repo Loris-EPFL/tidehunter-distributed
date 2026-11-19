@@ -2070,4 +2070,5 @@ mod conflict_index;
 mod file_retirement;
 mod live_extent;
 mod live_native;
+mod relocation_scan;
 mod wal_replay;

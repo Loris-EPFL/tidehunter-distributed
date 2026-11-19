@@ -1090,6 +1090,11 @@ impl ConcurrentRemoteDatabase {
         self.database.core.ensure_healthy()
     }
 
+    /// The shared write core, for maintenance passes in sibling modules.
+    pub(super) fn write_core(&self) -> &Arc<super::write_core::core::WriteCore> {
+        &self.database.core
+    }
+
     pub(super) fn poison(&self, cause: &LocalDbError) {
         // One fail-stop path: records the exact cause, closes Admission,
         // resolves every unresolved slot as unknown and wakes owner workers.
@@ -1112,15 +1117,6 @@ impl ConcurrentRemoteDatabase {
     pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
         self.ensure_healthy()?;
         let cut = self.index.latest_cut().map_err(LocalDbError::component)?;
-        self.ensure_healthy()?;
-        Ok(cut)
-    }
-
-    /// Like [`Self::published_cut`] without the owner charge. Hold the cut
-    /// only until the calling API returns (see `StandingViewBudget`).
-    pub(crate) fn call_published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
-        self.ensure_healthy()?;
-        let cut = self.index.call_cut();
         self.ensure_healthy()?;
         Ok(cut)
     }
@@ -1222,25 +1218,6 @@ impl ConcurrentRemoteDatabase {
         result
     }
 
-    pub(crate) fn relocation_history(
-        &self,
-        ks: KeySpace,
-        cut: IndexReadCut,
-    ) -> Result<super::super::native_index::NativeIndexHistory, LocalDbError> {
-        self.ensure_healthy()?;
-        self.index
-            .relocation_history(ks, cut)
-            .map_err(LocalDbError::component)
-    }
-
-    pub(crate) fn next_relocation_record(
-        &self,
-        history: &mut super::super::native_index::NativeIndexHistory,
-    ) -> Result<Option<(Bytes, ValueRecordReference)>, LocalDbError> {
-        self.ensure_healthy()?;
-        Ok(history.next(&self.index))
-    }
-
     /// Submit one complete batch and wait for synced, ordered publication.
     ///
     /// # Errors
@@ -1302,6 +1279,7 @@ impl ConcurrentRemoteDatabase {
         self.database.core.flush_index()
     }
 
+    #[cfg(test)]
     /// Persist a Stop-aware floor and reclaim wholly unreachable sealed files.
     /// Live retirement can return a non-fatal busy error while a read is held;
     /// finish or drop the read and retry without reopening the authority.

@@ -4,10 +4,10 @@
 //!
 //! One pass, under the cold `WriteCore::retirement` gate (the caller holds
 //! it; foreground writes, reads and checkpoints never take it):
-//! 1. Skip databases whose shape has a relocation filter. Until the §5
-//!    callback cursor (`CallbackStart`) lands, WAL history in those databases
-//!    is a callback obligation with no adopted bound, so only the older
-//!    sealed-generation path runs there (today's behavior).
+//! 1. Callback history: with any relocation filter in the shape, WAL at or
+//!    after the adopted `CallbackStart` of the serving stream is a callback
+//!    obligation (absent start: every file); without a filter no callback
+//!    can scan history again.
 //! 2. Between two equal even values of the R0 install seqlock, copy the
 //!    adopted Exact identity, the adopted stream positions and the installed
 //!    cut, and walk every retained reference of the installed image plus the
@@ -49,10 +49,6 @@ use std::time::Duration;
 const MAX_PAGES_PER_STREAM: usize = 1 << 16;
 /// Bounded wait (1 ms each) for an in-progress image installation.
 const INSTALL_WAIT_TRIES: u32 = 1000;
-/// Physical reclaim span per pass, in percent of the owner's span. Sui sets
-/// native `relocation_max_reclaim_pct` to 100; the coordinator option that
-/// carries Sui's value is Phase 3.3 work, so the pass uses Sui's value.
-const RECLAIM_PCT: u8 = 100;
 /// Proofs per request; equal to the owner's bounded pending set.
 const MAX_PROOFS_PER_REQUEST: usize = 256;
 
@@ -62,6 +58,8 @@ struct Snapshot {
     metadata_digest: [u8; 32],
     obsolete_root: bool,
     positions: BTreeMap<u32, PositionFacts>,
+    /// Adopted callback starts of the serving generation, per partition.
+    callback_starts: BTreeMap<u32, u64>,
 }
 
 /// Retire every exact-dead sealed file of the serving generation. The caller
@@ -71,16 +69,12 @@ struct Snapshot {
 pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
     core: &WriteCore,
 ) -> Result<(), LocalDbError> {
-    // Decision 1 (until §5 lands): any relocation filter keeps today's
-    // behavior. Destroyed keyspaces count too: their filter is not called,
-    // but the conservative skip never deletes a file a decision might need.
-    if core
+    // Destroyed keyspaces count too: their filter is not called, but the
+    // conservative bound never deletes a file a decision might need.
+    let filtered = core
         .shape
         .iter_ks()
-        .any(|keyspace| keyspace.relocation_filter().is_some())
-    {
-        return Ok(());
-    }
+        .any(|keyspace| keyspace.relocation_filter().is_some());
     // An installation that keeps running defers the pass.
     let Some(seq) = stable_install_seq(core) else {
         return Ok(());
@@ -163,6 +157,16 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
             page_stable: stable,
             persisted_cut_next,
         };
+        // Absent start: the first unretired file of the stream, so no file.
+        let callback_from = if filtered {
+            snapshot
+                .callback_starts
+                .get(&endpoint.partition)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            u64::MAX
+        };
         let proofs = victims(
             core,
             endpoint.partition,
@@ -170,6 +174,7 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
             &facts,
             &referenced,
             covered_next,
+            callback_from,
         )?;
         let Some(position) = facts.position else {
             continue;
@@ -179,9 +184,7 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
             metadata_digest: snapshot.metadata_digest,
             replay_from: position.replay_from,
             durable_end: position.durable_end,
-            // Decision 1: no keyspace has a relocation filter, so no WAL
-            // callback can ever scan this history again.
-            callback_from: u64::MAX,
+            callback_from,
             covered_next,
             persisted_cut_next,
         };
@@ -251,6 +254,12 @@ fn take_snapshot(core: &WriteCore) -> Option<Snapshot> {
                     },
                 )
             })
+            .collect(),
+        callback_starts: state
+            .callback_starts
+            .iter()
+            .filter(|((_, epoch), _)| *epoch == core.epoch)
+            .map(|(&(partition, _), &from)| (partition, from))
             .collect(),
     })
 }
@@ -334,6 +343,7 @@ fn victims(
     facts: &StreamFacts,
     referenced: &BTreeSet<(u32, u64)>,
     covered_next: u64,
+    callback_from: u64,
 ) -> Result<Vec<RetireProof>, LocalDbError> {
     let size = core.config.storage.wal_file_bytes;
     let used = rows
@@ -355,7 +365,7 @@ fn victims(
                 hi: facts.processed_end,
             }],
             size,
-            RECLAIM_PCT,
+            core.config.relocation_max_reclaim_pct,
         )
         .get(&core.epoch)
         .copied()
@@ -375,6 +385,10 @@ fn victims(
         }) else {
             continue;
         };
+        // Callback history at or after the adopted start stays.
+        if file_end > callback_from {
+            continue;
+        }
         if seal
             .last_batch_sequence
             .is_some_and(|last| last >= covered_next)

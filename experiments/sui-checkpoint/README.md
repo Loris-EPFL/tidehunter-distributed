@@ -810,9 +810,9 @@ exported before the exact-owned fleet termination attempt.
   local residence, may overlap existing timing and are not one-way network,
   hardware RTT or pure NVMe latency.
 * Always-on adapter stages expose cumulative `<stage>_ns`, `_calls` and
-  `_errors`: `write_gate_wait`, `scalar_read`, `bulk_read`, `write_commit`,
-  `read_submit`, `read_admission_wait`, `read_detached_wait` and `read_finish`.
-  The old owner-wait fields were removed with the adapter owner mutex.
+  `_errors`: `write_gate_wait`, `scalar_read`, `bulk_read` and `write_commit`.
+  The old owner-wait fields were removed with the adapter owner mutex; the
+  four relocation member-read stages were removed with the gated relocation.
   Ordinary remote writers hold a shared maintenance gate; maintenance takes it
   exclusively. Native retains the exclusive durability gate.
   `remote_timing_available` distinguishes unsupported remote stages.

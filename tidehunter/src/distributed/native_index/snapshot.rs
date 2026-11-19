@@ -173,7 +173,6 @@ impl PreparedIndexImage {
 
     /// Check `plan` on this image: each candidate whose cell birth and exact
     /// head still match at the image's cut becomes a mark.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by R1 logical pruning"))]
     pub(crate) fn with_prune_plan(mut self, plan: PrunePlan) -> Self {
         self.prune_plan = plan;
         self

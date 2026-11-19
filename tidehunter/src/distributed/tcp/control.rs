@@ -770,7 +770,7 @@ pub(super) fn is_maintenance_request(request: &Request) -> bool {
             epoch,
             ..
         } => epoch == authority_epoch,
-        Request::FileInventoryPage { .. } => true,
+        Request::FileInventoryPage { .. } | Request::RelocationPage { .. } => true,
         _ => false,
     }
 }
@@ -2091,6 +2091,22 @@ impl ControlContext {
                 limit,
             )
             .map(|reply| Response::FileInventoryPage(Box::new(reply))),
+            Request::RelocationPage {
+                authority_generation,
+                source_generation,
+                from,
+                end,
+                limit,
+            } => NodeInventory::relocation_page(
+                &self.inventory,
+                authority_generation,
+                source_generation,
+                from,
+                end,
+                limit,
+                limits,
+            )
+            .map(|page| Response::RelocationPage(Box::new(page))),
             Request::RetirementFiles {
                 authority_epoch,
                 epoch,

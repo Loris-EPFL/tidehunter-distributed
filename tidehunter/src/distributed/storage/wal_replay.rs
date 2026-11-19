@@ -68,7 +68,7 @@ fn read_result<T>(
 pub(super) const ROOT: &str = "partition-wal-root-v1";
 const ROOT_FORMAT: u32 = 2;
 const MEMBER_MISMATCH: &str = "WAL member differs from the reference";
-const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
+pub(super) const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
 
 /// Format 2: fixed-width bincode plus a trailing little-endian CRC32. Format 1
 /// (one offset per retired file) is refused: deployments use fresh databases.
@@ -660,10 +660,36 @@ impl PartitionLog {
                 "sealed WAL ends below the required position",
             ));
         }
+        self.replay_groups(
+            from..end,
+            end,
+            retired.as_deref(),
+            (!live).then_some(strict_end),
+            limit,
+            max_bytes,
+        )
+    }
+
+    /// Whole groups that start in `starts`, skipping retired intervals and
+    /// validated skip suffixes. Every group frame must end at or below
+    /// `frame_bound` (at least `starts.end`): a group that starts below
+    /// `starts.end` is read whole. An undecodable group is corruption, except
+    /// at or above `tolerate_from` (a sealed non-live tail beyond its strict
+    /// bound).
+    pub(super) fn replay_groups(
+        &self,
+        starts: std::ops::Range<u64>,
+        frame_bound: u64,
+        retired: Option<&WalRoot>,
+        tolerate_from: Option<u64>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<ReplayPage, StorageError> {
+        let std::ops::Range { start: from, end } = starts;
         if limit == 0 || limit > 256 {
             return Err(StorageError::Invalid("receipt page limit must be 1..=256"));
         }
-        if !from.is_multiple_of(8) || from > end {
+        if !from.is_multiple_of(8) || from > end || end > frame_bound {
             return Err(StorageError::Invalid(FRAME_BOUNDARY));
         }
         let _admission = self.read_admission()?;
@@ -719,13 +745,13 @@ impl PartitionLog {
             }
             let decoded = match self.decode_group_from_file(current_file, cursor) {
                 Ok(decoded) => decoded,
-                Err(_) if !live && cursor >= strict_end => {
+                Err(_) if tolerate_from.is_some_and(|strict_end| cursor >= strict_end) => {
                     cursor = fragment_end.min(end);
                     continue;
                 }
                 Err(_) => return Err(StorageError::Invalid(FRAME_BOUNDARY)),
             };
-            if decoded.frame_end > end {
+            if decoded.frame_end > frame_bound {
                 return Err(StorageError::Invalid(FRAME_BOUNDARY));
             }
             let group_bytes = decoded.receipts.iter().try_fold(0usize, |bytes, receipt| {

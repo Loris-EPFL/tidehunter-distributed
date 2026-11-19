@@ -108,6 +108,7 @@ impl Fixture {
                 queue_geometry: Default::default(),
             },
             durable_cut: Default::default(),
+            relocation_max_reclaim_pct: 100,
         };
         let node = StorageNode::open(
             NodeConfig {

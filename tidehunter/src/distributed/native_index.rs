@@ -44,13 +44,14 @@ use std::path::Path;
 use typenum::U32;
 
 mod prune_marks;
+mod relocation;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
 use prune_marks::PruneMark;
 pub use prune_marks::PruneStats;
-pub(crate) use prune_marks::{MarkBudget, PrunePlan, UnboundedMarkBudget};
+pub(crate) use prune_marks::{MarkBudget, PruneCandidate, PrunePlan, UnboundedMarkBudget};
 
 /// Fixed cap of the Exact checkpoint cell flusher pool. Not a measured optimum.
 pub(crate) const MAX_CELL_FLUSHERS: usize = 8;
@@ -326,11 +327,12 @@ pub(crate) struct NativeIndexScan {
     cut: IndexReadCut,
 }
 
-/// Retained-history traversal for native WAL-style relocation filters. Latest
-/// rows cannot establish a safe cutoff: overwritten/deleted puts can still Stop.
-/// A retained-floor pin protects all traversed history, not just latest heads.
-/// The logical key/version frontier survives unloading and base replacement;
+/// Retained-history traversal of every retained version, oldest first. Only
+/// tests use it since R1 relocation replaced the pass that walked history in
+/// the coordinator. A retained-floor pin protects all traversed history. The
+/// logical key/version frontier survives unloading and base replacement;
 /// values are resolved one at a time without cloning retained history.
+#[cfg(test)]
 pub(crate) struct NativeIndexHistory {
     cells: Vec<(KeySpace, CellId)>,
     after: Option<(Bytes, MutationVersion)>,
@@ -338,6 +340,7 @@ pub(crate) struct NativeIndexHistory {
     cut: IndexReadCut,
 }
 
+#[cfg(test)]
 impl NativeIndexHistory {
     pub(crate) fn next(&mut self, index: &NativeIndex) -> Option<(Bytes, ValueRecordReference)> {
         loop {
@@ -815,6 +818,7 @@ impl NativeIndex {
         Ok(rows)
     }
 
+    #[cfg(test)]
     pub(crate) fn relocation_history(
         &self,
         keyspace: KeySpace,
@@ -1274,6 +1278,7 @@ impl CellIndex {
         }
     }
 
+    #[cfg(test)]
     fn next_history(
         &self,
         after: Option<&(Bytes, MutationVersion)>,
@@ -1337,6 +1342,7 @@ impl CellIndex {
     }
 }
 
+#[cfg(test)]
 fn earliest_history(
     a: Option<(Bytes, ValueRecordReference)>,
     b: Option<(Bytes, ValueRecordReference)>,

@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod capacity;
 mod ready_binding;
+mod relocation;
 mod retirement;
 
 /// Owner file-maintenance counters of this process (R1 seal and retirement,

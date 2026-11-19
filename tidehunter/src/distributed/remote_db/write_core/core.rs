@@ -33,6 +33,8 @@ pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub positions: &'a mut BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: &'a mut BTreeSet<(u32, u64)>,
     pub committed_streams: &'a mut BTreeSet<(u32, u64)>,
+    /// Adopted R1 callback starts, keyed by `(partition, fencing_generation)`.
+    pub callback_starts: &'a mut BTreeMap<(u32, u64), u64>,
     pub recent: &'a mut VecDeque<RecentReceipt>,
     pub latest: &'a mut Option<MutationVersion>,
     pub live_latest: &'a mut Option<MutationVersion>,
@@ -61,6 +63,8 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     /// not. A generation trim adopts a replacement root only when the root
     /// names the trimmed stream or the stream produced it (L1).
     pub committed_streams: BTreeSet<(u32, u64)>,
+    /// Adopted R1 callback starts; changed only by an Exact installation.
+    pub callback_starts: BTreeMap<(u32, u64), u64>,
     pub recent: VecDeque<RecentReceipt>,
     pub latest: Option<MutationVersion>,
     pub live_latest: Option<MutationVersion>,
@@ -109,6 +113,7 @@ impl PublisherState {
             positions: &mut self.positions,
             committed_complete: &mut self.committed_complete,
             committed_streams: &mut self.committed_streams,
+            callback_starts: &mut self.callback_starts,
             recent: &mut self.recent,
             latest: &mut self.latest,
             live_latest: &mut self.live_latest,

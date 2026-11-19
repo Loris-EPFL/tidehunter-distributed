@@ -594,6 +594,37 @@ fn unreferenced_generation_with_data_stays_retained_until_its_files_retire() {
 }
 
 #[test]
+fn adopted_callback_start_keeps_a_generation_with_a_remaining_suffix() {
+    let harness = Harness::new(true);
+    let db = harness.open().unwrap();
+    let generation = db.epoch();
+    let key = (0, generation);
+    let end = harness.fixture.config.storage.wal_file_bytes;
+    {
+        // Isolate the eligibility check: a complete stream, no retained
+        // references or receipts, and one file in the adopted callback suffix.
+        let mut state = db.core.publisher.lock();
+        let state = state.checkpoint_state();
+        state.positions.insert(
+            key,
+            StreamPosition {
+                partition: 0,
+                epoch: generation,
+                replay_from: end,
+                last_offset: None,
+                durable_end: end,
+                complete: true,
+            },
+        );
+        state.callback_starts.insert(key, 0);
+    }
+    assert!(!coordinator_eligible(&db.core, None, generation));
+    db.core.publisher.lock().callback_starts.insert(key, end);
+    assert!(coordinator_eligible(&db.core, None, generation));
+    fail_stop_without_checkpoint(db);
+}
+
+#[test]
 fn empty_generation_the_root_does_not_name_is_trimmed_without_a_replacement_root() {
     for synchronous in [false, true] {
         let harness = Harness::new(synchronous);

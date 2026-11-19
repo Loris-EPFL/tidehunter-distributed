@@ -2175,6 +2175,7 @@ fn request_kind_code(request: &Request) -> u64 {
         Request::CheckTrimGeneration(_) => 47,
         Request::TrimGeneration(_) => 48,
         Request::FileInventoryPage { .. } => 49,
+        Request::RelocationPage { .. } => 50,
     }
 }
 

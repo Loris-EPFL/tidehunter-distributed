@@ -60,6 +60,8 @@ mod file_retirement;
 #[cfg(test)]
 pub(crate) use file_retirement::CrashCut;
 pub use file_retirement::{RetireProof, RetirementOutcome, RetirementWitness, WalInode};
+mod relocation_scan;
+pub use relocation_scan::{RelocationBatch, RelocationPage, RelocationPut};
 mod file_seal;
 
 /// Full static inventory for one database epoch, copied durably to every node.

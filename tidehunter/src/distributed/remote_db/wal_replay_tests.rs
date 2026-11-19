@@ -431,7 +431,8 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         fail_stop_without_checkpoint(db);
         let mut manifest: AuthorityManifest = read_metadata(&path.join(MANIFEST)).unwrap();
         let commit = manifest.checkpoint.as_mut().unwrap();
-        let mut image: CheckpointImageV3 =
+        // The writer emits the callback-start wrapper (format 4).
+        let mut image: CheckpointImageV4 =
             read_checkpoint(&path.join(commit.metadata_name())).unwrap();
         if wrong_format {
             image.format = 2;
@@ -451,7 +452,7 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         let error = reopen_result(&fixture).err().unwrap().to_string();
         assert!(
             error.contains(if wrong_format {
-                "checkpoint image format is not the WAL-replay format 3"
+                "checkpoint image format is not a WAL-replay format (3 or 4)"
             } else {
                 "sealed WAL ends below the required position"
             }),

@@ -2,7 +2,7 @@
 //! manifest adopts an image; all acknowledged suffix batches remain WAL-backed.
 
 use super::super::native_index::{
-    MarkBudget, PersistedIndexImage, PreparedIndexImage, UnboundedMarkBudget,
+    MarkBudget, PersistedIndexImage, PreparedIndexImage, PrunePlan, UnboundedMarkBudget,
 };
 use super::*;
 
@@ -54,6 +54,9 @@ struct CompletedCheckpoint {
     index_persist_ns: Option<u64>,
     metadata_install_ns: Option<u64>,
     root_adoption_ns: Option<u64>,
+    /// Adopted per-stream callback starts of this image.
+    callback_starts: BTreeMap<(u32, u64), u64>,
+    relocation: Option<super::relocation::RelocationReply>,
 }
 
 struct CapturingCheckpoint {
@@ -67,6 +70,8 @@ struct CapturingCheckpoint {
     jobs: Vec<(Arc<OwnerSender>, u32, Vec<u64>)>,
     published_next: u64,
     prepare_work_ns: Option<u64>,
+    callback_starts: BTreeMap<(u32, u64), u64>,
+    relocation: Option<(PrunePlan, super::relocation::RelocationReply)>,
 }
 
 pub(super) struct BackgroundCheckpoint {
@@ -75,6 +80,9 @@ pub(super) struct BackgroundCheckpoint {
     // Publisher-owned until capture consumes it. A post-capture request is
     // transferred atomically to one successor before this job is removed.
     requested_floor: Option<IndexReadCut>,
+    // Same ownership and successor transfer as `requested_floor`. At most one:
+    // the database's single relocation worker waits for each adoption.
+    relocation: Option<super::relocation::RelocationCapture>,
 }
 
 impl Drop for BackgroundCheckpoint {
@@ -140,7 +148,32 @@ fn core_start_checkpoint_with_floor(
     {
         return Ok(());
     }
-    core_launch_checkpoint(core, state, floor)
+    core_launch_checkpoint(core, state, floor, None)
+}
+
+/// Attach one R1 relocation plan, its callback starts and its floor to the
+/// next Exact capture: the job that has not frozen yet, else one successor.
+/// Forces a capture even without a user suffix. The caller waits on the
+/// capture's reply while driving `core_progress_checkpoint`.
+pub(super) fn core_start_relocation_checkpoint(
+    core: &Arc<WriteCore>,
+    floor: IndexReadCut,
+    capture: super::relocation::RelocationCapture,
+) -> Result<(), LocalDbError> {
+    core.ensure_healthy()?;
+    core_progress_checkpoint(core, false)?;
+    let mut publisher = core.publisher.lock();
+    let state = publisher.checkpoint_state();
+    if let Some(background) = state.background_checkpoint.as_mut() {
+        if background.relocation.is_some() {
+            return Err(LocalDbError::new("a relocation capture is already pending"));
+        }
+        background.requested_floor =
+            merge_checkpoint_floor(background.requested_floor.take(), Some(floor))?;
+        background.relocation = Some(capture);
+        return Ok(());
+    }
+    core_launch_checkpoint(core, state, Some(floor), Some(capture))
 }
 
 fn merge_checkpoint_floor(
@@ -168,6 +201,7 @@ fn core_launch_checkpoint(
     core: &Arc<WriteCore>,
     state: PublisherCheckpoint<'_>,
     floor: Option<IndexReadCut>,
+    relocation: Option<super::relocation::RelocationCapture>,
 ) -> Result<(), LocalDbError> {
     if state.manifest.checkpoint_staging.is_some() || state.manifest.checkpoint_obsolete.is_some() {
         return Err(LocalDbError::new(
@@ -218,6 +252,7 @@ fn core_launch_checkpoint(
         reply,
         thread: Some(thread),
         requested_floor: floor,
+        relocation,
     });
     Ok(())
 }
@@ -242,12 +277,19 @@ pub(super) fn core_progress_checkpoint(
         };
         if let Some(result) = result {
             let mut background = state.background_checkpoint.take();
-            let requested_floor = background
-                .as_mut()
-                .and_then(|background| background.requested_floor.take());
-            let has_successor = result.is_ok() && requested_floor.is_some();
+            let (requested_floor, relocation) =
+                background.as_mut().map_or((None, None), |background| {
+                    (
+                        background.requested_floor.take(),
+                        background.relocation.take(),
+                    )
+                });
+            // A failed job drops a waiting relocation: its requester observes
+            // the closed reply and the poisoned authority.
+            let has_successor =
+                result.is_ok() && (requested_floor.is_some() || relocation.is_some());
             let successor = if has_successor {
-                core_launch_checkpoint(core, state, requested_floor)
+                core_launch_checkpoint(core, state, requested_floor, relocation)
             } else {
                 Ok(())
             };
@@ -303,10 +345,31 @@ fn core_capture_checkpoint(
     let state = publisher.checkpoint_state();
     // A forced request races ordinary starts only through publisher. Consume
     // it at the actual freeze, not when the worker was spawned.
-    let floor = state
-        .background_checkpoint
-        .as_mut()
-        .and_then(|background| background.requested_floor.take());
+    let (floor, relocation) =
+        state
+            .background_checkpoint
+            .as_mut()
+            .map_or((None, None), |background| {
+                (
+                    background.requested_floor.take(),
+                    background.relocation.take(),
+                )
+            });
+    // Ordinary captures copy the adopted starts unchanged; a relocation
+    // capture raises them monotonically in this same Exact transaction.
+    let (callback_starts, relocation) = match relocation {
+        None => (state.callback_starts.clone(), None),
+        Some(capture) => {
+            let starts = super::relocation::merge_callback_starts(
+                state.callback_starts,
+                &capture.callback_starts,
+                state.retained_epochs,
+                &core.partition_indexes,
+                core.config.storage.wal_file_bytes,
+            )?;
+            (starts, Some((capture.plan, capture.reply)))
+        }
+    };
     let cut = *state.latest;
     if cut.is_some_and(|cut| cut.batch.epoch == core.epoch && cut.batch.sequence >= published_next)
     {
@@ -397,6 +460,8 @@ fn core_capture_checkpoint(
         jobs,
         published_next,
         prepare_work_ns: prepare_started.map(elapsed),
+        callback_starts,
+        relocation,
     };
     let persistence = CheckpointPersistence {
         path: core.path.clone(),
@@ -438,6 +503,12 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         admission: Arc::clone(&core.admission),
         held: 0,
     }));
+    // An R1 plan is checked per frozen cell against this capture's cut, off
+    // the writer and publisher locks, during persistence.
+    let (prepared, relocation) = match capture.relocation.take() {
+        Some((plan, reply)) => (prepared.with_prune_plan(plan), Some(reply)),
+        None => (prepared, None),
+    };
     if let (Some(total), Some(started)) = (&mut capture.prepare_work_ns, prepare_started) {
         *total = total.saturating_add(elapsed(started));
     }
@@ -474,6 +545,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     #[cfg(test)]
     let cleanup_pause = persistence.hooks.cleanup_pause.take();
     let mut completed = persist_checkpoint(capture, prepared, persistence)?;
+    completed.relocation = relocation;
     let work_started = Instant::now();
     core.write_timeline.checkpoint_generation(
         "result_send",
@@ -543,6 +615,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         *state.committed_streams = completed.positions.keys().copied().collect();
         *state.positions = std::mem::take(&mut completed.positions);
         *state.recent = std::mem::take(&mut completed.recent);
+        *state.callback_starts = std::mem::take(&mut completed.callback_starts);
         state.known.retain(|_, receipt| {
             completed
                 .cut
@@ -627,6 +700,11 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     }
     core.write_timeline
         .checkpoint_generation("cleaned", None, core.epoch, None, Some(generation));
+    // The relocation's marks, starts and floor are adopted, live and the old
+    // root is cleaned up. A dropped waiter (deadline) loses only this reply.
+    if let Some(reply) = completed.relocation.take() {
+        let _ = reply.try_send(Ok(()));
+    }
     Ok(())
 }
 
@@ -744,6 +822,12 @@ pub(super) fn core_retire_history_before(
 }
 
 pub(super) fn core_retire_unreachable_sealed_files(core: &WriteCore) -> Result<(), LocalDbError> {
+    // R1 callback history: with a relocation filter, a file is a callback
+    // obligation unless it ends at or below its stream's adopted start.
+    let filtered = core
+        .shape
+        .iter_ks()
+        .any(|keyspace| keyspace.relocation_filter().is_some());
     let jobs = {
         let mut publisher = core.publisher.lock();
         let state = publisher.checkpoint_state();
@@ -752,13 +836,22 @@ pub(super) fn core_retire_unreachable_sealed_files(core: &WriteCore) -> Result<(
             let partition = core.config.endpoints[node].partition;
             for &epoch in epochs {
                 if epoch < core.epoch && state.committed_complete.contains(&(partition, epoch)) {
-                    jobs.push((node, partition, epoch));
+                    let callback_from = if filtered {
+                        state
+                            .callback_starts
+                            .get(&(partition, epoch))
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        u64::MAX
+                    };
+                    jobs.push((node, partition, epoch, callback_from));
                 }
             }
         }
         jobs
     };
-    for (node, partition, epoch) in jobs {
+    for (node, partition, epoch, callback_from) in jobs {
         let mut after = None;
         let authority_epoch = core.epoch;
         loop {
@@ -774,9 +867,10 @@ pub(super) fn core_retire_unreachable_sealed_files(core: &WriteCore) -> Result<(
                 let end = offset
                     .checked_add(core.config.storage.wal_file_bytes)
                     .ok_or_else(|| LocalDbError::new("retirement file bounds overflow"))?;
-                if !core
-                    .index
-                    .references_wal_file(partition, epoch, offset, end)
+                if end <= callback_from
+                    && !core
+                        .index
+                        .references_wal_file(partition, epoch, offset, end)
                 {
                     retired.push(offset);
                 }
@@ -821,6 +915,7 @@ fn persist_checkpoint(
         mut jobs,
         published_next,
         prepare_work_ns: index_prepare_ns,
+        callback_starts,
         ..
     } = capture;
     let CheckpointPersistence {
@@ -1020,8 +1115,8 @@ fn persist_checkpoint(
         None,
         Some(generation),
     );
-    let encoded = encode_checkpoint(&CheckpointImageV3 {
-        format: 3,
+    let encoded = encode_checkpoint(&CheckpointImageV4 {
+        format: CALLBACK_START_WRAPPER_FORMAT,
         database,
         shape_yaml,
         authority_epoch,
@@ -1032,6 +1127,14 @@ fn persist_checkpoint(
         index_digest: persisted.metadata.digest,
         positions: positions.values().cloned().collect(),
         recent: recent.iter().copied().collect(),
+        callback_starts: callback_starts
+            .iter()
+            .map(|(&(partition, fencing_generation), &from)| CallbackStart {
+                partition,
+                fencing_generation,
+                from,
+            })
+            .collect(),
     })?;
     let mut commit = commit;
     commit.index_files = persisted.files();
@@ -1137,6 +1240,8 @@ fn persist_checkpoint(
         index_persist_ns,
         metadata_install_ns,
         root_adoption_ns,
+        callback_starts,
+        relocation: None,
     })
 }
 

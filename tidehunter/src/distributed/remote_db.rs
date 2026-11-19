@@ -52,6 +52,7 @@ mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
 mod dead_wal_files;
+mod relocation;
 use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
@@ -61,6 +62,9 @@ use coordinator_profile::{
     CoordinatorResolutionDiagnostics, MemberOutcome, ResolutionSample, ResolutionStage,
 };
 pub use coordinator_profile::{CoordinatorResolutionSnapshot, CoordinatorResolutionStage};
+pub(crate) use relocation::RelocationReport;
+#[cfg(feature = "test_methods")]
+pub(crate) use relocation::{CallbackDecision, RelocationGate};
 mod durable_cut;
 pub use durable_cut::{DurableCutStats, RecoveredCut};
 mod fencing_generations;
@@ -172,6 +176,16 @@ pub struct RemoteDatabaseConfig {
     /// The durable cut of Native-tier recovery. Absent means the default lags.
     #[serde(default, skip_serializing_if = "DurableCutConfig::is_default")]
     pub durable_cut: DurableCutConfig,
+    /// Native `relocation_max_reclaim_pct` (0..=100), carried from the
+    /// caller's native config: it caps only the per-owner physical reclaim
+    /// span of an R1 pass, never the callback scan. Zero keeps native's
+    /// one-file minimum. Absent means native's default.
+    #[serde(default = "default_relocation_max_reclaim_pct")]
+    pub relocation_max_reclaim_pct: u8,
+}
+
+fn default_relocation_max_reclaim_pct() -> u8 {
+    crate::config::Config::default().relocation_max_reclaim_pct
 }
 
 fn default_max_pending_reads() -> usize {
@@ -319,6 +333,11 @@ impl RemoteDatabaseConfig {
         {
             return Err(LocalDbError::new(
                 "index_shards must be a power of two in 1..=MAX_INDEX_SHARDS",
+            ));
+        }
+        if self.relocation_max_reclaim_pct > 100 {
+            return Err(LocalDbError::new(
+                "relocation_max_reclaim_pct must be in 0..=100",
             ));
         }
         self.durable_cut.validate().map_err(LocalDbError::new)?;
@@ -490,6 +509,9 @@ impl RemoteDatabaseConfig {
     }
 }
 
+/// Exact wrapper format with the per-stream callback starts (format 3 plus
+/// one trailing sorted vector). Readers accept 3 (no starts) and 4.
+const CALLBACK_START_WRAPPER_FORMAT: u32 = 4;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AuthorityManifest {
     format: u32,
@@ -660,6 +682,33 @@ struct CheckpointImageV3 {
     index_digest: [u8; 32],
     positions: Vec<StreamPosition>,
     recent: Vec<RecentReceipt>,
+}
+
+/// R1 durable callback cursor of one stream: the next relocation scan of
+/// `(partition, fencing_generation)` starts at file-aligned offset `from`.
+/// Monotone across adopted Exact roots; never an owner replay cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CallbackStart {
+    partition: u32,
+    fencing_generation: u64,
+    from: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckpointImageV4 {
+    format: u32,
+    database: [u8; 16],
+    shape_yaml: String,
+    authority_epoch: u64,
+    generation: u64,
+    cut: Option<MutationVersion>,
+    published_next: u64,
+    index_bytes: u64,
+    index_digest: [u8; 32],
+    positions: Vec<StreamPosition>,
+    recent: Vec<RecentReceipt>,
+    /// Sorted by `(partition, fencing_generation)`, unique.
+    callback_starts: Vec<CallbackStart>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1497,6 +1546,7 @@ impl RemoteDatabase {
         let mut positions = BTreeMap::new();
         let mut recent = VecDeque::with_capacity(WAL_REPLAY_WINDOW_BATCHES);
         let mut recent_ids = HashMap::with_capacity(WAL_REPLAY_WINDOW_BATCHES);
+        let mut callback_starts = BTreeMap::new();
         let mut latest = None;
         if let Some(checkpoint) = &manifest.checkpoint {
             load_checkpoint(
@@ -1512,6 +1562,7 @@ impl RemoteDatabase {
                 &mut positions,
                 &mut recent,
                 &mut recent_ids,
+                &mut callback_starts,
                 &mut recovery_stats,
             )?;
         }
@@ -1656,7 +1707,7 @@ impl RemoteDatabase {
         fencing_generations::mark_served(&mut manifest, epoch)?;
         // Old suffixes validated against their original durable bound. Only a
         // fully recovered, not-yet-serving epoch may activate a larger bound.
-        // Only the new format may serve and write DropCells batches.
+        // Before serving, gate DropCells and the Exact callback-start wrapper.
         manifest.format = fencing_generations::AUTHORITY_FORMAT;
         manifest.replay_limits = config.replay_limits;
         persist_manifest(&path, &manifest)?;
@@ -1733,6 +1784,7 @@ impl RemoteDatabase {
                 positions,
                 committed_complete,
                 committed_streams,
+                callback_starts,
                 recent,
                 published_next: 0,
                 upper: latest,
@@ -2675,6 +2727,7 @@ fn load_checkpoint(
     positions: &mut BTreeMap<(u32, u64), StreamPosition>,
     recent: &mut VecDeque<RecentReceipt>,
     recent_ids: &mut HashMap<BatchId, (BatchVersion, super::types::PayloadDigest)>,
+    callback_starts: &mut BTreeMap<(u32, u64), u64>,
     stats: &mut RecoveryStats,
 ) -> Result<(), LocalDbError> {
     let started = Instant::now();
@@ -2703,12 +2756,30 @@ fn load_checkpoint(
         .with_fixint_encoding()
         .deserialize(&header)
         .map_err(LocalDbError::component)?;
-    if format != 3 {
+    if !matches!(format, 3 | CALLBACK_START_WRAPPER_FORMAT) {
         return Err(LocalDbError::new(
-            "checkpoint image format is not the WAL-replay format 3",
+            "checkpoint image format is not a WAL-replay format (3 or 4)",
         ));
     }
-    let mut image: CheckpointImageV3 = read_checkpoint(&metadata_path)?;
+    let mut image: CheckpointImageV4 = if format == CALLBACK_START_WRAPPER_FORMAT {
+        read_checkpoint(&metadata_path)?
+    } else {
+        let image: CheckpointImageV3 = read_checkpoint(&metadata_path)?;
+        CheckpointImageV4 {
+            format: image.format,
+            database: image.database,
+            shape_yaml: image.shape_yaml,
+            authority_epoch: image.authority_epoch,
+            generation: image.generation,
+            cut: image.cut,
+            published_next: image.published_next,
+            index_bytes: image.index_bytes,
+            index_digest: image.index_digest,
+            positions: image.positions,
+            recent: image.recent,
+            callback_starts: Vec::new(),
+        }
+    };
     for position in std::mem::take(&mut image.positions) {
         if !config.storage.partitions.contains(&position.partition)
             || !histories[config
@@ -2745,6 +2816,22 @@ fn load_checkpoint(
             return Err(LocalDbError::new("invalid checkpoint retry identity"));
         }
         recent.push_back(receipt);
+    }
+    // A callback start is file-aligned, strictly sorted and covered by the
+    // same image's durable position of its stream.
+    let mut previous = None;
+    for start in std::mem::take(&mut image.callback_starts) {
+        let key = (start.partition, start.fencing_generation);
+        if previous.is_some_and(|previous| previous >= key)
+            || start.from % config.storage.wal_file_bytes != 0
+            || positions
+                .get(&key)
+                .is_none_or(|position| start.from > position.durable_end)
+        {
+            return Err(LocalDbError::new("invalid checkpoint callback start"));
+        }
+        previous = Some(key);
+        callback_starts.insert(key, start.from);
     }
     if image.format != format
         || image.database != config.storage.database
@@ -3405,6 +3492,8 @@ mod leased_tests;
 mod live_bench_tests;
 #[cfg(test)]
 mod position_tests;
+#[cfg(all(test, feature = "test_methods"))]
+mod relocation_tests;
 
 #[cfg(test)]
 mod pipeline_tests;

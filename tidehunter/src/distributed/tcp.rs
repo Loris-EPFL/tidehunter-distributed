@@ -44,6 +44,7 @@ pub(crate) mod export_pin_tests;
 mod live_control;
 pub(super) mod live_read;
 mod live_recovery;
+mod relocation_scan;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 pub use live_control::{LiveRecoveryEntry, LiveRecoveryPage};
 mod live_wire;
@@ -113,7 +114,8 @@ pub use inventory::{FileMaintenanceStats, NodeInventory};
 /// 31 (R0) appends FileInventoryPage (request tag 29, response tag 26).
 /// 32 (R1 owner) gives RetireWalFiles inode-bound proofs and an Exact witness, and `Retired`
 /// a Completed/Busy outcome (payloads change in place; tags are unchanged).
-const PROTOCOL: u32 = 32;
+/// 33 (R1 logical) appends RelocationPage (request tag 30, response tag 27).
+const PROTOCOL: u32 = 33;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -535,6 +537,16 @@ enum Request {
         after: Option<u64>,
         limit: u16,
     },
+    /// Tag 30. R1 relocation scan: metadata of the complete batches of one
+    /// stream in `[from, end)`, active or older sealed
+    /// (`storage::RelocationPage`).
+    RelocationPage {
+        authority_generation: u64,
+        source_generation: u64,
+        from: u64,
+        end: u64,
+        limit: u16,
+    },
 }
 impl Request {
     /// Startup/recovery negotiation, durable epoch/retirement maintenance and
@@ -549,7 +561,9 @@ impl Request {
             | Self::Seal { .. }
             | Self::RetireWalFiles { .. }
             // A directory scan with `lstat` per file, like retirement pages.
-            | Self::FileInventoryPage { .. } => true,
+            | Self::FileInventoryPage { .. }
+            // Reads and decodes up to one page of WAL groups.
+            | Self::RelocationPage { .. } => true,
             Self::Stats
             | Self::StatsDetailed
             | Self::PartitionStats
@@ -715,6 +729,8 @@ enum Response {
     TrimGeneration(generation_control::TrimReply),
     /// Tag 26. Boxed so ordinary responses do not grow.
     FileInventoryPage(Box<super::capacity::FileInventoryReply>),
+    /// Tag 27. Boxed like FileInventoryPage.
+    RelocationPage(Box<super::storage::RelocationPage>),
 }
 
 /// Named error of a benchmark evidence request this owner build cannot serve.

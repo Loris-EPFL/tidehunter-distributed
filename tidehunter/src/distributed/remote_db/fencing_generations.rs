@@ -29,10 +29,12 @@ use crate::distributed::tcp::{
     InventoryGeneration, NodeStatus, OwnerGenerationState, TrimReadiness,
 };
 
-/// Authority manifest format that allows serving DropCells WAL batches.
-pub(super) const AUTHORITY_FORMAT: u32 = 7;
+/// Authority manifest format that allows the Exact callback-start wrapper.
+pub(super) const AUTHORITY_FORMAT: u32 = 8;
 /// L1 introduced the monotone fencing ledger; its Exact roots are readable.
 const FENCING_AUTHORITY_FORMAT: u32 = 6;
+/// L3 gated DropCells batches. The ledger structure did not change.
+const DROP_CELLS_AUTHORITY_FORMAT: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,7 +67,7 @@ pub(super) fn read_authority_manifest(path: &Path) -> Result<AuthorityManifest, 
     let probe: FormatProbe = read_metadata(path).map_err(LocalDbError::component)?;
     probe.mode.reject_legacy_mode(probe.format)?;
     match probe.format {
-        FENCING_AUTHORITY_FORMAT | AUTHORITY_FORMAT => {
+        FENCING_AUTHORITY_FORMAT | DROP_CELLS_AUTHORITY_FORMAT | AUTHORITY_FORMAT => {
             read_metadata(path).map_err(LocalDbError::component)
         }
         format => Err(LocalDbError::new(format!(
@@ -352,7 +354,8 @@ pub(super) fn maintain(
 
 /// Coordinator-side proof that no selectable state needs bytes, positions or
 /// proofs of `generation`: no index value, tail receipt, retry identity or
-/// incomplete replay position names it, and the tracked cut does not.
+/// incomplete replay position names it, the tracked cut does not, and no
+/// adopted relocation callback start leaves a suffix to scan in it.
 fn coordinator_eligible(core: &WriteCore, record: Option<&CutRecord>, generation: u64) -> bool {
     if record.is_some_and(|record| record.live_generation() == Some(generation)) {
         return false;
@@ -367,10 +370,14 @@ fn coordinator_eligible(core: &WriteCore, record: Option<&CutRecord>, generation
                 .known
                 .values()
                 .any(|receipt| receipt.version().epoch == generation)
-            || publisher
-                .positions
-                .iter()
-                .any(|((_, stream), position)| *stream == generation && !position.complete)
+            || publisher.positions.iter().any(|(key, position)| {
+                key.1 == generation
+                    && (!position.complete
+                        || publisher
+                            .callback_starts
+                            .get(key)
+                            .is_some_and(|&from| from < position.durable_end))
+            })
         {
             return false;
         }
@@ -422,6 +429,9 @@ fn commit_trim(core: &Arc<WriteCore>, generation: u64) -> Result<(), LocalDbErro
         }
         state
             .positions
+            .retain(|(_, stream), _| *stream != generation);
+        state
+            .callback_starts
             .retain(|(_, stream), _| *stream != generation);
         state
             .committed_complete

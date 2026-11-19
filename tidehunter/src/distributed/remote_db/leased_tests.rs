@@ -894,6 +894,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 queue_geometry: Default::default(),
             },
             durable_cut: Default::default(),
+            relocation_max_reclaim_pct: 100,
         };
         let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
         let database =
