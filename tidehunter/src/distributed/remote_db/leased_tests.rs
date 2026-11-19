@@ -174,10 +174,6 @@ fn leased_submit_redrain_switch_selects_the_frame_of_a_late_ready_group() {
 #[test]
 fn leased_worker_group_flush_replies_and_checkpoint_cover_the_durable_prefix() {
     let fixture = Fixture::new(DurabilityTier::Synchronous, 64 * 1024);
-    fixture
-        .node
-        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
     let mut client = fixture.writer();
     client.leased_test_group_flush();
     client.leased_test_set_window(4);
@@ -210,18 +206,22 @@ fn leased_worker_group_flush_replies_and_checkpoint_cover_the_durable_prefix() {
     assert!(counts.leased_flushes > 0);
     assert_eq!(counts.leased_flushes, counts.leased_flush_samples);
     assert_eq!(counts.fua_writes + counts.leased_flush_covered_frames, 8);
+    let written = worker.client.lock().leased_test_frontier().0;
     let (reply, checkpoint) = mpsc::sync_channel(1);
-    worker.send(Command::Checkpoint(1, 1, 8, reply)).unwrap();
-    assert_eq!(
+    worker
+        .send(Command::CheckpointPosition(1, 1, written, reply))
+        .unwrap();
+    assert!(
         checkpoint
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap()
-            .prefix,
-        8
+            .durable_end
+            >= written
     );
-    let written = worker.client.lock().leased_test_frontier().0;
-    assert!(fixture.node.log_for_test(1).synced_frontier() >= written);
+    // A position proof persists the WAL position root, not adopted-receipt
+    // bookkeeping (the removed receipt-prefix proof did that).
+    assert!(fixture.node.log_for_test(1).position_frontier_for_test() >= written);
     drop(worker);
     assert!(!failure.load(Ordering::Acquire));
 }
@@ -397,61 +397,6 @@ fn leased_worker_merges_ready_appends_and_splits_receipts_in_order() {
 }
 
 #[test]
-fn leased_worker_settles_checkpoint_and_closes_before_seal() {
-    let fixture = Fixture::new(DurabilityTier::Native, 16384);
-    fixture
-        .node
-        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    let (worker, failure) = worker(&fixture, fixture.writer());
-    let receipt = receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap()[0];
-    let (reply, checkpoint) = mpsc::sync_channel(1);
-    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-    let proof = checkpoint
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    assert_eq!(proof.prefix, 1);
-    let (written, open, _) = worker.client.lock().leased_test_frontier();
-    assert!(open);
-    let log = fixture.node.log_for_test(1);
-    assert_eq!(log.appended_frontier(), written);
-    assert!(log.synced_frontier() >= written);
-    assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
-    assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 1);
-    assert_eq!(
-        fixture
-            .metrics
-            .snapshot()
-            .counts
-            .adoption_history_full_settles,
-        0
-    );
-    receive(worker.seal(1).unwrap()).unwrap();
-    assert!(!worker.client.lock().leased_test_frontier().1);
-    assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 1);
-    assert_eq!(
-        fixture
-            .metrics
-            .snapshot()
-            .counts
-            .adoption_history_full_settles,
-        0
-    );
-    let reference = fixture
-        .batch(0)
-        .record_reference(receipt.appended().address(), 0)
-        .unwrap();
-    assert_eq!(
-        log.read_record(&reference).unwrap(),
-        fixture.batch(0).mutations()[0]
-    );
-    drop(worker);
-    // Acquire observes the worker's fatal-outcome publication, if any.
-    assert!(!failure.load(Ordering::Acquire));
-}
-
-#[test]
 fn leased_worker_clean_shutdown_closes_owner_allocation_guard() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
@@ -482,7 +427,10 @@ fn leased_worker_unknown_write_poison_stops_queued_commands() {
         let guard = worker.client.lock();
         let first = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
         let (reply, checkpoint) = mpsc::sync_channel(1);
-        worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
+        // The position covers the failed first frame, so it can never succeed.
+        worker
+            .send(Command::CheckpointPosition(1, 1, 4096, reply))
+            .unwrap();
         let later = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         drop(guard);
         assert!(first.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
@@ -551,122 +499,99 @@ fn leased_worker_failed_adoption_and_digest_mismatch_poison_while_idle() {
 
 #[test]
 fn leased_measurement_gate_observations_keep_warm_extent() {
-    use crate::distributed::storage::HistoryPersistence;
-
     let mut cold_restarts = Vec::new();
-    for mode in [
-        HistoryPersistence::WalReplay,
-        HistoryPersistence::OnDisk,
-        #[cfg(feature = "test-utils")]
-        HistoryPersistence::MemoryOnly,
-    ] {
-        for (ahead, timeline) in [(false, false), (false, true), (true, false), (true, true)] {
-            let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
-            fixture.node.set_history_persistence(mode).unwrap();
-            let mut client = if ahead {
-                fixture.writer()
-            } else {
-                fixture.writer_without_ahead()
-            };
-            let warmup = client
-                .submit_and_drain_leased_group(
-                    1,
-                    vec![fixture.batch(0)],
-                    &WriteTimeline::default(),
-                    2,
-                )
-                .unwrap()[0];
-            // Complete the warmup driver's prelease and adoption before the gate.
-            for _ in 0..2 {
-                client.submit_leased_adoption().unwrap();
-                client.wait_leased_control(&mut Vec::new(), None).unwrap();
-            }
-            let (worker, failure) = worker(&fixture, client);
-            if mode == HistoryPersistence::WalReplay {
-                let through =
-                    warmup.appended().address().offset + u64::from(warmup.appended().address().len);
-                let (reply, checkpoint) = mpsc::sync_channel(1);
-                worker
-                    .send(Command::CheckpointPosition(1, 1, through, reply))
-                    .unwrap();
-                assert!(receive(checkpoint).unwrap().durable_end >= through);
-            } else {
-                let (reply, checkpoint) = mpsc::sync_channel(1);
-                worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-                assert_eq!(receive(checkpoint).unwrap().prefix, 1);
-            }
-            receive(worker.stats().unwrap()).unwrap();
-            assert!(worker.client.lock().leased_test_frontier().1);
-            // The gate can arm the owner timeline before taking read observations.
-            // Neither typed command should terminate the warm extents.
-            let before = fixture.metrics.snapshot().counts;
-            if timeline {
-                worker.control_handle().owner_timeline_arm(64).unwrap();
-            }
-            worker.read_io_stats().unwrap();
-            let gate = fixture.metrics.snapshot().counts;
-            let open = worker.client.lock().leased_test_frontier().1;
-            let measured = receive(worker.enqueue(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
-            let first = fixture.metrics.snapshot().counts;
-            eprintln!(
-                "mode={mode:?} lease_ahead={ahead} timeline={timeline}: gate open={open}, skips={}, synchronous closes={}, first-put leases={}",
-                gate.leased_skip_markers - before.leased_skip_markers,
-                gate.adoption_sync_exchanges - before.adoption_sync_exchanges,
-                first.lease_exchanges - gate.lease_exchanges,
-            );
-            if !open
-                || first.lease_exchanges != before.lease_exchanges
-                || gate.leased_skip_markers != before.leased_skip_markers
-                || gate.adoption_sync_exchanges != before.adoption_sync_exchanges
-            {
-                cold_restarts.push((mode, ahead, timeline));
-            }
-            let log = fixture.node.log_for_test(1);
-            for (sequence, receipt) in [(0, warmup), (1, measured)] {
-                let batch = fixture.batch(sequence);
-                let reference = batch
-                    .record_reference(receipt.appended().address(), 0)
-                    .unwrap();
-                assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]);
-            }
-            drop(worker);
-            assert!(!failure.load(Ordering::Acquire));
-            if mode == HistoryPersistence::WalReplay {
-                // The worker is gone, but the owner may still publish its
-                // frontier root asynchronously. Copy the WAL and root like a
-                // crash snapshot: a temporary root renamed away during the
-                // copy did not exist at that point of the snapshot.
-                let recovered_root = tempdir::TempDir::new("leased-gate-recovery").unwrap();
-                let stream = fixture.config.root.join("epoch_0000000000000001");
-                for entry in std::fs::read_dir(stream).unwrap() {
-                    let entry = entry.unwrap();
-                    assert!(entry.file_type().unwrap().is_file());
-                    match std::fs::copy(entry.path(), recovered_root.path().join(entry.file_name()))
-                    {
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => panic!("crash snapshot copy failed: {error}"),
-                    }
-                }
-                let recovered = crate::distributed::storage::PartitionLog::recover_live_sealed(
-                    recovered_root.path(),
-                    &fixture.config.partition,
-                    Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-                    // These copied inodes were never exposed by a live target.
-                    || Ok(()),
-                )
+    for (ahead, timeline) in [(false, false), (false, true), (true, false), (true, true)] {
+        let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+        let mut client = if ahead {
+            fixture.writer()
+        } else {
+            fixture.writer_without_ahead()
+        };
+        let warmup = client
+            .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+            .unwrap()[0];
+        // Complete the warmup driver's prelease and adoption before the gate.
+        for _ in 0..2 {
+            client.submit_leased_adoption().unwrap();
+            client.wait_leased_control(&mut Vec::new(), None).unwrap();
+        }
+        let (worker, failure) = worker(&fixture, client);
+        let through =
+            warmup.appended().address().offset + u64::from(warmup.appended().address().len);
+        let (reply, checkpoint) = mpsc::sync_channel(1);
+        worker
+            .send(Command::CheckpointPosition(1, 1, through, reply))
+            .unwrap();
+        assert!(receive(checkpoint).unwrap().durable_end >= through);
+        receive(worker.stats().unwrap()).unwrap();
+        assert!(worker.client.lock().leased_test_frontier().1);
+        // The gate can arm the owner timeline before taking read observations.
+        // Neither typed command should terminate the warm extents.
+        let before = fixture.metrics.snapshot().counts;
+        if timeline {
+            worker.control_handle().owner_timeline_arm(64).unwrap();
+        }
+        // A typed observation command; generic `Control` would close the extent.
+        receive(worker.stats().unwrap()).unwrap();
+        let gate = fixture.metrics.snapshot().counts;
+        let open = worker.client.lock().leased_test_frontier().1;
+        let measured = receive(worker.enqueue(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
+        let first = fixture.metrics.snapshot().counts;
+        eprintln!(
+            "lease_ahead={ahead} timeline={timeline}: gate open={open}, skips={}, synchronous closes={}, first-put leases={}",
+            gate.leased_skip_markers - before.leased_skip_markers,
+            gate.adoption_sync_exchanges - before.adoption_sync_exchanges,
+            first.lease_exchanges - gate.lease_exchanges,
+        );
+        if !open
+            || first.lease_exchanges != before.lease_exchanges
+            || gate.leased_skip_markers != before.leased_skip_markers
+            || gate.adoption_sync_exchanges != before.adoption_sync_exchanges
+        {
+            cold_restarts.push((ahead, timeline));
+        }
+        let log = fixture.node.log_for_test(1);
+        for (sequence, receipt) in [(0, warmup), (1, measured)] {
+            let batch = fixture.batch(sequence);
+            let reference = batch
+                .record_reference(receipt.appended().address(), 0)
                 .unwrap();
-                for (sequence, receipt) in [(0, warmup), (1, measured)] {
-                    let batch = fixture.batch(sequence);
-                    let reference = batch
-                        .record_reference(receipt.appended().address(), 0)
-                        .unwrap();
-                    assert_eq!(
-                        recovered.read_record(&reference).unwrap(),
-                        batch.mutations()[0]
-                    );
-                }
+            assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]);
+        }
+        drop(worker);
+        assert!(!failure.load(Ordering::Acquire));
+        // The worker is gone, but the owner may still publish its frontier
+        // root asynchronously. Copy the WAL and root like a crash snapshot: a
+        // temporary root renamed away during the copy did not exist at that
+        // point of the snapshot.
+        let recovered_root = tempdir::TempDir::new("leased-gate-recovery").unwrap();
+        let stream = fixture.config.root.join("epoch_0000000000000001");
+        for entry in std::fs::read_dir(stream).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            match std::fs::copy(entry.path(), recovered_root.path().join(entry.file_name())) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("crash snapshot copy failed: {error}"),
             }
+        }
+        let recovered = crate::distributed::storage::PartitionLog::recover_live_sealed(
+            recovered_root.path(),
+            &fixture.config.partition,
+            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
+            // These copied inodes were never exposed by a live target.
+            || Ok(()),
+        )
+        .unwrap();
+        for (sequence, receipt) in [(0, warmup), (1, measured)] {
+            let batch = fixture.batch(sequence);
+            let reference = batch
+                .record_reference(receipt.appended().address(), 0)
+                .unwrap();
+            assert_eq!(
+                recovered.read_record(&reference).unwrap(),
+                batch.mutations()[0]
+            );
         }
     }
     assert!(
@@ -756,11 +681,17 @@ fn leased_worker_failed_checkpoint_never_dispatches_queued_stats_or_control() {
     for control_first in [false, true] {
         let fixture = Fixture::new(DurabilityTier::Native, 16384);
         let (worker, failure) = worker(&fixture, fixture.writer());
-        let guard = worker.client.lock();
+        // A position proof is fixed-through and is submitted with frames
+        // still in flight; its fatal reply leaves those frames unknown. So
+        // acknowledge the earlier append before queueing the proof.
         let append = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
+        receive(append).unwrap();
+        let guard = worker.client.lock();
         let (reply, checkpoint) = mpsc::sync_channel(1);
-        // Only one batch exists: the real owner must reject this proof request.
-        worker.send(Command::Checkpoint(1, 1, 2, reply)).unwrap();
+        // No owner WAL reaches this position: the proof request must fail.
+        worker
+            .send(Command::CheckpointPosition(1, 1, u64::MAX, reply))
+            .unwrap();
         let (reply, stats) = mpsc::sync_channel(1);
         let stats_command = Command::Stats(reply);
         let (reply, control) = mpsc::sync_channel(1);
@@ -777,7 +708,6 @@ fn leased_worker_failed_checkpoint_never_dispatches_queued_stats_or_control() {
         }
         let later = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
         drop(guard);
-        receive(append).unwrap();
         assert!(
             checkpoint
                 .recv_timeout(Duration::from_secs(5))
@@ -897,63 +827,8 @@ fn leased_worker_completes_flight_while_adoption_pending_without_timer_wait() {
 }
 
 #[test]
-fn leased_worker_checkpoint_waits_for_adoption_without_holding_client_lock() {
-    use crate::distributed::storage::LivePausePoint;
-    let fixture = Fixture::new(DurabilityTier::Native, 16384);
-    fixture
-        .node
-        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    let mut client = fixture.writer();
-    client
-        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
-        .unwrap();
-    let (entered, release) = fixture
-        .node
-        .log_for_test(1)
-        .pause_live(LivePausePoint::FrameProbe);
-    let (worker, failure) = worker_with_capacity(&fixture, client, 1);
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (reply, checkpoint) = mpsc::sync_channel(1);
-    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-    let stats = worker.stats().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let guard = worker
-            .client
-            .try_lock_for(Duration::from_millis(100))
-            .expect("queued checkpoint must park outside the client mutex");
-        if guard.leased_test_command_adoption_waits() != 0 {
-            assert!(guard.leased_test_frontier().2);
-            break;
-        }
-        drop(guard);
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(matches!(
-        checkpoint.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    release.send(()).unwrap();
-    assert_eq!(
-        checkpoint
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-            .prefix,
-        1
-    );
-    assert!(stats.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
-    assert!(worker.client.lock().leased_test_frontier().1);
-    drop(worker);
-    // Acquire observes a fatal outcome, if any, before accepting the result.
-    assert!(!failure.load(Ordering::Acquire));
-}
-
-#[test]
 fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
-    use crate::distributed::tcp::{LiveClientConfig, LiveWriteMode};
+    use crate::distributed::tcp::LiveClientConfig;
     for (result, already_poisoned) in [
         (Some(-libc::EIO), false),
         (Some(2048), false),
@@ -964,7 +839,6 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
         let owner = &fixture.config.partition;
         let root = tempdir::TempDir::new("leased-shutdown").unwrap();
         let config = RemoteDatabaseConfig {
-            history_persistence: HistoryPersistence::default(),
             storage: LocalInventoryConfig {
                 database: owner.inventory.database,
                 partitions: owner.inventory.partitions.clone(),
@@ -1003,7 +877,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             max_pending_reads: 4,
             max_pending_read_bytes: 128 * 1024,
             write_profile_limit: 0,
-            live_nvme: Some(LiveClientConfig {
+            live_nvme: LiveClientConfig {
                 lease_ahead: true,
                 polled_writes: false,
                 host_nqn: "nqn.2026-01.test:leased".into(),
@@ -1016,25 +890,16 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 max_inflight_bytes: 128 * 1024,
                 connect_timeout_ms: 1000,
                 io_timeout_ms: 1000,
-                write_mode: LiveWriteMode::Leased,
-                leased_durability: Some(DurabilityTier::Native),
+                leased_durability: DurabilityTier::Native,
                 inline_reads: true,
                 queue_geometry: Default::default(),
-                export_mode: Default::default(),
-            }),
-            checkpoint_mode: CheckpointMode::Exact,
+            },
             durable_cut: Default::default(),
         };
         let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
-        let database = RemoteDatabase::open(
-            root.path(),
-            &shape,
-            config,
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-        )
-        .unwrap();
+        let database =
+            RemoteDatabase::open_local_live_fixture(root.path(), &shape, config).unwrap();
         let client = database.core.clients[0].client.clone();
-        client.lock().bench_local_live_fixture(false);
         let batch = fixture.batch(0);
         database
             .write_batch(batch.id().operation, batch.mutations().to_vec())
@@ -1670,40 +1535,6 @@ fn parked_position_requests_prelease_without_blocking_appends_or_shutdown() {
 }
 
 #[test]
-fn parked_receipt_checkpoint_keeps_its_captured_prefix() {
-    use crate::distributed::storage::{HistoryPersistence, LivePausePoint};
-    let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
-    fixture
-        .node
-        .set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let mut client = fixture.writer();
-    let first = client
-        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
-        .unwrap()[0];
-    client.wait_leased_control(&mut Vec::new(), None).unwrap();
-    let log = fixture.node.log_for_test(1);
-    let (entered, release) = log.pause_live(LivePausePoint::FrameProbe);
-    client.submit_leased_adoption().unwrap();
-    let (worker, failure) = worker(&fixture, client);
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let guard = worker.client.lock();
-    let (reply, proof) = mpsc::sync_channel(1);
-    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-    let append = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
-    drop(guard);
-    let passed = append.recv_timeout(Duration::from_secs(5));
-    release.send(()).unwrap();
-    let passed = passed.unwrap().unwrap()[0];
-    let proof = proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-    assert_eq!(proof.prefix, 1);
-    assert_eq!(proof.digest, log.checkpoint_prefix(1).unwrap());
-    assert!(passed.appended().address().offset > first.appended().address().offset);
-    drop(worker);
-    assert!(!failure.load(Ordering::Acquire));
-}
-
-#[test]
 fn failed_append_poison_replies_to_inflight_position() {
     use crate::distributed::storage::LivePausePoint;
     let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
@@ -1725,43 +1556,6 @@ fn failed_append_poison_replies_to_inflight_position() {
         .unwrap();
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     let append = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
-    let result = append.recv_timeout(Duration::from_secs(5));
-    let proof_result = proof.recv_timeout(Duration::from_secs(5));
-    release.send(()).unwrap();
-    assert!(result.unwrap().is_err());
-    assert!(proof_result.unwrap().is_err());
-    drop(worker);
-    assert!(failure.load(Ordering::Acquire));
-}
-
-#[test]
-fn failed_append_poison_replies_to_parked_receipt_checkpoint() {
-    use crate::distributed::storage::{HistoryPersistence, LivePausePoint};
-    let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
-    fixture
-        .node
-        .set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let mut client = fixture.writer();
-    client
-        .submit_and_drain_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
-        .unwrap();
-    client.wait_leased_control(&mut Vec::new(), None).unwrap();
-    let (entered, release) = fixture
-        .node
-        .log_for_test(1)
-        .pause_live(LivePausePoint::FrameProbe);
-    client.submit_leased_adoption().unwrap();
-    client.leased_test_fail_write(-libc::EIO);
-    let (worker, failure) = worker(&fixture, client);
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let guard = worker.client.lock();
-    let (reply, proof) = mpsc::sync_channel(1);
-    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
-    let append = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
-    drop(guard);
-    // The receipt proof cannot leave its parked slot while adoption is held.
-    // The failed passing append must finalize that proof before owner progress.
     let result = append.recv_timeout(Duration::from_secs(5));
     let proof_result = proof.recv_timeout(Duration::from_secs(5));
     release.send(()).unwrap();

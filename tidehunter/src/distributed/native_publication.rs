@@ -443,7 +443,6 @@ mod tests {
     use super::*;
     use crate::distributed::codec::BatchLimits;
     use crate::distributed::group::{CompleteGroup, GroupLimits};
-    use crate::distributed::local_db::publication::PublicationTracker;
     use crate::distributed::storage::{PartitionConfig, StaticInventory};
     use crate::distributed::types::RequestAuthority;
     use crate::index::pending_table::CommittedChange;
@@ -664,22 +663,13 @@ mod tests {
                 1 => sink.panic_at = Some(1),
                 _ => sink.skip_at = Some(1),
             }
-            let mut tracker = PublicationTracker::new(batch.id().database, EPOCH, 8).unwrap();
-            tracker.admit(&batch).unwrap();
-            tracker.mark_in_flight(batch.id()).unwrap();
-            tracker.record_durable(receipt).unwrap();
             let prepared = PreparedNativePublication::prepare(&log, &batch, receipt).unwrap();
-            let mut prepared = Some(prepared);
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                tracker.publish_ready(|_| prepared.take().unwrap().publish(&mut sink))
-            }));
+            let result = catch_unwind(AssertUnwindSafe(|| prepared.publish(&mut sink)));
             if kind == 1 {
                 assert!(result.is_err());
             } else {
                 assert!(result.unwrap().is_err());
             }
-            assert!(tracker.ensure_publication_healthy().is_err());
-            assert_eq!(tracker.published_prefix().next_sequence(), 0);
             assert!(collect(&mut sink).is_empty());
             assert!(sink.tables.values().all(|table| table.len() == 0));
             // Native transaction cleanup does not abort the durable authority.

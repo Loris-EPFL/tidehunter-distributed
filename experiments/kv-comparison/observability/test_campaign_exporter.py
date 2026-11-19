@@ -63,7 +63,7 @@ def live_write_diagnostics():
         "scope": "measurement_nvme_io_cumulative_delta", "requested_limit": 2, "selected_operations": 3,
         "stages": {"live_nvmeof": {
             "completed_write_ops": 3, "completed_write_bytes": 12288,
-            "completed_read_ops": 0, "metadata_requests": 4, "payload_rpc_requests": 0,
+            "completed_read_ops": 0, "metadata_requests": 4,
             "unknown_writes": 0, "errors": 0, "queue_ns": 3000000000, "queue_samples": 3,
             "cq_ns": 0, "cq_samples": 0}},
         "finalization_error": None}
@@ -320,16 +320,14 @@ class CaseIdentityTests(unittest.TestCase):
     def test_live_measurement_deltas_are_scoped_and_missing_is_not_zero(self):
         fields = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
                   "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
-                  "metadata_requests", "namespace_connects", "payload_rpc_requests",
+                  "metadata_requests", "namespace_connects",
                   "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
         counters = {field: index for index, field in enumerate(fields)}
-        for stage in ("queue", "submit", "cq", "control", "validation", "allocation",
-                      "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
-                      "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace"):
+        for stage in ("queue", "submit", "cq", "control", "validation",
+                      "publication", "namespace_setup", "read_io"):
             counters[stage + "_ns"] = 0
             counters[stage + "_samples"] = 0
         counters["queue_ns"], counters["queue_samples"] = 100, 2
-        counters["owner_completion_ns"], counters["owner_completion_samples"] = 250, 1
         evidence = {"scope": "measurement_boundary", "deltas": {"available": False},
                     "live_nvmeof": {"available": True, "counters": counters}}
         labels = campaign.context("run", job() | {"backend": "tidehunter_nvme_tcp", "nvmeof_route": "live"})
@@ -341,9 +339,6 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('stage="queue",statistic="sum"} 1e-07', text)
         self.assertIn('stage="cq"} 0', text)
         self.assertNotIn('stage="cq",statistic="sum"', text)
-        self.assertIn('stage="owner_completion",statistic="sum"} 2.5e-07', text)
-        self.assertIn('stage="frontier_file"} 0', text)
-        self.assertNotIn('stage="frontier_file",statistic="sum"', text)
         evidence["live_nvmeof"] = {"available": False}
         text = campaign.measurement_read_metrics(evidence, labels)
         self.assertIn('scope="measurement_boundary"} 0', text)
@@ -356,10 +351,9 @@ class CaseIdentityTests(unittest.TestCase):
         counters = {field: 0 for field in (
             "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
             "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
-            "payload_rpc_requests", "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")}
-        for stage in ("queue", "submit", "cq", "control", "validation", "allocation", "publication",
-                      "namespace_setup", "read_io", "persistence", "owner_completion", "wal_persistence",
-                      "wal_namespace", "frontier_file", "frontier_namespace"):
+            "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")}
+        for stage in ("queue", "submit", "cq", "control", "validation", "publication",
+                      "namespace_setup", "read_io"):
             counters.update({stage + "_ns": 0, stage + "_samples": 0})
         counters.update(lane_inflight_samples=2, lane_inflight_request_sum=3, grant_hits=4,
                         copy_bytes_avoided=4096, delivery_ns=200, delivery_samples=2)
@@ -730,6 +724,17 @@ class CaseIdentityTests(unittest.TestCase):
         evidence["profile"]["counters"]["read_profile_server_async_count"] = 2.5
         with self.assertRaisesRegex(ValueError, "expected a nonnegative count"):
             campaign.read_diagnostic_metrics(evidence, {})
+
+    def test_retired_read_retry_counters_remain_admissible_without_exporting_them(self):
+        evidence = read_diagnostics()
+        evidence["profile"]["counters"].update(
+            read_profile_admission_retry_credit=1,
+            read_profile_admission_retry_config=2,
+            read_profile_admission_retry_mixed=3)
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('counter="read_profile_admission_retry_credit"', text)
+        self.assertNotIn("read_profile_admission_retry_config", text)
+        self.assertNotIn("read_profile_admission_retry_mixed", text)
 
     def test_read_diagnostics_no_data_and_validation(self):
         self.assertEqual(campaign.read_diagnostic_metrics(None, {}), "")

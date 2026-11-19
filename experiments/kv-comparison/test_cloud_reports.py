@@ -240,7 +240,6 @@ class WriteTimelineAdmissionTests(unittest.TestCase):
 class CloudMatrixTests(unittest.TestCase):
     def contract_spec(self):
         arms = {'native': ['value_wal_barrier', 'page_cache'],
-                'tidehunter_verbs_native': ['synchronous', 'native'],
                 'tidehunter_nvme_rdma': ['synchronous', 'native'],
                 'valkey_tcp': ['synced'],
                 'valkey_rdma': ['synced', 'os_buffered', 'periodic_sync'],
@@ -251,7 +250,7 @@ class CloudMatrixTests(unittest.TestCase):
     def test_contract_core_profiles_and_arms(self):
         spec = self.contract_spec()
         jobs = cloud.make_matrix(spec)
-        self.assertEqual(len(jobs), 156)
+        self.assertEqual(len(jobs), 130)
         self.assertEqual(len({job['case_id'] for job in jobs}), len(jobs))
         self.assertEqual({job['backend'] for job in jobs}, set(spec['backends']))
         self.assertEqual({job['profile'] for job in jobs},
@@ -327,7 +326,7 @@ class CloudMatrixTests(unittest.TestCase):
         for changed in cases:
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 cloud.make_matrix(changed)
-        self.assertEqual(len(cloud.make_matrix({key: value for key, value in spec.items() if key != 'arms'})), 102)
+        self.assertEqual(len(cloud.make_matrix({key: value for key, value in spec.items() if key != 'arms'})), 85)
 
     def test_advertised_read_evidence_cannot_be_missing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -349,115 +348,6 @@ class CloudMatrixTests(unittest.TestCase):
             "offered_seconds": 8, "case_deadline_seconds": 180,
             "hard_deadline_seconds": 10800, "export_reserve_seconds": 600,
         }
-    def test_combined_matrix_preserves_standard_and_sealed_populations(self):
-        backends = ["native", "tidehunter_tcp", "tidehunter_verbs_native",
-                    "tidehunter_nvme_rdma", "tikv", "cassandra", "foundationdb",
-                    "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"]
-        diagnostics = {"write_profile_limit": 256, "read_profile_limit": 256,
-                       "write_timeline_limit": 8192}
-        spec = self.spec(1) | {"mode": "standard-with-nvmeof", "backends": backends,
-                               "diagnostics": diagnostics, "hard_deadline_seconds": 14400}
-        jobs = cloud.make_matrix(spec)
-        standard = cloud.make_matrix(spec | {"mode": "standard",
-                                    "backends": [b for b in backends if b not in cloud.NVME_BACKENDS]})
-        focused = cloud.make_matrix(spec | {"mode": "nvmeof-focused",
-                                   "backends": backends[:4]})
-        self.assertEqual(len(standard), 280)
-        self.assertEqual(len(focused), 129)
-        self.assertEqual(len(jobs), 409)
-        self.assertEqual(jobs[:len(standard)], standard)
-        self.assertEqual([{k: v for k, v in j.items() if k != "case_id"}
-                          for j in jobs[len(standard):]],
-                         [{k: v for k, v in j.items() if k != "case_id"} for j in focused])
-        self.assertEqual(len({j["case_id"] for j in jobs}), len(jobs))
-        expected = {"native": 70, "tidehunter_tcp": 69, "tidehunter_verbs_native": 69,
-                    "tidehunter_nvme_rdma": 26, "tikv": 25, "cassandra": 25,
-                    "foundationdb": 25, "valkey_tcp": 25, "valkey_rdma": 25,
-                    "garnet": 25, "kvrocks": 25}
-        self.assertEqual({b: sum(j["backend"] == b for j in jobs) for b in backends}, expected)
-        seen, previous = set(), None
-        for job in jobs[len(standard):]:
-            if "sealed_dataset" not in job:
-                continue
-            source = job["sealed_dataset"]["source_id"]
-            if source != previous:
-                self.assertNotIn(source, seen)
-                seen.add(source)
-                previous = source
-            self.assertEqual(job["mix"]["read"] + job["mix"]["get_many"], 100)
-            config = cloud.make_run_config(job, Path("/tmp/case"), {}, "source")
-            self.assertFalse(config["phases"]["preload"])
-            self.assertTrue(config["phases"]["verify_existing_dataset"])
-        self.assertTrue(all("sealed_dataset" in j for j in jobs if j["backend"] in cloud.NVME_BACKENDS))
-        with self.assertRaisesRegex(ValueError, "409 cases"):
-            cloud.make_matrix(spec | {"max_cases": 408})
-        with self.assertRaises(ValueError):
-            cloud.make_matrix(spec | {"repeats": 2})
-        self.assertEqual(cloud.make_matrix(spec | {"hard_deadline_seconds": 21600}), jobs)
-        with self.assertRaises(ValueError):
-            cloud.make_matrix(spec | {"hard_deadline_seconds": 21601})
-        both = cloud.make_matrix(spec | {"backends": backends + ["tidehunter_nvme_tcp"]})
-        self.assertEqual(len(both), 435)
-        self.assertTrue(all("sealed_dataset" in j for j in both
-                            if j["backend"] in cloud.NVME_BACKENDS))
-        baseline_spec = spec | {"mode": "standard", "backends": [b for b in backends
-                                if b not in cloud.NVME_BACKENDS]}
-        old = cloud.make_matrix(baseline_spec | {"diagnostics": {"write_profile_limit": 256,
-                                                                 "read_profile_limit": 256}})
-        self.assertEqual(standard[:len(old)], old)
-
-    def test_live_matrix_matches_distributed_primary_and_keeps_sealed_separate(self):
-        backends = ["native", "tidehunter_tcp", "tidehunter_verbs_native",
-                    "tidehunter_nvme_rdma", "tikv", "cassandra", "foundationdb",
-                    "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"]
-        spec = self.spec(1) | {"mode": "standard-with-live-nvmeof", "backends": backends,
-            "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256,
-                            "write_timeline_limit": 8192},
-            "hard_deadline_seconds": 14400}
-        jobs = cloud.make_matrix(spec)
-        self.assertEqual(len(jobs), 461)
-        def primary(backend):
-            return sorted((j["value_size"], j["profile"], j["concurrency"],
-                           j["measurement_operations"], j["warmup_operations"],
-                           json.dumps(j["mix"], sort_keys=True))
-                          for j in jobs if j["backend"] == backend and j["cohort"] == "primary_rf1")
-        self.assertEqual(primary("tidehunter_nvme_rdma"), primary("tidehunter_tcp"))
-        live = [j for j in jobs if j.get("nvmeof_route") == "live"]
-        sealed = [j for j in jobs if j.get("nvmeof_route") == "sealed_read"]
-        self.assertEqual(len(live), 37)
-        self.assertEqual(len(sealed), 26)
-        self.assertTrue(all("sealed_dataset" not in j for j in live))
-        self.assertTrue(all("sealed_dataset" in j for j in sealed))
-        self.assertTrue(any(j["mix"]["delete"] for j in live))
-        self.assertTrue(any(j["mix"]["put"] for j in live))
-        self.assertTrue(any(j["mix"]["put_batch"] for j in live))
-        self.assertEqual(len({j["case_id"] for j in jobs}), len(jobs))
-        with self.assertRaisesRegex(ValueError, "461 cases"):
-            cloud.make_matrix(spec | {"max_cases": 460})
-
-    def test_spdk_live_twins_cover_every_live_rdma_case(self):
-        spec = self.spec(1) | {"mode": "standard-with-live-nvmeof",
-            "backends": ["native", "tidehunter_tcp", "tidehunter_nvme_rdma"],
-            "spdk_comparison": True,
-            "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256,
-                            "write_timeline_limit": 8192}}
-        jobs = cloud.make_matrix(spec)
-        live = [j for j in jobs if j.get("nvmeof_route") == "live"
-                and j["backend"] == "tidehunter_nvme_rdma"]
-        kernel = [j for j in live if j.get("nvmeof_target", "kernel") == "kernel"]
-        spdk = [j for j in live if j.get("nvmeof_target") == "spdk"]
-        def workload(job):
-            return {k: v for k, v in job.items() if k not in ("case_id", "nvmeof_target")}
-        self.assertEqual(len(kernel), len(spdk))
-        self.assertTrue(kernel)
-        self.assertEqual([workload(j) for j in kernel], [workload(j) for j in spdk])
-        self.assertTrue({"primary_rf1", "cold_os_cache", "coordinator_cache_configured",
-                         "write_stage_diagnostics", "read_stage_diagnostics",
-                         "write_timeline_diagnostics"} <= {j["cohort"] for j in spdk})
-        self.assertTrue(all(cloud.comparison_backend(j) == "tidehunter_spdk_live_rdma" for j in spdk))
-        self.assertTrue(any(cloud.comparison_backend(j) == "tidehunter_spdk_rdma" for j in jobs))
-        self.assertEqual(len({j["case_id"] for j in jobs}), len(jobs))
-
     def test_nvme_diagnostic_identity_distinguishes_historical_and_sealed(self):
         job = {"backend": "tidehunter_nvme_rdma"}
         self.assertEqual(cloud.diagnostic_backend(job), "tidehunter_nvme_rdma")
@@ -478,8 +368,23 @@ class CloudMatrixTests(unittest.TestCase):
         evidence["live_nvmeof"]["counters"]["completed_write_ops"] = 0
         self.assertFalse(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
         evidence["live_nvmeof"]["counters"]["completed_write_ops"] = 1
-        evidence["end"]["live_nvmeof"]["payload_rpc_requests"] = 1
-        evidence["live_nvmeof"]["counters"]["payload_rpc_requests"] = 1
+        evidence["end"]["live_nvmeof"]["unknown_writes"] = 1
+        evidence["live_nvmeof"]["counters"]["unknown_writes"] = 1
+        self.assertFalse(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
+
+    def test_m3_live_measurement_does_not_require_retired_owner_executor_counters(self):
+        zero = dict.fromkeys((*cloud.LIVE_NVME_COUNTERS, "grant_misses",
+                              "controller_connect_ns", "controller_connect_samples",
+                              "leased_frames", "leased_skip_markers", "fua_writes"), 0)
+        end = zero | {"completed_write_ops": 1, "completed_write_bytes": 4096, "leased_frames": 1}
+        evidence = {"measurement_attempted": True, "measurement_drained": True,
+                    "start": {"live_nvmeof": zero}, "end": {"live_nvmeof": end},
+                    "live_nvmeof": {"available": True, "counters": end.copy()}}
+        job = {"selection": "nvmeof_m3_t2_2", "group": "G33W", "owner_count": 2,
+               "backend": "tidehunter_nvme_rdma", "mix": cloud.mix(put=100)}
+        self.assertTrue(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
+        evidence["end"]["live_nvmeof"]["fence_evidence_dropped"] = 1
+        evidence["live_nvmeof"]["counters"]["fence_evidence_dropped"] = 1
         self.assertFalse(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
 
     def test_live_cache_hit_cohort_can_avoid_measurement_io_with_accounting(self):
@@ -528,12 +433,12 @@ class CloudMatrixTests(unittest.TestCase):
         self.assertFalse(cloud.qualify_live_nvme_route(evidence, spdk_job, expected)["qualified"])
 
     def test_timeline_twins_have_matched_counts_and_no_legacy_profile(self):
-        spec = self.nvmeof_spec() | {"mode": "standard-with-nvmeof",
-                "backends": ["native", "tidehunter_tcp", "tidehunter_verbs_native", "tidehunter_nvme_rdma"],
+        spec = self.spec(1) | {"mode": "standard-with-live-nvmeof",
+                "backends": ["native", "tidehunter_nvme_tcp", "tidehunter_nvme_rdma"],
                 "diagnostics": {"write_profile_limit": 256, "write_timeline_limit": 8192}}
         jobs = cloud.make_matrix(spec)
         timeline = [j for j in jobs if j["cohort"] == "write_timeline_diagnostics"]
-        self.assertEqual(len(timeline), 6)
+        self.assertEqual(len(timeline), 2)
         for job in timeline:
             self.assertEqual(job["diagnostics"], {"write_profile_limit": 0, "write_timeline_limit": 8192})
             candidates = [j for j in jobs if j["backend"] == job["backend"]
@@ -552,170 +457,21 @@ class CloudMatrixTests(unittest.TestCase):
                 cloud.make_matrix(spec | {"diagnostics": {"write_timeline_limit": value}})
 
     def test_portable_backends_preserve_standard_common_workloads(self):
-        spec = self.spec(1)
+        spec = self.spec(1) | {"mode": "standard-with-live-nvmeof"}
         selected = cloud.make_matrix(spec | {"backends": ["valkey_tcp", "valkey_rdma",
-                                                         "tidehunter_verbs", "tidehunter_verbs_native"]})
+                                                         "tidehunter_nvme_tcp", "tidehunter_nvme_rdma"]})
         workload_fields = ("repeat", "profile", "cohort", "value_size", "keys", "mix",
                            "concurrency", "measurement_operations", "warmup_operations",
                            "offered_ops_per_second", "distribution")
         common = lambda backend: sorted(
             cloud.analyze.canonical({k: job[k] for k in workload_fields})
-            for job in selected if job["backend"] == backend and job["cohort"] == "primary_rf1")
+            for job in selected if job["backend"] == backend and job["cohort"] == "primary_rf1"
+            and job["profile"] != "write-batch32")
         self.assertTrue(common("valkey_tcp"))
         self.assertEqual(common("valkey_tcp"), common("valkey_rdma"))
-        self.assertEqual(common("valkey_tcp"), common("tidehunter_verbs"))
-        self.assertEqual(common("valkey_tcp"), common("tidehunter_verbs_native"))
+        self.assertEqual(common("valkey_tcp"), common("tidehunter_nvme_tcp"))
+        self.assertEqual(common("valkey_tcp"), common("tidehunter_nvme_rdma"))
 
-
-    def nvmeof_spec(self):
-        return self.spec(1) | {
-            "mode": "nvmeof-focused",
-            "backends": ["native", "tidehunter_tcp", "tidehunter_nvme_tcp"],
-        }
-
-    def test_nvmeof_matrix_requires_controls_and_one_repetition(self):
-        spec = self.nvmeof_spec()
-        for backend in spec["backends"]:
-            with self.subTest(missing=backend), self.assertRaises(ValueError):
-                cloud.make_matrix(spec | {"backends": [b for b in spec["backends"] if b != backend]})
-        with self.assertRaises(ValueError):
-            cloud.make_matrix(spec | {"repeats": 2})
-        with self.assertRaises(ValueError):
-            cloud.make_matrix(spec | {"backends": spec["backends"] + ["valkey_tcp"]})
-        jobs = cloud.make_matrix(spec | {"backends": spec["backends"] + ["tidehunter_efa_native"]})
-        self.assertEqual({job["backend"] for job in jobs}, set(spec["backends"]) | {"tidehunter_efa_native"})
-        self.assertEqual(len(jobs), 125)
-
-    def test_portable_nvme_rdma_selection_keeps_logical_data_and_distinct_sources(self):
-        for verbs in ("tidehunter_verbs", "tidehunter_verbs_native"):
-            for extra in ([], ["tidehunter_nvme_tcp"]):
-                backends = ["native", "tidehunter_tcp", verbs, "tidehunter_nvme_rdma"] + extra
-                jobs = cloud.make_matrix(self.nvmeof_spec() | {"backends": backends})
-                reads = [job for job in jobs if job["cohort"] == "sealed_read"]
-                writes = [job for job in jobs if job["cohort"] == "native_write_regression"]
-                self.assertEqual({job["backend"] for job in reads}, set(backends))
-                self.assertEqual({job["backend"] for job in writes}, {"native", "tidehunter_tcp", verbs})
-                for size in (64, 256, 1024, 8192, 65536):
-                    block = [job for job in reads if job["value_size"] == size]
-                    self.assertEqual(len({job["sealed_dataset"]["data_id"] for job in block}), 1)
-                    sources = {backend: {job["sealed_dataset"]["source_id"] for job in block
-                                         if job["backend"] == backend} for backend in backends}
-                    self.assertTrue(all(len(source) == 1 for source in sources.values()))
-                    self.assertEqual(sources["tidehunter_tcp"], sources["tidehunter_nvme_rdma"])
-                    self.assertEqual(len({next(iter(sources[backend])) for backend in
-                                          ("native", "tidehunter_tcp", verbs)}), 3)
-                    if extra:
-                        self.assertEqual(sources["tidehunter_tcp"], sources["tidehunter_nvme_tcp"])
-                self.assertTrue(all(job["coordinator_cache_bytes"] == 0 for job in reads))
-                self.assertTrue(all(job["mix"]["read"] + job["mix"]["get_many"] == 100 for job in reads))
-        for backends in (["native", "tidehunter_tcp", "tidehunter_verbs"],
-                         ["native", "tidehunter_nvme_rdma"], ["tidehunter_tcp", "tidehunter_nvme_rdma"],
-                         ["native", "tidehunter_tcp", "tidehunter_nvme_rdma", "valkey_rdma"]):
-            with self.subTest(backends=backends), self.assertRaises(ValueError):
-                cloud.make_matrix(self.nvmeof_spec() | {"backends": backends})
-        with self.assertRaises(ValueError):
-            cloud.make_matrix(self.nvmeof_spec() | {"mode": "standard",
-                "backends": ["native", "tidehunter_tcp", "tidehunter_nvme_rdma"]})
-
-
-    def test_nvmeof_matrix_has_complete_read_shapes_and_independent_twins(self):
-        spec = self.nvmeof_spec()
-        jobs = cloud.make_matrix(spec)
-        self.assertEqual(len(jobs), 90)
-        self.assertEqual(len({job["case_id"] for job in jobs}), len(jobs))
-        self.assertEqual({job["repeat"] for job in jobs}, {0})
-        reads = [job for job in jobs if job["cohort"] == "sealed_read"]
-        expected = set()
-        for backend in spec["backends"]:
-            for size in (64, 256, 1024, 8192, 65536):
-                shapes = (("scalar", 1), ("scalar", 16), ("batch32", 1), ("batch32", 16)) \
-                    if size in (1024, 8192) else (("scalar", 1),)
-                for shape, concurrency in shapes:
-                    for tier in ("first_touch", "repeat_read"):
-                        expected.add((backend, size, shape, concurrency, tier, False))
-                        if backend != "native" and (size, shape, concurrency) in (
-                                (1024, "scalar", 1), (8192, "batch32", 16)):
-                            expected.add((backend, size, shape, concurrency, tier, True))
-        actual = set()
-        twins = {}
-        for job in reads:
-            shape = "batch32" if job["mix"]["get_many"] else "scalar"
-            profiled = job["sealed_dataset"]["profiled"]
-            tier = job["sealed_dataset"]["tier"]
-            key = (job["backend"], job["value_size"], shape, job["concurrency"], tier)
-            actual.add((*key, profiled))
-            twins.setdefault(key, []).append(job)
-            self.assertEqual(job["mix"], cloud.mix(**{"get_many" if shape == "batch32" else "read": 100}))
-            self.assertEqual(job["read_lanes"], 0 if job["backend"] == "native" else
-                             (4 if job["concurrency"] == 16 else 1))
-            self.assertEqual(job["warmup_operations"], 0)
-            self.assertEqual(job["measurement_operations"], 2048 if shape == "batch32" else 8192)
-            self.assertEqual(job["coordinator_cache_bytes"], 0)
-            self.assertNotIn("owner_read_cache_bytes", job)
-            self.assertEqual(job["measurement_key_sweep"], tier == "first_touch")
-            self.assertEqual(job["drop_os_caches"], tier == "first_touch")
-            self.assertEqual(job["evict_mapped_wal_before_measurement"],
-                             tier == "first_touch" and job["backend"] not in cloud.NVME_BACKENDS)
-            self.assertEqual(job["keys"], 65536 if job["value_size"] in (1024, 8192) else 8192)
-        self.assertEqual(actual, expected)
-        self.assertEqual(len(reads), len(expected))
-        for key, pair in twins.items():
-            self.assertEqual(len(pair), 2 if (*key, True) in expected else 1)
-            baseline = next(job for job in pair if not job["sealed_dataset"]["profiled"])
-            self.assertNotIn("diagnostics", baseline)
-            if len(pair) == 2:
-                diagnostic = next(job for job in pair if job["sealed_dataset"]["profiled"])
-                self.assertNotEqual(baseline["case_id"], diagnostic["case_id"])
-                self.assertEqual(baseline["sealed_dataset"]["source_id"], diagnostic["sealed_dataset"]["source_id"])
-                self.assertEqual(diagnostic["diagnostics"]["read_profile_limit"], 256)
-
-        writes = [job for job in jobs if job["cohort"] == "native_write_regression"]
-        scalar = [job for job in writes if job["mix"] == cloud.mix(put=100)]
-        batch = [job for job in writes if job["mix"] == cloud.mix(put_batch=100)]
-        self.assertEqual(len(scalar), 12)
-        self.assertEqual(len(batch), 4)
-        self.assertEqual({(job["backend"], job["value_size"]) for job in scalar if "diagnostics" in job},
-                         {("tidehunter_tcp", 1024), ("tidehunter_tcp", 8192)})
-        self.assertEqual({(job["backend"], job["value_size"]) for job in scalar if "diagnostics" not in job},
-                         {(backend, size) for backend in ("native", "tidehunter_tcp")
-                          for size in (64, 256, 1024, 8192, 65536)})
-        self.assertTrue(all("diagnostics" not in job for job in batch))
-        self.assertEqual({(job["value_size"], job["measurement_operations"]) for job in batch},
-                         {(1024, 2048), (8192, 2048)})
-        self.assertTrue(all(job["measurement_operations"] == 4096 for job in scalar))
-        self.assertEqual({job["backend"] for job in writes}, {"native", "tidehunter_tcp"})
-        self.assertTrue(all(job["concurrency"] == 16 and "sealed_dataset" not in job for job in writes))
-        self.assertLess(max(index for index, job in enumerate(jobs) if job["cohort"] == "sealed_read"),
-                        min(index for index, job in enumerate(jobs) if job["cohort"] == "native_write_regression"))
-
-    def test_nvmeof_sealed_source_identity_and_read_only_run_configs(self):
-        spec = self.nvmeof_spec()
-        jobs = [job for job in cloud.make_matrix(spec) if job["cohort"] == "sealed_read"]
-        identities = {}
-        for job in jobs:
-            sealed = job["sealed_dataset"]
-            expected = f"sealed-v2-seed{spec['seed']}-size{job['value_size']}-keys{job['keys']}"
-            self.assertEqual(sealed["source_id"], expected + ("-native" if job["backend"] == "native" else "-tcp"))
-            self.assertEqual(sealed["data_id"], expected)
-            self.assertEqual(sealed["seed"], spec["seed"])
-            self.assertEqual(sealed["page_cache_policy"],
-                             "drop_at_measurement_gate" if job["drop_os_caches"] else "not_dropped")
-            self.assertEqual(sealed["target_cache"], "buffered_file_page_cache" if job["backend"] == "tidehunter_nvme_tcp"
-                             else "not_applicable")
-            config = cloud.make_run_config(job, Path("/tmp/owned-case") / job["case_id"], {}, "source")
-            self.assertFalse(config["phases"]["preload"])
-            self.assertTrue(config["phases"]["verify_existing_dataset"])
-            self.assertEqual(config["phases"]["evict_mapped_wal_before_measurement"],
-                             job["evict_mapped_wal_before_measurement"])
-            self.assertEqual(config["seed"], spec["seed"])
-            self.assertEqual(config["dataset"]["keys"], job["keys"])
-            self.assertEqual(config["phases"].get("measurement_key_sweep", False),
-                             sealed["tier"] == "first_touch")
-            self.assertEqual(config["dataset"]["value_size"], job["value_size"])
-            identities.setdefault(job["value_size"], set()).add((sealed["data_id"], config["namespace"]))
-        self.assertTrue(all(len(values) == 1 for values in identities.values()))
-        self.assertEqual(len({next(iter(values))[0] for values in identities.values()}), 5)
-        self.assertEqual(len({next(iter(values))[1] for values in identities.values()}), 5)
 
     def test_nvmeof_measurement_qualification_requires_complete_clean_interval(self):
         def evidence():
@@ -779,185 +535,10 @@ class CloudMatrixTests(unittest.TestCase):
             {"target_receipt": {"target_cache": "buffered_file_page_cache",
                                 "target_cache_verified": False, "selected_transport": "tcp"}}]}}])["qualified"])
 
-    def test_short_campaign_keeps_existing_cases_and_prioritizes_controls(self):
-        spec = self.spec(1)
-        jobs = cloud.make_matrix(spec | {"mode": "read-tier-focused"})
-        self.assertEqual(len(jobs), 142)
-        self.assertEqual(len({j["case_id"] for j in jobs}), len(jobs))
-        self.assertTrue(all(j["read_tier"]["name"] in
-                            ("native_hot_wal_lru0_pagecache", "native_cold_os_lru0", "cold_device")
-                            for j in jobs[:12]))
-        selected = spec | {"mode": "read-tier-focused",
-                           "backends": ["native", "tidehunter_tcp", "tidehunter_efa_native", "valkey_tcp"]}
-        smaller = cloud.make_matrix(selected)
-        self.assertEqual(len(smaller), 69)
-        self.assertEqual({j["backend"] for j in smaller}, set(selected["backends"]))
-        self.assertEqual(sum(j["profile"] == "write-concurrent" for j in smaller), 5)
-        self.assertEqual(sum(j["profile"] == "read-many32" for j in smaller), 4)
-        with self.assertRaises(ValueError):
-            cloud.make_matrix(self.spec(2) | {"mode": "read-tier-focused"})
-    def test_short_campaign_includes_separate_write_profiles_when_requested(self):
-        spec = self.spec(1) | {"mode": "read-tier-focused",
-                              "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256}}
-        jobs = cloud.make_matrix(spec)
-        self.assertEqual(len(jobs), 147)
-        diagnostics = [j for j in jobs if j["cohort"] == "write_stage_diagnostics"]
-        self.assertEqual({j["backend"] for j in diagnostics},
-                         {"native"} | (set(spec["backends"]) & set(cloud.TRANSPORTS)))
-        self.assertTrue(all(j["diagnostics"]["write_profile_limit"] == 256
-                            and j["measurement_operations"] == 4096 for j in diagnostics))
-        self.assertEqual(sum(j["cohort"] == "primary_rf1" and j["profile"] == "write-concurrent"
-                             for j in jobs), 11)
-        selected = spec | {"backends": ["native", "tidehunter_tcp", "tidehunter_efa_native", "valkey_tcp"]}
-        self.assertEqual(len(cloud.make_matrix(selected)), 72)
-        timeline_jobs = cloud.make_matrix(selected | {"diagnostics": {
-            "write_profile_limit": 256, "read_profile_limit": 256, "write_timeline_limit": 8192}})
-        timelines = [j for j in timeline_jobs if j["cohort"] == "write_timeline_diagnostics"]
-        self.assertEqual(len(timeline_jobs), 74)
-        self.assertEqual({j["backend"] for j in timelines}, {"tidehunter_tcp", "tidehunter_efa_native"})
-        self.assertTrue(all(j["measurement_operations"] == 4096 and j["diagnostics"] ==
-                            {"write_profile_limit": 0, "write_timeline_limit": 8192} for j in timelines))
-
-
-
-    def test_focused_tiers_are_ordered_matched_and_bounded(self):
-        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
-        names = list(dict.fromkeys(j["read_tier"]["name"] for j in jobs))
-        self.assertEqual(names, ["remote", "coordinator_hit", "wal_warm",
-                                 "native_hot_wal_lru0_pagecache", "cold_device",
-                                 "native_cold_os_lru0", "bounded_mixed"])
-        self.assertTrue(all("owner_read_cache_bytes" not in job and "resident_reads" not in job
-                            for job in jobs))
-        native = [j for j in jobs if j["backend"] == "native"]
-        self.assertEqual(len(native), 10)
-        self.assertTrue(all("diagnostics" not in j for j in native))
-        remote = [j for j in jobs if j["backend"] != "native"]
-        twins = {}
-        for job in remote:
-            twins.setdefault((job["read_tier"]["name"], job["read_tier"]["source_id"]), []).append(job)
-        for first, second in twins.values():
-            self.assertFalse(first["read_tier"]["profiled"])
-            self.assertTrue(second["read_tier"]["profiled"])
-            self.assertEqual(first["read_tier"]["source_id"], second["read_tier"]["source_id"])
-            self.assertEqual(first["mix"], second["mix"])
-            a = cloud.make_run_config(first, Path("/tmp/owned-case"), {}, "source")
-            b = cloud.make_run_config(second, Path("/tmp/owned-case"), {}, "source")
-            self.assertEqual(a["namespace"], b["namespace"])
-            self.assertEqual(a["dataset"], b["dataset"])
-            self.assertEqual(a["phases"], b["phases"])
-            self.assertNotIn("resident_reads", first)
-        contended = [job for job in jobs if "-c16-" in job["profile"]]
-        self.assertTrue(contended)
-        self.assertTrue(all(job["concurrency"] == 16 and job["read_lanes"] == (0 if job["backend"] == "native" else 4)
-                            for job in contended))
-        self.assertEqual({(job["value_size"], job["mix"]["get_many"]) for job in contended}, {(1024, 0), (8192, 100)})
-        self.assertTrue(all(job["warmup_key_sweep"] and
-                            job["warmup_operations"] * (32 if job["mix"]["get_many"] else 1) >= job["keys"]
-                            for job in contended))
-        with self.assertRaises(ValueError):
-            cloud.make_matrix(self.spec(1) | {"mode": "read-tier", "backends": ["native"]})
-
-    def test_focused_data_identity_is_shared_across_backends_and_profiles(self):
-        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
-        selected = [job for job in jobs if job["value_size"] == 8192]
-        self.assertEqual({job["backend"] for job in selected},
-                         {"native"} | (set(self.spec(1)["backends"]) & set(cloud.TRANSPORTS)))
-        self.assertGreater(len({job["read_tier"]["source_id"] for job in selected}), 4)
-        self.assertEqual(len({job["read_tier"]["data_id"] for job in selected}), 1)
-        configs = [cloud.make_run_config(job, Path("/tmp/owned-case"), {}, "source") for job in selected]
-        self.assertEqual(len({config["namespace"] for config in configs}), 1)
-        self.assertEqual(len({config["seed"] for config in configs}), 1)
-        self.assertEqual(len({json.dumps(config["dataset"], sort_keys=True) for config in configs}), 1)
-        self.assertGreater(len({json.dumps(config["workload"], sort_keys=True) for config in configs}), 1)
-        other = next(job for job in jobs if job["value_size"] == 1024)
-        self.assertNotEqual(other["read_tier"]["data_id"], selected[0]["read_tier"]["data_id"])
-
-    def test_pure_cache_budgets_fit_working_set_and_fleet_bounds(self):
-        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
-        pure = [j for j in jobs if j["read_tier"]["name"] == "coordinator_hit"]
-        self.assertTrue(all(j["coordinator_cache_bytes"] >= 2 * j["keys"] * (j["value_size"] + 512)
-                            for j in pure))
-        large = next(j for j in pure if j["value_size"] == 65536)
-        self.assertGreaterEqual(large["coordinator_cache_bytes"], 1024**3)
-        self.assertGreaterEqual(large["coordinator_read_memory_allowance_bytes"],
-                                large["coordinator_cache_bytes"] + 64 * 1024**2)
-        mixed = [j for j in jobs if j["read_tier"]["name"] == "bounded_mixed"]
-        self.assertTrue(all(j["coordinator_cache_bytes"] == 1024**2 for j in mixed))
-        controller.validate_read_tier_memory(jobs, {"client_memory_mib": 16384, "server_memory_mib": 16384})
-        with self.assertRaisesRegex(ValueError, "fleet memory budget"):
-            controller.validate_read_tier_memory(jobs, {"client_memory_mib": 1024, "server_memory_mib": 16384})
-
-    def test_focused_report_exposes_missing_and_partial_trace_capability(self):
-        spec = self.spec(1) | {"mode": "read-tier"}
-        jobs = cloud.make_matrix(spec)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "matrix.json").write_text(json.dumps({"spec": spec, "jobs": jobs}))
-            report = cloud.report(root)
-            self.assertFalse(report["trace_capability"]["identity_backend_available"])
-            self.assertIn("probe not completed", report["trace_capability"]["gaps"][0])
-            receipt = {"schema_version": 1, "identity_backend_available": False,
-                       "hosts": [], "gaps": [{"host_index": 3, "gaps": ["BPF unavailable"]}]}
-            (root / "trace-capability.json").write_text(json.dumps(receipt))
-            self.assertEqual(cloud.report(root)["trace_capability"], receipt)
-
-    def test_tier_qualification_never_infers_missing_or_cold_device_evidence(self):
-        job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
-                   if j["read_tier"]["name"] == "cold_device")
-        proof = cloud.qualify_read_tier(job, None, {"status": "completed"})
-        self.assertFalse(proof["qualified"])
-        self.assertIsNone(proof["observed"]["wal_reads"])
-        self.assertTrue(any("trace" in reason for reason in proof["reasons"]))
-
-    def test_tier_plot_profiles_do_not_share_identity(self):
-        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
-        identities = {(j["backend"], j["cohort"], j["profile"], j["value_size"], j["repeat"]) for j in jobs}
-        self.assertEqual(len(identities), len(jobs))
-
-    def test_cold_trace_loss_and_missing_counts_disqualify(self):
-        job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
-                   if j["read_tier"]["name"] == "cold_device")
-        coord = {"available": True, "counters": {"hits": 0, "misses": 1, "read_rpc_count": 1}}
-        owner_counts = {"wal_reads": 1, "wal_read_bytes": 256, "async_read_submissions": 1}
-        def partitions(counts):
-            return {"available": True, "partitions": {str(i): {"available": True, "counters": dict(counts)}
-                                                       for i in range(5)}}
-        evidence = {"measurement_drained": True, "deltas": {"coordinator": coord,
-                    "owner_executor": partitions(owner_counts)}}
-        trace = dict.fromkeys(("unmatched_completions", "unmatched_issues", "overlaps",
-            "split_or_partial_completions", "requeues", "completion_errors", "malformed_events",
-            "outstanding_overflow", "lost", "truncated"), 0)
-        trace.update(available=True, qualified=False, read_issues=1, read_completions=1)
-        receipt = {"status": "completed", "read_tier_effective": dict(job["read_tier"]["requested"]),
-                   "cold_device_evidence": [{"available": False}, *[dict(trace) for _ in range(5)]]}
-        proof = cloud.qualify_read_tier(job, evidence, receipt)
-        self.assertFalse(proof["qualified"])
-        self.assertEqual(proof["scope"], "measurement_counters_and_wider_collector_window")
-        self.assertTrue(any("wider than measurement" in reason for reason in proof["reasons"]))
-        receipt["cold_device_evidence"][2]["truncated"] = True
-        self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
-        receipt["cold_device_evidence"][2] = {"available": False}
-        self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
-
-    def test_warm_wal_does_not_claim_page_cache_residency(self):
-        job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
-                   if j["read_tier"]["name"] == "wal_warm")
-        owner = {"available": True, "partitions": {
-            str(i): {"available": True, "counters": {"wal_reads": 1}} for i in range(5)}}
-        evidence = {"measurement_drained": True, "deltas": {
-            "coordinator": {"available": True, "counters": {"hits": 0}},
-            "owner_executor": owner}}
-        receipt = {"status": "completed", "read_tier_effective": dict(job["read_tier"]["requested"])}
-        proof = cloud.qualify_read_tier(job, evidence, receipt)
-        self.assertFalse(proof["qualified"])
-        self.assertTrue(any("page cache" in reason for reason in proof["reasons"]))
-        del owner["partitions"]["0"]
-        self.assertIsNone(cloud.qualify_read_tier(job, evidence, receipt)["observed"]["wal_reads"])
-
     def test_one_repeat_preserves_every_first_repeat_job_and_run_configuration(self):
         single = cloud.make_matrix(self.spec(1))
         historical = cloud.make_matrix(self.spec(3))
-        self.assertEqual((len(single), len(historical)), (298, 894))
+        self.assertEqual((len(single), len(historical)), (190, 570))
         first = [job for job in historical if job["repeat"] == 0]
         for job, old_job in zip(single, first):
             self.assertEqual({k: v for k, v in job.items() if k != "case_id"},
@@ -968,7 +549,7 @@ class CloudMatrixTests(unittest.TestCase):
     def test_write_diagnostics_are_a_distinct_cohort_without_reducing_any_work(self):
         normal = cloud.make_matrix(self.spec(1))
         diagnostic = cloud.make_matrix(self.spec(1) | {"diagnostics": {"write_profile_limit": 256}})
-        self.assertEqual(len(diagnostic), len(normal) + 5)
+        self.assertEqual(len(diagnostic), len(normal) + 1)
         def identity(job):
             return job["backend"], job["repeat"], job["profile"], job["cohort"], job["value_size"]
         retained = {identity(job): job for job in diagnostic if job["cohort"] != "write_stage_diagnostics"}
@@ -1015,8 +596,8 @@ class CloudMatrixTests(unittest.TestCase):
 
 
     def test_manual_read_diagnostics_are_propagated_for_mixed_cases(self):
-        job = next(job for job in cloud.make_matrix(self.spec(1))
-                   if job["backend"] == "tidehunter_tcp" and job["profile"] == "point-mixed")
+        spec = self.spec(1) | {"mode": "standard-with-live-nvmeof", "backends": ["tidehunter_nvme_tcp"]}
+        job = next(job for job in cloud.make_matrix(spec) if job["profile"] == "point-mixed")
         job["diagnostics"] = {"read_profile_limit": 7, "write_profile_limit": 0}
         self.assertEqual(cloud.make_run_config(job, Path("/tmp/owned-case"), {}, "source")["diagnostics"],
                          job["diagnostics"])
@@ -1122,7 +703,7 @@ class CloudMatrixTests(unittest.TestCase):
             self.assertEqual(legacy["backend"]["options"]["durability"], "value_wal_barrier")
 
     def test_exact_case_bound_admits_all_jobs_but_never_truncates(self):
-        for repeats, count in ((1, 298), (3, 894)):
+        for repeats, count in ((1, 190), (3, 570)):
             with self.subTest(repeats=repeats):
                 spec = self.spec(repeats) | {"max_cases": count}
                 self.assertEqual(len(cloud.make_matrix(spec)), count)
@@ -1157,22 +738,22 @@ class CloudMatrixTests(unittest.TestCase):
             with self.subTest(backends=invalid), self.assertRaises(ValueError):
                 cloud.make_matrix(full | {"backends": invalid})
         self.assertEqual(len(cloud.make_matrix(self.spec(3) | {
-            'diagnostics': {'write_profile_limit': 256}})), 909)
+            'diagnostics': {'write_profile_limit': 256}})), 573)
 
     def test_historical_frozen_jobs_report_without_current_completeness(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs = [job for job in cloud.make_matrix(self.spec(1))
-                    if job["backend"] in cloud.LEGACY_BACKENDS]
+                    if job["backend"] != "kvrocks"]
             jobs.append({**jobs[0], "case_id": "historical-registered-value",
                          "cohort": "registered_ram_fullset_control"})
             frozen = {"schema_version": 1, "spec": self.spec(1) | {
-                "backends": list(cloud.LEGACY_BACKENDS)}, "jobs": jobs}
+                "backends": [b for b in cloud.BACKENDS if b != "kvrocks"]}, "jobs": jobs}
             original = json.dumps(frozen)
             (root / "matrix.json").write_text(original)
             report = cloud.report(root)
             self.assertEqual(report["planned_cases"], len(jobs))
-            self.assertEqual(report["planned_backends"], sorted(cloud.LEGACY_BACKENDS))
+            self.assertEqual(report["planned_backends"], sorted(set(cloud.BACKENDS) - {"kvrocks"}))
             self.assertFalse(report["current_backend_coverage"])
             self.assertEqual((root / "matrix.json").read_text(), original)
             self.assertEqual([row["job"] for row in report["cases"]], jobs)

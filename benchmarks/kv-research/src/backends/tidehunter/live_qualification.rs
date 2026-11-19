@@ -3,6 +3,7 @@ use super::*;
 use crate::workload::{key_bytes, value_bytes};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,13 +14,7 @@ struct Input {
     namespace: [u8; 16],
     expected_route: String,
     durability_tier: String,
-    #[serde(default = "default_target_implementation")]
-    target_implementation: String,
     value_bytes: usize,
-}
-
-fn default_target_implementation() -> String {
-    "kernel".to_owned()
 }
 // This is diagnostic state, never a successful qualification receipt. Updating
 // it is best-effort so an evidence I/O error cannot replace the actual failure.
@@ -151,7 +146,7 @@ fn transition_write(
     Ok(())
 }
 
-fn verify_routes(sample: &serde_json::Value, expected: &str, target: &str) -> BackendResult<()> {
+fn verify_routes(sample: &serde_json::Value, expected: &str) -> BackendResult<()> {
     let routes = sample
         .get("routes")
         .and_then(serde_json::Value::as_array)
@@ -170,65 +165,6 @@ fn verify_routes(sample: &serde_json::Value, expected: &str, target: &str) -> Ba
             .get("namespace_identity")
             .and_then(serde_json::Value::as_object)
             .ok_or("observed live namespace identity unavailable")?;
-        check(
-            route
-                .get("target_implementation")
-                .and_then(serde_json::Value::as_str)
-                == Some(target)
-                && identity
-                    .get("target_implementation")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(target),
-            "opened namespace target implementation differs from requested qualification",
-        )?;
-        if target == "spdk" {
-            let spdk = route
-                .get("spdk")
-                .and_then(serde_json::Value::as_object)
-                .ok_or("opened SPDK route lacks authenticated owner binding")?;
-            check(
-                spdk.get("rpc_socket")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|s| Path::new(s).is_absolute())
-                    && spdk
-                        .get("image_path")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|s| Path::new(s).is_absolute())
-                    && spdk
-                        .get("pid")
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some_and(|n| n > 0)
-                    && spdk
-                        .get("process_start_ticks")
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some_and(|n| n > 0)
-                    && spdk
-                        .get("bdev_name")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|s| !s.is_empty()),
-                "incomplete authenticated SPDK owner binding",
-            )?;
-            if let Some(writer) = route.get("writer").and_then(serde_json::Value::as_object) {
-                let file = writer
-                    .get("file_identity")
-                    .and_then(serde_json::Value::as_object)
-                    .ok_or("SPDK writer lacks authenticated WAL file identity")?;
-                check(
-                    file.get("path") == spdk.get("image_path")
-                        && file
-                            .get("device")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some()
-                        && file
-                            .get("inode")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some_and(|n| n > 0)
-                        && file.get("bytes") == identity.get("bytes")
-                        && file.get("block_size") == identity.get("block_size"),
-                    "SPDK writer binding does not match authenticated WAL file",
-                )?;
-            }
-        }
         check(
             identity
                 .get("namespace_path")
@@ -275,11 +211,7 @@ fn verify_routes(sample: &serde_json::Value, expected: &str, target: &str) -> Ba
     }
     Ok(())
 }
-fn verify_fences(
-    sample: &serde_json::Value,
-    partitions: &[u32],
-    target: &str,
-) -> BackendResult<()> {
+fn verify_fences(sample: &serde_json::Value, partitions: &[u32]) -> BackendResult<()> {
     check(
         count(sample, "fence_evidence_dropped")? == 0,
         "live fence evidence was dropped",
@@ -297,7 +229,6 @@ fn verify_fences(
                         .and_then(serde_json::Value::as_u64)
                         .is_some_and(|epoch| epoch >= 2)
                     && f["target"]["fixture_only"] == false
-                    && f["target"]["target_implementation"].as_str() == Some(target)
                     && f["target"]["disable_drain_successes"]
                         .as_u64()
                         .is_some_and(|n| n > 0)
@@ -311,7 +242,6 @@ fn verify_fences(
 fn shutdown_targets(
     config: &RemoteDatabaseConfig,
     shape: &KeyShape,
-    target: &str,
 ) -> BackendResult<Vec<serde_json::Value>> {
     use tidehunter::distributed::storage::{PartitionConfig, StaticInventory};
     use tidehunter::distributed::tcp::Client;
@@ -354,19 +284,7 @@ fn shutdown_targets(
         }
         let stats = client.shutdown_live_target(epoch)?;
         check(
-            !stats.fixture_only
-                && stats.owned_namespace_count == 0
-                && stats.errors == 0
-                && matches!(
-                    (stats.target_implementation, target),
-                    (
-                        tidehunter::distributed::nvmeof::LiveTargetImplementation::Kernel,
-                        "kernel"
-                    ) | (
-                        tidehunter::distributed::nvmeof::LiveTargetImplementation::Spdk,
-                        "spdk"
-                    )
-                ),
+            !stats.fixture_only && stats.owned_namespace_count == 0 && stats.errors == 0,
             "owner target shutdown did not prove matching namespace cleanup",
         )?;
         receipts.push(serde_json::json!({
@@ -410,7 +328,7 @@ fn run_local_file(input: &Input, output: &Path) -> BackendResult<()> {
     use tidehunter::distributed::{
         codec::{BatchLimits, CompleteBatch, Mutation},
         group::{CompleteGroup, GroupLimits},
-        nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult},
+        nvmeof::live_storage::LiveGroupDescriptor,
         storage::{PartitionConfig, PartitionLog, StaticInventory},
         types::{BatchId, BatchVersion, RequestAuthority},
     };
@@ -478,27 +396,31 @@ fn run_local_file(input: &Input, output: &Path) -> BackendResult<()> {
             config.batch_limits,
             config.group_limits,
         )?;
-        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group)?;
-        let reservation = match log.reserve_live_group(authority, descriptor.clone())? {
-            LiveReserveResult::Reserved(reservation) => reservation,
-            LiveReserveResult::Existing(_) => {
-                return Err("fresh local group unexpectedly existed".into());
-            }
-        };
+        let (_, frame) = LiveGroupDescriptor::from_group(&group)?;
+        let (extent, _) = log.lease_live_extent(authority)?;
         let file = fs::OpenOptions::new()
             .write(true)
-            .open(&reservation.segment.path)?;
-        file.write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)?;
-        let appended = log.complete_live_group(authority, reservation.token)?;
-        check(appended.len() == 1, "local group receipt count mismatch")?;
+            .open(&extent.segment.path)?;
+        file.write_all_at(&frame, extent.start % extent.segment.bytes)?;
+        let through = extent.start + frame.len() as u64;
+        // Close the extent behind a skip marker unless the frame fills it.
+        if through < extent.end {
+            let mut skip = [0; 4096];
+            skip[..8].copy_from_slice(tidehunter::crc::CrcFrame::skip_marker().as_ref());
+            file.write_all_at(&skip, through % extent.segment.bytes)?;
+        }
+        let (adoption, _) = log.adopt_live_extent(authority, extent.token, through, true)?;
+        check(
+            adoption.closed && adoption.receipt_count == 1,
+            "local leased frame adoption mismatch",
+        )?;
+        let appended = log.receipt_page(log.receipt_count() - 1, 1)?;
         log.persist_many(&appended)?;
         check(
-            log.complete_live_group(authority, reservation.token)? == appended,
-            "local finalize retry mismatch",
-        )?;
-        check(
-            matches!(log.reserve_live_group(authority, descriptor)?, LiveReserveResult::Existing(found) if found == appended),
-            "local reservation retry mismatch",
+            log.adopt_live_extent(authority, extent.token, through, true)?
+                .0
+                == adoption,
+            "local adoption retry mismatch",
         )?;
         check(
             log.read_batch(appended[0])?.encoded() == batch.encoded(),
@@ -521,7 +443,7 @@ fn run_local_file(input: &Input, output: &Path) -> BackendResult<()> {
     let proof = serde_json::json!({
         "schema_version": 1, "kind": "live_nvmeof_file_component_qualification",
         "durability_tier": input.durability_tier,
-        "scope": "local positional file protocol; not kernel NVMe-oF, RDMA, or hardware performance",
+        "scope": "local positional file protocol on the leased route; not kernel NVMe-oF, RDMA, or hardware performance",
         "frame_count": receipts.len(), "mixed_put_delete": true,
         "owner_validate_persist_retry_recovery": true
     });
@@ -559,12 +481,8 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
         .remote_config
         .ok_or("child requires remote configuration")?;
     check(
-        matches!(input.expected_route.as_str(), "tcp" | "rdma") && remote.live_nvme.is_some(),
+        matches!(input.expected_route.as_str(), "tcp" | "rdma"),
         "child requires a live Linux initiator route",
-    )?;
-    check(
-        matches!(input.target_implementation.as_str(), "kernel" | "spdk"),
-        "target_implementation must be kernel or spdk",
     )?;
     let mut progress = QualificationProgress {
         directory: ready.parent().ok_or("missing ready parent")?.to_path_buf(),
@@ -579,10 +497,8 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
     let ks = db.ks("root");
     let start = stats(&db)?;
     check(
-        count(&start, "payload_rpc_requests")? == 0
-            && count(&start, "errors")? == 0
-            && count(&start, "unknown_writes")? == 0,
-        "abrupt child opened with payload RPC or live I/O errors",
+        count(&start, "errors")? == 0 && count(&start, "unknown_writes")? == 0,
+        "abrupt child opened with live I/O errors or unknown writes",
     )?;
     progress.mark("child_mixed_write", Some(&db));
     let mut batch = db.write_batch();
@@ -601,12 +517,10 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
         "abrupt child did not complete a live payload write",
     )?;
     check(
-        delta(&start, &end, "payload_rpc_requests")? == 0
-            && delta(&start, &end, "errors")? == 0
-            && delta(&start, &end, "unknown_writes")? == 0,
-        "abrupt child used payload RPC or encountered an unknown write",
+        delta(&start, &end, "errors")? == 0 && delta(&start, &end, "unknown_writes")? == 0,
+        "abrupt child encountered live I/O errors or unknown writes",
     )?;
-    verify_routes(&end, &input.expected_route, &input.target_implementation)?;
+    verify_routes(&end, &input.expected_route)?;
     progress.mark("child_ready_write", Some(&db));
     let evidence = serde_json::json!({
         "schema_version": 1, "kind": "acknowledged_unrooted_mixed_batch",
@@ -654,11 +568,7 @@ fn qualify_member_transition(
         "member transition qualification geometry is outside its bounded fixture",
     )?;
     let transition_start = stats(db)?;
-    verify_routes(
-        &transition_start,
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
+    verify_routes(&transition_start, &input.expected_route)?;
     let initial_routes = transition_start["routes"]
         .as_array()
         .ok_or("member transition routes unavailable")?;
@@ -757,7 +667,7 @@ fn qualify_member_transition(
                     && &route["namespace_identity"]["uuid"] != initial_uuid
             })
         {
-            verify_routes(sample, &input.expected_route, &input.target_implementation)?;
+            verify_routes(sample, &input.expected_route)?;
             break;
         }
     }
@@ -795,14 +705,9 @@ fn qualify_member_transition(
     )?;
     let transition_checked = stats(db)?;
     check(
-        delta(
-            &transition_start,
-            &transition_checked,
-            "payload_rpc_requests",
-        )? == 0
-            && delta(&transition_start, &transition_checked, "errors")? == 0
+        delta(&transition_start, &transition_checked, "errors")? == 0
             && delta(&transition_start, &transition_checked, "unknown_writes")? == 0,
-        "member transition used payload RPC or encountered an unknown write",
+        "member transition encountered live I/O errors or unknown writes",
     )?;
     let member_transition = serde_json::json!({
         "wal_file_bytes": remote.storage.wal_file_bytes,
@@ -872,19 +777,10 @@ fn qualify_abrupt_child(
                 &child_evidence["start"],
                 &child_evidence["end"],
                 "completed_write_bytes",
-            )? > 0
-            && delta(
-                &child_evidence["start"],
-                &child_evidence["end"],
-                "payload_rpc_requests",
-            )? == 0,
+            )? > 0,
         "abrupt child evidence did not prove live payload write",
     )?;
-    verify_routes(
-        &child_evidence["end"],
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
+    verify_routes(&child_evidence["end"], &input.expected_route)?;
     Ok(child_evidence)
 }
 
@@ -899,18 +795,10 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         input.namespace != [0; 16] && (1..=65536).contains(&input.value_bytes),
         "invalid bounded qualification data",
     )?;
-    check(
-        matches!(input.target_implementation.as_str(), "kernel" | "spdk"),
-        "target_implementation must be kernel or spdk",
-    )?;
     if input.expected_route == "local_file" {
         check(
             input.remote_config.is_none(),
             "local file qualification must not configure a remote backend",
-        )?;
-        check(
-            input.target_implementation == "kernel",
-            "local file qualification cannot qualify an SPDK target",
         )?;
         fs::create_dir(output)?;
         return run_local_file(&input, output);
@@ -923,10 +811,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         .remote_config
         .as_ref()
         .ok_or("remote_config required for live qualification")?;
-    let live = remote
-        .live_nvme
-        .as_ref()
-        .ok_or("live_nvme configuration required")?;
+    let live = &remote.live_nvme;
     check(
         (1..=60_000).contains(&live.connect_timeout_ms)
             && (1..=60_000).contains(&live.io_timeout_ms)
@@ -970,10 +855,8 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         .collect();
     let start = stats(&db)?;
     check(
-        count(&start, "payload_rpc_requests")? == 0
-            && count(&start, "errors")? == 0
-            && count(&start, "unknown_writes")? == 0,
-        "initial open used payload RPC or encountered live I/O errors",
+        count(&start, "errors")? == 0 && count(&start, "unknown_writes")? == 0,
+        "initial open encountered live I/O errors or unknown writes",
     )?;
     progress.mark("scalar_write_read", Some(&db));
     db.insert(ks, keys[0].clone(), values[0].clone())
@@ -1077,19 +960,11 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         "no completed live payload writes",
     )?;
     check(
-        delta(&start, &before_close, "payload_rpc_requests")? == 0,
-        "payload RPC used in live qualification",
-    )?;
-    check(
         delta(&start, &before_close, "errors")? == 0
             && delta(&start, &before_close, "unknown_writes")? == 0,
         "live I/O errors or unknown writes",
     )?;
-    verify_routes(
-        &before_close,
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
+    verify_routes(&before_close, &input.expected_route)?;
     progress.mark("before_graceful_close", Some(&db));
     db.wait_for_background_threads_to_finish()
         .map_err(native_error)?;
@@ -1099,11 +974,8 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let ks = reopened.ks("root");
     let recovery = stats(&reopened)?;
     progress.mark("graceful_reopen_complete", Some(&reopened));
-    verify_fences(&recovery, partitions, &input.target_implementation)?;
-    check(
-        count(&recovery, "payload_rpc_requests")? == 0 && count(&recovery, "errors")? == 0,
-        "recovery used RPC payload or failed",
-    )?;
+    verify_fences(&recovery, partitions)?;
+    check(count(&recovery, "errors")? == 0, "recovery failed")?;
     progress.mark("cache_miss_read", Some(&reopened));
     let cache_before = reopened
         .remote_counters()
@@ -1139,15 +1011,10 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     read_expected(&reopened, ks, &keys[0], Some(&values[0]))?;
     read_expected(&reopened, ks, &keys[1], None)?;
     let after_reopen_reads = stats(&reopened)?;
-    verify_routes(
-        &after_reopen_reads,
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
+    verify_routes(&after_reopen_reads, &input.expected_route)?;
     check(
-        delta(&recovery, &after_reopen_reads, "payload_rpc_requests")? == 0
-            && delta(&recovery, &after_reopen_reads, "errors")? == 0,
-        "reopened live path used RPC payload or failed",
+        delta(&recovery, &after_reopen_reads, "errors")? == 0,
+        "reopened live reads failed",
     )?;
     progress.mark("cache_checks_complete", Some(&reopened));
     progress.mark("before_second_graceful_close", Some(&reopened));
@@ -1162,19 +1029,14 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
             .map_err(native_error)?;
     let crash_recovery = stats(&crash_reopened)?;
     progress.mark("abrupt_recovery_open_complete", Some(&crash_reopened));
-    verify_fences(&crash_recovery, partitions, &input.target_implementation)?;
+    verify_fences(&crash_recovery, partitions)?;
     check(
         count(&crash_recovery, "recovery_read_ops")? > 0
             && count(&crash_recovery, "recovery_read_bytes")? > 0
-            && count(&crash_recovery, "payload_rpc_requests")? == 0
             && count(&crash_recovery, "errors")? == 0,
         "abrupt reopen did not prove live payload recovery",
     )?;
-    verify_routes(
-        &crash_recovery,
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
+    verify_routes(&crash_recovery, &input.expected_route)?;
     let crash_ks = crash_reopened.ks("root");
     read_expected(&crash_reopened, crash_ks, &keys[3], None)?;
     read_expected(&crash_reopened, crash_ks, &keys[5], Some(&values[5]))?;
@@ -1184,15 +1046,10 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     read_expected(&crash_reopened, crash_ks, &delete_key, None)?;
     read_expected(&crash_reopened, crash_ks, &keys[0], Some(&values[0]))?;
     let after_crash_reads = stats(&crash_reopened)?;
-    verify_routes(
-        &after_crash_reads,
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
+    verify_routes(&after_crash_reads, &input.expected_route)?;
     check(
-        count(&after_crash_reads, "payload_rpc_requests")? == 0
-            && count(&after_crash_reads, "errors")? == 0,
-        "crash-reopened reads used RPC payload or failed",
+        count(&after_crash_reads, "errors")? == 0,
+        "crash-reopened live reads failed",
     )?;
     progress.mark("abrupt_recovery_checks_complete", Some(&crash_reopened));
     progress.mark("before_final_close", Some(&crash_reopened));
@@ -1200,14 +1057,10 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         .wait_for_background_threads_to_finish()
         .map_err(native_error)?;
     progress.mark("target_shutdown", None);
-    let target_shutdown = shutdown_targets(remote, &shape, &input.target_implementation)?;
+    let target_shutdown = shutdown_targets(remote, &shape)?;
     progress.mark("target_shutdown_complete", None);
-    let scope = if input.target_implementation == "spdk" {
-        "verified_spdk_namespace_not_physical_media_performance"
-    } else {
-        "verified_kernel_namespace_not_physical_media_performance"
-    };
-    let proof = serde_json::json!({"schema_version": 1, "kind": "live_nvmeof_qualification", "expected_route": input.expected_route, "target_implementation": input.target_implementation, "durability_tier": input.durability_tier, "scope": scope, "start": start, "before_close": before_close, "member_transition": member_transition, "recovery": recovery, "after_miss": after_miss, "after_hit": after_hit, "after_reopen_reads": after_reopen_reads, "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery, "after_crash_reads": after_crash_reads, "target_shutdown": target_shutdown, "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_drain":true,"cache_miss_hit":true,"payload_rpc_fallback":false}});
+    let scope = "verified_kernel_namespace_not_physical_media_performance";
+    let proof = serde_json::json!({"schema_version": 1, "kind": "live_nvmeof_qualification", "expected_route": input.expected_route, "durability_tier": input.durability_tier, "scope": scope, "start": start, "before_close": before_close, "member_transition": member_transition, "recovery": recovery, "after_miss": after_miss, "after_hit": after_hit, "after_reopen_reads": after_reopen_reads, "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery, "after_crash_reads": after_crash_reads, "target_shutdown": target_shutdown, "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_drain":true,"cache_miss_hit":true}});
     fs::write(
         output.join("qualification.json"),
         serde_json::to_vec_pretty(&proof)?,
@@ -1274,42 +1127,23 @@ mod tests {
             "route_evidence_dropped": 0, "fence_evidence_dropped": 0,
             "routes": [{
                 "transport":"rdma", "address":"10.0.0.2", "service":4420,
-                "target_implementation":"kernel",
-                "namespace_identity":{"namespace_path":"/dev/nvme0n1", "target_implementation":"kernel",
+                "namespace_identity":{"namespace_path":"/dev/nvme0n1",
                     "nqn":"nqn.2026-01.test:wal", "nsid":1, "bytes":4096,
                     "controller_instance":0, "block_size":4096, "uuid":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}
             }],
             "fences":[{"partition":0,"authority_epoch":2,
-                "target":{"fixture_only":false,"disable_drain_successes":1,"errors":0,"target_implementation":"kernel"}}]
+                "target":{"fixture_only":false,"disable_drain_successes":1,"errors":0}}]
         });
-        assert!(verify_routes(&sample, "rdma", "kernel").is_ok());
-        assert!(verify_routes(&sample, "tcp", "kernel").is_err());
-        assert!(verify_routes(&sample, "rdma", "spdk").is_err());
-        assert!(verify_fences(&sample, &[0], "kernel").is_ok());
-        assert!(verify_fences(&sample, &[0], "spdk").is_err());
-        sample["routes"][0]["target_implementation"] = serde_json::json!("spdk");
-        assert!(verify_routes(&sample, "rdma", "spdk").is_err());
-        sample["routes"][0]["namespace_identity"]["target_implementation"] =
-            serde_json::json!("spdk");
-        assert!(verify_routes(&sample, "rdma", "spdk").is_err());
-        sample["routes"][0]["spdk"] = serde_json::json!({
-            "rpc_socket": "/run/spdk.sock", "pid": 42, "process_start_ticks": 10,
-            "bdev_name": "wal", "image_path": "/wal/member"
-        });
-        sample["routes"][0]["writer"] = serde_json::json!({
-            "epoch": 1, "file_index": 0,
-            "file_identity": {"path": "/wal/member", "device": 1, "inode": 2, "bytes": 4096, "block_size": 4096}
-        });
-        assert!(verify_routes(&sample, "rdma", "spdk").is_ok());
-        sample["fences"][0]["target"]["target_implementation"] = serde_json::json!("spdk");
-        assert!(verify_fences(&sample, &[0], "spdk").is_ok());
+        assert!(verify_routes(&sample, "rdma").is_ok());
+        assert!(verify_routes(&sample, "tcp").is_err());
+        assert!(verify_fences(&sample, &[0]).is_ok());
         sample["fences"][0]["target"]["fixture_only"] = serde_json::json!(true);
-        assert!(verify_fences(&sample, &[0], "spdk").is_err());
+        assert!(verify_fences(&sample, &[0]).is_err());
         sample["fences"][0]["target"]["fixture_only"] = serde_json::json!(false);
         sample["fences"][0]["target"]["disable_drain_successes"] = serde_json::json!(0);
-        assert!(verify_fences(&sample, &[0], "spdk").is_err());
+        assert!(verify_fences(&sample, &[0]).is_err());
         sample["route_evidence_dropped"] = serde_json::json!(1);
-        assert!(verify_routes(&sample, "rdma", "spdk").is_err());
+        assert!(verify_routes(&sample, "rdma").is_err());
     }
 
     #[test]

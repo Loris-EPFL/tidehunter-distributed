@@ -1153,10 +1153,10 @@ def summarize_write_timeline(samples, evidence):
         for index in sorted(linked_indexes):
             group = live_groups[index]
             live_summary["observations"].append({"group_index": index, **group})
-            if group["owner_validation_ns"] is not None:
-                live_summary["owner_validation_ns"].append(group["owner_validation_ns"])
-            if group["owner_persistence"] is not None:
-                live_summary["owner_persistence"].append(group["owner_persistence"])
+            if group.get("owner_validation_ns") is not None:
+                live_summary["owner_validation_ns"].append(group.get("owner_validation_ns"))
+            if group.get("owner_persistence") is not None:
+                live_summary["owner_persistence"].append(group.get("owner_persistence"))
         live_summary["owner_validation_unavailable"] = len(linked_indexes) - len(live_summary["owner_validation_ns"])
         live_summary["owner_persistence_unavailable"] = len(linked_indexes) - len(live_summary["owner_persistence"])
     else:
@@ -1453,13 +1453,14 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
     batch_records = {(record["batch"]["epoch"], record["batch"]["sequence"]): record
                      for record in records if record.get("batch") is not None}
     group_memberships = 0
-    group_required = {"owner", "batches", "reservation_token", "owner_validation_ns", "owner_persistence"}
+    group_required = {"owner", "batches", "reservation_token"}
+    archive_group = {"owner_validation_ns", "owner_persistence"}
     # Leased groups add their frame coordinates; other routes omit them.
     group_geometry = {"wal_position": 2**64, "file_offset": 2**64, "frame_len": 2**32,
                       "wal_file": 2**64, "namespace_block_size": 2**32}
     for group in groups or []:
         if (not isinstance(group, dict)
-                or not group_required <= set(group) <= group_required | set(group_geometry)
+                or not group_required <= set(group) <= group_required | archive_group | set(group_geometry)
                 or type(group["owner"]) is not int or not 0 <= group["owner"] < 2**32
                 or not isinstance(group["batches"], list) or not group["batches"]):
             raise ValueError("invalid live group timeline")
@@ -1473,11 +1474,11 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
         if token is not None and (not isinstance(token, list) or len(token) != 16
                                   or any(type(byte) is not int or not 0 <= byte <= 255 for byte in token)):
             raise ValueError("invalid live group reservation token")
-        validation = group["owner_validation_ns"]
+        validation = group.get("owner_validation_ns")
         if validation is not None and (type(validation) is not int or not 0 <= validation < 2**64):
             raise ValueError("invalid live group owner validation")
-        if group["owner_persistence"] is not None:
-            _validate_storage_write_profile(group["owner_persistence"])
+        if group.get("owner_persistence") is not None:
+            _validate_storage_write_profile(group.get("owner_persistence"))
         members = set()
         for batch in group["batches"]:
             if (not isinstance(batch, dict) or set(batch) != {"epoch", "sequence"}

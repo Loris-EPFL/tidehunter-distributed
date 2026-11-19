@@ -7,12 +7,9 @@
 //! the supported subset. No wire format or disk-format stability is promised yet.
 
 pub mod codec;
-pub mod completion;
 pub mod durability;
 pub mod group;
 pub mod index_reference;
-pub mod local_db;
-pub mod local_inventory;
 pub mod native_index;
 pub mod native_publication;
 pub mod nvmeof;
@@ -23,9 +20,9 @@ pub mod sequence;
 pub mod shard_lock;
 pub mod storage;
 pub mod sui;
+pub(crate) mod sys;
 pub mod tcp;
 pub mod types;
-pub mod worker;
 pub mod write_timeline;
 
 #[cfg(test)]

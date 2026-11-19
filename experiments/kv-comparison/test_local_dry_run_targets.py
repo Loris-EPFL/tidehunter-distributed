@@ -1,8 +1,11 @@
 """Contract tests only; no hardware or target processes are started."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import errno
 import tempfile
 from pathlib import Path
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -155,36 +158,14 @@ class TargetsContractTests(unittest.TestCase):
 
     def test_kernel_qualification_rejects_invalid_transport(self):
         with self.assertRaises(ValueError):
-            targets.qualify_kernel_live(self.root, '/binary', transport='other',
-                                        history_persistence='on_disk')
+            targets.qualify_kernel_live(self.root, '/binary', transport='other')
 
-    def test_kernel_qualification_requires_durable_history(self):
-        with self.assertRaisesRegex(ValueError, 'history persistence'):
-            targets.qualify_kernel_live(self.root, '/binary', history_persistence='memory_only')
-
-    def test_kernel_qualification_passes_history_to_worker(self):
-        for history in ('on_disk', 'wal_replay'):
-            with self.subTest(history=history), patch.object(targets.subprocess, 'run') as run:
-                run.return_value.returncode = 0
-                run.return_value.stdout = '{"complete": true}'
-                self.assertTrue(targets.qualify_kernel_live(
-                    self.root, '/binary', transport='tcp', history_persistence=history)['complete'])
-                self.assertEqual(run.call_args.args[0][-1], history)
-
-    def test_kernel_qualification_requires_prepared_leased_per_owner_route(self):
-        for tier in ('native', 'synchronous'):
-            live = {'write_mode': 'leased', 'export_mode': 'per_owner', 'leased_durability': tier}
-            target = {'export_mode': 'per_owner'}
-            with self.subTest(tier=tier):
-                targets._admit_kernel_leased_route({'live_nvme': live}, target, tier)
-            for field, value in (('write_mode', 'reserved'), ('export_mode', 'on_demand'),
-                                 ('leased_durability', None)):
-                with self.subTest(tier=tier, field=field), self.assertRaisesRegex(
-                        targets.TargetError, 'not leased per-owner'):
-                    targets._admit_kernel_leased_route({'live_nvme': live | {field: value}}, target, tier)
-            with self.subTest(tier=tier, field='target'), self.assertRaisesRegex(
-                    targets.TargetError, 'not leased per-owner'):
-                targets._admit_kernel_leased_route({'live_nvme': live}, {'export_mode': 'on_demand'}, tier)
+    def test_kernel_qualification_passes_tcp_to_worker(self):
+        with patch.object(targets.subprocess, 'run') as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = '{"complete": true}'
+            self.assertTrue(targets.qualify_kernel_live(self.root, '/binary', transport='tcp')['complete'])
+            self.assertEqual(run.call_args.args[0][-3], 'tcp')
 
     def test_kernel_worker_rejects_untrusted_output_before_creating_artifacts(self):
         self.root.chmod(0o777)
@@ -192,8 +173,17 @@ class TargetsContractTests(unittest.TestCase):
         with patch.object(targets.os, 'geteuid', return_value=0):
             with self.assertRaisesRegex(ValueError, 'untrusted directory'):
                 targets._kernel_live_worker(self.root, self.root / 'missing-binary',
-                                            'rdma', 120, 0, history_persistence='on_disk')
+                                            'rdma', 120, 0)
         self.assertEqual(set(self.root.iterdir()), before)
+    def test_kernel_qualification_requires_prepared_durability(self):
+        for tier, wrong_tier in (('native', 'synchronous'), ('synchronous', 'native')):
+            with self.subTest(tier=tier):
+                targets._admit_kernel_durability({'live_nvme': {'leased_durability': tier}}, tier)
+                for remote in ({}, {'live_nvme': {'leased_durability': wrong_tier}}):
+                    with self.assertRaisesRegex(targets.TargetError, 'durability differs'):
+                        targets._admit_kernel_durability(remote, tier)
+
+
 
 
 class OwnedControllerTeardownTests(unittest.TestCase):
@@ -350,64 +340,154 @@ class FailureEvidenceTests(unittest.TestCase):
 
 
 class KernelPortsContractTests(unittest.TestCase):
-    def sockets(self):
-        sockets = [MagicMock() for _ in range(3)]
-        for candidate in sockets:
-            candidate.__enter__.return_value = candidate
-        sockets[0].getsockname.return_value = ("127.0.0.1", 41000)
-        sockets[1].getsockname.return_value = ("10.99.0.2", 42000)
-        return sockets
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.sysctls = self.root / "ipv4"
+        self.sysctls.mkdir()
+        (self.sysctls / "ip_local_port_range").write_text("20001 20003\n")
+        (self.sysctls / "ip_local_reserved_ports").write_text("20004,20007-20009\n")
+        self.configfs = self.root / "nvmet"
+        (self.configfs / "ports").mkdir(parents=True)
 
-    def test_consecutive_pair_and_distinct_control_are_bind_checked(self):
-        sockets = self.sockets()
+    def allocate(self, evidence="run", address="10.99.0.2"):
+        return targets._kernel_live_ports(
+            address, commissioning_address="127.0.0.1", control_address="127.0.0.1",
+            state=self.state, evidence=self.root / evidence, deadline=time.monotonic() + 5,
+            sysctls=self.sysctls, configfs=self.configfs)
+
+    @staticmethod
+    def socket_probe():
+        probe = MagicMock()
+        probe.__enter__.return_value = probe
+        probe.getsockname.return_value = ("127.0.0.1", 42000)
+        return probe
+
+    def test_pair_excludes_automatic_reserved_and_unlinked_configfs_ports(self):
+        for port_id, service in ((20011, 20020), (9, 20013)):
+            port = self.configfs / "ports" / str(port_id)
+            port.mkdir()
+            (port / "addr_trsvcid").write_text(f"{service}\n")
+        sockets = [self.socket_probe() for _ in range(3)]
         with patch.object(targets.socket, "socket", side_effect=sockets):
-            control, service, commissioning = targets._kernel_live_ports(
-                "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1")
-        self.assertEqual((control, service, commissioning), (41000, 42000, 42001))
-        self.assertNotIn(control, (service, commissioning))
+            control, service, commissioning, claim = self.allocate()
+        self.assertEqual((control, service, commissioning), (42000, 20014, 20015))
+        self.assertNotIn(service, range(20001, 20004))
+        self.assertNotIn(commissioning, range(20001, 20004))
+        self.assertEqual(claim.read_text(), f"{self.root / 'run'}\n")
         sockets[0].bind.assert_called_once_with(("127.0.0.1", 0))
-        sockets[1].bind.assert_called_once_with(("10.99.0.2", 0))
-        sockets[2].bind.assert_called_once_with(("127.0.0.1", service + 1))
-        for candidate in sockets:
-            candidate.__exit__.assert_called_once()
+        sockets[1].bind.assert_called_once_with(("10.99.0.2", service))
+        sockets[2].bind.assert_called_once_with(("127.0.0.1", commissioning))
+        for probe in sockets:
+            probe.__exit__.assert_called_once()
 
-    def test_pair_collision_exhausts_bounded_attempts_and_closes_sockets(self):
-        sockets = self.sockets()
+    def test_concurrent_allocations_keep_distinct_pairs_until_cleanup(self):
+        barrier = threading.Barrier(2, timeout=5)
+
+        def concurrent(name):
+            barrier.wait()
+            return self.allocate(name)
+
+        with patch.object(targets.socket, "socket", side_effect=self.socket_probe):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(concurrent, ("first", "second")))
+            pairs = sorted((service, commissioning) for _, service, commissioning, _ in results)
+            self.assertEqual(pairs, [(20010, 20011), (20012, 20013)])
+            self.assertEqual({claim.read_text().strip() for _, _, _, claim in results},
+                             {str(self.root / "first"), str(self.root / "second")})
+            min(results)[-1].unlink()
+            self.assertEqual(self.allocate("after-cleanup")[1:3], pairs[0])
+
+    def test_detects_commissioning_address_conflict_without_claiming_pair(self):
+        sockets = [self.socket_probe() for _ in range(5)]
         sockets[2].bind.side_effect = OSError(errno.EADDRINUSE, "port busy")
-        with patch.object(targets.socket, "socket", side_effect=sockets * 32) as factory:
-            with self.assertRaisesRegex(targets.TargetError, "after 32 attempts"):
-                targets._kernel_live_ports(
-                    "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1")
-        self.assertEqual(factory.call_count, 96)
-        for candidate in sockets:
-            self.assertEqual(candidate.__exit__.call_count, 32)
+        with patch.object(targets.socket, "socket", side_effect=sockets):
+            self.assertEqual(self.allocate()[1:3], (20012, 20013))
+        sockets[2].bind.assert_called_once_with(("127.0.0.1", 20011))
+        self.assertFalse((self.state / "20010.claim").exists())
+        for probe in sockets:
+            probe.__exit__.assert_called_once()
 
-    def test_loopback_only_commissioning_listener_is_detected(self):
-        real_socket = targets.socket.socket
-        with real_socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            busy_port = listener.getsockname()[1]
-            sockets = self.sockets()
-            sockets[0].getsockname.return_value = ("127.0.0.1", 1)
-            sockets[1].getsockname.return_value = ("10.99.0.2", busy_port - 1)
-            commissioning_sockets = []
+    def test_fails_closed_if_every_pool_pair_overlaps_automatic_range(self):
+        (self.sysctls / "ip_local_port_range").write_text("20000 65535\n")
+        probe = self.socket_probe()
+        with patch.object(targets.socket, "socket", return_value=probe):
+            with self.assertRaisesRegex(targets.TargetError, "no free adjacent non-ephemeral"):
+                self.allocate()
+        probe.bind.assert_called_once_with(("127.0.0.1", 0))
+        self.assertEqual(list(self.state.glob("*.claim")), [])
 
-            def candidates():
-                for _ in range(32):
-                    yield sockets[0]
-                    yield sockets[1]
-                    candidate = real_socket()
-                    commissioning_sockets.append(candidate)
-                    yield candidate
+    def geometry_fixture(self):
+        address = "127.0.0.1"
+        with patch.object(targets.socket, "socket", side_effect=self.socket_probe):
+            _, public, private, _ = self.allocate(address=address)
+        sysfs = self.root / "sysfs"
+        sysfs.mkdir()
+        host_nqn, host_id = "nqn.2014-08.org.nvmexpress:uuid:fixture", "fixture-host-id"
 
-            with patch.object(targets.socket, "socket", side_effect=candidates()) as factory:
-                with self.assertRaisesRegex(targets.TargetError, "after 32 attempts"):
-                    targets._kernel_live_ports(
-                        "10.99.0.2", commissioning_address="127.0.0.1",
-                        control_address="127.0.0.1")
-            self.assertEqual(factory.call_count, 96)
-            self.assertTrue(all(candidate.fileno() == -1 for candidate in commissioning_sockets))
+        def controller(instance, service, subsystem, queues="2", initiator=host_nqn):
+            directory = sysfs / f"nvme{instance}"
+            directory.mkdir()
+            for key, value in {"transport": "tcp", "address": f"traddr={address},trsvcid={service}",
+                               "hostnqn": initiator, "hostid": host_id, "subsysnqn": subsystem,
+                               "queue_count": queues, "sqsize": "31"}.items():
+                (directory / key).write_text(value)
+            return directory
+
+        expected = controller(0, public, "nqn.writer")
+        unrelated = controller(1, public, "nqn.other")
+        controller(2, private, "nqn.writer", queues="5", initiator="nqn.commissioning")
+        proof = {"member_transition": {"writer_routes": [
+            {"namespace_identity": {"controller_instance": 0, "nqn": "nqn.writer"}}]}}
+        def scan(errors):
+            return targets._owned_controllers(sysfs, "tcp", address, (public, private), host_nqn,
+                                              sample_errors=errors)
+
+        return proof, host_id, expected, unrelated, scan
+
+    def test_geometry_on_allocator_chosen_public_service(self):
+        proof, host_id, _, _, scan = self.geometry_fixture()
+        record = {"sample_errors": [], "sample_errors_truncated": False}
+        rows = scan(record["sample_errors"])
+        targets._admit_kernel_geometry(record, proof, host_id, rows)
+        self.assertEqual([row["controller"] for row in record["queue_samples"]], ["nvme0"])
+        self.assertEqual(record["sample_errors"], [])
+
+    def test_geometry_records_errno_path_and_identity_without_tolerating_errors(self):
+        proof, host_id, expected, unrelated, scan = self.geometry_fixture()
+        earlier = scan([])
+        read = Path.read_text
+        for directory, code in ((unrelated, errno.ENODEV), (expected, errno.ENODEV), (unrelated, errno.EIO)):
+            with self.subTest(controller=directory.name, errno=code):
+                failed = directory / "sqsize"
+                moved = self.root / "disconnected"
+
+                def during_teardown(path, *args, **kwargs):
+                    if path == failed:
+                        if code == errno.ENODEV:
+                            directory.rename(moved)
+                        raise OSError(code, "test", str(path))
+                    return read(path, *args, **kwargs)
+
+                record = {"sample_errors": [], "sample_errors_truncated": False}
+                try:
+                    with patch.object(Path, "read_text", during_teardown):
+                        scan(record["sample_errors"])
+                finally:
+                    if moved.exists():
+                        moved.rename(directory)
+                error, = record["sample_errors"]
+                self.assertEqual(error["path"], str(failed))
+                self.assertEqual(error["errno"], code)
+                self.assertEqual(error["identity"]["controller"], directory.name)
+                self.assertEqual(error["disappeared"], code == errno.ENODEV)
+                with self.assertRaisesRegex(targets.TargetError, "sampling errors: 1"):
+                    targets._admit_kernel_geometry(record, proof, host_id, earlier)
+                self.assertEqual(record["missing_queue_identities"], [])
+                self.assertEqual(record["invalid_queue_samples"], [])
 
 
 if __name__ == '__main__':

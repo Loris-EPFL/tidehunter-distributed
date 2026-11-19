@@ -1,6 +1,6 @@
 //! The explicit trusted-network TCP mode: opt-in only, recorded, no TLS, and
 //! never a downgrade of, or a silent fallback from, mutual-TLS TCP.
-use super::tests::{batch, certificates, config, metrics};
+use super::tests::{certificates, config, metrics};
 use super::*;
 use crate::key_shape::KeyType;
 use serde_json::json;
@@ -56,7 +56,7 @@ fn trusted_tcp_requires_empty_credentials_and_mtls_never_degrades() {
     let server = trusted_files().server_config().unwrap();
     assert!(server.config.is_none() && server.verifier.is_none());
     let client = trusted_files().client_config_with_identity().unwrap();
-    assert!(client.config.is_none() && client.verifier.is_none());
+    assert!(client.config.is_none());
 
     // Credentials next to a trusted transport are a configuration error.
     let mut with_ca = trusted_files();
@@ -152,31 +152,4 @@ fn trusted_tcp_serves_status_and_is_not_interchangeable_with_mtls() {
     );
     // The legitimate mTLS client still works against the same server.
     assert!(strict.connect(&mtls_files).unwrap().status().is_ok());
-}
-
-#[test]
-fn trusted_tcp_round_trips_a_durable_batch() {
-    let trusted = Server::start(
-        trusted_files(),
-        tempdir::TempDir::new("trusted-tcp-data").unwrap(),
-    );
-    let mut client = trusted.connect(&trusted_files()).unwrap();
-    client.fence_to(1).unwrap();
-    let batches = vec![batch(&trusted.config, 1, 0), batch(&trusted.config, 1, 1)];
-    let receipts = client.append_many(1, &batches).unwrap();
-    let references: Vec<_> = batches
-        .iter()
-        .zip(receipts)
-        .map(|(batch, receipt)| {
-            batch
-                .record_reference(receipt.appended().address(), 0)
-                .unwrap()
-        })
-        .collect();
-    for (batch, reference) in batches.iter().zip(&references) {
-        assert_eq!(
-            client.read_record(1, reference).unwrap(),
-            batch.mutations()[0]
-        );
-    }
 }

@@ -27,15 +27,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from portable_transport import runtime_backend, transport_for_case, validate_transport, protocol_key, select_backends
 from nvmeof import spdk_measurement
 
-LEGACY_BACKENDS = ("native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct",
-                   "tidehunter_efa_native", "tikv", "cassandra", "foundationdb")
-BACKENDS = (*LEGACY_BACKENDS, "valkey_tcp", "garnet", "kvrocks")
-PORTABLE_BACKENDS = {"tidehunter_verbs", "tidehunter_verbs_native", "tidehunter_tcp_trusted", "valkey_rdma"}
-TRANSPORTS = {name: transport_for_case(name) for name in (*BACKENDS, *sorted(PORTABLE_BACKENDS))
-              if name.startswith("tidehunter_")}
+BACKENDS = ("native", "tikv", "cassandra", "foundationdb", "valkey_tcp", "garnet", "kvrocks")
+PORTABLE_BACKENDS = {"valkey_rdma"}
 NVME_BACKENDS = {"tidehunter_nvme_tcp", "tidehunter_nvme_rdma"}
-for name in NVME_BACKENDS:
-    TRANSPORTS[name] = transport_for_case("tidehunter_tcp")
+TCP_CONTROL = "tidehunter_tcp"
+OFI_CONTROL = "tidehunter_verbs_native"
+CONTROL_TRANSPORTS = {name: transport_for_case(name) for name in (TCP_CONTROL, OFI_CONTROL)}
+TRANSPORTS = {name: CONTROL_TRANSPORTS[TCP_CONTROL] for name in NVME_BACKENDS}
 MIX_FIELDS = ("read", "put", "delete", "missing_read", "get_many", "put_batch")
 # Owner acknowledgement tier of every Tidehunter case. `native` (the default: the native Tidehunter
 # contract) acks after the page-cache write and matches only native `page_cache`; `synchronous`
@@ -46,7 +44,6 @@ DURABILITY_TIERS = ("native", "synchronous")
 # specs that were generated with the earlier synchronous default name `durability_tier:
 # "synchronous"` explicitly, so their matrices are unchanged.
 DEFAULT_DURABILITY_TIER = "native"
-ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
 NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put", "nvmeof_contracts", "nvmeof_contracts_crossing", "nvmeof_contracts_crossing2", "nvmeof_parallel_writes", "nvmeof_single_caller", "nvmeof_f6", "nvmeof_f6b", "nvmeof_f8", "nvmeof_f7_highmem32", "nvmeof_reads_geometry", "nvmeof_reads_geometry_rest", "nvmeof_reads_geometry_rest2")
 REDRAIN_AB_SELECTION = "nvmeof_p16_redrain_ab"
 WRITE_ENGINE_ARCHIVE_LIMIT_BYTES = {
@@ -62,6 +59,13 @@ M3_OWNER_ADMISSION_MARGIN_SECONDS = 5
 NVMEOF_PATH_SELECTIONS += M3_SELECTIONS
 TOOL_SELECTIONS = ("nvmeof_f9_tools",)
 
+
+
+def owner_control_backend(job):
+    if (job["backend"] == "tidehunter_nvme_rdma" and job.get("selection") in
+            ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS)):
+        return OFI_CONTROL
+    return TCP_CONTROL
 
 
 def durability_tier(job):
@@ -81,37 +85,13 @@ def active_owner_count(job):
         expected = _m3_cases().get(job.get("case_id"))
         if expected is None or not _focused_exact(job, expected):
             raise ValueError("multiple owners require an exact reviewed M3 case")
-    one_owner_read = (job.get("selection") == "remote_rw_compact"
-                      and ((job.get("group") == "G15C" and job.get("case_kind") == "media_read")
-                           or (job.get("group") == "G15M" and job.get("case_kind") == "sealed_knee")))
-    fabric_read = (job.get("selection") == "fabric_ab_compact" and (
-        (job.get("group") == "G16P" and job.get("case_kind") == "sealed_knee"
-         and job.get("backend") in ("tidehunter_tcp", "tidehunter_tcp_trusted", "tidehunter_verbs_native")
-         and "nvmeof_route" not in job and job.get("owner_polling") in ("adaptive", "busy"))
-        or (job.get("group") == "G16C" and job.get("case_kind") == "media_read"
-            and ((job.get("backend") in ("tidehunter_tcp_trusted", "tidehunter_verbs_native")
-                  and "nvmeof_route" not in job and job.get("owner_polling") == "adaptive")
-                 or (job.get("backend") in NVME_BACKENDS and job.get("nvmeof_route") == "sealed_read"
-                     and "owner_polling" not in job
-                     and ((job.get("nvmeof_target") == "kernel" and job.get("target_io") == "direct")
-                          or (job.get("backend") == "tidehunter_nvme_rdma"
-                              and job.get("nvmeof_target") == "spdk" and job.get("target_io") == "spdk_direct")))))))
-    if count == 1 and job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS):
+    if count == 1:
+        if job.get("selection") not in FOCUSED_SELECTIONS:
+            raise ValueError("one owner requires a reviewed leased campaign selection")
         expected = next((item for item in make_focused_matrix(job["selection"])
                          if item["case_id"] == job.get("case_id")), None)
         if expected is None or not _focused_exact(job, expected):
             raise ValueError("one owner requires an exact reviewed leased campaign case")
-        return count
-    if count == 1 and fabric_read:
-        if job.get("durability_tier") != "synchronous":
-            raise ValueError("fabric read requires synchronous owner durability")
-        return count
-    if count == 1 and (job.get("backend") not in ("tidehunter_verbs_native", "tidehunter_tcp")
-                       or job.get("durability_tier") != "synchronous"
-                       or "nvmeof_route" in job
-                       or (not one_owner_read and (job.get("case_kind") not in ONE_OWNER_CASE_KINDS
-                                                   or "sealed_dataset" in job))):
-        raise ValueError("one owner is restricted to reviewed synchronous owner RPC cases")
     return count
 
 
@@ -261,7 +241,7 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     required = {"schema_version", "seed", "repeats", "value_sizes", "backends",
                 "keys", "max_cases", "offered_rates", "offered_seconds",
                 "case_deadline_seconds", "hard_deadline_seconds", "export_reserve_seconds"}
-    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode", "spdk_comparison", "valkey_reproduction_profiles", "native_durability_cohort", "shapes", "arms", "durability_tier"}:
+    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode", "valkey_reproduction_profiles", "native_durability_cohort", "shapes", "arms", "durability_tier"}:
         raise ValueError("cloud matrix requires its explicit schema")
     if spec["schema_version"] != 1 or isinstance(spec["seed"], bool) or not isinstance(spec["seed"], int):
         raise ValueError("invalid cloud schema/seed")
@@ -277,31 +257,26 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
     mid_contract = spec.get("shapes") == "contract_core" and sizes == [512, 4096]
     if not mid_contract and (set(sizes) != {64, 256, 1024, 8192, 65536} or len(sizes) != 5):
         raise ValueError("full campaign requires all five value sizes without duplicates; contract_core also accepts [512, 4096]")
-    if type(spec.get("spdk_comparison", False)) is not bool:
-        raise ValueError("spdk_comparison must be a boolean")
     if type(spec.get("native_durability_cohort", False)) is not bool:
         raise ValueError("native_durability_cohort must be a boolean")
     if spec.get("durability_tier", DEFAULT_DURABILITY_TIER) not in DURABILITY_TIERS:
         raise ValueError("invalid spec durability_tier")
     if spec.get("native_durability_cohort") and spec.get("mode") != "standard-with-live-nvmeof":
-        raise ValueError("native durability cohort requires the matched live and sealed campaign")
-    if spec.get("spdk_comparison") and (spec.get("mode") != "standard-with-live-nvmeof"
-                                      or "tidehunter_nvme_rdma" not in backends):
-        raise ValueError("SPDK comparison requires the matched live/ sealed RDMA campaign")
+        raise ValueError("native durability cohort requires the live NVMe-oF campaign")
     profiles = spec.get("valkey_reproduction_profiles", [])
     if (not isinstance(profiles, list) or any(not isinstance(name, str) for name in profiles)
             or len(profiles) != len(set(profiles))
             or set(profiles) - {"published-as-written", "matched-ram"}
             or profiles and not {"valkey_tcp", "valkey_rdma"} <= set(backends)):
         raise ValueError("native Valkey profiles require both TCP and RDMA")
-    supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if _allow_live_nvme or spec.get("mode") in ("nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") else set())
+    live = _allow_live_nvme or spec.get("mode") == "standard-with-live-nvmeof"
+    supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if live else set())
     backends = select_backends(None, backends, supported)
     if "shapes" in spec and spec["shapes"] != "contract_core":
         raise ValueError("shapes must be contract_core")
     if "arms" in spec:
         allowed = {
-            "tidehunter_tcp": ("synchronous", "native"),
-            "tidehunter_verbs_native": ("synchronous", "native"),
+            "tidehunter_nvme_tcp": ("synchronous", "native"),
             "tidehunter_nvme_rdma": ("synchronous", "native"),
             "native": ("value_wal_barrier", "page_cache"),
             "valkey_rdma": ("synced", "os_buffered", "periodic_sync"),
@@ -340,107 +315,25 @@ def _make_matrix(spec, *, _allow_live_nvme=False):
                    "valkey_profile_limit": diagnostics.get("valkey_profile_limit", 0)}
     diagnostics.update(stride_option)
     if spec.get("shapes") == "contract_core":
-        if spec.get("mode", "standard") not in ("standard", "standard-with-nvmeof", "standard-with-live-nvmeof"):
+        if spec.get("mode", "standard") not in ("standard", "standard-with-live-nvmeof"):
             raise ValueError("contract_core requires a standard campaign")
         base = {key: value for key, value in spec.items() if key not in ("shapes", "arms")}
-        base.update(mode="standard", max_cases=2000, spdk_comparison=False, native_durability_cohort=False)
+        base.update(mode="standard", max_cases=2000, native_durability_cohort=False)
         if mid_contract:
             base["value_sizes"] = [64, 256, 1024, 8192, 65536]
         sources = make_matrix(base, _allow_live_nvme=_allow_live_nvme or spec.get("mode") == "standard-with-live-nvmeof")
         return _contract_core_matrix(spec, sources)
-    if spec.get("mode") in ("standard-with-nvmeof", "standard-with-live-nvmeof"):
-        live = spec["mode"] == "standard-with-live-nvmeof"
-        standard_backends = backends if live else [backend for backend in backends if backend not in NVME_BACKENDS]
-        matched_backends = [backend for backend in backends if backend in
-                            ({"native", "tidehunter_tcp", "tidehunter_verbs", "tidehunter_verbs_native",
-                              "tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native"} | NVME_BACKENDS)]
-        expanded = {**spec, "max_cases": 2000}
-        jobs = make_matrix({**expanded, "mode": "standard", "backends": standard_backends,
-                            "spdk_comparison": False, "native_durability_cohort": False}, _allow_live_nvme=live)
-        valkey_jobs = [job for job in jobs if job["cohort"] == "valkey_client_diagnostics"]
-        jobs = [job for job in jobs if job["cohort"] != "valkey_client_diagnostics"]
-        matched = make_nvmeof_matrix(expanded, matched_backends, diagnostics)
-        for number, job in enumerate(matched, start=len(jobs)):
-            job["case_id"] = f"{number:04d}-{comparison_backend(job)}-{job['value_size']}-{job['profile']}"
-        jobs.extend(matched)
-        for number, job in enumerate(valkey_jobs, start=len(jobs)):
-            job["case_id"] = (f"{number:04d}-{job['backend']}-{job['value_size']}-"
-                              f"{job['profile']}-{job['cohort']}-r{job['repeat']}")
-        jobs.extend(valkey_jobs)
-        if spec.get("spdk_comparison"):
-            paired = []
-            for job in jobs:
-                paired.append(job)
-                if job["backend"] == "tidehunter_nvme_rdma" and job.get("nvmeof_route") == "live":
-                    twin = copy.deepcopy(job)
-                    twin["nvmeof_target"] = "spdk"
-                    paired.append(twin)
-            jobs = paired
-            # Admit every storage target early, before spending the fleet on
-            # unrelated write/load controls. Keep each immutable source block intact.
-            jobs = ([job for job in jobs if job["cohort"] == "sealed_read"]
-                    + [job for job in jobs if job["cohort"] != "sealed_read"])
-            for number, job in enumerate(jobs):
-                job["case_id"] = (f"{number:04d}-{comparison_backend(job)}-{job['value_size']}-"
-                                  f"{job['profile']}-{job['cohort']}-r{job['repeat']}")
+    if spec.get("mode") == "standard-with-live-nvmeof":
+        jobs = make_matrix({**spec, "mode": "standard", "native_durability_cohort": False},
+                           _allow_live_nvme=True)
         if spec.get("native_durability_cohort"):
-            sealed_native, standard_native = [], []
-            for job in jobs:
-                if job["backend"] not in TRANSPORTS:
-                    continue
-                sealed = (job["cohort"] == "sealed_read"
-                          and "-scalar-" in job["profile"]
-                          and job["profile"].endswith("-baseline"))
-                standard = (job["cohort"] == "primary_rf1"
-                            and job["profile"] in ("point-mixed", "read-many32", "write-concurrent"))
-                if not (sealed or standard):
-                    continue
-                twin = copy.deepcopy(job)
-                twin["durability_tier"] = "native"
-                twin["case_id"] += "-durability-native"
-                if sealed:
-                    twin["sealed_dataset"]["source_id"] += "-durability-native"
-                    sealed_native.append(twin)
-                else:
-                    standard_native.append(twin)
-            split = next((i for i, job in enumerate(jobs) if job["cohort"] != "sealed_read"), len(jobs))
-            jobs = jobs[:split] + sealed_native + jobs[split:] + standard_native
+            jobs += [job | {"durability_tier": "native", "case_id": job["case_id"] + "-durability-native"}
+                     for job in jobs if job["backend"] in NVME_BACKENDS and job["cohort"] == "primary_rf1"
+                     and job["durability_tier"] == "synchronous" and job["profile"] in
+                     ("point-mixed", "read-many32", "write-concurrent")]
         if len(jobs) > spec["max_cases"]:
             raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
         return jobs
-    if spec.get("mode") == "nvmeof-focused":
-        return make_nvmeof_matrix(spec, backends, diagnostics)
-    if spec.get("mode", "standard") == "read-tier-focused":
-        if spec["repeats"] != 1:
-            raise ValueError("focused campaign requires one repetition")
-        expanded = {**spec, "mode": "read-tier", "max_cases": 2000}
-        tier_jobs = make_read_tier_matrix(expanded, backends, diagnostics)
-        standard_jobs = make_matrix({**expanded, "mode": "standard"})
-        early = [job for job in tier_jobs if
-                 (job["read_tier"]["name"] in ("native_hot_wal_lru0_pagecache", "native_cold_os_lru0")
-                  and job["value_size"] in (256, 1024) and job["concurrency"] == 1)
-                 or (job["read_tier"]["name"] == "cold_device" and job["value_size"] == 256
-                     and job["concurrency"] == 1)]
-        wanted = {"remote", "coordinator_hit", "wal_warm"}
-        later = [job for job in tier_jobs if job["read_tier"]["name"] in wanted
-                 and ((job["concurrency"] == 1 and job["value_size"] in (256, 8192))
-                      or (job["concurrency"] == 16 and job["value_size"] in (1024, 8192)))]
-        comparisons = [job for job in standard_jobs if job["cohort"] == "primary_rf1" and
-                       (job["value_size"], job["profile"]) in ((1024, "write-concurrent"),
-                           (1024, "read-concurrent"), (8192, "read-many32"))]
-        comparisons += [job for job in standard_jobs if job["cohort"] == "write_stage_diagnostics"
-                        and job["value_size"] == 1024 and job["profile"] == "write-concurrent"]
-        comparisons += [job for job in standard_jobs if job["cohort"] == "write_timeline_diagnostics"
-                        and job["value_size"] == 1024 and job["profile"] == "write-concurrent"]
-        comparisons += [job for job in standard_jobs if job["cohort"] == "native_async_write"
-                        and job["value_size"] == 1024]
-        jobs = early + comparisons + later
-        jobs.extend(job for job in standard_jobs if job["cohort"] == "valkey_client_diagnostics")
-        if len(jobs) > spec["max_cases"]:
-            raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
-        return jobs
-    if spec.get("mode", "standard") == "read-tier":
-        return make_read_tier_matrix(spec, backends, diagnostics)
     if spec.get("mode", "standard") != "standard":
         raise ValueError("unknown cloud campaign mode")
     profiles = [
@@ -600,221 +493,10 @@ def _contract_core_matrix(spec, sources):
     return jobs
 
 
-def make_nvmeof_matrix(spec, backends, diagnostics):
-    """Matched sealed-source read cohorts; profiled twins are independent runs."""
-    if spec["repeats"] != 1:
-        raise ValueError("NVMe-oF comparison requires one repetition")
-    required = {"native", "tidehunter_tcp"}
-    if not required <= set(backends) or not (set(backends) & NVME_BACKENDS):
-        raise ValueError("NVMe-oF comparison requires native, RPC TCP and at least one NVMe-oF backend")
-    allowed = required | NVME_BACKENDS | {"tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native",
-                                          "tidehunter_verbs", "tidehunter_verbs_native"}
-    if set(backends) - allowed:
-        raise ValueError("NVMe-oF comparison excludes unrelated KV backends")
-    # These two readers must share one physical source block. A native or
-    # different transport case ends that block; its evidence directory remains
-    # immutable and cannot be recreated later in the same matrix.
-    tcp_readers = {"tidehunter_tcp"} | NVME_BACKENDS
-    first_tcp = next(index for index, backend in enumerate(backends) if backend in tcp_readers)
-    backends = (list(backends[:first_tcp])
-                + [backend for backend in backends if backend in tcp_readers]
-                + [backend for backend in backends[first_tcp:] if backend not in tcp_readers])
-    jobs, writes = [], []
-    for size in (1024, 8192, 64, 256, 65536):
-        keys = max(spec["keys"], 65536 if size in (1024, 8192) else 8192)
-        source = f"sealed-v2-seed{spec['seed']}-size{size}-keys{keys}"
-        shapes = (("scalar", 1), ("scalar", 16), ("batch32", 1), ("batch32", 16)) if size in (1024, 8192) else (("scalar", 1),)
-        for backend in backends:
-            physical = ("tcp" if backend in tcp_readers else
-                        "native" if backend == "native" else backend)
-            for shape, concurrency in shapes:
-                for tier in ("first_touch", "repeat_read"):
-                    for profiled in ((False, True) if backend != "native" and
-                                     (size, shape, concurrency) in ((1024, "scalar", 1), (8192, "batch32", 16))
-                                     else (False,)):
-                        drop = tier == "first_touch"
-                        mapped_eviction = drop and backend not in NVME_BACKENDS
-                        job = {"backend": backend, "repeat": 0,
-                               "profile": f"{tier}-{shape}-c{concurrency}-{'diagnostic' if profiled else 'baseline'}",
-                               "cohort": "sealed_read", "value_size": size, "keys": keys,
-                               "mix": mix(get_many=100) if shape == "batch32" else mix(read=100),
-                               "concurrency": concurrency, "read_lanes": 0 if backend == "native" else (4 if concurrency == 16 else 1),
-                               "measurement_operations": 2048 if shape == "batch32" else 8192,
-                               "warmup_operations": 0, "offered_ops_per_second": None,
-                               "distribution": "uniform", "coordinator_cache_bytes": 0,
-                               "drop_os_caches": drop,
-                               "native_durability": "value_wal_barrier",
-                               "measurement_key_sweep": tier == "first_touch",
-                               "evict_mapped_wal_before_measurement": mapped_eviction,
-                               "sealed_dataset": {"source_id": f"{source}-{physical}", "data_id": source, "seed": spec["seed"], "profiled": profiled,
-                                                  "tier": tier, "instrumentation": "read_profile" if profiled and backend != "native" else "none",
-                                                  "page_cache_policy": "drop_at_measurement_gate" if drop else "not_dropped",
-                                                  "mapped_wal_eviction": "before_measurement_gate" if mapped_eviction else "not_requested",
-                                                  "directness": "initiator_O_DIRECT_target_buffered" if backend in NVME_BACKENDS else "buffered_WAL_pagecache_or_device",
-                                                  "cold_claim": "distinct keys after OS cache drop do not prove per-call device reads; shared pages, readahead and device caches remain",
-                                                  "target_cache": "buffered_file_page_cache" if backend in NVME_BACKENDS else "not_applicable"}}
-                        if backend in NVME_BACKENDS:
-                            job["nvmeof_route"] = "sealed_read"
-                        if backend == "native":
-                            job["native_wal_geometry"] = "native_default"
-                        if profiled and backend != "native":
-                            job["diagnostics"] = {"read_profile_limit": diagnostics["read_profile_limit"] or 256}
-                        jobs.append(job)
-                        if spec.get("spdk_comparison") and backend == "tidehunter_nvme_rdma":
-                            spdk = copy.deepcopy(job)
-                            spdk["nvmeof_target"] = "spdk"
-                            spdk["sealed_dataset"]["directness"] = "initiator_O_DIRECT_target_file_O_DIRECT"
-                            spdk["sealed_dataset"]["target_cache"] = "direct_file_bdev_no_OS_pagecache"
-                            spdk["sealed_dataset"]["cold_claim"] = (
-                                "SPDK file direct I/O bypasses OS cache; device/controller caches remain. "
-                                "Compare actual device evidence, not first-touch keys alone.")
-                            jobs.append(spdk)
-        for backend in (name for name in backends if name not in NVME_BACKENDS):
-            for profiled in ((False, True) if backend != "native" and size in (1024, 8192) else (False,)):
-                job = {"backend": backend, "repeat": 0, "profile": "write-c16-" + ("diagnostic" if profiled else "baseline"),
-                       "cohort": "native_write_regression", "value_size": size, "keys": keys,
-                       "write_path": "native_local_WAL" if backend == "native" else "common_RF1_owner_WAL_existing_transport_no_NVMe_reader_installed",
-                       "mix": mix(put=100), "concurrency": 16, "read_lanes": 0 if backend == "native" else 4,
-                       "measurement_operations": 4096, "warmup_operations": 512,
-                       "offered_ops_per_second": None, "distribution": "uniform",
-                       "coordinator_cache_bytes": 0,
-                       "drop_os_caches": False, "native_durability": "value_wal_barrier"}
-                if backend == "native":
-                    job["native_wal_geometry"] = "native_default"
-                if profiled and backend != "native":
-                    job["diagnostics"] = {"write_profile_limit": diagnostics["write_profile_limit"] or 256}
-                writes.append(job)
-                if size in (1024, 8192) and not profiled:
-                    batch = copy.deepcopy(job)
-                    batch["profile"] = job["profile"].replace("write-c16-", "write-batch32-c16-", 1)
-                    batch["mix"] = mix(put_batch=100)
-                    batch["measurement_operations"] = 2048
-                    writes.append(batch)
-    jobs.extend(writes)
-    if diagnostics["write_timeline_limit"]:
-        jobs.extend(job | {"cohort": "write_timeline_diagnostics",
-                           "profile": job["profile"].replace("-baseline", "-timeline"),
-                           "diagnostics": {"write_profile_limit": 0,
-                                           "write_timeline_limit": diagnostics["write_timeline_limit"],
-                                           **({"write_timeline_sample_every": diagnostics["write_timeline_sample_every"]}
-                                              if "write_timeline_sample_every" in diagnostics else {})}}
-                    for job in writes if job["backend"] in TRANSPORTS
-                    and ((job["value_size"] == 1024 and job["profile"] == "write-c16-baseline")
-                         or (job["value_size"] == 8192 and job["profile"] == "write-batch32-c16-baseline")))
-    if len(jobs) > spec["max_cases"]:
-        raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
-    for number, job in enumerate(jobs):
-        job["case_id"] = f"{number:04d}-{comparison_backend(job)}-{job['value_size']}-{job['profile']}"
-    return jobs
-
-
-def make_read_tier_matrix(spec, backends, diagnostics):
-    """A single ordered fleet experiment; each instrumented twin has its own population."""
-    selected = [backend for backend in backends if backend in TRANSPORTS]
-    if not selected:
-        raise ValueError("read-tier mode requires at least one distributed Tidehunter backend")
-    limit = diagnostics["read_profile_limit"] or 4096
-    working_keys = max(spec["keys"], 8192)
-    tiers = ("remote", "coordinator_hit", "wal_warm", "native_hot_wal_lru0_pagecache",
-             "cold_device", "native_cold_os_lru0", "bounded_mixed")
-    jobs = []
-    for tier in tiers:
-        for repeat in range(spec["repeats"]):
-            for backend in (["native"] if tier.startswith("native_") and "native" in backends
-                            else [] if tier.startswith("native_") else selected):
-                for size in ((256, 1024, 8192, 65536) if backend == "native"
-                             else (256, 8192, 65536)):
-                    for profiled in ((False,) if backend == "native" else (False, True)):
-                        # Size pure-hit controls for the finite dataset plus cache metadata,
-                        # without claiming four-way placement can retain every key.
-                        footprint = working_keys * (size + 512)
-                        cache = max(128 * 1024**2, 2 * footprint) if tier == "coordinator_hit" else (1024**2 if tier == "bounded_mixed" else 0)
-                        coordinator_allowance = max(512 * 1024**2, cache + 64 * 1024**2)
-                        owner_allowance = 512 * 1024**2
-                        sweep = tier in ("coordinator_hit", "wal_warm", "native_hot_wal_lru0_pagecache")
-                        warmup = working_keys if sweep else (0 if tier in ("cold_device", "native_cold_os_lru0") else 512)
-                        source = f"{backend}-{size}-keys{working_keys}-scalar-c1-l{'0' if backend == 'native' else '1'}-seed{1775 + repeat}-r{repeat}"
-                        tier_name = tier
-                        job = {"backend": backend, "repeat": repeat, "profile": "read-tier-profiled" if profiled else "read-tier-baseline",
-                            "cohort": "read_tier_" + tier_name,
-                            "value_size": size, "keys": working_keys, "mix": mix(read=100),
-                            "concurrency": 1, "read_lanes": 1,
-                            "measurement_operations": 8192,
-                            "warmup_operations": warmup, "offered_ops_per_second": None,
-                            "distribution": "uniform", "coordinator_cache_bytes": cache,
-                            "drop_os_caches": tier in ("cold_device", "native_cold_os_lru0"),
-                            "native_durability": "value_wal_barrier", "warmup_key_sweep": sweep,
-                            "owner_read_resident_first": tier == "wal_warm",
-                            "read_tier": {"name": tier_name, "source_id": source,
-                                "data_id": f"read-tier-v1-seed{1775 + repeat}-r{repeat}-size{size}-keys{working_keys}",
-                                "profiled": profiled,
-                                "requested": {"coordinator_cache_bytes": cache,
-                                    "owner_read_resident_first": tier == "wal_warm",
-                                    "page_cache_policy": "drop_at_measurement_gate" if tier in ("cold_device", "native_cold_os_lru0") else "not_dropped",
-                                    "warmup_operations": warmup, "warmup_key_sweep": sweep,
-                                    "device_trace": "enabled" if backend == "native" or tier == "cold_device" else "disabled",
-                                    "measurement_key_sweep": False,
-                                    "read_lanes": 0 if backend == "native" else 1, "concurrency": 1,
-                                    "sessions": "not_applicable" if backend == "native" else "runtime_default"},
-                                "effective": None}}
-                        if backend != "native":
-                            job["coordinator_read_memory_allowance_bytes"] = coordinator_allowance
-                            job["owner_read_memory_allowance_bytes"] = owner_allowance
-                            job["read_tier"]["requested"]["coordinator_read_memory_allowance_bytes"] = coordinator_allowance
-                            job["read_tier"]["requested"]["owner_read_memory_allowance_bytes"] = owner_allowance
-                        if backend == "native":
-                            job["native_wal_geometry"] = "native_default"
-                            job["read_tier"]["requested"]["native_value_lru_bytes"] = 0
-                            job["read_tier"]["requested"]["native_value_lru_source"] = "KeyShape::new_single default"
-                        if profiled:
-                            job["diagnostics"] = {"read_profile_limit": limit}
-                        jobs.append(job)
-    supplemental = []
-    wanted = {"remote", "coordinator_hit", "wal_warm", "bounded_mixed",
-              "native_hot_wal_lru0_pagecache"}
-    for original in jobs:
-        tier = original["read_tier"]["name"]
-        if tier not in wanted or original["value_size"] != 8192:
-            continue
-        for size, shape, calls in ((1024, "scalar", 8192), (8192, "batch32", 2048)):
-            job = copy.deepcopy(original)
-            profiled = job["read_tier"]["profiled"]
-            job["value_size"] = size
-            job["profile"] = f"read-tier-c16-{shape}-{'profiled' if profiled else 'baseline'}"
-            job["mix"] = mix(get_many=100) if shape == "batch32" else mix(read=100)
-            job["concurrency"] = 16
-            job["read_lanes"] = 0 if job["backend"] == "native" else 4
-            job["measurement_operations"] = calls
-            job["warmup_key_sweep"] = True
-            job["warmup_operations"] = max(1024, -(-working_keys // (32 if shape == "batch32" else 1)))
-            job["read_tier"]["source_id"] = (f"{job['backend']}-{size}-keys{working_keys}-{shape}-c16-"
-                f"l{job['read_lanes']}-seed{1775 + job['repeat']}-r{job['repeat']}")
-            job["read_tier"]["data_id"] = f"read-tier-v1-seed{1775 + job['repeat']}-r{job['repeat']}-size{size}-keys{working_keys}"
-            requested = job["read_tier"]["requested"]
-            requested.update(concurrency=16, read_lanes=job["read_lanes"],
-                             warmup_operations=job["warmup_operations"], warmup_key_sweep=True)
-            supplemental.append(job)
-    jobs.extend(supplemental)
-    tier_order = {name: index for index, name in enumerate(tiers)}
-    jobs.sort(key=lambda job: tier_order[job["read_tier"]["name"]])
-    if len(jobs) > spec["max_cases"]:
-        raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
-    for number, job in enumerate(jobs):
-        variant = job["profile"] if "-c16-" in job["profile"] else ("profiled" if job["read_tier"]["profiled"] else "baseline")
-        job["case_id"] = f"{number:04d}-{job['backend']}-{job['value_size']}-{job['read_tier']['name']}-{variant}-r{job['repeat']}"
-    return jobs
-
-
-FOCUSED_SELECTIONS = ("recommended", "full", "device", "floors", "stages", "unified",
-                      "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner",
-                      "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS)
-FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
-                  "stages": 183, "ssd_write": 18, "unified": 270, "append_floors": 48,
-                  "fair_native": 168, "parity": 216, "parity_compact": 177, "fair_five_owner": 39,
-                  "remote_rw_compact": 342, "fabric_ab_compact": 80, "leased_ab_compact": 72,
-                  "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
-                  "nvmeof_first_put": 12, "nvmeof_contracts": 34, "nvmeof_contracts_crossing": 35,
-                  "nvmeof_contracts_crossing2": 36, "nvmeof_parallel_writes": 44, "nvmeof_single_caller": 20, "valkey_rdma_reads": 22,
+FOCUSED_SELECTIONS = ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS)
+FOCUSED_COUNTS = {"nvmeof_path_compact": 123, "nvmeof_path_core": 53, "nvmeof_path_fix": 29,
+                  "nvmeof_first_put": 12, "nvmeof_contracts": 30, "nvmeof_contracts_crossing": 31,
+                  "nvmeof_contracts_crossing2": 32, "nvmeof_parallel_writes": 44, "nvmeof_single_caller": 20, "valkey_rdma_reads": 22,
                   "nvmeof_reads_geometry": 74, "nvmeof_reads_geometry_rest": 20, "nvmeof_reads_geometry_rest2": 18}
 FOCUSED_COUNTS["nvmeof_f6"] = 42
 FOCUSED_COUNTS["nvmeof_f6b"] = 58
@@ -823,7 +505,7 @@ FOCUSED_COUNTS.update(nvmeof_m3_t1=8, nvmeof_m3_t2_2=8, nvmeof_m3_t2_5=8)
 FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
 FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 18
 FOCUSED_COUNTS["nvmeof_p13_write_engine"] = 50
-FOCUSED_COUNTS[REDRAIN_AB_SELECTION] = 22
+FOCUSED_COUNTS[REDRAIN_AB_SELECTION] = 20
 FOCUSED_COUNTS[Q0_SELECTION] = 60
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
@@ -839,38 +521,17 @@ NVMEOF_PATH_OPTIONAL_LIVE_SETTING_KEYS = ("live_leased_write_window", "live_max_
                                         "live_leased_flush_min_frame_bytes")
 NVMEOF_PATH_SETTING_KEYS = {
     "native": NVMEOF_PATH_NATIVE_SETTING_KEYS,
-    "tidehunter_verbs_native": NVMEOF_PATH_REMOTE_SETTING_KEYS,
     # Compact/core documents predate the two fix-selection settings.
     "tidehunter_nvme_rdma": NVMEOF_PATH_LIVE_SETTING_KEYS[:-2],
 }
 _FOCUSED_GROUP_COUNTS = {
-    "recommended": {"G1": 81, "G2": 24, "G3": 6, "G4": 12, "G5": 150, "anchors": 6},
-    "full": {"G1": 81, "G2": 24, "G3": 6, "G4": 12, "G5": 150,
-             "anchors": 6, "G7": 48, "G9": 6},
-    # The device-only follow-up holds only the cases appended after the full selection.
-    "device": {"G10R": 60, "G10W": 60},
-    "floors": {"G11N": 45, "G11S": 24},
-    "stages": {"G12N": 52, "G12W": 60, "G12H": 12, "G12K": 12, "G12D": 43, "G12S": 4},
-    "unified": {"G12N": 52, "G12W": 60, "G12H": 12, "G12K": 12, "G12D": 43,
-                "G12S": 4, "G11N": 45, "G11S": 24, "G11W": 18},
-    "append_floors": {"G13W": 48},
-    "fair_native": {"G14N": 54, "G14S": 36, "G14O1": 36, "G14O5": 36, "G14P": 6},
-    "parity": {"G13W": 48, "G14N": 54, "G14S": 36, "G14O1": 36, "G14O5": 36, "G14P": 6},
-    "parity_compact": {"G13W": 48, "G14N": 54, "G14S": 36, "G14O1": 36, "G14P": 3},
-    "fair_five_owner": {"G14O5": 36, "G14P": 3},
-    "remote_rw_compact": {"G13W": 48, "G11N": 45, "G11S": 24, "G15F": 24,
-                          "G14N": 54, "G14O1": 36, "G14P": 3, "G15C": 54, "G15M": 54},
-    "fabric_ab_compact": {"G16P": 40, "G16C": 40},
-    "leased_ab_compact": {"G17W": 50, "G17R": 22},
-    "nvmeof_path_compact": {"G18F": 10, "G18N": 32, "G18W": 35, "G18R": 24,
-                             "G18M": 18, "G18B": 30, "G18X": 8},
-    "nvmeof_path_core": {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
-                          "G18M": 7, "G18B": 5, "G18X": 2},
-    "nvmeof_path_fix": {"G19W": 21, "G19R": 7, "G19N": 8, "G19X": 1},
+    "nvmeof_path_compact": {"G18N": 32, "G18W": 19, "G18R": 24, "G18M": 18, "G18B": 22, "G18X": 8},
+    "nvmeof_path_core": {"G18N": 17, "G18W": 11, "G18R": 12, "G18M": 7, "G18B": 4, "G18X": 2},
+    "nvmeof_path_fix": {"G19W": 15, "G19R": 5, "G19N": 8, "G19X": 1},
     "nvmeof_first_put": {"G20W": 9, "G20R": 1, "G20N": 2},
-    "nvmeof_contracts": {"G21W": 16, "G21R": 8, "G21N": 10},
-    "nvmeof_contracts_crossing": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 1},
-    "nvmeof_contracts_crossing2": {"G21W": 16, "G21R": 8, "G21N": 10, "G22W": 2},
+    "nvmeof_contracts": {"G21W": 12, "G21R": 8, "G21N": 10},
+    "nvmeof_contracts_crossing": {"G21W": 12, "G21R": 8, "G21N": 10, "G22W": 1},
+    "nvmeof_contracts_crossing2": {"G21W": 12, "G21R": 8, "G21N": 10, "G22W": 2},
     "nvmeof_parallel_writes": {"G23W": 32, "G23X": 6, "G23N": 6},
     "nvmeof_single_caller": {"G28W": 8, "G28C": 8, "G28N": 4},
     "nvmeof_f6": {"G29W": 20, "G29X": 6, "G29R": 8, "G29G": 4, "G24M": 4},
@@ -882,7 +543,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_p9_small_put": {"G34W": 7},
     "nvmeof_p9_write_engine": {"G35W": 12, "G35R": 2, "G35S": 4},
     "nvmeof_p13_write_engine": {"G35W": 16, "G35R": 2, "G35S": 32},
-    REDRAIN_AB_SELECTION: {"G36W": 18, "G36T": 4},
+    REDRAIN_AB_SELECTION: {"G36W": 16, "G36T": 4},
     Q0_SELECTION: {"G37W": 48, "G37S": 12},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
@@ -898,7 +559,7 @@ def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
         return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2, 2, 2, 2)))[selection]
-    return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
+    return 1
 
 
 def job_owner_hosts(job):
@@ -919,58 +580,34 @@ def focused_group_counts(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
     groups = dict(_FOCUSED_GROUP_COUNTS[selection])
-    if selection in ("stages", "unified", "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS):
-        jobs = make_focused_matrix(selection)
-        for kind in {job["case_kind"] for job in jobs}:
-            groups[kind] = sum(job["case_kind"] == kind for job in jobs)
-        return groups
-    kinds = {"G1": "media_read", "G2": "fio_floor", "G3": "block_trace",
-             "G4": "interference", "G5": "sealed_knee", "anchors": "native_anchor",
-             "G7": "high_concurrency", "G9": "write_wait_diagnostic",
-             "G10R": "media_read", "G10W": "remote_put",
-             "G11N": "net_floor", "G11S": "ssd_floor"}
-    return {**groups, **{kinds[group]: count for group, count in groups.items()}}
+    jobs = make_focused_matrix(selection)
+    for kind in {job["case_kind"] for job in jobs}:
+        groups[kind] = sum(job["case_kind"] == kind for job in jobs)
+    return groups
 
 
 def _focused_jobs():
     """Build the frozen matrix without consulting mutable external specifications."""
     jobs = []
-    routes = (("tidehunter_verbs_native", None), ("tidehunter_tcp", None),
-              ("tidehunter_nvme_rdma", "kernel"), ("tidehunter_nvme_rdma", "spdk"))
-    def add(group, kind, repeat, backend, target=None, *, size=1024, concurrency=1,
+    def add(group, kind, repeat, backend, *, size=1024, concurrency=1,
             operation="read", tier="repeat_read", media=None, extra=None):
         profile = f"{group}-{operation}-c{concurrency}-{tier}"
-        if kind == "native_anchor":
-            profile = "read-concurrent" if operation == "read" else "write-concurrent"
         job = {"case_kind": kind,
-               "selection": ("nvmeof_path_compact" if group.startswith("G18") else
-                             "leased_ab_compact" if group.startswith("G17") else
-                             "fabric_ab_compact" if group.startswith("G16") else
-                             "remote_rw_compact" if group.startswith("G15")
-                             else "fair_native" if group.startswith("G14")
-                             else "append_floors" if group == "G13W"
-                             else "unified" if group == "G11W"
-                             else "stages" if group.startswith("G12")
-                             else "floors" if group in ("G11N", "G11S")
-                             else "device" if group in ("G10R", "G10W")
-                             else "full" if group in ("G7", "G9") else "recommended"),
+               "selection": "nvmeof_path_compact",
                "group": group, "backend": backend, "repeat": repeat,
-               "profile": profile, "cohort": "sealed_read" if operation == "read" or kind == "interference" else "primary_rf1",
+               "profile": profile, "cohort": "primary_rf1",
                "value_size": size, "keys": 4096, "mix": mix(**{operation: 100}),
                "concurrency": concurrency, "read_lanes": 0 if backend == "native" else (4 if concurrency >= 16 else 1),
-               "measurement_operations": (400000 if kind == "interference" else
-                                          4096 if tier == "first_touch" or operation == "put" else 8192),
+               "measurement_operations": 4096 if tier == "first_touch" or operation == "put" else 8192,
                "warmup_operations": 0 if operation == "read" else 512,
                "offered_ops_per_second": None, "distribution": "uniform",
                "coordinator_cache_bytes": 0, "drop_os_caches": tier == "first_touch",
                "native_durability": "value_wal_barrier",
                "durability_tier": "value_wal_barrier" if backend == "native" else "synchronous",
-               "target_io": "not_applicable" if target is None else ("buffered" if target == "kernel" else "spdk_direct"),
+               "target_io": "not_applicable",
                "execution": {"queue_capacity": max(128, concurrency)}}
         if backend == "native":
             job["native_wal_geometry"] = "native_default"
-        if target:
-            job.update(nvmeof_route="sealed_read", nvmeof_target=target)
         if media is not None:
             job["media"] = media
             if media["history"] == "prewarm":
@@ -988,12 +625,10 @@ def _focused_jobs():
         # transport, target, tier and complete case dimensions.
         identity = hashlib.sha256(json.dumps(job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
         job["case_id"] = f"{group}-r{repeat}-{identity}"
-        if ((operation == "read" and not group.startswith("G17")) or kind in ("interference", "hybrid_put")) and (not group.startswith("G18") or backend == "native"):
-            physical = backend + ("-" + target if target else "")
-            dataset_size = 1024 if kind == "hybrid_put" else size
+        if operation == "read" and backend == "native":
             job["sealed_dataset"] = {
-                "source_id": f"focused-r{repeat}-{physical}-s{dataset_size}-seed1775-{tier}-{identity}",
-                "data_id": f"focused-r{repeat}-s{dataset_size}-seed1775",
+                "source_id": f"focused-r{repeat}-{backend}-s{size}-seed1775-{tier}-{identity}",
+                "data_id": f"focused-r{repeat}-s{size}-seed1775",
                 "seed": 1775, "tier": tier, "profiled": False, "instrumentation": "none",
                 "page_cache_policy": ("evict_mapped_wal_then_drop_at_measurement_gate"
                                       if job.get("evict_mapped_wal_before_measurement") and job["drop_os_caches"]
@@ -1001,486 +636,34 @@ def _focused_jobs():
                                       else "drop_at_measurement_gate" if tier == "first_touch" else "not_dropped"),
                 "mapped_wal_eviction": ("before_measurement_gate" if job.get("evict_mapped_wal_before_measurement")
                                         else "not_requested"),
-                "directness": ("initiator_O_DIRECT_target_kernel_buffered_io_0" if job["target_io"] == "direct" else
-                               "initiator_O_DIRECT_target_file_O_DIRECT" if target == "spdk" else
-                               "initiator_O_DIRECT_target_buffered" if target else "buffered_WAL_pagecache_or_device"),
+                "directness": "buffered_WAL_pagecache_or_device",
                 "cold_claim": "first touch does not establish per-call device reads",
-                "target_cache": ("direct_kernel_buffered_io_0_no_target_pagecache" if job["target_io"] == "direct" else
-                                 "direct_file_bdev_no_OS_pagecache" if target == "spdk" else
-                                 "buffered_file_page_cache" if target else "not_applicable")}
+                "target_cache": "not_applicable"}
             job["measurement_key_sweep"] = tier == "first_touch" and job.get("key_order") != "random_with_replacement"
         jobs.append(job)
 
-    for repeat in range(3):
-        for size in (1024, 8192, 65536):
-            for backend, target in routes:
-                add("G1", "media_read", repeat, backend, target, size=size, tier="first_touch",
-                    media={"expected": "cold", "history": "normal", "wal_eviction": "none"})
-            add("G1", "media_read", repeat, "tidehunter_verbs_native", size=size, tier="first_touch",
-                media={"expected": "cold", "history": "prewarm", "wal_eviction": "selective"})
-            for backend, target in routes[:3]:
-                add("G1", "media_read", repeat, backend, target, size=size,
-                    media={"expected": "memory", "history": "normal", "wal_eviction": "none"})
-        # Append direct controls after the existing G1 cases for this repeat.
-        for size in (1024, 8192, 65536):
-            add("G1", "media_read", repeat, "tidehunter_nvme_rdma", "kernel", size=size,
-                tier="first_touch", media={"expected": "cold", "history": "normal", "wal_eviction": "none"},
-                extra={"target_io": "direct"})
-        for location in ("local_file", "nvmeof_namespace"):
-            for block in (4096, 65536):
-                for depth in (1, 16):
-                    add("G2", "fio_floor", repeat, "tidehunter_nvme_rdma" if location == "nvmeof_namespace" else "tidehunter_verbs_native",
-                        "kernel" if location == "nvmeof_namespace" else None, size=65536,
-                        extra={"fio": {"location": location, "block_bytes": block, "queue_depth": depth,
-                                       "runtime_seconds": 10, "direct": True, "pattern": "randread"}})
-        for scope, operation in (("cold_owner_read", "read"), ("owner_put", "put")):
-            add("G3", "block_trace", repeat, "tidehunter_verbs_native", operation=operation,
-                tier="first_touch" if operation == "read" else "repeat_read",
-                extra={"trace": {"scope": scope, "require_file_attribution": True}})
-        for backend, target in routes:
-            add("G4", "interference", repeat, backend, target, concurrency=16,
-                extra={"interference": {"read_offered_per_second": 1000, "read_queue_capacity": 4096,
-                       "put_concurrency": 16, "duration_seconds": 20, "key_policy": "disjoint_read_put"}})
-        for backend, target in (("native", None), *routes):
-            for tier in ("first_touch", "repeat_read"):
-                for concurrency in (1, 2, 4, 8, 16):
-                    add("G5", "sealed_knee", repeat, backend, target, concurrency=concurrency, tier=tier)
-        for operation in ("read", "put"):
-            add("anchors", "native_anchor", repeat, "native", concurrency=16, operation=operation)
-    for repeat in range(3):
-        for operation in ("read", "put"):
-            for backend, target in (("native", None), *routes):
-                if operation == "put" and target:
-                    continue
-                for concurrency in (64, 256):
-                    add("G7", "high_concurrency", repeat, backend, target, concurrency=concurrency, operation=operation)
-        for enabled in (False, True):
-            limit = 256 if enabled else 0
-            add("G9", "write_wait_diagnostic", repeat, "tidehunter_verbs_native", concurrency=16,
-                operation="put", extra={"write_wait_diagnostics": {"enabled": enabled, "timeline_limit": limit},
-                                        "diagnostics": {"write_timeline_limit": limit}})
-    # G10, the device-only follow-up: cold reads on spread datasets with random keys, and plain puts.
-    # A 4,096-key sweep reads each owner's WAL in order, so kernel readahead serves most calls.
-    # Random keys over a large dataset make each call a first touch; device counters qualify it.
-    first_device = len(jobs)
-    # The sealed preparer admits at most 65,536 keys, and a hybrid reader charges 4 KiB per catalog entry
-    # against a 448 MiB allowance. With 65,536 keys, 4,096 random reads of 8 or 64 KiB values first-touch
-    # about 0.97 of their keys. At 1 KiB about four values share a 4 KiB page, so 2,048 reads keep the
-    # first-touch share near 0.94 (4,096 reads would give about 0.88, below the 0.9 cold test).
-    device_routes = (("tidehunter_verbs_native", None), ("tidehunter_tcp", None),
-                     ("tidehunter_nvme_rdma", "kernel"), ("tidehunter_nvme_rdma", "spdk"))
-    for repeat in range(3):
-        for backend, target in device_routes:
-            for size, concurrency in ((1024, 1), (8192, 1), (65536, 1), (1024, 16), (65536, 16)):
-                extra = {"keys": 65536, "key_order": "random_with_replacement"}
-                if size == 1024:
-                    extra["measurement_operations"] = 2048
-                if target == "kernel":
-                    extra["target_io"] = "direct"
-                add("G10R", "media_read", repeat, backend, target, size=size, concurrency=concurrency,
-                    tier="first_touch", extra=extra,
-                    media={"expected": "cold", "history": "normal",
-                           "wal_eviction": "selective" if target is None else "none"})
-        for backend in ("tidehunter_verbs_native", "tidehunter_tcp"):
-            for owner_tier in ("synchronous", "native"):
-                for size in (1024, 65536):
-                    for concurrency in (1, 16):
-                        add("G10W", "remote_put", repeat, backend, size=size, concurrency=concurrency,
-                            operation="put", extra={"durability_tier": owner_tier})
-                add("G10W", "remote_put", repeat, backend, size=1024, concurrency=16, operation="put",
-                    extra={"durability_tier": owner_tier, "measurement_operations": 200000})
-    device = jobs[first_device:]
-
-    def canary(group, backend, size, concurrency, detail=None, operations=None):
-        for job in device:
-            if (job["repeat"] == 0 and job["group"] == group and job["backend"] == backend
-                    and job["value_size"] == size and job["concurrency"] == concurrency
-                    and detail in (None, job.get("nvmeof_target"), job["durability_tier"])
-                    and operations in (None, job["measurement_operations"])):
-                return job
-        raise ValueError("device canary case missing")
-
-    # One case of every new flow first, so a failed cold gate or put flow shows within minutes.
-    canaries = [canary("G10R", "tidehunter_verbs_native", 65536, 1),
-                canary("G10R", "tidehunter_tcp", 1024, 1),
-                canary("G10R", "tidehunter_nvme_rdma", 1024, 1, "spdk"),
-                canary("G10R", "tidehunter_nvme_rdma", 8192, 1, "kernel"),
-                canary("G10W", "tidehunter_verbs_native", 1024, 1, "synchronous", 4096),
-                canary("G10W", "tidehunter_verbs_native", 1024, 1, "native", 4096),
-                canary("G10W", "tidehunter_verbs_native", 1024, 16, "synchronous", 200000)]
-    chosen = {job["case_id"] for job in canaries}
-    jobs[first_device:] = canaries + [job for job in device if job["case_id"] not in chosen]
-    first_floors = len(jobs)
-    sizes = [8, 1024, 4096, 65536]
-    for repeat in range(3):
-        for tool in ("ib_send_lat", "ib_write_lat", "ib_read_lat"):
-            for mode in ("polled", "event"):
-                add("G11N", "net_floor", repeat, "tidehunter_verbs_native", size=65536,
-                    extra={"net": {"tool": tool, "mode": mode, "interface": "rdma0",
-                                   "provider": None, "endpoint": None, "sizes": sizes,
-                                   "iterations": 5000, "warmup": 0}})
-        for provider, endpoint, interface in (("verbs;ofi_rxm", "rdm", "rdma0"),
-                                               ("verbs", "msg", "rdma0"),
-                                               ("tcp;ofi_rxm", "rdm", "eth0")):
-            add("G11N", "net_floor", repeat, "tidehunter_verbs_native", size=65536,
-                extra={"net": {"tool": "fi_pingpong", "mode": None, "interface": interface,
-                               "provider": provider, "endpoint": endpoint, "sizes": sizes,
-                               "iterations": 5000, "warmup": 0}})
-        for interface in ("eth0", "rdma0"):
-            for mode in ("block", "spin", "busy_poll"):
-                add("G11N", "net_floor", repeat, "tidehunter_verbs_native", size=65536,
-                    extra={"net": {"tool": "tcp_rtt", "mode": mode, "interface": interface,
-                                   "provider": None, "endpoint": None, "sizes": sizes,
-                                   "iterations": 20000, "warmup": 2000}})
-        for block in (4096, 65536):
-            for region in (67108864, 2147483648):
-                for state, age in (("fresh", 0), ("aged", 60)):
-                    add("G11S", "ssd_floor", repeat, "tidehunter_verbs_native", size=65536,
-                        extra={"ssd": {"block_bytes": block, "region_bytes": region,
-                                       "state": state, "age_seconds": age, "runtime_seconds": 6,
-                                       "queue_depth": 1, "pattern": "randread", "direct": True}})
-    floors = jobs[first_floors:]
-    canaries = [
-        next(job for job in floors if job["repeat"] == 0 and job.get("net", {}).get("tool") == "ib_send_lat"
-             and job["net"]["mode"] == "polled"),
-        next(job for job in floors if job["repeat"] == 0 and job.get("net", {}).get("provider") == "verbs;ofi_rxm"),
-        next(job for job in floors if job["repeat"] == 0 and job.get("net", {}).get("tool") == "tcp_rtt"
-             and job["net"]["interface"] == "eth0" and job["net"]["mode"] == "block"),
-        *[next(job for job in floors if job["repeat"] == 0 and job.get("ssd", {}).get("state") == state
-               and job["ssd"]["block_bytes"] == 4096 and job["ssd"]["region_bytes"] == 67108864)
-          for state in ("fresh", "aged")],
-    ]
-    chosen = {job["case_id"] for job in canaries}
-    jobs[first_floors:] = canaries + [job for job in floors if job["case_id"] not in chosen]
-    first_stages = len(jobs)
-
-    def write_case(group, kind, repeat, backend, operation, size, concurrency, durability,
-                   target=None, extra=None):
+    def write_case(group, kind, repeat, backend, operation, size, concurrency, durability, *, extra):
         fields = {"measurement_operations": 1024 if operation == "put_batch" else 4096,
                   "durability_tier": durability}
         if backend == "native":
             fields["native_durability"] = durability
-        if target == "kernel":
-            fields["target_io"] = "direct"
-        if kind == "hybrid_put":
-            fields["read_lanes"] = 4
-        fields.update(extra or {})
-        add(group, kind, repeat, backend, target, size=size, concurrency=concurrency,
+        fields.update(extra)
+        add(group, kind, repeat, backend, size=size, concurrency=concurrency,
             operation=operation, extra=fields)
 
-    for repeat in range(2):
-        for operation, sizes in (("put", (1024, 8192, 65536)), ("put_batch", (1024, 8192)),
-                                 ("delete", (1024,))):
-            if repeat and operation != "put":
-                continue
-            for size in sizes:
-                for concurrency in (1, 16):
-                    for durability in ("page_cache", "value_wal_barrier"):
-                        write_case("G12N", "native_op", repeat, "native", operation, size, concurrency, durability)
-        for size in (8192, 65536):
-            for concurrency in (1, 16):
-                add("G12N", "native_op", repeat, "native", size=size, concurrency=concurrency)
-        for size in (1024, 8192, 65536):
-            for concurrency in (1, 16):
-                if concurrency == 16 and (repeat or size == 8192):
-                    continue
-                add("G12N", "native_media_read", repeat, "native", size=size, concurrency=concurrency,
-                    tier="first_touch", media={"expected": "cold", "history": "normal", "wal_eviction": "selective"},
-                    extra={"keys": 65536, "key_order": "random_with_replacement",
-                           "measurement_operations": 2048 if size == 1024 else 4096})
-        for operation, sizes in (("put", (1024, 8192, 65536)), ("put_batch", (1024, 8192)),
-                                 ("delete", (1024,))):
-            if repeat and operation != "put":
-                continue
-            for size in sizes:
-                for concurrency in (1, 16):
-                    for tier in ("synchronous", "native"):
-                        write_case("G12W", "remote_put", repeat, "tidehunter_verbs_native",
-                                   operation, size, concurrency, tier)
-        for backend, tiers in (("tidehunter_tcp", ("synchronous", "native")),
-                               ("tidehunter_verbs", ("synchronous",))):
-            for size in (1024, 65536):
-                for concurrency in (1, 16):
-                    for tier in tiers:
-                        write_case("G12W", "remote_put", repeat, backend, "put", size, concurrency, tier)
-        for target in ("kernel", "spdk"):
-            for size, concurrency in ((1024, 1), (1024, 16), (65536, 16)):
-                write_case("G12H", "hybrid_put", repeat, "tidehunter_nvme_rdma",
-                           "put", size, concurrency, "synchronous", target)
-        for backend, kind, tier in (("native", "native_op", "value_wal_barrier"),
-                                     ("tidehunter_verbs_native", "remote_put", "synchronous")):
-            for size, concurrency in ((1024, 1), (1024, 16), (65536, 16)):
-                write_case("G12K", kind, repeat, backend, "put", size, concurrency, tier,
-                           extra={"put_key_policy": "new"})
-
-    def diagnostic_copy(source, field, limit, group="G12D", extra=None):
+    def diagnostic_copy(source, field, limit, group, extra):
         job = copy.deepcopy(source)
         job["group"] = group
         job["diagnostics"] = {field: limit}
-        job.update(extra or {})
+        job.update(extra)
         job.pop("case_id")
         identity = hashlib.sha256(json.dumps(job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
         job["case_id"] = f"{group}-r0-{identity}"
-        if "sealed_dataset" in job:
-            job["sealed_dataset"]["source_id"] += "-" + identity
-            if field == "read_profile_limit":
-                job["sealed_dataset"]["profiled"] = True
-                job["sealed_dataset"]["instrumentation"] = "read_profile"
         jobs.append(job)
 
-    base = jobs[first_stages:]
-    def find(group, backend, operation, size, concurrency, tier, target=None):
-        return next(j for j in base if j["repeat"] == 0 and j["group"] == group and j["backend"] == backend
-                    and j["mix"][operation] == 100 and j["value_size"] == size
-                    and j["concurrency"] == concurrency and j["durability_tier"] == tier
-                    and (target is None or j.get("nvmeof_target") == target))
-
-    for backend, operation, size, concurrency, tier, target in (
-            ("tidehunter_verbs_native", "put", 1024, 1, "synchronous", None),
-            ("tidehunter_verbs_native", "put", 65536, 1, "synchronous", None),
-            ("tidehunter_verbs_native", "put", 1024, 16, "synchronous", None),
-            ("tidehunter_verbs_native", "put_batch", 8192, 1, "synchronous", None),
-            ("tidehunter_verbs_native", "delete", 1024, 1, "synchronous", None),
-            ("tidehunter_verbs_native", "put", 1024, 1, "native", None),
-            ("tidehunter_tcp", "put", 1024, 1, "synchronous", None),
-            ("tidehunter_tcp", "put", 1024, 16, "synchronous", None),
-            ("tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "kernel"),
-            ("tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "spdk")):
-        diagnostic_copy(find("G12H" if target else "G12W", backend, operation, size, concurrency, tier, target),
-                        "write_timeline_limit", 4096)
-    for backend, operation, size, concurrency, tier in (
-            ("native", "put", 1024, 1, "value_wal_barrier"), ("native", "put", 1024, 1, "page_cache"),
-            ("native", "put", 65536, 1, "value_wal_barrier"), ("native", "put", 1024, 16, "value_wal_barrier"),
-            ("native", "delete", 1024, 1, "value_wal_barrier"),
-            ("tidehunter_verbs_native", "put", 1024, 1, "synchronous"),
-            ("tidehunter_verbs_native", "put", 1024, 16, "synchronous")):
-        diagnostic_copy(find("G12N" if backend == "native" else "G12W", backend, operation, size, concurrency, tier),
-                        "write_profile_limit", 4096)
-    for backend, target, states in (("tidehunter_verbs_native", None, ("memory", "cold")),
-                                     ("tidehunter_tcp", None, ("memory", "cold")),
-                                     ("tidehunter_nvme_rdma", "kernel", ("memory", "cold")),
-                                     ("tidehunter_nvme_rdma", "spdk", ("cold",))):
-        for state in states:
-            for size in (1024, 65536):
-                cold = state == "cold"
-                extra = {"diagnostics": {"read_profile_limit": 4096}, "measurement_operations": 4096}
-                if cold:
-                    extra.update(keys=65536, key_order="random_with_replacement",
-                                 measurement_operations=2048 if size == 1024 else 4096)
-                    if target == "kernel":
-                        extra["target_io"] = "direct"
-                add("G12D", "media_read", 0, backend, target, size=size,
-                    tier="first_touch" if cold else "repeat_read",
-                    media={"expected": state, "history": "normal",
-                           "wal_eviction": "selective" if cold and target is None else "none"},
-                    extra=extra)
-                jobs[-1]["sealed_dataset"]["profiled"] = True
-                jobs[-1]["sealed_dataset"]["instrumentation"] = "read_profile"
-    for backend, target, states, concurrency in (
-            ("tidehunter_verbs_native", None, ("memory", "cold"), 16),
-            ("tidehunter_tcp", None, ("memory", "cold"), 16),
-            ("tidehunter_nvme_rdma", "kernel", ("cold",), 16),
-            ("tidehunter_nvme_rdma", "spdk", ("cold",), 16),
-            ("tidehunter_verbs", None, ("memory", "cold"), 1)):
-        for state in states:
-            cold = state == "cold"
-            extra = {"diagnostics": {"read_profile_limit": 4096}, "measurement_operations": 4096}
-            if cold:
-                extra.update(keys=65536, key_order="random_with_replacement", measurement_operations=2048)
-                if target == "kernel":
-                    extra["target_io"] = "direct"
-            add("G12D", "media_read", 0, backend, target, size=1024, concurrency=concurrency,
-                tier="first_touch" if cold else "repeat_read",
-                media={"expected": state, "history": "normal",
-                       "wal_eviction": "selective" if cold and target is None else "none"},
-                extra=extra)
-            jobs[-1]["sealed_dataset"]["profiled"] = True
-            jobs[-1]["sealed_dataset"]["instrumentation"] = "read_profile"
-    diagnostic_copy(find("G12W", "tidehunter_verbs", "put", 1024, 1, "synchronous"),
-                    "write_timeline_limit", 4096)
-    for operation, size in (("put", 65536), ("put_batch", 8192), ("delete", 1024)):
-        write_case("G12D", "remote_put", 0, "tidehunter_tcp", operation, size, 1, "synchronous",
-                   extra={"diagnostics": {"write_timeline_limit": 4096}})
-    for policy in ("overwrite", "new"):
-        for field, limit in (("write_timeline_limit", 65536), ("write_profile_limit", 4096)):
-            source = find("G12W", "tidehunter_verbs_native", "put", 1024, 16, "synchronous")
-            extra = {"measurement_operations": 200000}
-            if policy == "new":
-                extra["put_key_policy"] = "new"
-            diagnostic_copy(source, field, limit, "G12S", extra)
-    stages = jobs[first_stages:]
-    canaries = [
-        find("G12N", "native", "put", 1024, 1, "value_wal_barrier"),
-        next(j for j in stages if j["case_kind"] == "native_media_read" and j["repeat"] == 0
-             and j["value_size"] == 1024 and j["concurrency"] == 1),
-        find("G12W", "tidehunter_verbs_native", "put", 1024, 1, "synchronous"),
-        find("G12W", "tidehunter_verbs_native", "put_batch", 8192, 1, "synchronous"),
-        find("G12W", "tidehunter_verbs_native", "delete", 1024, 1, "synchronous"),
-        find("G12H", "tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "kernel"),
-        find("G12H", "tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "spdk"),
-        find("G12K", "tidehunter_verbs_native", "put", 1024, 1, "synchronous"),
-        next(j for j in stages if j["group"] == "G12D" and "write_timeline_limit" in j["diagnostics"]),
-        next(j for j in stages if j["group"] == "G12D" and "read_profile_limit" in j["diagnostics"]),
-        next(j for j in stages if j["group"] == "G12D" and "write_profile_limit" in j["diagnostics"]),
-    ]
-    chosen = {j["case_id"] for j in canaries}
-    remaining = [j for j in stages if j["case_id"] not in chosen]
-    remaining.sort(key=lambda j: (j["repeat"], j["group"]))
-    jobs[first_stages:] = canaries + remaining
-    first_ssd_write = len(jobs)
-    for repeat in range(2):
-        for mode in ("buffered", "fdatasync", "direct"):
-            for block in (1024, 8192, 65536):
-                add("G11W", "ssd_write_floor", repeat, "tidehunter_verbs_native", size=65536,
-                    extra={"ssd_write": {"mode": mode, "block_bytes": block, "region_bytes": 536870912,
-                                         "runtime_seconds": 6, "queue_depth": 1, "location": "local_file",
-                                         "preheat": True}})
-    ssd_write = jobs[first_ssd_write:]
-    canary = next(job for job in ssd_write if job["repeat"] == 0
-                  and job["ssd_write"]["mode"] == "fdatasync" and job["ssd_write"]["block_bytes"] == 1024)
-    jobs[first_ssd_write:] = [canary] + [job for job in ssd_write if job["case_id"] != canary["case_id"]]
-    first_append = len(jobs)
-    for block in (1024, 8192, 65536):
-        for mode in ("fdatasync", "append_pwrite", "append_mmap", "append_mmap_fsync"):
-            for repeat in (0, 1):
-                for host in (("client", "owner0") if repeat == 0 else ("owner0", "client")):
-                    spec = {"mode": mode, "block_bytes": block, "region_bytes": 536870912,
-                            "queue_depth": 1, "location": "local_file", "host": host}
-                    if mode == "fdatasync":
-                        spec.update(runtime_seconds=6, preheat=True)
-                    else:
-                        spec.update(operations=4096, warmup_operations=512)
-                    add("G13W", "ssd_write_floor", repeat, "tidehunter_verbs_native",
-                        size=65536, extra={"ssd_write": spec})
-    append = jobs[first_append:]
-    canary = next(job for job in append if job["repeat"] == 0
-                  and job["ssd_write"]["mode"] == "append_mmap"
-                  and job["ssd_write"]["block_bytes"] == 1024
-                  and job["ssd_write"]["host"] == "client")
-    jobs[first_append:] = [canary] + [job for job in append if job["case_id"] != canary["case_id"]]
-    first_fair = len(jobs)
-    for repeat in (0, 1):
-        for shards, group, concurrencies in ((1, "G14N", (1, 5, 16)),
-                                             (5, "G14S", (5, 16))):
-            for durability in ("page_cache", "value_wal_barrier", "value_wal_group_barrier"):
-                for size in (1024, 8192, 65536):
-                    for concurrency in concurrencies:
-                        write_case(group, "native_op", repeat, "native", "put", size,
-                                   concurrency, durability,
-                                   extra={"profile": "write-concurrent", "native_shards": shards})
-        for owners, group in ((1, "G14O1"), (5, "G14O5")):
-            for backend in ("tidehunter_verbs_native", "tidehunter_tcp"):
-                for size in (1024, 8192, 65536):
-                    for concurrency in (1, 5, 16):
-                        write_case(group, "remote_put", repeat, backend, "put", size,
-                                   concurrency, "synchronous",
-                                   extra={"profile": "write-concurrent", "owner_count": owners})
-    fair = jobs[first_fair:]
-    for backend, concurrency, tier, owners, shards in (
-            ("tidehunter_verbs_native", 1, "synchronous", 5, None),
-            ("tidehunter_tcp", 1, "synchronous", 5, None),
-            ("tidehunter_verbs_native", 16, "synchronous", 5, None),
-            ("tidehunter_verbs_native", 16, "synchronous", 1, None),
-            ("native", 16, "value_wal_barrier", None, 1),
-            ("native", 1, "value_wal_barrier", None, 1)):
-        source = next(j for j in fair if j["repeat"] == 0 and j["backend"] == backend
-                      and j["value_size"] == 65536 and j["concurrency"] == concurrency
-                      and j["durability_tier"] == tier and j.get("owner_count") == owners
-                      and j.get("native_shards") == shards)
-        diagnostic_copy(source, "write_profile_limit", 4096, "G14P")
-    fair = jobs[first_fair:]
-    canary = next(j for j in fair if j["group"] == "G14N" and j["repeat"] == 0
-                  and j["value_size"] == 1024 and j["concurrency"] == 1
-                  and j["native_durability"] == "value_wal_group_barrier")
-    jobs[first_fair:] = [canary] + [j for j in fair if j["case_id"] != canary["case_id"]]
-    # New read cases follow the frozen blocks; existing job records stay unchanged.
-    for source in floors:
-        if source["group"] == "G11S":
-            add("G15F", "ssd_floor", source["repeat"], "tidehunter_verbs_native",
-                size=65536, extra={"ssd": {**source["ssd"], "host": "client"}})
-    for group in ("G15C", "G15M"):
-        cold = group == "G15C"
-        for size in (1024, 8192, 65536):
-            for concurrency in (1, 5, 16):
-                for repeat in (0, 1):
-                    arms = (("native", "tidehunter_tcp", "tidehunter_verbs_native") if cold
-                            else ("native", "tidehunter_verbs_native", "tidehunter_tcp"))
-                    for backend in arms if repeat == 0 else reversed(arms):
-                        native = backend == "native"
-                        kind = ("native_media_read" if native else "media_read") if cold else "sealed_knee"
-                        extra = ({"keys": 65536, "key_order": "random_with_replacement",
-                                  "measurement_operations": 2048 if size == 1024 else 4096}
-                                 if cold else {})
-                        if not native:
-                            extra["owner_count"] = 1
-                        add(group, kind, repeat, backend, size=size, concurrency=concurrency,
-                            tier="first_touch" if cold else "repeat_read",
-                            media={"expected": "cold" if cold else "memory", "history": "normal",
-                                   "wal_eviction": "selective" if cold else "none"}, extra=extra)
-    for group in ("G16P", "G16C"):
-        cold = group == "G16C"
-        arms = ((("tidehunter_tcp_trusted", None, "adaptive"),
-                 ("tidehunter_verbs_native", None, "adaptive"),
-                 ("tidehunter_nvme_rdma", "kernel", None),
-                 ("tidehunter_nvme_rdma", "spdk", None),
-                 ("tidehunter_nvme_tcp", "kernel", None)) if cold else
-                (("tidehunter_tcp", None, "adaptive"),
-                 ("tidehunter_tcp_trusted", None, "adaptive"),
-                 ("tidehunter_tcp_trusted", None, "busy"),
-                 ("tidehunter_verbs_native", None, "adaptive"),
-                 ("tidehunter_verbs_native", None, "busy")))
-        for size in (1024, 65536):
-            for concurrency in (1, 16):
-                for repeat in (0, 1):
-                    for backend, target, polling in arms if repeat == 0 else reversed(arms):
-                        extra = {"owner_count": 1}
-                        if polling is not None:
-                            extra["owner_polling"] = polling
-                        if cold:
-                            extra.update(keys=65536, key_order="random_with_replacement",
-                                         measurement_operations=2048 if size == 1024 else 4096)
-                        if target == "kernel":
-                            extra["target_io"] = "direct"
-                        add(group, "media_read" if cold else "sealed_knee", repeat, backend, target,
-                            size=size, concurrency=concurrency, tier="first_touch" if cold else "repeat_read",
-                            media={"expected": "cold" if cold else "memory", "history": "normal",
-                                   "wal_eviction": "selective" if cold and target is None else "none"},
-                            extra=extra)
-    for size in (1024, 65536):
-        for concurrency in (1, 16):
-            for tier in ("synchronous", "native"):
-                for repeat in (0, 1):
-                    for mode in ("owner", "leased", "reserved"):
-                        if mode == "reserved" and size != 1024:
-                            continue
-                        backend = "tidehunter_verbs_native" if mode == "owner" else "tidehunter_nvme_rdma"
-                        extra = {"owner_count": 1, "owner_polling": "adaptive"}
-                        if mode != "owner":
-                            extra.update(nvmeof_route="live", nvmeof_target="kernel",
-                                         target_io="buffered", live_write_mode=mode)
-                        write_case("G17W", "remote_put", repeat, backend, "put", size, concurrency, tier, extra=extra)
-                        if repeat == 0 and (mode == "leased" or (mode == "reserved" and concurrency == 1)):
-                            diagnostic_copy(jobs[-1], "write_profile_limit", 4096, group="G17W")
-    for size in (1024, 65536):
-        for concurrency in (1, 16):
-            for repeat in (0, 1):
-                for inline in (True, False, None):
-                    if inline is None and concurrency != 1:
-                        continue
-                    backend = "tidehunter_verbs_native" if inline is None else "tidehunter_nvme_rdma"
-                    extra = {"owner_count": 1, "owner_polling": "adaptive", "cohort": "primary_rf1",
-                             "warmup_operations": 4096, "warmup_key_sweep": True}
-                    if inline is not None:
-                        extra.update(nvmeof_route="live", nvmeof_target="kernel", target_io="buffered",
-                                     live_write_mode="leased", live_inline_reads=inline)
-                    add("G17R", "live_read", repeat, backend, size=size, concurrency=concurrency, extra=extra)
-                    if size == 1024 and concurrency == 1 and inline is True:
-                        add("G17R", "live_read", repeat, backend, size=size, concurrency=concurrency,
-                            operation="get_many", extra=extra)
-    first_path = len(jobs)
     native_settings = {"native_shards": 1, "native_wal_geometry": "native_default"}
     remote_settings = {"owner_count": 1, "owner_polling": "adaptive",
-                       "owner_wal_geometry": "native_default", "history_persistence": "memory_only"}
+                       "owner_wal_geometry": "native_default", "history_persistence": "wal_replay"}
     live_settings = {**remote_settings, "nvmeof_route": "live", "nvmeof_target": "kernel",
                      "target_io": "buffered", "live_write_mode": "leased", "live_export_mode": "per_owner",
                      "live_inline_reads": True, "live_io_queues": 1, "live_io_queue_size": 32, "live_poll_queues": 0}
@@ -1505,25 +688,6 @@ def _focused_jobs():
             tier="first_touch" if cold else "repeat_read",
             media={"expected": "cold" if cold else "memory", "history": "normal",
                    "wal_eviction": "selective" if cold else "none"}, extra=fields)
-    for tool in ("ib_send_lat", "ib_read_lat"):
-        for mode in ("polled", "event"):
-            add("G18F", "net_floor", 0, "tidehunter_verbs_native", size=65536,
-                extra={**remote_settings, "net": {"tool": tool, "mode": mode, "interface": "rdma0",
-                       "provider": None, "endpoint": None, "sizes": [8, 1024, 4096, 65536],
-                       "iterations": 5000, "warmup": 0}})
-    for block in (4096, 65536):
-        add("G18F", "ssd_floor", 0, "tidehunter_verbs_native", size=65536,
-            extra={**remote_settings, "ssd": {"host": "owner0", "block_bytes": block,
-                   "region_bytes": 2147483648, "state": "fresh", "age_seconds": 0,
-                   "runtime_seconds": 6, "queue_depth": 1, "pattern": "randread", "direct": True}})
-    for mode in ("append_pwrite", "fdatasync"):
-        for block in (1024, 65536):
-            floor = {"mode": mode, "block_bytes": block, "region_bytes": 536870912,
-                     "queue_depth": 1, "location": "local_file", "host": "owner0"}
-            floor.update({"runtime_seconds": 6, "preheat": True} if mode == "fdatasync" else
-                         {"operations": 4096, "warmup_operations": 512})
-            add("G18F", "ssd_write_floor", 0, "tidehunter_verbs_native", size=65536,
-                extra={**remote_settings, "ssd_write": floor})
     for repeat in (0, 1):
         for size in (1024, 65536):
             for concurrency in (1, 16):
@@ -1532,8 +696,7 @@ def _focused_jobs():
                 for cold in (False, True):
                     read("G18N", "native", repeat, size, concurrency, cold)
                 for tier in ("native", "synchronous"):
-                    for backend in ("tidehunter_verbs_native", "tidehunter_nvme_rdma"):
-                        put("G18W", backend, repeat, size, concurrency, tier)
+                    put("G18W", "tidehunter_nvme_rdma", repeat, size, concurrency, tier)
             for inline, polls in ((True, 0), (False, 0), (True, 1)):
                 flags = {"require_media_qualified": True} if repeat == 0 and size == 65536 and inline and polls == 0 else {}
                 read("G18R", "tidehunter_nvme_rdma", repeat, size, 1, True,
@@ -1554,7 +717,7 @@ def _focused_jobs():
                 read("G18X", "tidehunter_nvme_rdma", repeat, 65536, concurrency, True,
                      owner_wal_geometry="sui_harness", read_lanes=1 if concurrency == 1 else 4,
                      live_io_queues=queues, live_io_queue_size=depth)
-    source = next(j for j in jobs[first_path:] if j["group"] == "G18W" and j["repeat"] == 0
+    source = next(j for j in jobs if j["group"] == "G18W" and j["repeat"] == 0
                   and j["backend"] == "tidehunter_nvme_rdma" and j["value_size"] == 1024
                   and j["concurrency"] == 1 and j["durability_tier"] == "native")
     for field in ("write_profile_limit", "write_timeline_limit"):
@@ -1563,21 +726,20 @@ def _focused_jobs():
     for size in (1024, 8192):
         for concurrency in (1, 16):
             for native_tier, remote_tier in (("page_cache", "native"), ("value_wal_barrier", "synchronous")):
-                for backend in ("native", "tidehunter_verbs_native", "tidehunter_nvme_rdma"):
+                for backend in ("native", "tidehunter_nvme_rdma"):
                     put("G18B", backend, 0, size, concurrency,
                         native_tier if backend == "native" else remote_tier, "put_batch")
         for backend in ("native", "tidehunter_nvme_rdma"):
             read("G18B", backend, 0, size, 1, operation="get_many")
     for backend in ("native", "tidehunter_nvme_rdma"):
         read("G18B", backend, 0, 8192, 1, True, "get_many", measurement_operations=256)
-    path = jobs[first_path:]
+    path = jobs.copy()
     def pick(group, backend, operation="read", size=1024, concurrency=1, **fields):
         return next(j for j in path if j["group"] == group and j["backend"] == backend
                     and j["repeat"] == 0 and j["value_size"] == size and j["concurrency"] == concurrency
                     and j["mix"][operation] == 100 and not j.get("diagnostics")
                     and all(j.get(k) == v for k, v in fields.items()))
     canaries = [pick("G18N", "native", "put", durability_tier="page_cache"),
-                pick("G18W", "tidehunter_verbs_native", "put", durability_tier="native"),
                 pick("G18W", "tidehunter_nvme_rdma", "put", durability_tier="native"),
                 pick("G18N", "native", drop_os_caches=False),
                 pick("G18M", "tidehunter_nvme_rdma", live_poll_queues=0, coordinator_cache_bytes=0),
@@ -1586,12 +748,10 @@ def _focused_jobs():
                 pick("G18R", "tidehunter_nvme_rdma", live_poll_queues=1),
                 pick("G18R", "tidehunter_nvme_rdma", concurrency=16, read_lanes=4, live_io_queues=4),
                 pick("G18B", "tidehunter_nvme_rdma", "put_batch", durability_tier="native"),
-                pick("G18X", "tidehunter_nvme_rdma", size=65536, live_io_queues=1),
-                next(j for j in path if j.get("net", {}).get("tool") == "ib_read_lat"
-                     and j["net"]["mode"] == "polled")]
+                pick("G18X", "tidehunter_nvme_rdma", size=65536, live_io_queues=1)]
     chosen = {j["case_id"] for j in canaries}
-    order = ("G18F", "G18N", "G18W", "G18M", "G18R", "G18B", "G18X")
-    jobs[first_path:] = canaries + sorted((j for j in path if j["case_id"] not in chosen),
+    order = ("G18N", "G18W", "G18M", "G18R", "G18B", "G18X")
+    jobs[:] = canaries + sorted((j for j in path if j["case_id"] not in chosen),
                                          key=lambda j: order.index(j["group"]))
     return jobs
 
@@ -1624,7 +784,7 @@ def _clone_job(result, selection, item, group, *, case_label=None, **overrides):
     return job
 
 
-def _nvmeof_path_fix(path, fabric):
+def _nvmeof_path_fix(path):
     """Clone reviewed cells without changing their dataset identities."""
     result = []
     def put(backend="tidehunter_nvme_rdma", size=1024, concurrency=1, repeat=0, tier="native"):
@@ -1633,19 +793,14 @@ def _nvmeof_path_fix(path, fabric):
     leased64 = [_clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16, repeat=r), "G19W") for r in (0, 1)]
     for r in (0, 1):
         _clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16, repeat=r), "G19W", live_lease_ahead=False)
-    _clone_job(result, "nvmeof_path_fix", put(size=65536, concurrency=16), "G19W", history_persistence="memory_only")
     for concurrency in (1, 16):
         for r in (0, 1):
             _clone_job(result, "nvmeof_path_fix", put(concurrency=concurrency, repeat=r), "G19W")
     _clone_job(result, "nvmeof_path_fix", put(tier="synchronous"), "G19W")
     _clone_job(result, "nvmeof_path_fix", put(size=65536), "G19W")
-    owner = [_clone_job(result, "nvmeof_path_fix", put("tidehunter_verbs_native", repeat=r), "G19W") for r in (0, 1)]
-    _clone_job(result, "nvmeof_path_fix", put("tidehunter_verbs_native", size=65536, concurrency=16), "G19W")
-    _clone_job(result, "nvmeof_path_fix", put("tidehunter_verbs_native", tier="synchronous"), "G19W")
     sustained = _clone_source(path, "G18W", "tidehunter_nvme_rdma", concurrency=16,
                        measurement_operations=200000)
     sustained_job = _clone_job(result, "nvmeof_path_fix", sustained, "G19W")
-    _clone_job(result, "nvmeof_path_fix", sustained, "G19W", history_persistence="on_disk")
     timeline = next(job for job in path if job["group"] == "G18W"
                     and "write_timeline_limit" in job.get("diagnostics", {}))
     _clone_job(result, "nvmeof_path_fix", timeline, "G19W")
@@ -1664,10 +819,6 @@ def _nvmeof_path_fix(path, fabric):
     for polls in (0, 1):
         warm.append(_clone_job(result, "nvmeof_path_fix", _clone_source(path, "G18M", "tidehunter_nvme_rdma", operation="read",
                                  live_poll_queues=polls, coordinator_cache_bytes=0), "G19R"))
-    owner_cold = _clone_job(result, "nvmeof_path_fix", _clone_source(fabric, "G16C", "tidehunter_verbs_native", operation="read",
-                              owner_polling="adaptive"), "G19R", owner_wal_geometry="native_default")
-    _clone_job(result, "nvmeof_path_fix", _clone_source(fabric, "G16P", "tidehunter_verbs_native", operation="read",
-                 owner_polling="adaptive"), "G19R", owner_wal_geometry="native_default")
     native = []
     for size, concurrency, repeats in ((1024, 1, (0, 1)), (1024, 16, (0,)),
                                        (65536, 16, (0, 1)), (65536, 1, (0,))):
@@ -1680,10 +831,10 @@ def _nvmeof_path_fix(path, fabric):
                             "wal_eviction": "selective" if expected == "cold" else "none"}), "G19N")
     _clone_job(result, "nvmeof_path_fix", _clone_source(path, "G18X", "tidehunter_nvme_rdma", 65536, operation="read",
                  live_io_queues=1, live_io_queue_size=32), "G19X")
-    priority = [native[0], leased64[0], owner[0], cold[1], owner_cold, warm[0], polled, sustained_job]
+    priority = [native[0], leased64[0], cold[1], warm[0], polled, sustained_job]
     ids = {job["case_id"] for job in priority}
     result = priority + [job for job in result if job["case_id"] not in ids]
-    if (len(result) != 37 or len({job["case_id"] for job in result}) != 37
+    if (len(result) != FOCUSED_COUNTS["nvmeof_path_fix"] or len({job["case_id"] for job in result}) != len(result)
             or {group: sum(job["group"] == group for job in result)
                 for group in _FOCUSED_GROUP_COUNTS["nvmeof_path_fix"]}
             != _FOCUSED_GROUP_COUNTS["nvmeof_path_fix"]):
@@ -1712,12 +863,6 @@ def _nvmeof_contracts(path):
         _clone_job(result, "nvmeof_contracts", leased[tier][-1], "G21W",
                    diagnostics=copy.deepcopy(timeline["diagnostics"]),
                    owner_history_diagnostics=timeline["owner_history_diagnostics"])
-    for size in (1024, 65536):
-        for concurrency in (1, 16):
-            item = _clone_source(path, "G18W", "tidehunter_verbs_native", size, concurrency,
-                                 durability_tier="synchronous", diagnostics=None,
-                                 measurement_operations=4096)
-            _clone_job(result, "nvmeof_contracts", item, "G21W")
     cold = []
     for group in ("G18M", "G18R"):
         for size in (1024, 65536):
@@ -2240,9 +1385,7 @@ def _nvmeof_p16_redrain_ab(jobs):
                and j["concurrency"] in (16, 64)}
     first = [(tier, concurrency, arm) for concurrency in (16, 64)
              for tier in ("native", "synchronous") for arm in ("B", "C")]
-    first.insert(first.index(("native", 64, "C")) + 1, ("native", 64, "D"))
-    overrides = {"B": {}, "C": {"remote_config_overrides": {"leased_submit_redrain": False}},
-                 "D": {"remote_config_overrides": {"durable_cut": {"recovery": "per_owner"}}}}
+    overrides = {"B": {}, "C": {"remote_config_overrides": {"leased_submit_redrain": False}}}
     result = []
 
     def add(group, tier, concurrency, arm, repeat, **extra):
@@ -2530,124 +1673,14 @@ def make_focused_matrix(selection):
     ids = [job["case_id"] for job in jobs]
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate focused case ID")
-    if len(jobs) != sum(FOCUSED_COUNTS[name] for name in ("full", "device", "floors", "stages", "ssd_write", "append_floors", "fair_native", "fabric_ab_compact", "leased_ab_compact", "nvmeof_path_compact")) + 132:
-        raise ValueError("focused matrix size differs from its reviewed counts")
-    if selection == "recommended":
-        return jobs[:FOCUSED_COUNTS["recommended"]]
-    if selection == "full":
-        return jobs[:FOCUSED_COUNTS["full"]]
-    device_end = FOCUSED_COUNTS["full"] + FOCUSED_COUNTS["device"]
-    if selection == "device":
-        return jobs[FOCUSED_COUNTS["full"]:device_end]
-    floors_end = device_end + FOCUSED_COUNTS["floors"]
-    if selection == "floors":
-        return jobs[device_end:floors_end]
-    stages_end = floors_end + FOCUSED_COUNTS["stages"]
-    if selection == "stages":
-        return jobs[floors_end:stages_end]
-    write_end = stages_end + FOCUSED_COUNTS["ssd_write"]
-    append_end = write_end + FOCUSED_COUNTS["append_floors"]
-    fair_end = append_end + FOCUSED_COUNTS["fair_native"]
-    if selection == "append_floors":
-        return jobs[write_end:append_end]
-    if selection == "fair_native":
-        return jobs[append_end:fair_end]
-    if selection in ("parity", "parity_compact", "fair_five_owner"):
-        parity = jobs[append_end:append_end + 1] + jobs[write_end:append_end] + jobs[append_end + 1:fair_end]
-        if selection == "parity":
-            return parity
-        wanted = 1 if selection == "parity_compact" else 5
-        return [job for job in parity if job_owner_hosts(job) == wanted]
-    if selection == "remote_rw_compact":
-        new = jobs[fair_end:fair_end + 132]
-        reads = [job for job in new if job["group"] in ("G15C", "G15M")]
-        canary_specs = (("G15C", "native"), ("G15C", "tidehunter_tcp"),
-                        ("G15C", "tidehunter_verbs_native"), ("G15M", "native"),
-                        ("G15M", "tidehunter_verbs_native"))
-        canaries = [next(job for job in reads if job["group"] == group and job["backend"] == backend
-                         and job["value_size"] == 1024 and job["concurrency"] == 1 and job["repeat"] == 0)
-                    for group, backend in canary_specs]
-        canaries.append(next(job for job in reads if job["group"] == "G15M"
-                             and job["backend"] == "tidehunter_tcp" and job["value_size"] == 1024
-                             and job["concurrency"] == 1 and job["repeat"] == 0))
-        floor_jobs = (jobs[write_end:append_end] + jobs[device_end:floors_end]
-                      + [job for job in new if job["group"] == "G15F"])
-        write_jobs = [job for job in jobs[append_end:fair_end] if job["group"] in ("G14N", "G14O1")]
-        arms = (("native", "page_cache"), ("native", "value_wal_barrier"),
-                ("native", "value_wal_group_barrier"), ("tidehunter_tcp", "synchronous"),
-                ("tidehunter_verbs_native", "synchronous"))
-        def write_order(job):
-            arm = arms.index((job["backend"], job["durability_tier"]))
-            return job["value_size"], job["concurrency"], job["repeat"], arm if job["repeat"] == 0 else -arm
-        write_jobs.sort(key=write_order)
-        profiles = [job for job in jobs[append_end:fair_end]
-                    if job["group"] == "G14P" and job_owner_hosts(job) == 1]
-        # Keep the five proven read canaries first. One repeat-0 maximum per
-        # flow follows: read arms, floor variants, then write arms.
-        def variant(job):
-            group = job["group"]
-            if group == "G13W":
-                return group, job["case_kind"], job["backend"], job["ssd_write"]["mode"], job["ssd_write"]["host"]
-            if group == "G11N":
-                net = job["net"]
-                return (group, job["case_kind"], job["backend"],
-                        *(net.get(k) for k in ("tool", "mode", "interface", "provider", "endpoint")))
-            if group in ("G11S", "G15F"):
-                return group, job["case_kind"], job["backend"], job["ssd"]["state"], job["ssd"].get("host", "owner0")
-            return group, job["case_kind"], job["backend"], job.get("durability_tier")
-        def weight(job):
-            floor = job.get("ssd_write") or job.get("ssd") or {}
-            return (job["value_size"], job["concurrency"], floor.get("block_bytes", 0),
-                    floor.get("queue_depth", 0), floor.get("region_bytes", 0))
-        selected = {}
-        for job in reads + floor_jobs + write_jobs + profiles:
-            if job["repeat"] != 0:
-                continue
-            key = variant(job)
-            if key not in selected or weight(job) > weight(selected[key]):
-                selected[key] = job
-        chosen = {job["case_id"] for job in canaries}
-        for job in selected.values():
-            if job["case_id"] not in chosen:
-                canaries.append(job)
-                chosen.add(job["case_id"])
-        result = canaries + [job for job in floor_jobs + write_jobs + profiles + reads
-                             if job["case_id"] not in chosen]
-        if len(result) != FOCUSED_COUNTS[selection] or parity_violations(result, complete=True):
-            raise ValueError("remote read/write matrix violates reviewed parity")
-        return result
-    if selection == "fabric_ab_compact":
-        fabric = jobs[fair_end + 132:fair_end + 132 + FOCUSED_COUNTS["fabric_ab_compact"]]
-        warm = [job for job in fabric if job["group"] == "G16P"]
-        cold = [job for job in fabric if job["group"] == "G16C"]
-        canaries = [job for job in warm + cold if job["repeat"] == 0
-                    and job["value_size"] == 1024 and job["concurrency"] == 1]
-        canaries += [job for job in cold if job["repeat"] == 0
-                     and job["value_size"] == 65536 and job["concurrency"] == 16
-                     and job["backend"] in NVME_BACKENDS]
-        canaries += [job for job in warm if job["repeat"] == 0
-                     and job["value_size"] == 65536 and job["concurrency"] == 16
-                     and job["owner_polling"] == "busy"]
-        chosen = {job["case_id"] for job in canaries}
-        remaining = (warm + [job for job in cold if job["backend"] not in NVME_BACKENDS]
-                     + [job for job in cold if job["backend"] in NVME_BACKENDS])
-        result = canaries + [job for job in remaining if job["case_id"] not in chosen]
-        if len(result) != FOCUSED_COUNTS[selection] or fabric_parity_violations(result):
-            raise ValueError("fabric matrix violates reviewed parity")
-        return result
-    if selection == "leased_ab_compact":
-        start = fair_end + 132 + FOCUSED_COUNTS["fabric_ab_compact"]
-        leased = jobs[start:start + FOCUSED_COUNTS["leased_ab_compact"]]
-        canaries = [job for job in leased if job["repeat"] == 0 and job["value_size"] == 1024
-                    and job["concurrency"] == 1 and not job.get("diagnostics")]
-        chosen = {job["case_id"] for job in canaries}
-        return canaries + [job for job in leased if job["case_id"] not in chosen]
+    if len(jobs) != FOCUSED_COUNTS["nvmeof_path_compact"]:
+        raise ValueError("focused matrix size differs from its reviewed count")
     if selection in NVMEOF_PATH_SELECTIONS:
-        path = jobs[-FOCUSED_COUNTS[NVMEOF_PATH_SELECTIONS[0]]:]
+        path = jobs
         if selection == NVMEOF_PATH_SELECTIONS[0]:
             return path
         if selection == "nvmeof_path_fix":
-            return _nvmeof_path_fix(path, make_focused_matrix("fabric_ab_compact"))
+            return _nvmeof_path_fix(path)
         if selection == "nvmeof_first_put":
             return _nvmeof_first_put(make_focused_matrix("nvmeof_path_fix"))
         if selection == "nvmeof_reads_geometry_rest2":
@@ -2683,9 +1716,7 @@ def make_focused_matrix(selection):
             tier = source["native_durability"] if source["backend"] == "native" else source["durability_tier"]
             page = tier in ("page_cache", "native")
             cold = source.get("media", {}).get("expected") == "cold"
-            if group == "G18F":
-                keep = source.get("net", {}).get("tool") == "ib_read_lat" or source["case_kind"] == "ssd_floor"
-            elif group == "G18N":
+            if group == "G18N":
                 keep = ((page or c1) and (r0 or (page and c1)) if source["mix"]["put"]
                         else (r0 or c1) if cold else r0 and (c1 or small))
             elif group == "G18W":
@@ -2732,189 +1763,6 @@ def make_focused_matrix(selection):
         priority_ids = {job["case_id"] for job in priority}
         result = priority + [job for job in result if job["case_id"] not in priority_ids]
         return result
-    return jobs[floors_end:stages_end] + jobs[device_end:floors_end] + jobs[stages_end:write_end]
-
-
-def parity_violations(jobs, *, complete=True):
-    """Check matched grid contracts, independent of execution order."""
-    violations = []
-    groups = {}
-    for job in jobs:
-        group = job.get("group")
-        if group not in ("G15C", "G15M", "G14N", "G14O1"):
-            continue
-        category = "write" if group in ("G14N", "G14O1") else group
-        key = (category, job.get("value_size"), job.get("concurrency"), job.get("repeat"))
-        groups.setdefault(key, []).append(job)
-    if complete:
-        required = {(category, size, concurrency, repeat)
-                    for category in ("G15C", "G15M", "write")
-                    for size in (1024, 8192, 65536)
-                    for concurrency in (1, 5, 16)
-                    for repeat in (0, 1)}
-        for key in sorted(required - groups.keys()):
-            violations.append(f"{key}: missing grid cell")
-    common = ("cohort", "value_size", "concurrency", "repeat", "keys", "key_order", "distribution",
-              "measurement_operations", "warmup_operations", "mix", "coordinator_cache_bytes")
-    for key, members in groups.items():
-        category, size, concurrency, repeat = key
-        if (type(size) is not int or size not in (1024, 8192, 65536)
-                or type(concurrency) is not int or concurrency not in (1, 5, 16)
-                or type(repeat) is not int or repeat not in (0, 1)):
-            violations.append(f"{key}: invalid grid dimensions")
-        if category == "write":
-            expected = {("native", mode) for mode in ("page_cache", "value_wal_barrier", "value_wal_group_barrier")}
-            expected |= {(backend, "synchronous") for backend in ("tidehunter_tcp", "tidehunter_verbs_native")}
-            observed = [(job.get("backend"), job.get("durability_tier")) for job in members]
-        else:
-            expected = {"native", "tidehunter_tcp", "tidehunter_verbs_native"}
-            observed = [job.get("backend") for job in members]
-        if len(observed) != len(expected) or set(observed) != expected:
-            violations.append(f"{key}: missing, duplicate, or unexpected arms")
-        baseline = members[0]
-        for job in members:
-            if any(job.get(field) != baseline.get(field) for field in common):
-                violations.append(f"{key}: workload fields differ")
-            native = job.get("backend") == "native"
-            if not native and job.get("owner_count") != 1:
-                violations.append(f"{key}: owner count differs")
-            if category == "write":
-                if ((native and (job.get("group") != "G14N"
-                                 or job.get("native_durability") != job.get("durability_tier")))
-                        or (not native and (job.get("group") != "G14O1"
-                                            or job.get("durability_tier") != "synchronous"))):
-                    violations.append(f"{key}: write durability differs")
-                continue
-            if (job.get("native_durability") != "value_wal_barrier"
-                    or job.get("durability_tier") != ("value_wal_barrier" if native else "synchronous")):
-                violations.append(f"{key}: read durability differs")
-            cold = category == "G15C"
-            dataset = job.get("sealed_dataset") or {}
-            base_dataset = baseline.get("sealed_dataset") or {}
-            if ({field: value for field, value in dataset.items() if field != "source_id"} !=
-                    {field: value for field, value in base_dataset.items() if field != "source_id"}):
-                violations.append(f"{key}: dataset geometry differs")
-            if (job.get("case_kind") != (("native_media_read" if native else "media_read") if cold else "sealed_knee")
-                    or dataset.get("tier") != ("first_touch" if cold else "repeat_read")
-                    or job.get("media") != {"expected": "cold" if cold else "memory", "history": "normal",
-                                             "wal_eviction": "selective" if cold else "none"}
-                    or job.get("coordinator_cache_bytes") != 0
-                    or job.get("keys") != (65536 if cold else 4096)
-                    or job.get("measurement_operations") != ((2048 if size == 1024 else 4096) if cold else 8192)
-                    or job.get("warmup_operations") != (0 if cold else 4096)
-                    or job.get("key_order") != ("random_with_replacement" if cold else None)
-                    or job.get("distribution") != "uniform"
-                    or job.get("drop_os_caches") is not cold
-                    or bool(job.get("evict_mapped_wal_before_measurement")) != cold
-                    or bool(job.get("warmup_key_sweep")) == cold):
-                violations.append(f"{key}: read contract differs")
-        if category != "write":
-            owners = [job for job in members if job.get("backend") in ("tidehunter_tcp", "tidehunter_verbs_native")]
-            if len(owners) == 2:
-                def owner_shape(job):
-                    shape = copy.deepcopy(job)
-                    shape.pop("backend", None)
-                    shape.pop("case_id", None)
-                    shape.get("sealed_dataset", {}).pop("source_id", None)
-                    return shape
-                if owner_shape(owners[0]) != owner_shape(owners[1]):
-                    violations.append(f"{key}: owner transports differ in non-transport fields")
-    return violations
-
-
-def fabric_parity_violations(jobs, *, complete=True):
-    """Check matched fabric read cells; partial mode checks only present cells."""
-    violations, cells = [], {}
-    warm_arms = {("tidehunter_tcp", None, "adaptive"),
-                 ("tidehunter_tcp_trusted", None, "adaptive"),
-                 ("tidehunter_tcp_trusted", None, "busy"),
-                 ("tidehunter_verbs_native", None, "adaptive"),
-                 ("tidehunter_verbs_native", None, "busy")}
-    cold_arms = {("tidehunter_tcp_trusted", None, "adaptive"),
-                 ("tidehunter_verbs_native", None, "adaptive"),
-                 ("tidehunter_nvme_rdma", "kernel", None),
-                 ("tidehunter_nvme_rdma", "spdk", None),
-                 ("tidehunter_nvme_tcp", "kernel", None)}
-    for job in jobs:
-        if job.get("group") in ("G16P", "G16C"):
-            key = (job["group"], job.get("value_size"), job.get("concurrency"), job.get("repeat"))
-            cells.setdefault(key, []).append(job)
-    if complete:
-        required = {(group, size, concurrency, repeat)
-                    for group in ("G16P", "G16C") for size in (1024, 65536)
-                    for concurrency in (1, 16) for repeat in (0, 1)}
-        for key in sorted(required - cells.keys()):
-            violations.append(f"{key}: missing cell")
-    for key, members in cells.items():
-        group, size, concurrency, repeat = key
-        cold = group == "G16C"
-        if (type(size) is not int or size not in (1024, 65536)
-                or type(concurrency) is not int or concurrency not in (1, 16)
-                or type(repeat) is not int or repeat not in (0, 1)):
-            violations.append(f"{key}: invalid grid dimensions")
-        arms = [(j.get("backend"), j.get("nvmeof_target"), j.get("owner_polling")) for j in members]
-        expected = cold_arms if cold else warm_arms
-        if len(arms) != len(expected) or set(arms) != expected:
-            violations.append(f"{key}: missing, duplicate, or unexpected arms")
-        def common_shape(job):
-            shape = copy.deepcopy(job)
-            # These fields describe the permitted transport/cache-specific arm differences.
-            for field in ("case_id", "profile", "backend", "owner_polling", "nvmeof_route",
-                          "nvmeof_target", "target_io", "evict_mapped_wal_before_measurement"):
-                shape.pop(field, None)
-            if isinstance(shape.get("media"), dict):
-                shape["media"].pop("wal_eviction", None)
-            if isinstance(shape.get("sealed_dataset"), dict):
-                for field in ("source_id", "directness", "target_cache", "mapped_wal_eviction",
-                              "cold_claim", "page_cache_policy"):
-                    shape["sealed_dataset"].pop(field, None)
-            return shape
-        baseline = common_shape(members[0])
-        for job in members:
-            if common_shape(job) != baseline:
-                violations.append(f"{key}: non-transport workload or dataset fields differ")
-            backend = job.get("backend")
-            nvme = backend in NVME_BACKENDS
-            target = job.get("nvmeof_target")
-            dataset = job.get("sealed_dataset")
-            if not isinstance(dataset, dict):
-                violations.append(f"{key}: dataset is missing")
-                continue
-            policy = ("drop_at_measurement_gate" if nvme else
-                      "evict_mapped_wal_then_drop_at_measurement_gate") if cold else "not_dropped"
-            directness = ("initiator_O_DIRECT_target_kernel_buffered_io_0" if target == "kernel" else
-                          "initiator_O_DIRECT_target_file_O_DIRECT" if target == "spdk" else
-                          "buffered_WAL_pagecache_or_device")
-            cache = ("direct_kernel_buffered_io_0_no_target_pagecache" if target == "kernel" else
-                     "direct_file_bdev_no_OS_pagecache" if target == "spdk" else "not_applicable")
-            if (job.get("selection") != "fabric_ab_compact" or job.get("owner_count") != 1
-                    or job.get("case_kind") != ("media_read" if cold else "sealed_knee")
-                    or job.get("cohort") != "sealed_read" or job.get("durability_tier") != "synchronous"
-                    or job.get("keys") != (65536 if cold else 4096)
-                    or job.get("key_order") != ("random_with_replacement" if cold else None)
-                    or job.get("distribution") != "uniform"
-                    or job.get("measurement_operations") != ((2048 if size == 1024 else 4096) if cold else 8192)
-                    or job.get("warmup_operations") != (0 if cold else 4096)
-                    or job.get("read_lanes") != (4 if concurrency == 16 else 1)
-                    or job.get("coordinator_cache_bytes") != 0
-                    or job.get("mix") != mix(read=100)
-                    or job.get("drop_os_caches") is not cold
-                    or bool(job.get("warmup_key_sweep")) == cold
-                    or bool(job.get("evict_mapped_wal_before_measurement")) != (cold and not nvme)
-                    or job.get("media") != {"expected": "cold" if cold else "memory", "history": "normal",
-                                             "wal_eviction": "selective" if cold and not nvme else "none"}
-                    or dataset.get("tier") != ("first_touch" if cold else "repeat_read")
-                    or dataset.get("page_cache_policy") != policy
-                    or dataset.get("mapped_wal_eviction") != ("before_measurement_gate" if cold and not nvme else "not_requested")
-                    or dataset.get("directness") != directness or dataset.get("target_cache") != cache
-                    or job.get("target_io") != ("direct" if target == "kernel" else
-                                                "spdk_direct" if target == "spdk" else "not_applicable")
-                    or (nvme and (job.get("nvmeof_route") != "sealed_read" or "owner_polling" in job))
-                    or (not nvme and ("nvmeof_route" in job or "nvmeof_target" in job))):
-                violations.append(f"{key}: arm cache, geometry, or route contract differs")
-    return violations
-
-
 def _focused_exact(actual, expected):
     if type(actual) is not type(expected):
         return False
@@ -2990,7 +1838,7 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         if node_options.get("durability_tier", tier) != tier:
             raise ValueError("replay durability_tier differs from the planned case")
         node_options["durability_tier"] = tier
-        node_options["transport"] = copy.deepcopy(TRANSPORTS["tidehunter_verbs_native"])
+        node_options["transport"] = CONTROL_TRANSPORTS[owner_control_backend(job)]
         return {
             "schema_version": 1, "case_id": job["case_id"], "source_revision": source_revision,
             "backend": {"kind": "tidehunter_tcp", "options": {
@@ -3043,11 +1891,7 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         if options.get("durability_tier", tier) != tier:
             raise ValueError("durability_tier differs from the planned case")
         options["durability_tier"] = tier
-        expected = (transport_for_case("tidehunter_verbs_native")
-                    if job.get("case_kind") and
-                    (job["backend"] == "tidehunter_nvme_rdma" or
-                     (job["backend"] == "tidehunter_nvme_tcp" and job.get("nvmeof_route") == "sealed_read"))
-                    else TRANSPORTS[job["backend"]])
+        expected = CONTROL_TRANSPORTS[owner_control_backend(job)]
         selected = validate_transport(options.get("transport", expected))
         if protocol_key(selected) != protocol_key(expected):
             raise ValueError("runtime transport differs from research case provider/security")
@@ -3154,18 +1998,12 @@ def admit_measurement_read_evidence(directory):
 
 LIVE_NVME_COUNTERS = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
                       "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
-                      "metadata_requests", "namespace_connects", "payload_rpc_requests",
+                      "metadata_requests", "namespace_connects",
                       "unknown_writes", "errors", "queue_ns", "queue_samples",
                       "submit_ns", "submit_samples", "cq_ns", "cq_samples",
                       "control_ns", "control_samples", "validation_ns", "validation_samples",
-                      "allocation_ns", "allocation_samples", "publication_ns", "publication_samples",
+                      "publication_ns", "publication_samples",
                       "namespace_setup_ns", "namespace_setup_samples", "read_io_ns", "read_io_samples",
-                      "persistence_ns", "persistence_samples",
-                      "owner_completion_ns", "owner_completion_samples",
-                      "wal_persistence_ns", "wal_persistence_samples",
-                      "wal_namespace_ns", "wal_namespace_samples",
-                      "frontier_file_ns", "frontier_file_samples",
-                      "frontier_namespace_ns", "frontier_namespace_samples",
                       "route_evidence_dropped", "fence_evidence_dropped")
 
 def requested_leased_sync(job):
@@ -3194,7 +2032,7 @@ def executed_leased_settings(backend_info):
 
 # Each exchange increments metadata_requests at the same submission site.
 WRITE_METADATA_EXCHANGES = ("adoption_async_exchanges", "adoption_sync_exchanges",
-                            "lease_exchanges", "reserve_exchanges", "complete_exchanges")
+                            "lease_exchanges")
 
 
 def qualify_live_nvme_measurement(evidence, job, backend_info=None):
@@ -3214,19 +2052,6 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
             ["F8 default arm did not run the engine default"] if f8_default else [])}
     start = data.get("start") or {}
     end = data.get("end") or {}
-    if job.get("selection") in M3_SELECTIONS:
-        partitions = {str(i) for i in range(active_owner_count(job))}
-        for boundary in (data.get("start"), data.get("end"), data.get("deltas")):
-            owner = (boundary or {}).get("owner_executor") or {}
-            rows = owner.get("partitions") or {}
-            if owner.get("available") is not True or set(rows) != partitions:
-                reasons.append("per-owner measurement counter population unavailable")
-                break
-        delta_owners = ((data.get("deltas") or {}).get("owner_executor") or {}).get("partitions") or {}
-        if any(row.get("available") is not True or not isinstance(row.get("counters"), dict)
-               or any(type(value) is not int or value < 0 for value in row["counters"].values())
-               for row in delta_owners.values()):
-            reasons.append("per-owner measurement counters reset or unavailable")
     start = start.get("live_nvmeof") if isinstance(start, dict) else None
     end = end.get("live_nvmeof") if isinstance(end, dict) else None
     delta = data.get("live_nvmeof")
@@ -3235,11 +2060,15 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
             or not isinstance(delta, dict) or delta.get("available") is not True
             or not isinstance(start, dict) or not isinstance(end, dict) or not isinstance(counters, dict)):
         return {"qualified": False, "reasons": ["live NVMe boundary counters unavailable"]}
-    for name in LIVE_NVME_COUNTERS:
+    archive = job.get("selection") == Q0_SELECTION
+    names = LIVE_NVME_COUNTERS + (("payload_rpc_requests",) if archive else ())
+    for name in names:
         a, b, value = start.get(name), end.get(name), counters.get(name)
         if (type(a) is not int or type(b) is not int or type(value) is not int
                 or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
             reasons.append(f"invalid live NVMe counter {name}")
+    if archive and counters.get("payload_rpc_requests"):
+        reasons.append("payload RPC observed on archived live NVMe route")
     if reasons:
         return {"qualified": False, "reasons": reasons}
     if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
@@ -3254,8 +2083,8 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-    if job.get("selection") in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
-        names = ("reserve_exchanges", "complete_exchanges", "leased_frames", "leased_skip_markers", "fua_writes")
+    if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
+        names = ("leased_frames", "leased_skip_markers", "fua_writes")
         if (executed_sync == "group_flush"
                 and job.get("durability_tier") == "synchronous"
                 and any(job["mix"].get(name, 0) for name in ("put", "put_batch"))):
@@ -3269,29 +2098,26 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
                 reasons.append(f"invalid live NVMe counter {name}")
         if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W", "G21W", "G22W", "G23W", "G23X", "G28W", "G28C", "G29W", "G29X", "G31W", "G31H", "G31S", "G31X", "G32W", "G32H", "G32S", "G30W", "G24W", "G24M") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
-            if job["live_write_mode"] == "leased":
-                if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
-                    reasons.append("leased write exchanges or frame count differ")
-                if executed_polled and any(
-                        counters.get(name, 0) != 0 for name in ("leased_flushes", "leased_flush_covered_frames")):
-                    reasons.append("polled leased writes observed shared flushes")
-                if (executed_sync == "group_flush" and not executed_polled
-                        and job["durability_tier"] == "synchronous"):
-                    if counters["fua_writes"] > counters["leased_frames"] + counters["leased_skip_markers"]:
-                        reasons.append("group flush FUA count exceeds frames and skip markers")
-                    if (job["value_size"] == 65536 and job["concurrency"] in (16, 64)
-                            and executed_minimum <= job["value_size"] * job["concurrency"]
-                            and job.get("live_leased_write_window") != 1) and (
-                            counters["leased_flushes"] <= 0
-                            or counters["leased_flush_covered_frames"] <= counters["leased_flushes"]):
-                        reasons.append("group flush did not cover shared frames")
-                else:
-                    expected_fua = (counters["leased_frames"] + counters["leased_skip_markers"]
-                                    if job["durability_tier"] == "synchronous" else 0)
-                    if counters["fua_writes"] != expected_fua:
-                        reasons.append("leased FUA count differs from frames and skip markers")
-            elif counters["leased_frames"]:
-                reasons.append("reserved write observed leased frames")
+            if counters["leased_frames"] <= 0:
+                reasons.append("no completed leased frames")
+            if executed_polled and any(
+                    counters.get(name, 0) != 0 for name in ("leased_flushes", "leased_flush_covered_frames")):
+                reasons.append("polled leased writes observed shared flushes")
+            if (executed_sync == "group_flush" and not executed_polled
+                    and job["durability_tier"] == "synchronous"):
+                if counters["fua_writes"] > counters["leased_frames"] + counters["leased_skip_markers"]:
+                    reasons.append("group flush FUA count exceeds frames and skip markers")
+                if (job["value_size"] == 65536 and job["concurrency"] in (16, 64)
+                        and executed_minimum <= job["value_size"] * job["concurrency"]
+                        and job.get("live_leased_write_window") != 1) and (
+                        counters["leased_flushes"] <= 0
+                        or counters["leased_flush_covered_frames"] <= counters["leased_flushes"]):
+                    reasons.append("group flush did not cover shared frames")
+            else:
+                expected_fua = (counters["leased_frames"] + counters["leased_skip_markers"]
+                                if job["durability_tier"] == "synchronous" else 0)
+                if counters["fua_writes"] != expected_fua:
+                    reasons.append("leased FUA count differs from frames and skip markers")
         if (job.get("group") == "G29R" and job.get("live_pin_read_lanes")
                 and counters.get("read_lane_pin_failures") != 0):
             reasons.append("read lane pin failures observed")
@@ -3307,8 +2133,6 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
                     or (not job["live_inline_reads"] and value != 0)
                     or (job["live_inline_reads"] and job["concurrency"] == 1 and value <= 0)):
                 reasons.append("live inline admission evidence differs")
-    if counters["payload_rpc_requests"]:
-        reasons.append("payload RPC observed on live NVMe route")
     if counters["errors"] or counters["unknown_writes"]:
         reasons.append("live NVMe errors or unknown writes observed")
     if counters["route_evidence_dropped"] or counters["fence_evidence_dropped"]:
@@ -3393,13 +2217,13 @@ def admit_live_write_contract(job, backend_info):
     if ("live_pin_read_lanes" in job
             and configuration.get("client", {}).get("pin_read_lanes") != job["live_pin_read_lanes"]):
         raise ValueError("live_pin_read_lanes differs")
-    if job.get("selection") not in ("leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) or job.get("nvmeof_route") != "live":
+    if job.get("selection") not in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS) or job.get("nvmeof_route") != "live":
         return
     if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
         configuration = backend_info.get("configuration", {})
         geometry = {"io_queues": job["live_io_queues"], "queue_size": job["live_io_queue_size"],
                     "poll_queues": job["live_poll_queues"]}
-        if (configuration.get("live_export_mode") != job["live_export_mode"]
+        if (configuration.get("live_export_mode", "per_owner") != "per_owner"
                 or configuration.get("live_queue_geometry") != geometry
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):
@@ -3421,15 +2245,12 @@ def admit_live_write_contract(job, backend_info):
                 or configuration["live_leased_write_window"] != job["live_leased_write_window"]):
             raise ValueError("leased write window differs")
     evidence = backend_info.get("configuration", {}).get("live_write", {})
-    mode, tier = job["live_write_mode"], job["durability_tier"]
     expected = {
-        ("leased", "native"): "leased extent: page-cache write",
-        ("leased", "synchronous"): "synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous",
-        ("reserved", "native"): "reserved frame: owner validated page-cache write",
-        ("reserved", "synchronous"): "reserved frame: owner WAL and frontier root synchronized",
-    }[(mode, tier)]
-    if evidence.get("write_mode") != mode or evidence.get("acknowledgement_contract") != expected:
-        raise ValueError("live write mode or acknowledgement contract differs")
+        "native": "leased extent: page-cache write",
+        "synchronous": "synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous",
+    }[job["durability_tier"]]
+    if evidence.get("acknowledgement_contract") != expected:
+        raise ValueError("leased write acknowledgement contract differs")
 
 
 def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
@@ -5116,7 +3937,7 @@ def main():
     plan.add_argument("--spec", type=Path, default=Path(__file__).with_name("cloud-campaign.json"))
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--backends", help="comma-separated nonempty subset of tracked backend IDs")
-    plan.add_argument("--mode", choices=("standard", "read-tier", "read-tier-focused", "nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof", "focused"), default="standard")
+    plan.add_argument("--mode", choices=("standard", "standard-with-live-nvmeof", "focused"))
     plan.add_argument("--selection", choices=FOCUSED_SELECTIONS, default="recommended")
     plan.add_argument("--write-profile-limit", type=int,
                       help="diagnostic-only 1KiB write cohort for native/Tidehunter; leaves normal plans unprofiled")
@@ -5142,7 +3963,7 @@ def main():
                               "job_selection_semantics": "minimum campaign selection containing the job"}))
             return 0
         spec = json.loads(args.spec.read_text())
-        spec["mode"] = args.mode
+        mode = spec["mode"] = args.mode or spec.get("mode", "standard")
         if any(value is not None for value in (args.write_profile_limit, args.read_profile_limit,
                                                 args.write_timeline_limit, args.valkey_profile_limit)):
             diagnostics = dict(spec.get("diagnostics", {}))
@@ -5155,11 +3976,10 @@ def main():
             if args.valkey_profile_limit is not None:
                 diagnostics["valkey_profile_limit"] = args.valkey_profile_limit
             spec["diagnostics"] = diagnostics
-        supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if args.mode in ("nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") else set())
+        supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if mode == "standard-with-live-nvmeof" else set())
         configured = select_backends(None, spec.get("backends"), supported)
-        if args.mode in ("nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") and args.backends is not None:
-            # Provider-specific workflow admission remains separate.
-            configured += sorted((NVME_BACKENDS | {"tidehunter_verbs", "tidehunter_verbs_native"}).difference(configured))
+        if mode == "standard-with-live-nvmeof" and args.backends is not None:
+            configured += sorted(NVME_BACKENDS - set(configured))
         spec["backends"] = select_backends(args.backends, configured, supported)
         value = {"schema_version": 1, "spec": spec, "jobs": make_matrix(spec)}
         local.dump(args.output, value)

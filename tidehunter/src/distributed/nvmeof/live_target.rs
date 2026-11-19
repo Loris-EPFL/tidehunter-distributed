@@ -9,7 +9,8 @@
 //! write protection can be changed by an authorized controller.
 use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
 use super::live_namespace::LiveNamespaceAccess;
-use super::{LiveExportMode, LiveTargetConfig, LiveTargetStats, NvmeofTransport};
+use super::live_storage::LiveTargetBinding;
+use super::{LiveTargetConfig, LiveTargetStats, NvmeofTransport};
 use crate::lock::DbLock;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -22,13 +23,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[path = "live_target/spdk.rs"]
-mod spdk;
-
 const CONFIGFS: &str = "/sys/kernel/config/nvmet";
 const STATE: &str = "live-target.json";
 const MAX_STATE: u64 = 4 * 1024 * 1024;
-const MAX_SPDK_IDENTITIES: usize = 32_768;
 
 /// Persist in the node-root marker before the first namespace is exposed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,24 +47,6 @@ pub struct LiveFileIdentity {
     pub block_size: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LiveTargetBinding {
-    pub nqn: String,
-    pub uuid: [u8; 16],
-    pub nsid: u32,
-    pub bytes: u64,
-    pub block_size: u32,
-    pub address: String,
-    pub service: u16,
-    pub transport: NvmeofTransport,
-    pub readonly: bool,
-    #[serde(default)]
-    pub spdk: Option<std::sync::Arc<super::SpdkTarget>>,
-    #[serde(default)]
-    pub permanent: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum Kind {
     Directory,
@@ -87,8 +66,6 @@ struct Export {
     binding: LiveTargetBinding,
     file: LiveFileIdentity,
     readonly: bool,
-    #[serde(default)]
-    spdk_phase: Option<spdk::Phase>,
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -100,10 +77,6 @@ struct State {
     exports: Vec<Export>,
     sealed_directory_device: u64,
     sealed_directory_inode: u64,
-    #[serde(default)]
-    spdk_daemon: Option<spdk::Daemon>,
-    #[serde(default)]
-    spdk_issued: Vec<[u8; 16]>,
 }
 
 /// A persistence step of the target state journal, for crash-cut tests.
@@ -141,6 +114,30 @@ pub struct LiveTargetManager {
 
 fn invalid(s: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, s)
+}
+/// A registry written before the refactor carries the removed `spdk` key in
+/// every export binding (`null` when unused), which the current binding
+/// rejects. Name that mode instead of reporting a corrupt registry.
+fn unparsable_state_error(payload: &[u8]) -> io::Error {
+    let mode = serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|state| {
+            state.get("exports")?.as_array()?.iter().find_map(|export| {
+                let spdk = export.get("binding")?.get("spdk")?;
+                Some(if spdk.is_null() {
+                    "pre_refactor_live_target_registry"
+                } else {
+                    "spdk"
+                })
+            })
+        });
+    match mode {
+        Some(mode) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported legacy distributed mode {mode}: use archive/multi-design"),
+        ),
+        None => invalid("invalid target state"),
+    }
 }
 fn path_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
@@ -230,9 +227,6 @@ fn check_path(path: &Path, private: bool) -> io::Result<()> {
     Ok(())
 }
 pub(crate) fn validate_config(c: &LiveTargetConfig) -> io::Result<()> {
-    if c.export_mode != LiveExportMode::OnDemand && c.spdk.is_some() {
-        return Err(invalid("permanent live export requires the kernel target"));
-    }
     if c.address.parse::<IpAddr>().is_err()
         || !nqn_valid(&c.host_nqn)
         || c.service == 0
@@ -306,9 +300,7 @@ impl LiveTargetManager {
     }
 
     pub fn open(config: LiveTargetConfig) -> io::Result<Self> {
-        if config.spdk.is_none() {
-            check_configfs()?;
-        }
+        check_configfs()?;
         check_path(&config.state_dir, true)?;
         Self::open_inner(
             config,
@@ -324,9 +316,7 @@ impl LiveTargetManager {
         config: LiveTargetConfig,
         expected: LiveTargetIdentity,
     ) -> io::Result<Self> {
-        if config.spdk.is_none() {
-            check_configfs()?;
-        }
+        check_configfs()?;
         check_path(&config.state_dir, true)?;
         Self::open_inner(
             config,
@@ -365,7 +355,6 @@ impl LiveTargetManager {
             return Err(invalid("target state directory identity changed"));
         }
         let state_path = config.state_dir.join(STATE);
-        let spdk = config.spdk.is_some();
         let state = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -393,7 +382,7 @@ impl LiveTargetManager {
                     return Err(invalid("target state checksum mismatch"));
                 }
                 let s: State =
-                    serde_json::from_slice(payload).map_err(|_| invalid("invalid target state"))?;
+                    serde_json::from_slice(payload).map_err(|_| unparsable_state_error(payload))?;
                 if s.version != 1
                     || s.config != config
                     || !nqn_valid(&s.private_host)
@@ -440,8 +429,6 @@ impl LiveTargetManager {
                     exports: Vec::new(),
                     sealed_directory_device: meta.dev(),
                     sealed_directory_inode: meta.ino(),
-                    spdk_daemon: None,
-                    spdk_issued: Vec::new(),
                 }
             }
             Err(e) => return Err(path_error("open target state registry", &state_path, e)),
@@ -471,11 +458,6 @@ impl LiveTargetManager {
             fixture,
             stats: LiveTargetStats {
                 fixture_only: fixture,
-                target_implementation: if spdk {
-                    super::LiveTargetImplementation::Spdk
-                } else {
-                    super::LiveTargetImplementation::Kernel
-                },
                 ..LiveTargetStats::default()
             },
             commissioning: None,
@@ -486,9 +468,6 @@ impl LiveTargetManager {
         // Persist even an empty state before touching configfs. An old state is
         // cleaned first; old writable capabilities are never re-enabled.
         manager.save()?;
-        if manager.state.config.spdk.is_some() {
-            manager.spdk_setup()?;
-        }
         // Disconnect persisted local controllers only after denying new target
         // connections and draining all old namespaces.
         manager.fence(None)?;
@@ -686,9 +665,6 @@ impl LiveTargetManager {
         Ok(())
     }
     fn setup(&mut self) -> io::Result<()> {
-        if self.state.config.spdk.is_some() {
-            return Ok(());
-        }
         let g = [0; 16];
         let host = PathBuf::from("hosts").join(&self.state.config.host_nqn);
         let private = PathBuf::from("hosts").join(&self.state.private_host);
@@ -775,10 +751,6 @@ impl LiveTargetManager {
         }
         Ok(file)
     }
-    pub fn export_mode(&self) -> LiveExportMode {
-        self.state.config.export_mode
-    }
-
     pub fn endpoint(&self) -> (String, u16, NvmeofTransport) {
         let config = &self.state.config;
         (config.address.clone(), config.service, config.transport)
@@ -845,14 +817,12 @@ impl LiveTargetManager {
             service: self.state.config.service,
             transport: self.state.config.transport,
             readonly: false,
-            spdk: None,
             permanent: true,
         };
         self.state.exports.push(Export {
             binding: binding.clone(),
             file: file.clone(),
             readonly: false,
-            spdk_phase: None,
         });
         self.pins.insert(name.uuid, pin);
         self.save()?;
@@ -906,9 +876,6 @@ impl LiveTargetManager {
     pub fn stats(&self) -> io::Result<LiveTargetStats> {
         let mut stats = self.stats.clone();
         stats.owned_namespace_count = 0;
-        if self.state.config.spdk.is_some() {
-            return self.spdk_stats(stats);
-        }
         for export in &self.state.exports {
             let path = PathBuf::from("subsystems")
                 .join(&export.binding.nqn)
@@ -924,9 +891,6 @@ impl LiveTargetManager {
     fn export(&mut self, file: LiveFileIdentity, readonly: bool) -> io::Result<LiveTargetBinding> {
         if self.poisoned {
             return Err(invalid("target manager is quarantined"));
-        }
-        if self.state.config.spdk.is_some() && self.state.spdk_issued.len() >= MAX_SPDK_IDENTITIES {
-            return Err(invalid("SPDK namespace identity history is full"));
         }
         if !readonly && let Some(old) = self.sealed_file(&file.path)? {
             return Err(if old == file {
@@ -949,15 +913,7 @@ impl LiveTargetManager {
                 return Err(invalid("registered configfs object disappeared"));
             }
         }
-        let mut next = None;
-        for _ in 0..8 {
-            let candidate = random_id()?;
-            if !self.state.spdk_issued.contains(&candidate) {
-                next = Some(candidate);
-                break;
-            }
-        }
-        let id = next.ok_or_else(|| invalid("namespace identity allocation exhausted"))?;
+        let id = random_id()?;
         let binding = LiveTargetBinding {
             nqn: format!("nqn.2026-01.local.tidehunter:live-{}", uuid(id)),
             uuid: id,
@@ -968,21 +924,12 @@ impl LiveTargetManager {
             service: self.state.config.service,
             transport: self.state.config.transport,
             readonly,
-            spdk: if self.state.config.spdk.is_some() {
-                Some(std::sync::Arc::new(self.spdk_binding(id, &file)?))
-            } else {
-                None
-            },
             permanent: false,
         };
-        if binding.spdk.is_some() {
-            self.state.spdk_issued.push(id);
-        }
         self.state.exports.push(Export {
             binding: binding.clone(),
             file: file.clone(),
             readonly,
-            spdk_phase: binding.spdk.as_ref().map(|_| spdk::Phase::Creating),
         });
         self.pins.insert(id, pin);
         let result = self.export_inner(&binding, &file, readonly);
@@ -997,9 +944,6 @@ impl LiveTargetManager {
         file: &LiveFileIdentity,
         readonly: bool,
     ) -> io::Result<()> {
-        if binding.spdk.is_some() {
-            return self.spdk_export(binding, file, readonly);
-        }
         self.save()?; // durable quarantine precedes any possible exposure
         let id = binding.uuid;
         let sub = PathBuf::from("subsystems").join(&binding.nqn);
@@ -1047,7 +991,6 @@ impl LiveTargetManager {
                 address: "127.0.0.1".to_owned(),
                 service: self.state.config.commissioning_service,
                 transport: NvmeofTransport::Tcp,
-                spdk: binding.spdk.clone(),
                 geometry: Default::default(),
             };
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -1129,9 +1072,6 @@ impl LiveTargetManager {
     }
     /// `groups: None` selects every registered object and export.
     fn fence(&mut self, groups: Option<&[[u8; 16]]>) -> io::Result<()> {
-        if self.state.config.spdk.is_some() {
-            return self.spdk_fence(groups);
-        }
         // Check shared parents as well as the selected namespace before mutation.
         for object in &self.state.objects {
             self.verify_object(object)?;
@@ -1217,9 +1157,6 @@ impl LiveTargetManager {
         Ok(())
     }
     fn cleanup(&mut self, groups: Option<&[[u8; 16]]>) -> io::Result<()> {
-        if self.state.config.spdk.is_some() {
-            return self.spdk_cleanup(groups);
-        }
         self.fence(groups)?;
         let mut paths: Vec<_> = self
             .state
@@ -1519,3 +1456,7 @@ impl LiveTargetManager {
 #[cfg(test)]
 #[path = "live_target_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "live_target_legacy_tests.rs"]
+mod legacy_tests;

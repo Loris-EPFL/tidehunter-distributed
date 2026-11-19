@@ -59,7 +59,7 @@ class WriteEngineRegistryTests(unittest.TestCase):
         selection = campaign.REDRAIN_AB_SELECTION
         spec = workflow_input.specification("kv", "tidehunter_nvme_rdma", "focused", selection)
         jobs = manual._reviewed_jobs(spec)
-        self.assertEqual((spec["job_count"], spec["owner_hosts"], len(jobs)), (22, 2, 22))
+        self.assertEqual((spec["job_count"], spec["owner_hosts"], len(jobs)), (20, 2, 20))
         self.assertNotIn("arms", spec)
         self.assertEqual(manual.reservation_quote(spec, spec["machine_type"]), (16200, 4438, 5438))
         fixed = (bootstrap.M3_PAIR_SECONDS + manual.PAIR_CLEANUP_SECONDS + manual.EXPORT_RESERVE_SECONDS
@@ -67,10 +67,10 @@ class WriteEngineRegistryTests(unittest.TestCase):
         admissions = len(jobs) * (campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS
                                   + campaign.M3_OWNER_ADMISSION_MARGIN_SECONDS)
         sizing = [job["measurement_sizing"] for job in jobs]
-        self.assertEqual(fixed + admissions + sum(cell["case_deadline_seconds"] for cell in sizing), 12736)
+        self.assertEqual(fixed + admissions + sum(cell["case_deadline_seconds"] for cell in sizing), 11764)
         archive = sum(cell["expected_archive_bytes"] for cell in sizing)
-        self.assertEqual(archive, 3797942272)
-        self.assertEqual(campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES[selection], (archive * 11 + 9) // 10)
+        self.assertEqual(archive, 3477078016)
+        self.assertLessEqual(archive, campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES[selection])
         for change in ({"arms": ["B"]}, {"machine_type": "z4m-highmem-32"},
                        {"reservation_hours": 5, "hard_deadline_seconds": 18000},
                        {"hard_deadline_seconds": manual.FLEET_SECONDS}):

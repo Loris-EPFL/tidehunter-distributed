@@ -156,11 +156,14 @@ def validate_runtime(config):
     _sha(package.get('sha256'))
     if config['spec'].get('suite') != 'kv':
         raise RuntimeSafetyError('invalid campaign suite')
+    import workflow_input
     backends = config['spec'].get('backends', [])
-    if not isinstance(backends, list) or not set(backends) <= {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
+    if (not isinstance(backends, list) or not backends
+            or any(not isinstance(backend, str) or backend not in workflow_input.BACKENDS for backend in backends)
+            or len(set(backends)) != len(backends)):
         raise RuntimeSafetyError('invalid GCP backend selection')
     mode = config['spec'].get('mode', 'standard')
-    if mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
+    if mode not in {'standard', 'standard-with-live-nvmeof', 'focused'}:
         raise RuntimeSafetyError('invalid matrix mode')
     if len(config['fleet']) == 2:
         if mode != 'focused' or config['spec'].get('suite') != 'kv':
@@ -269,7 +272,7 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
 def live_mode(spec):
     from workflow_input import cloud_campaign
     return (spec.get('mode') == 'standard-with-live-nvmeof'
-            or (spec.get('mode') == 'focused' and spec.get('selection') in ('leased_ab_compact', 'valkey_rdma_reads', *cloud_campaign.NVMEOF_PATH_SELECTIONS, *cloud_campaign.TOOL_SELECTIONS)))
+            or (spec.get('mode') == 'focused' and spec.get('selection') in cloud_campaign.FOCUSED_SELECTIONS))
 
 
 def admit_package_profile(spec, package):
@@ -447,11 +450,9 @@ def validate_controller_config(config):
     if (config.get('repository_root') != str(root / 'source') or config.get('binary') != str(root / 'runtime/bin/kv-research')
         or config.get('fdb_library_dir') != str(root / 'runtime/lib')):
         raise RuntimeSafetyError('package paths differ from sealed layout')
-    allowed = {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native',
-               'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma',
-               'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
-    if not set(config['spec']['backends']) <= allowed:
-        raise RuntimeSafetyError('unsupported GCP backend or AWS EFA selected')
+    from workflow_input import BACKENDS
+    if not set(config['spec']['backends']) <= BACKENDS:
+        raise RuntimeSafetyError('unsupported GCP backend selected')
     if runtime['spec'].get('mode') == 'focused':
         if json.dumps(config['spec'], sort_keys=True) != json.dumps(_controller_spec(runtime['spec']), sort_keys=True):
             raise RuntimeSafetyError('focused controller spec differs from reviewed runtime')
@@ -813,21 +814,13 @@ def _controller_config(runtime):
     required_artifacts = set()
     if live_mode(runtime['spec']):
         required_artifacts.add('source/experiments/kv-comparison/nvme_campaign_owner.py')
-    if runtime['spec'].get('spdk_comparison'):
-        required_artifacts |= {'runtime/spdk/spdk.json', 'runtime/spdk/bin/nvmf_tgt',
-                               'source/experiments/nvmeof/spdk_targets.py',
-                               'source/experiments/nvmeof/spdk_artifacts.py',
-                               'source/experiments/nvmeof/spdk_measurement.py'}
-        if live_mode(runtime['spec']):
-            required_artifacts |= {'source/experiments/nvmeof/live_spdk_daemon.py',
-                                   'source/experiments/kv-comparison/nvme_campaign_owner.py'}
     if runtime['spec'].get('valkey_reproduction_profiles'):
         required_artifacts |= {'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json',
                                'source/experiments/kv-comparison/valkey_cloud.py',
                                'source/experiments/kv-comparison/valkey_reproduction.py',
                                'source/experiments/kv-comparison/valkey-public-reproduction.json'}
     if not required_artifacts <= set(manifest.get('files', {})):
-        raise RuntimeSafetyError('runtime omits selected SPDK or native Valkey artifacts')
+        raise RuntimeSafetyError('runtime omits selected leased or native Valkey artifacts')
     raw_hosts = runtime['fleet']
     def host(item):
         return {'instance_id': item['name'], 'numeric_id': str(item['id']), 'address': item['internal_ip'],

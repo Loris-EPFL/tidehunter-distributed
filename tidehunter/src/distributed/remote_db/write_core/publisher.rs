@@ -164,8 +164,8 @@ impl WriteCore {
                 let _ = resume.recv();
             }
         }
-        // Owner-RPC harvest entered W3 for these receipts; leased receipts never
-        // entered it, and the saturating leave keeps that window at zero.
+        // The leased worker's ordered receipt release entered W3 for these
+        // receipts (`release_leased_replies`); publication leaves it here.
         self.write_timeline
             .wait_leave(super::super::WriteWait::HarvestToDurable, receipts.len());
         if let Some(cut) = &self.durable_cut

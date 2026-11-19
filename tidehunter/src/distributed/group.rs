@@ -63,13 +63,11 @@ pub struct CompleteGroup {
 }
 
 /// Validated live members without an intermediate encoded payload.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) struct LiveFrame {
     batches: Vec<CompleteBatch>,
     len: usize,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LiveFrame {
     pub(crate) fn new(
         shape: &KeyShape,
@@ -498,7 +496,6 @@ mod tests {
     use crate::distributed::types::{BatchId, BatchVersion};
     use crate::key_shape::KeyType;
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn live_in_place_encoder_matches_canonical_frames_for_group_shapes() {
         let sizes = [0, 1, 7, 8, 1024, 4088, 4089, 65536];
@@ -563,7 +560,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn live_in_place_validates_without_taking_an_encoding_buffer() {
         let (bl, gl) = limits();

@@ -580,6 +580,17 @@ fn scratch_is_reused_and_never_exceeds_the_limit() {
 }
 
 #[test]
+fn flusher_count_is_bounded_by_shards_cpus_and_cap() {
+    assert_eq!(cell_flushers(0), 1);
+    assert_eq!(cell_flushers(1), 1);
+    for shards in [2, 64, MAX_INDEX_SHARDS] {
+        let flushers = cell_flushers(shards);
+        assert!((1..=MAX_CELL_FLUSHERS).contains(&flushers));
+        assert!(flushers <= crate::parallelism::available().min(shards));
+    }
+}
+
+#[test]
 fn scratch_limit_is_one_flusher_share_of_a_quarter_of_the_index_budget() {
     const MIB: usize = 1 << 20;
     assert_eq!(cell_scratch_limit(32 * MIB, 8), MIB);
@@ -587,7 +598,7 @@ fn scratch_limit_is_one_flusher_share_of_a_quarter_of_the_index_budget() {
     assert_eq!(cell_scratch_limit(MIB, 0), MIB / 4);
     assert_eq!(cell_scratch_limit(512 * MIB, 1), CELL_SCRATCH_CEILING);
     for budget in [1, 4095, MIB, 7 * MIB + 3, 512 * MIB] {
-        for flushers in 1..=cell_contract::MAX_CELL_FLUSHERS {
+        for flushers in 1..=MAX_CELL_FLUSHERS {
             let limit = cell_scratch_limit(budget, flushers);
             assert!(limit * flushers <= budget / 4);
             assert!(limit <= MAX_IMAGE_BYTES - 8);

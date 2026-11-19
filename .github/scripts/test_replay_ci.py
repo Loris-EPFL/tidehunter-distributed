@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -62,21 +61,21 @@ class ReplayCITests(unittest.TestCase):
                 campaign.qualify_mainnet_resp(Path("/actual/binary"), state, Path(temporary) / "replay")
             freshness.assert_not_called()
 
-    def test_distributed_selection_fails_closed_and_allows_new_module_tests(self):
-        success = lambda n: f"test result: ok. {n} passed; 0 failed; 0 ignored; 100 filtered out;"
-        for output, passes in (([success(6), success(1)], True),
-                               ([success(7), success(1)], True),
-                               ([success(0)], False),
-                               ([success(6), success(0)], False),
-                               ([success(6), success(2)], False)):
-            with self.subTest(output=output), \
-                    patch.object(distributed, "fabric_environment", return_value=dict(os.environ)), \
-                    patch.object(distributed, "cargo", side_effect=output):
-                if passes:
-                    self.assertEqual(distributed.main(), 0)
-                else:
-                    with self.assertRaises(RuntimeError):
-                        distributed.main()
+    def test_distributed_selection_gates_only_the_leased_replay_module(self):
+        for passed in (6, 7):
+            with self.subTest(passed=passed), patch.object(distributed, "cargo", return_value=(
+                    f"test result: ok. {passed} passed; 0 failed; 0 ignored; 100 filtered out;")) as cargo:
+                self.assertEqual(distributed.main(), 0)
+                cargo.assert_called_once()
+                self.assertEqual(cargo.call_args.args[6:],
+                                 ("--lib", "backends::tidehunter::replay", "--", "--nocapture"))
+
+    def test_distributed_selection_fails_closed_on_empty_or_failed_output(self):
+        for output in ("", "test result: ok. 0 passed; 0 failed; 0 ignored;",
+                       "test result: FAILED. 6 passed; 1 failed; 0 ignored;"):
+            with self.subTest(output=output), patch.object(distributed, "cargo", return_value=output):
+                with self.assertRaisesRegex(RuntimeError, "nonempty passing suite"):
+                    distributed.main()
 
     def test_kernel_termination_enters_maintained_cleanup(self):
         with patch.object(kernel.signal, "signal") as handler:
@@ -84,7 +83,7 @@ class ReplayCITests(unittest.TestCase):
                 kernel.interrupted(15, None)
             self.assertEqual(handler.call_count, 2)
 
-    def test_kernel_live_qualification_gates_both_history_modes_and_cleanup(self):
+    def test_kernel_live_qualification_gates_wal_replay_and_cleanup(self):
         import argparse
         import local_dry_run_targets
         for complete, clean, restored in ((True, True, True), (False, True, True),
@@ -95,14 +94,12 @@ class ReplayCITests(unittest.TestCase):
                 args = argparse.Namespace(state=state, binary=state / "binary")
                 calls = []
 
-                def worker(output, binary, route, seconds, deadline, *,
-                           history_persistence, owner_wal_file_bytes):
+                def worker(output, binary, route, seconds, deadline, *, owner_wal_file_bytes):
                     self.assertEqual((binary, route), (args.binary, "tcp"))
                     self.assertEqual(owner_wal_file_bytes, 8 * 1024**2)
-                    self.assertEqual(output.name, history_persistence)
-                    calls.append(history_persistence)
-                    return ({"complete": complete or history_persistence == "wal_replay",
-                             "fixture_removed": clean}, output / "evidence")
+                    self.assertEqual(output.name, "wal_replay")
+                    calls.append(output.name)
+                    return ({"complete": complete, "fixture_removed": clean}, output / "evidence")
 
                 with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
                         patch.object(kernel.signal, "signal"), \
@@ -112,11 +109,11 @@ class ReplayCITests(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
                             kernel.qualify(args)
-                expected = ["on_disk", "wal_replay"] if clean and restored else ["on_disk"]
+                expected = ["wal_replay"]
                 self.assertEqual(calls, expected)
                 summary = json.loads((state / "single-owner/summary.json").read_text())
                 self.assertEqual(list(summary), expected)
-                self.assertEqual(summary["on_disk"]["inventory_restored"], restored)
+                self.assertEqual(summary["wal_replay"]["inventory_restored"], restored)
 
     def test_prewrite_pass_is_non_gating_but_cleanup_is_required(self):
         import argparse

@@ -110,6 +110,18 @@ impl DependencyRegistry {
             .map(|shard| shard.lock().capacity())
             .sum()
     }
+
+    /// Bytes per resident slot, as charged by `resident_bytes` (spilled key
+    /// storage is charged separately).
+    #[cfg(test)]
+    pub(super) const fn entry_bytes() -> usize {
+        std::mem::size_of::<(Dependency, u64)>()
+    }
+
+    #[cfg(test)]
+    pub(super) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
 }
 
 impl LockedDependencies<'_> {

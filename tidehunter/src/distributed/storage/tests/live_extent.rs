@@ -1014,7 +1014,7 @@ fn leased_close_rejects_missing_marker_and_nonzero_suffix() {
 }
 
 #[test]
-fn leased_self_adoption_stops_at_torn_frame_and_keeps_sync_checkpoint_barrier() {
+fn leased_self_adoption_stops_at_torn_frame_and_flush_discovers_complete_frames() {
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
         let (_temp, config, log) = fixture();
         let frontier = log
@@ -1044,16 +1044,11 @@ fn leased_self_adoption_stops_at_torn_frame_and_keeps_sync_checkpoint_barrier() 
         }
         assert_eq!(frontier.appended(), 4096);
         assert_eq!(log.synced_frontier(), 0);
-        assert!(matches!(
-            log.checkpoint_prefix(1),
-            Err(StorageError::NeedsPersistence)
-        ));
         let (_, frame) = encoded(&config, vec![batch(&config, 1)]);
         write(&extent, 4096, &frame);
         // Flush discovers complete frames which no explicit adoption reported.
         assert_eq!(log.persist_appended().unwrap(), 8192);
         assert_eq!(log.receipt_count(), 2);
-        log.checkpoint_prefix(2).unwrap();
         assert_eq!(
             log.read_record(&reference).unwrap(),
             batch(&config, 0).mutations()[0]
@@ -1062,15 +1057,10 @@ fn leased_self_adoption_stops_at_torn_frame_and_keeps_sync_checkpoint_barrier() 
 }
 
 #[test]
-fn leased_mode_excludes_reservations_and_rpc_append() {
+fn leased_mode_excludes_rpc_append() {
     let (_temp, config, log) = fixture();
     let extent = log.lease_live_extent(authority(&config)).unwrap().0;
     let (group, _) = encoded(&config, vec![batch(&config, 0)]);
-    let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
-    assert!(matches!(
-        log.reserve_live_group(authority(&config), descriptor.clone()),
-        Err(StorageError::Invalid(_))
-    ));
     assert!(matches!(
         log.append_group(authority(&config), &group),
         Err(StorageError::Invalid(_))
@@ -1078,10 +1068,8 @@ fn leased_mode_excludes_reservations_and_rpc_append() {
     skip(&extent, 0);
     log.adopt_live_extent(authority(&config), extent.token, 0, true)
         .unwrap();
-    log.reserve_live_group(authority(&config), descriptor)
-        .unwrap();
     assert!(matches!(
-        log.lease_live_extent(authority(&config)),
+        log.append_group(authority(&config), &group),
         Err(StorageError::Invalid(_))
     ));
 }
@@ -1189,16 +1177,7 @@ fn leased_recovery_reports_a_hole_only_below_a_later_valid_frame() {
 /// of fragment 1. With `damaged`, unsynced bytes inside v1 stop the scan there and
 /// recovery probes fragment 1. Returns the stream path and fragment 1's start.
 fn two_fragment_stream(damaged: bool) -> (tempdir::TempDir, PartitionConfig, u64) {
-    two_fragment_stream_in(HistoryPersistence::WalReplay, damaged)
-}
-
-fn two_fragment_stream_in(
-    history: HistoryPersistence,
-    damaged: bool,
-) -> (tempdir::TempDir, PartitionConfig, u64) {
     let (temp, config, log) = fixture();
-    log.set_history_persistence(history).unwrap();
-    assert_eq!(log.history_persistence(), history);
     let first = log.lease_live_extent(authority(&config)).unwrap().0;
     for n in 0..2 {
         let (_, frame) = encoded(&config, vec![batch(&config, n)]);
@@ -1267,63 +1246,6 @@ fn leased_recovery_scan_header_io_error_at_a_skip_marker_fails() {
     assert_eq!(recovered.receipt_count(), 3);
 }
 
-/// Live stream with on-disk history: recovery writes back every frame and skip
-/// marker it accepts above the synced live frontier, each from the validated
-/// bytes and each followed by a sync of its file before recovery returns.
-#[test]
-fn on_disk_live_recovery_rewrites_validated_frames_and_skip_markers() {
-    use crate::distributed::storage::wal_replay::suffix_rewrite_hook::{self as hook, Event};
-    let (temp, config, fragment) = two_fragment_stream_in(HistoryPersistence::OnDisk, false);
-    let path = temp.path().join("stream");
-    let synced: LiveFrontier = read_metadata(&path.join(LIVE_FRONTIER)).unwrap();
-    let mut before = vec![0u8; 2 * config.wal_file_bytes as usize];
-    for file in 0..2usize {
-        let bytes = fs::read(path.join(format!("wal_{file:016x}"))).unwrap();
-        let start = file * config.wal_file_bytes as usize;
-        let len = bytes.len().min(config.wal_file_bytes as usize);
-        before[start..start + len].copy_from_slice(&bytes[..len]);
-    }
-    hook::install(hook::Hook::default());
-    let recovered =
-        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
-    let events = hook::take().unwrap().events;
-    assert_eq!(recovered.history_persistence(), HistoryPersistence::OnDisk);
-    assert_eq!(recovered.receipt_count(), 3);
-    let mut pending = Vec::new();
-    let mut written = Vec::new();
-    for event in events {
-        match event {
-            Event::Write { offset, bytes } => pending.push((offset, bytes)),
-            Event::Sync { file_start } => {
-                for (offset, bytes) in pending.drain(..) {
-                    assert_eq!(
-                        offset / config.wal_file_bytes * config.wal_file_bytes,
-                        file_start
-                    );
-                    let range = offset as usize..offset as usize + bytes.len();
-                    assert_eq!(bytes[..], before[range], "offset {offset}");
-                    written.push((offset, bytes.len()));
-                }
-            }
-        }
-    }
-    assert!(pending.is_empty(), "rewrite without a following sync");
-    // v0, v1, the skip marker (8 bytes plus zeros to the fragment end) and v2,
-    // except what the synced live frontier already covered.
-    let expected: Vec<_> = [
-        (0, 4096),
-        (4096, 4096),
-        (8192, fragment - 8192),
-        (fragment, 4096),
-    ]
-    .into_iter()
-    .filter(|(offset, _)| *offset >= synced.end)
-    .map(|(offset, len)| (offset, len as usize))
-    .collect();
-    assert_eq!(written, expected);
-    assert!(!expected.is_empty());
-}
-
 #[test]
 fn leased_seal_adopts_and_persists_complete_frames_after_revocation() {
     let (temp, config, log) = fixture();
@@ -1343,7 +1265,7 @@ fn leased_seal_adopts_and_persists_complete_frames_after_revocation() {
 }
 
 #[test]
-fn leased_metadata_pressure_persists_spills_and_finishes_declared_range() {
+fn leased_metadata_pressure_finishes_declared_range() {
     let temp = tempdir::TempDir::new("live-lease-pressure").unwrap();
     let mut config = live_config();
     config.max_batches = 2;
@@ -1356,20 +1278,21 @@ fn leased_metadata_pressure_persists_spills_and_finishes_declared_range() {
         metrics(),
     )
     .unwrap();
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
     let extent = log.lease_live_extent(authority(&config)).unwrap().0;
     for n in 0..4 {
         let (_, frame) = encoded(&config, vec![batch(&config, n)]);
         write(&extent, n * 4096, &frame);
     }
+    let synced_before = log.synced_frontier();
     let adopted = log
         .adopt_live_extent(authority(&config), extent.token, extent.end, false)
         .unwrap()
         .0;
     assert_eq!(adopted.receipt_count, 4);
     assert_eq!(adopted.adopted_end, extent.end);
-    assert!(log.synced_frontier() >= 8192);
+    // OnDisk history persisted a pressure spill (synced ≥ 8192); WAL-replay
+    // history (the only mode) adopts the whole range without a spill.
+    assert_eq!(log.synced_frontier(), synced_before);
     assert_eq!(log.receipt_count(), 4);
 }
 
@@ -1485,7 +1408,7 @@ fn leased_namespace_persistence_exposes_no_transient_poison_and_preserves_termin
 
 #[test]
 fn leased_large_fragment_skip_does_not_charge_an_unadoptable_gap_as_metadata_pressure() {
-    for rooted in [false, true] {
+    {
         let temp = tempdir::TempDir::new("live-lease-large-skip").unwrap();
         let mut config = live_config();
         config.fragment_bytes = 128 * 1024 * 1024;
@@ -1498,16 +1421,6 @@ fn leased_large_fragment_skip_does_not_charge_an_unadoptable_gap_as_metadata_pre
         skip(&first, first.start + 4096);
         log.adopt_live_extent(authority(&config), first.token, first.start + 4096, false)
             .unwrap();
-        if rooted {
-            log.persist_appended().unwrap();
-            log.state
-                .lock()
-                .references
-                .start_background(4096, 1, &path)
-                .unwrap();
-            log.wait_history().unwrap();
-            assert_eq!(log.references.root().end, 4096);
-        }
         log.adopt_live_extent(authority(&config), first.token, first.start + 4096, true)
             .unwrap();
         let next = log.lease_live_extent(authority(&config)).unwrap().0;
@@ -1807,8 +1720,8 @@ fn leased_concurrent_reader_and_control_match_independent_canonical_receipt_dige
 }
 
 #[test]
-fn leased_seal_flush_and_checkpoint_scan_past_a_concurrent_adopter() {
-    for operation in 0..3 {
+fn leased_seal_and_flush_scan_past_a_concurrent_adopter() {
+    for operation in 0..2 {
         let (temp, config, log) = fixture();
         let log = Arc::new(log);
         log.attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Native))
@@ -1830,8 +1743,7 @@ fn leased_seal_flush_and_checkpoint_scan_past_a_concurrent_adopter() {
         let auth = authority(&config);
         let complete = std::thread::spawn(move || match operation {
             0 => target.seal_live_epoch(auth, || Ok(())),
-            1 => target.persist_appended().map(|_| ()),
-            _ => target.checkpoint_prefix(2).map(|_| ()),
+            _ => target.persist_appended().map(|_| ()),
         });
         snapshot.recv_timeout(Duration::from_secs(5)).unwrap();
         let (between, resume_reader) = log.pause_live(LivePausePoint::AfterFrame);
@@ -1842,18 +1754,10 @@ fn leased_seal_flush_and_checkpoint_scan_past_a_concurrent_adopter() {
         assert_eq!(log.appended_frontier(), 8192);
         resume_snapshot.send(()).unwrap();
         let result = complete.join().unwrap();
-        if operation == 2 {
-            assert!(matches!(result, Err(StorageError::NeedsPersistence)));
-        } else {
-            result.unwrap();
-        }
+        result.unwrap();
         assert_eq!(log.receipt_count(), 2);
         assert_eq!(log.appended_frontier(), 8192);
-        if operation == 2 {
-            log.persist_appended().unwrap();
-        }
         assert_eq!(log.synced_frontier(), 8192);
-        log.checkpoint_prefix(2).unwrap();
         resume_reader.send(()).unwrap();
         read.join().unwrap().unwrap();
         drop(log);
@@ -1894,53 +1798,6 @@ fn leased_seal_refuses_an_unlocked_close_without_poisoning_it() {
     assert!(close.join().unwrap().unwrap().0.closed);
     log.persist_appended().unwrap();
     log.seal_live_epoch(authority(&config), || Ok(())).unwrap();
-}
-
-#[test]
-fn leased_pressure_rechecks_capacity_after_an_independent_history_drain() {
-    let temp = tempdir::TempDir::new("live-lease-history-race").unwrap();
-    let mut config = live_config();
-    config.max_batches = 1;
-    config.fragment_bytes = 16 * 1024;
-    config.wal_file_bytes = 32 * 1024;
-    let log = Arc::new(
-        PartitionLog::create_live(
-            &temp.path().join("stream"),
-            config.clone(),
-            &shape(),
-            metrics(),
-        )
-        .unwrap(),
-    );
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
-    let (_, first) = encoded(&config, vec![batch(&config, 0)]);
-    write(&extent, 0, &first);
-    log.adopt_live_extent(authority(&config), extent.token, 4096, false)
-        .unwrap();
-    let (history_entered, history_resume) = log.references.pause_next_history();
-    log.persist_appended().unwrap();
-    history_entered
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
-    let (background, _) = log.state.lock().references.background_handle();
-    let (_, second) = encoded(&config, vec![batch(&config, 1)]);
-    write(&extent, 4096, &second);
-    let (pressure, pressure_resume) = log.pause_live(LivePausePoint::PressureObserved);
-    let adopter = log.clone();
-    let auth = authority(&config);
-    let token = extent.token;
-    let adopt = std::thread::spawn(move || adopter.adopt_live_extent(auth, token, 8192, false));
-    pressure.recv_timeout(Duration::from_secs(5)).unwrap();
-    history_resume.send(()).unwrap();
-    background.lock().take().unwrap().join().unwrap();
-    assert_eq!(log.references.root().end, 4096);
-    pressure_resume.send(()).unwrap();
-    let reply = adopt.join().unwrap().unwrap().0;
-    assert_eq!(reply.receipt_count, 2);
-    assert_eq!(reply.adopted_end, 8192);
-    assert!(log.state.lock().poison.is_none());
 }
 
 fn split_block_fixture() -> (tempdir::TempDir, PartitionConfig, PartitionLog) {
@@ -2227,10 +2084,9 @@ fn seal_rejects_live_frames_beyond_a_torn_extent_tail() {
 
 #[test]
 fn owner_read_of_preleased_extent_frame_while_old_extent_closes() {
-    for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
+    {
         for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
             let (_temp, config, log) = fixture();
-            log.set_history_persistence(mode).unwrap();
             log.attach_frontier(&DurabilityConfig::with_tier(tier))
                 .unwrap();
             let log = Arc::new(log);
@@ -2864,51 +2720,6 @@ fn leased_crash_after_validation_before_publication_recovers_acknowledged_bytes(
 }
 
 #[test]
-fn leased_parallel_round_restarts_after_history_pressure() {
-    let mut config = live_config();
-    config.batch_limits.max_encoded_bytes = 2 * 1024 * 1024;
-    config.group_limits.max_encoded_bytes = 4 * 1024 * 1024 - 8;
-    config.fragment_bytes = 8 * 1024 * 1024;
-    config.wal_file_bytes = 2 * config.fragment_bytes;
-    config.max_batches = 1;
-    let temp = tempdir::TempDir::new("live-parallel-pressure").unwrap();
-    let log = Arc::new(
-        PartitionLog::create_live(
-            &temp.path().join("stream"),
-            config.clone(),
-            &shape(),
-            metrics(),
-        )
-        .unwrap(),
-    );
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
-    let mut end = 0;
-    let mut receipts = Vec::new();
-    for sequence in 0..4 {
-        let (group, frame) = encoded(&config, vec![sized_batch(&config, sequence, 600 * 1024)]);
-        receipts.extend(expected(&config, &group, end, frame.len()));
-        write(&extent, end, &frame);
-        end += frame.len() as u64;
-    }
-    let (pressure, resume_pressure) = log.pause_live(LivePausePoint::PressureObserved);
-    let adopter = log.clone();
-    let token = extent.token;
-    let auth = authority(&config);
-    let adopt = std::thread::spawn(move || adopter.adopt_live_extent(auth, token, end, false));
-    pressure.recv_timeout(Duration::from_secs(5)).unwrap();
-    resume_pressure.send(()).unwrap();
-    let adoption = adopt.join().unwrap().unwrap().0;
-    assert_eq!(adoption.receipt_count, 4);
-    assert_eq!(adoption.adopted_end, end);
-    assert_eq!(log.receipt_page(0, 16).unwrap(), receipts);
-    assert!(log.synced_frontier() >= 2 * (end / 4));
-    assert!(log.live_test_diagnostics().adoption.parallel_rounds >= 1);
-    assert!(log.state.lock().poison.is_none());
-}
-
-#[test]
 fn leased_round_byte_cap_and_oversized_frame_bound_validation_work() {
     for (sizes, rounds, parallel_rounds) in [
         ([3 * 1024 * 1024, 3 * 1024 * 1024], 1, 1),
@@ -2974,7 +2785,7 @@ fn leased_validation_keeps_abandoned_reservation_recovery_exclusive() {
 }
 
 #[test]
-fn leased_read_and_checkpoint_wait_for_validated_prefix_publication() {
+fn leased_read_waits_for_validated_prefix_publication() {
     let (_temp, config, log) = parallel_adoption_fixture();
     log.attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Native))
         .unwrap();
@@ -3003,32 +2814,20 @@ fn leased_read_and_checkpoint_wait_for_validated_prefix_publication() {
     let reader = log.clone();
     let read = std::thread::spawn(move || reader.read_record(&reference.unwrap()));
     read_snapshot.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (checkpoint_snapshot, resume_checkpoint) = log.pause_live(LivePausePoint::ScanSnapshot);
-    let checker = log.clone();
-    let checkpoint = std::thread::spawn(move || checker.checkpoint_prefix(2));
-    checkpoint_snapshot
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
     resume_read.send(()).unwrap();
-    resume_checkpoint.send(()).unwrap();
     resume.send(()).unwrap();
     assert_eq!(adopt.join().unwrap().unwrap().0.receipt_count, 2);
     assert_eq!(
         read.join().unwrap().unwrap(),
         sized_batch(&config, 1, 600 * 1024).mutations()[0]
     );
-    assert!(matches!(
-        checkpoint.join().unwrap(),
-        Err(StorageError::NeedsPersistence)
-    ));
     assert_eq!(log.receipt_count(), 2);
     assert_eq!(log.appended_frontier(), end);
     log.persist_appended().unwrap();
-    log.checkpoint_prefix(2).unwrap();
 }
 
 #[test]
-fn leased_seal_self_adoption_drains_history_pressure() {
+fn leased_seal_self_adoption_adopts_and_syncs_every_frame() {
     let temp = tempdir::TempDir::new("live-seal-adoption-pressure").unwrap();
     let mut config = live_config();
     config.max_batches = 1;
@@ -3043,8 +2842,6 @@ fn leased_seal_self_adoption_drains_history_pressure() {
         )
         .unwrap(),
     );
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
     let extent = log.lease_live_extent(authority(&config)).unwrap().0;
     for sequence in 0..4 {
         write(
@@ -3053,13 +2850,7 @@ fn leased_seal_self_adoption_drains_history_pressure() {
             &encoded(&config, vec![batch(&config, sequence)]).1,
         );
     }
-    let (pressure, resume_pressure) = log.pause_live(LivePausePoint::PressureObserved);
-    let sealer = log.clone();
-    let auth = authority(&config);
-    let seal = std::thread::spawn(move || sealer.seal_live_epoch(auth, || Ok(())));
-    pressure.recv_timeout(Duration::from_secs(5)).unwrap();
-    resume_pressure.send(()).unwrap();
-    seal.join().unwrap().unwrap();
+    log.seal_live_epoch(authority(&config), || Ok(())).unwrap();
     assert_eq!(log.receipt_count(), 4);
     assert_eq!(log.appended_frontier(), extent.end);
     assert_eq!(log.synced_frontier(), extent.end);
@@ -3191,8 +2982,6 @@ fn cold_grant_bypasses_close_and_metadata_gate_without_promoting_a_prefix() {
     for next_file in [false, true] {
         for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
             let (temp, config, log) = fixture();
-            log.set_history_persistence(HistoryPersistence::WalReplay)
-                .unwrap();
             log.attach_frontier(&DurabilityConfig::with_tier(tier))
                 .unwrap();
             let log = Arc::new(log);
@@ -3386,8 +3175,6 @@ fn cold_grant_failure_cuts_discard_authority_and_pins() {
 #[test]
 fn cold_grant_rechecks_promotion_and_retains_pin_through_retirement() {
     let (_temp, config, log) = fixture();
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
     let log = Arc::new(log);
     let first = log.lease_live_extent(authority(&config)).unwrap().0;
     let next = log
@@ -3414,8 +3201,7 @@ fn cold_grant_rechecks_promotion_and_retains_pin_through_retirement() {
     let lease = read.join().unwrap().unwrap();
     log.evict_authority_cache();
     log.seal_live_epoch(authority(&config), || Ok(())).unwrap();
-    log.checkpoint_prefix(2).unwrap();
-    assert!(log.retire_files(2, &[0]).is_err());
+    assert!(log.retire_wal_files(&[0]).is_err());
     let mut bytes = vec![0; lease.len as usize];
     lease
         ._plan
@@ -3428,7 +3214,7 @@ fn cold_grant_rechecks_promotion_and_retains_pin_through_retirement() {
         batch(&config, 1).mutations()[0]
     );
     drop(lease);
-    log.retire_files(2, &[0]).unwrap();
+    log.retire_wal_files(&[0]).unwrap();
     assert!(log.resolve_live_record(&reference).is_err());
 }
 
@@ -3437,8 +3223,6 @@ fn cold_grant_uses_existing_owner_coverage_and_native_never_syncs() {
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
         for covered in [false, true] {
             let (_temp, config, log) = fixture();
-            log.set_history_persistence(HistoryPersistence::WalReplay)
-                .unwrap();
             log.attach_frontier(&DurabilityConfig::with_tier(tier))
                 .unwrap();
             let log = Arc::new(log);

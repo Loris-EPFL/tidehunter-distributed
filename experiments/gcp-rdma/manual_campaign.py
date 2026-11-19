@@ -57,14 +57,13 @@ MACHINE_RATE_NANODOLLARS = {'z4m-highmem-16': 3287109973, 'z4m-highmem-32': 6574
 COMPUTE_CENTS = (3287109973 * 6 * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
 COMPACT_COMPUTE_CENTS = (3287109973 * 2 * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
 COMPACT_CEILING_CENTS = (COMPACT_COMPUTE_CENTS * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
-# This spec keeps the previously reviewed live and sealed comparison.
+# Standard leased NVMe-oF and external-store comparison.
 REVIEWED_SPEC = {
     'schema_version': 1, 'suite': 'kv', 'mode': 'standard-with-live-nvmeof', 'seed': 1775,
     'repeats': 1, 'value_sizes': [64, 256, 1024, 8192, 65536],
-    'backends': ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
-                 'tidehunter_nvme_rdma', 'valkey_tcp', 'valkey_rdma',
+    'backends': ['native', 'tidehunter_nvme_rdma', 'valkey_tcp', 'valkey_rdma',
                  'tikv', 'cassandra', 'foundationdb', 'kvrocks', 'garnet'], 'keys': 4096,
-    'spdk_comparison': True, 'native_durability_cohort': True,
+    'native_durability_cohort': True,
     'valkey_reproduction_profiles': ['published-as-written', 'matched-ram'],
     'max_cases': 2000, 'offered_rates': [1000, 10000, 50000],
     'offered_seconds': 8, 'case_deadline_seconds': 600, 'hard_deadline_seconds': FLEET_SECONDS,
@@ -78,53 +77,27 @@ REVIEWED_SPEC = {
 REVIEWED_CONTRACT_SPEC = {
     **{key: copy.deepcopy(value) for key, value in REVIEWED_SPEC.items()
        if key != 'valkey_reproduction_profiles'},
-    'backends': ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma',
-                 'valkey_tcp', 'valkey_rdma', 'kvrocks'],
-    'repeats': 2, 'spdk_comparison': False, 'shapes': 'contract_core',
+    'backends': ['native', 'tidehunter_nvme_rdma', 'valkey_tcp', 'valkey_rdma', 'kvrocks'],
+    'repeats': 2, 'shapes': 'contract_core',
     'arms': {'native': ['value_wal_barrier', 'page_cache'],
-             'tidehunter_verbs_native': ['synchronous', 'native'],
              'tidehunter_nvme_rdma': ['synchronous', 'native'],
              'valkey_tcp': ['synced'],
              'valkey_rdma': ['synced', 'os_buffered', 'periodic_sync'],
              'kvrocks': ['synced', 'page_cache']},
 }
 
-# F2b adds owner RPC TCP and selects intermediate values; F2 stays unchanged.
-REVIEWED_CONTRACT_MID_SPEC = {
-    **copy.deepcopy(REVIEWED_CONTRACT_SPEC), 'value_sizes': [512, 4096],
-    'backends': ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
-                 'tidehunter_nvme_rdma', 'valkey_tcp', 'valkey_rdma', 'kvrocks'],
-    'arms': {**copy.deepcopy(REVIEWED_CONTRACT_SPEC['arms']),
-             'tidehunter_tcp': ['synchronous', 'native']},
-}
-REVIEWED_CONTRACT_MID_SPEC_SHA256 = '19b35bfb072c9e35a14687fbb205433565ba2acf9a05601de198f1664f1ee886'
-REVIEWED_CONTRACT_MID_SEALED_SPEC_SHA256 = '8e20863701b41515dd3c05dd5e6980ccbffacf1b9a037f20588fd88f4276eb7c'
-REVIEWED_CONTRACT_MID_MATRIX_SHA256 = '5966571f1721883d6a0078f2e9d4d924087b2b82e8059709b9026ffe5b43635f'
+# F2b keeps the intermediate value sizes without the owner RPC arms.
+REVIEWED_CONTRACT_MID_SPEC = {**copy.deepcopy(REVIEWED_CONTRACT_SPEC), 'value_sizes': [512, 4096]}
 
-# Full focused estimate: 4.8892 fleet hours and $123.09 with allowance.
-# It is a planning estimate, not a bound; the full $145 quote is reserved.
 # Matrix digests bind the exact reviewed job order and content.
 FOCUSED_MATRIX_SHA256 = {
-    'recommended': 'e033a68d931e9db33cacd5ac25ef43f0647bb3d919a1d7c7ac608d8c0414f08d',
-    'full': '04dff9517aff741c01289d534e6a55f2f3b1d0e211b2f0ea9cb58c8b5bf6650c',
-    'device': '8a0cf7c9ebf16552ef32d616aec14d6876d3f1a84eb904ee53e7a24cc28d9a43',
-    'floors': '5fb477358bc57c14c8fad9b7e0958b93afb22ff4d1ba085204d44b1e74fcd429',
-    'stages': '646207fe6727aa37367b727759a4d46005ebd56a59f29ec49b13a690de24a724',
-    'unified': 'a73d7a070f8416f555aab6434e1c6893b4deca756e77036d0509001b23bc3506',
-    'append_floors': '646f9ff50949c4ecab44a4d77d2ad38e5b2700311cb5c1ce69e742ed521f4e40',
-    'fair_native': '7a8e64eeb181b0f5040f3b02105d76def85823e87f591fea448d34bcb6a7f2d9',
-    'parity': 'ee942bda8565ff1295814a61fb00040f6feedce9cd73304dea29dec095169ec6',
-    'parity_compact': '4978687ab42ca839e2c864978fb1489854ae201d28f06facf89a283cdea8e0aa',
-    'fair_five_owner': '479601db27b3a709e83944dcdfa9b77e7f8e4bacac9637a29e04327e09151946',
-    'remote_rw_compact': 'b2f2afc44afc1d066bedb27f819c5fa7789e000f96da0c7beb4c6f9359122620',
-    'fabric_ab_compact': '8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e',
-    'leased_ab_compact': '52029dc2047cecca4903b4240d7a84d8dcb402bfbfddcad827d605405f15c2dc',
-    'nvmeof_path_compact': '8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036',
-    'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
-    'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
+    'nvmeof_path_compact': 'd830e7c32fd715a794328445a26c2d9e62a76188d5dbd12a9471712a90212772',
+    'nvmeof_path_core': 'f59942def5dc313b09c41dffa0df4d604f57e110f359dd12b2af75f5deea121c',
+    'nvmeof_path_fix': 'a6c9f07e1d9b60c3145e261014250fb61e655517268c6755585100078303f9ae',
     'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
-    'nvmeof_contracts_crossing': '7cf192750aa556071a73aaf3c1f19ce8f7b73c4baa51f3abfc46816896620bfa',
-    'nvmeof_contracts_crossing2': '8dde34953df300c798b0a5605abf393d310bd6e321c3568c861cfdb27caab295',
+    'nvmeof_contracts': 'cb960b1bcddd75fe950d5648b79644b217f3243e1fa6e45b3b427c5964ea699a',
+    'nvmeof_contracts_crossing': 'df39156bd7680bb8702a4270f87ea98a68af9321564e2634f54a7d09170db150',
+    'nvmeof_contracts_crossing2': 'a51a42c7606fbc98afa436fca1695ce621cce20603f6497b9baa2b75a4af2ea9',
     'nvmeof_parallel_writes': '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4',
     'nvmeof_single_caller': '294b50957b21d6acafadcf1b682c71d1b424524a144ecd6c2c18e2b1cc40fd4e',
     'nvmeof_f6': '1186674f1706550f0faaac6d7852dcee711b43dba8c87b22be4dd071d768e8a7',
@@ -134,68 +107,27 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_reads_geometry': 'c27b1598f34949d642d3cc518985a2f92f5c388e77e2742da9ce780ce8b41aea',
     'nvmeof_reads_geometry_rest': 'b5db99b28d0faf8386e5b885e25c55d50b74f732e9b220ef552bd6c90a761935',
     'nvmeof_reads_geometry_rest2': 'c80e079b256fad0c765dc66fec387cdb7bac160c90aa0747ac184347cb5bbed4',
-    'nvmeof_contracts': 'cad4e58cc1e01a4977f7b7e3e0c87ed6ff00cfb15d498959472a511a8bab0208',
     'valkey_rdma_reads': 'fbbecb9ecba897a624c388dc7ab51fe080fd2ce3363edfebf4b6069c5454c0a2',
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
     'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
     'nvmeof_p13_write_engine': '674cd71e117824550abb4624747e462b739cb9535912b5a6415782e186e03d18',
-    REDRAIN_AB_SELECTION: '33349d644ad5295f39bc88d23d0fcd8dbf088a6fb9e2dec429545a792f631808',
+    REDRAIN_AB_SELECTION: '36681e83990a39f3c36e730d805e05f1f58f3ecf5a67bf64b49888e45795e152',
     q0_campaign.SELECTION: 'ec7b1e585125b53a952b97f8da54b4fb10376c9b54db1f45163c8d442b9a82ec',
 }
 REVIEWED_SPECS = {
     selection: {
         'schema_version': 1, 'suite': 'kv', 'mode': 'focused', 'selection': selection,
         'matrix_sha256': digest, 'job_count': count, 'seed': 1775, 'repeats': 3,
-        'backends': (['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma']
-                     if selection in NVMEOF_PATH_SELECTIONS else
-                     ['tidehunter_verbs_native', 'tidehunter_nvme_rdma']
-                     if selection == 'leased_ab_compact' else
-                     ['tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs_native',
-                      'tidehunter_nvme_rdma', 'tidehunter_nvme_tcp']
-                     if selection == 'fabric_ab_compact' else
-                     ['native', 'tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma', 'tidehunter_verbs']
-                     if selection in ('stages', 'unified') else
-                     ['native', 'tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma']),
-        'keys': 4096, 'spdk_comparison': selection not in ('leased_ab_compact', *NVMEOF_PATH_SELECTIONS), 'direct_control_arm': True,
-        'max_cases': count if selection in NVMEOF_PATH_SELECTIONS else 72 if selection == 'leased_ab_compact' else 80 if selection == 'fabric_ab_compact' else 342 if selection == 'remote_rw_compact' else 333,
+        'backends': ['native', 'tidehunter_nvme_rdma'],
+        'keys': 4096, 'max_cases': count, 'direct_control_arm': True,
         'case_deadline_seconds': 600, 'hard_deadline_seconds': FLEET_SECONDS,
         'export_reserve_seconds': EXPORT_RESERVE_SECONDS,
         'diagnostics': {'write_profile_limit': 256, 'read_profile_limit': 256, 'write_timeline_limit': 8192},
-        **({'owner_hosts': 1} if selection in ('parity_compact', 'remote_rw_compact', 'fabric_ab_compact', 'leased_ab_compact', *NVMEOF_PATH_SELECTIONS) else {}),
+        'owner_hosts': 1,
     }
-    for selection, digest, count in (
-        ('recommended', FOCUSED_MATRIX_SHA256['recommended'], 279),
-        ('full', FOCUSED_MATRIX_SHA256['full'], 333),
-        ('device', FOCUSED_MATRIX_SHA256['device'], 120),
-        ('floors', FOCUSED_MATRIX_SHA256['floors'], 69),
-        ('stages', FOCUSED_MATRIX_SHA256['stages'], 183),
-        ('unified', FOCUSED_MATRIX_SHA256['unified'], 270),
-        ('append_floors', FOCUSED_MATRIX_SHA256['append_floors'], 48),
-        ('fair_native', FOCUSED_MATRIX_SHA256['fair_native'], 168),
-        ('parity', FOCUSED_MATRIX_SHA256['parity'], 216),
-        ('parity_compact', FOCUSED_MATRIX_SHA256['parity_compact'], 177),
-        ('fair_five_owner', FOCUSED_MATRIX_SHA256['fair_five_owner'], 39),
-        ('remote_rw_compact', FOCUSED_MATRIX_SHA256['remote_rw_compact'], 342),
-        ('fabric_ab_compact', FOCUSED_MATRIX_SHA256['fabric_ab_compact'], 80),
-        ('leased_ab_compact', FOCUSED_MATRIX_SHA256['leased_ab_compact'], 72),
-        ('nvmeof_path_compact', FOCUSED_MATRIX_SHA256['nvmeof_path_compact'], 157),
-        ('nvmeof_path_core', FOCUSED_MATRIX_SHA256['nvmeof_path_core'], 66),
-        ('nvmeof_path_fix', FOCUSED_MATRIX_SHA256['nvmeof_path_fix'], 37),
-        ('nvmeof_first_put', FOCUSED_MATRIX_SHA256['nvmeof_first_put'], 12),
-        ('nvmeof_contracts', FOCUSED_MATRIX_SHA256['nvmeof_contracts'], 34),
-        ('nvmeof_contracts_crossing', FOCUSED_MATRIX_SHA256['nvmeof_contracts_crossing'], 35),
-        ('nvmeof_contracts_crossing2', FOCUSED_MATRIX_SHA256['nvmeof_contracts_crossing2'], 36),
-        ('nvmeof_parallel_writes', FOCUSED_MATRIX_SHA256['nvmeof_parallel_writes'], 44),
-        ('nvmeof_single_caller', FOCUSED_MATRIX_SHA256['nvmeof_single_caller'], 20),
-        ('nvmeof_f6', FOCUSED_MATRIX_SHA256['nvmeof_f6'], 42),
-        ('nvmeof_f6b', FOCUSED_MATRIX_SHA256['nvmeof_f6b'], 58),
-        ('nvmeof_f8', FOCUSED_MATRIX_SHA256['nvmeof_f8'], 36),
-        ('nvmeof_f7_highmem32', FOCUSED_MATRIX_SHA256['nvmeof_f7_highmem32'], 8),
-        ('nvmeof_reads_geometry', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry'], 74),
-        ('nvmeof_reads_geometry_rest', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest'], 20),
-        ('nvmeof_reads_geometry_rest2', FOCUSED_MATRIX_SHA256['nvmeof_reads_geometry_rest2'], 18),
-    )
+    for selection in NVMEOF_PATH_SELECTIONS if selection not in workflow_input.cloud_campaign.M3_SELECTIONS
+    for digest, count in [(FOCUSED_MATRIX_SHA256[selection], workflow_input.cloud_campaign.FOCUSED_COUNTS[selection])]
 }
 REVIEWED_SPECS['valkey_rdma_reads'] = {
     **copy.deepcopy(REVIEWED_SPECS['nvmeof_parallel_writes']),
@@ -253,7 +185,7 @@ REVIEWED_SPECS["nvmeof_p13_write_engine"] = {
 REVIEWED_SPECS[REDRAIN_AB_SELECTION] = {
     **{key: copy.deepcopy(value) for key, value in REVIEWED_SPECS["nvmeof_m3_t2_2"].items()
        if key != "diagnostics"},
-    "selection": REDRAIN_AB_SELECTION, "job_count": 22, "max_cases": 22, "repeats": 2,
+    "selection": REDRAIN_AB_SELECTION, "job_count": 20, "max_cases": 20, "repeats": 2,
     "reservation_hours": 4.5, "hard_deadline_seconds": 16200, "case_deadline_seconds": 386,
     "matrix_sha256": FOCUSED_MATRIX_SHA256[REDRAIN_AB_SELECTION],
 }
@@ -461,13 +393,7 @@ def _reviewed_jobs(spec):
     if isinstance(spec, dict) and any(_json(spec) == _json(reviewed)
                                      for reviewed in (REVIEWED_SPEC, REVIEWED_CONTRACT_SPEC,
                                                       REVIEWED_CONTRACT_MID_SPEC)):
-        jobs = workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
-        if spec == REVIEWED_CONTRACT_MID_SPEC and (
-                _digest(_json(spec)) != REVIEWED_CONTRACT_MID_SPEC_SHA256
-                or len(jobs) != 182
-                or _digest(_json(jobs)) != REVIEWED_CONTRACT_MID_MATRIX_SHA256):
-            raise ValueError('contract mid matrix differs from the reviewed specification')
-        return jobs
+        return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
     reviewed = REVIEWED_SPECS.get(spec.get('selection')) if isinstance(spec, dict) else None
     if isinstance(spec, dict) and spec.get('selection') in ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5'):
         reviewed = m3_spec(spec.get('owner_hosts'))
@@ -555,6 +481,8 @@ def _admit_package(package_dir, revision, spec):
     receipt = json.loads((package_dir / 'package-receipt.json').read_text())
     root = package_dir / 'package'
     verified = package.verify_directory(root)
+    if verified.get('spdk') is not None:
+        raise ValueError('leased campaigns do not admit SPDK artifacts')
     focused = spec.get('mode') == 'focused'
     expected_profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
     if spec.get('selection') == q0_campaign.SELECTION:
@@ -563,7 +491,6 @@ def _admit_package(package_dir, revision, spec):
         raise ValueError('focused campaign requires its exact package profile')
     if not focused and verified.get('build_profile') is not None:
         raise ValueError('full campaign cannot use a focused package')
-    gcp_image.admit_spdk_scope(spec, verified.get('spdk'))
     source = package.admit_source(root)
     _check_snapshot(source, revision)
     fields = ('source_sha256', 'binary_sha256', 'binary_blake2b512', 'manifest_sha256', 'abi')
@@ -723,44 +650,51 @@ async def _wait_status(store, state, name, manifest, *, filename='status.json', 
     raise TimeoutError('qualification status missing before deadline')
 
 
+def _status_probe(function, *args, **kwargs):
+    """Return absence inside the I/O task, before cancellation joins it."""
+    try:
+        return function(*args, **kwargs)
+    except ApiError as error:
+        if error.status != 404:
+            raise
+        return None
+
+
+async def _read_status_object(store, key):
+    meta = await _blocking(_status_probe, store.head, key)
+    if meta is None:
+        return None
+    raw = await _blocking(_status_probe, store.get, key, generation=meta['generation'], max_bytes=1024 * 1024)
+    if raw is None:
+        return None
+    return meta, raw
+
+
 async def _wait_status_poll(store, state, name, manifest, *, filename='status.json', host=None):
     key = 'runs/' + state['run_id'] + '/qualification/' + name + '/' + filename
     while time.time() < campaign.parse_time(state['deadline']).timestamp():
-        try:
-            meta = await _blocking(store.head, key)
-            raw = await _blocking(store.get, key, generation=meta['generation'], max_bytes=1024 * 1024)
-            value = json.loads(raw)
-            if host is not None and (_digest(raw) != meta.get('metadata', {}).get('sha256')
-                                     or not re.fullmatch(r'[1-9][0-9]*', str(meta.get('generation', '')))):
-                raise ValueError('qualification status checksum or generation mismatch')
-        except ApiError as exc:
-            if exc.status != 404:
-                raise
+        observed = await _read_status_object(store, key)
+        if observed is None:
             failure_key = 'runs/' + state['run_id'] + '/qualification/' + name + '/startup-error.json'
-            try:
-                failure_meta = await _blocking(store.head, failure_key)
-                failure = json.loads(await _blocking(store.get, failure_key, generation=failure_meta['generation'], max_bytes=1024 * 1024))
-            except ApiError as failure_error:
-                if failure_error.status != 404:
-                    raise
-            else:
+            failure_object = await _read_status_object(store, failure_key)
+            if failure_object is not None:
+                failure = json.loads(failure_object[1])
                 if failure.get('source_sha256') != state['source_sha256'] or failure.get('complete') is not False:
                     raise RuntimeError('startup error identity mismatch')
                 raise RuntimeError('qualification startup failed: ' + str(failure.get('error')))
             if filename == 'preparation.json':
-                status_key = key.removesuffix(filename) + 'status.json'
-                try:
-                    status_meta = await _blocking(store.head, status_key)
-                    status = json.loads(await _blocking(store.get, status_key, generation=status_meta['generation'],
-                                                        max_bytes=1024 * 1024))
-                except ApiError as status_error:
-                    if status_error.status != 404:
-                        raise
-                else:
+                status_object = await _read_status_object(store, key.removesuffix(filename) + 'status.json')
+                if status_object is not None:
+                    status = json.loads(status_object[1])
                     if status.get('complete') is False:
                         raise RuntimeError('guest preparation failed: ' + str(status.get('error')))
             await asyncio.sleep(1)
             continue
+        meta, raw = observed
+        value = json.loads(raw)
+        if host is not None and (_digest(raw) != meta.get('metadata', {}).get('sha256')
+                                 or not re.fullmatch(r'[1-9][0-9]*', str(meta.get('generation', '')))):
+            raise ValueError('qualification status checksum or generation mismatch')
         expected = {'run_id': state['run_id'], 'source_sha256': state['source_sha256'],
                     'manifest_sha256': manifest, 'deadline_utc': state['deadline']}
         if host is not None:
@@ -815,31 +749,6 @@ def _admit_live_pair(records, hosts, spec, rdma_device, run_id=None):
                                          owner['internal_ip'], result.get('coordinator_counters'),
                                          result.get('owner_counters'), target='kernel', tier=tier,
                                          owner_launch=result.get('owner_launch'), owner_receipt=result.get('owner_receipt'))
-    if spec.get('spdk_comparison'):
-        if not isinstance(run_id, str) or not re.fullmatch(r'bench-[0-9a-f]{16}', run_id):
-            raise ValueError('live SPDK qualification requires the bound pair run identity')
-        tiers = records[coordinator_index].get('live_spdk_rdma')
-        if not isinstance(tiers, dict) or set(tiers) != {'native', 'synchronous'} or 'rdma' not in required:
-            raise ValueError('two-host live SPDK RDMA qualification requires both durability tiers')
-        identity = records[owner_index].get('outputs', {}).get('package', {}).get('spdk', {})
-        gcp_image.admit_spdk_scope(spec, identity)
-        sha = identity.get('files', {}).get('bin/nvmf_tgt', {}).get('sha256')
-        if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{64}', sha):
-            raise ValueError('qualified SPDK binary identity missing')
-        for tier, result in tiers.items():
-            if not isinstance(result, dict):
-                raise ValueError('invalid live SPDK qualification proof')
-            for key in ('coordinator_counters', 'owner_counters'):
-                if result.get(key, {}).get('before', {}).get('device') != rdma_device:
-                    raise ValueError('SPDK physical RDMA evidence differs from admitted device')
-            proof = result.get('proof')
-            gcp_live_qualification.admit(proof, 'rdma', owner['rdma_ip'], coordinator['rdma_ip'],
-                                         owner['internal_ip'], result.get('coordinator_counters'),
-                                         result.get('owner_counters'), target='spdk', tier=tier,
-                                         owner_launch=result.get('owner_launch'), owner_receipt=result.get('owner_receipt'))
-            root = Path('/mnt/tidehunter-kv-comparison') / run_id / f'live-rdma-spdk-{tier}/node-0/storage'
-            gcp_live_qualification.admit_spdk_observation(result.get('spdk_observation'),
-                result.get('spdk_daemon'), proof, root, sha)
 
 
 
@@ -1581,7 +1490,6 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
             config['bucket'], fleet_state['run_id'], source, fleet_state['deadline'],
             receipt['manifest_sha256'], prep_sha, members=fleet, rdma_device=rdma_device,
             machine_type=config['machine_type'], live_transports=live_transports,
-            live_spdk=bool(spec.get('spdk_comparison') and gcp_runtime.live_mode(spec)),
             **({'qualification_profile': 'focused', 'selection': spec.get('selection')}
                if spec.get('mode') == 'focused' else {}))
         await _blocking(_record, path, parent, 'preparation')
@@ -1653,7 +1561,6 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         qualification = await _blocking(gcp_image.admit_image, _StoreApi(store, config['bucket']), admitted_config, info)
         gcp_image.admit_nvme_transports(qualification, spec['backends'],
                                         live=gcp_runtime.live_mode(spec))
-        gcp_image.admit_spdk(qualification, spec)
         gcp_image.admit_abi(qualification, receipt['abi'])
         if await fleet_compute.admit_guests() != fleet:
             raise RuntimeError('guest fleet identity changed after qualification')

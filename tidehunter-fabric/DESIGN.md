@@ -7,36 +7,38 @@ That path records provenance; the active crate does not build or import archived
 code. Each TLS or explicit trusted-native session owns one FI_EP_RDM endpoint
 and drives its completion queue. The coordinator's single read owner services
 its connections; bounded reusable shard workers own server sessions. The
-native-feature endpoint can additionally expose immutable resident member
-regions for read-only FI_READ; this is a derived cache, never authoritative WAL,
-and ordinary message-only opens remain unchanged.
+endpoint is two-sided message transport only.
+
+Removed by the NVMe-oF-only refactor (R4): the EFA and EFA-direct backends, the
+EFA-direct packet protocol and the one-sided `FI_READ` API (`RmaConfig`,
+registered read regions, `ReadBuffer`, `PeerDrainToken`). Their designs and
+evidence remain in the `archive/multi-design` tag; the dated sections below
+that described them were deleted, and the remaining dated sections are a
+design log that may name since-removed engine files.
 
 ## Portable transport boundary (27 October 2026)
 
 The distributed storage/WAL/index protocol is shared. Transport selection
-changes only the bounded message endpoint and, when explicitly configured,
-the registered-read endpoint; it does not create a provider-specific WAL,
-index, lock, durability, or recovery implementation.
+changes only the bounded message endpoint; it does not create a
+provider-specific WAL, index, lock, durability, or recovery implementation.
 
 ```text
-                 shared Tidehunter WAL + index + read-grant protocol
-                                      |
-                            common engine Transport
-                              /               \
-                            TCP               OFI
-                      existing TLS       common libfabric Endpoint
-                                        /           |            \
-                                      EFA       EFA-direct   generic verbs
-                                                            IB / RoCE / Falcon
+                 shared Tidehunter WAL + index protocol
+                                 |
+                       common engine Transport
+                         /               \
+                       TCP               OFI
+                 existing TLS       common libfabric Endpoint
+                                      /            \
+                              generic verbs     software tcp
+                            IB / RoCE / Falcon  (correctness control)
 ```
 
-`FabricBackend` explicitly selects `efa`, `efa-direct`, `verbs`, or
-`software-tcp`; provider mapping is centralized: `efa`, `efa-direct` fabric,
-`verbs;ofi_rxm`, and `tcp;ofi_rxm`, respectively. EFA's SRD transport is not
-interoperable with verbs RDMA. InfiniBand, RoCE and Falcon use the common
-verbs/RxM implementation when the selected host's libfabric exposes a
-compatible device, but are not interchangeable wire technologies or a claim
-that devices on different networks can communicate.
+`FabricBackend` explicitly selects `verbs` or `software-tcp`; provider mapping
+is centralized: `verbs;ofi_rxm` and `tcp;ofi_rxm`, respectively. InfiniBand,
+RoCE and Falcon use the common verbs/RxM implementation when the selected
+host's libfabric exposes a compatible device, but are not interchangeable wire
+technologies or a claim that devices on different networks can communicate.
 
 Canonical engine configuration is structured:
 
@@ -48,8 +50,7 @@ Canonical engine configuration is structured:
 `trusted`. `domain` and `source_address` are optional host-local selectors:
 use the appropriate local domain/device and source IP on each host, while
 selecting the same provider family and security mode on both peers. Source-IP
-selectors are provider-constrained: EFA and EFA-direct reject them because
-`FI_ADDR_EFA` is opaque and no source-IP association is attested; verbs accepts
+selectors are provider-constrained: verbs accepts
 IPv4 only because the pinned RxM layer lists only `FI_SOCKADDR`/
 `FI_SOCKADDR_IN` (regardless of core verbs IPv6 support); software-tcp accepts
 IPv4 or IPv6 when `fi_getinfo` returns a matching sockaddr. Without a selector,
@@ -61,18 +62,12 @@ Peers with different backend/security fail protocol matching. Fabric selection
 never retries or silently downgrades to TCP. Default transport remains TCP;
 configuration types do not require native libfabric linkage, which is opt-in.
 
-One-sided reads remain opt-in and bounded by `RmaConfig`. `Endpoint::provider_info`
-reports `ProviderInfo` fields: selected backend/provider/fabric/domain/source,
-observed device/driver/PCI bus address when available, RMA capabilities, and
-capability evidence. Unknown or unobserved facts remain absent or explicitly
-unverified. `require_device_read` is strict: it rejects `Unknown` or `Emulated`
-read modes. EFA native mode requires `FI_OPT_EFA_EMULATED_READ == false`;
-verbs requires native FI_READ plus provider PCI NIC/device metadata matched to
-that NIC's canonical sysfs PCI BDF, and excludes software `rxe`, `rdma_rxe`,
-and `siw` drivers. This establishes a PCI-backed generic verbs endpoint, not
-that the device is Falcon. Software-provider FI_READ byte-comparison tests
-qualify software correctness only; they do not qualify EFA, IB, RoCE, or Falcon
-hardware or performance.
+`Endpoint::provider_info` reports `ProviderInfo` fields: selected
+backend/provider/fabric/domain/source, observed device/driver/PCI bus address
+when available, and capability evidence. Unknown or unobserved facts remain
+absent or explicitly unverified. Software-provider tests qualify software
+correctness only; they do not qualify IB, RoCE, or Falcon hardware or
+performance.
 
 The transport does not alter WAL append receipts, synchronization semantics,
 index updates, grant/drain ownership, or the storage's existing locks. Local
@@ -85,8 +80,7 @@ Opt-in `ProgressStats` also samples application slot state before each CQ poll:
 operations or elapsed time. These are poll-weighted samples, not durations.
 An RX slot still marked pending can already have an unobserved completion, so
 these counters do not measure hardware receive WQEs, RxM internal credits,
-RNR retries, CQ occupancy, or time spent starved. Four pending TX slots include
-the reserved control slot on EFA-direct; this sample is not its data-lane limit.
+RNR retries, CQ occupancy, or time spent starved.
 They flow through the existing sampled read and write profile counters and the
 Sui adapter's `tidehunter_adapter` metrics; unsampled/TCP profiles omit them.
 They are not retroactive evidence for older runs. Disabled diagnostics do not
@@ -96,14 +90,12 @@ and ALPN version 16 rejects older peers.
 Implementation map:
 
 - `tidehunter-fabric/src/config.rs`: `FabricBackend`, `FabricConfig`, selector validation.
-- `tidehunter-fabric/src/endpoint.rs` and `endpoint/resources.rs`: endpoint setup, provider discovery, bounded message and RMA ownership/capabilities.
+- `tidehunter-fabric/src/endpoint.rs` and `endpoint/resources.rs`: endpoint setup, provider discovery, bounded message ownership.
 - `tidehunter/src/distributed/tcp/fabric.rs`: engine `Transport`, `FabricSecurity`, protocol matching and endpoint bootstrap.
-- `tidehunter/src/distributed/tcp/resident.rs`: resident-read budgets and device-read requirement.
 - `tidehunter/examples/support/tcp_cluster.rs` and `benchmarks/kv-research/src/backends/tidehunter.rs`: shared engine adapter and benchmark integration.
 
 Primary references: [OFI verbs provider](https://ofiwg.github.io/libfabric/main/man/fi_verbs.7.html),
 [OFI RxM provider](https://ofiwg.github.io/libfabric/main/man/fi_rxm.7.html),
-[EFA provider](https://ofiwg.github.io/libfabric/main/man/fi_efa.7.html),
 [RDMA over Falcon specification, §§6.2–6.4](https://www.opencompute.org/documents/rdma-over-falcon-spec-v1-1-pdf),
 and the local [Tidehunter 2026 paper, §3](../../papers/parsed/Tidehunter-2026-v2.md)
 for WAL/index/concurrency semantics. The papers and provider documentation
@@ -156,18 +148,10 @@ unsafe wrapper boundary were reviewed. It needs the system headers, libfabric,
 pkg-config and libclang; its vendored feature is not intended for downstream
 crates. `libc` already exists in the workspace. Both dependencies are optional;
 ordinary Tidehunter/TCP builds do not need libfabric.
-The direct packet codec also reuses the engine's existing `crc32fast` package
-(locked at 1.4.2), optional under `native`. This adds a dependency edge, not a new
-registry package. CRC32/IEEE detects malformed packets. TLS provides peer
-authentication and confidentiality only in the TLS transport modes.
 
 Sources:
 - [OFI Rust bindings](https://github.com/ofiwg/libfabric/tree/main/bindings/rust):
   generated provider ABI; no hand-maintained C structs or custom C source here.
-- [EFA provider](https://ofiwg.github.io/libfabric/main/man/fi_efa.7.html):
-  FI_EP_RDM/FI_MSG, FI_ORDER_SAS and manual progress requirements. Current main
-  also documents wait objects on newer versions; this implementation chooses
-  FI_WAIT_NONE and does not assume those newer capabilities.
 - [Completion queues](https://ofiwg.github.io/libfabric/main/man/fi_cq.3.html):
   a validated CQ completion ends each buffer's provider ownership.
 - [eRPC, NSDI 2019](https://www.usenix.org/conference/nsdi19/presentation/kalia):
@@ -175,12 +159,11 @@ Sources:
   path motivate direct ownership. This is not an eRPC implementation or a claim
   to reproduce its performance.
 
-## Ordinary EFA/software-provider invariants
+## Message endpoint invariants
 
-Four stable 64 KiB TX and four RX slots bound application buffers to 512 KiB per
-endpoint. EFA requests 128 TX and 128 RX packet entries, not four: medium messages
-must allocate every constituent packet before posting. Software providers retain
-their default capacities. Only one thread operates an endpoint/domain at a time;
+Four stable 64 KiB TX and four RX slots (the default `FabricConfig::slots`)
+bound application buffers to 512 KiB per endpoint. Providers retain their
+default packet capacities. Only one thread operates an endpoint/domain at a time;
 FI_THREAD_DOMAIN permits exclusive ownership transfers, never concurrent sharing.
 
 TX slots are immutable until their exact context completes. RX bytes are read
@@ -227,91 +210,8 @@ remains the only write acknowledgement.
 See the [11 October implementation plan and local evidence](../docs/distributed/CLUSTER_RAM_AND_READ_PATH_PLAN_2026-10-11.md)
 and [9 October provenance](../docs/distributed/CHECKPOINT_ASYNC_READS_2026-10-09.md).
 Software-provider and five-process TCP/software-fabric checks exercise ownership,
-recovery and failure paths. Real EFA performance still requires approved hardware
-validation.
-
-## Bounded EFA queues and setup measurement
-
-The reviewed provider is [AWS libfabric 2.6.0amzn1.0](https://github.com/aws/libfabric/releases/tag/v2.6.0amzn1.0),
-mapping to upstream commit `3cc1095272b07ebeb5cc8f44851af6aa3eb75e41`.
-The bound is deliberately specific to libfabric 2.6.0, provider ABI version
-206.0, EFA protocol 4, host memory, one authenticated peer, FI_MSG/FI_DIRECTED_RECV,
-FI_ORDER_SAS, and messages of at most 65,536 bytes. Other EFA provider versions,
-missing NIC geometry, MTUs below 4096, changed protocol IDs, or returned queues
-other than exactly 128 fail before opening provider handles. There is no retry
-with default queues, reduced ordering, or software fallback. Expanding the
-version range requires reviewing the internal allocation/protocol paths; packet
-pool geometry is not a libfabric API guarantee.
-
-Source-to-bound mapping, all at that exact commit:
-
-- [`efa_prov.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_prov.c)
-  sets `fi_provider.version` to
-  [`OFI_VERSION_DEF_PROV`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/include/ofi.h):
-  `FI_VERSION(library_major * 100 + library_minor, revision * 10)`.
-  Thus `fi_fabric_attr.prov_version` is `206 << 16` for this release, not the
-  public API version `(2 << 16) | 6`. Pre-launch validation caught and corrected
-  this distinction. The independent provider-version fixture failed before the
-  correction and passed afterward; incompatible versions still fail closed.
-
-- [`efa_user_info.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_user_info.c)
-  calls `ofi_alter_info` after EFA capability selection.
-  [`util_attr.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/util/src/util_attr.c)
-  `fi_alter_tx_attr` / `fi_alter_rx_attr` copy nonzero hint sizes into the returned
-  attributes. Exact returned-size checking therefore does not mistake a supported
-  maximum for a negotiated value on this path. These same returned attributes
-  are passed to `fi_domain` / `fi_endpoint`, not overwritten after validation.
-- [`efa_base_ep.h`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_base_ep.h)
-  `efa_base_ep_get_{tx,rx}_pool_size` take `min(device capacity, user size)`.
-  [`efa_base_ep.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_base_ep.c)
-  uses these for QP send/receive WR counts.
-  [`efa_rdm_ep_fiops.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/rdm/efa_rdm_ep_fiops.c)
-  uses the same values as both chunk and maximum sizes of registered TX/RX
-  packet pools; its operation-entry pool starts with `tx_size + rx_size = 256`
-  entries. TX grows at endpoint creation; RX grows on the first CQ progress.
-  [`efa_rdm_ep_utils.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/rdm/efa_rdm_ep_utils.c)
-  posts exactly the reduced RX pool and clamps the refill threshold to that
-  pool's size, so larger configured thresholds still refill when it is empty.
-- [`efa_prov_info.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_prov_info.c)
-  exposes the device's actual `max_msg_sz` as `nic->link_attr->mtu`.
-  [`efa_rdm_protocol.h`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/rdm/efa_rdm_protocol.h)
-  and [`efa_rdm_pkt_type.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/rdm/efa_rdm_pkt_type.c)
-  define a 24-byte medium MSG header plus at most the padded 40-byte raw-address
-  header. The implementation conservatively reserves 128 bytes per packet.
-- [`efa_rdm_ope.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/rdm/efa_rdm_ope.c)
-  `efa_rdm_ope_prepare_to_post_send` needs an entire medium-message batch at once
-  or returns EAGAIN; its eight-byte host-memory balancing can add a final packet.
-  Thus a safe per-chunk bound is `ceil(65536 / (4096 - 128)) + 1 = 18`.
-  Four whole chunks require at most 72 entries per direction. A further 32
-  entries (four per live TX/RX operation) reserve handshake/control/progress
-  headroom, and `next_power_of_two(72 + 32) = 128`.
-- [`efa_hmem.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_hmem.c)
-  initializes host medium/read thresholds; [`efa_rdm_msg.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/rdm/efa_rdm_msg.c)
-  selects eager/medium for these chunk sizes with supported thresholds. No
-  long-CTS or RDMA-read context budget is silently assumed. RNR retries retain
-  and reuse existing packet entries; exhausted posts still require bounded
-  application retries plus CQ progress, not a promise of EAGAIN-free operation.
-
-Configuration is process-scoped and must be established before libfabric first
-initializes. Compatible environment overrides are accepted, not merely rejected
-for being present: `FI_EFA_TX_SIZE` / `FI_EFA_RX_SIZE` allow 0 (provider default)
-or at least 128; `FI_EFA_TX_QUEUE_SIZE` allows 0 or 128..INT_MAX;
-`FI_EFA_INTERNAL_RX_REFILL_THRESHOLD` accepts any unsigned value because the
-provider clamps it to the RX pool size (default 8);
-`FI_EFA_INTER_MAX_MEDIUM_MESSAGE_SIZE` must be at least 65536;
-`FI_EFA_INTER_MIN_READ_MESSAGE_SIZE` must exceed 65536;
-`FI_EFA_EFA_CQ_READ_SIZE` must be positive. Missing values retain provider
-defaults; incompatible or unparsable values fail explicitly, never get rewritten.
-Non-EFA endpoints do not inherit these EFA policy restrictions.
-
-This bounds the negotiated TX/RX queues and their fixed packet pools, **not all
-provider memory**. In particular, the pinned endpoint pre-grows a 1024-peer
-reorder-buffer pool with default 16,384 pointers per peer (128 MiB of pointer
-storage on 64-bit hosts, before metadata/alignment). Its unexpected/OOO and
-operation pools may grow, and its CQ implementation retains a provider/domain
-floor. These allocations are independent of our four application slots; no
-claim is made that queue hints remove them or that allocated virtual memory is
-all resident. Endpoint admission and failed-close quarantine remain unchanged.
+recovery and failure paths. Real verbs hardware performance still requires
+approved hardware validation.
 
 `Endpoint::open_profile()` exposes allocation, discovery, fabric/domain, CQ/AV,
 endpoint, bind/enable, MR registration, address, peer setup, and first-CQ-read
@@ -333,164 +233,14 @@ empty poll. Error-queue handling, poisoning, exact-context retirement, receive
 order and close quarantine do not change. Deterministic dispatch tests cover maximum chunks, no-repoll EAGAIN,
 partial receive/repost ownership, error CQ reads and invalid counts; an opt-in
 software-provider test transfers across ring wraps with exactly one explicit
-CQ poll per sweep. No EFA hardware performance is inferred from these changes.
-
-## Separate EFA-direct packet transport (17 October)
-
-Selecting `FabricBackend::EfaDirect` through `Endpoint::open` selects
-**provider `efa`, fabric `efa-direct`**.
-It does not call the ordinary EFA message path, and absence or incompatible
-capabilities produces an error, not a TCP, software-provider or regular-EFA retry.
-TCP remains the default distributed transport. TLS authentication, encryption,
-protocol-v4 admission checks and durable storage receipts remain above this
-ordered byte-stream adapter.
-
-### Exact source boundaries
-
-| Source | Responsibility | Problem addressed |
-|---|---|---|
-| `src/endpoint/resources/efa_direct.rs` | Validate pinned provider 206.0, EFA protocol 1, MTU-sized messages, `FI_CONTEXT2`, local MR and automatic data progress | Ordinary EFA protocol 4/SAS/medium-message assumptions do not apply to direct |
-| `src/endpoint/resources.rs` | Select the exact fabric; stable generated `fi_context2` storage; registered TX/RX ownership and exact CQ fences | A direct packet must not outlive its MR or overwrite another in-flight physical slot |
-| `src/endpoint/efa_direct.rs` | Versioned 28-byte headers, CRC32, DATA ordinals, bounded reassembly and cumulative consumption credit | Direct FI_MSG does not supply SAS stream ordering or arbitrary-size TLS messages |
-| `src/endpoint.rs` | Fragment vectored TLS output into the actual free registered TX slot; decode a scoped completed RX packet once; drive reserved control progress | Avoid three payload staging copies, duplicate checksum passes and ACK starvation after EAGAIN |
-| `src/endpoint/resources/nonblocking_tests.rs` | Actual direct-state API fixtures and explicit software-provider packet-adapter exercise | Test post failure, CQ versus peer credit, ACK flush and large partial streams without claiming hardware |
-
-The normal four-application-slot/128-provider-entry geometry and regular EFA
-protocol-4 validation above are unchanged. Direct requests four physical entries
-and validates the returned direct geometry separately. Unsupported additional
-context or registration modes fail before live provider operations. Generated
-OFI Rust bindings remain the ABI; there is no new C source or handwritten context
-layout.
-
-### Ordering, credit and lifetime rules
-
-- Three physical DATA TX slots and one reserved CREDIT TX slot retain registered
-  bytes until their exact CQ completion. Physical lifetime is owned only by
-  `Resources`, not by wire-ordinal modulo arithmetic.
-- The independent logical window allows 32 DATA packets before peer-consumption
-  credit. A fixed 33-slot heap-backed reorder store holds at most 31 packets
-  ahead of a missing head. Receive slots are processed and reposted independently
-  of application consumption, so later packets cannot occupy every hardware
-  receive slot while preventing the missing head from arriving.
-- Each packet is at most the actual negotiated MTU. Payload is at most MTU minus
-  28 bytes. TLS records and application frames can span many packets/windows;
-  partial reads preserve the stream. Reassembly payload storage is bounded by
-  `33 * (MTU - 28)`, plus fixed slot metadata and the shared registered buffers.
-  There is no packet-time heap allocation or additional endpoint mutex.
-- DATA duplicates, malformed checksums/lengths, invalid/exhausted ordinals and
-  out-of-window DATA fail closed. Stale/reordered cumulative CREDIT is an
-  idempotent no-op; credit beyond successfully posted DATA is invalid.
-- Local CQ completion, peer ciphertext consumption and durable storage receipt
-  are three different events. Only the last acknowledges a durable write.
-  A provider EAGAIN consumes no application bytes, wire ordinal or send fence.
-- CREDIT spends no DATA credit, uses reserved physical capacity, coalesces while
-  a prior control send is live and never generates an ACK loop. Receive-only
-  progress retries a control post after EAGAIN. `flush` drives pending control
-  even when no TX has yet been accepted; success still means local completion,
-  not proof that the peer application consumed the stream.
-- Successful endpoint close still precedes MR/buffer release. Failed close
-  keeps the existing bounded quarantine. Direct does not depend on unsupported
-  `fi_cancel` behavior.
-
-TX framing copies payload once into its registered slot. RX validates the scoped
-completed packet once, then copies only payload into reassembly before repost.
-The final reassembly-to-TLS copy remains: this is not end-to-end zero-copy,
-one-sided RDMA, direct WAL addressing or NVMe-oF.
-
-The existing opt-in `send_copy_ns` scope includes direct framing and checksum;
-`receive_copy_ns` includes direct packet validation and reassembly insertion.
-Counts/bytes include control packets and transport headers. These differ from
-ordinary EFA's simple completed-buffer copy scopes and must not be subtracted as
-identical exclusive budgets. No extra clock is read when profiling is disabled;
-CQ and enclosing TLS/RPC clocks retain their existing scopes.
-
-### Pinned source basis and local proof
-
-The reviewed implementation is upstream
-[`3cc1095272b07ebeb5cc8f44851af6aa3eb75e41`](https://github.com/ofiwg/libfabric/tree/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src),
-not libfabric main/2.7:
-
-- [`fi_efa.7`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/man/fi_efa.7.md):
-  named direct fabric, unordered/MTU-bounded messages, context2/local-MR/automatic
-  progress, CQ progress after EAGAIN and unsupported cancellation.
-- `efa_prov_info.c`, `efa_user_info.c`, `efa_msg.c`,
-  `efa_data_path_direct_entry.h`, `efa_cq.c`, `efa_base_ep.c` and util
-  `util_attr.c`: direct protocol identity, normalized capabilities, stable
-  operation contexts, queue admission and QP-before-MR teardown.
-- [eRPC](https://www.usenix.org/system/files/nsdi19-kalia.pdf): bounded reusable
-  fast-path storage and explicit ownership. Its published latency is not a
-  prediction for this TLS/libfabric implementation.
-
-Local validation ran all 44 native-enabled fabric unit cases, including the
-otherwise ignored software-provider adapter: both directions transferred
-1,000,003/1,000,019 bytes with partial reads and exact content equality. Seven
-existing software-provider integration cases also passed. The test initially
-closed one endpoint when only its local CQ had retired; retaining both endpoints
-until both consumers finish corrected that test lifetime error without weakening
-the production completion contract.
-
-The laptop's exact `fi_info -p efa -f efa-direct -t FI_EP_RDM` discovery returned
-`-61 (No data available)`. These are software correctness results, **not hardware
-EFA-direct measurements**. Real registration, delivery/reordering/RNR, device
-faults, teardown, TLS on EFA and latency/throughput still require hardware.
-Local receipts and later source-bound KV/Sui results are retained under
-`checkpoint-work/2026-10-17-efa-direct-local/` at the project root. No AWS
-operation or launch is part of this implementation.
-
-
-## Hardware discovery correction (18 October)
-
-The first hardware qualification, `th-2e14bc3d9fcbf762`, found the exact
-`efa-direct` fabric with provider 206.0, but the application's `fi_getinfo`
-returned `-FI_ENODATA`. This was a request mismatch, not evidence that the
-instance lacked EFA-direct and not a latency result.
-
-The pinned provider's
-[`efa_prov_info.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_prov_info.c#L49)
-declares MR requirements which
-[`ofi_check_mr_mode`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/util/src/util_attr.c#L545-L615)
-normalizes for `FI_MSG` to **`FI_MR_LOCAL | FI_MR_ALLOCATED`**. Our former
-LOCAL-only hint was rejected before `ofi_alter_info`, leaving no candidate.
-The command-line query allowed those requirements and therefore succeeded.
-
-`Info::hints` now requests both flags **only for direct**. The returned-MR
-validator already accepts them. Buffers are heap allocated and zero-filled
-before registration, retain stable addresses and stay live until endpoint/MR
-close; failed close still quarantines them. This satisfies ALLOCATED rather than
-merely ignoring the provider requirement.
-
-Ordinary EFA/software hints, API versions 1.18/1.11, identity/protocol/context/
-progress/MTU/queue checks, TLS, wire framing and write durability are unchanged.
-Pinned source tracing did not identify API 1.18 as the rejection cause, so it
-was not changed speculatively. No new lock, C ABI or fallback was added.
-
-The direct implementer and independent reviewer traced this match failure.
-Local native-enabled fabric cases and strict Clippy were rerun after the fix;
-only hardware can prove that corrected discovery and subsequent data transfer
-work. The failed source `e022…` and its complete partial evidence remain
-immutable. All six failed-fleet instances and temporary AWS resources were
-independently verified closed before a replacement campaign.
-
-### Corrected hardware qualification
-
-The fresh `70454d…921aa` build subsequently completed the authorized
-`th-7ffe878d1f51852d` and `th-1819bd4b6691868e` campaigns: native controls,
-TCP, ordinary EFA and EFA-direct, each on six `g6.8xlarge` hosts with cluster
-placement and local instance NVMe. All 15 paired Sui cells passed complete state
-audits, and all 84 paired KV cases passed their completion/reopen guards.
-Required hardware cells had positive send and receive counter deltas on every
-host and the exact selected fabric. The MR hint correction is therefore
-hardware-qualified; it is not a software-provider substitution.
-
-EFA-direct did not establish general latency parity or a consistent speedup over
-ordinary EFA. RAM-only transport controls remained tens of microseconds.
-Normal delivery/stop/reopen validation does not qualify injected device failures,
-all reorder/RNR conditions or production-scale availability. The full measured
-scope, timings, raw artifacts, independent closure proofs and remaining limits
-are in the [18 October hardware comparison](../docs/distributed/HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md#18-october-completed-hardware-comparison).
-
+CQ poll per sweep. No hardware performance is inferred from these changes.
 
 ## Trusted native message mode (21 October)
+
+Historical: the `efa-native` and `fabric-tcp-native` names below predate the
+structured `Transport`. A trusted OFI session is now
+`Transport::Ofi { security: Trusted }` over `verbs` or `software-tcp`; the
+trust model below still applies to it.
 
 `efa-native` uses the existing **provider `efa`, fabric `efa-direct`** adapter
 without a rustls handshake, encryption records or application peer authentication.
@@ -726,81 +476,6 @@ claim follows from local tests. Physical NVMe misses and remote-resident reads
 are distinct target populations; an MR key or transport label cannot make cold
 disk data resident.
 
-## Bounded resident FI_READ extension (23 October)
-
-`Endpoint::open(&FabricConfig, Option<RmaConfig>)` negotiates message transport
-and, when requested, FI_RMA/FI_READ on the same FI_EP_RDM endpoint and
-provider. The backend selects EFA, EFA-direct, generic verbs, or software TCP;
-there are no provider-specific endpoint constructors.
-`Endpoint::provider_info()` exposes actual provider/fabric/domain/source/device
-setup and capability evidence. `RmaCapabilities` reports virtual-vs-offset MR
-addressing, selected RMA size and IOV limit, and native/emulated/unknown read
-mode. `require_device_read` rejects unknown/emulated modes and applies the
-backend-specific evidence checks described in the portable transport section.
-
-`reserve_read_region` allocates a bounded stable identity before envelope
-encoding, so region ID and generation can be embedded in the immutable bytes.
-`register_read_region` then owns those finalized bytes and registers source
-memory with `FI_REMOTE_READ` only. It returns a plain `RemoteReadRegion`
-(identity, address, key and length); it never exposes a local MR descriptor.
-Requested MR keys are process-unique from 3 upward, avoiding the existing
-endpoint message keys 1 and 2 in a shared domain. A destination is one stable
-registered slot with an `fi_context2`; `try_post_read` posts an actual
-`fi_read`, and the shared CQ dispatches its completion by exact context
-alongside SEND/RECV completions.
-`try_read_completion` transfers a stable `ReadBuffer` owner only after terminal
-completion. `ReadBuffer::into_minibytes_bytes` transfers that slot lease to
-zero-copy decoded consumers. A slot stays unavailable while either a request
-can still DMA or any result owner remains alive.
-
-The fabric enforces process-wide RMA budgets (256 MiB source, 256 MiB
-destinations, 65,536 source-region slots and 8,192 destination slots) as well
-as each endpoint's configured budgets. Destination pool setup rolls back
-successfully closed MRs and all unconsumed admission credits on registration
-failure. Any uncertain MR close retains its backing allocation and credits;
-the MR FID is never retried. Dropping an endpoint with a live source or pending
-read quarantines its endpoint, domain, MRs, contexts and bytes under the
-existing 1,024-endpoint process cap. Quarantine is bounded, not a time-based
-reclamation rule.
-
-Source retirement requires `PeerDrainToken::after_ack` for the exact session
-and grant generation after an authenticated grant-drain acknowledgement has
-drained every admitted read for that grant. Timeout, endpoint close, unknown
-context or failed operation is not such an acknowledgement. EFA's pinned
-provider implementation does not justify reusing a source after uncertain
-remote DMA: `efa_ep_close` returns success even if base endpoint teardown
-failed, and `efa_mr_close` frees its wrapper even on deregistration error.
-Therefore unproven source memory stays quarantined; a quota limit must fail
-closed rather than reclaiming it.
-
-Primary provider basis:
-
-- [Pinned EFA direct capability matrix](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/docs/efa_fabric_comparison.md):
-  `efa-direct` supports RMA reads, requires local/allocated/provider-key/virtual
-  address MR modes, and has no `fi_cancel`, `FI_FENCE` or read event.
-- [`efa_rma_post_read`, pinned `efa_rma.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_rma.c)
-  and [generic `fi_rma(3)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_rma.3.html):
-  read posting consumes the remote address/key and local destination descriptor;
-  the destination cannot be read before completion.
-- [`efa_ep_close`, pinned `efa_ep.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_ep.c),
-  [`efa_base_ep_destruct_qp_unsafe`, `efa_base_ep.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_base_ep.c),
-  and [`efa_mr_close` / `efa_mr_dereg_impl`, `efa_mr.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_mr.c):
-  local CQ/QP teardown and MR wrapper release do not establish that an
-  already-issued remote read has ceased accessing its source.
-- [`fi_efa(7)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_efa.7.html),
-  [`fi_mr(3)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_mr.3.html) and
-  [`fi_cq(3)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_cq.3.html):
-  query EFA emulation, follow negotiated MR address mode, and retain the local
-  destination/context through terminal CQ handling.
-
-The ignored software-provider regression
-`software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership`
-performs a real loopback FI_READ byte comparison, mixes it with SEND/RECV
-progress, exercises range rejection, pool pressure, retained result ownership,
-operation-drop cancellation and grant retirement. It is a local correctness
-test only; no EFA device latency, DMA-failure recovery or native-read
-performance has been demonstrated by it.
-
 ## Send retry, slot count, idle parking and provider facts (6 November 2026)
 
 These changes follow the transport review of the 1 KiB/8 KiB verbs-versus-TCP
@@ -819,9 +494,8 @@ and no default geometry.
   contract that the endpoint never posts bytes the caller no longer offers.
 - **Slot count.** `FabricConfig::slots` (`None` = 4) selects the number of 64 KiB
   TX and RX slots per endpoint, `1..=64` (`MAX_SLOTS`). The CQ depth, MR
-  registration, completion-context arrays and ring arithmetic follow it. EFA and
-  EFA-direct accept only the default: their queue-size proof (`efa::QUEUE`,
-  direct MTU geometry) was derived for four slots. The default is unchanged.
+  registration, completion-context arrays and ring arithmetic follow it. The
+  default is unchanged.
 - **Idle parking.** A server session opens its endpoint with
   `Endpoint::open_idle_parking`. Software RxM keeps its bounded `fi_cq_sread`.
   `verbs` additionally requests `FI_WAIT_FD` on the CQ, reads the descriptor with
@@ -835,8 +509,7 @@ and no default geometry.
   owner keeps its bounded spin/yield progress; the reason is recorded in
   `ProviderInfo::geometry.cq_wait`. Whether `verbs;ofi_rxm` grants `FI_WAIT_FD` is a
   provider property that only a real device can show: **unverified on hardware**.
-  EFA still has no wait object, so its idle owner still spins. `cq_idle_waits`
-  counts parked sweeps.
+  `cq_idle_waits` counts parked sweeps.
 - **Provider facts at open.** `ProviderInfo::geometry` records the libfabric API
   version (`fi_version`), the version requested from `fi_getinfo`, the provider
   version, protocol, `tx_attr.inject_size`, TX/RX sizes, iov limits,

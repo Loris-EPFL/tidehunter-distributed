@@ -5,12 +5,11 @@
 //! one WAL per owner, each owner can lose a different suffix, so plain recovery
 //! can keep a later batch and lose an earlier one. The coordinator therefore
 //! persists a cut: every batch of the epoch with a sequence below `next` is
-//! synced on its owner or was aborted. Recovery discards every batch above the
-//! cut ([`CutRecovery::Strict`]) or above the run of surviving sequences that
-//! starts at the cut ([`CutRecovery::Extend`]). Both keep an exact prefix of the
-//! coordinator's version order.
+//! synced on its owner or was aborted. Recovery extends the cut over the run of
+//! surviving sequences that starts at it and discards every batch above that
+//! run, which keeps an exact prefix of the coordinator's version order.
 //!
-//! Owner continuity (Extend): an owner is continuous when its incarnation at the
+//! Owner continuity: an owner is continuous when its incarnation at the
 //! recovery fence equals the incarnation recorded for the epoch and its recovery
 //! found no hole and it saw no persistence failure (`NodeStatus::recovery_clean`).
 //! The incarnation is random per owner open, so every owner process restart
@@ -34,9 +33,10 @@
 //! Explicit flush certifies its covered prefix through the actor, so a flush
 //! returns only after the record covers it.
 
-use super::super::durability::{CutRecovery, DurableCutConfig, NativeRecovery};
-use super::super::local_db::LocalDbError;
-use super::super::storage::{StorageError, encode_metadata, install_metadata, read_metadata};
+use super::super::durability::DurableCutConfig;
+use super::super::storage::{
+    LocalDbError, StorageError, encode_metadata, install_metadata, read_metadata,
+};
 use super::super::tcp::{Client, DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport, TcpError};
 use super::super::types::BatchVersion;
 use parking_lot::Mutex;
@@ -173,7 +173,7 @@ pub struct RecoveredCut {
 struct OpenTruncation {
     epoch: u64,
     next: u64,
-    /// Extend mode and no lost sequence seen yet.
+    /// No lost sequence seen yet.
     extending: bool,
     /// Continuity bound (exclusive): a missing sequence below it was never written.
     bound: u64,
@@ -232,7 +232,6 @@ impl RecoveryPlan {
     pub(super) fn new(
         record: Option<CutRecord>,
         database: [u8; 16],
-        config: &DurableCutConfig,
         checkpoint: Option<BatchVersion>,
         fenced: &[OwnerFence],
     ) -> Self {
@@ -244,14 +243,8 @@ impl RecoveryPlan {
             .iter()
             .map(|cut| (cut.epoch, cut.next))
             .collect();
-        // Only a durable-prefix open decides a new bound. A per-owner open keeps
-        // the tracked epoch whole and clears `live`, so no later open can
-        // truncate batches that this epoch already served.
         let open = live
-            .filter(|live| {
-                config.recovery == NativeRecovery::DurablePrefix
-                    && !recorded.contains_key(&live.epoch)
-            })
+            .filter(|live| !recorded.contains_key(&live.epoch))
             .map(|live| OpenTruncation {
                 epoch: live.epoch,
                 next: live.next.max(
@@ -259,13 +252,10 @@ impl RecoveryPlan {
                         .filter(|version| version.epoch == live.epoch)
                         .map_or(0, |version| version.sequence.saturating_add(1)),
                 ),
-                extending: config.cut == CutRecovery::Extend,
+                extending: true,
                 bound: continuity_bound(&marks, fenced),
             });
-        let continuity_bound = open
-            .as_ref()
-            .filter(|open| open.extending)
-            .map(|open| open.bound);
+        let continuity_bound = open.as_ref().map(|open| open.bound);
         Self {
             database,
             existed,
@@ -312,7 +302,7 @@ impl RecoveryPlan {
 
     /// The record to persist before `epoch` activates, and the bound this
     /// recovery decided. No record is written when none existed and `epoch` is
-    /// not tracked: behaviour is then exactly the per-owner recovery. A tracked
+    /// not tracked (a Synchronous owner). A tracked
     /// epoch starts with one mark per fenced owner (its incarnation, nothing synced).
     pub(super) fn finish(
         mut self,
@@ -543,8 +533,7 @@ impl Shared {
 /// Diagnostic snapshot of the durable cut. Counters are weakly consistent.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DurableCutStats {
-    /// False when this epoch is not tracked (per-owner recovery, a Synchronous
-    /// owner, or on-disk receipt history).
+    /// False when this epoch is not tracked (a Synchronous owner).
     pub enabled: bool,
     pub epoch: u64,
     /// Every batch of `epoch` below this sequence is synced or aborted, and the

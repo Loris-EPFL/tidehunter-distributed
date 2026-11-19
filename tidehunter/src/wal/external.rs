@@ -2,7 +2,6 @@
 use super::position::WalFileId;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -62,35 +61,19 @@ impl ExternalPreparation {
                 "invalid external WAL file size",
             ));
         }
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: file retains its descriptor and the checked nonnegative
-            // range fits off_t. Only the opener or sole mapper grows this file.
-            let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
-            if result != 0 {
-                return Err(io::Error::from_raw_os_error(result));
-            }
+        crate::distributed::sys::allocate(file, len)?;
+        if self.prewrite {
+            self.zero_and_sync(file, len, scratch)?;
         }
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "live NVMe-oF requires Linux",
-        ));
-        #[cfg(target_os = "linux")]
-        {
-            if self.prewrite {
-                self.zero_and_sync(file, len, scratch)?;
-            }
-            #[cfg(test)]
-            // Relaxed: deterministic fault injection, not an I/O ordering edge.
-            if self.fail_before_ready.swap(false, Ordering::Relaxed) {
-                return Err(io::Error::other("injected crash before prepared marker"));
-            }
-            // Release publishes successful preallocation, and (when enabled)
-            // every zero write and its data barrier, before any readiness check.
-            self.ready.fetch_max(id.0 + 1, Ordering::Release);
-            Ok(())
+        #[cfg(test)]
+        // Relaxed: deterministic fault injection, not an I/O ordering edge.
+        if self.fail_before_ready.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected crash before prepared marker"));
         }
+        // Release publishes successful preallocation, and (when enabled)
+        // every zero write and its data barrier, before any readiness check.
+        self.ready.fetch_max(id.0 + 1, Ordering::Release);
+        Ok(())
     }
 
     fn zero_and_sync(&self, file: &File, len: u64, scratch: &mut Vec<u8>) -> io::Result<()> {

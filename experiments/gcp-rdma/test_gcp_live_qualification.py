@@ -37,7 +37,7 @@ def evidence():
         return {'completed_write_ops': 0, 'completed_write_bytes': 0,
                 'completed_read_ops': 0, 'completed_read_bytes': 0,
                 'recovery_read_ops': 0, 'recovery_read_bytes': 0,
-                'errors': 0, 'unknown_writes': 0, 'payload_rpc_requests': 0,
+                'errors': 0, 'unknown_writes': 0,
                 'route_evidence_dropped': 0, 'fence_evidence_dropped': 0,
                 'routes': [copy.deepcopy(route)], 'fences': [], **extra}
     proof = {'schema_version': 1, 'kind': 'live_nvmeof_qualification', 'expected_route': 'rdma',
@@ -46,8 +46,7 @@ def evidence():
              'checks': {'scalar_write_delete': True, 'mixed_batch': True,
                         'ordered_batch_missing_exists': True, 'checkpoint_iteration': True,
                         'flush_reopen': True, 'abrupt_tail_recovery': True,
-                        'fence_drain': True, 'cache_miss_hit': True,
-                        'payload_rpc_fallback': False},
+                        'fence_drain': True, 'cache_miss_hit': True},
              'member_transition': {'wal_file_bytes': 1048576, 'completed_write_bytes': 1114112,
                                    'completed_write_ops': 32, 'writes_acknowledged': 32,
                                    'writer_routes': [first_writer, next_writer],
@@ -81,10 +80,25 @@ def evidence():
 
 
 class QualificationTest(unittest.TestCase):
-    def admit(self, proof, coordinator, owner):
+    def admit(self, proof, coordinator, owner, *, archive_binary=False):
         launch, receipt = owner_evidence()
         return live.admit(proof, 'rdma', '10.1.0.2', '10.1.0.1', '10.0.0.2', coordinator, owner,
-                          target='kernel', tier='synchronous', owner_launch=launch, owner_receipt=receipt)
+                          target='kernel', tier='synchronous', owner_launch=launch, owner_receipt=receipt,
+                          archive_binary=archive_binary)
+
+    def test_archive_proof_requires_no_payload_fallback(self):
+        proof, coordinator, owner = evidence()
+        with self.assertRaisesRegex(ValueError, 'checks incomplete'):
+            self.admit(proof, coordinator, owner, archive_binary=True)
+        proof['checks']['payload_rpc_fallback'] = False
+        for sample in (proof['before_close'], proof['recovery'], proof['after_hit'],
+                       proof['abrupt_child']['end'], proof['abrupt_recovery']):
+            sample['payload_rpc_requests'] = 0
+        self.admit(proof, coordinator, owner, archive_binary=True)
+        proof['before_close']['payload_rpc_requests'] = 1
+        with self.assertRaisesRegex(ValueError, 'live errors'):
+            self.admit(proof, coordinator, owner, archive_binary=True)
+
     def test_owner_tier_and_launch_receipt_are_required(self):
         proof, coordinator, owner = evidence()
         launch, receipt = owner_evidence()
@@ -237,7 +251,7 @@ class QualificationTest(unittest.TestCase):
             lambda p, c, o: p['abrupt_recovery'].update(fences=[]),
             lambda p, c, o: p['abrupt_recovery'].update(recovery_read_ops=0),
             lambda p, c, o: p['after_hit']['routes'][0].update(address='127.0.0.1'),
-            lambda p, c, o: p['before_close'].update(payload_rpc_requests=1),
+            lambda p, c, o: p['before_close'].update(unknown_writes=1),
             lambda p, c, o: p['target_shutdown'][0]['stats'].update(owned_namespace_count=1),
             lambda p, c, o: o['after']['counter_samples']['irdma_ipv4'].update(rx=20),
             lambda p, c, o: c['after'].update(device='other'),

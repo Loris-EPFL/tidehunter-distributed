@@ -2,7 +2,7 @@
 //! acknowledgements precede the sync, so an owner process crash must keep every
 //! acknowledged frame; a kernel crash may lose only a clean unsynced suffix.
 use super::*;
-use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
 use std::path::PathBuf;
 
 fn frame_file(path: &Path, config: &PartitionConfig, frame: u64) -> PathBuf {
@@ -122,44 +122,6 @@ fn a_defect_below_the_synced_root_stays_fatal() {
 }
 
 #[test]
-fn an_unfinished_reservation_blocks_every_later_acknowledgement() {
-    use crate::distributed::durability::DurabilityConfig;
-    let temp = tempdir::TempDir::new("live-native-hole").unwrap();
-    let config = live_config();
-    let log = PartitionLog::create_live(
-        &temp.path().join("stream"),
-        config.clone(),
-        &shape(),
-        metrics(),
-    )
-    .unwrap();
-    let frontier = log.attach_frontier(&DurabilityConfig::default()).unwrap();
-    let descriptor_of = |n| {
-        let group = CompleteGroup::new_live(
-            &shape(),
-            vec![batch(&config, n)],
-            config.batch_limits,
-            config.group_limits,
-        )
-        .unwrap();
-        LiveGroupDescriptor::from_group(&group).unwrap().0
-    };
-    // Reserve frame 0 and never complete it: a hole at the head of the stream.
-    assert!(matches!(
-        log.reserve_live_group(authority(&config), descriptor_of(0))
-            .unwrap(),
-        LiveReserveResult::Reserved(_)
-    ));
-    // No later frame can be reserved, so none can be completed or acknowledged.
-    assert!(matches!(
-        log.reserve_live_group(authority(&config), descriptor_of(1)),
-        Err(StorageError::Invalid(_))
-    ));
-    assert_eq!(frontier.appended(), 0);
-    assert_eq!(log.appended_frontier(), 0);
-}
-
-#[test]
 fn completed_frames_publish_into_the_contiguous_appended_frontier() {
     use crate::distributed::durability::DurabilityConfig;
     let temp = tempdir::TempDir::new("live-native-frontier").unwrap();
@@ -182,7 +144,7 @@ fn completed_frames_publish_into_the_contiguous_appended_frontier() {
     assert_eq!(log.synced_frontier(), 3 * 4096);
 }
 
-/// Reserve and fully write a frame for `item` without completing it: the owner
+/// Lease and fully write a frame for `item` without adopting it: the owner
 /// never learns it finished, as when a coordinator or owner dies in between.
 fn write_unfinished(
     log: &PartitionLog,
@@ -196,25 +158,16 @@ fn write_unfinished(
         config.group_limits,
     )
     .unwrap();
-    let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-    let LiveReserveResult::Reserved(reservation) = log
-        .reserve_live_group(authority(config), descriptor)
-        .unwrap()
-    else {
-        panic!("expected a new reservation");
-    };
-    OpenOptions::new()
-        .write(true)
-        .open(&reservation.segment.path)
-        .unwrap()
-        .write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
-        .unwrap();
+    let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+    let span = (frame.len() as u64).div_ceil(4096) * 4096;
+    let (extent, offset) = live_fixture_extent(log, config, span);
+    write_live_fixture(&extent, offset, &frame);
     let item = &group.batches()[0];
     receipt_for(
         config,
         item,
         member_position(
-            WalPosition::new(reservation.frame_offset, reservation.frame_len),
+            WalPosition::new(offset, frame.len() as u32),
             group.batch_offsets()[0],
             item,
         ),
@@ -339,22 +292,17 @@ fn incomplete_after_valid_prefix() -> (tempdir::TempDir, PartitionConfig, Arc<Pa
     append_live_fixture(&log, &config, 0);
     assert_eq!(frontier.synced(), 0);
     assert_eq!(frontier.appended(), 4096);
-    let group = CompleteGroup::new_live(
-        &shape(),
-        vec![batch(&config, 1)],
-        config.batch_limits,
-        config.group_limits,
-    )
-    .unwrap();
-    let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
-    let LiveReserveResult::Reserved(reserved) = log
-        .reserve_live_group(authority(&config), descriptor)
-        .unwrap()
-    else {
-        panic!("expected an unwritten reservation")
-    };
+    // Close the open extent beyond its adopted end: the later frame was never
+    // written, so the close fails as an incomplete live frame.
+    let (token, end) = log
+        .state
+        .lock()
+        .open_live_extent
+        .as_ref()
+        .map(|open| (open.extent.token, open.adoption.adopted_end))
+        .unwrap();
     assert!(matches!(
-        log.complete_live_group(authority(&config), reserved.token),
+        log.adopt_live_extent(authority(&config), token, end + 4096, true),
         Err(StorageError::IncompleteLiveFrame)
     ));
     assert!(matches!(
@@ -378,9 +326,9 @@ fn syncer_shutdown_drains_only_the_validated_prefix_after_an_incomplete_live_fra
     assert_eq!(frontier.synced(), 4096);
     assert_eq!(log.synced_frontier(), 4096);
     let root: LiveFrontier = read_metadata(&log.path.join(LIVE_FRONTIER)).unwrap();
-    assert_eq!(root.end, 4096, "the unwritten reservation is never covered");
+    assert_eq!(root.end, 4096, "the unwritten frame is never covered");
     assert!(matches!(
-        log.complete_live_group(authority(&config), [0; 16]),
+        log.lease_live_extent(authority(&config)),
         Err(StorageError::Poisoned)
     ));
     assert!(matches!(
@@ -398,7 +346,7 @@ fn persistence_failure_after_an_incomplete_frame_stays_fatal() {
     assert_eq!(log.synced_frontier(), 0);
     assert!(log.frontier().unwrap().failure().is_some());
     assert!(matches!(
-        log.complete_live_group(authority(&config), [0; 16]),
+        log.lease_live_extent(authority(&config)),
         Err(StorageError::Poisoned)
     ));
     assert!(log.sync_for_frontier().is_err());

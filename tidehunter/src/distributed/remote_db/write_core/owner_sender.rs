@@ -86,7 +86,7 @@ impl OwnerSender {
         }
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub fn observe_full_park(&self, entered: mpsc::SyncSender<()>) {
         *self.capacity.full_park.lock() = Some(entered);
     }
@@ -174,7 +174,6 @@ impl OwnerReceiver {
 
     /// `park_full` for a worker that must still drive a pending leased
     /// adoption and its deadline: wake after `timeout` at the latest.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn park_full_timeout(&self, timeout: Duration) {
         self.note_full_park();
         thread::park_timeout(timeout);
@@ -236,7 +235,6 @@ impl OwnerReceiver {
     }
 
     /// Only the leased worker loop waits with a deadline on the control channel.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn recv_timeout(
         &self,
         timeout: Duration,
@@ -389,10 +387,6 @@ mod tests {
             "owner control deadline expired before admission"
         );
         sender.close();
-        assert_eq!(
-            handle.read_io_stats().unwrap_err().message(),
-            "TCP worker stopped"
-        );
         assert_eq!(
             handle.owner_timeline_arm(1).unwrap_err().message(),
             "TCP worker stopped"

@@ -1,5 +1,6 @@
 use super::super::tests::{batch, config, metrics};
 use super::*;
+use crate::distributed::durability::DurabilityTier;
 
 // Mirror the production ownership-preserving admission API without boxing.
 #[allow(clippy::result_large_err)]
@@ -16,17 +17,10 @@ fn command(
         charge,
         limits: TcpLimits::default(),
         measured: true,
-        trace_shape: None,
         queued: Some(Instant::now()),
         submitted: Some(Instant::now()),
         completed: completed.clone(),
     })
-}
-fn append_request(config: &NodeConfig, epoch: u64, sequence: u64) -> Request {
-    Request::Append {
-        epoch,
-        batches: vec![batch(config, epoch, sequence).encoded().clone().into()],
-    }
 }
 fn receive(
     completions: &mpsc::Receiver<reactor::WorkCompletion>,
@@ -48,51 +42,11 @@ fn open_synchronous(config: &NodeConfig) -> Arc<StorageNode> {
     node
 }
 
-#[test]
-fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
-    let temp = tempdir::TempDir::new("control-not-read-pool").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = open_synchronous(&config);
-    node.inventory.lock().fence_to(1).unwrap();
-    let (entered, entries) = mpsc::sync_channel(config.effective_read_workers());
-    let (release, released) = mpsc::sync_channel(config.effective_read_workers());
-    let released = Arc::new(Mutex::new(released));
-    for _ in 0..config.effective_read_workers() {
-        let entered = entered.clone();
-        let released = released.clone();
-        node.read_pool.spawn(move || {
-            entered.send(()).unwrap();
-            released
-                .lock()
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-        });
-    }
-    for _ in 0..config.effective_read_workers() {
-        entries.recv_timeout(Duration::from_secs(5)).unwrap();
-    }
-    let (completed, completions) = mpsc::sync_channel(1);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    let response = receive(&completions, 1).response;
-    for _ in 0..config.effective_read_workers() {
-        release.send(()).unwrap();
-    }
-    let Response::Appended(receipts) = response.unwrap() else {
-        panic!("append failed")
-    };
-    assert_eq!(receipts.len(), 1);
-    let log = node.inventory.lock().active(1).unwrap();
-    let reference = batch(&config, 1, 0)
-        .record_reference(receipts[0].address, 0)
-        .unwrap();
-    log.validate_durable_record_reference(&reference).unwrap();
-    assert_eq!(log.stats().persistence_barriers, 1);
-}
-
 /// A reply is the last effect of an admitted command, so its holder must see
-/// the admission released on every completion path: an exclusive control and
-/// a failed command (worker), a native append (worker hand-off) and a
-/// synchronous append (flusher). Final target teardown relies on this.
+/// the admission released on every completion path: a successful exclusive
+/// control, a failed exclusive control and a stream request. Final target
+/// teardown relies on this. (The owner-RPC append hand-off paths were removed
+/// with the payload route.)
 #[test]
 fn reply_follows_admission_release_on_every_completion_path() {
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
@@ -104,10 +58,17 @@ fn reply_follows_admission_release_on_every_completion_path() {
         node.inventory.lock().fence_to(1).unwrap();
         let (completed, completions) = mpsc::sync_channel(1);
         let requests = [
-            (append_request(&config, 1, 0), true),
             (Request::Fence { epoch: 2 }, true),
-            // Epoch 1 is fenced now, so this append fails in the worker.
-            (append_request(&config, 1, 1), false),
+            // Epoch 2 is current now, so fencing back to 1 fails in the worker.
+            (Request::Fence { epoch: 1 }, false),
+            (
+                Request::CheckpointPosition {
+                    authority_epoch: 2,
+                    epoch: 2,
+                    through: 0,
+                },
+                true,
+            ),
         ];
         for (id, (request, succeeds)) in (1..).zip(requests) {
             assert!(command(&node, id, request, 4096, &completed).is_ok());
@@ -118,123 +79,18 @@ fn reply_follows_admission_release_on_every_completion_path() {
 }
 
 #[test]
-fn appender_services_next_group_while_captured_persistence_is_paused() {
-    let temp = tempdir::TempDir::new("control-captured-prefix").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = open_synchronous(&config);
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, release) = log.pause_next_persist();
-    let (completed, completions) = mpsc::sync_channel(3);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
-    let second = batch(&config, 1, 1);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while log.lookup(second.id()).unwrap().is_none() && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    assert!(log.lookup(second.id()).unwrap().is_some());
-    assert!(matches!(
-        completions.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    assert!(command(&node, 3, Request::Fence { epoch: 2 }, 1, &completed).is_ok());
-    release.send(()).unwrap();
-    assert!(matches!(
-        receive(&completions, 1).response.unwrap(),
-        Response::Appended(_)
-    ));
-    assert!(matches!(
-        receive(&completions, 2).response.unwrap(),
-        Response::Appended(_)
-    ));
-    assert!(matches!(
-        receive(&completions, 3).response.unwrap(),
-        Response::Status(_)
-    ));
-    assert_eq!(log.stats().appended_groups, 2);
-    assert_eq!(log.stats().persistence_barriers, 2);
-}
-#[test]
-fn append_checkpoint_seal_and_fence_keep_fifo_and_exact_durable_receipts() {
-    let temp = tempdir::TempDir::new("control-fifo").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = open_synchronous(&config);
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, release) = log.pause_next_persist();
-    let (completed, completions) = mpsc::sync_channel(7);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let requests = [
-        Request::Checkpoint {
-            authority_epoch: 1,
-            epoch: 1,
-            prefix: 1,
-        },
-        Request::Seal { epoch: 1 },
-        append_request(&config, 1, 1),
-        Request::Fence { epoch: 2 },
-        append_request(&config, 2, 0),
-        Request::Seal { epoch: 2 },
-    ];
-    for (index, request) in requests.into_iter().enumerate() {
-        assert!(command(&node, index as u64 + 2, request, 4096, &completed).is_ok());
-    }
-    assert!(matches!(
-        completions.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    release.send(()).unwrap();
-    let Response::Appended(first) = receive(&completions, 1).response.unwrap() else {
-        panic!("append")
-    };
-    assert_eq!(first[0].id, batch(&config, 1, 0).id());
-    let Response::Checkpoint(proof) = receive(&completions, 2).response.unwrap() else {
-        panic!("checkpoint")
-    };
-    assert_eq!(proof.prefix, 1);
-    assert_eq!(proof.retained, 1);
-    assert!(matches!(
-        receive(&completions, 3).response.unwrap(),
-        Response::Sealed
-    ));
-    assert!(
-        receive(&completions, 4).response.is_err(),
-        "sealed append cannot succeed"
-    );
-    assert!(matches!(
-        receive(&completions, 5).response.unwrap(),
-        Response::Status(_)
-    ));
-    let Response::Appended(second) = receive(&completions, 6).response.unwrap() else {
-        panic!("append")
-    };
-    assert_eq!(second[0].id, batch(&config, 2, 0).id());
-    assert!(matches!(
-        receive(&completions, 7).response.unwrap(),
-        Response::Sealed
-    ));
-    assert_eq!(log.stats().appended_groups, 1);
-    assert_eq!(log.stats().persistence_barriers, 1);
-}
-
-#[test]
 fn active_commands_retain_both_queue_bounds() {
     for bytes_full in [false, true] {
         let temp = tempdir::TempDir::new("control-bounds").unwrap();
         let config = config(&temp.path().join("node"));
         let node = open_synchronous(&config);
         node.inventory.lock().fence_to(1).unwrap();
-        let log = node.inventory.lock().active(1).unwrap();
-        let (entered, release) = log.pause_next_persist();
+        // Hold the first command (an exclusive fence) at inventory acquisition,
+        // so it stays admitted while the queue fills behind it.
+        let inventory = node.inventory.lock();
         let (completed, completions) = mpsc::sync_channel(MAX_COMMANDS);
         let charge = if bytes_full { MAX_COMMAND_BYTES } else { 1 };
-        assert!(command(&node, 1, append_request(&config, 1, 0), charge, &completed).is_ok());
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(command(&node, 1, Request::Fence { epoch: 2 }, charge, &completed).is_ok());
         let accepted = if bytes_full { 1 } else { MAX_COMMANDS };
         for id in 2..=accepted {
             assert!(command(&node, id as u64, Request::Stats, 1, &completed).is_ok());
@@ -244,108 +100,27 @@ fn active_commands_retain_both_queue_bounds() {
         let work = rejected.err().unwrap();
         assert_eq!(work.id, 99);
         assert!(matches!(work.request, Request::Seal { epoch: 1 }));
-        release.send(()).unwrap();
+        drop(inventory);
         for id in 1..=accepted {
             assert!(receive(&completions, id as u64).response.is_ok());
         }
     }
 }
-
-#[test]
-fn panic_after_append_fails_active_and_later_commands_closed() {
-    let temp = tempdir::TempDir::new("control-panic").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = open_synchronous(&config);
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    // Hold both appends at inventory acquisition until every command has been
-    // accepted, so both are in flight when the first one to finish panics.
-    let inventory = node.inventory.lock();
-    node.inject_panic_after_next_append();
-    let (completed, completions) = mpsc::sync_channel(3);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
-    assert!(command(&node, 3, Request::Seal { epoch: 1 }, 1, &completed).is_ok());
-    drop(inventory);
-    let mut outcomes = std::collections::HashMap::new();
-    let mut order = Vec::new();
-    for _ in 0..3 {
-        let completion = completions.recv_timeout(Duration::from_secs(5)).unwrap();
-        order.push(completion.id);
-        outcomes.insert(completion.id, completion.response.is_err());
-    }
-    // A poisoned authority fails the seal at once; an append still waiting on the
-    // flusher may complete after it.
-    assert_eq!(order.len(), 3);
-    // The panicking append and every command behind the poisoned authority fail;
-    // the overlapping append either finished before the panic or failed closed.
-    assert!(outcomes[&1] || outcomes[&2]);
-    assert!(outcomes[&3]);
-    assert!(log.stats().appended_groups <= 2);
-    // The non-panicking append may already have been synced before the failure.
-    assert!(node.status().is_err());
-}
-
-#[test]
-fn caller_cancellation_and_owner_drop_drain_accepted_writes() {
-    let temp = tempdir::TempDir::new("control-cancel-drain").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = open_synchronous(&config);
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, release) = log.pause_next_persist();
-    let (completed, completions) = mpsc::sync_channel(1);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
-    let second = batch(&config, 1, 1);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while log.lookup(second.id()).unwrap().is_none() && Instant::now() < deadline {
-        thread::yield_now();
-    }
-    let appended = log.lookup(second.id()).unwrap().unwrap();
-    let reference = second.record_reference(appended.address(), 0).unwrap();
-    assert!(matches!(
-        log.validate_durable_record_reference(&reference),
-        Err(StorageError::NeedsPersistence)
-    ));
-    drop(completions); // Delivery cancellation must not cancel the admitted WAL write.
-    let (stopped, stopping) = mpsc::sync_channel(1);
-    let dropping = thread::spawn(move || {
-        drop(node);
-        stopped.send(()).unwrap();
-    });
-    assert!(matches!(
-        stopping.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    release.send(()).unwrap();
-    stopping.recv_timeout(Duration::from_secs(5)).unwrap();
-    dropping.join().unwrap();
-    for sequence in 0..2 {
-        let batch = batch(&config, 1, sequence);
-        let appended = log.lookup(batch.id()).unwrap().unwrap();
-        log.validate_durable_record_reference(
-            &batch.record_reference(appended.address(), 0).unwrap(),
-        )
-        .unwrap();
-    }
-    assert_eq!(log.stats().appended_groups, 2);
-    assert_eq!(log.stats().persistence_barriers, 2);
-}
-
 #[test]
 fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
     let temp = tempdir::TempDir::new("control-retirement-authority").unwrap();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
     node.inventory.lock().fence_to(1).unwrap();
+    let log = node.inventory.lock().active(1).unwrap();
+    log.append_complete_batch(
+        crate::distributed::types::RequestAuthority { epoch: 1 },
+        &batch(&config, 1, 0),
+    )
+    .unwrap();
+    log.persist_appended().unwrap();
+    drop(log);
     let (completed, completions) = mpsc::sync_channel(1);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    assert!(matches!(
-        receive(&completions, 1).response.unwrap(),
-        Response::Appended(_)
-    ));
     assert!(command(&node, 2, Request::Fence { epoch: 2 }, 1, &completed).is_ok());
     assert!(matches!(
         receive(&completions, 2).response.unwrap(),
@@ -395,22 +170,19 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
             after: None,
             limit: 257,
         },
-        Request::RetireFiles {
+        Request::RetireWalFiles {
             authority_epoch: 1,
             epoch: 1,
-            prefix: 1,
             files: files.clone(),
         },
-        Request::RetireFiles {
+        Request::RetireWalFiles {
             authority_epoch: 2,
             epoch: 2,
-            prefix: 1,
             files: files.clone(),
         },
-        Request::RetireFiles {
+        Request::RetireWalFiles {
             authority_epoch: 2,
             epoch: 1,
-            prefix: 1,
             files: vec![files[0]; 257],
         },
     ];
@@ -425,7 +197,6 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
     );
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn live_resolution_rejects_forged_reference_and_stale_authority() {
     let temp = tempdir::TempDir::new("live-owner-reference").unwrap();
@@ -433,12 +204,18 @@ fn live_resolution_rejects_forged_reference_and_stale_authority() {
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
     node.inventory.lock().fence_to(1).unwrap();
     let (completed, completions) = mpsc::sync_channel(1);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    let Response::Appended(receipts) = receive(&completions, 1).response.unwrap() else {
-        panic!("append failed")
-    };
+    let appended = node
+        .inventory
+        .lock()
+        .active(1)
+        .unwrap()
+        .append_complete_batch(
+            crate::distributed::types::RequestAuthority { epoch: 1 },
+            &batch(&config, 1, 0),
+        )
+        .unwrap();
     let reference = batch(&config, 1, 0)
-        .record_reference(receipts[0].address, 0)
+        .record_reference(appended.address(), 0)
         .unwrap();
     let mut forged = reference;
     forged.descriptor.checksum.0 ^= 1;
@@ -461,7 +238,6 @@ fn live_resolution_rejects_forged_reference_and_stale_authority() {
     assert!(node.status().is_ok());
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn unknown_live_pin_release_is_not_acknowledged() {
     let temp = tempdir::TempDir::new("live-unknown-pin").unwrap();
@@ -487,61 +263,7 @@ fn unknown_live_pin_release_is_not_acknowledged() {
 }
 
 #[test]
-fn synchronous_group_commit_replies_only_after_the_covering_sync() {
-    let temp = tempdir::TempDir::new("control-group-commit").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = open_synchronous(&config);
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, release) = log.pause_next_persist();
-    let (completed, completions) = mpsc::sync_channel(8);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    // Three more groups append while the first sync is held.
-    for sequence in 1..4 {
-        assert!(
-            command(
-                &node,
-                sequence + 1,
-                append_request(&config, 1, sequence),
-                4096,
-                &completed
-            )
-            .is_ok()
-        );
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while log.stats().appended_groups < 4 && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    assert_eq!(log.stats().appended_groups, 4);
-    // No receipt precedes the barrier that covers it.
-    assert!(matches!(
-        completions.recv_timeout(Duration::from_millis(200)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
-    assert_eq!(log.synced_frontier(), 0);
-    release.send(()).unwrap();
-    // Parallel append workers hand groups to the flusher in any order.
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..4 {
-        let completion = completions.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(
-            completion.response.unwrap(),
-            Response::Appended(_)
-        ));
-        seen.insert(completion.id);
-        // Every receipt that is returned is already covered by a completed sync.
-        assert!(log.synced_frontier() > 0);
-    }
-    assert_eq!(seen, (1..=4).collect());
-    // One sync for the first group, one shared by the three queued behind it.
-    assert_eq!(log.stats().persistence_barriers, 2);
-    assert_eq!(log.synced_frontier(), log.appended_frontier());
-}
-
-#[test]
-fn native_tier_replies_before_the_sync_and_controls_flush_first() {
+fn native_tier_controls_flush_the_appended_frontier_first() {
     let temp = tempdir::TempDir::new("control-native-tier").unwrap();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
@@ -550,12 +272,12 @@ fn native_tier_replies_before_the_sync_and_controls_flush_first() {
     let log = node.inventory.lock().active(1).unwrap();
     let (entered, release) = log.pause_next_persist();
     let (completed, completions) = mpsc::sync_channel(4);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    // The reply does not wait for a sync, so it arrives with none completed.
-    assert!(matches!(
-        receive(&completions, 1).response.unwrap(),
-        Response::Appended(_)
-    ));
+    log.append_complete_batch(
+        crate::distributed::types::RequestAuthority { epoch: 1 },
+        &batch(&config, 1, 0),
+    )
+    .unwrap();
+    node.control.shared.frontier_for(&log).unwrap();
     assert!(log.synced_frontier() < log.appended_frontier());
     // A control flushes everything acknowledged before it runs; the held sync
     // therefore holds the control.
@@ -574,14 +296,14 @@ fn native_tier_replies_before_the_sync_and_controls_flush_first() {
 }
 
 #[test]
-fn durability_cannot_change_after_the_first_append() {
+fn durability_cannot_change_after_the_first_stream_frontier() {
     let temp = tempdir::TempDir::new("control-tier-fixed").unwrap();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
     node.inventory.lock().fence_to(1).unwrap();
-    let (completed, completions) = mpsc::sync_channel(1);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    receive(&completions, 1).response.unwrap();
+    let log = node.inventory.lock().active(1).unwrap();
+    // The first lease (or append) attaches the stream frontier and syncer.
+    node.control.shared.frontier_for(&log).unwrap();
     assert!(
         node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Synchronous))
             .is_err()
@@ -590,37 +312,7 @@ fn durability_cannot_change_after_the_first_append() {
 }
 
 #[test]
-fn native_checkpoint_proof_is_issued_only_after_its_prefix_is_synced() {
-    let temp = tempdir::TempDir::new("control-native-checkpoint").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
-    node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
-        .unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (completed, completions) = mpsc::sync_channel(4);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    receive(&completions, 1).response.unwrap();
-    let group_end = log.appended_frontier();
-    let request = Request::Checkpoint {
-        authority_epoch: 1,
-        epoch: 1,
-        prefix: 1,
-    };
-    assert!(command(&node, 2, request, 1, &completed).is_ok());
-    let Response::Checkpoint(proof) = receive(&completions, 2).response.unwrap() else {
-        panic!("checkpoint")
-    };
-    assert_eq!(proof.prefix, 1);
-    // The proof the coordinator needs before it commits an image exists only
-    // once the owner's synced frontier covers the referenced prefix.
-    assert!(log.synced_frontier() >= group_end);
-}
-
-#[test]
-fn position_root_does_not_replace_read_or_synchronous_put_barriers() {
+fn position_root_does_not_replace_read_barriers() {
     use crate::distributed::storage::PartitionLog;
     use crate::distributed::types::RequestAuthority;
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
@@ -690,9 +382,7 @@ fn position_root_does_not_replace_read_or_synchronous_put_barriers() {
         );
 
         if tier == DurabilityTier::Synchronous {
-            // Inline serving must defer, not expose NeedsPersistence. The
-            // blocking owner-read boundary obtains its own covering sync.
-            assert!(log.try_plan_record_read(&reference).unwrap().is_none());
+            // The blocking owner-read boundary obtains its own covering sync.
             let (entered, release) = log.pause_next_persist();
             let read_log = log.clone();
             let (ready, result) = mpsc::sync_channel(1);
@@ -721,92 +411,33 @@ fn position_root_does_not_replace_read_or_synchronous_put_barriers() {
             log.read_batch(receipt).unwrap().mutations(),
             first.mutations()
         );
-
-        if tier == DurabilityTier::Synchronous {
-            let (entered, release) = log.pause_next_persist();
-            assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
-            entered.recv_timeout(Duration::from_secs(5)).unwrap();
-            let pending = completions.recv_timeout(Duration::from_millis(100));
-            let uncovered = log.synced_frontier() < log.appended_frontier();
-            release.send(()).unwrap();
-            assert!(matches!(pending, Err(mpsc::RecvTimeoutError::Timeout)));
-            assert!(uncovered);
-            assert!(matches!(
-                receive(&completions, 2).response.unwrap(),
-                Response::Appended(_)
-            ));
-            assert!(log.synced_frontier() >= log.appended_frontier());
-        }
     }
 }
 
-#[test]
-fn native_ack_paused_before_hand_off_fails_after_a_concurrent_persistence_failure() {
-    let temp = tempdir::TempDir::new("control-native-paused-ack").unwrap();
-    let config = config(&temp.path().join("node"));
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
-        .unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let log = node.inventory.lock().active(1).unwrap();
-    let (entered, resume) = node.control.pause_before_next_ack();
-    let (completed, completions) = mpsc::sync_channel(2);
-    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    // The group is appended; a direct persistence now fails and poisons the log.
-    log.fail_next_persist();
-    assert!(log.persist_appended().is_err());
-    resume.send(()).unwrap();
-    // The held append may not be acknowledged after the failure.
-    assert!(receive(&completions, 1).response.is_err());
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_fencing {
     use super::*;
-    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    use crate::distributed::group::CompleteGroup;
+    use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
     use crate::distributed::nvmeof::live_target::{LiveFileIdentity, LiveTargetManager};
     use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
     use std::os::unix::fs::FileExt;
 
-    /// Block until at most `streams` stream slots are active, or 5 s pass, and
-    /// return the queue guard so the caller asserts on that same snapshot.
-    /// `Slot::drop` decrements the count and calls `ready.notify_all()` under
-    /// the queue lock, so this predicate wait cannot miss the release. A
-    /// waiter here could absorb the `notify_one` that `try_submit` meant for a
-    /// worker; forwarding a `notify_all` on exit hands that wakeup back.
-    fn wait_active_streams_at_most(
-        node: &StorageNode,
-        streams: usize,
-    ) -> parking_lot::MutexGuard<'_, Queue> {
-        let shared = &node.control.shared;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut queue = shared.queue.lock();
-        while queue.active_appends > streams
-            && !shared.ready.wait_until(&mut queue, deadline).timed_out()
-        {}
-        shared.ready.notify_all();
-        queue
+    /// The owner's key shape, which live groups are built against. The
+    /// control context no longer keeps a parsed copy (the owner-RPC append
+    /// handler was its only user).
+    fn append_shape(node: &StorageNode) -> crate::key_shape::KeyShape {
+        crate::key_shape::KeyShape::from_yaml(&node.inventory.lock().config.shape_yaml).unwrap()
     }
 
     // Exercise the actual WAL/control lifecycle with the existing journal-only
     // target fixture. This is not evidence of kernel namespace I/O drain.
     fn open_live(root: &std::path::Path, tier: DurabilityTier) -> (NodeConfig, Arc<StorageNode>) {
-        open_live_mode(root, tier, LiveExportMode::OnDemand)
-    }
-
-    fn open_live_mode(
-        root: &std::path::Path,
-        tier: DurabilityTier,
-        mode: LiveExportMode,
-    ) -> (NodeConfig, Arc<StorageNode>) {
-        open_live_with(root, tier, mode, config(&root.join("node")))
+        open_live_with(root, tier, config(&root.join("node")))
     }
 
     fn open_live_with(
         root: &std::path::Path,
         tier: DurabilityTier,
-        mode: LiveExportMode,
         mut config: NodeConfig,
     ) -> (NodeConfig, Arc<StorageNode>) {
         // A complete 4 KiB live group stays below the native fragment trigger.
@@ -832,8 +463,6 @@ mod live_fencing {
                 state_dir,
                 commissioning_port_id: 43,
                 commissioning_service: 4421,
-                spdk: None,
-                export_mode: mode,
             },
             configfs,
         )
@@ -847,6 +476,7 @@ mod live_fencing {
     }
 
     /// Lease the first live extent and return its whole WAL file.
+    #[cfg(target_os = "linux")]
     fn leased_wal_file(node: &StorageNode) -> (fs::File, u64) {
         let Response::LiveLeased(leased) =
             extent_exchange(node, Request::LeaseLiveExtent { epoch: 1 })
@@ -857,6 +487,8 @@ mod live_fencing {
         (fs::File::open(&segment.path).unwrap(), segment.bytes)
     }
 
+    // FIEMAP is Linux only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn default_owner_grants_prewritten_files_without_unwritten_extents() {
         let temp = tempdir::TempDir::new("default-owner-prewrite").unwrap();
@@ -864,29 +496,20 @@ mod live_fencing {
         let mut value = serde_yaml::to_value(config(&temp.path().join("node"))).unwrap();
         value.as_mapping_mut().unwrap().remove("wal_prewrite");
         let default = serde_yaml::from_value(value).unwrap();
-        let (config, node) = open_live_with(
-            temp.path(),
-            DurabilityTier::Synchronous,
-            LiveExportMode::OnDemand,
-            default,
-        );
+        let (config, node) = open_live_with(temp.path(), DurabilityTier::Synchronous, default);
         assert!(config.wal_prewrite);
         let (file, bytes) = leased_wal_file(&node);
         crate::wal::fiemap::assert_written_extents(&file, bytes);
         assert!(node.wal_prewrite_stats().0 >= bytes);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn explicit_false_owner_grants_files_with_unwritten_extents() {
         let temp = tempdir::TempDir::new("explicit-false-owner-prewrite").unwrap();
         let mut explicit = config(&temp.path().join("node"));
         explicit.wal_prewrite = false;
-        let (_, node) = open_live_with(
-            temp.path(),
-            DurabilityTier::Synchronous,
-            LiveExportMode::OnDemand,
-            explicit,
-        );
+        let (_, node) = open_live_with(temp.path(), DurabilityTier::Synchronous, explicit);
         let (file, bytes) = leased_wal_file(&node);
         assert!(
             crate::wal::fiemap::extents(&file, bytes)
@@ -937,11 +560,7 @@ mod live_fencing {
     #[test]
     fn prepared_permanent_export_is_reused_and_identity_checked() {
         let temp = tempdir::TempDir::new("prepared-permanent").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         let Response::LiveLeased(first) =
             extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
         else {
@@ -1049,11 +668,7 @@ mod live_fencing {
     fn prepared_never_granted_exports_are_revoked_on_fence_and_seal() {
         for seal in [false, true] {
             let temp = tempdir::TempDir::new("prepared-retirement").unwrap();
-            let (_, node) = open_live_mode(
-                temp.path(),
-                DurabilityTier::Native,
-                LiveExportMode::PerOwner,
-            );
+            let (_, node) = open_live(temp.path(), DurabilityTier::Native);
             extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 });
             let log = node.inventory.lock().active(1).unwrap();
             wait_prepared(&log, 1);
@@ -1104,11 +719,7 @@ mod live_fencing {
     #[test]
     fn final_target_shutdown_joins_a_preparer_parked_on_the_lifecycle_gate() {
         let temp = tempdir::TempDir::new("prepared-final-shutdown").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         let log = node.inventory.lock().active(1).unwrap();
         log.lease_live_extent(RequestAuthority { epoch: 1 })
             .unwrap();
@@ -1133,11 +744,7 @@ mod live_fencing {
     #[test]
     fn final_target_shutdown_drains_preparers_after_a_join_error() {
         let temp = tempdir::TempDir::new("prepared-shutdown-error").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         let log = node.inventory.lock().active(1).unwrap();
         log.lease_live_extent(RequestAuthority { epoch: 1 })
             .unwrap();
@@ -1247,11 +854,7 @@ mod live_fencing {
     fn preparer_retirement_joins_while_the_lifecycle_gate_is_held() {
         for seal in [false, true] {
             let temp = tempdir::TempDir::new("prepared-try-lock").unwrap();
-            let (_, node) = open_live_mode(
-                temp.path(),
-                DurabilityTier::Native,
-                LiveExportMode::PerOwner,
-            );
+            let (_, node) = open_live(temp.path(), DurabilityTier::Native);
             let log = node.inventory.lock().active(1).unwrap();
             log.lease_live_extent(RequestAuthority { epoch: 1 })
                 .unwrap();
@@ -1275,66 +878,39 @@ mod live_fencing {
     }
 
     #[test]
-    fn on_demand_preparer_does_not_publish_and_export_failure_poison_fences() {
-        for failure in [false, true] {
-            let temp = tempdir::TempDir::new("prepared-publication-error").unwrap();
-            let mode = if failure {
-                LiveExportMode::PerOwner
-            } else {
-                LiveExportMode::OnDemand
-            };
-            let (_, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
-            let log = node.inventory.lock().active(1).unwrap();
-            log.lease_live_extent(RequestAuthority { epoch: 1 })
-                .unwrap();
-            if failure {
-                // The registry's pending path must be a regular file.
-                fs::create_dir(temp.path().join("target/.live-target.pending")).unwrap();
-            }
-            node.control.shared.trigger_file_preparation(&log);
-            wait_prepared(&log, 0);
-            if failure {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !node.control_context.poison_pending.load(Ordering::Acquire) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "publication failure did not poison readers"
-                    );
-                    thread::yield_now();
-                }
-            }
-            node.control.shared.retire_syncer(&log).unwrap();
-            if failure {
-                assert!(node.control_context.poison_pending.load(Ordering::Acquire));
-                assert!(
-                    log.lease_live_extent(RequestAuthority { epoch: 1 })
-                        .is_err()
-                );
-            } else {
-                assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
-                assert_eq!(
-                    node.with_live_target(|target| target.stats())
-                        .unwrap()
-                        .owned_namespace_count,
-                    0
-                );
-                drop(log);
-                shutdown(&node, 1);
-            }
+    fn preparer_export_failure_poison_fences() {
+        let temp = tempdir::TempDir::new("prepared-publication-error").unwrap();
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
+        let log = node.inventory.lock().active(1).unwrap();
+        log.lease_live_extent(RequestAuthority { epoch: 1 })
+            .unwrap();
+        // The registry's pending path must be a regular file.
+        fs::create_dir(temp.path().join("target/.live-target.pending")).unwrap();
+        node.control.shared.trigger_file_preparation(&log);
+        wait_prepared(&log, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !node.control_context.poison_pending.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "publication failure did not poison readers"
+            );
+            thread::yield_now();
         }
+        node.control.shared.retire_syncer(&log).unwrap();
+        assert!(node.control_context.poison_pending.load(Ordering::Acquire));
+        assert!(
+            log.lease_live_extent(RequestAuthority { epoch: 1 })
+                .is_err()
+        );
     }
 
     #[test]
     fn permanent_export_survives_read_pin_release_and_idle_reaping() {
         let temp = tempdir::TempDir::new("permanent-pin").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let batch = batch(&config, 1, 0);
         let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
+            &append_shape(&node),
             vec![batch.clone()],
             config.partition.batch_limits,
             config.partition.group_limits,
@@ -1416,21 +992,17 @@ mod live_fencing {
     }
 
     #[test]
-    fn open_live_exports_default_is_empty_and_permanent_exports_are_idempotent() {
-        for mode in [
-            LiveExportMode::OnDemand,
-            LiveExportMode::PerFile,
-            LiveExportMode::PerOwner,
-        ] {
+    fn open_live_exports_are_permanent_and_idempotent() {
+        {
             let temp = tempdir::TempDir::new("open-live-exports").unwrap();
-            let (_, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
+            let (_, node) = open_live(temp.path(), DurabilityTier::Native);
             let Response::LiveLeased(leased) =
                 extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
             else {
                 panic!("expected lease")
             };
-            let permanent = mode != LiveExportMode::OnDemand;
-            let expected_namespaces = if permanent { 2 } else { 1 };
+            let permanent = true;
+            let expected_namespaces = 2;
             let pause =
                 if permanent {
                     let log = node.inventory.lock().active(1).unwrap();
@@ -1474,13 +1046,12 @@ mod live_fencing {
                 else {
                     panic!("expected exports")
                 };
-                assert_eq!(info.mode, mode);
                 assert_eq!(info.exported_files, if permanent { 2 } else { 0 });
                 assert_eq!(info.wal_file_bytes, 32768);
                 let stats = node.with_live_target(|target| target.stats()).unwrap();
                 assert_eq!(stats.namespaces_exposed, expected_namespaces);
                 assert_eq!(stats.owned_namespace_count, expected_namespaces);
-                assert_eq!(leased.binding.permanent, mode != LiveExportMode::OnDemand);
+                assert!(leased.binding.permanent);
             }
             node.with_lifecycle(|inventory, slot| {
                 NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 1)
@@ -1502,11 +1073,7 @@ mod live_fencing {
     #[test]
     fn prepared_namespace_is_not_advertised_as_a_granted_file() {
         let temp = tempdir::TempDir::new("prepared-export-info").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 });
         let log = node.inventory.lock().active(1).unwrap();
         wait_prepared(&log, 1);
@@ -1529,22 +1096,10 @@ mod live_fencing {
     }
 
     #[test]
-    fn permanent_owner_rejects_reserved_writes_and_active_record_resolution() {
+    fn permanent_owner_rejects_active_record_resolution() {
         let temp = tempdir::TempDir::new("permanent-controls").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let batch = batch(&config, 1, 0);
-        let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
-            vec![batch.clone()],
-            config.partition.batch_limits,
-            config.partition.group_limits,
-        )
-        .unwrap();
-        let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
         let reference = batch
             .record_reference(
                 PhysicalValueAddress {
@@ -1556,88 +1111,76 @@ mod live_fencing {
                 0,
             )
             .unwrap();
-        for (request, message) in [
-            (
-                Request::ReserveLiveGroup {
-                    epoch: 1,
-                    descriptor,
-                },
-                "permanent live export requires leased write mode",
-            ),
-            (
+        let error = node
+            .handle(
                 Request::ResolveLiveRecords {
                     authority_epoch: 1,
                     references: vec![reference],
                 },
-                "live record resolution is disabled for the active epoch in permanent export mode",
-            ),
-        ] {
-            let error = node.handle(request, TcpLimits::default()).err().unwrap();
-            assert_eq!(error.to_string(), message);
-        }
+                TcpLimits::default(),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "live record resolution is disabled for the active epoch in permanent export mode"
+        );
         shutdown(&node, 1);
     }
 
-    fn reserve(
+    /// Write one single-batch frame at `offset` of the open leased extent and
+    /// adopt it without closing the extent; returns the adopted receipt.
+    fn adopt_leased_frame(
         node: &StorageNode,
         config: &NodeConfig,
-        epoch: u64,
+        leased: &LiveLeased,
         sequence: u64,
-    ) -> (LiveReserved, Vec<u8>) {
+        offset: u64,
+    ) -> Receipt {
+        let epoch = leased.extent.segment.epoch;
         let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
+            &append_shape(node),
             vec![batch(config, epoch, sequence)],
             config.partition.batch_limits,
             config.partition.group_limits,
         )
         .unwrap();
-        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-        let (completed, completions) = mpsc::sync_channel(1);
-        assert!(
-            command(
-                node,
-                1,
-                Request::ReserveLiveGroup { epoch, descriptor },
-                4096,
-                &completed,
-            )
-            .is_ok()
-        );
-        let Response::LiveReserved(live_control::LiveReserveWire::Reserved(reserved)) =
-            receive(&completions, 1).response.unwrap()
-        else {
-            panic!("expected new live reservation")
-        };
-        (reserved, frame)
-    }
-
-    fn complete(node: &StorageNode, reserved: &LiveReserved, frame: &[u8]) -> Receipt {
-        let reservation = &reserved.reservation;
+        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
         fs::OpenOptions::new()
             .write(true)
-            .open(&reservation.segment.path)
+            .open(&leased.extent.segment.path)
             .unwrap()
-            .write_all_at(frame, reservation.frame_offset % reservation.segment.bytes)
+            .write_all_at(&frame, offset % leased.extent.segment.bytes)
             .unwrap();
-        let (completed, completions) = mpsc::sync_channel(1);
-        assert!(
-            command(
-                node,
-                1,
-                Request::CompleteLiveGroup {
-                    epoch: reservation.segment.epoch,
-                    token: reservation.token,
-                },
-                4096,
-                &completed,
-            )
-            .is_ok()
-        );
-        let Response::LiveCompleted(completion) = receive(&completions, 1).response.unwrap() else {
-            panic!("expected completed live group")
+        let Response::LiveAdopted(_) = extent_exchange(
+            node,
+            Request::AdoptLiveExtent {
+                epoch,
+                token: leased.extent.token,
+                through: offset + frame.len() as u64,
+                close: false,
+                lease_next: false,
+            },
+        ) else {
+            panic!("expected adoption")
         };
-        assert_eq!(completion.receipts.len(), 1);
-        completion.receipts[0]
+        let log = node.inventory.lock().active(epoch).unwrap();
+        let appended = log.receipt_page(log.receipt_count() - 1, 1).unwrap()[0];
+        Receipt {
+            id: appended.id(),
+            version: appended.version(),
+            digest: appended.digest(),
+            address: appended.address(),
+        }
+    }
+
+    fn lease(node: &StorageNode, epoch: u64) -> LiveLeased {
+        let Response::LiveLeased(leased) =
+            extent_exchange(node, Request::LeaseLiveExtent { epoch })
+        else {
+            panic!("expected lease")
+        };
+        leased
     }
 
     fn fence(node: &StorageNode, epoch: u64) -> Result<Response, TcpError> {
@@ -1664,8 +1207,6 @@ mod live_fencing {
     }
 
     fn leased_history(node: &StorageNode, config: &NodeConfig, extents: usize) -> u64 {
-        node.set_history_persistence(crate::distributed::storage::HistoryPersistence::WalReplay)
-            .unwrap();
         let Response::LiveLeased(mut leased) =
             extent_exchange(node, Request::LeaseLiveExtent { epoch: 1 })
         else {
@@ -1673,7 +1214,7 @@ mod live_fencing {
         };
         for sequence in 0..extents {
             let group = CompleteGroup::new_live(
-                &node.control_context.append_shape,
+                &append_shape(node),
                 vec![batch(config, 1, sequence as u64)],
                 config.partition.batch_limits,
                 config.partition.group_limits,
@@ -1717,7 +1258,7 @@ mod live_fencing {
         from: u64,
         end: u64,
         sequence: u64,
-    ) -> live_control::LiveRecoveryWire {
+    ) -> live_wire::LiveRecoveryWire {
         let Response::LiveRecovery(page) = extent_exchange(
             node,
             Request::ReplayLiveWal {
@@ -1743,7 +1284,7 @@ mod live_fencing {
         page
     }
 
-    fn release_history_page(node: &StorageNode, page: &live_control::LiveRecoveryWire) {
+    fn release_history_page(node: &StorageNode, page: &live_wire::LiveRecoveryWire) {
         assert!(matches!(
             extent_exchange(
                 node,
@@ -1762,14 +1303,10 @@ mod live_fencing {
     }
 
     #[test]
-    fn history_pages_reuse_readonly_exports_only_in_permanent_modes() {
-        for mode in [
-            LiveExportMode::OnDemand,
-            LiveExportMode::PerFile,
-            LiveExportMode::PerOwner,
-        ] {
+    fn history_pages_reuse_retained_readonly_exports() {
+        {
             let temp = tempdir::TempDir::new("retained-history-pages").unwrap();
-            let (config, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
+            let (config, node) = open_live(temp.path(), DurabilityTier::Native);
             let end = leased_history(&node, &config, 2);
             assert_eq!(target_stats(&node).owned_namespace_count, 0);
             let first = history_page(&node, &config, 0, end, 0);
@@ -1779,7 +1316,7 @@ mod live_fencing {
                 NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 2)
             })
             .unwrap();
-            let retained = mode != LiveExportMode::OnDemand;
+            let retained = true;
             assert_eq!(
                 target_stats(&node).owned_namespace_count,
                 u64::from(retained)
@@ -1806,11 +1343,7 @@ mod live_fencing {
     #[test]
     fn readonly_export_connection_pin_survives_record_release_and_idle_history_eviction() {
         let temp = tempdir::TempDir::new("pinned-history-export").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let count = 2 * (super::super::inventory::MAX_IDLE_HISTORY_EXPORTS + 2);
         let end = leased_history(&node, &config, count);
         let first = history_page(&node, &config, 0, end, 0);
@@ -1857,11 +1390,7 @@ mod live_fencing {
     fn retained_history_stays_readonly_and_lifecycle_revocation_allows_retirement() {
         for lifecycle in ["seal", "retire", "final"] {
             let temp = tempdir::TempDir::new("retained-history-lifecycle").unwrap();
-            let (config, node) = open_live_mode(
-                temp.path(),
-                DurabilityTier::Synchronous,
-                LiveExportMode::PerOwner,
-            );
+            let (config, node) = open_live(temp.path(), DurabilityTier::Synchronous);
             let end = leased_history(&node, &config, 1);
             let page = history_page(&node, &config, 0, end, 0);
             let segment = &page.entries[0].segment;
@@ -1947,11 +1476,7 @@ mod live_fencing {
     #[test]
     fn retained_history_cache_evicts_oldest_unpinned_export_not_an_inflight_page() {
         let temp = tempdir::TempDir::new("retained-history-bound").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let bound = inventory::MAX_IDLE_HISTORY_EXPORTS;
         let end = leased_history(&node, &config, (bound + 2) * 2);
         let mut from = 0;
@@ -2036,16 +1561,17 @@ mod live_fencing {
         for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
             let temp = tempdir::TempDir::new("live-fence-syncer").unwrap();
             let (config, node) = open_live(temp.path(), tier);
-            let (reserved, frame) = reserve(&node, &config, 1, 0);
-            let first = complete(&node, &reserved, &frame);
+            let leased = lease(&node, 1);
+            let first = adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
             let log = node.inventory.lock().active(1).unwrap();
             let old = Arc::downgrade(&log);
             let frontier = log.frontier().unwrap().clone();
-            if tier == DurabilityTier::Native {
-                assert!(frontier.synced() < frontier.appended());
-            } else {
-                assert_eq!(frontier.synced(), frontier.appended());
-            }
+            // The removed Reserved completion replied only after an owner
+            // covering sync in the Synchronous tier. On the leased route the
+            // Synchronous proof is the coordinator's FUA/covering flush, and an
+            // owner adoption without close requests no sync in either tier, so
+            // the owner frontier stays behind until the fence below flushes it.
+            assert!(frontier.synced() < frontier.appended(), "{tier:?}");
             drop(log);
             for epoch in [1, 0] {
                 let response = fence(&node, epoch);
@@ -2054,8 +1580,7 @@ mod live_fencing {
             }
             // A later real completion proves the no-op/rejected fences did not
             // stop the old frontier. Its next control must still be able to sync.
-            let (reserved, frame) = reserve(&node, &config, 1, 1);
-            let second = complete(&node, &reserved, &frame);
+            let second = adopt_leased_frame(&node, &config, &leased, 1, leased.extent.start + 4096);
             let Response::Status(status) = fence(&node, 2).unwrap() else {
                 panic!("expected fenced status")
             };
@@ -2076,53 +1601,40 @@ mod live_fencing {
                     .is_err()
             );
             assert_recovered(&node, &config, &[first, second]);
-            let (reserved, frame) = reserve(&node, &config, 2, 0);
-            complete(&node, &reserved, &frame);
+            let leased = lease(&node, 2);
+            adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
             assert_eq!(node.control.shared.syncers.lock().len(), 1);
             shutdown(&node, 2);
         }
     }
 
     #[test]
-    fn recoverable_live_fence_releases_used_wal_after_an_abandoned_reservation() {
+    fn recoverable_live_fence_releases_used_wal_after_an_incomplete_leased_frame() {
         let temp = tempdir::TempDir::new("live-recoverable-syncer").unwrap();
         let (config, node) = open_live(temp.path(), DurabilityTier::Native);
-        let (reserved, frame) = reserve(&node, &config, 1, 0);
-        let receipt = complete(&node, &reserved, &frame);
+        let leased = lease(&node, 1);
+        let receipt = adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
         let log = node.inventory.lock().active(1).unwrap();
         let old = Arc::downgrade(&log);
         assert!(log.synced_frontier() < log.appended_frontier());
         let frontier = log.frontier().unwrap().clone();
-        // A reserve worker may pass its preliminary flush while a completion
-        // worker is still publishing the preceding group. Reserve directly at
-        // the same storage boundary to reproduce that overlap deterministically:
-        // the acknowledged group stays unsynced when the next frame is absent.
-        let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
-            vec![batch(&config, 1, 1)],
-            config.partition.batch_limits,
-            config.partition.group_limits,
-        )
-        .unwrap();
-        let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
-        let LiveReserveResult::Reserved(abandoned) = log
-            .reserve_live_group(RequestAuthority { epoch: 1 }, descriptor)
-            .unwrap()
-        else {
-            panic!("expected abandoned reservation")
-        };
         let (sync_entered, resume_sync) = log.pause_next_persist();
         drop(log);
         let incarnation = node.inventory.lock().incarnation();
         assert!(node.inventory.lock().status().unwrap().recovery_clean);
+        // Close beyond the adopted end: the next frame was never written, so the
+        // acknowledged frame stays unsynced behind an incomplete live frame.
         let (completed, completions) = mpsc::sync_channel(1);
         assert!(
             command(
                 &node,
                 1,
-                Request::CompleteLiveGroup {
+                Request::AdoptLiveExtent {
                     epoch: 1,
-                    token: abandoned.token,
+                    token: leased.extent.token,
+                    through: leased.extent.start + 2 * 4096,
+                    close: true,
+                    lease_next: false,
                 },
                 4096,
                 &completed,
@@ -2160,21 +1672,6 @@ mod live_fencing {
         // so the fence and every later status report it unclean.
         assert_eq!(status.incarnation, incarnation);
         assert!(!status.recovery_clean);
-        assert!(
-            command(
-                &node,
-                3,
-                Request::Status { protocol: PROTOCOL },
-                1,
-                &completed
-            )
-            .is_ok()
-        );
-        let Response::Status(status) = receive(&completions, 3).response.unwrap() else {
-            panic!("expected status")
-        };
-        assert_eq!(status.incarnation, incarnation);
-        assert!(!status.recovery_clean);
         assert_recovered(&node, &config, &[receipt]);
         shutdown(&node, 2);
     }
@@ -2183,8 +1680,8 @@ mod live_fencing {
     fn live_fence_keeps_the_external_handle_guard_after_joining_the_syncer() {
         let temp = tempdir::TempDir::new("live-fence-external-handle").unwrap();
         let (config, node) = open_live(temp.path(), DurabilityTier::Native);
-        let (reserved, frame) = reserve(&node, &config, 1, 0);
-        complete(&node, &reserved, &frame);
+        let leased = lease(&node, 1);
+        adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
         let retained = node.inventory.lock().active(1).unwrap();
         let error = fence(&node, 2).err().unwrap();
         assert!(
@@ -2222,7 +1719,7 @@ mod live_fencing {
                 config.partition.fragment_bytes
             );
             let group = CompleteGroup::new_live(
-                &node.control_context.append_shape,
+                &append_shape(&node),
                 vec![batch(&config, 1, 0)],
                 config.partition.batch_limits,
                 config.partition.group_limits,
@@ -2313,7 +1810,7 @@ mod live_fencing {
             .unwrap();
         for sequence in 0..3 {
             let group = CompleteGroup::new_live(
-                &node.control_context.append_shape,
+                &append_shape(&node),
                 vec![batch(&config, 1, sequence)],
                 config.partition.batch_limits,
                 config.partition.group_limits,
@@ -2376,282 +1873,6 @@ mod live_fencing {
     }
 
     #[test]
-    fn leased_checkpoint_and_grants_tail_frames_but_recovery_stays_immutable() {
-        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
-            let temp = tempdir::TempDir::new("live-extent-tail-controls").unwrap();
-            let (config, node) = open_live(temp.path(), tier);
-            node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-                .unwrap();
-            let Response::LiveLeased(leased) =
-                extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
-            else {
-                panic!("expected extent")
-            };
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(&leased.extent.segment.path)
-                .unwrap();
-            let mut groups = Vec::new();
-            for n in 0..3 {
-                let group = CompleteGroup::new_live(
-                    &node.control_context.append_shape,
-                    vec![batch(&config, 1, n)],
-                    config.partition.batch_limits,
-                    config.partition.group_limits,
-                )
-                .unwrap();
-                let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-                if n < 2 {
-                    file.write_all_at(&frame, n * 4096).unwrap();
-                }
-                groups.push((group, frame));
-            }
-            let (completed, completions) = mpsc::sync_channel(1);
-            assert!(
-                command(
-                    &node,
-                    1,
-                    Request::RecoverLiveMetadata {
-                        authority_epoch: 1,
-                        source_epoch: 1,
-                        cursor: 0,
-                        limit: 2,
-                    },
-                    4096,
-                    &completed
-                )
-                .is_ok()
-            );
-            let error = receive(&completions, 1).response.err().unwrap();
-            assert!(
-                error
-                    .to_string()
-                    .contains("recovery requires sealed immutable epoch")
-            );
-            let Response::Checkpoint(proof) = extent_exchange(
-                &node,
-                Request::Checkpoint {
-                    authority_epoch: 1,
-                    epoch: 1,
-                    prefix: 2,
-                },
-            ) else {
-                panic!("expected checkpoint proof")
-            };
-            assert_eq!(proof.retained, 2);
-            assert_eq!(proof.prefix, 2);
-            let log = node.log_for_test(1);
-            assert_eq!(log.synced_frontier(), 8192);
-            // The next grant must discover a frame written after the proof.
-            file.write_all_at(&groups[2].1, 8192).unwrap();
-            let item = &groups[2].0.batches()[0];
-            let receipt = crate::distributed::storage::receipt_for(
-                log.config(),
-                item,
-                crate::distributed::storage::member_position(
-                    crate::WalPosition::new(8192, groups[2].1.len() as u32),
-                    groups[2].0.batch_offsets()[0],
-                    item,
-                ),
-            );
-            let reference = item.record_reference(receipt.address(), 0).unwrap();
-            let before = (
-                log.appended_frontier(),
-                log.synced_frontier(),
-                log.receipt_count(),
-            );
-            let Response::LiveRecords(locations) = extent_exchange(
-                &node,
-                Request::ResolveLiveRecords {
-                    authority_epoch: 1,
-                    references: vec![reference],
-                },
-            ) else {
-                panic!("expected read grant")
-            };
-            assert_eq!(locations.entries.len(), 1);
-            assert_eq!(locations.entries[0].reference, reference);
-            assert_eq!(log.synced_frontier(), 8192);
-            assert_eq!(
-                (
-                    log.appended_frontier(),
-                    log.synced_frontier(),
-                    log.receipt_count(),
-                ),
-                before,
-                "cold grants must not promote sparse authority into an owner prefix",
-            );
-            extent_exchange(
-                &node,
-                Request::ReleaseLiveEpochPin {
-                    epoch: 1,
-                    token: locations.epoch_pin_token,
-                },
-            );
-            drop(log);
-            shutdown(&node, 1);
-        }
-    }
-
-    #[test]
-    fn cold_resolver_overlaps_close_and_excludes_lifecycle_controls() {
-        use crate::distributed::storage::{LivePausePoint, member_position, receipt_for};
-
-        for lifecycle in [
-            Request::Seal { epoch: 1 },
-            Request::Fence { epoch: 2 },
-            Request::RetireFiles {
-                authority_epoch: 1,
-                epoch: 1,
-                prefix: 0,
-                files: vec![0],
-            },
-        ] {
-            let sealing = matches!(lifecycle, Request::Seal { .. });
-            let retirement = matches!(lifecycle, Request::RetireFiles { .. });
-            let temp = tempdir::TempDir::new("cold-control-stream").unwrap();
-            let (config, node) = open_live(temp.path(), DurabilityTier::Synchronous);
-            let Response::LiveLeased(first) =
-                extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
-            else {
-                panic!("expected leased extent")
-            };
-            let Response::LiveLeased(next) = extent_exchange(
-                &node,
-                Request::PreleaseLiveExtent {
-                    epoch: 1,
-                    after: first.extent.token,
-                },
-            ) else {
-                panic!("expected preleased extent")
-            };
-            // The lease replies can precede their slot releases (see
-            // `wait_active_streams_at_most`). Start from an idle stream count
-            // so the close/resolver count below is exact.
-            assert_eq!(wait_active_streams_at_most(&node, 0).active_appends, 0);
-            let mut reference = None;
-            for (sequence, extent) in [(0, &first.extent), (1, &next.extent)] {
-                let group = CompleteGroup::new_live(
-                    &node.control_context.append_shape,
-                    vec![batch(&config, 1, sequence)],
-                    config.partition.batch_limits,
-                    config.partition.group_limits,
-                )
-                .unwrap();
-                let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(&extent.segment.path)
-                    .unwrap()
-                    .write_all_at(&frame, extent.start % extent.segment.bytes)
-                    .unwrap();
-                let batch = &group.batches()[0];
-                let receipt = receipt_for(
-                    &config.partition,
-                    batch,
-                    member_position(
-                        crate::WalPosition::new(extent.start, frame.len() as u32),
-                        group.batch_offsets()[0],
-                        batch,
-                    ),
-                );
-                reference = Some(batch.record_reference(receipt.address(), 0).unwrap());
-            }
-            let mut marker = [0; 4096];
-            marker[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
-            fs::OpenOptions::new()
-                .write(true)
-                .open(&first.extent.segment.path)
-                .unwrap()
-                .write_all_at(&marker, 4096)
-                .unwrap();
-            let log = node.log_for_test(1);
-            let (close_entered, close_resume) = log.pause_live(LivePausePoint::CloseSuffix);
-            let (completed, completions) = mpsc::sync_channel(3);
-            assert!(
-                command(
-                    &node,
-                    1,
-                    Request::AdoptLiveExtent {
-                        epoch: 1,
-                        token: first.extent.token,
-                        through: 4096,
-                        close: true,
-                        lease_next: false,
-                    },
-                    4096,
-                    &completed
-                )
-                .is_ok()
-            );
-            close_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-            let (root_entered, root_resume) = log.pause_live(LivePausePoint::PositionRootLocked);
-            let prover = log.clone();
-            let proof = std::thread::spawn(move || prover.persist_wal_through(4096));
-            root_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-            let (read_entered, read_resume) = log.pause_live(LivePausePoint::ColdReadAfterSync);
-            let request = Request::ResolveLiveRecords {
-                authority_epoch: 1,
-                references: vec![reference.unwrap()],
-            };
-            assert!(is_stream_request(&request));
-            assert!(!is_stream_request(&lifecycle));
-            assert!(command(&node, 2, request, 4096, &completed).is_ok());
-            // Positive handler hook while close owns its stream slot AND the
-            // position proof owns durable-metadata persistence. No preflush
-            // through the generic control flusher may run for this resolver.
-            read_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert_eq!(node.control.shared.queue.lock().active_appends, 2);
-            assert!(command(&node, 3, lifecycle, 4096, &completed).is_ok());
-            {
-                let queue = node.control.shared.queue.lock();
-                assert!(!queue.control_active);
-                assert!(queue.work.iter().any(|work| work.id == 3));
-            }
-            root_resume.send(()).unwrap();
-            assert_eq!(proof.join().unwrap().unwrap(), 4096);
-            close_resume.send(()).unwrap();
-            assert!(matches!(
-                receive(&completions, 1).response.unwrap(),
-                Response::LiveAdopted(_)
-            ));
-            {
-                // `run` sends a command's completion before that worker's
-                // `Slot` binding drops, so the close reply alone does not
-                // order the close slot's release before this read. Wait for
-                // the release event itself; the paused resolver keeps one
-                // slot, so the exact count below is still the contract.
-                let queue = wait_active_streams_at_most(&node, 1);
-                assert_eq!(queue.active_appends, 1);
-                assert!(!queue.control_active);
-                assert!(queue.work.iter().any(|work| work.id == 3));
-            }
-            drop(log);
-            read_resume.send(()).unwrap();
-            assert!(matches!(
-                receive(&completions, 2).response.unwrap(),
-                Response::LiveRecords(_)
-            ));
-            let result = receive(&completions, 3).response;
-            // Retirement rejects an active stream, but only after the resolver
-            // has installed its ordinary bounded owner file/epoch pin.
-            if retirement {
-                assert!(result.is_err());
-            } else if sealing {
-                assert_eq!(
-                    result.err().unwrap().to_string(),
-                    "live NVMe-oF pins must drain before sealing"
-                );
-            } else {
-                assert!(matches!(
-                    result.unwrap(),
-                    Response::Sealed | Response::Status(_)
-                ));
-            }
-        }
-    }
-
-    #[test]
     fn queued_live_fence_waits_for_unlocked_adoption_then_rejects_old_authority() {
         use crate::distributed::storage::LivePausePoint;
 
@@ -2664,7 +1885,7 @@ mod live_fencing {
                 panic!("expected leased extent")
             };
             let group = CompleteGroup::new_live(
-                &node.control_context.append_shape,
+                &append_shape(&node),
                 vec![batch(&config, 1, 0)],
                 config.partition.batch_limits,
                 config.partition.group_limits,
@@ -2770,7 +1991,7 @@ mod live_fencing {
             panic!("expected first extent")
         };
         let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
+            &append_shape(&node),
             vec![batch(&config, 1, 0)],
             config.partition.batch_limits,
             config.partition.group_limits,
@@ -2933,7 +2154,7 @@ mod live_fencing {
         let error = receive(&second_result, 102).response.err().unwrap();
         assert!(error.to_string().contains("live extent already open"));
         let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
+            &append_shape(&node),
             vec![batch(&config, 1, 0)],
             config.partition.batch_limits,
             config.partition.group_limits,
@@ -2971,7 +2192,7 @@ mod live_fencing {
         assert!(!node.control_context.poison_pending.load(Ordering::Acquire));
         assert!(node.status().unwrap().healthy);
         let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
+            &append_shape(&node),
             vec![batch(&config, 1, 1)],
             config.partition.batch_limits,
             config.partition.group_limits,
@@ -3020,7 +2241,7 @@ mod live_fencing {
             .unwrap();
         for sequence in 0..3 {
             let group = CompleteGroup::new_live(
-                &node.control_context.append_shape,
+                &append_shape(&node),
                 vec![batch(&config, 1, sequence)],
                 config.partition.batch_limits,
                 config.partition.group_limits,
@@ -3074,7 +2295,96 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 28);
-    preface[4..6].copy_from_slice(&27u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 29);
+    preface[4..6].copy_from_slice(&28u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
+}
+
+/// R3 removed the read executor; `Status.max_reads` and the
+/// `ResolveLiveRecords` count bound must not change with it. Absent keys mean
+/// async member reads with 128 device reads (Status 128); 300 device reads
+/// are capped by the wire limit (256); mapped member reads report
+/// `limits.max_reads` whatever the device bound. One resolution accepts
+/// exactly `min(max_reads, 256)` references and rejects one more.
+#[test]
+fn max_reads_and_live_resolution_bound_are_unchanged() {
+    use crate::distributed::storage::WalMemberReadPolicy;
+    let temp = tempdir::TempDir::new("max-reads-invariance").unwrap();
+    let mut document = serde_yaml::to_value(config(&temp.path().join("base"))).unwrap();
+    let fields = document.as_mapping_mut().unwrap();
+    fields.remove("wal_member_read");
+    fields.remove("read_max_device_reads");
+    let defaults: NodeConfig = serde_yaml::from_value(document).unwrap();
+    assert_eq!(defaults.wal_member_read, WalMemberReadPolicy::Async);
+    assert_eq!(defaults.read_max_device_reads, 128);
+    let wire = TcpLimits::default();
+    assert_eq!(wire.max_reads, 256);
+    let narrow = TcpLimits {
+        max_reads: 64,
+        ..TcpLimits::default()
+    };
+    for (name, policy, device_reads, limits, expected) in [
+        (
+            "default",
+            defaults.wal_member_read,
+            defaults.read_max_device_reads,
+            wire,
+            128,
+        ),
+        ("device-300", WalMemberReadPolicy::Async, 300, wire, 256),
+        (
+            "device-300-narrow",
+            WalMemberReadPolicy::Async,
+            300,
+            narrow,
+            64,
+        ),
+        ("mapped", WalMemberReadPolicy::Mapped, 8, wire, 256),
+        ("mapped-narrow", WalMemberReadPolicy::Mapped, 8, narrow, 64),
+    ] {
+        let mut config = defaults.clone();
+        config.root = temp.path().join(name);
+        config.wal_member_read = policy;
+        config.read_max_device_reads = device_reads;
+        let node = StorageNode::open(config.clone(), metrics()).unwrap();
+        let Response::Status(status) = node
+            .handle(Request::Status { protocol: PROTOCOL }, limits)
+            .unwrap()
+        else {
+            panic!("{name}: status reply");
+        };
+        assert_eq!(status.max_reads, expected, "{name}");
+        {
+            node.inventory.lock().fence_to(1).unwrap();
+            let appended = node
+                .inventory
+                .lock()
+                .active(1)
+                .unwrap()
+                .append_complete_batch(
+                    crate::distributed::types::RequestAuthority { epoch: 1 },
+                    &batch(&config, 1, 0),
+                )
+                .unwrap();
+            let reference = batch(&config, 1, 0)
+                .record_reference(appended.address(), 0)
+                .unwrap();
+            let over_bound = |count: usize| {
+                matches!(
+                    node.handle(
+                        Request::ResolveLiveRecords {
+                            authority_epoch: 1,
+                            references: vec![reference; count],
+                        },
+                        limits,
+                    ),
+                    Err(error) if error.to_string() == "live record count exceeds negotiated bound"
+                )
+            };
+            let bound = expected.min(256);
+            assert!(over_bound(0), "{name}: empty resolution");
+            assert!(!over_bound(bound), "{name}: {bound} references");
+            assert!(over_bound(bound + 1), "{name}: {} references", bound + 1);
+        }
+    }
 }

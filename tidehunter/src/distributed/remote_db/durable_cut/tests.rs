@@ -2,13 +2,6 @@ use super::*;
 
 const DB: [u8; 16] = [7; 16];
 
-fn config(cut: CutRecovery) -> DurableCutConfig {
-    DurableCutConfig {
-        cut,
-        ..DurableCutConfig::default()
-    }
-}
-
 fn record(live: Option<EpochCut>, truncations: Vec<EpochCut>) -> CutRecord {
     CutRecord {
         format: FORMAT,
@@ -81,34 +74,9 @@ fn record_round_trips_and_rejects_foreign_or_future_state() {
 }
 
 #[test]
-fn strict_keeps_only_the_persisted_cut() {
-    let live = Some(EpochCut { epoch: 2, next: 3 });
-    let mut plan = RecoveryPlan::new(
-        Some(record(live, Vec::new())),
-        DB,
-        &config(CutRecovery::Strict),
-        None,
-        &[],
-    );
-    assert_eq!(replay(&mut plan), [0, 1, 2]);
-    assert_eq!((plan.discarded, plan.extended), (4, 0));
-    let (record, cut) = plan.finish(3, true, &[]);
-    assert_eq!(cut, Some(RecoveredCut { epoch: 2, next: 3 }));
-    let record = record.unwrap();
-    assert_eq!(record.truncations, [EpochCut { epoch: 2, next: 3 }]);
-    assert_eq!(record.live, Some(EpochCut { epoch: 3, next: 0 }));
-}
-
-#[test]
 fn extend_stops_at_the_first_missing_version() {
     let live = Some(EpochCut { epoch: 2, next: 3 });
-    let mut plan = RecoveryPlan::new(
-        Some(record(live, Vec::new())),
-        DB,
-        &config(CutRecovery::Extend),
-        None,
-        &[],
-    );
+    let mut plan = RecoveryPlan::new(Some(record(live, Vec::new())), DB, None, &[]);
     assert_eq!(replay(&mut plan), [0, 1, 2, 3, 4]);
     assert_eq!((plan.discarded, plan.extended), (2, 2));
     let (record, cut) = plan.finish(3, false, &[]);
@@ -121,13 +89,7 @@ fn extend_stops_at_the_first_missing_version() {
 #[test]
 fn extend_from_nothing_requires_sequence_zero() {
     let live = Some(EpochCut { epoch: 2, next: 0 });
-    let mut plan = RecoveryPlan::new(
-        Some(record(live, Vec::new())),
-        DB,
-        &config(CutRecovery::Extend),
-        None,
-        &[],
-    );
+    let mut plan = RecoveryPlan::new(Some(record(live, Vec::new())), DB, None, &[]);
     // Sequence 0 was aborted: nothing of the epoch survives.
     assert!(!plan.keep(version(2, 1)));
     assert!(!plan.keep(version(2, 2)));
@@ -140,27 +102,16 @@ fn extend_from_nothing_requires_sequence_zero() {
 #[test]
 fn checkpoint_raises_the_start_of_the_run() {
     let live = Some(EpochCut { epoch: 2, next: 1 });
-    let mut plan = RecoveryPlan::new(
-        Some(record(live, Vec::new())),
-        DB,
-        &config(CutRecovery::Strict),
-        Some(version(2, 4)),
-        &[],
-    );
-    // The checkpoint covered 0..=4; replay resumes after it.
+    let mut plan = RecoveryPlan::new(Some(record(live, Vec::new())), DB, Some(version(2, 4)), &[]);
+    // The checkpoint covered 0..=4; replay resumes after it and stops at the
+    // missing 5 (no continuity evidence).
     assert!(!plan.keep(version(2, 6)));
     assert_eq!(
         plan.finish(3, true, &[]).1,
         Some(RecoveredCut { epoch: 2, next: 5 })
     );
     // A checkpoint of an older epoch does not raise the bound.
-    let plan = RecoveryPlan::new(
-        Some(record(live, Vec::new())),
-        DB,
-        &config(CutRecovery::Strict),
-        Some(version(1, 9)),
-        &[],
-    );
+    let plan = RecoveryPlan::new(Some(record(live, Vec::new())), DB, Some(version(1, 9)), &[]);
     assert_eq!(
         plan.finish(3, true, &[]).1,
         Some(RecoveredCut { epoch: 2, next: 1 })
@@ -170,52 +121,21 @@ fn checkpoint_raises_the_start_of_the_run() {
 #[test]
 fn recorded_truncations_are_always_honoured() {
     let truncations = vec![EpochCut { epoch: 2, next: 3 }];
-    for recovery in [NativeRecovery::DurablePrefix, NativeRecovery::PerOwner] {
-        let mut plan = RecoveryPlan::new(
-            Some(record(None, truncations.clone())),
-            DB,
-            &DurableCutConfig {
-                recovery,
-                ..DurableCutConfig::default()
-            },
-            None,
-            &[],
-        );
-        assert_eq!(replay(&mut plan), [0, 1, 2]);
-        // Untracked epochs are unbounded.
-        assert!(plan.keep(version(3, 40)));
-        let (record, cut) = plan.finish(4, false, &[]);
-        assert_eq!(cut, None);
-        assert_eq!(record.unwrap().truncations, truncations);
-    }
-}
-
-#[test]
-fn per_owner_open_keeps_the_tracked_epoch_and_clears_it() {
-    let live = Some(EpochCut { epoch: 2, next: 0 });
-    let mut plan = RecoveryPlan::new(
-        Some(record(live, Vec::new())),
-        DB,
-        &DurableCutConfig {
-            recovery: NativeRecovery::PerOwner,
-            ..DurableCutConfig::default()
-        },
-        None,
-        &[],
-    );
-    assert_eq!(replay(&mut plan), [0, 1, 2, 3, 4, 6, 7]);
-    let (record, cut) = plan.finish(3, false, &[]);
+    let mut plan = RecoveryPlan::new(Some(record(None, truncations.clone())), DB, None, &[]);
+    assert_eq!(replay(&mut plan), [0, 1, 2]);
+    // Untracked epochs are unbounded.
+    assert!(plan.keep(version(3, 40)));
+    let (record, cut) = plan.finish(4, false, &[]);
     assert_eq!(cut, None);
-    let record = record.unwrap();
-    assert_eq!((record.live, record.truncations), (None, Vec::new()));
+    assert_eq!(record.unwrap().truncations, truncations);
 }
 
 #[test]
 fn no_record_and_no_tracking_writes_nothing() {
-    let mut plan = RecoveryPlan::new(None, DB, &DurableCutConfig::default(), None, &[]);
+    let mut plan = RecoveryPlan::new(None, DB, None, &[]);
     assert_eq!(replay(&mut plan), [0, 1, 2, 3, 4, 6, 7]);
     assert_eq!(plan.finish(3, false, &[]), (None, None));
-    let plan = RecoveryPlan::new(None, DB, &DurableCutConfig::default(), None, &[]);
+    let plan = RecoveryPlan::new(None, DB, None, &[]);
     let (record, cut) = plan.finish(3, true, &[]);
     assert_eq!(cut, None);
     assert_eq!(
@@ -247,10 +167,10 @@ fn fence(partition: u32, incarnation: [u8; 16], recovery_clean: bool) -> OwnerFe
 }
 
 /// Epoch 2, persisted cut 3, owner 0 synced through 3, owner 1 through `synced`.
-fn continuity_plan(cut: CutRecovery, owner1_synced: u64, fenced: &[OwnerFence]) -> RecoveryPlan {
+fn continuity_plan(owner1_synced: u64, fenced: &[OwnerFence]) -> RecoveryPlan {
     let mut stored = record(Some(EpochCut { epoch: 2, next: 3 }), Vec::new());
     stored.owners = vec![mark(0, 4), mark(1, owner1_synced)];
-    RecoveryPlan::new(Some(stored), DB, &config(cut), None, fenced)
+    RecoveryPlan::new(Some(stored), DB, None, fenced)
 }
 
 /// Coordinator-only crash: every owner process kept running, so the missing 5
@@ -258,7 +178,7 @@ fn continuity_plan(cut: CutRecovery, owner1_synced: u64, fenced: &[OwnerFence]) 
 #[test]
 fn continuous_owners_skip_a_never_written_version() {
     let fenced = [fence(0, INCARNATION, true), fence(1, INCARNATION, true)];
-    let mut plan = continuity_plan(CutRecovery::Extend, 1, &fenced);
+    let mut plan = continuity_plan(1, &fenced);
     assert_eq!(plan.continuity_bound, Some(u64::MAX));
     assert_eq!(replay(&mut plan), [0, 1, 2, 3, 4, 6, 7]);
     assert_eq!((plan.discarded, plan.extended, plan.skipped), (0, 4, 1));
@@ -280,7 +200,7 @@ fn a_discontinuous_owner_bounds_the_skip_at_its_recorded_sync() {
     ] {
         let fenced = [fence(0, INCARNATION, true), discontinuity];
         for (synced, kept) in [(6, &[0, 1, 2, 3, 4, 6, 7][..]), (5, &[0, 1, 2, 3, 4])] {
-            let mut plan = continuity_plan(CutRecovery::Extend, synced, &fenced);
+            let mut plan = continuity_plan(synced, &fenced);
             assert_eq!(plan.continuity_bound, Some(synced));
             assert_eq!(replay(&mut plan), kept, "{discontinuity:?} synced={synced}");
         }
@@ -295,25 +215,16 @@ fn missing_continuity_evidence_stops_at_the_first_gap() {
         fence(1, INCARNATION, true),
         fence(2, INCARNATION, true),
     ];
-    let mut plan = continuity_plan(CutRecovery::Extend, 9, &unmarked);
+    let mut plan = continuity_plan(9, &unmarked);
     assert_eq!(plan.continuity_bound, Some(0));
     assert_eq!(replay(&mut plan), [0, 1, 2, 3, 4]);
     let mut plan = RecoveryPlan::new(
         Some(record(Some(EpochCut { epoch: 2, next: 3 }), Vec::new())),
         DB,
-        &config(CutRecovery::Extend),
         None,
         &unmarked,
     );
     assert_eq!(replay(&mut plan), [0, 1, 2, 3, 4]);
-}
-
-#[test]
-fn strict_ignores_continuity() {
-    let fenced = [fence(0, INCARNATION, true), fence(1, INCARNATION, true)];
-    let mut plan = continuity_plan(CutRecovery::Strict, 9, &fenced);
-    assert_eq!(plan.continuity_bound, None);
-    assert_eq!(replay(&mut plan), [0, 1, 2]);
 }
 
 /// A tracked epoch starts with every fenced owner's incarnation and nothing synced; an
@@ -325,7 +236,7 @@ fn finish_marks_every_fenced_owner_of_a_tracked_epoch() {
         fence(4, INCARNATION, true),
         fence(9, OTHER_INCARNATION, false),
     ];
-    let plan = RecoveryPlan::new(None, DB, &config(CutRecovery::Extend), None, &fenced);
+    let plan = RecoveryPlan::new(None, DB, None, &fenced);
     let record = plan.finish(3, true, &fenced).0.unwrap();
     assert_eq!(
         record.owners,
@@ -348,16 +259,10 @@ fn finish_marks_every_fenced_owner_of_a_tracked_epoch() {
         CutRecord::load(directory.path(), DB, 4).unwrap(),
         Some(record.clone())
     );
-    let untracked = RecoveryPlan::new(
-        Some(record),
-        DB,
-        &config(CutRecovery::Extend),
-        None,
-        &fenced,
-    )
-    .finish(4, false, &fenced)
-    .0
-    .unwrap();
+    let untracked = RecoveryPlan::new(Some(record), DB, None, &fenced)
+        .finish(4, false, &fenced)
+        .0
+        .unwrap();
     assert!(untracked.owners.is_empty());
     let mut orphan = untracked;
     orphan.owners = vec![mark(4, 0)];

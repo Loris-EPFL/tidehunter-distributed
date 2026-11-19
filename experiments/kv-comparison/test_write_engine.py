@@ -102,21 +102,21 @@ class WriteEngineTests(unittest.TestCase):
 
     def test_p16_same_workload_reversed_order_and_diagnostic_isolation(self):
         jobs = campaign.make_focused_matrix(campaign.REDRAIN_AB_SELECTION)
-        self.assertEqual(len({j["case_id"] for j in jobs}), 22)
-        self.assertEqual(len({j["profile"] for j in jobs}), 22)
+        self.assertEqual(len({j["case_id"] for j in jobs}), 20)
+        self.assertEqual(len({j["profile"] for j in jobs}), 20)
         baseline = {(j["durability_tier"], j["concurrency"]): j
                     for j in campaign.make_focused_matrix("nvmeof_p13_write_engine")
                     if j["group"] == "G35W" and j["arm"] == "prewritten"}
-        first, second, attribution = jobs[:9], jobs[9:18], jobs[18:]
+        first, second, attribution = jobs[:8], jobs[8:16], jobs[16:]
         def cell(job):
             return job["durability_tier"], job["concurrency"], job["arm"]
         expected = {(tier, c, arm) for tier in ("native", "synchronous") for c in (16, 64)
-                    for arm in ("B", "C")} | {("native", 64, "D")}
+                    for arm in ("B", "C")}
         self.assertEqual({cell(j) for j in first}, expected)
         self.assertEqual(list(map(cell, first)), list(map(cell, reversed(second))))
         self.assertEqual({j["repeat"] for j in first}, {0})
         self.assertEqual({j["repeat"] for j in second}, {1})
-        self.assertEqual({cell(j) for j in attribution}, {row for row in expected if row[1] == 64 and row[2] != "D"})
+        self.assertEqual({cell(j) for j in attribution}, {row for row in expected if row[1] == 64})
         for job in jobs:
             with self.subTest(case=job["case_id"]):
                 tier, c, arm = cell(job)
@@ -130,14 +130,11 @@ class WriteEngineTests(unittest.TestCase):
                     omit.update(("diagnostics", "measurement_sizing"))
                 self.assertEqual({k: v for k, v in job.items() if k not in omit},
                                  {k: v for k, v in baseline[tier, c].items() if k not in omit})
-                options = {"external_remote_config": {"durable_cut": {"lag_ms": 1234},
-                                                       "live_nvme": {"write_mode": "leased"}}}
+                options = {"external_remote_config": {"durable_cut": {"lag_ms": 1234}, "live_nvme": {}}}
                 config = campaign.make_run_config(job, Path("/case"), options, "test")
                 expected = copy.deepcopy(options["external_remote_config"])
                 if arm == "C":
                     expected["leased_submit_redrain"] = False
-                if arm == "D":
-                    expected["durable_cut"]["recovery"] = "per_owner"
                 self.assertEqual(config["backend"]["options"]["external_remote_config"], expected)
                 admission = campaign.make_owner_admission_config(config, 2)
                 self.assertEqual(admission["backend"]["options"]["external_remote_config"]["durable_cut"],
@@ -310,9 +307,9 @@ class WriteEngineTests(unittest.TestCase):
         for job in campaign.make_focused_matrix(SELECTION):
             arms.add((job["arm"], job["owner_wal_prewrite"]))
             node = Path(config["fleet"]["data_root"]) / "cells" / job["case_id"] / "node-0"
-            tls = {"transport": campaign.TRANSPORTS[job["backend"]], "ca": str(node / "tls" / "ca.der"),
-                   "cert": str(node / "tls" / "tidehunter-node-0.der"),
-                   "key": str(node / "tls" / "tidehunter-node-0.pk8")}
+            transport = campaign.CONTROL_TRANSPORTS[campaign.OFI_CONTROL]
+            self.assertEqual(controller.owner_control_settings(job)["owner_transport"], transport)
+            tls = {"transport": transport, "ca": "", "cert": "", "key": ""}
             for prepared_prewrite in (True, False, None):
                 prepared = {"ready_file": str(node / "ready"), "stop_file": str(node / "stop"),
                             "listen": "10.0.0.1:9400", "node": {"root": str(node / "storage")}, "tls": tls}
@@ -326,6 +323,9 @@ class WriteEngineTests(unittest.TestCase):
                 with patch.object(controller, "guarded", side_effect=lambda path, *_args, **_kwargs: Path(path)), \
                      patch.object(controller, "logical_owner_hosts", return_value=[{"address": "10.0.0.1"}]):
                     controller.validate_launch(config, launch, job["case_id"], 0)
+                    wrong = dict(launch, tls=dict(tls, transport=campaign.CONTROL_TRANSPORTS[campaign.TCP_CONTROL]))
+                    with self.assertRaisesRegex(controller.SafetyError, "planned leased owner control protocol"):
+                        controller.validate_launch(config, wrong, job["case_id"], 0)
         self.assertEqual(arms, {("file", False), ("prewritten", True)})
 
     def test_owner_launch_binds_and_validates_prewrite_boolean(self):
@@ -371,7 +371,7 @@ class WriteEngineTests(unittest.TestCase):
                 config = {"spec": {"selection": selection},
                           "fleet": {"data_root": "/tmp/engine", "nodes": [{}] * hosts}}
                 node = Path(config["fleet"]["data_root"]) / "cells" / job["case_id"] / "node-0"
-                transport = campaign.TRANSPORTS[job["backend"]]
+                transport = campaign.CONTROL_TRANSPORTS[campaign.owner_control_backend(job)]
                 trusted = controller.is_trusted(controller.validate_transport(transport))
                 tls = {"transport": transport}
                 for field, name in (("ca", "ca.der"), ("cert", "tidehunter-node-0.der"),

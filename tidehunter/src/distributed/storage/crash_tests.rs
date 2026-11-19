@@ -266,41 +266,6 @@ fn torn_sibling_discards_whole_unpersisted_group_and_retains_prior_durable_group
 }
 
 #[test]
-fn inventory_recovery_rejects_a_logical_version_reused_on_another_partition() {
-    let temp = tempdir::TempDir::new("sharded-global-version").unwrap();
-    let left_config = config(vec![3, 5], 3);
-    let right_config = config(vec![3, 5], 5);
-    let left_path = temp.path().join("left");
-    let right_path = temp.path().join("right");
-    let left = PartitionLog::create(&left_path, left_config.clone(), &shape(), metrics()).unwrap();
-    left.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let right =
-        PartitionLog::create(&right_path, right_config.clone(), &shape(), metrics()).unwrap();
-    right
-        .set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let l = left
-        .append_complete_batch(authority(&left_config), &batch(&left_config, 0, 7))
-        .unwrap();
-    let r = right
-        .append_complete_batch(authority(&right_config), &batch(&right_config, 1, 7))
-        .unwrap();
-    left.persist_through(l).unwrap();
-    right.persist_through(r).unwrap();
-    drop(left);
-    drop(right);
-    assert!(matches!(
-        recover_inventory(
-            &left_config.inventory,
-            &[(left_path, left_config.clone()), (right_path, right_config),],
-            metrics()
-        ),
-        Err(StorageError::VersionConflict)
-    ));
-}
-
-#[test]
 fn reported_synced_prefix_survives_loss_of_the_unsynced_suffix() {
     let temp = tempdir::TempDir::new("sharded-durable-progress-cut").unwrap();
     let config = config(vec![3], 3);
@@ -332,7 +297,7 @@ fn reported_synced_prefix_survives_loss_of_the_unsynced_suffix() {
 }
 
 /// Owner continuity: a recovery reports a hole only when it ended early below a valid
-/// frame. Damage at the very tail is the normal crash tail. Both history modes.
+/// frame. Damage at the very tail is the normal crash tail (WAL-replay history).
 #[test]
 fn recovery_reports_a_hole_only_below_a_later_valid_frame() {
     #[derive(Clone, Copy, Debug)]
@@ -341,16 +306,12 @@ fn recovery_reports_a_hole_only_below_a_later_valid_frame() {
         Tail,
         BelowLaterFragment,
     }
-    for on_disk in [false, true] {
+    {
         for damage in [Damage::None, Damage::Tail, Damage::BelowLaterFragment] {
             let temp = tempdir::TempDir::new("sharded-recovery-hole").unwrap();
             let config = config(vec![3], 3);
             let path = temp.path().join("stream");
             let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
-            if on_disk {
-                log.set_history_persistence(HistoryPersistence::OnDisk)
-                    .unwrap();
-            }
             // Unsynced appends until one lands in the second fragment.
             let mut receipts = Vec::new();
             for n in 0..32 {
@@ -385,12 +346,12 @@ fn recovery_reports_a_hole_only_below_a_later_valid_frame() {
             assert_eq!(
                 recovered.recovery_found_hole(),
                 matches!(damage, Damage::BelowLaterFragment),
-                "on_disk={on_disk} damage={damage:?}"
+                "damage={damage:?}"
             );
             assert_eq!(
                 recovered.lookup(last.id()).unwrap().is_some(),
                 !matches!(damage, Damage::Tail),
-                "on_disk={on_disk} damage={damage:?}"
+                "damage={damage:?}"
             );
         }
     }

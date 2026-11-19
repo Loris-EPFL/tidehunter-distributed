@@ -208,7 +208,6 @@ impl OwnerQueue {
 
     /// Consecutive READY entries at the head before `before_owner_seq`, at most
     /// `limit`. Packing evidence only: callers may make more entries READY.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn ready_run(&self, before_owner_seq: u64, limit: usize) -> usize {
         // Only this owner worker changes head; Acquire matches take_ready_before.
         let head = self.head.load(Ordering::Acquire);

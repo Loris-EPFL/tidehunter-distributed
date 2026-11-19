@@ -83,7 +83,7 @@ class QualificationBootstrapTests(unittest.TestCase):
                    for i in range(6)]
         args = ('test-bucket', 'run-1', 'a' * 64, '2030-01-01T00:00:00Z', 'b' * 64, 'c' * 64)
         options = {'members': members[:2], 'rdma_device': 'irdma0', 'machine_type': 'z4m-highmem-16',
-                   'qualification_profile': 'focused', 'selection': 'leased_ab_compact', 'live_transports': ['rdma']}
+                   'qualification_profile': 'focused', 'selection': 'nvmeof_path_core', 'live_transports': ['rdma']}
         self.assertIn('TIDEHUNTER_BOOTSTRAP', bootstrap.fleet_startup_script(*args, **options))
         for change in ({'selection': 'parity_compact'}, {'members': members},
                        {'live_transports': ['tcp']}, {'live_spdk': True}):

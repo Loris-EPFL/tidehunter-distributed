@@ -669,7 +669,7 @@ class MailboxTests(unittest.TestCase):
                   'package_root': '/mnt/tidehunter/run/package',
                   'package': {'source_sha256': 'a' * 64, 'source_revision': 'b' * 40,
                               'object_key': 'runs/run/package.tar', 'generation': '1', 'sha256': 'c' * 64},
-                  'spec': {'suite': 'kv', 'backends': ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
+                  'spec': {'suite': 'kv', 'backends': ['native',
                                         'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma',
                                         'garnet', 'kvrocks']}}
         self.assertIs(runtime.validate_runtime(config), config)
@@ -679,10 +679,10 @@ class MailboxTests(unittest.TestCase):
         config['spec'] = {'suite': 'kv', 'backends': ['native', 'tidehunter_nvme_rdma'], 'mode': 'standard'}
         with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'NVMe-oF mode'):
             runtime.validate_runtime(config)
-        config['spec']['mode'] = 'nvmeof-focused'
-        self.assertIs(runtime.validate_runtime(config), config)
-        config['spec']['mode'] = 'standard-with-nvmeof'
-        self.assertIs(runtime.validate_runtime(config), config)
+        for mode in ('nvmeof-focused', 'standard-with-nvmeof'):
+            config['spec']['mode'] = mode
+            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'invalid matrix mode'):
+                runtime.validate_runtime(config)
         config['spec']['mode'] = 'standard-with-live-nvmeof'
         with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'live pair qualification'):
             runtime.validate_runtime(config)
@@ -731,7 +731,7 @@ class MailboxTests(unittest.TestCase):
                   'package_root': f'/mnt/tidehunter/{run}/package',
                   'package': {'source_sha256': 'a' * 64, 'source_revision': 'b' * 40,
                               'object_key': f'runs/{run}/package.tar', 'generation': '1', 'sha256': 'c' * 64},
-                  'spec': manual_campaign.REVIEWED_SPECS['leased_ab_compact']}
+                  'spec': manual_campaign.REVIEWED_SPECS['nvmeof_path_core']}
         with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'live pair qualification'):
             runtime.validate_runtime(config)
         config['live_qualification'] = {

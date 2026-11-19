@@ -331,15 +331,11 @@ pub enum WriteTimelineStage {
     LiveGroupBuilt,
     LiveExtentSwitchStarted,
     LiveExtentSwitchCompleted,
-    LiveReserveStarted,
-    LiveReserveCompleted,
     LiveNamespaceSetupStarted,
     LiveNamespaceSetupCompleted,
     LiveIoStarted,
     /// The CQE was observed. Leased groups can complete out of frame order.
     LiveIoCompleted,
-    LiveCompleteStarted,
-    LiveCompleteCompleted,
     /// Leased receipts release only after all prior frames complete.
     LiveReceiptsValidated,
     /// The request has been queued in the local reactor, not necessarily sent on the wire.
@@ -463,15 +459,12 @@ pub struct OwnerTimelineRecord {
     pub persistence_capture: Option<super::storage::PersistenceCapture>,
     pub ready_append_prefix: Option<ReadyAppendPrefix>,
 }
-/// A single live group; owner durations are returned by the completion RPC and
-/// are never compared to coordinator timestamps. Versions include sampled calls only.
+/// A single live group. Versions include sampled calls only.
 #[derive(Debug, Serialize)]
 pub struct LiveGroupTimeline {
     pub owner: u32,
     pub batches: Vec<BatchVersion>,
     pub reservation_token: Option<[u8; 16]>,
-    pub owner_validation_ns: Option<u64>,
-    pub owner_persistence: Option<super::storage::StorageWriteProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wal_position: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -536,7 +529,6 @@ pub(crate) struct WriteTimelineSample {
     generation: u64,
     index: usize,
 }
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy)]
 pub(crate) struct LiveGroupSample {
     generation: u64,
@@ -549,8 +541,6 @@ struct Session {
     export: WriteTimelineExport,
     operations: HashMap<[u8; 16], usize>,
     versions: HashMap<BatchVersion, usize>,
-    envelopes: HashMap<(u32, u64), Vec<usize>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_memberships: usize,
 }
 
@@ -591,7 +581,6 @@ impl WriteTimeline {
         counter.max_depth.fetch_max(depth as u64, Ordering::Relaxed);
     }
 
-    #[cfg(any(test, feature = "experimental-nvmeof"))]
     pub(crate) fn owner_frame(
         &self,
         owner: u32,
@@ -679,8 +668,6 @@ impl WriteTimeline {
                 },
                 operations: HashMap::new(),
                 versions: HashMap::new(),
-                envelopes: HashMap::new(),
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 live_memberships: 0,
             });
             self.enabled.store(true, Ordering::Release);
@@ -1004,7 +991,6 @@ impl WriteTimeline {
             Self::push(s, sample.index, stage, None, None);
         }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_group(
         &self,
         owner: u32,
@@ -1033,8 +1019,6 @@ impl WriteTimeline {
             owner,
             batches: versions,
             reservation_token: None,
-            owner_validation_ns: None,
-            owner_persistence: None,
             wal_position: None,
             file_offset: None,
             frame_len: None,
@@ -1047,7 +1031,6 @@ impl WriteTimeline {
         })
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn live_group_position(
         &self,
         group: Option<LiveGroupSample>,
@@ -1073,7 +1056,6 @@ impl WriteTimeline {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_group_event(&self, group: Option<LiveGroupSample>, stage: WriteTimelineStage) {
         if group.is_none() {
             return;
@@ -1081,7 +1063,6 @@ impl WriteTimeline {
         self.live_group_event_at(group, stage, Instant::now());
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn live_group_event_at(
         &self,
         group: Option<LiveGroupSample>,
@@ -1108,7 +1089,6 @@ impl WriteTimeline {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_group_token(&self, group: Option<LiveGroupSample>, token: [u8; 16]) {
         let Some(group) = group else { return };
         if let Some(row) = self
@@ -1119,26 +1099,6 @@ impl WriteTimeline {
             .and_then(|s| s.export.live_groups.get_mut(group.index))
         {
             row.reservation_token = Some(token);
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn live_group_owner(
-        &self,
-        group: Option<LiveGroupSample>,
-        validation_ns: Option<u64>,
-        persistence: super::storage::StorageWriteProfile,
-    ) {
-        let Some(group) = group else { return };
-        if let Some(row) = self
-            .session
-            .lock()
-            .as_mut()
-            .filter(|s| s.generation == group.generation)
-            .and_then(|s| s.export.live_groups.get_mut(group.index))
-        {
-            row.owner_validation_ns = validation_ns;
-            row.owner_persistence = Some(persistence);
         }
     }
 
@@ -1157,31 +1117,6 @@ impl WriteTimeline {
             && let Some(&index) = s.versions.get(&version)
         {
             Self::push(s, index, stage, owner, envelope);
-            if let (Some(owner), Some(envelope)) = (owner, envelope) {
-                s.envelopes
-                    .entry((owner, envelope))
-                    .or_default()
-                    .push(index);
-            }
-        }
-    }
-    pub fn response(&self, owner: u32, envelope: u64) {
-        if !self.enabled() {
-            return;
-        }
-        let mut guard = self.session.lock();
-        if let Some(s) = guard.as_mut()
-            && let Some(indexes) = s.envelopes.remove(&(owner, envelope))
-        {
-            for index in indexes {
-                Self::push(
-                    s,
-                    index,
-                    WriteTimelineStage::CompletionHarvested,
-                    Some(owner),
-                    Some(envelope),
-                );
-            }
         }
     }
     pub fn complete(&self, sample: WriteTimelineSample, error: Option<String>) {
@@ -1382,7 +1317,6 @@ mod tests {
         assert_eq!(next.write_wait_metrics.windows[0].wake_attempts, 0);
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn live_group_links_coalesced_calls_and_preserves_failed_control() {
         let timeline = WriteTimeline::default();
@@ -1405,28 +1339,26 @@ mod tests {
         timeline.batch([1; 16], versions[0]);
         timeline.batch([2; 16], versions[1]);
         let group = timeline.live_group(3, versions.into_iter()).unwrap();
-        timeline.live_group_event(Some(group), WriteTimelineStage::LiveReserveStarted);
         timeline.live_group_token(Some(group), [9; 16]);
-        timeline.live_group_event(Some(group), WriteTimelineStage::LiveCompleteStarted);
+        timeline.live_group_event(Some(group), WriteTimelineStage::LiveIoStarted);
         timeline.complete(a, Some("control failed".into()));
         timeline.complete(b, Some("control failed".into()));
         let export = timeline.finish().unwrap();
         assert_eq!(export.live_groups[0].batches, versions);
         assert_eq!(export.live_groups[0].reservation_token, Some([9; 16]));
-        assert!(export.live_groups[0].owner_persistence.is_none());
         for record in &export.records {
             assert_eq!(record.error.as_deref(), Some("control failed"));
             assert!(
                 record
                     .events
                     .iter()
-                    .any(|e| e.stage == WriteTimelineStage::LiveCompleteStarted)
+                    .any(|e| e.stage == WriteTimelineStage::LiveIoStarted)
             );
             assert!(
                 !record
                     .events
                     .iter()
-                    .any(|e| e.stage == WriteTimelineStage::LiveCompleteCompleted)
+                    .any(|e| e.stage == WriteTimelineStage::LiveIoCompleted)
             );
             assert!(
                 record
@@ -1437,7 +1369,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn live_group_limit_and_stale_generation_are_explicit() {
         let timeline = WriteTimeline::default();

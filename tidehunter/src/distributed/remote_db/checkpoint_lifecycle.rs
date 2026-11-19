@@ -10,19 +10,15 @@ struct CompletedCheckpoint {
     persisted: Option<PersistedIndexImage>,
     batches: usize,
     bytes: usize,
-    history: Option<ReceiptHistory>,
     positions: BTreeMap<(u32, u64), StreamPosition>,
     recent: VecDeque<RecentReceipt>,
     cut: Option<MutationVersion>,
     staging_manifest_ns: Option<u64>,
-    receipt_history_ns: Option<u64>,
-    receipt_history_sync_ns: Option<u64>,
     node_prefix_wait_ns: Option<u64>,
     index_prepare_ns: Option<u64>,
     index_persist_ns: Option<u64>,
     metadata_install_ns: Option<u64>,
     root_adoption_ns: Option<u64>,
-    history_io: super::receipt_history::HistoryIoStats,
 }
 
 struct CapturingCheckpoint {
@@ -30,7 +26,6 @@ struct CapturingCheckpoint {
     cut: Option<MutationVersion>,
     batches: usize,
     bytes: usize,
-    receipts: Vec<CheckpointReceipt>,
     stream_last: BTreeMap<(u32, u64), (u64, u32)>,
     positions: BTreeMap<(u32, u64), StreamPosition>,
     recent: VecDeque<RecentReceipt>,
@@ -281,18 +276,12 @@ fn core_capture_checkpoint(
     }
     // Partition occupancy is returned by publication, not checkpoint adoption.
     let mut credits = CheckpointCredits::default();
-    let replay = core.config.history_persistence == HistoryPersistence::WalReplay;
-    let mut receipts = Vec::with_capacity(if replay { 0 } else { state.known.len() });
     let mut stream_last = BTreeMap::new();
-    let mut recent: BTreeMap<_, _> = if replay {
-        state
-            .recent
-            .iter()
-            .map(|receipt| (receipt.version, *receipt))
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
+    let mut recent: BTreeMap<_, _> = state
+        .recent
+        .iter()
+        .map(|receipt| (receipt.version, *receipt))
+        .collect();
     for receipt in state.known.values() {
         if cut.is_none_or(|cut| receipt.version() > cut.batch) {
             continue;
@@ -318,28 +307,24 @@ fn core_capture_checkpoint(
             .replay_bytes
             .checked_add(encoded_bytes)
             .ok_or_else(|| LocalDbError::new("checkpoint receipt byte count overflow"))?;
-        if replay {
-            stream_last
-                .entry((address.partition, receipt.version().epoch))
-                .and_modify(|last: &mut (u64, u32)| {
-                    if address.offset > last.0 {
-                        *last = (address.offset, address.len);
-                    }
-                })
-                .or_insert((address.offset, address.len));
-            recent.insert(
-                receipt.version(),
-                RecentReceipt {
-                    id: receipt.id(),
-                    version: receipt.version(),
-                    digest: receipt.digest(),
-                },
-            );
-            if recent.len() > WAL_REPLAY_WINDOW_BATCHES {
-                recent.pop_first();
-            }
-        } else {
-            receipts.push((*receipt).into());
+        stream_last
+            .entry((address.partition, receipt.version().epoch))
+            .and_modify(|last: &mut (u64, u32)| {
+                if address.offset > last.0 {
+                    *last = (address.offset, address.len);
+                }
+            })
+            .or_insert((address.offset, address.len));
+        recent.insert(
+            receipt.version(),
+            RecentReceipt {
+                id: receipt.id(),
+                version: receipt.version(),
+                digest: receipt.digest(),
+            },
+        );
+        if recent.len() > WAL_REPLAY_WINDOW_BATCHES {
+            recent.pop_first();
         }
     }
     *state.stream_last = stream_last.clone();
@@ -366,7 +351,6 @@ fn core_capture_checkpoint(
         cut,
         batches: credits.replay_batches,
         bytes: credits.replay_bytes,
-        receipts,
         stream_last,
         positions: state.positions.clone(),
         recent: recent.into_values().collect(),
@@ -374,17 +358,12 @@ fn core_capture_checkpoint(
         published_next,
         prepare_work_ns: prepare_started.map(elapsed),
     };
-    let mut history = state.receipt_history.clone();
-    if let Some(history) = &mut history {
-        history.reset_io_stats();
-    }
     let persistence = CheckpointPersistence {
         path: core.path.clone(),
         database: core.config.storage.database,
         fragment_bytes: core.config.storage.fragment_bytes,
         shape_yaml: state.manifest.shape_yaml.clone(),
         staging_manifest: state.manifest.clone(),
-        history,
         timeline: Arc::clone(&core.write_timeline),
         diagnostics_enabled,
         #[cfg(test)]
@@ -500,19 +479,13 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
             .checked_sub(completed.bytes)
             .ok_or_else(|| LocalDbError::new("checkpoint captured byte count exceeds tail"))?;
         *state.manifest = completed.manifest.clone();
-        // Install the immutable history root before retiring any identity shard
-        // entry. A caller snapshots this root only after a table miss, so a
-        // retired identity is always visible through its history snapshot.
-        *state.receipt_history = completed.history.take();
-        if core.config.history_persistence == HistoryPersistence::WalReplay {
-            *state.committed_complete = completed
-                .positions
-                .iter()
-                .filter_map(|(key, position)| position.complete.then_some(*key))
-                .collect();
-            *state.positions = std::mem::take(&mut completed.positions);
-            *state.recent = std::mem::take(&mut completed.recent);
-        }
+        *state.committed_complete = completed
+            .positions
+            .iter()
+            .filter_map(|(key, position)| position.complete.then_some(*key))
+            .collect();
+        *state.positions = std::mem::take(&mut completed.positions);
+        *state.recent = std::mem::take(&mut completed.recent);
         state.known.retain(|_, receipt| {
             completed
                 .cut
@@ -631,16 +604,6 @@ fn checkpoint_diagnostic(
         captured_batches: Some(completed.batches),
         captured_bytes: Some(completed.bytes),
         staging_manifest_ns: completed.staging_manifest_ns,
-        receipt_history_ns: completed.receipt_history_ns,
-        receipt_history_sync_ns: completed.receipt_history_sync_ns,
-        history_stream_opens: Some(completed.history_io.stream_opens),
-        history_previous_slot_reads: Some(completed.history_io.previous_slot_reads),
-        history_receipt_write_ops: Some(completed.history_io.receipt_write_ops),
-        history_receipt_write_bytes: Some(completed.history_io.receipt_write_bytes),
-        history_buffer_flushes: Some(completed.history_io.buffer_flushes),
-        history_node_write_ops: Some(completed.history_io.node_write_ops),
-        history_node_write_bytes: Some(completed.history_io.node_write_bytes),
-        history_sync_operations: Some(completed.history_io.sync_operations),
         node_prefix_wait_ns: completed.node_prefix_wait_ns,
         index_prepare_ns: completed.index_prepare_ns,
         index_persist_ns: completed.index_persist_ns,
@@ -664,7 +627,6 @@ pub(super) fn core_retire_history_before(
     if core.take_retirement_preflight_busy() {
         return Err(LocalDbError::new("injected retirement preflight busy"));
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     let _live_pause = core.reads.pause_live_for_retirement()?;
     let result = (|| {
         core.wait_published_before(core.next_sequence())?;
@@ -703,32 +665,17 @@ pub(super) fn core_retire_unreachable_sealed_files(core: &WriteCore) -> Result<(
         let mut publisher = core.publisher.lock();
         let state = publisher.checkpoint_state();
         let mut jobs = Vec::new();
-        let replay = core.config.history_persistence == HistoryPersistence::WalReplay;
         for (node, epochs) in state.retained_epochs.iter().enumerate() {
             let partition = core.config.endpoints[node].partition;
             for &epoch in epochs {
-                if epoch >= core.epoch {
-                    continue;
+                if epoch < core.epoch && state.committed_complete.contains(&(partition, epoch)) {
+                    jobs.push((node, partition, epoch));
                 }
-                let prefix = state
-                    .receipt_history
-                    .as_ref()
-                    .and_then(|history| history.counts.get(&(partition, epoch)))
-                    .copied()
-                    .unwrap_or(0);
-                if if replay {
-                    !state.committed_complete.contains(&(partition, epoch))
-                } else {
-                    prefix == 0
-                } {
-                    continue;
-                }
-                jobs.push((node, partition, epoch, (!replay).then_some(prefix)));
             }
         }
         jobs
     };
-    for (node, partition, epoch, prefix) in jobs {
+    for (node, partition, epoch) in jobs {
         let mut after = None;
         let authority_epoch = core.epoch;
         loop {
@@ -753,7 +700,7 @@ pub(super) fn core_retire_unreachable_sealed_files(core: &WriteCore) -> Result<(
             }
             if !retired.is_empty() {
                 let _retirement = core.control_owner(node, move |client| {
-                    client.retire_files_if_idle(authority_epoch, epoch, prefix, retired)
+                    client.retire_files_if_idle(authority_epoch, epoch, retired)
                 })?;
             }
         }
@@ -769,7 +716,6 @@ struct CheckpointPersistence {
     fragment_bytes: u64,
     shape_yaml: String,
     staging_manifest: AuthorityManifest,
-    history: Option<ReceiptHistory>,
     timeline: Arc<WriteTimeline>,
     diagnostics_enabled: bool,
     #[cfg(test)]
@@ -786,7 +732,6 @@ fn persist_checkpoint(
         cut,
         batches,
         bytes,
-        receipts,
         stream_last,
         mut positions,
         recent,
@@ -801,7 +746,6 @@ fn persist_checkpoint(
         fragment_bytes,
         shape_yaml,
         mut staging_manifest,
-        mut history,
         timeline,
         diagnostics_enabled,
         #[cfg(test)]
@@ -862,240 +806,101 @@ fn persist_checkpoint(
             "injected interruption after checkpoint intent",
         ));
     }
-    let (streams, receipt_history_ns, receipt_history_sync_ns, node_prefix_wait_ns) =
-        if let Some(history) = &mut history {
+    let phase_started = diagnostics_enabled.then(Instant::now);
+    let output = endpoint_map(&mut jobs, |_, (sender, partition, streams)| {
+        let mut output = Vec::with_capacity(streams.len());
+        for &epoch in streams.iter() {
+            let key = (*partition, epoch);
+            let previous = positions.get(&key);
+            let Some(&(offset, len)) = stream_last.get(&key) else {
+                output.push(previous.cloned().unwrap_or(StreamPosition {
+                    partition: *partition,
+                    epoch,
+                    replay_from: 0,
+                    last_offset: None,
+                    durable_end: 0,
+                    complete: false,
+                }));
+                continue;
+            };
+            if previous.is_some_and(|position| {
+                position.complete || position.last_offset.is_some_and(|last| last >= offset)
+            }) {
+                output.push(previous.unwrap().clone());
+                continue;
+            }
+            let through = offset
+                .checked_add(u64::from(len))
+                .ok_or_else(|| LocalDbError::new("checkpoint position overflow"))?;
+            let (reply, pending) = mpsc::sync_channel(1);
             timeline.checkpoint_generation(
-                "receipt_group_start",
-                None,
-                authority_epoch,
+                "control_enqueue",
+                Some(*partition),
+                epoch,
                 None,
                 Some(generation),
             );
-            let mut by_stream: BTreeMap<(u32, u64), Vec<CheckpointReceipt>> = BTreeMap::new();
-            for receipt in receipts {
-                by_stream
-                    .entry((receipt.address.partition, receipt.version.epoch))
-                    .or_default()
-                    .push(receipt);
-            }
-            for receipts in by_stream.values_mut() {
-                receipts.sort_unstable_by_key(|receipt| receipt.version);
-            }
-            timeline.checkpoint_generation(
-                "receipt_group_end",
-                None,
+            sender.send(Command::CheckpointPosition(
                 authority_epoch,
-                None,
-                Some(generation),
-            );
+                epoch,
+                through,
+                reply,
+            ))?;
+            let proof = receive(pending)?;
             timeline.checkpoint_generation(
-                "receipt_append_start",
-                None,
-                authority_epoch,
-                None,
-                Some(generation),
-            );
-            let phase_started = diagnostics_enabled.then(Instant::now);
-            for receipts in by_stream.values() {
-                history.append_stream(receipts)?;
-            }
-            let receipt_history_ns = phase_started.map(elapsed);
-            timeline.checkpoint_generation(
-                "receipt_append_end",
-                None,
-                authority_epoch,
+                "control_observed",
+                Some(*partition),
+                epoch,
                 None,
                 Some(generation),
             );
             #[cfg(test)]
-            if interruption == Some(4) {
-                return Err(LocalDbError::new(
-                    "injected interruption before receipt metadata sync",
-                ));
-            }
-            let phase_started = diagnostics_enabled.then(Instant::now);
-            timeline.checkpoint_generation(
-                "receipt_sync_start",
-                None,
-                authority_epoch,
-                None,
-                Some(generation),
-            );
-            history.sync()?;
-            let receipt_history_sync_ns = phase_started.map(elapsed);
-            timeline.checkpoint_generation(
-                "receipt_sync_end",
-                None,
-                authority_epoch,
-                None,
-                Some(generation),
-            );
-            let phase_started = diagnostics_enabled.then(Instant::now);
-            let streams = endpoint_map(&mut jobs, |_, (sender, partition, streams)| {
-                let mut output = Vec::with_capacity(streams.len());
-                for epoch in std::mem::take(streams) {
-                    let count = history
-                        .counts
-                        .get(&(*partition, epoch))
-                        .copied()
-                        .unwrap_or(0);
-                    let (reply, pending) = mpsc::sync_channel(1);
-                    timeline.checkpoint_generation(
-                        "control_enqueue",
-                        Some(*partition),
-                        epoch,
-                        Some(count),
-                        Some(generation),
-                    );
-                    sender.send(Command::Checkpoint(authority_epoch, epoch, count, reply))?;
-                    let proof = receive(pending)?;
-                    timeline.checkpoint_generation(
-                        "control_observed",
-                        Some(*partition),
-                        epoch,
-                        Some(count),
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    let proof = if corrupt_checkpoint_proof && *partition == 0 {
-                        let mut proof = proof;
-                        proof.digest[0] ^= 1;
-                        proof
-                    } else {
-                        proof
-                    };
-                    #[cfg(test)]
-                    if *partition == 0
-                        && let Some((entered, resume)) = prefix_pause.lock().take()
-                    {
-                        let _ = entered.send(());
-                        resume.recv().map_err(|_| {
-                            LocalDbError::new("checkpoint prefix test pause disconnected")
-                        })?;
-                    }
-                    // Later durable appends do not change this exact prefix.
-                    if proof.prefix != count
-                        || proof.retained < count
-                        || proof.digest != history.prefix(*partition, epoch, count)?
-                    {
-                        return Err(LocalDbError::new(
-                            "checkpoint prefix differs from published receipts",
-                        ));
-                    }
-                    output.push(CheckpointStream {
-                        proof,
-                        state: history.state(*partition, epoch)?,
-                    });
-                }
-                Ok(output)
-            })?
-            .into_iter()
-            .flatten()
-            .collect();
-            let node_prefix_wait_ns = phase_started.map(elapsed);
-            (
-                streams,
-                receipt_history_ns,
-                receipt_history_sync_ns,
-                node_prefix_wait_ns,
-            )
-        } else {
-            let phase_started = diagnostics_enabled.then(Instant::now);
-            let output = endpoint_map(&mut jobs, |_, (sender, partition, streams)| {
-                let mut output = Vec::with_capacity(streams.len());
-                for &epoch in streams.iter() {
-                    let key = (*partition, epoch);
-                    let previous = positions.get(&key);
-                    let Some(&(offset, len)) = stream_last.get(&key) else {
-                        output.push(previous.cloned().unwrap_or(StreamPosition {
-                            partition: *partition,
-                            epoch,
-                            replay_from: 0,
-                            last_offset: None,
-                            durable_end: 0,
-                            complete: false,
-                        }));
-                        continue;
-                    };
-                    if previous.is_some_and(|position| {
-                        position.complete || position.last_offset.is_some_and(|last| last >= offset)
-                    }) {
-                        output.push(previous.unwrap().clone());
-                        continue;
-                    }
-                    let through = offset
-                        .checked_add(u64::from(len))
-                        .ok_or_else(|| LocalDbError::new("checkpoint position overflow"))?;
-                    let (reply, pending) = mpsc::sync_channel(1);
-                    timeline.checkpoint_generation(
-                        "control_enqueue",
-                        Some(*partition),
-                        epoch,
-                        None,
-                        Some(generation),
-                    );
-                    sender.send(Command::CheckpointPosition(
-                        authority_epoch,
-                        epoch,
-                        through,
-                        reply,
-                    ))?;
-                    let proof = receive(pending)?;
-                    timeline.checkpoint_generation(
-                        "control_observed",
-                        Some(*partition),
-                        epoch,
-                        None,
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    let proof = if corrupt_checkpoint_proof && *partition == 0 {
-                        let mut proof = proof;
-                        proof.database[0] ^= 1;
-                        proof
-                    } else {
-                        proof
-                    };
-                    #[cfg(test)]
-                    if *partition == 0
-                        && let Some((entered, resume)) = prefix_pause.lock().take()
-                    {
-                        let _ = entered.send(());
-                        resume.recv().map_err(|_| {
-                            LocalDbError::new("checkpoint prefix test pause disconnected")
-                        })?;
-                    }
-                    if proof.database != database
-                        || proof.partition != *partition
-                        || proof.epoch != epoch
-                        || proof.durable_end < through
-                    {
-                        return Err(LocalDbError::new("checkpoint position proof differs"));
-                    }
-                    output.push(StreamPosition {
-                        partition: *partition,
-                        epoch,
-                        replay_from: offset - offset % fragment_bytes,
-                        last_offset: Some(offset),
-                        durable_end: proof.durable_end,
-                        complete: previous.is_some_and(|position| position.complete),
-                    });
-                }
-                Ok(output)
-            })?;
-            positions = output
-                .into_iter()
-                .flatten()
-                .map(|position| ((position.partition, position.epoch), position))
-                .collect();
+            let proof = if corrupt_checkpoint_proof && *partition == 0 {
+                let mut proof = proof;
+                proof.database[0] ^= 1;
+                proof
+            } else {
+                proof
+            };
             #[cfg(test)]
-            if interruption == Some(4) {
-                return Err(LocalDbError::new(
-                    "injected interruption after checkpoint positions",
-                ));
+            if *partition == 0
+                && let Some((entered, resume)) = prefix_pause.lock().take()
+            {
+                let _ = entered.send(());
+                resume
+                    .recv()
+                    .map_err(|_| LocalDbError::new("checkpoint prefix test pause disconnected"))?;
             }
-            (Vec::new(), None, None, phase_started.map(elapsed))
-        };
+            if proof.database != database
+                || proof.partition != *partition
+                || proof.epoch != epoch
+                || proof.durable_end < through
+            {
+                return Err(LocalDbError::new("checkpoint position proof differs"));
+            }
+            output.push(StreamPosition {
+                partition: *partition,
+                epoch,
+                replay_from: offset - offset % fragment_bytes,
+                last_offset: Some(offset),
+                durable_end: proof.durable_end,
+                complete: previous.is_some_and(|position| position.complete),
+            });
+        }
+        Ok(output)
+    })?;
+    positions = output
+        .into_iter()
+        .flatten()
+        .map(|position| ((position.partition, position.epoch), position))
+        .collect();
+    #[cfg(test)]
+    if interruption == Some(4) {
+        return Err(LocalDbError::new(
+            "injected interruption after checkpoint positions",
+        ));
+    }
+    let node_prefix_wait_ns = phase_started.map(elapsed);
     let phase_started = diagnostics_enabled.then(Instant::now);
     timeline.checkpoint_generation(
         "index_persist_start",
@@ -1132,36 +937,19 @@ fn persist_checkpoint(
         None,
         Some(generation),
     );
-    let encoded = if let Some(history) = &history {
-        let image = CheckpointImage {
-            format: 2,
-            database,
-            shape_yaml,
-            authority_epoch,
-            generation: commit.generation,
-            cut,
-            published_next,
-            index_bytes: persisted.metadata.bytes,
-            index_digest: persisted.metadata.digest,
-            streams,
-            history_root: history.root,
-        };
-        encode_checkpoint(&image)?
-    } else {
-        encode_checkpoint(&CheckpointImageV3 {
-            format: 3,
-            database,
-            shape_yaml,
-            authority_epoch,
-            generation: commit.generation,
-            cut,
-            published_next,
-            index_bytes: persisted.metadata.bytes,
-            index_digest: persisted.metadata.digest,
-            positions: positions.values().cloned().collect(),
-            recent: recent.iter().copied().collect(),
-        })?
-    };
+    let encoded = encode_checkpoint(&CheckpointImageV3 {
+        format: 3,
+        database,
+        shape_yaml,
+        authority_epoch,
+        generation: commit.generation,
+        cut,
+        published_next,
+        index_bytes: persisted.metadata.bytes,
+        index_digest: persisted.metadata.digest,
+        positions: positions.values().cloned().collect(),
+        recent: recent.iter().copied().collect(),
+    })?;
     let mut commit = commit;
     commit.index_files = persisted.files();
     commit.index_files.sort_unstable();
@@ -1253,16 +1041,10 @@ fn persist_checkpoint(
         persisted: Some(persisted),
         batches,
         bytes,
-        history_io: history
-            .as_ref()
-            .map_or_else(Default::default, |history| history.io_stats),
-        history,
         positions,
         recent,
         cut,
         staging_manifest_ns,
-        receipt_history_ns,
-        receipt_history_sync_ns,
         node_prefix_wait_ns,
         index_prepare_ns,
         index_persist_ns,
@@ -1271,9 +1053,10 @@ fn persist_checkpoint(
     })
 }
 
+// The pipeline Fixture serves only the leased live route.
 #[cfg(test)]
 mod tests {
-    use super::super::pipeline_tests::Fixture;
+    use super::super::pipeline_tests::{Fixture, LIVE_HOST_NQN};
     use super::*;
 
     fn put(value: u8) -> Mutation {
@@ -1283,15 +1066,12 @@ mod tests {
             value: vec![value; 32].into(),
         }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn checkpoint_defers_busy_controller_retirement_and_retries_without_poisoning() {
         use crate::distributed::nvmeof::{
-            LiveTargetConfig, NvmeofTransport,
             live_connect::{LiveConnectTarget, LiveConnectionRegistry},
             live_namespace::LiveNamespaceAccess,
             live_pool::LiveControllerPool,
-            live_target::LiveTargetManager,
         };
         let fixture = Fixture::new_with_root(
             tempdir::TempDir::new("checkpoint-export-pin").unwrap(),
@@ -1300,15 +1080,8 @@ mod tests {
             KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
             2,
             |_| {},
-            |config| {
-                super::super::super::tcp::StorageNode::open(
-                    config,
-                    super::super::tests::recovery_metrics(),
-                )
-                .unwrap()
-            },
-        )
-        .history(HistoryPersistence::OnDisk);
+            |_| {},
+        );
         let first = fixture.open();
         first
             .write_batch(fixture.operation(0, 1), vec![put(1)])
@@ -1323,8 +1096,8 @@ mod tests {
         let db = fixture.open();
         db.write_batch(fixture.operation(0, 2), vec![put(2)])
             .unwrap();
-        // The RPC fixture does not materialize a full NVMe backing allocation.
-        // Write the unchanged bytes and zero tail before real export validation.
+        // Write the unchanged bytes and a zero tail up to the full file size
+        // before real export validation, whatever the writer allocated.
         let wal_bytes = fixture.config.storage.wal_file_bytes;
         let wal = fixture.startups[0]
             .0
@@ -1340,30 +1113,6 @@ mod tests {
         let file = fs::OpenOptions::new().write(true).open(&wal).unwrap();
         std::os::unix::fs::FileExt::write_all_at(&file, &contents, 0).unwrap();
         let root = fixture.temp.path();
-        let configfs = root.join("pin-configfs");
-        for name in ["hosts", "ports", "subsystems"] {
-            fs::create_dir_all(configfs.join(name)).unwrap();
-        }
-        let state_dir = root.join("pin-target");
-        fs::create_dir(&state_dir).unwrap();
-        fixture.nodes[0].bench_install_live_target(
-            LiveTargetManager::open_fixture(
-                LiveTargetConfig {
-                    address: "127.0.0.1".into(),
-                    service: 4420,
-                    transport: NvmeofTransport::Tcp,
-                    host_nqn: "nqn.2026-01.test:checkpoint-pin".into(),
-                    port_id: 42,
-                    state_dir,
-                    commissioning_port_id: 43,
-                    commissioning_service: 4421,
-                    spdk: None,
-                    export_mode: Default::default(),
-                },
-                configfs,
-            )
-            .unwrap(),
-        );
         let epoch = db.epoch();
         let locations = db.core.clients[0]
             .control(move |client| client.resolve_live_records(epoch, &[reference]))
@@ -1393,12 +1142,11 @@ mod tests {
                     address: binding.address.clone(),
                     service: binding.service,
                     transport: binding.transport,
-                    spdk: binding.spdk.clone(),
                     geometry: Default::default(),
                 };
                 let (lease, _, _) = worker_pool.acquire_pinned(
                     &target,
-                    "nqn.2026-01.test:checkpoint-pin",
+                    LIVE_HOST_NQN,
                     [1; 16],
                     LiveNamespaceAccess::ReadOnly,
                     Instant::now() + Duration::from_secs(5),
@@ -1424,7 +1172,7 @@ mod tests {
 
     #[test]
     fn request_timeline_splits_checkpoint_without_legacy_profile() {
-        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+        let fixture = Fixture::new();
         let db = fixture.open();
         assert_eq!(db.core.config.write_profile_limit, 0);
         db.core.write_timeline.arm(4, 1).unwrap();
@@ -1444,12 +1192,6 @@ mod tests {
             "capture_end",
             "staging_manifest_start",
             "staging_manifest_end",
-            "receipt_group_start",
-            "receipt_group_end",
-            "receipt_append_start",
-            "receipt_append_end",
-            "receipt_sync_start",
-            "receipt_sync_end",
             "index_persist_start",
             "index_persist_end",
             "metadata_encode_start",
@@ -1588,6 +1330,7 @@ mod tests {
     }
 }
 
+// The pipeline Fixture serves only the leased live route.
 #[cfg(test)]
 mod core_tests {
     use super::super::pipeline_tests::Fixture;
@@ -1644,129 +1387,125 @@ mod core_tests {
 
     #[test]
     fn capture_overlaps_publication_and_apply_returns_only_captured_credits() {
-        for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
-            let fixture = Fixture::new().history(mode);
-            let db = fixture.open();
-            let first = db
-                .write_batch(fixture.operation(0, 1), vec![put(1)])
-                .unwrap();
-            let suffix_id = fixture.operation(0, 2);
-            db.write_batch(suffix_id, vec![put(2), put(3)]).unwrap();
-            db.drain().unwrap();
-            let (entered, waiting) = mpsc::sync_channel(1);
-            let (resume, gate) = mpsc::sync_channel(1);
-            db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-            let core = Arc::clone(&db.core);
-            let granted = core.admission.checkpoint_pressure();
-            assert_eq!(granted.replay_batches, 2);
-            let suffix = hold_publication(&core, suffix_id, first);
-            core.start_checkpoint().unwrap();
-            waiting.recv_timeout(core.config.timeout).unwrap();
-            let publisher_core = Arc::clone(&core);
-            thread::spawn(move || publish_receipt(&publisher_core, suffix, 1))
-                .join()
-                .unwrap();
-            resume.send(()).unwrap();
-            core.progress_checkpoint(true).unwrap();
+        let fixture = Fixture::new();
+        let db = fixture.open();
+        let first = db
+            .write_batch(fixture.operation(0, 1), vec![put(1)])
+            .unwrap();
+        let suffix_id = fixture.operation(0, 2);
+        db.write_batch(suffix_id, vec![put(2), put(3)]).unwrap();
+        db.drain().unwrap();
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (resume, gate) = mpsc::sync_channel(1);
+        db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
+        let core = Arc::clone(&db.core);
+        let granted = core.admission.checkpoint_pressure();
+        assert_eq!(granted.replay_batches, 2);
+        let suffix = hold_publication(&core, suffix_id, first);
+        core.start_checkpoint().unwrap();
+        waiting.recv_timeout(core.config.timeout).unwrap();
+        let publisher_core = Arc::clone(&core);
+        thread::spawn(move || publish_receipt(&publisher_core, suffix, 1))
+            .join()
+            .unwrap();
+        resume.send(()).unwrap();
+        core.progress_checkpoint(true).unwrap();
 
-            let suffix_bytes = (suffix.address().len - 8) as usize;
-            let remaining = core.admission.checkpoint_pressure();
-            assert_eq!(remaining.identities, 1);
-            assert_eq!(remaining.replay_batches, 1);
-            assert_eq!(remaining.replay_bytes, suffix_bytes);
-            {
-                let mut publisher = core.publisher.lock();
-                let state = publisher.checkpoint_state();
-                assert_eq!(state.known.len(), 1);
-                assert_eq!(state.known.get(&suffix.id()), Some(&suffix));
-                assert_eq!(*state.checkpoint_tail_batches, 1);
-                assert_eq!(*state.checkpoint_tail_bytes, suffix_bytes);
-                let diagnostic = state.last_checkpoint_diagnostic.unwrap();
-                assert_eq!(diagnostic.captured_batches, Some(1));
-                assert_eq!(
-                    diagnostic.captured_bytes,
-                    Some(granted.replay_bytes - suffix_bytes)
-                );
-            }
-            core.commit_checkpoint().unwrap();
-            let remaining = core.admission.checkpoint_pressure();
-            assert_eq!(remaining.identities, 0);
-            assert_eq!(remaining.replay_batches, 0);
-            assert_eq!(remaining.replay_bytes, 0);
-            assert!(core.publisher.lock().checkpoint_state().known.is_empty());
-            // An unchanged cut cannot release any receipt a second time.
-            core.commit_checkpoint().unwrap();
-            assert_eq!(core.admission.checkpoint_pressure().replay_batches, 0);
+        let suffix_bytes = (suffix.address().len - 8) as usize;
+        let remaining = core.admission.checkpoint_pressure();
+        assert_eq!(remaining.identities, 1);
+        assert_eq!(remaining.replay_batches, 1);
+        assert_eq!(remaining.replay_bytes, suffix_bytes);
+        {
+            let mut publisher = core.publisher.lock();
+            let state = publisher.checkpoint_state();
+            assert_eq!(state.known.len(), 1);
+            assert_eq!(state.known.get(&suffix.id()), Some(&suffix));
+            assert_eq!(*state.checkpoint_tail_batches, 1);
+            assert_eq!(*state.checkpoint_tail_bytes, suffix_bytes);
+            let diagnostic = state.last_checkpoint_diagnostic.unwrap();
+            assert_eq!(diagnostic.captured_batches, Some(1));
+            assert_eq!(
+                diagnostic.captured_bytes,
+                Some(granted.replay_bytes - suffix_bytes)
+            );
         }
+        core.commit_checkpoint().unwrap();
+        let remaining = core.admission.checkpoint_pressure();
+        assert_eq!(remaining.identities, 0);
+        assert_eq!(remaining.replay_batches, 0);
+        assert_eq!(remaining.replay_bytes, 0);
+        assert!(core.publisher.lock().checkpoint_state().known.is_empty());
+        // An unchanged cut cannot release any receipt a second time.
+        core.commit_checkpoint().unwrap();
+        assert_eq!(core.admission.checkpoint_pressure().replay_batches, 0);
     }
 
     #[test]
     fn capture_racing_publication_conserves_all_receipts_and_bytes() {
-        for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
-            let fixture = Fixture::new().history(mode);
-            let db = fixture.open();
-            let mut operations = Vec::with_capacity(32);
-            for n in 1..=32 {
-                let operation = fixture.operation(0, n);
-                let operation_index = ((n - 1) % 4) as u32;
-                let version = db
-                    .write_batch(operation, vec![put(n as u8); operation_index as usize + 1])
-                    .unwrap();
-                operations.push((operation, operation_index, version));
-            }
-            db.drain().unwrap();
-            let core = Arc::clone(&db.core);
-            let initial = core.admission.checkpoint_pressure();
-            let first = operations[0].2;
-            let pending: Vec<_> = operations
-                .into_iter()
-                .skip(1)
-                .map(|(operation, operation_index, _)| {
-                    (hold_publication(&core, operation, first), operation_index)
-                })
-                .collect();
-            let barrier = Arc::new(std::sync::Barrier::new(2));
-            let publisher_barrier = Arc::clone(&barrier);
-            let publisher_core = Arc::clone(&core);
-            let publisher = thread::spawn(move || {
-                publisher_barrier.wait();
-                for (receipt, operation_index) in pending {
-                    publish_receipt(&publisher_core, receipt, operation_index);
-                }
-            });
-            barrier.wait();
-            core.start_checkpoint().unwrap();
-            core.progress_checkpoint(true).unwrap();
-            publisher.join().unwrap();
-            let remaining = core.admission.checkpoint_pressure();
-            {
-                let mut publisher = core.publisher.lock();
-                let state = publisher.checkpoint_state();
-                let captured = state.last_checkpoint_diagnostic.unwrap();
-                assert_eq!(
-                    captured.captured_batches.unwrap() + remaining.replay_batches,
-                    initial.replay_batches
-                );
-                assert_eq!(
-                    captured.captured_bytes.unwrap() + remaining.replay_bytes,
-                    initial.replay_bytes
-                );
-                assert_eq!(remaining.identities, remaining.replay_batches);
-                assert_eq!(state.known.len(), remaining.replay_batches);
-                assert_eq!(*state.checkpoint_tail_batches, remaining.replay_batches);
-                assert_eq!(*state.checkpoint_tail_bytes, remaining.replay_bytes);
-                assert_eq!(
-                    state
-                        .known
-                        .values()
-                        .map(|receipt| (receipt.address().len - 8) as usize)
-                        .sum::<usize>(),
-                    remaining.replay_bytes,
-                );
-            }
-            core.commit_checkpoint().unwrap();
-            assert_eq!(core.admission.checkpoint_pressure().replay_batches, 0);
+        let fixture = Fixture::new();
+        let db = fixture.open();
+        let mut operations = Vec::with_capacity(32);
+        for n in 1..=32 {
+            let operation = fixture.operation(0, n);
+            let operation_index = ((n - 1) % 4) as u32;
+            let version = db
+                .write_batch(operation, vec![put(n as u8); operation_index as usize + 1])
+                .unwrap();
+            operations.push((operation, operation_index, version));
         }
+        db.drain().unwrap();
+        let core = Arc::clone(&db.core);
+        let initial = core.admission.checkpoint_pressure();
+        let first = operations[0].2;
+        let pending: Vec<_> = operations
+            .into_iter()
+            .skip(1)
+            .map(|(operation, operation_index, _)| {
+                (hold_publication(&core, operation, first), operation_index)
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let publisher_barrier = Arc::clone(&barrier);
+        let publisher_core = Arc::clone(&core);
+        let publisher = thread::spawn(move || {
+            publisher_barrier.wait();
+            for (receipt, operation_index) in pending {
+                publish_receipt(&publisher_core, receipt, operation_index);
+            }
+        });
+        barrier.wait();
+        core.start_checkpoint().unwrap();
+        core.progress_checkpoint(true).unwrap();
+        publisher.join().unwrap();
+        let remaining = core.admission.checkpoint_pressure();
+        {
+            let mut publisher = core.publisher.lock();
+            let state = publisher.checkpoint_state();
+            let captured = state.last_checkpoint_diagnostic.unwrap();
+            assert_eq!(
+                captured.captured_batches.unwrap() + remaining.replay_batches,
+                initial.replay_batches
+            );
+            assert_eq!(
+                captured.captured_bytes.unwrap() + remaining.replay_bytes,
+                initial.replay_bytes
+            );
+            assert_eq!(remaining.identities, remaining.replay_batches);
+            assert_eq!(state.known.len(), remaining.replay_batches);
+            assert_eq!(*state.checkpoint_tail_batches, remaining.replay_batches);
+            assert_eq!(*state.checkpoint_tail_bytes, remaining.replay_bytes);
+            assert_eq!(
+                state
+                    .known
+                    .values()
+                    .map(|receipt| (receipt.address().len - 8) as usize)
+                    .sum::<usize>(),
+                remaining.replay_bytes,
+            );
+        }
+        core.commit_checkpoint().unwrap();
+        assert_eq!(core.admission.checkpoint_pressure().replay_batches, 0);
     }
 
     #[test]
@@ -1803,116 +1542,110 @@ mod core_tests {
     }
     #[test]
     fn concurrent_retirements_cover_each_requested_floor() {
-        for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
-            let fixture = Fixture::new().history(mode);
-            let db = fixture.open();
-            let first = db
-                .write_batch(fixture.operation(0, 1), vec![put(1)])
+        let fixture = Fixture::new();
+        let db = fixture.open();
+        let first = db
+            .write_batch(fixture.operation(0, 1), vec![put(1)])
+            .unwrap();
+        let second = db
+            .write_batch(fixture.operation(0, 2), vec![put(2)])
+            .unwrap();
+        db.drain().unwrap();
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (resume, gate) = mpsc::sync_channel(1);
+        db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
+        let core = Arc::clone(&db.core);
+        let lower = MutationVersion {
+            batch: first,
+            operation_index: 0,
+        };
+        let upper = MutationVersion {
+            batch: second,
+            operation_index: 0,
+        };
+        let lower_core = Arc::clone(&core);
+        let lower_thread = thread::spawn(move || {
+            lower_core
+                .retire_history_before(IndexReadCut::At(lower))
                 .unwrap();
-            let second = db
-                .write_batch(fixture.operation(0, 2), vec![put(2)])
-                .unwrap();
-            db.drain().unwrap();
-            let (entered, waiting) = mpsc::sync_channel(1);
-            let (resume, gate) = mpsc::sync_channel(1);
-            db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-            let core = Arc::clone(&db.core);
-            let lower = MutationVersion {
-                batch: first,
-                operation_index: 0,
-            };
-            let upper = MutationVersion {
-                batch: second,
-                operation_index: 0,
-            };
-            let lower_core = Arc::clone(&core);
-            let lower_thread = thread::spawn(move || {
-                lower_core
-                    .retire_history_before(IndexReadCut::At(lower))
-                    .unwrap();
-                assert!(matches!(lower_core.index.retention_floor(),
+            assert!(matches!(lower_core.index.retention_floor(),
                     IndexReadCut::At(installed) if installed >= lower));
-            });
-            waiting.recv_timeout(core.config.timeout).unwrap();
-            assert!(core.retirement.try_lock().is_none());
-            let (started, pending) = mpsc::sync_channel(1);
-            let upper_core = Arc::clone(&core);
-            let upper_thread = thread::spawn(move || {
-                started.send(()).unwrap();
-                upper_core
-                    .retire_history_before(IndexReadCut::At(upper))
-                    .unwrap();
-                assert!(matches!(upper_core.index.retention_floor(),
+        });
+        waiting.recv_timeout(core.config.timeout).unwrap();
+        assert!(core.retirement.try_lock().is_none());
+        let (started, pending) = mpsc::sync_channel(1);
+        let upper_core = Arc::clone(&core);
+        let upper_thread = thread::spawn(move || {
+            started.send(()).unwrap();
+            upper_core
+                .retire_history_before(IndexReadCut::At(upper))
+                .unwrap();
+            assert!(matches!(upper_core.index.retention_floor(),
                     IndexReadCut::At(installed) if installed >= upper));
-            });
-            pending.recv_timeout(core.config.timeout).unwrap();
-            resume.send(()).unwrap();
-            lower_thread.join().unwrap();
-            upper_thread.join().unwrap();
-            assert_eq!(core.index.retention_floor(), IndexReadCut::At(upper));
-        }
+        });
+        pending.recv_timeout(core.config.timeout).unwrap();
+        resume.send(()).unwrap();
+        lower_thread.join().unwrap();
+        upper_thread.join().unwrap();
+        assert_eq!(core.index.retention_floor(), IndexReadCut::At(upper));
     }
 
     #[test]
     fn every_checkpoint_interruption_recovers_captured_and_concurrent_suffix() {
-        for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
-            for stage in 0..=8 {
-                let fixture = Fixture::new().history(mode);
-                let db = fixture.open();
-                let first_id = fixture.operation(0, 1);
-                let captured_id = fixture.operation(0, 2);
-                let suffix_id = fixture.operation(0, 3);
-                let first = db.write_batch(first_id, vec![put(1)]).unwrap();
-                db.flush_index().unwrap();
-                let captured = db.write_batch(captured_id, vec![put(2)]).unwrap();
-                let suffix = db.write_batch(suffix_id, vec![put(3)]).unwrap();
-                db.drain().unwrap();
-                let (entered, waiting) = mpsc::sync_channel(1);
-                let (resume, gate) = mpsc::sync_channel(1);
-                {
-                    let mut hooks = db.core.test_hooks.lock();
-                    hooks.checkpoint_pause = Some((entered, gate));
-                    hooks.checkpoint_interruption = Some(stage);
-                }
-                let core = Arc::clone(&db.core);
-                let receipt = hold_publication(&core, suffix_id, captured);
-                core.start_checkpoint().unwrap();
-                waiting.recv_timeout(core.config.timeout).unwrap();
-                publish_receipt(&core, receipt, 0);
-                resume.send(()).unwrap();
-                assert!(
-                    core.progress_checkpoint(true).is_err(),
-                    "stage {stage}, mode {mode:?}"
-                );
-                assert!(core.ensure_healthy().is_err());
-                drop(core);
-                drop(db);
-                let mut recovered = fixture.open();
-                assert_eq!(
-                    recovered
-                        .get(KeySpace(0), &1u32.to_be_bytes())
-                        .unwrap()
-                        .unwrap()
-                        .as_ref(),
-                    &[3; 32],
-                    "stage {stage}, mode {mode:?}",
-                );
-                for (id, value, version) in [
-                    (first_id, 1, first),
-                    (captured_id, 2, captured),
-                    (suffix_id, 3, suffix),
-                ] {
-                    assert_eq!(
-                        recovered.write_batch(id, vec![put(value)]).unwrap(),
-                        version
-                    );
-                }
-                recovered.shutdown().unwrap();
+        for stage in 0..=8 {
+            let fixture = Fixture::new();
+            let db = fixture.open();
+            let first_id = fixture.operation(0, 1);
+            let captured_id = fixture.operation(0, 2);
+            let suffix_id = fixture.operation(0, 3);
+            let first = db.write_batch(first_id, vec![put(1)]).unwrap();
+            db.flush_index().unwrap();
+            let captured = db.write_batch(captured_id, vec![put(2)]).unwrap();
+            let suffix = db.write_batch(suffix_id, vec![put(3)]).unwrap();
+            db.drain().unwrap();
+            let (entered, waiting) = mpsc::sync_channel(1);
+            let (resume, gate) = mpsc::sync_channel(1);
+            {
+                let mut hooks = db.core.test_hooks.lock();
+                hooks.checkpoint_pause = Some((entered, gate));
+                hooks.checkpoint_interruption = Some(stage);
             }
+            let core = Arc::clone(&db.core);
+            let receipt = hold_publication(&core, suffix_id, captured);
+            core.start_checkpoint().unwrap();
+            waiting.recv_timeout(core.config.timeout).unwrap();
+            publish_receipt(&core, receipt, 0);
+            resume.send(()).unwrap();
+            assert!(core.progress_checkpoint(true).is_err(), "stage {stage}");
+            assert!(core.ensure_healthy().is_err());
+            drop(core);
+            drop(db);
+            let mut recovered = fixture.open();
+            assert_eq!(
+                recovered
+                    .get(KeySpace(0), &1u32.to_be_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                &[3; 32],
+                "stage {stage}",
+            );
+            for (id, value, version) in [
+                (first_id, 1, first),
+                (captured_id, 2, captured),
+                (suffix_id, 3, suffix),
+            ] {
+                assert_eq!(
+                    recovered.write_batch(id, vec![put(value)]).unwrap(),
+                    version
+                );
+            }
+            recovered.shutdown().unwrap();
         }
     }
 }
 
+// The pipeline Fixture serves only the leased live route.
 #[cfg(test)]
 mod retirement_request_tests {
     use super::super::pipeline_tests::Fixture;
@@ -1928,77 +1661,73 @@ mod retirement_request_tests {
 
     #[test]
     fn ordinary_checkpoint_after_idle_check_preserves_forced_retirement_request() {
-        for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
-            let fixture = Fixture::new().history(mode);
-            let db = fixture.open();
-            let version = db
-                .write_batch(fixture.operation(0, 1), vec![put(1)])
-                .unwrap();
-            db.drain().unwrap();
-            let (entered, waiting) = mpsc::sync_channel(1);
-            let (resume, gate) = mpsc::sync_channel(1);
-            db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-            let core = Arc::clone(&db.core);
-            let requested = IndexReadCut::At(MutationVersion {
-                batch: version,
-                operation_index: 0,
-            });
-            // Retirement observed idle; an ordinary checkpoint wins the start
-            // before retirement records its forced floor.
-            core.progress_checkpoint(true).unwrap();
-            core.start_checkpoint().unwrap();
-            waiting.recv_timeout(core.config.timeout).unwrap();
-            core_start_checkpoint_with_floor(&core, Some(requested.clone())).unwrap();
-            {
-                let mut publisher = core.publisher.lock();
-                let state = publisher.checkpoint_state();
-                assert_eq!(
-                    state
-                        .background_checkpoint
-                        .as_ref()
-                        .unwrap()
-                        .requested_floor,
-                    Some(requested.clone())
-                );
-            }
-            assert_eq!(core.index.retention_floor(), IndexReadCut::BeforeAll);
-            resume.send(()).unwrap();
-            core.progress_checkpoint(true).unwrap();
-            assert_eq!(core.index.retention_floor(), requested);
+        let fixture = Fixture::new();
+        let db = fixture.open();
+        let version = db
+            .write_batch(fixture.operation(0, 1), vec![put(1)])
+            .unwrap();
+        db.drain().unwrap();
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (resume, gate) = mpsc::sync_channel(1);
+        db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
+        let core = Arc::clone(&db.core);
+        let requested = IndexReadCut::At(MutationVersion {
+            batch: version,
+            operation_index: 0,
+        });
+        // Retirement observed idle; an ordinary checkpoint wins the start
+        // before retirement records its forced floor.
+        core.progress_checkpoint(true).unwrap();
+        core.start_checkpoint().unwrap();
+        waiting.recv_timeout(core.config.timeout).unwrap();
+        core_start_checkpoint_with_floor(&core, Some(requested.clone())).unwrap();
+        {
+            let mut publisher = core.publisher.lock();
+            let state = publisher.checkpoint_state();
             assert_eq!(
-                *core.publisher.lock().checkpoint_state().snapshot_generation,
-                2
+                state
+                    .background_checkpoint
+                    .as_ref()
+                    .unwrap()
+                    .requested_floor,
+                Some(requested.clone())
             );
         }
+        assert_eq!(core.index.retention_floor(), IndexReadCut::BeforeAll);
+        resume.send(()).unwrap();
+        core.progress_checkpoint(true).unwrap();
+        assert_eq!(core.index.retention_floor(), requested);
+        assert_eq!(
+            *core.publisher.lock().checkpoint_state().snapshot_generation,
+            2
+        );
     }
 
     #[test]
     fn forced_retirement_preserves_older_pin_clamp() {
-        for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
-            let fixture = Fixture::new().history(mode);
-            let db = fixture.open();
-            let first = db
-                .write_batch(fixture.operation(0, 1), vec![put(1)])
-                .unwrap();
-            let second = db
-                .write_batch(fixture.operation(0, 2), vec![put(2)])
-                .unwrap();
-            db.drain().unwrap();
-            let core = Arc::clone(&db.core);
-            let older = IndexReadCut::At(MutationVersion {
-                batch: first,
-                operation_index: 0,
-            });
-            let requested = IndexReadCut::At(MutationVersion {
-                batch: second,
-                operation_index: 0,
-            });
-            let pin = core.index.pin_cut(older.clone()).unwrap();
-            core.retire_history_before(requested.clone()).unwrap();
-            assert_eq!(core.index.retention_floor(), older);
-            drop(pin);
-            core.retire_history_before(requested.clone()).unwrap();
-            assert_eq!(core.index.retention_floor(), requested);
-        }
+        let fixture = Fixture::new();
+        let db = fixture.open();
+        let first = db
+            .write_batch(fixture.operation(0, 1), vec![put(1)])
+            .unwrap();
+        let second = db
+            .write_batch(fixture.operation(0, 2), vec![put(2)])
+            .unwrap();
+        db.drain().unwrap();
+        let core = Arc::clone(&db.core);
+        let older = IndexReadCut::At(MutationVersion {
+            batch: first,
+            operation_index: 0,
+        });
+        let requested = IndexReadCut::At(MutationVersion {
+            batch: second,
+            operation_index: 0,
+        });
+        let pin = core.index.pin_cut(older.clone()).unwrap();
+        core.retire_history_before(requested.clone()).unwrap();
+        assert_eq!(core.index.retention_floor(), older);
+        drop(pin);
+        core.retire_history_before(requested.clone()).unwrap();
+        assert_eq!(core.index.retention_floor(), requested);
     }
 }

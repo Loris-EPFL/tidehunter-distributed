@@ -151,18 +151,18 @@ class OperationScalingTests(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gcp-rdma"))
         import manual_campaign
         import risk_order
-        spec = copy.deepcopy(manual_campaign.REVIEWED_SPECS["recommended"])
+        spec = copy.deepcopy(manual_campaign.REVIEWED_SPECS["nvmeof_path_core"])
         jobs = manual_campaign._reviewed_jobs(spec)
         order = risk_order.generate_order(jobs)
         ordered = local_dry_run.ordered_jobs(spec, order)
-        self.assertEqual(len(ordered), 279)
+        self.assertEqual(len(ordered), 53)
         self.assertTrue(all(local_dry_run.scale_operations(job, 1.0) == job for job in ordered))
         spec["keys"] += 1
         with self.assertRaises(ValueError):
             local_dry_run.ordered_jobs(spec, order)
         order["matrix_sha256"] = "0" * 64
         with self.assertRaises(ValueError):
-            local_dry_run.ordered_jobs(manual_campaign.REVIEWED_SPECS["recommended"], order)
+            local_dry_run.ordered_jobs(manual_campaign.REVIEWED_SPECS["nvmeof_path_core"], order)
 
     def test_focused_default_scaling_is_rejected_before_fixture(self):
         import json
@@ -170,7 +170,7 @@ class OperationScalingTests(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gcp-rdma"))
         import manual_campaign
         import risk_order
-        spec = manual_campaign.REVIEWED_SPECS["recommended"]
+        spec = manual_campaign.REVIEWED_SPECS["nvmeof_path_core"]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "binary").touch()

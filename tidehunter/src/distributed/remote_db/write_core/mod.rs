@@ -15,7 +15,7 @@ mod publisher;
 #[cfg(test)]
 mod scenario_tests;
 mod sequencer;
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 pub(super) mod test_completion;
 pub(super) mod transport_budget;
 mod worker;

@@ -119,7 +119,8 @@ class Lifecycle(unittest.TestCase):
     def test_reviewed_valkey_read_fleet_cases_pass_compact_controller_admission(self):
         import cloud_controller
         runtime = cloud_controller.Controller.__new__(cloud_controller.Controller)
-        runtime.config = {"fleet": {"nodes": [{}]},
+        runtime.config = {"binary": "/unused/kv-research", "source_revision": "a" * 40,
+                          "fleet": {"nodes": [{}]},
                           "spec": {"mode": "focused", "selection": "valkey_rdma_reads"}}
         jobs = cloud_controller.cloud_campaign.make_focused_matrix("valkey_rdma_reads")
         self.assertEqual(len(jobs), 22)

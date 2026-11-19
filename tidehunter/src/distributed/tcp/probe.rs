@@ -29,12 +29,12 @@ impl Write for CountIo {
     }
 }
 
+/// A reply of `bytes * count` payload bytes. The owner-RPC `Records` reply
+/// (one vector entry per record) was removed with the payload route; no
+/// remaining reply carries a record vector, so the probe frames the same
+/// byte count as one string.
 fn payload(bytes: usize, count: usize) -> Response {
-    Response::Records(
-        (0..count)
-            .map(|index| vec![index as u8; bytes].into())
-            .collect(),
-    )
+    Response::Error("r".repeat(bytes * count))
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn profile_tcp_primitives() {
                 assert_eq!(response.id, id);
                 samples.push(began.elapsed().as_nanos());
                 assert!(
-                    matches!(black_box(response.body),Response::Records(records) if records.len()==count)
+                    matches!(black_box(response.body),Response::Error(message) if message.len()==bytes*count)
                 );
             }
             let elapsed = start.elapsed().as_nanos();

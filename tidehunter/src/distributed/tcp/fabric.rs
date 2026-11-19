@@ -347,12 +347,6 @@ impl Transport {
             Self::Tcp => "tcp",
             Self::TcpTrusted => "tcp-trusted",
             Self::Ofi { fabric, security } => match (&fabric.backend, security) {
-                (FabricBackend::Efa, FabricSecurity::MutualTls) => "ofi-efa-mutual-tls",
-                (FabricBackend::Efa, FabricSecurity::Trusted) => "ofi-efa-trusted",
-                (FabricBackend::EfaDirect, FabricSecurity::MutualTls) => {
-                    "ofi-efa-direct-mutual-tls"
-                }
-                (FabricBackend::EfaDirect, FabricSecurity::Trusted) => "ofi-efa-direct-trusted",
                 (FabricBackend::Verbs, FabricSecurity::MutualTls) => "ofi-verbs-mutual-tls",
                 (FabricBackend::Verbs, FabricSecurity::Trusted) => "ofi-verbs-trusted",
                 (FabricBackend::SoftwareTcp, FabricSecurity::MutualTls) => {
@@ -395,9 +389,9 @@ impl Transport {
             return Err(io::Error::other("TCP needs no fabric endpoint"));
         };
         if park_idle {
-            tidehunter_fabric::Endpoint::open_idle_parking(fabric, None)
+            tidehunter_fabric::Endpoint::open_idle_parking(fabric)
         } else {
-            tidehunter_fabric::Endpoint::open(fabric, None)
+            tidehunter_fabric::Endpoint::open(fabric)
         }
     }
 }

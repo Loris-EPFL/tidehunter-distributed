@@ -62,57 +62,6 @@ fn pair() -> Pair {
     panic!("TLS handshake did not finish");
 }
 
-#[cfg(feature = "experimental-fabric")]
-#[test]
-fn owned_record_segments_preserve_protocol_wire_bytes() {
-    let mut pair = pair();
-    let members = vec![
-        WireBytes::from(vec![1, 2, 3]),
-        WireBytes::from(minibytes::Bytes::from(vec![4, 5, 6, 7])),
-    ];
-    pair.session
-        .queue_native_records(19, members, None, 4096)
-        .unwrap();
-    let output = pair.session.output.back().unwrap();
-    assert!(output.bytes.is_empty());
-    assert!(output.segments.is_some());
-    let mut sources = [std::io::IoSlice::new(&[]); MAX_NATIVE_IOV];
-    let (source_count, source_bytes) = output.native_slices(PROGRESS_BYTES, &mut sources);
-    assert!(output.len <= PROGRESS_BYTES);
-    assert_eq!(source_bytes, output.len);
-    assert_eq!(
-        source_bytes,
-        sources[..source_count]
-            .iter()
-            .map(|slice| slice.len())
-            .sum::<usize>()
-    );
-    let frame = output.flatten();
-    let response: Envelope<Response> = pair.session.decode(&frame[4..], 4096).unwrap();
-    assert_eq!(response.protocol, PROTOCOL);
-    assert_eq!(response.id, 19);
-    let Response::Records(records) = response.body else {
-        panic!("unexpected response variant")
-    };
-    assert_eq!(records[0].as_slice(), [1, 2, 3]);
-    assert_eq!(records[1].as_slice(), [4, 5, 6, 7]);
-    let output = pair.session.output.back_mut().unwrap();
-    output.advance(7);
-    assert_eq!(output.offset, 7);
-    assert_eq!(output.flatten(), frame);
-
-    let profile = ServerReadProfile::default();
-    pair.session
-        .queue_native_records(20, vec![WireBytes::from(vec![8; 64])], Some(profile), 4096)
-        .unwrap();
-    let frame = pair.session.output.back().unwrap().flatten();
-    let response: Envelope<Response> = pair.session.decode(&frame[4..], 4096).unwrap();
-    assert!(matches!(
-        response.body,
-        Response::RecordsProfiled { records, .. } if records[0].as_slice() == [8; 64]
-    ));
-}
-
 #[test]
 fn work_profiles_disable_reset_and_preserve_live_frames() {
     let mut pair = pair();
@@ -487,12 +436,29 @@ fn later_tls_frame_submits_before_earlier_fence_and_preserves_stream_order() {
     assert_eq!(pair.session.transport_stats().output_retire_samples, 2);
 }
 
+/// One pending owner reply with the fields the output path reads. The read
+/// executor's reply lease was removed with the owner-RPC read route; the
+/// session's `charge` accounting is the remaining reply credit.
+fn pending_reply(charge: usize, response_queued: bool, deadline: Instant) -> ServerPending {
+    ServerPending {
+        partition: 0,
+        deadline,
+        kind: 8,
+        timeout: Duration::from_secs(2),
+        charge,
+        response_queued,
+        ready_response: None,
+        measured: false,
+        output_started: None,
+        control_queued: None,
+        is_append: false,
+        owner_trace: false,
+    }
+}
+
 #[test]
 fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
     let mut pair = pair();
-    let admission = Arc::new(
-        read_executor::ReadAdmission::new(read_executor::ReadExecutorConfig::default()).unwrap(),
-    );
     let mut pending = HashMap::new();
     let mut retained = 0;
     for id in 1..=SESSION_REQUESTS as u64 {
@@ -500,31 +466,7 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
         pair.session.queue(id, &vec![id as u8; 32], 1024).unwrap();
         pending.insert(
             id,
-            ServerPending {
-                partition: 0,
-                deadline: Instant::now() + Duration::from_secs(2),
-                kind: 8,
-                timeout: Duration::from_secs(2),
-                charge,
-                epoch: Some(1),
-                read_generation: None,
-                profile: None,
-                record_started: None,
-                executor_started: None,
-                read_profile: ServerReadProfile::default(),
-                response_queued: true,
-                ready_response: None,
-                response_ready_at: None,
-                measured: false,
-                output_started: None,
-                _lease: admission.reserve_reply(charge).unwrap(),
-                async_started: None,
-                async_handler_ns: 0,
-                control_queued: None,
-                is_append: false,
-                owner_trace: false,
-                owner_trace_shape: None,
-            },
+            pending_reply(charge, true, Instant::now() + Duration::from_secs(2)),
         );
         retained += charge;
         pair.session.stats.retained_reply_credit_bytes += charge as u64;
@@ -540,8 +482,7 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
         retire_responses(&mut pair.session, &mut pending, &mut retained, None);
     }
     assert_eq!(pending.len(), SESSION_REQUESTS);
-    assert_eq!(admission.stats().inflight_requests, SESSION_REQUESTS);
-    assert_eq!(admission.stats().inflight_bytes, retained);
+    assert_eq!(retained, SESSION_REQUESTS * 4096);
     assert_eq!(pair.session.output_bytes, owned);
     assert!(owned <= SESSION_BYTES);
     assert!(pair.session.queue(33, &0u8, 1024).is_err());
@@ -558,10 +499,10 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
     pair.session.finish_output(wire.accepted, first_fence);
     retire_responses(&mut pair.session, &mut pending, &mut retained, None);
     assert_eq!(pending.len(), SESSION_REQUESTS - 1);
-    assert_eq!(admission.stats().inflight_requests, SESSION_REQUESTS - 1);
+    assert_eq!(retained, (SESSION_REQUESTS - 1) * 4096);
     pair.session.finish_output(wire.accepted, wire.accepted);
     retire_responses(&mut pair.session, &mut pending, &mut retained, None);
-    assert_eq!(admission.stats().inflight_requests, 0);
+    assert!(pending.is_empty());
     assert_eq!(retained, 0);
     assert_eq!(
         pair.session.transport_stats().retained_reply_credit_bytes,
@@ -895,328 +836,51 @@ fn reset_drops_timing_not_live_output_ownership() {
     assert_eq!(pair.session.transport_stats().output_submit_samples, 0);
 }
 
-fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending> {
-    let admission =
-        read_executor::ReadAdmission::new(read_executor::ReadExecutorConfig::default()).unwrap();
-    HashMap::from([(
-        1,
-        ServerPending {
-            partition: 0,
-            deadline: Instant::now() + Duration::from_secs(2),
-            kind: 8,
-            timeout: Duration::from_secs(2),
-            charge: 4096,
-            epoch: Some(1),
-            read_generation: None,
-            profile: profiled.then(Instant::now),
-            record_started: profiled.then(Instant::now),
-            executor_started: None,
-            read_profile: ServerReadProfile::default(),
-            response_queued: false,
-            ready_response: None,
-            response_ready_at: None,
-            measured,
-            output_started: None,
-            _lease: Arc::new(admission).reserve_reply(4096).unwrap(),
-            async_started: measured.then(Instant::now),
-            async_handler_ns: 0,
-            control_queued: None,
-            is_append: false,
-            owner_trace: false,
-            owner_trace_shape: None,
-        },
-    )])
-}
+/// Ported from the owner-RPC read-completion test (removed route): a ready
+/// reply past its owner deadline closes the session without queueing, and a
+/// queued reply keeps its charge until transport retirement, not TLS
+/// acceptance.
 #[test]
-fn completed_response_rejects_fenced_or_poisoned_authority() {
-    use super::super::tests::{config, metrics};
-    for poison in [false, true] {
+fn ready_reply_deadline_and_retirement_follow_transport_fences() {
+    for expired in [false, true] {
         let mut pair = pair();
-        let node = StorageNode::open(config(&pair._temp.path().join("node")), metrics()).unwrap();
-        node.inventory.lock().fence_to(1).unwrap();
-        let generation = node.reader_snapshot(1, &[]).unwrap().generation;
-        let mut pending = completed_read(true, true);
-        pending.get_mut(&1).unwrap().read_generation = Some(generation);
-        finish_read(&mut pending, 1, Ok(vec![b"completed record"[..].into()])).unwrap();
-        let handler_ns = pending[&1].read_profile.handler_ns;
-        pending.get_mut(&1).unwrap().response_ready_at =
-            Some(Instant::now() - Duration::from_millis(1));
-        let mut profile = ConnectionProfile::default();
-        if poison {
-            node.poison_readers();
+        let charge = 4096;
+        let deadline = if expired {
+            Instant::now()
         } else {
-            node.inventory.lock().fence_to(2).unwrap();
-        }
-        // Fencing can persist metadata. Start the synthetic request deadline
-        // after that setup; this case tests authority rejection, not expiration.
-        pending.get_mut(&1).unwrap().deadline = Instant::now() + Duration::from_secs(2);
-        assert!(
-            flush_responses(
-                &node,
-                &mut pair.session,
-                &mut pending,
-                TcpLimits::default(),
-                Some(&mut profile),
-            )
-            .unwrap()
-        );
-        assert_eq!(profile.read_response_recheck_samples, 1);
-        assert_eq!(profile.read_response_recheck_errors, 1);
-        assert_eq!(profile.response_send_ns, 0);
-        let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
-        let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
-        let Response::ReadErrorProfiled {
-            profile: rejected, ..
-        } = reply.body
-        else {
-            panic!("fenced read did not retain its error profile");
+            Instant::now() + Duration::from_secs(2)
         };
-        assert_eq!(rejected.handler_ns, handler_ns);
-        assert_eq!(rejected.response_recheck_samples, 1);
-        assert!(pending[&1]._lease.is_some());
-        assert!(queue_response(&mut pending, 1, Response::Error("duplicate".into())).is_err());
-    }
-}
-
-#[test]
-fn fenced_sync_worker_response_retains_its_actual_read_profile() {
-    use super::super::tests::{batch, config, metrics};
-    use crate::distributed::storage::WalMemberReadPolicy;
-
-    let mut pair = pair();
-    let mut config = config(&pair._temp.path().join("sync-node"));
-    config.wal_member_read = WalMemberReadPolicy::Mapped;
-    let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let batch = batch(&config, 1, 0);
-    let Response::Appended(receipts) = node
-        .handle(
-            Request::Append {
-                epoch: 1,
-                batches: vec![batch.encoded().clone().into()],
-            },
-            TcpLimits::default(),
-        )
-        .unwrap()
-    else {
-        panic!("append did not return receipts");
-    };
-    let reference = batch.record_reference(receipts[0].address, 0).unwrap();
-    let generation = node.reader_snapshot(1, &[reference]).unwrap().generation;
-    let response = node
-        .read_response::<true>(1, vec![reference], TcpLimits::default())
-        .unwrap();
-    let Response::RecordsProfiled { profile, .. } = &response else {
-        panic!("sync worker did not return a profile");
-    };
-    let expected = *profile;
-    let mut pending = completed_read(false, true);
-    pending.get_mut(&1).unwrap().read_generation = Some(generation);
-    queue_response(&mut pending, 1, response).unwrap();
-    node.inventory.lock().fence_to(2).unwrap();
-    pending.get_mut(&1).unwrap().deadline = Instant::now() + Duration::from_secs(2);
-    flush_responses(
-        &node,
-        &mut pair.session,
-        &mut pending,
-        TcpLimits::default(),
-        None,
-    )
-    .unwrap();
-    let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
-    let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
-    let Response::ReadErrorProfiled { profile, .. } = reply.body else {
-        panic!("fenced sync response lost its error profile");
-    };
-    assert_eq!(profile.handler_ns, expected.handler_ns);
-    assert_eq!(profile.authority_lookup_ns, expected.authority_lookup_ns);
-    assert_eq!(profile.record_read_ns, expected.record_read_ns);
-    assert_eq!(profile.wal.sync_reader_requests, 1);
-    assert_eq!(profile.response_recheck_samples, 1);
-}
-
-#[test]
-fn recheck_profiles_success_and_preserves_member_errors() {
-    use super::super::tests::{config, metrics};
-    for failed_read in [false, true] {
-        let mut pair = pair();
-        let node = StorageNode::open(config(&pair._temp.path().join("node")), metrics()).unwrap();
-        node.inventory.lock().fence_to(1).unwrap();
-        let generation = node.reader_snapshot(1, &[]).unwrap().generation;
-        let mut pending = completed_read(false, true);
-        pending.get_mut(&1).unwrap().read_generation = Some(generation);
-        let result = if failed_read {
-            Err(TcpError::new("member read failed"))
-        } else {
-            Ok(vec![b"completed record"[..].into()])
-        };
-        finish_read(&mut pending, 1, result).unwrap();
-        assert!(
-            flush_responses(
-                &node,
-                &mut pair.session,
-                &mut pending,
-                TcpLimits::default(),
-                None,
-            )
-            .unwrap()
-        );
-        let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
-        let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
-        match reply.body {
-            Response::RecordsProfiled { records, profile } if !failed_read => {
-                assert_eq!(records[0].as_slice(), b"completed record");
-                assert_eq!(profile.response_recheck_samples, 1);
-                assert_eq!(
-                    wire_codec(4096).serialized_size(&profile).unwrap() as usize,
-                    SERVER_READ_PROFILE_BYTES,
-                );
-            }
-            Response::ReadErrorProfiled { message, profile } if failed_read => {
-                assert_eq!(message, "member read failed");
-                assert_eq!(profile.response_recheck_samples, 1);
-            }
-            _ => panic!("read error or profile was lost"),
-        }
-    }
-}
-
-#[test]
-fn ordinary_completed_reads_do_not_start_recheck_clocks() {
-    use super::super::tests::{config, metrics};
-    let pair = pair();
-    let node = StorageNode::open(config(&pair._temp.path().join("node")), metrics()).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let generation = node.reader_snapshot(1, &[]).unwrap().generation;
-    let mut pending = completed_read(false, false);
-    pending.get_mut(&1).unwrap().read_generation = Some(generation);
-    finish_read(&mut pending, 1, Ok(vec![b"record"[..].into()])).unwrap();
-    assert!(pending[&1].response_ready_at.is_none());
-    assert!(matches!(
-        pending[&1].ready_response.as_ref(),
-        Some(Response::Records(_))
-    ));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
-    use super::super::tests::{batch, config, metrics};
-    for (fenced, expired) in [(false, false), (true, false), (false, true)] {
-        let mut pair = pair();
-        let config = config(&pair._temp.path().join("node"));
-        let node = StorageNode::open(config.clone(), metrics()).unwrap();
-        node.inventory.lock().fence_to(1).unwrap();
-        let batch = batch(&config, 1, 0);
-        let Response::Appended(receipts) = node
-            .handle(
-                Request::Append {
-                    epoch: 1,
-                    batches: vec![batch.encoded().clone().into()],
-                },
-                TcpLimits::default(),
-            )
-            .unwrap()
-        else {
-            panic!("append did not return receipts")
-        };
-        let reference = batch.record_reference(receipts[0].address, 0).unwrap();
-        let snapshot = node.reader_snapshot(1, &[reference]).unwrap();
-        let mut pending = completed_read(true, true);
-        let request = pending.get_mut(&1).unwrap();
-        request.read_generation = Some(snapshot.generation);
-        request.charge = read_charge(&[reference]).unwrap();
-        request._lease = node.read_admission.reserve_reply(request.charge).unwrap();
-        let mut executor =
-            read_executor::ReadExecutor::new(node.read_config, node.read_admission.clone())
-                .unwrap();
-        let ReadPlanning::Ready(plans) = resident_read_plans(snapshot.members).unwrap() else {
-            panic!("current append authority must be resident")
-        };
-        assert!(matches!(
-            executor
-                .submit_planned_profiled(
-                    1,
-                    plans,
-                    &mut request._lease,
-                    Some(&mut request.read_profile.wal),
-                )
-                .unwrap(),
-            read_executor::SubmitOutcome::Pending,
-        ));
-        // Deterministically leave a real ready CQE for the exact helper called
-        // after the server's submission turn. Do not synthesize record bytes.
-        executor.wait_for_ready_completion().unwrap();
-        let progressed = harvest_reads(&mut executor, &mut pending).unwrap();
-        assert!(progressed);
-        let progressed = harvest_reads(&mut executor, &mut pending).unwrap();
-        assert!(!progressed);
-        assert!(pending[&1].ready_response.is_some());
-        assert!(pending[&1]._lease.is_some());
-        assert_eq!(node.read_admission.stats().inflight_reads, 0);
-        assert_eq!(node.read_admission.stats().inflight_requests, 1);
-        if fenced {
-            node.inventory.lock().fence_to(2).unwrap();
-            // Fencing persists metadata (tens of fsyncs). As in the other
-            // recheck tests here, start the synthetic request deadline after
-            // it: this pass tests authority rejection, not fence latency.
-            pending.get_mut(&1).unwrap().deadline = Instant::now() + Duration::from_secs(2);
-        }
-        if expired {
-            pending.get_mut(&1).unwrap().deadline = Instant::now();
-        }
-        let queued = flush_responses(
-            &node,
-            &mut pair.session,
-            &mut pending,
-            TcpLimits::default(),
-            None,
-        );
+        let mut request = pending_reply(charge, false, deadline);
+        request.ready_response = Some(Response::Error("ready reply".into()));
+        let mut pending = HashMap::from([(1, request)]);
+        let queued = flush_responses(&mut pair.session, &mut pending, TcpLimits::default(), None);
         if expired {
             assert!(queued.is_err());
             assert!(pair.session.output.is_empty());
-            assert_eq!(node.read_admission.stats().inflight_requests, 1);
-            drop(pending);
-            assert_eq!(node.read_admission.stats().inflight_requests, 0);
+            assert_eq!(pair.session.stats.retained_reply_credit_bytes, 0);
             continue;
         }
         assert!(queued.unwrap());
+        assert_eq!(
+            pair.session.stats.retained_reply_credit_bytes,
+            charge as u64
+        );
         let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
         let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
-        if fenced {
-            let Response::ReadErrorProfiled { profile, .. } = reply.body else {
-                panic!("fenced asynchronous read lost its error profile");
-            };
-            assert_eq!(profile.response_recheck_samples, 1);
-            assert_eq!(profile.wal.async_count, 1);
-        } else {
-            let Response::RecordsProfiled { records, .. } = reply.body else {
-                panic!("completed read lost its profile")
-            };
-            assert_eq!(
-                CompleteBatch::decode_record(
-                    &KeyShape::from_yaml(&config.shape_yaml).unwrap(),
-                    &reference,
-                    records.into_iter().next().unwrap().into_bytes(),
-                )
-                .unwrap(),
-                batch.mutations()[0],
-            );
-        }
+        assert!(matches!(reply.body, Response::Error(message) if message == "ready reply"));
         let mut wire = Wire {
             allowance: usize::MAX,
             ..Wire::default()
         };
         submit_frames(&mut pair.session, &mut wire, 1);
-        let mut retained = pending[&1].charge;
+        let mut retained = charge;
         retire_responses(&mut pair.session, &mut pending, &mut retained, None);
         assert_eq!(pending.len(), 1, "TLS acceptance is not CQ retirement");
-        assert_eq!(node.read_admission.stats().inflight_requests, 1);
         pair.session.finish_output(wire.accepted, wire.accepted);
         retire_responses(&mut pair.session, &mut pending, &mut retained, None);
         assert!(pending.is_empty());
         assert_eq!(retained, 0);
-        assert_eq!(node.read_admission.stats().inflight_requests, 0);
+        assert_eq!(pair.session.stats.retained_reply_credit_bytes, 0);
     }
 }
 

@@ -1,7 +1,6 @@
 //! Shared write engine. Callers allocate/encode; owner workers publish durable
 //! batches. Checkpoint persistence owns no foreground or publication lock.
 
-use super::super::receipt_history::ReceiptHistory;
 use super::super::{
     AppendedBatch, AuthorityManifest, AuthorityWriteStats, BackgroundCheckpoint, BatchId,
     CheckpointDiagnostic, CheckpointDiagnosticSummary, ControlHandle, IndexReadCut, LocalDbError,
@@ -30,7 +29,6 @@ use std::sync::{
 /// without cloning maps or exposing the legacy authority's clients/admission.
 pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub known: &'a mut HashMap<BatchId, AppendedBatch>,
-    pub receipt_history: &'a mut Option<ReceiptHistory>,
     pub stream_last: &'a mut BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: &'a mut BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: &'a mut BTreeSet<(u32, u64)>,
@@ -55,7 +53,6 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     /// publication path (writer → publisher) installs views from it.
     pub view_budget: crate::distributed::native_index::StandingViewBudget,
     pub known: HashMap<BatchId, AppendedBatch>,
-    pub receipt_history: Option<ReceiptHistory>,
     pub stream_last: BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: BTreeSet<(u32, u64)>,
@@ -85,7 +82,6 @@ impl PublisherState {
     ) -> PublisherCheckpoint<'_> {
         PublisherCheckpoint {
             known: &mut self.known,
-            receipt_history: &mut self.receipt_history,
             stream_last: &mut self.stream_last,
             positions: &mut self.positions,
             committed_complete: &mut self.committed_complete,
@@ -152,13 +148,8 @@ pub(in crate::distributed::remote_db) struct OpenState {
     pub write_profile: Arc<Mutex<WriteProfileSnapshot>>,
     pub write_timeline: Arc<WriteTimeline>,
     pub clients: Vec<super::super::ClientWorker>,
-    pub operational_sampler: super::super::OperationalReadIoSampler,
     pub durable_cut: Option<super::super::durable_cut::DurableCut>,
-    pub transport_pool: Option<Arc<super::super::RemoteTransportPool>>,
-    pub transport_key: Option<[u8; 32]>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     pub publisher: PublisherState,
     pub stats: CoreStats,
@@ -217,14 +208,9 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub stopped: AtomicBool,
     pub closing: AtomicBool,
     pub clients: Vec<super::super::ClientWorker>,
-    pub operational_sampler: super::super::OperationalReadIoSampler,
     /// Present when this epoch is tracked under durable-prefix recovery.
     pub durable_cut: Option<super::super::durable_cut::DurableCut>,
-    pub transport_pool: Option<Arc<super::super::RemoteTransportPool>>,
-    pub transport_key: Option<[u8; 32]>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     #[cfg(test)]
     pub test_hooks: Mutex<TestHooks>,
@@ -297,13 +283,8 @@ impl WriteCore {
             closing: AtomicBool::new(false),
             owner_controls,
             clients: open.clients,
-            operational_sampler: open.operational_sampler,
             durable_cut: open.durable_cut,
-            transport_pool: open.transport_pool,
-            transport_key: open.transport_key,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool: open.live_pool,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics: open.live_metrics,
             #[cfg(test)]
             test_hooks: Mutex::new(TestHooks::default()),
@@ -378,74 +359,71 @@ impl WriteCore {
                 return Err(LocalDbError::new("TCP worker stopped"));
             }
         };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         handle.wake_worker()?;
         Ok(coalesced)
     }
 
-    /// Check the in-flight table before snapshotting persisted retry authority.
-    /// Checkpoint installs the new history root before removing covered table
-    /// entries; cloning only after a shard miss therefore cannot miss a retired
-    /// identity. The allocation critical section must recheck the shard after
-    /// this no-lock I/O, because a concurrent first writer can insert meanwhile.
+    /// Check the identity table, which holds in-flight, suffix and recent
+    /// WAL-replay retry identities. The allocation critical section must
+    /// recheck the shard, because a concurrent first writer can insert meanwhile.
     pub(super) fn lookup_identity(
         &self,
         operation: [u8; 16],
     ) -> Result<Option<IdentityEntry>, LocalDbError> {
-        self.lookup_identity_at(operation)
-            .map(|(identity, _)| identity)
+        self.ensure_healthy()?;
+        Ok(self.identities.lookup(operation))
     }
 
-    /// `lookup_identity` plus the identity shard's retirement generation,
-    /// captured with the table miss and before the history snapshot. A miss
-    /// is a valid first-write decision at allocation only while the generation
-    /// is unchanged: a concurrent writer of the same operation may otherwise
-    /// have published and been retired into a newer history root meanwhile.
-    pub(super) fn lookup_identity_at(
-        &self,
-        operation: [u8; 16],
-    ) -> Result<(Option<IdentityEntry>, u64), LocalDbError> {
-        self.ensure_healthy()?;
-        let (identity, retirements) = self.identities.lookup(operation);
-        if identity.is_some()
-            || self.config.history_persistence
-                == crate::distributed::storage::HistoryPersistence::WalReplay
-        {
-            return Ok((identity, retirements));
-        }
-        let history = self
-            .publisher
-            .lock()
-            .checkpoint_state()
-            .receipt_history
-            .clone();
-        let receipt = history
-            .as_ref()
-            .map(|history| {
-                history.lookup(BatchId {
-                    database: self.config.storage.database,
-                    operation,
-                })
-            })
-            .transpose()
-            .inspect_err(|error| self.fail(LocalDbError::new(error.message())))?
-            .flatten();
-        self.ensure_healthy()?;
-        let identity = receipt.map(|receipt| IdentityEntry {
-            version: receipt.version(),
-            digest: Some(receipt.digest()),
-            seq: receipt.version().sequence,
-            class: IdentityClass::Recent,
-        });
-        Ok((identity, retirements))
-    }
-
-    /// Resident completed/in-flight write bookkeeping, excluding pageable
-    /// receipt files, allocator overhead and the separately reported index.
+    /// Resident completed/in-flight write bookkeeping, excluding allocator
+    /// overhead and the separately reported index.
     /// Publisher, identity and key shards are locked one at a time.
     pub(in crate::distributed::remote_db) fn metadata_history_bytes(&self) -> usize {
         let publisher = Self::publisher_resident_bytes(&self.publisher.lock());
         publisher + self.identities.resident_bytes() + self.dependencies.resident_bytes()
+    }
+
+    /// Retained operation identities of every class (Active, Suffix, Recent).
+    #[cfg(test)]
+    pub(in crate::distributed::remote_db) fn resident_identities(&self) -> usize {
+        [
+            IdentityClass::Active,
+            IdentityClass::Suffix,
+            IdentityClass::Recent,
+        ]
+        .into_iter()
+        .map(|class| self.identities.count(class))
+        .sum()
+    }
+
+    /// Static upper bound of [`Self::metadata_history_bytes`] under the fixed
+    /// WAL-replay retry window (`WAL_REPLAY_WINDOW_BATCHES` receipts), from
+    /// configuration and entry sizes only. Live entries: `known` ≤
+    /// `max_admitted_batches`; `recent` ≤ the window; identities ≤ the window
+    /// (Recent) plus one admission credit each for Active/Suffix (≤
+    /// `max_admitted_batches`); dependency keys belong to admitted batches. A
+    /// std `HashMap` holding at most `n` live entries never keeps more than
+    /// `4 * (n + 1) + 8` slots (it grows only when over half full, and both
+    /// registries shrink a shard above four slots per entry), so the shard sums
+    /// add at most 12 slots per shard. A `VecDeque` at most doubles past its
+    /// peak length or its initial window capacity.
+    #[cfg(test)]
+    pub(in crate::distributed::remote_db) fn metadata_history_bound(&self) -> usize {
+        let window = super::super::WAL_REPLAY_WINDOW_BATCHES;
+        let admitted = self.config.max_admitted_batches;
+        let map = |live: usize| 4 * (live + 1) + 8;
+        let known =
+            map(admitted) * (std::mem::size_of::<BatchId>() + std::mem::size_of::<AppendedBatch>());
+        let recent = 2 * window * std::mem::size_of::<RecentReceipt>();
+        let identities = (4 * (window + admitted) + 12 * self.identities.shard_count())
+            * IdentityTable::entry_bytes();
+        // Spilled key storage of one batch is below its encoded size; a
+        // spilled buffer at most doubles past its length.
+        let dependencies =
+            (4 * admitted * self.config.storage.batch_limits.max_operations as usize
+                + 12 * self.dependencies.shard_count())
+                * DependencyRegistry::entry_bytes()
+                + 2 * admitted * self.config.storage.batch_limits.max_encoded_bytes;
+        known + recent + identities + dependencies
     }
 
     /// Metrics variant: contention on the publisher or on any identity or key
@@ -462,10 +440,6 @@ impl WriteCore {
     fn publisher_resident_bytes(publisher: &PublisherState) -> usize {
         publisher.known.capacity()
             * (std::mem::size_of::<BatchId>() + std::mem::size_of::<AppendedBatch>())
-            + publisher
-                .receipt_history
-                .as_ref()
-                .map_or(0, ReceiptHistory::cached_metadata_bytes)
             + publisher.recent.capacity() * std::mem::size_of::<RecentReceipt>()
     }
 
@@ -486,15 +460,21 @@ impl WriteCore {
         &self,
         next: u64,
     ) -> Result<(), LocalDbError> {
-        self.wait_published_inner(next).map_err(|mut error| {
-            if error.uncertain_version.is_none() {
-                error.uncertain_version = self
-                    .first_failure
-                    .get()
-                    .and_then(super::super::FirstFailure::version);
-            }
-            error
-        })
+        self.wait_published_inner(next)
+            .map_err(|error| self.with_first_failure_version(error))
+    }
+
+    /// Names the first causal failure's uncertain version on `error` unless
+    /// it already names one. Every fail-stop error a waiter can observe
+    /// (early health check or wait) must carry it.
+    pub(super) fn with_first_failure_version(&self, mut error: LocalDbError) -> LocalDbError {
+        if error.uncertain_version.is_none() {
+            error.uncertain_version = self
+                .first_failure
+                .get()
+                .and_then(super::super::FirstFailure::version);
+        }
+        error
     }
 
     /// The old authority filled the post-publish read cache and installed the
@@ -727,7 +707,6 @@ impl WriteCore {
         for (_, owner) in &self.owner_controls {
             if let Some(sender) = owner.sender.upgrade() {
                 let _ = sender.try_send(super::super::Command::QueueReady);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let _ = owner.wake_worker();
             }
         }
@@ -1061,55 +1040,6 @@ mod tests {
         );
         drop(credit);
         assert!(core.shutdown().is_err());
-    }
-
-    #[test]
-    fn history_lookup_covers_identity_retired_by_concurrent_checkpoint() {
-        use crate::distributed::codec::Mutation;
-        use crate::distributed::storage::HistoryPersistence;
-        use crate::key_shape::KeySpace;
-        use std::time::Duration;
-
-        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-        let database = fixture.open();
-        let operation = fixture.operation(0, 19);
-        let version = database
-            .write_batch(
-                operation,
-                vec![Mutation::Put {
-                    keyspace: KeySpace(0),
-                    key: 19u32.to_be_bytes().to_vec().into(),
-                    value: vec![9; 32].into(),
-                }],
-            )
-            .unwrap();
-        assert_eq!(version.sequence, 0);
-        let (entered, waiting) = mpsc::sync_channel(1);
-        let (resume, gate) = mpsc::sync_channel(1);
-        database.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-        let core = Arc::clone(&database.core);
-        let before = core.lookup_identity(operation).unwrap().unwrap();
-        assert_eq!(before.version, version);
-        assert_eq!(before.class, IdentityClass::Suffix);
-        core.start_checkpoint().unwrap();
-        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-        let during = core.lookup_identity(operation).unwrap().unwrap();
-        assert_eq!(during.version, version);
-        assert_eq!(during.digest, before.digest);
-        assert_eq!(during.class, IdentityClass::Suffix);
-        resume.send(()).unwrap();
-        core.progress_checkpoint(true).unwrap();
-        assert!(
-            core.identities
-                .with_operation(operation, |entries| entries.get(&operation).copied())
-                .is_none()
-        );
-        let after = core.lookup_identity(operation).unwrap().unwrap();
-        assert_eq!(after.version, version);
-        assert_eq!(after.digest, before.digest);
-        assert_eq!(after.class, IdentityClass::Recent);
-        core.wait_published_before(1).unwrap();
-        core.shutdown().unwrap();
     }
 
     /// Replaces the deleted PublicationTracker sparse test on the live

@@ -38,24 +38,18 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
     let mut result = Vec::with_capacity(3);
     for node in parsed {
         let opts = parse_options(&node.options)?;
-        if let Some(remote) = &opts.external_remote_config {
-            remote.validate()?;
-            if opts
-                .database
-                .is_some_and(|db| db != remote.storage.database)
-                || opts
-                    .batch_limits
-                    .is_some_and(|limits| limits != remote.storage.batch_limits)
-            {
-                return Err("conflicting external replay database identity or batch limits".into());
-            }
+        let remote = &opts.external_remote_config;
+        remote.validate()?;
+        if opts
+            .database
+            .is_some_and(|db| db != remote.storage.database)
+            || opts
+                .batch_limits
+                .is_some_and(|limits| limits != remote.storage.batch_limits)
+        {
+            return Err("conflicting external replay database identity or batch limits".into());
         }
-        let database = opts
-            .external_remote_config
-            .as_ref()
-            .map(|c| c.storage.database)
-            .or(opts.database)
-            .ok_or("distributed replay requires an explicit database identity per node DB")?;
+        let database = remote.storage.database;
         if !identities.insert(database) {
             return Err("distributed replay node DB identities must be distinct".into());
         }
@@ -77,31 +71,19 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
             return Err("distributed replay node DB paths must not overlap".into());
         }
         paths.push(resolved);
-        if !opts.nvmeof_readers.is_empty() {
-            return Err(
-                "checkpoint replay requires owner RPC or live NVMe-oF, not sealed-WAL readers"
-                    .into(),
-            );
-        }
-        batch_limits(&opts)?.validate()?;
+        batch_limits(&opts).validate()?;
         result.push((node.db_id, node.options, opts));
     }
     let first = &result[0].2;
     for (_, _, other) in &result[1..] {
+        // Every node DB uses the leased live route (external_remote_config is required).
         if !first.transport.same_protocol(&other.transport)
             || first.durability_tier != other.durability_tier
-            || first
-                .external_remote_config
-                .as_ref()
-                .and_then(|c| c.live_nvme.as_ref())
-                .map(|c| c.write_mode)
-                != other
-                    .external_remote_config
-                    .as_ref()
-                    .and_then(|c| c.live_nvme.as_ref())
-                    .map(|c| c.write_mode)
         {
-            return Err("distributed replay node DBs must use the same transport, live write mode and durability tier".into());
+            return Err(
+                "distributed replay node DBs must use the same transport and durability tier"
+                    .into(),
+            );
         }
     }
     Ok(result)
@@ -119,12 +101,8 @@ fn resolve_path(path: &std::path::Path) -> BackendResult<std::path::PathBuf> {
     }
     Ok(resolved)
 }
-fn batch_limits(opts: &Options) -> BackendResult<BatchLimits> {
-    opts.external_remote_config
-        .as_ref()
-        .map(|c| c.storage.batch_limits)
-        .or(opts.batch_limits)
-        .ok_or_else(|| "distributed replay requires explicit complete-batch limits".into())
+fn batch_limits(opts: &Options) -> BatchLimits {
+    opts.external_remote_config.storage.batch_limits
 }
 pub(super) fn shape(tables: &[Table], db: u16) -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
@@ -168,7 +146,7 @@ impl TidehunterReplayBackend {
         }
         for (id, _, opts) in &parsed {
             let shape = shape(&trace.tables, *id);
-            let limits = batch_limits(opts)?;
+            let limits = batch_limits(opts);
             // Use the actual codec on the immutable source rows before opening owners.
             // Expanded keys have identical lengths. Never split the 519-member output batch.
             for entries in trace
@@ -219,12 +197,7 @@ impl TidehunterReplayBackend {
         let opts = options(value)?;
         let mut wal = 0;
         for (_, _, node) in &opts {
-            let bytes = node
-                .external_remote_config
-                .as_ref()
-                .map_or(node.owner_wal_geometry.wal_file_bytes(), |c| {
-                    c.storage.wal_file_bytes
-                });
+            let bytes = node.external_remote_config.storage.wal_file_bytes;
             wal = wal.max(
                 bytes
                     .checked_mul(node.owners as u64)
@@ -234,7 +207,7 @@ impl TidehunterReplayBackend {
         Ok(serde_json::json!({
             "wal_file_size":wal, "admission_path":opts[0].2.path,
             "databases":value["databases"], "node_databases":opts.len(),
-            "owner_disk_admission":"local owner roots share their per-DB coordinator filesystem; external owner capacity is not observable here",
+            "owner_disk_admission":"external owner capacity is not observable here",
             "atomicity":"complete batch within one node DB; no cross-DB atomicity",
             "scope":crate::mainnet_trace::SCOPE
         }))
@@ -380,8 +353,8 @@ impl ReplayBackend for TidehunterReplayBackend {
         // codec::CompleteBatch is one CRC-framed all-or-none recovery record, allocated
         // wholly to one owner. Publication follows the complete owner receipt. This is
         // crash-recovery batch atomicity, not a serializable multi-key read transaction.
-        // Owner RPC acknowledgements use the confirmed durability tier; leased live
-        // writes acknowledge their configured device completion before owner adoption.
+        // Leased live writes acknowledge their configured device completion before
+        // owner adoption.
         batch.commit().map_err(native_error)
     }
     fn physical_counts(&self) -> serde_json::Value {
@@ -414,12 +387,6 @@ impl ReplayBackend for TidehunterReplayBackend {
                 .ok_or("replay DB closed")?
                 .validate_cached_read()
                 .map_err(|e| format!("distributed replay node DB {id} health: {e:?}"))?;
-            drop(
-                backend
-                    .cluster
-                    .lock()
-                    .map_err(|_| "distributed replay owner cluster lock poisoned")?,
-            );
         }
         Ok(())
     }
@@ -427,4 +394,4 @@ impl ReplayBackend for TidehunterReplayBackend {
 
 mod resources;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

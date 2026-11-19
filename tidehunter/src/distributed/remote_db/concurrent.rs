@@ -110,10 +110,6 @@ pub(super) struct Admission {
     max_bytes: usize,
     max_identities: usize,
     max_index_bytes: usize,
-    /// Hard checkpoint-tail bound; None in WalReplay mode, where recovery
-    /// replays the WAL and the old engine never bounded the tail either.
-    /// The replay charges are still counted for checkpoint_due and release.
-    replay_limits: Option<ReplayLimits>,
     partition_batches: usize,
     reference_bytes: usize,
     index: Arc<NativeIndex>,
@@ -217,9 +213,7 @@ impl Admission {
             })
             .and_then(|entries| usize::try_from(entries).ok())
             .unwrap_or(0);
-        let max_identities = if database.config.history_persistence == HistoryPersistence::WalReplay
-            && metadata_identities >= WAL_REPLAY_WINDOW_BATCHES
-        {
+        let max_identities = if metadata_identities >= WAL_REPLAY_WINDOW_BATCHES {
             database.config.max_admitted_batches
         } else {
             database
@@ -243,8 +237,6 @@ impl Admission {
             max_bytes: database.config.max_pending_bytes,
             max_identities,
             max_index_bytes: database.config.max_index_bytes,
-            replay_limits: (database.config.history_persistence != HistoryPersistence::WalReplay)
-                .then_some(database.config.replay_limits),
             partition_batches: database.config.storage.max_batches_per_partition.min(1024),
             reference_bytes: database.config.storage.max_reference_metadata_bytes,
             index: Arc::clone(&database.index),
@@ -461,22 +453,9 @@ impl Admission {
             .map_or(self.max_identities, |limit| limit.min(self.max_identities));
         #[cfg(not(test))]
         let max_identities = self.max_identities;
-        let reason = if self.replay_limits.is_some_and(|limits| {
-            tail.replay_batches
-                .checked_add(grant.replay_batches)
-                .is_none_or(|n| n > limits.max_batches)
-        }) {
-            "tail_batches"
-        } else if self.replay_limits.is_some_and(|limits| {
-            !limits.admits(
-                tail.replay_batches,
-                tail.replay_bytes,
-                grant.replay_batches,
-                grant.replay_bytes,
-            )
-        }) {
-            "tail_bytes"
-        } else if tail
+        // WAL replay has no hard tail bound, as the native engine has none:
+        // the replay charges are counted only for checkpoint_due and release.
+        let reason = if tail
             .identities
             .checked_add(grant.identities)
             .is_none_or(|n| n > max_identities)
@@ -495,12 +474,8 @@ impl Admission {
             reason,
             batches: tail.replay_batches,
             encoded_bytes: tail.replay_bytes,
-            max_batches: self
-                .replay_limits
-                .map_or(usize::MAX, |limits| limits.max_batches),
-            max_encoded_bytes: self
-                .replay_limits
-                .map_or(usize::MAX, |limits| limits.max_encoded_bytes),
+            max_batches: usize::MAX,
+            max_encoded_bytes: usize::MAX,
             incoming_encoded_bytes: Some(grant.replay_bytes),
         })
     }
@@ -661,10 +636,6 @@ impl Admission {
             || grant.slots > self.max_requests
             || grant.identities > self.max_identities
             || grant.index_bytes > self.max_index_bytes
-            || self.replay_limits.is_some_and(|limits| {
-                grant.replay_batches > limits.max_batches
-                    || grant.replay_bytes > limits.max_encoded_bytes
-            })
         {
             return Err(LocalDbError::new("write exceeds admission window capacity"));
         }
@@ -817,11 +788,9 @@ pub struct FabricProviderEvidence {
     pub open_profile: Option<tidehunter_fabric::OpenProfile>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type LiveTargetReports = Vec<(u32, super::super::nvmeof::LiveTargetStats)>;
 
 /// Evidence collected only after the final sealed authority and initiator drain.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub struct LiveFinalShutdownEvidence {
     pub metrics: super::super::nvmeof::live_metrics::LiveNvmeStats,
     pub targets: LiveTargetReports,
@@ -837,7 +806,6 @@ pub struct ConcurrentRemoteDatabase {
     pub(super) reads: Arc<ReadService>,
     pub(super) cache: Arc<ReadCache>,
     write_profile: Arc<Mutex<WriteProfileSnapshot>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_metrics: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>>,
     pub(crate) write_timeline: Arc<WriteTimeline>,
     pub(super) shape: KeyShape,
@@ -847,8 +815,6 @@ pub struct ConcurrentRemoteDatabase {
     pub(super) read_resolve_ns: AtomicU64,
     pub(super) value_read_ns: AtomicU64,
     io_clients: Vec<(u32, ControlHandle)>,
-    operational_monitor: OperationalReadIoMonitor,
-    operational_lifecycle: std::sync::Weak<Mutex<OperationalReadIoLifecycle>>,
 }
 
 fn owner_timeline_error(
@@ -881,7 +847,6 @@ impl ConcurrentRemoteDatabase {
         self.database.storage_stats()
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
         self.live_metrics.as_ref().map(|metrics| metrics.snapshot())
     }
@@ -1042,44 +1007,10 @@ impl ConcurrentRemoteDatabase {
             .collect()
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn install_nvmeof_file_fixture(
-        &self,
-        config: super::super::nvmeof::NvmeofReaderConfig,
-        path: &std::path::Path,
-    ) -> Result<(), LocalDbError> {
-        self.ensure_healthy()?;
-        self.reads
-            .install_nvmeof_file_fixture(config, &self.config, &self.shape, path)
-    }
-
-    /// Install a verified sealed-WAL reader while all reads are idle.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn install_nvmeof_reader(
-        &self,
-        config: super::super::nvmeof::NvmeofReaderConfig,
-    ) -> Result<(), LocalDbError> {
-        self.ensure_healthy()?;
-        self.reads
-            .install_nvmeof_reader(config, &self.config, &self.shape)
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn clear_nvmeof_reader(&self) -> Result<(), LocalDbError> {
-        self.reads.clear_nvmeof_reader()
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn nvmeof_stats(&self) -> Vec<super::super::nvmeof::NvmeofStats> {
-        self.reads.nvmeof_stats()
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn register_nvmeof_metrics(
         &self,
         registry: &prometheus::Registry,
     ) -> Result<(), LocalDbError> {
-        self.reads.register_nvmeof_metrics(registry)?;
         if let Some(metrics) = &self.live_metrics {
             super::super::nvmeof::live_prometheus::register(registry, metrics.clone())
                 .map_err(LocalDbError::component)?;
@@ -1098,7 +1029,6 @@ impl ConcurrentRemoteDatabase {
             reads: Arc::clone(&core.reads),
             cache: Arc::clone(&core.read_cache),
             write_profile: Arc::clone(&core.write_profile),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics: core.live_metrics.clone(),
             write_timeline: Arc::clone(&core.write_timeline),
             shape: core.shape.clone(),
@@ -1107,9 +1037,13 @@ impl ConcurrentRemoteDatabase {
             partition_indexes: core.partition_indexes.clone(),
             read_resolve_ns: AtomicU64::new(0),
             value_read_ns: AtomicU64::new(0),
-            io_clients: db.read_evidence_monitor().clients,
-            operational_monitor: core.operational_sampler.monitor(),
-            operational_lifecycle: core.operational_sampler.downgrade_lifecycle(),
+            io_clients: core
+                .config
+                .endpoints
+                .iter()
+                .zip(&core.clients)
+                .map(|(endpoint, worker)| (endpoint.partition, worker.control_handle()))
+                .collect(),
             database: Arc::new(db),
         })
     }
@@ -1434,12 +1368,6 @@ impl ConcurrentRemoteDatabase {
     ) -> Option<[PerKeyspaceReadCacheStats; KEYSPACE_COUNTER_COUNT]> {
         Some(self.cache.per_keyspace_stats())
     }
-    pub fn read_evidence_monitor(&self) -> ReadEvidenceMonitor {
-        ReadEvidenceMonitor {
-            clients: self.io_clients.clone(),
-            reads: self.reads.clone(),
-        }
-    }
     /// Explicit flush: snapshot the next sequence, wait until every earlier
     /// allocation is published (or fail-stop), then run each owner's control
     /// barrier, which flushes every log's frontier before replying. Owners run
@@ -1496,14 +1424,6 @@ impl ConcurrentRemoteDatabase {
         self.ensure_healthy()?;
         Ok(result)
     }
-
-    /// Passive snapshots do not keep the write owner or its connections alive.
-    pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
-        if let Some(lifecycle) = self.operational_lifecycle.upgrade() {
-            OperationalReadIoSampler::activate_lifecycle(&lifecycle);
-        }
-        self.operational_monitor.clone()
-    }
     pub fn read_admission_generation(&self) -> u64 {
         self.reads.admission_generation()
     }
@@ -1526,7 +1446,6 @@ impl ConcurrentRemoteDatabase {
 
     /// Final campaign teardown, distinct from ordinary close/reopen.
     /// Returns only owner-reported target evidence after successful drain and seal.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn shutdown_live_target_final(mut self) -> Result<LiveFinalShutdownEvidence, LocalDbError> {
         let metrics = self
             .live_metrics
