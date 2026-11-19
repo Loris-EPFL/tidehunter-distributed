@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
+import threading
 import time
 import uuid
 
@@ -22,6 +24,171 @@ HELPERS = Path(__file__).resolve().parent.parent / "nvmeof"
 
 class TargetError(RuntimeError):
     pass
+
+
+SYSFS_NVME = Path("/sys/class/nvme")
+SYSFS_BLOCK = Path("/sys/class/block")
+NVMET_CONFIGFS = Path("/sys/kernel/config/nvmet")
+# Bound every diagnostic listing; evidence must not grow with host state.
+DIAGNOSTIC_ENTRIES = 256
+
+
+def _owned_controllers(sysfs, transport, address, services, hostnqn):
+    """Initiator controllers of this run: the host NQN is fresh per run."""
+    rows = []
+    for path in sysfs.glob("nvme*"):
+        if not re.fullmatch(r"nvme[0-9]+", path.name):
+            continue
+        try:
+            attrs = {name: (path / name).read_text().strip() for name in
+                     ("transport", "address", "subsysnqn", "hostnqn", "hostid", "queue_count", "sqsize")}
+            fields = dict(p.split("=", 1) for p in attrs["address"].split(",") if "=" in p)
+            if (attrs["transport"] == transport and fields.get("traddr") == address
+                    and fields.get("trsvcid") in {str(s) for s in services}
+                    and attrs["hostnqn"] == hostnqn):
+                stat = path.stat()
+                rows.append(dict(attrs, controller=path.name, device=stat.st_dev, inode=stat.st_ino))
+        except FileNotFoundError:
+            continue
+    return rows
+
+
+def _write_fd_bounded(fd, data, timeout):
+    """Write and close `fd` on a helper thread: a sysfs write can block in the
+    kernel, and must never outlive the cleanup. The thread owns the descriptor."""
+    errors = []
+
+    def write():
+        try:
+            if os.write(fd, data) != len(data):
+                errors.append(TargetError("incomplete sysfs write"))
+        except OSError as error:
+            errors.append(error)
+        finally:
+            os.close(fd)
+
+    thread = threading.Thread(target=write, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TargetError(f"sysfs write did not return within {timeout:.1f}s")
+    if errors and getattr(errors[0], "errno", None) not in (errno.ENOENT, errno.ENODEV):
+        raise errors[0]
+
+
+def _delete_enumerated_controller(sysfs, row, timeout):
+    """Delete the enumerated controller object, never a replacement at its name.
+
+    The directory descriptor pins the object; identity and attributes are
+    rechecked through it, and `delete_controller` is opened relative to it
+    (as `experiments/nvmeof/manage.py` `delete_controller` does).
+    """
+    try:
+        directory = os.open(sysfs / row["controller"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENODEV):
+            return
+        raise
+    try:
+        stat = os.fstat(directory)
+        if (stat.st_dev, stat.st_ino) != (row["device"], row["inode"]):
+            return
+        for name in ("transport", "address", "subsysnqn", "hostnqn"):
+            attribute = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
+            with os.fdopen(attribute) as stream:
+                if stream.read(4097).strip() != row[name]:
+                    return
+        delete = os.open("delete_controller", os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                         dir_fd=directory)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENODEV):
+            return
+        raise
+    finally:
+        os.close(directory)
+    _write_fd_bounded(delete, b"1", timeout)
+
+
+def _delete_owned_controllers(sysfs, transport, address, services, hostnqn, deadline):
+    """Delete this run's initiator controllers and wait until they are gone.
+
+    The client deletes them on graceful close. A client killed at its deadline
+    cannot, and nothing else owns them. Returns the enumerated controller names.
+    """
+    rows = _owned_controllers(sysfs, transport, address, services, hostnqn)
+    for row in rows:
+        _delete_enumerated_controller(sysfs, row, max(.1, deadline - time.monotonic()))
+    while _owned_controllers(sysfs, transport, address, services, hostnqn):
+        if time.monotonic() >= deadline:
+            raise TargetError("owned initiator controllers remain after delete")
+        time.sleep(.05)
+    return [row["controller"] for row in rows]
+
+
+def _attributes(path, names):
+    values = {}
+    for name in names:
+        try:
+            values[name] = (path / name).read_text(errors="replace").strip()
+        except OSError as error:
+            values[name] = repr(error)
+    return values
+
+
+def _nvme_state(sysfs_nvme=SYSFS_NVME, sysfs_block=SYSFS_BLOCK, configfs=NVMET_CONFIGFS):
+    """Host controllers and disks, and target namespaces and ports, for failure evidence."""
+    limit = DIAGNOSTIC_ENTRIES
+    disks = {}
+    for path in sorted(sysfs_block.glob("nvme*"))[:limit]:
+        disks[path.name] = dict(_attributes(path, ("nsid", "uuid", "hidden", "ro", "size", "dev")),
+                                device=os.path.realpath(path / "device"))
+    return {
+        "controllers": {path.name: _attributes(path, (
+            "state", "transport", "address", "subsysnqn", "hostnqn", "cntlid", "queue_count", "sqsize"))
+            for path in sorted(sysfs_nvme.glob("nvme*"))[:limit]},
+        "disks": disks,
+        "target_namespaces": {f"{path.parent.parent.name}/{path.name}": _attributes(
+            path, ("enable", "device_path", "device_uuid", "buffered_io"))
+            for path in sorted(configfs.glob("subsystems/*/namespaces/*"))[:limit]},
+        "target_ports": {path.name: sorted(p.name for p in path.glob("subsystems/*"))[:limit]
+                         for path in sorted(configfs.glob("ports/*"))[:limit]},
+    }
+
+
+def _process_threads(pid, proc=Path("/proc")):
+    """Per-thread state and kernel stack; root reads `stack`."""
+    rows = []
+    tasks = sorted((proc / str(pid) / "task").iterdir(), key=lambda p: int(p.name))
+    for task in tasks[:DIAGNOSTIC_ENTRIES]:
+        row = dict(_attributes(task, ("comm", "wchan", "syscall", "stack")), tid=int(task.name))
+        try:
+            row["state"] = next(line.split(":", 1)[1].strip() for line in
+                                (task / "status").read_text().splitlines() if line.startswith("State:"))
+        except (OSError, StopIteration) as error:
+            row["state"] = repr(error)
+        rows.append(row)
+    return {"pid": pid, "task_count": len(tasks), "threads": rows}
+
+
+def _gdb_backtrace(pid, timeout):
+    gdb = shutil.which("gdb")
+    if gdb is None:
+        return "gdb unavailable\n"
+    try:
+        result = subprocess.run([gdb, "-nx", "-batch", "-p", str(pid), "-ex", "thread apply all bt"],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return f"gdb timed out after {timeout}s\n{exc.stdout or ''}"
+    return result.stdout + result.stderr
+
+
+def _journal(args, timeout):
+    try:
+        result = subprocess.run(["journalctl", "--no-pager", "-o", "short-monotonic", *args],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return repr(error) + "\n"
+    return result.stdout + result.stderr
 
 
 def _inside(root, path):
@@ -330,6 +497,13 @@ def _kernel_live_ports(address, *, commissioning_address, control_address):
                       "service/commissioning pair after 32 attempts")
 
 
+def _admit_kernel_leased_route(remote, target, tier):
+    live = remote.get("live_nvme") or {}
+    if (live.get("write_mode") != "leased" or live.get("export_mode") != "per_owner"
+            or live.get("leased_durability") != tier or target.get("export_mode") != "per_owner"):
+        raise TargetError("prepared kernel qualification is not leased per-owner at the requested durability tier")
+
+
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         history_persistence, owner_wal_file_bytes=None):
     import hashlib
@@ -384,22 +558,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
 
 
     def controllers(address, services, hostnqn):
-        rows = []
-        for path in Path("/sys/class/nvme").glob("nvme*"):
-            if not re.fullmatch(r"nvme[0-9]+", path.name):
-                continue
-            try:
-                attrs = {name: (path / name).read_text().strip() for name in
-                         ("transport", "address", "subsysnqn", "hostnqn", "hostid", "queue_count", "sqsize")}
-                fields = dict(p.split("=", 1) for p in attrs["address"].split(",") if "=" in p)
-                if (attrs["transport"] == transport and fields.get("traddr") == address
-                        and fields.get("trsvcid") in {str(s) for s in services}
-                        and attrs["hostnqn"] == hostnqn):
-                    stat = path.stat()
-                    rows.append(dict(attrs, controller=path.name, device=stat.st_dev, inode=stat.st_ino))
-            except FileNotFoundError:
-                continue
-        return rows
+        return _owned_controllers(SYSFS_NVME, transport, address, services, hostnqn)
 
     def tier_run(tier, index):
         directory = root / tier
@@ -451,6 +610,17 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     if len(sample_errors) < 20:
                         sample_errors.append(repr(error))
 
+        def diagnose(name, capture):
+            # Failure evidence is best-effort; it never replaces the failure.
+            try:
+                capture()
+            except Exception as error:
+                record.setdefault("diagnostic_errors", []).append({"evidence": name, "error": repr(error)})
+
+        def capture_process(label, pid):
+            _write(evidence / f"{label}-threads.json", _process_threads(pid))
+            (evidence / f"{label}-gdb.txt").write_text(_gdb_backtrace(pid, 10))
+
         try:
             prep = {"guest_root": str(guest), "addresses": [f"{control_address}:{control}"],
                 "transport": {"kind": "tcp"}, "durability_tier": tier,
@@ -464,6 +634,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                 "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
                     "port_id": port_id, "commissioning_service": commissioning,
                     "commissioning_port_id": port_id + 1, "max_inflight_requests": 32,
+                    "write_mode": "leased", "export_mode": "per_owner",
                     "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
                     "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
             if owner_wal_file_bytes is not None:
@@ -483,6 +654,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     or launch["node"]["partition"]["wal_file_bytes"] != owner_wal_file_bytes):
                 raise TargetError("prepared qualification WAL member size differs from request")
             target = launch["node"]["live_target"]
+            _admit_kernel_leased_route(remote, target, tier)
             if (launch["listen"] != f"{control_address}:{control}" or target["address"] != addr
                     or target["transport"] != transport or target.get("spdk") is not None
                     or target["port_id"] != port_id or target["commissioning_port_id"] != port_id + 1):
@@ -561,6 +733,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                 try:
                     code = client.wait(timeout=budget)
                 except Exception as error:
+                    if isinstance(error, subprocess.TimeoutExpired):
+                        # The kill destroys the stalled stacks; capture them first.
+                        diagnose("client threads", lambda: capture_process("client", client.pid))
+                        diagnose("owner threads", lambda: capture_process("owner", int(status()["MainPID"])))
                     os.killpg(client.pid, signal.SIGTERM)
                     try:
                         client.wait(timeout=5)
@@ -618,8 +794,18 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         pass
                     else:
                         raise TargetError("client process group remains")
-                if remote and controllers(addr, (service, commissioning), remote["live_nvme"]["host_nqn"]):
-                    raise TargetError("owned initiator controllers remain")
+                if record["errors"]:
+                    diagnose("nvme state", lambda: _write(evidence / "nvme-state.json", _nvme_state()))
+                if remote:
+                    deleted = _delete_owned_controllers(
+                        SYSFS_NVME, transport, addr, (service, commissioning),
+                        remote["live_nvme"]["host_nqn"], time.monotonic() + remaining(20))
+                    if deleted:
+                        record["initiator_teardown"] = deleted
+                        if record.pop("qualified", False):
+                            record["errors"].append({"phase": "qualification", "error":
+                                "client exited without deleting its initiator controllers: "
+                                + ", ".join(deleted)})
                 if attempted:
                     if not captured:
                         raise TargetError("owner identity unavailable; retained")
@@ -644,6 +830,11 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                 record["cleanup_complete"] = True
             except Exception as error:
                 record["errors"].append({"phase": "cleanup", "error": repr(error), "traceback": traceback.format_exc()})
+            if record["errors"]:
+                diagnose("owner journal", lambda: (evidence / "owner-journal.txt").write_text(
+                    _journal(["-u", unit, "-n", "2000"], 5)))
+                diagnose("kernel journal", lambda: (evidence / "kernel-journal.txt").write_text(
+                    _journal(["-k", "-n", "500"], 5)))
             _write(evidence / "proof.json", record)
         return record
 

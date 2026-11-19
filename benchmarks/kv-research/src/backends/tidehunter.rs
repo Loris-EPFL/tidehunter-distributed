@@ -1712,10 +1712,14 @@ impl KvBackend for TidehunterBackend {
             Ok(None) => serde_json::json!({"available": false, "reason": "native backend"}),
             Err(error) => serde_json::json!({"available": false, "error": error}),
         };
+        let durable_cut = db.durable_cut_stats().map(|stats| {
+            serde_json::json!({"enabled": stats.enabled, "epoch": stats.epoch, "nudges": stats.nudges})
+        });
         let Some(monitor) = db.read_evidence_monitor() else {
             return Ok(
                 serde_json::json!({"available": true, "coordinator": coordinator,
                 "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "owner_storage": owner_storage,
+                "durable_cut": durable_cut,
                 "owner_executor": {"available": false, "error": "read evidence monitor unavailable"}}),
             );
         };
@@ -1726,7 +1730,8 @@ impl KvBackend for TidehunterBackend {
         Ok(
             serde_json::json!({"available": true, "coordinator": coordinator,
             "owner_executor": owners,
-            "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "owner_storage": owner_storage}),
+            "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "owner_storage": owner_storage,
+            "durable_cut": durable_cut}),
         )
     }
 

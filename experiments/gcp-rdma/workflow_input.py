@@ -16,12 +16,21 @@ BACKENDS = {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_ve
             'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
 
 
-def specification(suite, backends, mode, selection=None):
+def specification(suite, backends, mode, selection=None, *, case_binaries=None):
     selected = backends.split(',')
     if suite != 'kv' or mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise ValueError('unsupported suite or matrix mode')
     if not selected or len(set(selected)) != len(selected) or any(x not in BACKENDS for x in selected):
         raise ValueError('select unique supported backend IDs; EFA is not a GCP backend')
+    if selection == cloud_campaign.Q0_SELECTION:
+        if mode != 'focused' or selected != ['tidehunter_nvme_rdma']:
+            raise ValueError('Q0 requires the exact focused NVMe-oF RDMA selection')
+        import manual_campaign
+        spec = manual_campaign.q0_spec(case_binaries)
+        manual_campaign._reviewed_jobs(spec)
+        return spec
+    if case_binaries is not None:
+        raise ValueError('case binary seals are only admitted for Q0')
     if mode == 'focused':
         import manual_campaign
         if (suite != 'kv' or selection not in cloud_campaign.FOCUSED_SELECTIONS
@@ -91,6 +100,7 @@ def main():
     choose.add_argument('--backends', required=True)
     choose.add_argument('--mode', required=True)
     choose.add_argument('--selection', choices=cloud_campaign.FOCUSED_SELECTIONS)
+    choose.add_argument('--case-binaries', type=Path)
     choose.add_argument('--output', type=Path, required=True)
     policy = sub.add_parser('policy')
     policy.add_argument('--config', type=Path, required=True)
@@ -103,7 +113,8 @@ def main():
     configuration.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.action == 'spec':
-        value = specification(args.suite, args.backends, args.mode, args.selection)
+        seals = json.loads(args.case_binaries.read_text()) if args.case_binaries else None
+        value = specification(args.suite, args.backends, args.mode, args.selection, case_binaries=seals)
         args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
     elif args.action == 'configuration':
         deployment_configuration(args.config, args.image, args.qualification, args.output)

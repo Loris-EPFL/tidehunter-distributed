@@ -106,7 +106,7 @@ def sample_cpu(directory, stat_path=Path('/proc/stat'), duration_seconds=CPU_MAX
 def _start_sampler(directory, kind, duration_seconds, args=()):
     directory = Path(directory)
     if not 0 < duration_seconds <= CPU_MAX_SAMPLES:
-        return {'available': False, 'reason': 'CPU sampling deadline unavailable or expired'}
+        return {'available': False, 'reason': f'{kind} sampling deadline unavailable or expired'}
     try:
         directory.mkdir(parents=True, exist_ok=True)
         for name in (kind + '.json', kind + '.ready', kind + '.stop'):
@@ -121,16 +121,16 @@ def _start_sampler(directory, kind, duration_seconds, args=()):
         if (directory / (kind + '.ready')).exists():
             return {'directory': str(directory)}
         if process.poll() is not None:
-            return {'available': False, 'reason': 'owner CPU sampler failed to start'}
+            return {'available': False, 'reason': f'{kind} sampler failed to start'}
         time.sleep(0.02)
     process.terminate()
     process.wait(timeout=3)
-    return {'available': False, 'reason': 'owner CPU sampler startup timed out'}
+    return {'available': False, 'reason': f'{kind} sampler startup timed out'}
 
 
 def _stop_sampler(state, kind):
     if not state or 'directory' not in state:
-        return state or {'available': False, 'reason': 'owner CPU sampling was not started'}
+        return state or {'available': False, 'reason': f'{kind} sampling was not started'}
     directory = Path(state['directory'])
     try:
         (directory / (kind + '.stop')).touch()
@@ -138,12 +138,12 @@ def _stop_sampler(state, kind):
             path = directory / (kind + '.json')
             if path.exists():
                 if path.stat().st_size > CPU_MAX_BYTES:
-                    return {'available': False, 'reason': 'owner CPU artifact exceeds bound'}
+                    return {'available': False, 'reason': f'{kind} artifact exceeds bound'}
                 return json.loads(path.read_text())
             time.sleep(0.02)
     except (OSError, ValueError) as error:
         return {'available': False, 'reason': str(error)}
-    return {'available': False, 'reason': 'owner CPU sampler stop timed out'}
+    return {'available': False, 'reason': f'{kind} sampler stop timed out'}
 
 
 def start_cpu(directory, duration_seconds=CPU_MAX_SAMPLES):
@@ -152,6 +152,69 @@ def start_cpu(directory, duration_seconds=CPU_MAX_SAMPLES):
 
 def stop_cpu(state):
     return _stop_sampler(state, 'owner-cpu')
+
+
+def memory_snapshot(cgroup):
+    observed_unix_ns = time.time_ns()
+    observed_monotonic_ns = time.monotonic_ns()
+    events = {}
+    for line in (cgroup / 'memory.events').read_text().splitlines():
+        name, value = line.split()
+        events[name] = int(value)
+    current = int((cgroup / 'memory.current').read_text())
+    limit = (cgroup / 'memory.max').read_text().strip()
+    try:
+        peak = int((cgroup / 'memory.peak').read_text())
+    except FileNotFoundError:
+        peak = None  # Older cgroup-v2 kernels may not expose memory.peak.
+    return {'observed_unix_ns': observed_unix_ns, 'observed_monotonic_ns': observed_monotonic_ns,
+            'memory.events': events, 'memory.current': current,
+            'memory.max': limit if limit == 'max' else int(limit), 'memory.peak': peak}
+
+
+def sample_memory(directory, cgroup, duration_seconds):
+    """Sample cgroup-v2 memory at readiness, every second, and at stop."""
+    directory, cgroup = Path(directory), Path(cgroup)
+    artifact = {'available': False, 'cgroup': str(cgroup), 'interval_seconds': 1,
+                'scope': 'before measurement release through completion-observed stop',
+                'samples': [], 'sampled_peak_bytes': None, 'kernel_peak_bytes': None}
+    stop = directory / 'cgroup-memory.stop'
+    expires = time.monotonic() + duration_seconds
+    try:
+        for index in range(CPU_MAX_SAMPLES + 1):
+            previous = time.monotonic()
+            sample = memory_snapshot(cgroup)
+            artifact['samples'].append(sample)
+            observed = sample['memory.current']
+            artifact['sampled_peak_bytes'] = max(artifact['sampled_peak_bytes'] or 0, observed)
+            if sample['memory.peak'] is not None:
+                artifact['kernel_peak_bytes'] = max(artifact['kernel_peak_bytes'] or 0, sample['memory.peak'])
+            if index == 0:
+                (directory / 'cgroup-memory.ready').touch()
+            if stop.exists():
+                artifact['available'] = True
+                break
+            if previous >= expires:
+                artifact['reason'] = 'cgroup memory sampling deadline expired'
+                break
+            deadline = min(previous + 1, expires)
+            while not stop.exists() and (remaining := deadline - time.monotonic()) > 0:
+                time.sleep(min(0.05, remaining))
+        else:
+            artifact['reason'] = 'cgroup memory sample limit reached'
+    except (OSError, ValueError) as error:
+        artifact['reason'] = str(error)
+    temporary = directory / 'cgroup-memory.tmp'
+    temporary.write_text(json.dumps(artifact) + '\n')
+    temporary.replace(directory / 'cgroup-memory.json')
+
+
+def start_memory(directory, cgroup, duration_seconds):
+    return _start_sampler(directory, 'cgroup-memory', duration_seconds, (cgroup,))
+
+
+def stop_memory(state):
+    return _stop_sampler(state, 'cgroup-memory')
 
 
 THREAD_CLASSES = ('wal_write_owner', 'value_wal_tcp', 'value_wal_prepare', 'wal_live_read', 'other')
@@ -416,5 +479,9 @@ if __name__ == '__main__':
         sample_cpu(sys.argv[2], duration_seconds=float(sys.argv[3]))
     elif len(sys.argv) == 5 and sys.argv[1] == '--sample-thread-cpu':
         sample_threads(sys.argv[2], int(sys.argv[4]), duration_seconds=float(sys.argv[3]))
+    elif len(sys.argv) == 5 and sys.argv[1] == '--sample-cgroup-memory':
+        sample_memory(sys.argv[2], sys.argv[4], float(sys.argv[3]))
     else:
-        raise SystemExit('usage: owner_ftrace.py --sample-owner-cpu DIRECTORY DURATION_SECONDS | --sample-thread-cpu DIRECTORY DURATION_SECONDS PID')
+        raise SystemExit('usage: owner_ftrace.py --sample-owner-cpu DIRECTORY DURATION_SECONDS | '
+                         '--sample-thread-cpu DIRECTORY DURATION_SECONDS PID | '
+                         '--sample-cgroup-memory DIRECTORY DURATION_SECONDS CGROUP')

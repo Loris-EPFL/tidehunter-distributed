@@ -162,6 +162,11 @@ class FocusedAdmissionTest(unittest.TestCase):
             expected_count = workflow_input.cloud_campaign.FOCUSED_COUNTS[selection]
             with self.subTest(selection=selection):
                 spec = copy.deepcopy(manual.REVIEWED_SPECS[selection])
+                kwargs = {}
+                if selection == workflow_input.cloud_campaign.Q0_SELECTION:
+                    from test_q0_campaign import seals
+                    kwargs['case_binaries'] = seals()
+                    spec = manual.q0_spec(**kwargs)
                 if selection == 'nvmeof_parallel_writes':
                     self.assertEqual(spec['matrix_sha256'], '64def2342711b6f17b65796ff907fcc6b390c9d7cee9e93ed85d8623c8e32aa4')
                 if selection == 'nvmeof_single_caller':
@@ -183,7 +188,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                 self.assertFalse(spec['spdk_comparison'])
                 self.assertEqual(spec['backends'], ['tidehunter_nvme_rdma'] if selection in workflow_input.cloud_campaign.M3_SELECTIONS or selection == 'nvmeof_f7_highmem32' else ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
                 self.assertEqual(workflow_input.specification(
-                    'kv', ','.join(spec['backends']), 'focused', selection=selection),
+                    'kv', ','.join(spec['backends']), 'focused', selection=selection, **kwargs),
                     {'reservation_hours': 2, **spec} if selection in workflow_input.cloud_campaign.M3_SELECTIONS else spec)
                 self.assertTrue(gcp_runtime.live_mode(spec))
                 for mutation in ({'job_count': expected_count - 1}, {'matrix_sha256': '0' * 64},

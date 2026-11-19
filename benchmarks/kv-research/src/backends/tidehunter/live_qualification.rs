@@ -26,6 +26,7 @@ fn default_target_implementation() -> String {
 struct QualificationProgress {
     directory: PathBuf,
     file_name: &'static str,
+    started: Instant,
     events: Vec<serde_json::Value>,
 }
 
@@ -38,8 +39,27 @@ impl QualificationProgress {
     }
 
     fn mark_value(&mut self, phase: &'static str, snapshot: Option<serde_json::Value>) {
+        self.record(phase, snapshot, serde_json::Value::Null);
+    }
+
+    /// An event inside a phase; `detail` locates it, for example a write count.
+    fn mark_detail(&mut self, phase: &'static str, db: &sui::Db, detail: serde_json::Value) {
+        let snapshot = db
+            .live_nvmeof_stats()
+            .and_then(|stats| serde_json::to_value(stats).ok());
+        self.record(phase, snapshot, detail);
+    }
+
+    fn record(
+        &mut self,
+        phase: &'static str,
+        snapshot: Option<serde_json::Value>,
+        detail: serde_json::Value,
+    ) {
         self.events.push(serde_json::json!({
             "phase": phase,
+            "elapsed_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "detail": detail,
             "live_nvmeof": snapshot,
         }));
         let document = serde_json::json!({
@@ -549,6 +569,7 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
     let mut progress = QualificationProgress {
         directory: ready.parent().ok_or("missing ready parent")?.to_path_buf(),
         file_name: "qualification-child-progress.json",
+        started: Instant::now(),
         events: Vec::new(),
     };
     progress.mark("child_open", None);
@@ -621,7 +642,11 @@ fn qualify_member_transition(
     input: &Input,
     early_key: &Bytes,
     early_value: &Bytes,
+    progress: &mut QualificationProgress,
 ) -> BackendResult<MemberTransition> {
+    // Bounded in-phase evidence: a stall stays within eight writes of an event.
+    const MILESTONE_WRITES: u64 = 8;
+    const MAX_MILESTONES: u64 = 64;
     check(
         remote.storage.wal_file_bytes > 0
             && remote.storage.wal_file_bytes <= 1024 * 1024 * 1024
@@ -706,6 +731,15 @@ fn qualify_member_transition(
                     .map_err(native_error)
             },
         )?;
+        if writes_acknowledged.is_multiple_of(MILESTONE_WRITES)
+            && writes_acknowledged / MILESTONE_WRITES <= MAX_MILESTONES
+        {
+            progress.mark_detail(
+                "member_transition_writes",
+                db,
+                serde_json::json!({ "writes_acknowledged": writes_acknowledged }),
+            );
+        }
         if !writes_acknowledged.is_multiple_of(32) {
             continue;
         }
@@ -746,6 +780,11 @@ fn qualify_member_transition(
         &mut writes_acknowledged,
         || db.remove(ks, delete_key.clone()).map_err(native_error),
     )?;
+    progress.mark_detail(
+        "member_transition_reads",
+        db,
+        serde_json::json!({ "writes_acknowledged": writes_acknowledged }),
+    );
     read_expected(db, ks, &delete_key, None)?;
     read_expected_live(db, ks, &before_key, &before_value)?;
     read_expected_live(db, ks, &after_key, &after_value)?;
@@ -912,6 +951,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let mut progress = QualificationProgress {
         directory: output.to_path_buf(),
         file_name: "qualification-progress.json",
+        started: Instant::now(),
         events: Vec::new(),
     };
     progress.mark("initial_open", None);
@@ -1017,7 +1057,16 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         after_value,
         delete_key,
         evidence: member_transition,
-    } = qualify_member_transition(&db, ks, remote, &input, &keys[0], &values[0])?;
+    } = qualify_member_transition(&db, ks, remote, &input, &keys[0], &values[0], &mut progress)
+        .inspect_err(|error| {
+            // Record before the database drop, which can block after a failed write.
+            eprintln!("member transition failed: {error}");
+            progress.mark_detail(
+                "member_transition_failed",
+                &db,
+                serde_json::json!({ "error": error.to_string() }),
+            );
+        })?;
     progress.mark("member_transition_complete", Some(&db));
     progress.mark("flush", Some(&db));
     db.flush().map_err(native_error)?;
@@ -1261,5 +1310,36 @@ mod tests {
         assert!(verify_fences(&sample, &[0], "spdk").is_err());
         sample["route_evidence_dropped"] = serde_json::json!(1);
         assert!(verify_routes(&sample, "rdma", "spdk").is_err());
+    }
+
+    #[test]
+    fn progress_events_carry_elapsed_time_and_detail() {
+        let root = std::env::temp_dir().join(format!(
+            "live-qualification-progress-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&root).unwrap();
+        let mut progress = QualificationProgress {
+            directory: root.clone(),
+            file_name: "progress.json",
+            started: Instant::now(),
+            events: Vec::new(),
+        };
+        progress.mark_value("phase", None);
+        progress.record(
+            "phase_writes",
+            None,
+            serde_json::json!({ "writes_acknowledged": 8 }),
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("progress.json")).unwrap()).unwrap();
+        let events = document["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event["elapsed_ms"].is_u64()));
+        assert!(events[0]["detail"].is_null());
+        assert_eq!(events[1]["phase"], "phase_writes");
+        assert_eq!(events[1]["detail"]["writes_acknowledged"], 8);
+        fs::remove_dir_all(root).unwrap();
     }
 }

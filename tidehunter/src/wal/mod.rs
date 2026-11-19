@@ -29,6 +29,7 @@ use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -60,7 +61,16 @@ pub struct Wal {
     retained: bool,
     #[cfg(feature = "experimental-nvmeof")]
     external_preparation: Arc<external::ExternalPreparation>,
+    /// Files below this id hold only finished writes and are synced; see
+    /// `sync_files_through`.
+    synced_below: AtomicU64,
+    #[cfg(test)]
+    file_sync_hook: parking_lot::Mutex<Option<FileSyncHook>>,
 }
+
+/// Test hook run after a file sync, with the synced file id.
+#[cfg(test)]
+type FileSyncHook = Box<dyn Fn(position::WalFileId) + Send>;
 
 /// Sampled native benchmark barrier work, not isolated device latency.
 /// Counts include failed attempts; nanoseconds cover the same attempts.
@@ -436,6 +446,9 @@ impl Wal {
             retained: false,
             #[cfg(feature = "experimental-nvmeof")]
             external_preparation,
+            synced_below: AtomicU64::new(0),
+            #[cfg(test)]
+            file_sync_hook: Default::default(),
         };
         Ok(Arc::new(wal))
     }
@@ -460,6 +473,9 @@ impl Wal {
             retained: true,
             #[cfg(feature = "experimental-nvmeof")]
             external_preparation: Arc::new(external::ExternalPreparation::new(false)),
+            synced_below: AtomicU64::new(0),
+            #[cfg(test)]
+            file_sync_hook: Default::default(),
         }))
     }
 
@@ -512,15 +528,21 @@ impl Wal {
     pub fn read(&self, pos: WalPosition) -> Result<(ReadType, Option<Bytes>), WalError> {
         match self.frame_source(pos, true) {
             Some(FrameSource::Mapped(map, offset)) => {
-                // using CrcFrame::read_from_slice to avoid holding the larger byte array
-                Ok((
-                    ReadType::Mapped,
-                    Some(
-                        CrcFrame::read_from_slice(&map.data, offset as usize)?
-                            .to_vec()
-                            .into(),
-                    ),
-                ))
+                // Copy the frame out of the mapping once and check the copy. A CRC
+                // over the mapping followed by a second read of it could return
+                // bytes that changed in between: a clean page evicted after a
+                // writeback error reads back what the device holds. The owned
+                // copy also avoids holding the larger mapped byte array.
+                let start = offset as usize;
+                let frame = start
+                    .checked_add(pos.frame_len())
+                    .and_then(|end| map.data.get(start..end))
+                    .ok_or(CrcReadError::OutOfBoundsBody(pos.frame_len()))?;
+                let frame: Bytes = frame.to_vec().into();
+                let payload = CrcFrame::read_from_bytes(&frame, 0)?;
+                #[cfg(test)]
+                after_mapped_read_check(pos);
+                Ok((ReadType::Mapped, Some(payload)))
             }
             Some(FrameSource::File(file)) => {
                 let bytes = FileReader::new(file, self.layout.direct_io)
@@ -824,7 +846,55 @@ impl Wal {
 
     /// Ensure the file is written to disk (blocking call).
     pub fn fsync(&self) -> io::Result<()> {
-        self.files.load().current_file().sync_all()
+        let files = self.files.load();
+        files.current_file().sync_all()?;
+        #[cfg(test)]
+        self.run_file_sync_hook(files.current_file_id());
+        Ok(())
+    }
+
+    /// Persist every registered file up to and including `last`, then the
+    /// directory entries. A snapshot calls this before it stores a control
+    /// region that depends on these files: the map syncer runs asynchronously
+    /// and gives no order relative to the snapshot.
+    ///
+    /// Every write below `complete_below` has finished, so files below it are
+    /// never written again. A later call skips the files this call syncs below
+    /// that id; the others it syncs again.
+    pub(crate) fn sync_files_through(
+        &self,
+        last: position::WalFileId,
+        complete_below: position::WalFileId,
+    ) -> io::Result<()> {
+        let files = self.files.load_full();
+        // Acquire pairs with the Release below: a raised floor follows the
+        // completed syncs of the files under it.
+        let floor = position::WalFileId(self.synced_below.load(Ordering::Acquire));
+        if floor <= last {
+            for (_id, file) in files.files.range(floor..=last) {
+                file.sync_all()?;
+                #[cfg(test)]
+                self.run_file_sync_hook(*_id);
+            }
+        }
+        File::open(&files.base_path)?.sync_all()?;
+        let synced_below = complete_below.0.min(last.0.saturating_add(1));
+        self.synced_below.fetch_max(synced_below, Ordering::Release);
+        Ok(())
+    }
+
+    /// Installs a hook that runs after each file sync by `fsync` or
+    /// `sync_files_through`.
+    #[cfg(test)]
+    pub(crate) fn set_file_sync_hook(&self, hook: FileSyncHook) {
+        *self.file_sync_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_file_sync_hook(&self, id: position::WalFileId) {
+        if let Some(hook) = self.file_sync_hook.lock().as_ref() {
+            hook(id);
+        }
     }
 
     /// Complete deletion authorized by a durable distributed recovery root.
@@ -1399,6 +1469,26 @@ impl WalFailPoints {
     pub fn fp_multi_write_before_write_buf(&self) {
         self.0.load().fp_multi_write_before_write_buf.fp();
     }
+}
+
+/// Test hook run by `Wal::read` after it checked a mapped frame and before it
+/// returns the frame.
+#[cfg(test)]
+type MappedReadCheckHook = Box<dyn Fn(WalPosition)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_MAPPED_READ_CHECK: std::cell::RefCell<Option<MappedReadCheckHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_mapped_read_check(pos: WalPosition) {
+    AFTER_MAPPED_READ_CHECK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(pos);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2257,6 +2347,48 @@ mod tests {
         // `gc(0)` deletes nothing and round-trips through the mapper thread
         // behind everything already queued to it.
         writer.gc(0).unwrap();
+    }
+
+    /// A mapped read returns the bytes it checked even when the mapped range
+    /// changes right after the check: the hook zeroes the frame's file range
+    /// (a clean page evicted after a writeback error and read back from a device
+    /// that never held it). A check on the mapping followed by a second read of
+    /// it would return the zeros.
+    #[test]
+    fn mapped_read_returns_the_checked_copy_when_the_page_changes_after_the_check() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempdir::TempDir::new("mapped-read-checked-copy").unwrap();
+        let layout = index_layout(5, 10 << 12);
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let writer = wal.writer_after(None).unwrap();
+        let pos = writer
+            .write(&PreparedWalWrite::new(&vec![7u8; 200]))
+            .unwrap()
+            .into_wal_position();
+        // The writer's own fragment is pre-faulted, so the read takes the map.
+        assert_eq!(ReadType::Mapped, load_type(&wal, pos));
+        let file = OpenOptions::new()
+            .write(true)
+            .open(layout.wal_file_name(dir.path(), layout.locate_file(pos.offset())))
+            .unwrap();
+        let evicted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = evicted.clone();
+        let file_offset = layout.offset_in_wal_file(pos.offset());
+        AFTER_MAPPED_READ_CHECK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |read: WalPosition| {
+                assert_eq!(read, pos);
+                file.write_all_at(&vec![0; read.frame_len()], file_offset)
+                    .unwrap();
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }));
+        });
+        let (read_type, bytes) = wal.read(pos).unwrap();
+        AFTER_MAPPED_READ_CHECK.with(|hook| hook.borrow_mut().take());
+        assert!(evicted.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(ReadType::Mapped, read_type);
+        assert_eq!(&[7u8; 200][..], bytes.unwrap().as_ref());
+        // The mapping now holds the zeros; a fresh read rejects them.
+        assert!(matches!(wal.read(pos), Err(WalError::Crc(_))));
     }
 
     #[test]

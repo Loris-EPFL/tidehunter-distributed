@@ -21,6 +21,31 @@ GUEST_PATH = '/opt/tidehunter-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbi
 # Google automatically attaches these NVMe Local SSDs for the machine type.
 # https://docs.cloud.google.com/compute/docs/disks/local-ssd#performance
 LOCAL_SSD_COUNTS = {'z4m-highmem-16': 1, 'z4m-highmem-32': 2, 'h4d-highmem-192-lssd': 10}
+# Conservative MiB floors from the published VM RAM, keyed by the admitted SKU.
+MACHINE_RAM_MIB = {'z4m-highmem-16': 122_000_000_000 // 2**20,
+                   'z4m-highmem-32': 244_000_000_000 // 2**20,
+                   'h4d-highmem-192-lssd': 1523712}
+REPLAY_HOST_RESERVE_MIB = 8 * 1024  # Kernel, services, and host page cache.
+REPLAY_CLIENT_TARGET_MIB = 32 * 1024  # P13's 16 GiB client peaks were cap-censored.
+
+
+def replay_client_memory_mib(machine_type):
+    ram = MACHINE_RAM_MIB.get(machine_type, 0)
+    if ram <= REPLAY_HOST_RESERVE_MIB:
+        raise RuntimeSafetyError(f'REPLAY_HOST_MEMORY_UNAVAILABLE: {machine_type}')
+    return min(REPLAY_CLIENT_TARGET_MIB, ram - REPLAY_HOST_RESERVE_MIB)
+
+
+def qualify_physical_trace(spec):
+    import cloud_controller
+    import cold_device_trace
+    from gcp_image_prepare import require_kernel_btf
+
+    if not any(cloud_controller.requests_cold_trace(job)
+               for job in cloud_controller.controller_matrix(spec)):
+        return None
+    require_kernel_btf()
+    return cold_device_trace.qualify_trace_ring()
 
 
 class RuntimeSafetyError(RuntimeError):
@@ -430,7 +455,9 @@ def validate_controller_config(config):
     if runtime['spec'].get('mode') == 'focused':
         if json.dumps(config['spec'], sort_keys=True) != json.dumps(_controller_spec(runtime['spec']), sort_keys=True):
             raise RuntimeSafetyError('focused controller spec differs from reviewed runtime')
-        jobs = cloud_campaign.make_focused_matrix(runtime['spec']['selection'])
+        jobs = (cloud_controller.controller_matrix(config['spec'])
+                if runtime['spec']['selection'] == cloud_campaign.Q0_SELECTION
+                else cloud_campaign.make_focused_matrix(runtime['spec']['selection']))
     else:
         jobs = cloud_campaign.make_matrix(config['spec'])
     cloud_controller.validate_read_tier_memory(jobs, config['fleet'])
@@ -734,6 +761,7 @@ def bootstrap_guest(config, index, clients):
     admit_package_profile(config['spec'], package)
     nvmet_fix = admit_nvmet_fix(config['platform']['runtime'],
                                 {'name': identity['name'], 'id': identity['instance_id']}, package)
+    physical_trace = qualify_physical_trace(config['spec'])
     unit_admission = admit_guest_unit(config, index)
     unit = 'tidehunter-expire-' + config['prefix'] + '.timer'
     subprocess.run(['systemctl', 'is-active', '--quiet', unit], check=True, timeout=10)
@@ -748,6 +776,8 @@ def bootstrap_guest(config, index, clients):
     result = {'identity': identity, 'package': package, 'images': images, 'fabric_admission': fabrics,
               'guest_runtime': runtime_admission, 'guest_unit': unit_admission,
               'fleet_observations': fleet, 'snapshot': cloud_controller.snapshot(config), 'monitor_images': monitor_images}
+    if physical_trace is not None:
+        result['physical_trace_qualification'] = physical_trace
     if nvmet_fix is not None:
         result['nvmet_fix'] = nvmet_fix
     return result

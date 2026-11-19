@@ -3,7 +3,10 @@ use super::*;
 use bincode::Options;
 
 mod recovered_suffix;
-use recovered_suffix::SuffixRewrite;
+pub(super) use recovered_suffix::SuffixRewrite;
+// Used by the on-disk owned frame reader and the live-stream guard test.
+#[cfg(test)]
+pub(super) use recovered_suffix::hook as suffix_rewrite_hook;
 
 /// Recovery scans read beyond the durable frontier, where a frame can be absent or
 /// torn. Only these outcomes mean "no valid frame here": a missing file, a short
@@ -988,7 +991,9 @@ impl PartitionLog {
         // Restart durability guard (see `recovered_suffix`): every frame and skip
         // marker accepted above the persisted root is written back from the bytes
         // this scan validated. A sealed stream was synced whole before its seal.
-        let mut rewrite = recorded.is_none().then(SuffixRewrite::default);
+        let mut rewrite = recorded
+            .is_none()
+            .then(|| SuffixRewrite::new(&log.path, expected));
         // Live streams stop globally at an invalid tail. Ordinary owner-RPC
         // streams scan fragments independently, including after a lost skip.
         // In both cases only present WAL files bound the uncheckpointed suffix.
@@ -1034,7 +1039,7 @@ impl PartitionLog {
                 } else if cursor >= strict_end
                     && let Some(rewrite) = rewrite.as_mut()
                 {
-                    log.rewrite_skip_marker(rewrite, cursor, fragment_end)?;
+                    rewrite.skip_marker(cursor, fragment_end)?;
                 }
                 cursor = fragment_end;
                 continue;
@@ -1142,7 +1147,7 @@ impl PartitionLog {
             if cursor >= strict_end
                 && let Some(rewrite) = rewrite.as_mut()
             {
-                log.rewrite_validated_frame(rewrite, cursor, decoded.group.encoded())?;
+                rewrite.frame(cursor, decoded.group.encoded())?;
             }
             physical_end = physical_end.max(decoded.frame_end);
             cursor = decoded
@@ -1173,7 +1178,7 @@ impl PartitionLog {
         // The rewritten suffix reaches the device before the barrier below may
         // certify it and before any root or seal is installed.
         if let Some(rewrite) = rewrite {
-            log.finish_suffix_rewrite(rewrite)?;
+            rewrite.finish()?;
         }
         log.wal.persist_registered_files()?;
         if live

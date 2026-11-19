@@ -8,7 +8,7 @@ use crate::wal::position::WalFileId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// On-disk control-region format version.
@@ -52,6 +52,9 @@ pub struct ControlRegion {
 pub(crate) struct ControlRegionStore {
     path: PathBuf,
     last_position: u64,
+    /// Test hook run after the rename and before the directory sync.
+    #[cfg(test)]
+    after_rename_hook: Option<Box<dyn Fn() + Send>>,
 }
 
 /// Set of index WAL files that should be force-relocated because their
@@ -295,9 +298,19 @@ impl ControlRegionStore {
         Self {
             path,
             last_position: control_region.last_position,
+            #[cfg(test)]
+            after_rename_hook: None,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_after_rename_hook(&mut self, hook: Box<dyn Fn() + Send>) {
+        self.after_rename_hook = Some(hook);
+    }
+
+    /// Durably replaces the control region file. When this returns, a crash
+    /// reopens this control region, so the caller may then delete files that
+    /// only the previous control region references.
     pub fn store(
         &mut self,
         snapshot: LargeTableContainer<SnapshotEntryData>,
@@ -319,13 +332,19 @@ impl ControlRegionStore {
         bincode::serialize_into(&mut serialized, &control_region)
             .expect("Failed to serialize control region");
         let temp_file = self.path.with_extension(".bak");
-        fs::write(&temp_file, &serialized).unwrap_or_else(|e| {
-            panic!(
-                "Failed to write control region file {}: {}",
-                temp_file.display(),
-                e
-            )
-        });
+        // The data must be durable before the rename can expose it.
+        fs::File::create(&temp_file)
+            .and_then(|mut file| {
+                file.write_all(&serialized)?;
+                file.sync_all()
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to write control region file {}: {}",
+                    temp_file.display(),
+                    e
+                )
+            });
         metrics
             .snapshot_written_bytes
             .inc_by(serialized.len() as u64);
@@ -337,6 +356,28 @@ impl ControlRegionStore {
                 e
             )
         });
+        #[cfg(test)]
+        if let Some(hook) = &self.after_rename_hook {
+            hook();
+        }
+        // Make the new name durable. Until then a crash can reopen the
+        // previous control region, which can reference files the caller
+        // deletes after this call.
+        let directory = self.path.parent().unwrap_or_else(|| {
+            panic!(
+                "Control region file {} has no parent directory",
+                self.path.display()
+            )
+        });
+        fs::File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to sync control region directory {}: {}",
+                    directory.display(),
+                    e
+                )
+            });
         self.last_position = last_position;
     }
 

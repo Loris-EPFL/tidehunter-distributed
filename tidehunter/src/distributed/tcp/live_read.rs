@@ -1278,7 +1278,7 @@ impl LiveReadCache {
             let _setup =
                 LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
             let attached = (|| {
-                let handle = grant
+                let (handle, _) = grant
                     .lease
                     .as_ref()
                     .ok_or_else(|| TcpError::new("live controller lease unavailable"))?
@@ -1485,12 +1485,13 @@ impl LiveReadCache {
                 ConnectError::Failed(TcpError::component(error))
             }
         })?;
-        let namespace = if shared {
-            lease
+        let (namespace, opened) = if shared {
+            let (namespace, opened) = lease
                 .namespace(target.nsid, target.uuid, access, connect_deadline)
-                .map_err(failed)?
+                .map_err(failed)?;
+            (namespace, Some(opened))
         } else {
-            Arc::new(lease.open_namespace().map_err(failed)?)
+            (Arc::new(lease.open_namespace().map_err(failed)?), None)
         };
         drop(setup);
         if let Some(counters) = &client.live_counters {
@@ -1506,7 +1507,9 @@ impl LiveReadCache {
             }
         }
         if let Some(metrics) = &client.live_metrics {
-            let observed = lease.binding();
+            // A shared controller serves every member of its subsystem: name
+            // the member this grant opened, not the one used to connect.
+            let observed = opened.as_ref().unwrap_or_else(|| lease.binding());
             metrics.record_route(LiveRouteEvidence {
                 transport: observed.transport,
                 address: target.address.clone(),
@@ -2871,6 +2874,76 @@ pub(crate) mod tests {
         config.write_mode = super::super::LiveWriteMode::Leased;
         config.leased_durability = Some(crate::distributed::durability::DurabilityTier::Native);
         lane
+    }
+
+    /// per_owner: one controller serves both WAL members. A grant opened for
+    /// member 2 must name member 2, not the member the controller connected with.
+    #[test]
+    fn shared_grant_route_names_the_opened_member() {
+        use crate::distributed::nvmeof::NvmeofTransport;
+        use crate::distributed::nvmeof::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
+        use crate::distributed::nvmeof::live_pool::LiveControllerPool;
+        let mut lane = subsystem_lane();
+        lane.cache.grants.clear();
+        lane.client.live_metrics = Some(lane.metrics.clone());
+        let pool = Arc::new(
+            LiveControllerPool::new(
+                LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap(),
+                8,
+                4,
+            )
+            .unwrap(),
+        );
+        lane.client.set_live_pool(pool.clone());
+        let config = lane.client.live_config.clone().unwrap();
+        let member = |nsid: u32| LiveConnectTarget {
+            nqn: "nqn.2026-01.test:wal".into(),
+            uuid: [nsid as u8; 16],
+            nsid,
+            bytes: 8192,
+            block_size: 4096,
+            address: "127.0.0.1".into(),
+            service: 4420,
+            transport: NvmeofTransport::Tcp,
+            spdk: None,
+            geometry: config.queue_geometry,
+        };
+        for nsid in [1, 2] {
+            pool.cache_local_shared_namespace(
+                &member(nsid),
+                &config.host_nqn,
+                config.host_id,
+                &lane._dir.path().join(format!("wal-{}", nsid - 1)),
+            )
+            .unwrap();
+        }
+        let Ok(grant) = LiveReadCache::connect_scope(
+            &lane.client,
+            1,
+            member(2),
+            GrantScope::Subsystem {
+                epoch: 1,
+                partition: 2,
+                subsystem: 0,
+                files_per_subsystem: 1024,
+                file_bytes: 8192,
+                slots: vec![None; 1024],
+            },
+            None,
+            7,
+            LiveNamespaceAccess::ReadShared,
+            Instant::now() + Duration::from_secs(1),
+            true,
+        ) else {
+            panic!("shared grant setup failed");
+        };
+        let routes = lane.metrics.snapshot().routes;
+        assert_eq!(routes.len(), 1);
+        let identity = &routes[0].namespace_identity;
+        assert!(routes[0].writer.is_none());
+        assert_eq!((identity.nsid, identity.uuid), (2, [2; 16]));
+        assert_eq!(identity.namespace_path, lane._dir.path().join("wal-1"));
+        drop(grant);
     }
 
     #[test]

@@ -135,6 +135,7 @@ def main():
         job.pop(key, None)
     job.update(selection='local_functional', backend='tidehunter_nvme_tcp', keys=args.owners,
                warmup_operations=0, measurement_operations=args.owners, concurrency=args.owners,
+               live_write_mode='leased', live_export_mode='per_owner',
                owner_wal_geometry='research', owner_wal_file_bytes=8388608,
                owner_read_memory_allowance_bytes=128 * 1024**2)
     now = datetime.now(timezone.utc)
@@ -162,7 +163,7 @@ def main():
     directory.mkdir(parents=True)
     evidence = {'scope': __doc__, 'uptime_before': uptime, 'load_before': load,
                 'binary': str(binary), 'binary_sha256': cloud.digest(binary),
-                'route': 'kernel NVMe/TCP leased FUA writes; buffered kernel target reads; TCP/TLS control',
+                'route': 'kernel NVMe/TCP leased per-owner writes; buffered kernel target reads; TCP/TLS control',
                 'owner_count': args.owners, 'complete': False, 'cleanup_complete': False,
                 'wal_prewrite': args.wal_prewrite,
                 'fixture': str(fixture), 'errors': []}

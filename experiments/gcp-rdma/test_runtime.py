@@ -58,6 +58,50 @@ def deadline():
     return (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
 
 
+class TraceAndReplayPolicyTests(unittest.TestCase):
+    def test_image_preparation_pins_trace_buffer_for_next_boot(self):
+        import gcp_image_prepare as image
+        with patch.object(image, 'require_kernel_btf') as require, \
+             patch.object(image, 'run', side_effect=['', 'args="quiet trace_buf_size=4K"\n']) as run:
+            self.assertEqual(image.prepare_trace_boot('1-test'), 'trace_buf_size=4K')
+        require.assert_called_once_with()
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ['grubby', '--update-kernel=/boot/vmlinuz-1-test', '--args=trace_buf_size=4K'])
+        self.assertEqual(run.call_args_list[1].args[0], ['grubby', '--info=/boot/vmlinuz-1-test'])
+        with patch.object(image, 'require_kernel_btf'), \
+             patch.object(image, 'run', side_effect=['', 'args="quiet trace_buf_size=8K"\n']), \
+             self.assertRaisesRegex(ValueError, 'TRACE_BOOT_BUFFER_INVALID'):
+            image.prepare_trace_boot('1-test')
+
+    def test_trace_qualification_fails_with_named_error_before_ring_without_btf(self):
+        import cloud_campaign
+        import cold_device_trace
+        import gcp_image_prepare as image
+        spec = {'mode': 'focused', 'selection': cloud_campaign.REDRAIN_AB_SELECTION}
+        with tempfile.TemporaryDirectory() as root:
+            missing = Path(root) / 'vmlinux'
+            require = image.require_kernel_btf
+            with patch.object(cold_device_trace, 'qualify_trace_ring') as ring, \
+                 patch.object(image, 'require_kernel_btf', side_effect=lambda: require(missing)), \
+                 self.assertRaisesRegex(image.KernelBtfMissing, 'KERNEL_BTF_MISSING.*vmlinux'):
+                runtime.qualify_physical_trace(spec)
+            ring.assert_not_called()
+            missing.write_bytes(b'present')
+            proof = {'buffer_size_kb': 64}
+            with patch.object(cold_device_trace, 'qualify_trace_ring', return_value=proof) as ring, \
+                 patch.object(image, 'require_kernel_btf', side_effect=lambda: require(missing)):
+                self.assertEqual(runtime.qualify_physical_trace(spec), proof)
+            ring.assert_called_once_with()
+
+    def test_replay_memory_cap_leaves_reserve_on_selected_machine(self):
+        self.assertEqual(runtime.replay_client_memory_mib('z4m-highmem-16'), 32 * 1024)
+        self.assertEqual(runtime.replay_client_memory_mib('z4m-highmem-32'), 32 * 1024)
+        with patch.dict(runtime.MACHINE_RAM_MIB, {'small-vm': 28 * 1024}):
+            self.assertEqual(runtime.replay_client_memory_mib('small-vm'), 20 * 1024)
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'REPLAY_HOST_MEMORY_UNAVAILABLE'):
+            runtime.replay_client_memory_mib('unknown')
+
+
 class SelectedBackendRuntimeTests(unittest.TestCase):
     def test_controller_cpu_quotas_match_machine_parallelism(self):
         import cloud_package
@@ -736,6 +780,7 @@ class MailboxTests(unittest.TestCase):
                 patch.object(runtime, 'admit_guest_runtime', return_value={}), \
                 patch.object(runtime, 'verify_fleet', return_value=[]), \
                 patch.object(runtime, 'admit_nvmet_fix', return_value=None), \
+                patch.object(runtime, 'qualify_physical_trace', return_value=None), \
                 patch.object(runtime, 'admit_guest_unit', return_value={}), \
                 patch.object(runtime, 'admit_fabrics', return_value={}), \
                 patch.object(cloud_package, 'verify_directory', return_value=package), \
