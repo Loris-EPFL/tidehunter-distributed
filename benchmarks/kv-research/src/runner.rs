@@ -991,26 +991,12 @@ const LIVE_NVMEOF_DELTA_FIELDS: &[&str] = &[
     "control_samples",
     "validation_ns",
     "validation_samples",
-    "allocation_ns",
-    "allocation_samples",
     "publication_ns",
     "publication_samples",
     "namespace_setup_ns",
     "namespace_setup_samples",
     "read_io_ns",
     "read_io_samples",
-    "persistence_ns",
-    "persistence_samples",
-    "owner_completion_ns",
-    "owner_completion_samples",
-    "wal_persistence_ns",
-    "wal_persistence_samples",
-    "wal_namespace_ns",
-    "wal_namespace_samples",
-    "frontier_file_ns",
-    "frontier_file_samples",
-    "frontier_namespace_ns",
-    "frontier_namespace_samples",
     "route_evidence_dropped",
     "fence_evidence_dropped",
     "lane_inflight_samples",
@@ -1040,8 +1026,6 @@ const LIVE_NVMEOF_DELTA_FIELDS: &[&str] = &[
     "leased_submit_ready_left_full",
     "leased_submit_ready_left_full_batches",
     "leased_deferred_submits",
-    "reserve_exchanges",
-    "complete_exchanges",
     "lease_exchanges",
     "leased_frames",
     "leased_eventfd_unavailable",
@@ -7003,11 +6987,10 @@ mod tests {
             "payload_rpc_requests": 0, "unknown_writes": 0, "errors": 0,
             "queue_ns": 0, "queue_samples": 0, "submit_ns": 0, "submit_samples": 0,
             "cq_ns": 0, "cq_samples": 0, "control_ns": 0, "control_samples": 0,
-            "validation_ns": 0, "validation_samples": 0, "persistence_ns": 0,
-            "allocation_ns": 0, "allocation_samples": 0, "publication_ns": 0,
+            "validation_ns": 0, "validation_samples": 0, "publication_ns": 0,
             "publication_samples": 0, "namespace_setup_ns": 0, "namespace_setup_samples": 0,
             "read_io_ns": 0, "read_io_samples": 0,
-            "persistence_samples": 0, "route_evidence_dropped": 0, "fence_evidence_dropped": 0
+            "route_evidence_dropped": 0, "fence_evidence_dropped": 0
         });
         // Counters added with the multi-flight lanes; every one must be present to difference.
         for name in [
@@ -7038,8 +7021,6 @@ mod tests {
             "leased_submit_ready_left_full",
             "leased_submit_ready_left_full_batches",
             "leased_deferred_submits",
-            "reserve_exchanges",
-            "complete_exchanges",
             "lease_exchanges",
             "leased_frames",
             "leased_eventfd_unavailable",
@@ -7078,11 +7059,6 @@ mod tests {
             stats[name] = serde_json::json!(0);
         }
         for stage in [
-            "owner_completion",
-            "wal_persistence",
-            "wal_namespace",
-            "frontier_file",
-            "frontier_namespace",
             "adoption_async",
             "adoption_settle",
             "leased_write",
@@ -7127,11 +7103,10 @@ mod tests {
             );
         }
         for stage in [
-            "owner_completion",
-            "wal_persistence",
-            "wal_namespace",
-            "frontier_file",
-            "frontier_namespace",
+            "adoption_async",
+            "adoption_settle",
+            "leased_write",
+            "extent_switch",
         ] {
             let mut measured = end.clone();
             measured["live_nvmeof"][format!("{stage}_ns")] = serde_json::json!(40);

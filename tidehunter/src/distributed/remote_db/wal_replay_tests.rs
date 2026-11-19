@@ -4,18 +4,21 @@ use super::tests::{checkpoint_put, fail_stop_without_checkpoint, reopen_result};
 use super::*;
 
 #[test]
-fn sui_database_document_selects_history_mode_and_preserves_legacy_default() {
+fn removed_mode_keys_fail_config_parse() {
     let fixture = Fixture::new();
-    let mut document = serde_json::to_value(&fixture.config).unwrap();
-    assert_eq!(document["history_persistence"], "wal_replay");
-    let config: RemoteDatabaseConfig = serde_json::from_value(document.clone()).unwrap();
-    assert_eq!(config.history_persistence, HistoryPersistence::WalReplay);
-    document
-        .as_object_mut()
-        .unwrap()
-        .remove("history_persistence");
-    let config: RemoteDatabaseConfig = serde_json::from_value(document).unwrap();
-    assert_eq!(config.history_persistence, HistoryPersistence::OnDisk);
+    let document = serde_json::to_value(&fixture.config).unwrap();
+    for key in ["history_persistence", "checkpoint_mode"] {
+        assert!(document.get(key).is_none());
+        let mut legacy = document.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert(key.into(), "on_disk".into());
+        let error = serde_json::from_value::<RemoteDatabaseConfig>(legacy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field"), "{key}: {error}");
+    }
 }
 
 #[test]
@@ -32,7 +35,6 @@ fn wal_replay_retry_older_than_window_is_written_again_and_newest_wins() {
             .unwrap();
     }
     db.flush_index().unwrap();
-    assert!(db.core.publisher.lock().receipt_history.is_none());
     assert!(!db.core.path.join("receipt-history-v2").exists());
     assert_eq!(
         db.core.publisher.lock().recent.len(),
@@ -178,19 +180,7 @@ fn wal_replay_checkpointed_dataset_exports_all_keys_and_owner_restart_reads_them
 }
 
 #[test]
-fn wal_replay_mode_mismatch_fails_open() {
-    let mut fixture = Fixture::new();
-    let db = fixture.open();
-    fail_stop_without_checkpoint(db);
-    fixture.config.history_persistence = HistoryPersistence::OnDisk;
-    assert!(
-        reopen_result(&fixture)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("authority manifest history persistence differs")
-    );
-
+fn owner_history_other_than_wal_replay_fails_open() {
     let fixture = Fixture::new();
     fixture.nodes[0]
         .set_history_persistence(HistoryPersistence::OnDisk)
@@ -200,7 +190,7 @@ fn wal_replay_mode_mismatch_fails_open() {
             .err()
             .unwrap()
             .to_string()
-            .contains("owner history persistence differs from the coordinator")
+            .contains("owner history persistence is not wal_replay")
     );
 }
 
@@ -492,47 +482,11 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         let error = reopen_result(&fixture).err().unwrap().to_string();
         assert!(
             error.contains(if wrong_format {
-                "checkpoint image format differs from the history persistence"
+                "checkpoint image format is not the WAL-replay format 3"
             } else {
                 "sealed WAL ends below the required position"
             }),
             "{error}"
         );
     }
-}
-
-#[cfg(feature = "test-utils")]
-#[test]
-fn memory_only_coordinator_keeps_format_two_and_receipt_history() {
-    let fixture = Fixture::new().history(HistoryPersistence::MemoryOnly);
-    let db = fixture.open();
-    let operation = fixture.operation(0, 1);
-    let version = db
-        .write_batch(operation, vec![checkpoint_put(1, 1)])
-        .unwrap();
-    db.flush_index().unwrap();
-    assert!(
-        db.core
-            .path
-            .join("receipt-history-v2/nodes.pages")
-            .is_file()
-    );
-    let metadata_name = db
-        .core
-        .publisher
-        .lock()
-        .manifest
-        .checkpoint
-        .as_ref()
-        .unwrap()
-        .metadata_name();
-    let image: CheckpointImage = read_checkpoint(&db.core.path.join(metadata_name)).unwrap();
-    assert_eq!(image.format, 2);
-    fail_stop_without_checkpoint(db);
-    let db = fixture.open();
-    assert_eq!(
-        db.write_batch(operation, vec![checkpoint_put(1, 1)])
-            .unwrap(),
-        version
-    );
 }

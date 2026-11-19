@@ -217,7 +217,7 @@ jobs:
       - name: Build shared kernel TCP proof binary
         timeout-minutes: 10
         run: cargo +1.90 build --locked --offline -p kv-research --bin kv-research --features nvmeof
-      - name: Gate single-owner abrupt-crash recovery in both histories and tiers
+      - name: Gate single-owner abrupt-crash recovery in both durability tiers
         # CI uses 8 MiB WAL members with 4 MiB fragments, crossing both boundaries.
         # Cloud qualification keeps its 1 GiB members.
         timeout-minutes: 7

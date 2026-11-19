@@ -2540,6 +2540,8 @@ impl Client {
         })
     }
 
+    /// Nonblocking control slot of the live route (and of reactor tests).
+    #[cfg(any(test, all(feature = "experimental-nvmeof", target_os = "linux")))]
     pub(super) fn submit_control(
         &mut self,
         request: &Request,
@@ -2570,6 +2572,7 @@ impl Client {
         Ok(true)
     }
 
+    #[cfg(any(test, all(feature = "experimental-nvmeof", target_os = "linux")))]
     pub(super) fn take_control(&mut self) -> Option<Result<Response, TcpError>> {
         let (id, _) = self.reactor.control?;
         if self.reactor.control_result.is_none() || self.stream.output_pending(id) {

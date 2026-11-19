@@ -958,8 +958,6 @@ fn pending_checkpoint_does_not_hide_prior_durable_append_completion() {
     let tls = certificates(temp.path());
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
-        .unwrap();
     node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
         crate::distributed::durability::DurabilityTier::Synchronous,
     ))
@@ -993,11 +991,15 @@ fn pending_checkpoint_does_not_hide_prior_durable_append_completion() {
         Instant::now() < deadline,
         "append did not enter persistence"
     );
-    // This blocks only checkpoint proof lookup, not the already accepted
-    // append's flusher. Its barrier remains in the normal FIFO order.
+    // This blocks only the position proof's stream lookup, not the already
+    // accepted append's flusher. Its barrier remains in the normal FIFO order.
     let inventory = node.inventory.lock();
-    let control_deadline = client.checkpoint_deadline();
-    assert!(client.submit_checkpoint(1, 1, 1, control_deadline).unwrap());
+    let control_deadline = client.position_deadline();
+    assert!(
+        client
+            .submit_checkpoint_position(1, 1, 0, control_deadline)
+            .unwrap()
+    );
     release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut completion = None;
@@ -1009,7 +1011,7 @@ fn pending_checkpoint_does_not_hide_prior_durable_append_completion() {
         }
         thread::yield_now();
     }
-    let proof_still_pending = client.take_checkpoint(1, 1).is_none();
+    let proof_still_pending = client.take_checkpoint_position(1, 0).is_none();
     drop(inventory);
     let completion = completion
         .expect("durable append reply was blocked behind checkpoint")
@@ -1019,23 +1021,14 @@ fn pending_checkpoint_does_not_hide_prior_durable_append_completion() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let proof = loop {
         client.progress_appends().unwrap();
-        if let Some(proof) = client.take_checkpoint(1, 1) {
+        if let Some(proof) = client.take_checkpoint_position(1, 0) {
             break proof.unwrap();
         }
         assert!(Instant::now() < deadline, "checkpoint did not finish");
         thread::yield_now();
     };
-    assert_eq!(proof.prefix, 1);
-    assert!(proof.retained >= 1);
-    assert_eq!(
-        proof.digest,
-        checkpoint::prefix_digest(
-            proof.database,
-            proof.partition,
-            1,
-            std::iter::once(completion[0].appended().into()),
-        )
-    );
+    let address = completion[0].appended().address();
+    assert!(proof.durable_end >= address.offset + u64::from(address.len));
     drop(client);
     shutdown.store(true, Ordering::Release);
     server_thread.join().unwrap();

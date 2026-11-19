@@ -1920,7 +1920,7 @@ def admit_prepared_live_client(live_client, prep, tier):
                             "host_id": live_host_identity(identity.get("host_nqn"))}:
                 raise SafetyError("live owner UUID differs from its NQN")
         expected["owner_identities"] = identities
-    expected.update(host_nqn=host_nqn, host_id=host_id, write_mode="leased", leased_durability=tier,
+    expected.update(host_nqn=host_nqn, host_id=host_id, leased_durability=tier,
                     inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"],
                     export_mode=prep["export_mode"])
     for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
@@ -1930,6 +1930,8 @@ def admit_prepared_live_client(live_client, prep, tier):
                          ("leased_flush_min_frame_bytes", 65536)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
+    if "write_mode" in prep:  # Only an admitted archive binary requests this key.
+        expected["write_mode"] = "leased"
     if live_client != expected:
         raise SafetyError("prepared live client differs from admitted configuration")
     return host_nqn
@@ -3815,8 +3817,7 @@ class Controller:
                 "owner_wal_member_read": "async",
                 "owner_read_resident_first": job.get("owner_read_resident_first", False),
                 "owner_read_memory_allowance_bytes": allowance,
-                "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research"),
-                "history_persistence": "wal_replay"}
+                "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research")}
         if "owner_wal_file_bytes" in job:
             prep["owner_wal_file_bytes"] = job["owner_wal_file_bytes"]
         tier = cloud_campaign.durability_tier(job)
@@ -3826,11 +3827,11 @@ class Controller:
                         database=list(hashlib.blake2b(case.encode(), digest_size=16).digest()),
                         batch_limits={"max_operations": 519, "max_encoded_bytes": 500000})
         receipts, nonces = {}, {}
+        executable, binary_seal = resolve_case_binary(self.config, job)
         if job.get("nvmeof_route") == "live":
             live_transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}.get(job["backend"])
             prep["live_nvmeof"] = live_nvme_preparation(self.config, case, live_transport)
-            prep["live_nvmeof"].update(write_mode="leased",
-                                       inline_reads=job.get("live_inline_reads", True),
+            prep["live_nvmeof"].update(inline_reads=job.get("live_inline_reads", True),
                                        export_mode="per_owner",
                                        lease_ahead=job.get("live_lease_ahead", True),
                                        polled_writes=job.get("live_polled_writes", False),
@@ -3841,6 +3842,9 @@ class Controller:
             for key in ("leased_sync", "leased_flush_min_frame_bytes", "leased_write_lanes"):
                 if "live_" + key in job:
                     prep["live_nvmeof"][key] = job["live_" + key]
+            if binary_seal is not None:
+                prep["history_persistence"] = "wal_replay"
+                prep["live_nvmeof"]["write_mode"] = "leased"
         if "live_pin_read_lanes" in job:
             prep["pin_read_lanes"] = job["live_pin_read_lanes"]
         if "read_lanes" in job:
@@ -3855,7 +3859,6 @@ class Controller:
             prep = platform_module(self.config).prepare_transport(self.config, prep)
         dump(directory / "prepare-input.json", prep)
         prepared = directory / "prepared"
-        executable, binary_seal = resolve_case_binary(self.config, job)
         command([str(executable), "--prepare-external-case", directory / "prepare-input.json", "--output", prepared],
                 timeout=min(60, self.remaining()), env=environment(self.config))
         geometry = {"native_default": (134217728, 10737418240), "research": (4194304, 1073741824),

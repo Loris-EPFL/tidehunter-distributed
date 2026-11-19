@@ -6,7 +6,6 @@ use super::durable_cut::RECORD;
 use super::pipeline_tests::Fixture;
 use super::tests::recovery_metrics;
 use super::*;
-use crate::distributed::durability::{CutRecovery, NativeRecovery};
 use crate::key_shape::KeyType;
 
 /// No nudge can fire during a test: the cut moves only by flush or report.
@@ -25,9 +24,8 @@ fn fixture(owners: usize, durable_cut: DurableCutConfig) -> Fixture {
     )
 }
 
-fn quiet(cut: CutRecovery) -> DurableCutConfig {
+fn quiet() -> DurableCutConfig {
     DurableCutConfig {
-        cut,
         lag_ms: QUIET_LAG_MS,
         ..DurableCutConfig::default()
     }
@@ -84,34 +82,8 @@ fn write_flushed_prefix_and_unsynced_tail(fixture: &Fixture) {
 }
 
 #[test]
-fn strict_discards_the_tail_above_the_persisted_cut() {
-    let fixture = fixture(2, quiet(CutRecovery::Strict));
-    write_flushed_prefix_and_unsynced_tail(&fixture);
-    let mut db = fixture.open();
-    let stats = db.recovery_stats();
-    assert_eq!(
-        (stats.cut_discarded_batches, stats.cut_extended_batches),
-        (1, 0)
-    );
-    assert_eq!(
-        stats.recovered_cut,
-        Some(RecoveredCut { epoch: 1, next: 2 })
-    );
-    assert_eq!(
-        [1, 2, 3].map(|key| value(&mut db, key)),
-        [Some(1), Some(2), None]
-    );
-    // The discarded version is not a retry identity: a retry writes again.
-    let retried = db
-        .write_batch(fixture.operation(0, 3), vec![put(3, 3)])
-        .unwrap();
-    assert_eq!(retried.epoch, 2);
-    assert_eq!(value(&mut db, 3), Some(3));
-}
-
-#[test]
 fn extend_keeps_the_surviving_run_after_a_coordinator_crash() {
-    let fixture = fixture(2, quiet(CutRecovery::Extend));
+    let fixture = fixture(2, quiet());
     write_flushed_prefix_and_unsynced_tail(&fixture);
     let mut db = fixture.open();
     let stats = db.recovery_stats();
@@ -143,7 +115,7 @@ fn extend_keeps_the_surviving_run_after_a_coordinator_crash() {
 /// v0 (owner 0) is flushed, v1 (owner 1) is aborted before its write, and v2
 /// (owner 0) is acknowledged; then the coordinator crashes. Returns the fixture.
 fn write_around_an_aborted_version(flushed: bool) -> Fixture {
-    let fixture = fixture(2, quiet(CutRecovery::Extend));
+    let fixture = fixture(2, quiet());
     let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
         .unwrap();
@@ -226,7 +198,7 @@ fn restarted_owner_bounds_the_skip_at_its_recorded_sync() {
 /// and discards v2, and a later open keeps that truncation.
 #[test]
 fn restarted_owner_process_stops_extend_at_its_lost_version() {
-    let mut fixture = fixture(2, quiet(CutRecovery::Extend));
+    let mut fixture = fixture(2, quiet());
     let db = fixture.open();
     let epoch = db.epoch();
     db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
@@ -289,13 +261,18 @@ fn restarted_owner_process_stops_extend_at_its_lost_version() {
 }
 
 /// Every step of open is crash safe: an interruption after the record and
-/// before activation, a crash of the next epoch, and a later per-owner open
-/// all keep the truncation, so a discarded batch never returns.
+/// before activation, a crash of the next epoch, and a later open all keep
+/// the truncation, so a discarded batch never returns.
 #[test]
-fn truncation_survives_every_later_crash_and_mode() {
-    let fixture = fixture(2, quiet(CutRecovery::Strict));
-    write_flushed_prefix_and_unsynced_tail(&fixture);
+fn truncation_survives_every_later_crash() {
+    // Owner 1 restarted with sequence 1 aborted and unsynced: recovery stops
+    // at 1 and discards the acknowledged v2.
+    let fixture = write_around_an_aborted_version(false);
     let root = fixture.temp.path().join("authority");
+    super::durable_cut::rewrite_marks_for_test(&root, |marks| {
+        marks[1].incarnation = [0x5a; 16];
+        marks[1].synced_next = 1;
+    });
     let error = RemoteDatabase::open_inner(
         &root,
         &fixture.shape,
@@ -313,56 +290,44 @@ fn truncation_survives_every_later_crash_and_mode() {
     assert_eq!(db.recovery_stats().cut_discarded_batches, 1);
     assert_eq!(value(&mut db, 3), None);
     crash(db);
-    let mut per_owner = fixture.config.clone();
-    per_owner.durable_cut.recovery = NativeRecovery::PerOwner;
-    let mut db =
-        RemoteDatabase::open(&root, &fixture.shape, per_owner, recovery_metrics()).unwrap();
-    assert!(!db.durable_cut_stats().enabled);
+    let mut db = fixture.open();
+    assert!(db.durable_cut_stats().enabled);
     // Epoch 3 checkpointed its recovered tail, so epoch 1 is not replayed again.
     assert_eq!(db.recovery_stats().cut_discarded_batches, 0);
     assert_eq!(
         [1, 2, 3].map(|key| value(&mut db, key)),
-        [Some(1), Some(2), None]
+        [Some(1), None, None]
     );
 }
 
 #[test]
-fn per_owner_and_synchronous_recovery_are_unchanged() {
-    let per_owner = fixture(
-        2,
-        DurableCutConfig {
-            recovery: NativeRecovery::PerOwner,
-            ..quiet(CutRecovery::Strict)
-        },
+fn synchronous_recovery_is_unchanged() {
+    let fixture = fixture(2, quiet()).synchronous();
+    let db = fixture.open();
+    assert_eq!(db.durable_cut_stats(), DurableCutStats::default());
+    db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 2), vec![put(2, 2)])
+        .unwrap();
+    db.core.flush_durable().unwrap();
+    db.write_batch(fixture.operation(0, 3), vec![put(3, 3)])
+        .unwrap();
+    crash(db);
+    let mut db = fixture.open();
+    let stats = db.recovery_stats();
+    assert_eq!(
+        (
+            stats.cut_discarded_batches,
+            stats.cut_extended_batches,
+            stats.recovered_cut
+        ),
+        (0, 0, None)
     );
-    let synchronous = fixture(2, quiet(CutRecovery::Strict)).synchronous();
-    for fixture in [&per_owner, &synchronous] {
-        let db = fixture.open();
-        assert_eq!(db.durable_cut_stats(), DurableCutStats::default());
-        db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
-            .unwrap();
-        db.write_batch(fixture.operation(1, 2), vec![put(2, 2)])
-            .unwrap();
-        db.core.flush_durable().unwrap();
-        db.write_batch(fixture.operation(0, 3), vec![put(3, 3)])
-            .unwrap();
-        crash(db);
-        let mut db = fixture.open();
-        let stats = db.recovery_stats();
-        assert_eq!(
-            (
-                stats.cut_discarded_batches,
-                stats.cut_extended_batches,
-                stats.recovered_cut
-            ),
-            (0, 0, None)
-        );
-        assert_eq!(
-            [1, 2, 3].map(|key| value(&mut db, key)),
-            [Some(1), Some(2), Some(3)]
-        );
-        assert!(!record_path(fixture).exists());
-    }
+    assert_eq!(
+        [1, 2, 3].map(|key| value(&mut db, key)),
+        [Some(1), Some(2), Some(3)]
+    );
+    assert!(!record_path(&fixture).exists());
 }
 
 /// Owner 1 never receives a batch and stays idle; owner 0 lags until the actor

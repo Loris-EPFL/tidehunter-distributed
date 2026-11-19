@@ -110,10 +110,6 @@ pub(super) struct Admission {
     max_bytes: usize,
     max_identities: usize,
     max_index_bytes: usize,
-    /// Hard checkpoint-tail bound; None in WalReplay mode, where recovery
-    /// replays the WAL and the old engine never bounded the tail either.
-    /// The replay charges are still counted for checkpoint_due and release.
-    replay_limits: Option<ReplayLimits>,
     partition_batches: usize,
     reference_bytes: usize,
     index: Arc<NativeIndex>,
@@ -217,9 +213,7 @@ impl Admission {
             })
             .and_then(|entries| usize::try_from(entries).ok())
             .unwrap_or(0);
-        let max_identities = if database.config.history_persistence == HistoryPersistence::WalReplay
-            && metadata_identities >= WAL_REPLAY_WINDOW_BATCHES
-        {
+        let max_identities = if metadata_identities >= WAL_REPLAY_WINDOW_BATCHES {
             database.config.max_admitted_batches
         } else {
             database
@@ -243,8 +237,6 @@ impl Admission {
             max_bytes: database.config.max_pending_bytes,
             max_identities,
             max_index_bytes: database.config.max_index_bytes,
-            replay_limits: (database.config.history_persistence != HistoryPersistence::WalReplay)
-                .then_some(database.config.replay_limits),
             partition_batches: database.config.storage.max_batches_per_partition.min(1024),
             reference_bytes: database.config.storage.max_reference_metadata_bytes,
             index: Arc::clone(&database.index),
@@ -461,22 +453,9 @@ impl Admission {
             .map_or(self.max_identities, |limit| limit.min(self.max_identities));
         #[cfg(not(test))]
         let max_identities = self.max_identities;
-        let reason = if self.replay_limits.is_some_and(|limits| {
-            tail.replay_batches
-                .checked_add(grant.replay_batches)
-                .is_none_or(|n| n > limits.max_batches)
-        }) {
-            "tail_batches"
-        } else if self.replay_limits.is_some_and(|limits| {
-            !limits.admits(
-                tail.replay_batches,
-                tail.replay_bytes,
-                grant.replay_batches,
-                grant.replay_bytes,
-            )
-        }) {
-            "tail_bytes"
-        } else if tail
+        // WAL replay has no hard tail bound, as the native engine has none:
+        // the replay charges are counted only for checkpoint_due and release.
+        let reason = if tail
             .identities
             .checked_add(grant.identities)
             .is_none_or(|n| n > max_identities)
@@ -495,12 +474,8 @@ impl Admission {
             reason,
             batches: tail.replay_batches,
             encoded_bytes: tail.replay_bytes,
-            max_batches: self
-                .replay_limits
-                .map_or(usize::MAX, |limits| limits.max_batches),
-            max_encoded_bytes: self
-                .replay_limits
-                .map_or(usize::MAX, |limits| limits.max_encoded_bytes),
+            max_batches: usize::MAX,
+            max_encoded_bytes: usize::MAX,
             incoming_encoded_bytes: Some(grant.replay_bytes),
         })
     }
@@ -661,10 +636,6 @@ impl Admission {
             || grant.slots > self.max_requests
             || grant.identities > self.max_identities
             || grant.index_bytes > self.max_index_bytes
-            || self.replay_limits.is_some_and(|limits| {
-                grant.replay_batches > limits.max_batches
-                    || grant.replay_bytes > limits.max_encoded_bytes
-            })
         {
             return Err(LocalDbError::new("write exceeds admission window capacity"));
         }

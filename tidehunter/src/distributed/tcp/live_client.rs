@@ -36,36 +36,6 @@ fn bench_open_local_file(
     }
 }
 
-/// Explicit live write contract; never falls back to another route.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveWriteMode {
-    #[default]
-    Reserved,
-    Leased,
-}
-
-impl LiveWriteMode {
-    pub const fn acknowledgement(
-        self,
-        tier: crate::distributed::durability::DurabilityTier,
-    ) -> &'static str {
-        use crate::distributed::durability::DurabilityTier;
-        match (self, tier) {
-            (Self::Leased, DurabilityTier::Native) => "leased extent: page-cache write",
-            (Self::Leased, DurabilityTier::Synchronous) => {
-                "synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous"
-            }
-            (Self::Reserved, DurabilityTier::Native) => {
-                "reserved frame: owner validated page-cache write"
-            }
-            (Self::Reserved, DurabilityTier::Synchronous) => {
-                "reserved frame: owner WAL and frontier root synchronized"
-            }
-        }
-    }
-}
-
 /// Synchronous leased durability mechanism. F6b gained 34–40% throughput at
 /// 64 KiB c16 with shared flushes, but lost 6–17% at 1–16 KiB without a threshold.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -110,11 +80,8 @@ pub struct LiveClientConfig {
     pub max_inflight_bytes: usize,
     pub connect_timeout_ms: u64,
     pub io_timeout_ms: u64,
-    #[serde(default)]
-    pub write_mode: LiveWriteMode,
-    /// Required only for leased mode; every granted extent must match this tier.
-    #[serde(default)]
-    pub leased_durability: Option<crate::distributed::durability::DurabilityTier>,
+    /// Every granted extent must match this tier.
+    pub leased_durability: crate::distributed::durability::DurabilityTier,
     #[serde(default = "default_inline_reads")]
     pub lease_ahead: bool,
     /// Use IOPOLL for leased writes; requires a controller poll queue.
@@ -140,6 +107,18 @@ impl LiveClientConfig {
     pub const fn default_leased_flush_min_frame_bytes() -> usize {
         65536
     }
+    /// Acknowledgement contract of a leased write at `tier`.
+    pub const fn acknowledgement(
+        tier: crate::distributed::durability::DurabilityTier,
+    ) -> &'static str {
+        use crate::distributed::durability::DurabilityTier;
+        match tier {
+            DurabilityTier::Native => "leased extent: page-cache write",
+            DurabilityTier::Synchronous => {
+                "synchronous leased: written and covered by a FUA write or a later namespace flush before acknowledgement; owner frontier root asynchronous"
+            }
+        }
+    }
 
     #[cfg(any(test, all(feature = "experimental-nvmeof", target_os = "linux")))]
     fn for_owner(&self, partition: u32) -> Result<std::borrow::Cow<'_, Self>, &'static str> {
@@ -162,7 +141,6 @@ impl LiveClientConfig {
             max_inflight_bytes: self.max_inflight_bytes,
             connect_timeout_ms: self.connect_timeout_ms,
             io_timeout_ms: self.io_timeout_ms,
-            write_mode: self.write_mode,
             leased_durability: self.leased_durability,
             lease_ahead: self.lease_ahead,
             polled_writes: self.polled_writes,
@@ -196,18 +174,8 @@ impl LiveClientConfig {
         if self.polled_writes && self.queue_geometry.poll_queues == 0 {
             return Err("polled live writes require a poll queue");
         }
-        if self.polled_writes && self.write_mode != LiveWriteMode::Leased {
-            return Err("polled live writes require leased write mode");
-        }
-        if self.export_mode != LiveExportMode::OnDemand && self.write_mode != LiveWriteMode::Leased
-        {
-            return Err("permanent live export requires leased write mode");
-        }
         if self.queue_geometry.poll_queues > 0 && !self.inline_reads {
             return Err("polled live reads require inline reads");
-        }
-        if (self.write_mode == LiveWriteMode::Leased) != self.leased_durability.is_some() {
-            return Err("leased_durability is required exactly for leased write mode");
         }
         if self.host_id == [0; 16]
             || !self.host_nqn.starts_with("nqn.")
@@ -227,41 +195,6 @@ impl LiveClientConfig {
             return Err("invalid live NVMe-oF initiator configuration");
         }
         Ok(())
-    }
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-struct WriteTiming<'a> {
-    counters: &'a crate::distributed::nvmeof::live_metrics::LiveNvmeCounters,
-    stage: crate::distributed::nvmeof::live_metrics::LiveTimingStage,
-    started: std::time::Instant,
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-impl Drop for WriteTiming<'_> {
-    fn drop(&mut self) {
-        self.counters.record_timing(
-            self.stage,
-            self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            1,
-        );
-    }
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-struct UnknownWriteOnError<'a> {
-    counters: Option<&'a crate::distributed::nvmeof::live_metrics::LiveNvmeCounters>,
-    armed: bool,
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-impl Drop for UnknownWriteOnError<'_> {
-    fn drop(&mut self) {
-        if self.armed
-            && let Some(counters) = &self.counters
-        {
-            counters.record_unknown_write();
-        }
     }
 }
 
@@ -443,8 +376,6 @@ pub(super) struct LeasedWriter {
     #[cfg(test)]
     drain_pause: Option<WriteDrainPause>,
     #[cfg(test)]
-    command_adoption_waits: u64,
-    #[cfg(test)]
     flight_adoption_waits: u64,
     #[cfg(test)]
     largest_close_profile: super::live_control::AdoptProfile,
@@ -510,9 +441,9 @@ fn record_write_io(
     }
 }
 
-/// How many queued append groups one live reservation can carry. One frame has
-/// one reservation, one NVMe write, one completion RPC and one persistence
-/// sequence, so merging queued groups divides all four by the merge factor.
+/// How many queued append groups one leased frame can carry. One frame has one
+/// extent allocation, one NVMe write and one adoption record, so merging queued
+/// groups divides all three by the merge factor.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LiveGroupBudget {
@@ -691,17 +622,15 @@ impl super::Client {
                 "live NVMe client is not ready for configuration",
             ));
         }
-        if config.write_mode == LiveWriteMode::Leased {
-            let capacity = config.max_inflight_requests.min(owner_append_occupancy);
-            self.live_leased.flight_bound = capacity;
-            self.live_leased.flights.reserve(capacity);
-            self.live_leased.completions.reserve(capacity);
-            for buffer in &mut self.live_leased.prefix_buffers {
-                if buffer.capacity() == 0 {
-                    buffer
-                        .try_reserve_exact(1024)
-                        .map_err(super::TcpError::component)?;
-                }
+        let capacity = config.max_inflight_requests.min(owner_append_occupancy);
+        self.live_leased.flight_bound = capacity;
+        self.live_leased.flights.reserve(capacity);
+        self.live_leased.completions.reserve(capacity);
+        for buffer in &mut self.live_leased.prefix_buffers {
+            if buffer.capacity() == 0 {
+                buffer
+                    .try_reserve_exact(1024)
+                    .map_err(super::TcpError::component)?;
             }
         }
         if self.live_config.as_ref() != Some(config) {
@@ -738,448 +667,11 @@ impl super::Client {
             counters.record_error();
         }
     }
-
-    /// Runs on the dedicated owner worker, never the coordinator or a read reactor.
-    /// The reservation remains unresolved on any failure and the caller poisons
-    /// the authority; a successful CQE alone is not a durable receipt.
-    pub(crate) fn write_live_group(
-        &mut self,
-        epoch: u64,
-        batches: &[super::CompleteBatch],
-        timeline: &crate::distributed::write_timeline::WriteTimeline,
-        owner: u32,
-    ) -> Result<Vec<super::DurableBatch>, super::TcpError> {
-        use super::live_control::LiveReserveResponse;
-        use crate::distributed::group::CompleteGroup;
-        use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
-        use crate::distributed::nvmeof::live_io::{LiveIo, LiveIoResult, LiveSubmitOutcome};
-        use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
-        use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
-        use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
-        use crate::distributed::write_timeline::WriteTimelineStage as Stage;
-        use std::time::{Duration, Instant};
-        if self.live_writer_closing {
-            return Err(super::TcpError::new("live writer admission is closed"));
-        }
-
-        let config = self
-            .live_config
-            .as_ref()
-            .ok_or_else(|| super::TcpError::new("live NVMe is not configured"))?;
-        let (host_id, max_inflight_requests, max_inflight_bytes, connect_timeout_ms, io_timeout_ms) = (
-            config.host_id,
-            config.max_inflight_requests,
-            config.max_inflight_bytes,
-            config.connect_timeout_ms,
-            config.io_timeout_ms,
-        );
-        let pool = self
-            .live_pool
-            .clone()
-            .ok_or_else(|| super::TcpError::new("live controller pool unavailable"))?;
-        let counters = self.live_counters.clone();
-        let timed = |stage| {
-            counters.as_deref().map(|counters| WriteTiming {
-                counters,
-                stage,
-                started: Instant::now(),
-            })
-        };
-        let mut unknown = UnknownWriteOnError {
-            counters: counters.as_deref(),
-            armed: false,
-        };
-        let sample = timeline.live_group(owner, batches.iter().map(|batch| batch.version()));
-        timeline.live_group_event(sample, Stage::LiveGroupBuildStarted);
-        let (group, descriptor, frame) = {
-            let _timing = timed(LiveTimingStage::Allocation);
-            let group = CompleteGroup::new_live(
-                &self.shape,
-                batches.to_vec(),
-                self.expected.batch_limits,
-                self.expected.group_limits,
-            )
-            .map_err(super::TcpError::component)?;
-            let (descriptor, frame) =
-                LiveGroupDescriptor::from_group(&group).map_err(super::TcpError::component)?;
-            (group, descriptor, frame)
-        };
-        timeline.live_group_event(sample, Stage::LiveGroupBuilt);
-        if frame
-            .len()
-            .checked_add(4095)
-            .is_none_or(|n| n > max_inflight_bytes)
-        {
-            return Err(super::TcpError::new("live frame exceeds queue byte budget"));
-        }
-        if let Some(counters) = &self.live_counters {
-            counters.record_metadata_request();
-            counters.record_reserve_exchange();
-        }
-        timeline.live_group_event(sample, Stage::LiveReserveStarted);
-        let reserve = {
-            let _timing = timed(LiveTimingStage::Control);
-            self.reserve_live_group(epoch, descriptor)
-                .map_err(|error| super::TcpError::new(format!("live reserve RPC: {error}")))?
-        };
-        timeline.live_group_event(sample, Stage::LiveReserveCompleted);
-        let (receipts, frame_offset) = match reserve {
-            LiveReserveResponse::Existing(receipts) => (receipts, None),
-            LiveReserveResponse::Reserved(reserved) => {
-                timeline.live_group_token(sample, reserved.reservation.token);
-                if reserved.binding.readonly {
-                    return Err(super::TcpError::new(
-                        "owner returned a read-only write namespace",
-                    ));
-                }
-                let binding = &reserved.binding;
-                if !self
-                    .live_writer
-                    .as_ref()
-                    .is_some_and(|writer| writer.matches(binding))
-                {
-                    timeline.live_group_event(sample, Stage::LiveNamespaceSetupStarted);
-                    {
-                        assert!(
-                            self.live_leased.flights.is_empty(),
-                            "queue change has waiting leased replies"
-                        );
-                        self.drain_live_writer(&mut Vec::new(), None)?;
-                    }
-                    let target = LiveConnectTarget {
-                        nqn: binding.nqn.clone(),
-                        uuid: binding.uuid,
-                        nsid: binding.nsid,
-                        bytes: binding.bytes,
-                        block_size: binding.block_size,
-                        address: binding.address.clone(),
-                        service: binding.service,
-                        transport: binding.transport,
-                        spdk: binding.spdk.clone(),
-                        geometry: self
-                            .live_config
-                            .as_ref()
-                            .ok_or_else(|| super::TcpError::new("live NVMe is not configured"))?
-                            .queue_geometry,
-                    };
-                    let host_nqn = &self
-                        .live_config
-                        .as_ref()
-                        .ok_or_else(|| super::TcpError::new("live NVMe is not configured"))?
-                        .host_nqn;
-                    let setup_timing = timed(LiveTimingStage::NamespaceSetup);
-                    #[cfg(any(test, feature = "test-utils"))]
-                    if self.live_write_local_fixture {
-                        if self
-                            .live_config
-                            .as_ref()
-                            .is_some_and(|c| c.export_mode == super::LiveExportMode::OnDemand)
-                        {
-                            pool.cache_local_namespace(
-                                &target,
-                                host_nqn,
-                                host_id,
-                                LiveNamespaceAccess::ReadWrite,
-                                &reserved.reservation.segment.path,
-                            )
-                        } else {
-                            pool.cache_local_shared_namespace(
-                                &target,
-                                host_nqn,
-                                host_id,
-                                &reserved.reservation.segment.path,
-                            )
-                        }
-                        .map_err(super::TcpError::component)?;
-                        let namespace = bench_open_local_file(
-                            &reserved.reservation.segment.path,
-                            binding.bytes,
-                            binding.block_size,
-                            LiveNamespaceAccess::ReadWrite,
-                        )
-                        .map_err(super::TcpError::component)?;
-                        self.live_writer = Some(LiveWriteQueue {
-                            target: target.clone(),
-                            io: LiveIo::new(
-                                namespace,
-                                max_inflight_requests,
-                                max_inflight_bytes,
-                                false,
-                            )
-                            .map_err(super::TcpError::component)?,
-                            _lease: None,
-                            failed_accounting: None,
-                            #[cfg(test)]
-                            drain_pause: None,
-                        });
-                    }
-                    #[cfg(any(test, feature = "test-utils"))]
-                    let needs_controller = !self.live_write_local_fixture;
-                    #[cfg(not(any(test, feature = "test-utils")))]
-                    let needs_controller = true;
-                    if needs_controller {
-                        let (lease, acquisition) = pool
-                            .acquire_pinned(
-                                &target,
-                                host_nqn,
-                                host_id,
-                                LiveNamespaceAccess::ReadWrite,
-                                Instant::now() + Duration::from_millis(connect_timeout_ms),
-                                super::LiveExportPinRequest {
-                                    recipe: &self.live_pin_recipe,
-                                    epoch,
-                                    segment: &reserved.reservation.segment,
-                                    binding,
-                                },
-                            )
-                            .map(|(lease, acquisition, _)| (lease, acquisition))
-                            .map_err(super::TcpError::component)?;
-                        let namespace =
-                            lease.open_namespace().map_err(super::TcpError::component)?;
-                        let io = LiveIo::new(
-                            namespace,
-                            max_inflight_requests,
-                            max_inflight_bytes,
-                            false,
-                        )
-                        .map_err(super::TcpError::component)?;
-                        drop(setup_timing);
-                        timeline.live_group_event(sample, Stage::LiveNamespaceSetupCompleted);
-                        if let Some(counters) = &self.live_counters
-                            && matches!(
-                            acquisition,
-                            crate::distributed::nvmeof::live_pool::LivePoolAcquisition::Connected
-                        ) {
-                            counters.record_namespace_connect();
-                        }
-                        if let Some(metrics) = &self.live_metrics {
-                            let observed = lease.binding();
-                            metrics.record_route(crate::distributed::nvmeof::live_metrics::LiveRouteEvidence {
-                            transport: observed.transport,
-                            address: binding.address.clone(),
-                            service: binding.service,
-                            host_nqn: host_nqn.clone(),
-                            host_id,
-                            target_implementation: crate::distributed::nvmeof::live_metrics::target_implementation(&observed.spdk),
-                            spdk: observed.spdk.clone(),
-                            writer: Some(crate::distributed::nvmeof::live_metrics::LiveWriterRoute {
-                                epoch: reserved.reservation.segment.epoch,
-                                file_index: reserved.reservation.segment.file_index,
-                                file_identity: Some(crate::distributed::nvmeof::live_target::LiveFileIdentity {
-                                    path: reserved.reservation.segment.path.clone(),
-                                    device: reserved.reservation.segment.device,
-                                    inode: reserved.reservation.segment.inode,
-                                    bytes: reserved.reservation.segment.bytes,
-                                    block_size: reserved.reservation.segment.block_size,
-                                }),
-                            }),
-                            namespace_identity: crate::distributed::nvmeof::live_metrics::LiveNamespaceIdentity {
-                                namespace_path: observed.namespace_path.clone(),
-                                controller_instance: lease.controller_instance(),
-                                nqn: observed.nqn.clone(),
-                                uuid: observed.uuid,
-                                nsid: observed.nsid,
-                                bytes: observed.bytes,
-                                block_size: observed.block_size,
-                                target_implementation: crate::distributed::nvmeof::live_metrics::target_implementation(&observed.spdk),
-                            },
-                        });
-                        }
-                        self.live_writer = Some(LiveWriteQueue {
-                            target,
-                            io,
-                            _lease: Some(lease),
-                            failed_accounting: None,
-                            #[cfg(test)]
-                            drain_pause: None,
-                        });
-                    }
-                }
-                let io = &mut self
-                    .live_writer
-                    .as_mut()
-                    .ok_or_else(|| super::TcpError::new("live write queue missing"))?
-                    .io;
-                let before = io.stats();
-                let offset = reserved.reservation.frame_offset % reserved.reservation.segment.bytes;
-                let deadline = Instant::now() + Duration::from_millis(io_timeout_ms);
-                timeline.live_group_event(sample, Stage::LiveIoStarted);
-                match io
-                    .submit_write(
-                        1,
-                        offset,
-                        &frame,
-                        crate::distributed::nvmeof::live_io::LiveWriteSync::None,
-                        deadline,
-                    )
-                    .map_err(|error| {
-                        super::TcpError::new(format!("live write submit offset={offset}: {error}"))
-                    })? {
-                    LiveSubmitOutcome::Submitted => {
-                        unknown.armed = true;
-                    }
-                    LiveSubmitOutcome::Full => {
-                        return Err(super::TcpError::new("live write admission is full"));
-                    }
-                }
-                loop {
-                    let completions = match io.progress() {
-                        Ok(completions) => completions,
-                        Err(error) => {
-                            let drain = io.shutdown();
-                            if let Some(counters) = &counters {
-                                record_write_io(counters, &before, &io.stats());
-                            }
-                            return match drain {
-                                Ok(_) => Err(super::TcpError::new(format!(
-                                    "live write progress offset={offset}: {error}"
-                                ))),
-                                Err(drain_error) => Err(super::TcpError::new(format!(
-                                    "live write progress failed: {error}; drain failed: {drain_error}"
-                                ))),
-                            };
-                        }
-                    };
-                    if let Some(completion) = completions.into_iter().next() {
-                        if let Some(counters) = &counters {
-                            record_write_io(counters, &before, &io.stats());
-                        }
-                        if completion.id != 1 {
-                            return Err(super::TcpError::new("unexpected live write completion"));
-                        }
-                        match completion.result.map_err(|error| {
-                            super::TcpError::new(format!("live write CQE offset={offset}: {error}"))
-                        })? {
-                            LiveIoResult::Written => break,
-                            LiveIoResult::Reads(_) | LiveIoResult::Flushed => {
-                                return Err(super::TcpError::new("unexpected live write result"));
-                            }
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-                timeline.live_group_event(sample, Stage::LiveIoCompleted);
-                if let Some(counters) = &self.live_counters {
-                    counters.record_metadata_request();
-                    counters.record_complete_exchange();
-                }
-                timeline.live_group_event(sample, Stage::LiveCompleteStarted);
-                let completion = {
-                    let _timing = timed(LiveTimingStage::Control);
-                    self.complete_live_group_profiled(epoch, reserved.reservation.token)
-                        .map_err(|error| {
-                            super::TcpError::new(format!(
-                                "live completion RPC offset={offset}: {error}"
-                            ))
-                        })?
-                };
-                timeline.live_group_event(sample, Stage::LiveCompleteCompleted);
-                timeline.live_group_owner(
-                    sample,
-                    (completion.validation_samples != 0).then_some(completion.validation_ns),
-                    completion.persistence,
-                );
-                if let Some(counters) = &counters {
-                    let profile = &completion.persistence;
-                    // Persistence contains the WAL and frontier barrier spans;
-                    // these nested observations must not be added together.
-                    for (stage, ns, samples) in [
-                        (
-                            LiveTimingStage::OwnerCompletion,
-                            completion.validation_ns,
-                            completion.validation_samples,
-                        ),
-                        (
-                            LiveTimingStage::Persistence,
-                            profile.persist_total_ns,
-                            profile.persist_calls,
-                        ),
-                        (
-                            LiveTimingStage::WalPersistence,
-                            profile.persist_wal_file_ns,
-                            profile.file_persist_calls,
-                        ),
-                        (
-                            LiveTimingStage::WalNamespace,
-                            profile.persist_namespace_ns,
-                            profile.namespace_persist_calls,
-                        ),
-                        (
-                            LiveTimingStage::FrontierFile,
-                            profile.live_frontier_file_ns,
-                            profile.live_frontier_file_calls,
-                        ),
-                        (
-                            LiveTimingStage::FrontierNamespace,
-                            profile.live_frontier_namespace_ns,
-                            profile.live_frontier_namespace_calls,
-                        ),
-                    ] {
-                        if samples != 0 {
-                            counters.record_timing(stage, ns, samples);
-                        }
-                    }
-                }
-                (completion.receipts, Some(reserved.reservation.frame_offset))
-            }
-        };
-        let _validation_timing = timed(LiveTimingStage::Validation);
-        if receipts.len() != batches.len() {
-            return Err(super::TcpError::new(
-                "live receipt count differs from submitted group",
-            ));
-        }
-        let validated = batches
-            .iter()
-            .zip(receipts)
-            .zip(group.batch_offsets())
-            .map(|((batch, receipt), offset)| {
-                if let Some(frame_offset) = frame_offset {
-                    let expected = frame_offset
-                        .checked_add(8)
-                        .and_then(|n| n.checked_add(u64::from(*offset)));
-                    if expected != Some(receipt.appended().address().offset) {
-                        return Err(super::TcpError::new(
-                            "live receipt is outside the reserved frame",
-                        ));
-                    }
-                }
-                self.check_receipt(batch, super::Receipt::from_durable(receipt))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        timeline.live_group_event(sample, Stage::LiveReceiptsValidated);
-        unknown.armed = false;
-        Ok(validated)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    #[test]
-    fn unknown_write_counts_only_accepted_unresolved_writes() {
-        use crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics;
-        let metrics = LiveNvmeMetrics::new();
-        let counters = metrics.register().unwrap();
-        drop(UnknownWriteOnError {
-            counters: Some(&counters),
-            armed: false,
-        });
-        assert_eq!(metrics.snapshot().counts.unknown_writes, 0);
-        drop(UnknownWriteOnError {
-            counters: Some(&counters),
-            armed: true,
-        });
-        assert_eq!(metrics.snapshot().counts.unknown_writes, 1);
-        let mut resolved = UnknownWriteOnError {
-            counters: Some(&counters),
-            armed: true,
-        };
-        resolved.armed = false;
-        drop(resolved);
-        assert_eq!(metrics.snapshot().counts.unknown_writes, 1);
-    }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn io_timings_use_retired_cq_and_submission_counts() {
@@ -1294,8 +786,7 @@ mod tests {
             max_inflight_bytes: 4096,
             connect_timeout_ms: 1000,
             io_timeout_ms: 1000,
-            write_mode: LiveWriteMode::Reserved,
-            leased_durability: None,
+            leased_durability: crate::distributed::durability::DurabilityTier::Native,
             inline_reads: true,
             queue_geometry: Default::default(),
             export_mode: Default::default(),
@@ -1335,19 +826,14 @@ mod tests {
             );
         }
         assert!(restored.owner_identities.is_empty());
-        for mode in [LiveExportMode::PerFile, LiveExportMode::PerOwner] {
+        for mode in [
+            LiveExportMode::PerFile,
+            LiveExportMode::PerOwner,
+            LiveExportMode::OnDemand,
+        ] {
             config.export_mode = mode;
-            assert_eq!(
-                config.validate(),
-                Err("permanent live export requires leased write mode")
-            );
-            config.write_mode = LiveWriteMode::Leased;
-            config.leased_durability = Some(crate::distributed::durability::DurabilityTier::Native);
             assert!(config.validate().is_ok());
-            config.write_mode = LiveWriteMode::Reserved;
-            config.leased_durability = None;
         }
-        config.export_mode = LiveExportMode::OnDemand;
         config.leased_write_window = None;
         assert!(config.validate().is_ok());
         config.leased_write_window = Some(0);
@@ -1361,9 +847,7 @@ mod tests {
         assert!(config.validate().is_ok());
         let mut polled = config.clone();
         polled.polled_writes = true;
-        polled.write_mode = LiveWriteMode::Leased;
-        polled.leased_durability =
-            Some(crate::distributed::durability::DurabilityTier::Synchronous);
+        polled.leased_durability = crate::distributed::durability::DurabilityTier::Synchronous;
         polled.leased_sync = LeasedSync::GroupFlush;
         assert!(polled.validate().is_ok());
         config.inline_reads = false;
@@ -1531,7 +1015,7 @@ impl super::Client {
         let requested = self
             .live_config
             .as_ref()
-            .and_then(|config| config.leased_durability);
+            .map(|config| config.leased_durability);
         if requested != Some(leased.tier) {
             self.live_write_failed = true;
             return Err(super::TcpError::new(format!(
@@ -1584,12 +1068,6 @@ impl super::Client {
         result
     }
 
-    pub(crate) fn live_leased_mode(&self) -> bool {
-        self.live_config
-            .as_ref()
-            .is_some_and(|c| c.write_mode == LiveWriteMode::Leased)
-    }
-
     fn lease_ahead(&self) -> bool {
         self.live_config
             .as_ref()
@@ -1632,7 +1110,7 @@ impl super::Client {
                 let tier = self
                     .live_config
                     .as_ref()
-                    .and_then(|config| config.leased_durability);
+                    .map(|config| config.leased_durability);
                 if leased.extent.start != end || tier != Some(leased.tier) {
                     return Err(super::TcpError::new(
                         "preleased extent identity, tier or continuity differs",
@@ -2728,7 +2206,7 @@ impl super::Client {
         use crate::distributed::nvmeof::live_storage::extend_live_receipt_digest;
         use crate::distributed::write_timeline::WriteTimelineStage as Stage;
         self.ensure_leased_healthy()?;
-        if self.live_writer_closing || !self.live_leased_mode() {
+        if self.live_writer_closing || !self.live_nvme_configured() {
             return Err(super::TcpError::new(
                 "leased writer admission is closed or mode differs",
             ));
@@ -3224,8 +2702,7 @@ pub(crate) mod leased_tests {
                             .max(128 * 1024),
                         connect_timeout_ms: 1000,
                         io_timeout_ms: 1000,
-                        write_mode: LiveWriteMode::Leased,
-                        leased_durability: Some(tier),
+                        leased_durability: tier,
                         inline_reads: true,
                         queue_geometry: Default::default(),
                         export_mode: Default::default(),
@@ -3493,14 +2970,7 @@ pub(crate) mod leased_tests {
                 ),
                 (1, 3, 3)
             );
-            assert_eq!(
-                (
-                    counts.lease_exchanges,
-                    counts.reserve_exchanges,
-                    counts.complete_exchanges
-                ),
-                (1, 0, 0)
-            );
+            assert_eq!(counts.lease_exchanges, 1);
             assert_eq!(
                 counts.fua_writes,
                 if tier == DurabilityTier::Synchronous {
@@ -3952,7 +3422,7 @@ pub(crate) mod leased_tests {
     }
 
     #[test]
-    fn omitted_write_mode_is_reserved_and_unknown_mode_is_rejected() {
+    fn omitted_optional_keys_default_and_removed_write_mode_is_rejected() {
         assert!(
             LeasedWriter::default()
                 .prefix_buffers
@@ -3963,15 +3433,22 @@ pub(crate) mod leased_tests {
             "host_nqn": "nqn.2026-01.test:leased", "host_id": vec![1; 16],
             "max_inflight_requests": 4, "max_inflight_bytes": 65536,
             "connect_timeout_ms": 1000, "io_timeout_ms": 1000,
+            "leased_durability": "native",
         });
         let config: LiveClientConfig = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(config.write_mode, LiveWriteMode::Reserved);
+        assert_eq!(config.leased_durability, DurabilityTier::Native);
         assert!(config.inline_reads);
         assert!(config.lease_ahead);
         assert!(!config.polled_writes);
-        let mut invalid = value;
-        invalid["write_mode"] = serde_json::json!("fallback");
-        assert!(serde_json::from_value::<LiveClientConfig>(invalid).is_err());
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("leased_durability");
+        assert!(serde_json::from_value::<LiveClientConfig>(missing).is_err());
+        let mut removed = value;
+        removed["write_mode"] = serde_json::json!("leased");
+        let error = serde_json::from_value::<LiveClientConfig>(removed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field"), "{error}");
     }
 
     #[test]
@@ -4234,29 +3711,12 @@ pub(crate) mod leased_tests {
     }
 
     #[test]
-    fn leased_config_requires_an_explicit_tier_only_in_leased_mode() {
+    fn polled_writes_require_a_poll_queue() {
         let mut config: LiveClientConfig = serde_json::from_value(serde_json::json!({
             "host_nqn": "nqn.2026-01.test:leased", "host_id": vec![1; 16],
             "max_inflight_requests": 4, "max_inflight_bytes": 65536,
             "connect_timeout_ms": 1000, "io_timeout_ms": 1000,
-        }))
-        .unwrap();
-        assert!(config.validate().is_ok());
-        config.leased_durability = Some(DurabilityTier::Native);
-        assert!(config.validate().is_err());
-        config.write_mode = LiveWriteMode::Leased;
-        assert!(config.validate().is_ok());
-        config.leased_durability = None;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn polled_writes_require_a_poll_queue_and_leased_mode() {
-        let mut config: LiveClientConfig = serde_json::from_value(serde_json::json!({
-            "host_nqn": "nqn.2026-01.test:leased", "host_id": vec![1; 16],
-            "max_inflight_requests": 4, "max_inflight_bytes": 65536,
-            "connect_timeout_ms": 1000, "io_timeout_ms": 1000,
-            "lease_ahead": true, "polled_writes": true,
+            "lease_ahead": true, "polled_writes": true, "leased_durability": "native",
         }))
         .unwrap();
         assert_eq!(
@@ -4264,17 +3724,9 @@ pub(crate) mod leased_tests {
             Err("polled live writes require a poll queue")
         );
         config.queue_geometry.poll_queues = 1;
-        assert_eq!(
-            config.validate(),
-            Err("polled live writes require leased write mode")
-        );
-        config.write_mode = LiveWriteMode::Leased;
-        config.leased_durability = Some(DurabilityTier::Native);
         assert!(config.validate().is_ok());
         config.polled_writes = false;
         config.queue_geometry.poll_queues = 0;
-        config.write_mode = LiveWriteMode::Reserved;
-        config.leased_durability = None;
         assert!(config.validate().is_ok());
     }
 
@@ -5711,7 +5163,7 @@ impl super::Client {
             completed = flight.end;
         }
         let durable = self.live_config.as_ref().and_then(|config| {
-            (config.leased_durability == Some(DurabilityTier::Synchronous)).then(|| {
+            (config.leased_durability == DurabilityTier::Synchronous).then(|| {
                 self.live_leased
                     .flights
                     .iter()
@@ -5803,12 +5255,6 @@ impl super::Client {
         release: std::sync::mpsc::Receiver<()>,
     ) {
         self.live_leased.drain_pause = Some(WriteDrainPause { entered, release });
-    }
-    pub(crate) fn leased_test_note_command_adoption_wait(&mut self) {
-        self.live_leased.command_adoption_waits += 1;
-    }
-    pub(crate) fn leased_test_command_adoption_waits(&self) -> u64 {
-        self.live_leased.command_adoption_waits
     }
     pub(crate) fn leased_test_note_flight_adoption_wait(&mut self) {
         self.live_leased.flight_adoption_waits += 1;

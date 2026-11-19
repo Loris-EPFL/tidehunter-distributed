@@ -118,7 +118,7 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
     let legacy = LegacyManifest {
         format: manifest.format,
         storage: manifest.storage.clone(),
-        history_persistence: manifest.history_persistence,
+        history_persistence: HistoryPersistence::WalReplay,
         endpoints: manifest.endpoints.clone(),
         shape_yaml: manifest.shape_yaml.clone(),
         replay_limits: manifest.replay_limits,
@@ -232,20 +232,7 @@ fn benchmark_owner_lookup_uses_authoritative_reference_and_reports_absence() {
 
 #[test]
 fn checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts() {
-    checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
-        HistoryPersistence::OnDisk,
-    );
-}
-#[test]
-fn wal_replay_checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts() {
-    checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
-        HistoryPersistence::WalReplay,
-    );
-}
-fn checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
-    mode: HistoryPersistence,
-) {
-    let fixture = Fixture::new().history(mode);
+    let fixture = Fixture::new();
     let db = fixture.open();
     let operation = fixture.operation(0, 1);
     let original = checkpoint_put(1, 1);
@@ -373,7 +360,7 @@ fn checkpoint_is_not_adopted_until_every_required_shard_is_fenced() {
     );
 }
 
-fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointImage)) {
+fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointImageV3)) {
     let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
     let commit = manifest.checkpoint.as_mut().unwrap();
     let name = commit.metadata_name();
@@ -387,9 +374,9 @@ fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointI
 }
 
 #[test]
-fn committed_checkpoint_corruption_missing_files_and_wrong_prefixes_fail_closed() {
-    for damage in 0..7 {
-        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+fn committed_checkpoint_corruption_and_missing_files_fail_closed() {
+    for damage in 0..6 {
+        let fixture = Fixture::new();
         let db = fixture.open();
         db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
             .unwrap();
@@ -404,41 +391,19 @@ fn committed_checkpoint_corruption_missing_files_and_wrong_prefixes_fail_closed(
             3 => fs::write(root.join(commit.metadata_name()), b"corrupt metadata").unwrap(),
             4 => replace_checkpoint_metadata(&root, |image| image.database[0] ^= 1),
             5 => replace_checkpoint_metadata(&root, |image| {
-                image.streams.pop();
-            }),
-            6 => replace_checkpoint_metadata(&root, |image| {
-                let stream = image
-                    .streams
-                    .iter_mut()
-                    .find(|stream| stream.proof.prefix != 0)
-                    .unwrap();
-                let mut history =
-                    ReceiptHistory::open(&root, fixture.config.storage.database).unwrap();
-                let mut receipt = history
-                    .receipt(stream.proof.partition, stream.proof.epoch, 0)
-                    .unwrap();
-                receipt.address.offset += 8;
-                // Forge mutually consistent local cold authority and its digest.
-                // The independent authenticated shard must still reject it.
-                history.replace_single_receipt_for_test(receipt).unwrap();
-                image.history_root = history.root;
-                stream.state = history
-                    .state(stream.proof.partition, stream.proof.epoch)
-                    .unwrap();
-                stream.proof.digest = history
-                    .prefix(stream.proof.partition, stream.proof.epoch, 1)
-                    .unwrap();
+                // An unaligned replay start is never a valid WAL position.
+                image.positions[0].replay_from += 1;
             }),
             _ => unreachable!(),
         }
         let error = reopen_result(&fixture)
             .err()
             .expect("corrupt checkpoint must not fall back");
-        if damage == 6 {
+        if damage == 5 {
             assert!(
                 error
                     .to_string()
-                    .contains("fenced shard checkpoint proof differs")
+                    .contains("invalid checkpoint WAL position")
             );
         }
     }
@@ -446,22 +411,12 @@ fn committed_checkpoint_corruption_missing_files_and_wrong_prefixes_fail_closed(
 
 #[test]
 fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
-    automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(HistoryPersistence::OnDisk);
-}
-#[test]
-fn wal_replay_automatic_checkpoint_admission_keeps_crash_replay_bounded() {
-    automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(HistoryPersistence::WalReplay);
-}
-fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryPersistence) {
-    let mut fixture = Fixture::new_with_capacity(40).history(mode);
+    let mut fixture = Fixture::new_with_capacity(40);
     fixture.config.replay_limits = ReplayLimits {
         max_batches: 32,
         max_encoded_bytes: 1024 * 1024,
     };
-    let replay = mode == HistoryPersistence::WalReplay;
-    if replay {
-        fixture.config.max_admitted_batches = 1024;
-    }
+    fixture.config.max_admitted_batches = 1024;
     let limits = fixture.config.replay_limits;
     assert!(checkpoint_metadata_fits(
         &fixture.config,
@@ -475,15 +430,9 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryP
     let db = fixture.open();
     let (entered, waiting) = mpsc::sync_channel(1);
     let (resume, gate) = mpsc::sync_channel(1);
-    if replay {
-        db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    }
+    db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
     let mut acknowledged = Vec::new();
-    let count = if replay {
-        4 * limits.max_batches
-    } else {
-        limits.max_batches + 3
-    };
+    let count = 4 * limits.max_batches;
     for n in 0..count {
         let operation = fixture.operation((n % 5) as u32, n as u64);
         let value = n as u8;
@@ -491,19 +440,11 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryP
             .write_batch(operation, vec![checkpoint_put(1, value)])
             .unwrap();
         acknowledged.push((operation, value, version));
-        if !replay {
-            assert!(checkpoint_tail(&db).0 <= limits.max_batches);
-            assert!(checkpoint_tail(&db).1 <= limits.max_encoded_bytes);
-        }
     }
-    if replay {
-        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(db.authority_write_stats().foreground_checkpoint_count, 0);
-        assert_eq!(checkpoint_tail(&db).0, count);
-        assert!(!db.core.path.join("receipt-history-v2").exists());
-    } else {
-        assert!(manifest(&db).checkpoint.is_some());
-    }
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(db.authority_write_stats().foreground_checkpoint_count, 0);
+    assert_eq!(checkpoint_tail(&db).0, count);
+    assert!(!db.core.path.join("receipt-history-v2").exists());
     let retained_tail = checkpoint_tail(&db).0;
     let clocks = db.authority_write_stats();
     assert!(clocks.checkpoint_count > 0);
@@ -516,14 +457,8 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryP
     drop(resume);
     fail_stop_without_checkpoint(db);
     let mut db = fixture.open();
-    if replay {
-        assert_eq!(db.recovery_stats().tail_batches, count as u64);
-    }
+    assert_eq!(db.recovery_stats().tail_batches, count as u64);
     assert!(db.recovery_stats().tail_batches <= retained_tail as u64);
-    if !replay {
-        assert!(db.recovery_stats().tail_batches <= limits.max_batches as u64);
-        assert!(db.recovery_stats().tail_bytes <= limits.max_encoded_bytes as u64);
-    }
     assert_eq!(
         db.get(KeySpace(0), &1u32.to_be_bytes())
             .unwrap()
@@ -543,7 +478,7 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryP
 #[test]
 fn checkpoint_does_not_turn_damaged_referenced_value_into_absence() {
     use std::os::unix::fs::FileExt;
-    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+    let fixture = Fixture::new();
     let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
@@ -996,8 +931,7 @@ fn live_frame_can_fill_one_fragment() {
         max_inflight_bytes: 64 * 1024,
         connect_timeout_ms: 1000,
         io_timeout_ms: 1000,
-        write_mode: super::super::tcp::LiveWriteMode::Reserved,
-        leased_durability: None,
+        leased_durability: super::super::durability::DurabilityTier::Native,
         inline_reads: true,
         queue_geometry: Default::default(),
     });
@@ -1008,8 +942,6 @@ fn live_frame_can_fill_one_fragment() {
     );
     config.owner_append_occupancy = 8;
     let live = config.live_nvme.as_mut().unwrap();
-    live.write_mode = super::super::tcp::LiveWriteMode::Leased;
-    live.leased_durability = Some(super::super::durability::DurabilityTier::Native);
     live.max_inflight_requests = 32;
     live.leased_write_window = None;
     assert!(config.validate().is_ok());
@@ -1071,20 +1003,7 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
 
 #[test]
 fn parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries() {
-    parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode(
-        HistoryPersistence::OnDisk,
-    );
-}
-#[test]
-fn wal_replay_parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries() {
-    parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode(
-        HistoryPersistence::WalReplay,
-    );
-}
-fn parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode(
-    mode: HistoryPersistence,
-) {
-    let mut fixture = Fixture::new_with_capacity(1024).history(mode);
+    let mut fixture = Fixture::new_with_capacity(1024);
     // Freeze an explicit bound whose low watermark lies inside this replay
     // cohort; the test exercises refill/retry semantics, not an implicit default.
     fixture.config.replay_limits = ReplayLimits::legacy();
@@ -1878,131 +1797,91 @@ fn sui_relocation_retains_stop_overwritten_within_atomic_batch() {
 }
 
 #[test]
-fn recorded_replay_limits_reject_shrink_before_fencing_and_allow_recovered_growth() {
-    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-    fixture.config.replay_limits = ReplayLimits {
-        max_batches: 32,
-        max_encoded_bytes: 1024 * 1024,
-    };
+fn legacy_manifest_modes_fail_open_before_any_mutation() {
+    let fixture = Fixture::new();
     let db = fixture.open();
-    let operation = fixture.operation(0, 80);
-    let version = db
-        .write_batch(operation, vec![checkpoint_put(1, 7)])
+    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
         .unwrap();
-    assert!(manifest(&db).checkpoint.is_none());
-    fail_stop_without_checkpoint(db);
+    db.shutdown().unwrap();
+    drop(db);
     let root = fixture.temp.path().join("authority");
-    let before: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    for limits in [
-        ReplayLimits {
-            max_batches: 31,
-            max_encoded_bytes: 1024 * 1024,
-        },
-        ReplayLimits {
-            max_batches: 32,
-            max_encoded_bytes: 1024 * 1024 - 1,
-        },
+    let current: serde_yaml::Value = read_metadata(&root.join(MANIFEST)).unwrap();
+    // (case, key, value; None removes the key, expected mode name).
+    let mut legacy: Vec<(String, &str, Option<serde_yaml::Value>, &str)> = Vec::new();
+    for key in [
+        "checkpoint_mode",
+        "cell_checkpoint",
+        "cell_checkpoint_obsolete",
     ] {
-        fixture.config.replay_limits = limits;
-        let error = reopen_result(&fixture).err().unwrap();
-        assert!(error.to_string().contains("cannot shrink"));
-        let after: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-        assert_eq!(after.epochs.len(), before.epochs.len());
-        assert_eq!(after.replay_limits, before.replay_limits);
+        // Explicit null is a present key and must fail like any other value.
+        for value in [serde_yaml::Value::Null, "per_cell".into(), 1u32.into()] {
+            legacy.push((format!("{key}={value:?}"), key, Some(value), "per_cell"));
+        }
     }
-    fixture.config.replay_limits = ReplayLimits {
-        max_batches: 64,
-        max_encoded_bytes: 2 * 1024 * 1024,
-    };
-    let mut reopened = fixture.open();
-    assert_eq!(reopened.recovery_stats().tail_batches, 1);
+    legacy.push(("format 5".into(), "format", Some(5u32.into()), "per_cell"));
+    legacy.push((
+        "absent history".into(),
+        "history_persistence",
+        None,
+        "on_disk",
+    ));
+    legacy.push((
+        "memory_only".into(),
+        "history_persistence",
+        Some("memory_only".into()),
+        "memory_only",
+    ));
+    for (case, key, value, mode) in legacy {
+        let mut old = current.clone();
+        let fields = old.as_mapping_mut().unwrap();
+        match value {
+            Some(value) => {
+                fields.insert(key.into(), value);
+            }
+            None => {
+                fields.remove(serde_yaml::Value::from(key));
+            }
+        }
+        install_metadata(&root, MANIFEST, &encode_metadata(&old).unwrap()).unwrap();
+        let before = fs::read(root.join(MANIFEST)).unwrap();
+        let mut entries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        let error = reopen_result(&fixture).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!("unsupported legacy distributed mode {mode}: use archive/multi-design"),
+            "{case}"
+        );
+        assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before, "{case}");
+        let mut after: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        after.sort();
+        assert_eq!(after, entries, "{case}");
+    }
+    for (index, node) in fixture.nodes.iter().enumerate() {
+        // Fencing generation 1 only: no reopen reached an owner.
+        assert_eq!(
+            node.status().unwrap().epochs.len(),
+            1,
+            "owner {index} was fenced by a legacy open"
+        );
+    }
+    install_metadata(&root, MANIFEST, &encode_metadata(&current).unwrap()).unwrap();
+    let mut db = fixture.open();
+    assert_eq!(db.epoch(), 2);
     assert_eq!(
-        reopened
-            .write_batch(operation, vec![checkpoint_put(1, 7)])
-            .unwrap(),
-        version
-    );
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &1u32.to_be_bytes())
+        db.get(KeySpace(0), &1u32.to_be_bytes())
             .unwrap()
             .unwrap()
             .as_ref(),
         &[7; 32]
     );
-    let activated: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(activated.replay_limits, fixture.config.replay_limits);
-    assert!(activated.epochs.last().unwrap().active);
-}
-
-#[test]
-fn increased_replay_configuration_cannot_relax_the_recorded_recovery_check() {
-    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-    fixture.config.replay_limits = ReplayLimits {
-        max_batches: 32,
-        max_encoded_bytes: 1024 * 1024,
-    };
-    let db = fixture.open();
-    for n in 0..3 {
-        db.write_batch(
-            fixture.operation(n, 90 + n as u64),
-            vec![checkpoint_put(1, n as u8)],
-        )
-        .unwrap();
-    }
-    assert!(manifest(&db).checkpoint.is_none());
-    fail_stop_without_checkpoint(db);
-    let root = fixture.temp.path().join("authority");
-    let mut recorded: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    // Simulate a validly framed but inconsistent durable bound. The larger
-    // requested configuration must not legitimize an impossible old suffix.
-    recorded.replay_limits.max_batches = 1;
-    persist_manifest(&root, &recorded).unwrap();
-    fixture.config.replay_limits.max_batches = 64;
-    let error = reopen_result(&fixture).err().unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("tail exceeds committed admission bound")
-    );
-    let after: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(after.replay_limits, recorded.replay_limits);
-    assert!(!after.epochs.last().unwrap().active);
-}
-
-#[test]
-fn legacy_authority_without_explicit_limits_replays_before_format_upgrade() {
-    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-    fixture.config.replay_limits = ReplayLimits::legacy();
-    let db = fixture.open();
-    let operation = fixture.operation(2, 100);
-    let version = db
-        .write_batch(operation, vec![checkpoint_put(1, 9)])
-        .unwrap();
-    fail_stop_without_checkpoint(db);
-    let root = fixture.temp.path().join("authority");
-    let mut old: serde_yaml::Value = read_metadata(&root.join(MANIFEST)).unwrap();
-    let fields = old.as_mapping_mut().unwrap();
-    fields.insert("format".into(), 2u32.into());
-    fields.remove(serde_yaml::Value::from("replay_limits"));
-    fields.remove(serde_yaml::Value::from("live_nvme_identity"));
-    fields.remove(serde_yaml::Value::from("history_persistence"));
-    install_metadata(&root, MANIFEST, &encode_metadata(&old).unwrap()).unwrap();
-    let restored: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(restored.replay_limits, ReplayLimits::legacy());
-    assert!(restored.live_nvme_identity.is_none());
-    fixture.config.replay_limits = ReplayLimits::default();
-    let reopened = fixture.open();
-    assert_eq!(reopened.recovery_stats().tail_batches, 1);
-    assert_eq!(
-        reopened
-            .write_batch(operation, vec![checkpoint_put(1, 9)])
-            .unwrap(),
-        version
-    );
-    let upgraded: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(upgraded.format, 4);
-    assert_eq!(upgraded.replay_limits, fixture.config.replay_limits);
+    db.shutdown().unwrap();
 }
 
 #[test]

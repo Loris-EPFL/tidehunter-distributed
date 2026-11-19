@@ -441,10 +441,7 @@ class LiveSpdkDaemon:
         _write(self.stopped, result)
         return result
 
-KERNEL_LIVE_HISTORIES = ("on_disk", "wal_replay")
-
-
-def qualify_kernel_live(fixture, binary, *, history_persistence, transport="rdma",
+def qualify_kernel_live(fixture, binary, *, transport="rdma",
                         deadline_seconds=600, library_path=None):
     """Run both real single-owner durability tiers in a root-owned private fixture.
 
@@ -458,8 +455,6 @@ def qualify_kernel_live(fixture, binary, *, history_persistence, transport="rdma
         raise ValueError("absolute existing output directory and binary required")
     if transport not in ("rdma", "tcp") or not 120 <= deadline_seconds <= 1200:
         raise ValueError("invalid transport or qualification deadline")
-    if history_persistence not in KERNEL_LIVE_HISTORIES:
-        raise ValueError("invalid qualification history persistence")
     container = ROOT
     if library_path is not None:
         library_path = _inside(fixture, library_path).resolve(strict=True)
@@ -468,8 +463,7 @@ def qualify_kernel_live(fixture, binary, *, history_persistence, transport="rdma
         container = ROOT + ["env", "LD_LIBRARY_PATH=" + str(library_path)]
     deadline_epoch = time.time() + deadline_seconds
     argv = container + ["python3", "-B", str(Path(__file__).resolve()), "--kernel-live-worker",
-                        str(fixture), str(binary), transport, str(deadline_seconds), str(deadline_epoch),
-                        history_persistence]
+                        str(fixture), str(binary), transport, str(deadline_seconds), str(deadline_epoch)]
     result = subprocess.run(argv, capture_output=True, text=True, timeout=deadline_seconds)
     if result.returncode:
         raise TargetError("kernel live qualification failed; evidence retained: "
@@ -499,13 +493,13 @@ def _kernel_live_ports(address, *, commissioning_address, control_address):
 
 def _admit_kernel_leased_route(remote, target, tier):
     live = remote.get("live_nvme") or {}
-    if (live.get("write_mode") != "leased" or live.get("export_mode") != "per_owner"
-            or live.get("leased_durability") != tier or target.get("export_mode") != "per_owner"):
-        raise TargetError("prepared kernel qualification is not leased per-owner at the requested durability tier")
+    if (live.get("export_mode") != "per_owner" or live.get("leased_durability") != tier
+            or target.get("export_mode") != "per_owner"):
+        raise TargetError("prepared kernel qualification is not per-owner at the requested durability tier")
 
 
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
-                        history_persistence, owner_wal_file_bytes=None):
+                        owner_wal_file_bytes=None):
     import hashlib
     import shutil
     import signal
@@ -520,8 +514,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
 
     if os.geteuid() != 0:
         raise TargetError("kernel live worker requires root")
-    if history_persistence not in KERNEL_LIVE_HISTORIES:
-        raise ValueError("invalid qualification history persistence")
     output = Path(output).resolve(strict=True)
     owner._trusted_dir(output)
     binary = Path(binary).resolve(strict=True)
@@ -536,7 +528,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
     out.mkdir(mode=0o700)
     overall = {"scope": "single owner kernel live NVMe-oF qualification, not performance",
                "root": str(root), "transport": transport, "binary_sha256": binary_sha256,
-               "history_persistence": history_persistence,
                "tiers": {}, "complete": False}
 
     def run(argv, timeout, log=None):
@@ -625,7 +616,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             prep = {"guest_root": str(guest), "addresses": [f"{control_address}:{control}"],
                 "transport": {"kind": "tcp"}, "durability_tier": tier,
                 "owner_wal_geometry": "research",
-                "history_persistence": history_persistence,
                 "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
                 "max_index_bytes": 128 * 1024**2, "max_epochs": 4,
                 "coordinator_cache_bytes": 4 * 1024**2, "owner_read_workers": 2,
@@ -634,7 +624,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                 "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
                     "port_id": port_id, "commissioning_service": commissioning,
                     "commissioning_port_id": port_id + 1, "max_inflight_requests": 32,
-                    "write_mode": "leased", "export_mode": "per_owner",
+                    "export_mode": "per_owner",
                     "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
                     "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
             if owner_wal_file_bytes is not None:
@@ -646,9 +636,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             remote = json.loads((prepared / "remote.json").read_text())
             launch = yaml.safe_load((prepared / "node-0/launch.yaml").read_text())
             launch["launch_nonce"] = uuid.uuid4().hex
-            if (remote.get("history_persistence") != history_persistence
-                    or launch.get("history_persistence") != history_persistence):
-                raise TargetError("prepared qualification history persistence differs from request")
             if owner_wal_file_bytes is not None and (
                     remote["storage"]["wal_file_bytes"] != owner_wal_file_bytes
                     or launch["node"]["partition"]["wal_file_bytes"] != owner_wal_file_bytes):
@@ -861,10 +848,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) != 8 or sys.argv[1] != "--kernel-live-worker":
+    if len(sys.argv) != 7 or sys.argv[1] != "--kernel-live-worker":
         raise SystemExit("internal kernel live worker arguments required")
     result, evidence = _kernel_live_worker(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]),
-                                           float(sys.argv[6]), history_persistence=sys.argv[7])
+                                           float(sys.argv[6]))
     print(json.dumps({"complete": result["complete"], "fixture_removed": result["fixture_removed"],
                       "binary_sha256": result["binary_sha256"], "evidence": str(evidence)}, sort_keys=True))
     if not result["complete"] or not result["fixture_removed"]:

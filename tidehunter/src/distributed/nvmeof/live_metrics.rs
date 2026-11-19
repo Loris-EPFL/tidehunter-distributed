@@ -108,8 +108,6 @@ counter_fields!(
     failed_write_ops,
     short_write_ops,
     short_write_bytes,
-    reserve_exchanges,
-    complete_exchanges,
     lease_exchanges,
     leased_frames,
     leased_eventfd_unavailable,
@@ -172,26 +170,12 @@ counter_fields!(
     control_samples,
     validation_ns,
     validation_samples,
-    persistence_ns,
-    persistence_samples,
-    allocation_ns,
-    allocation_samples,
     publication_ns,
     publication_samples,
     namespace_setup_ns,
     namespace_setup_samples,
     read_io_ns,
     read_io_samples,
-    owner_completion_ns,
-    owner_completion_samples,
-    wal_persistence_ns,
-    wal_persistence_samples,
-    wal_namespace_ns,
-    wal_namespace_samples,
-    frontier_file_ns,
-    frontier_file_samples,
-    frontier_namespace_ns,
-    frontier_namespace_samples,
     // Lane in-flight occupancy, sampled at every flight submission: requests
     // and member operations in flight right after the submission.
     lane_inflight_samples,
@@ -264,16 +248,9 @@ pub enum LiveTimingStage {
     Completion,
     Control,
     Validation,
-    Persistence,
-    Allocation,
     Publication,
     NamespaceSetup,
     ReadIo,
-    OwnerCompletion,
-    WalPersistence,
-    WalNamespace,
-    FrontierFile,
-    FrontierNamespace,
     Delivery,
     ControllerConnect,
     ControllerDisconnect,
@@ -338,14 +315,6 @@ impl LiveNvmeCounters {
         };
         // Relaxed: independent failure evidence, not DMA ownership publication.
         counter.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_reserve_exchange(&self) {
-        // Relaxed: evidence only, not control-slot synchronization.
-        self.reserve_exchanges.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_complete_exchange(&self) {
-        // Relaxed: evidence only, not control-slot synchronization.
-        self.complete_exchanges.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_lease_exchange(&self) {
         // Relaxed: evidence only, not control-slot synchronization.
@@ -548,25 +517,11 @@ impl LiveNvmeCounters {
             LiveTimingStage::Completion => (&self.cq_ns, &self.cq_samples),
             LiveTimingStage::Control => (&self.control_ns, &self.control_samples),
             LiveTimingStage::Validation => (&self.validation_ns, &self.validation_samples),
-            LiveTimingStage::Persistence => (&self.persistence_ns, &self.persistence_samples),
-            LiveTimingStage::Allocation => (&self.allocation_ns, &self.allocation_samples),
             LiveTimingStage::Publication => (&self.publication_ns, &self.publication_samples),
             LiveTimingStage::NamespaceSetup => {
                 (&self.namespace_setup_ns, &self.namespace_setup_samples)
             }
             LiveTimingStage::ReadIo => (&self.read_io_ns, &self.read_io_samples),
-            LiveTimingStage::OwnerCompletion => {
-                (&self.owner_completion_ns, &self.owner_completion_samples)
-            }
-            LiveTimingStage::WalPersistence => {
-                (&self.wal_persistence_ns, &self.wal_persistence_samples)
-            }
-            LiveTimingStage::WalNamespace => (&self.wal_namespace_ns, &self.wal_namespace_samples),
-            LiveTimingStage::FrontierFile => (&self.frontier_file_ns, &self.frontier_file_samples),
-            LiveTimingStage::FrontierNamespace => (
-                &self.frontier_namespace_ns,
-                &self.frontier_namespace_samples,
-            ),
             LiveTimingStage::Delivery => (&self.delivery_ns, &self.delivery_samples),
             LiveTimingStage::ControllerConnect => (
                 &self.controller_connect_ns,

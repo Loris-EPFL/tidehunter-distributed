@@ -185,45 +185,15 @@ impl DurabilityConfig {
     }
 }
 
-/// Coordinator recovery of Native-tier writes. Synchronous acknowledgements are
-/// per-batch durable and are never truncated by this setting.
-#[derive(
-    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum NativeRecovery {
-    /// Recover an exact prefix of the coordinator's version order, as a single
-    /// native WAL does after a power loss: the coordinator persists a durable cut
-    /// and recovery discards every batch above it.
-    #[default]
-    DurablePrefix,
-    /// Legacy: keep every batch that survived on its owner, with no cross-owner
-    /// prefix guarantee.
-    PerOwner,
-}
-
-/// How recovery bounds the epoch that ran under [`NativeRecovery::DurablePrefix`].
-#[derive(
-    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CutRecovery {
-    /// Keep only the batches at or below the persisted cut.
-    Strict,
-    /// Fencing syncs every surviving batch; extend the persisted cut over the
-    /// unbroken run of surviving versions and stop at the first missing one.
-    #[default]
-    Extend,
-}
-
-/// Coordinator configuration of the durable cut. Every field has the default of
-/// the owner decision: durable prefix, extended at recovery, nudge at 1000 ms or
-/// 64 MiB of cut lag.
+/// Coordinator configuration of the durable cut. Native-tier recovery keeps an
+/// exact prefix of the coordinator's version order, as a single native WAL
+/// does after a power loss: recovery extends the persisted cut over the
+/// unbroken run of surviving versions and stops at the first missing one.
+/// Synchronous acknowledgements are per-batch durable and never truncated.
+/// The defaults nudge at 1000 ms or 64 MiB of cut lag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DurableCutConfig {
-    pub recovery: NativeRecovery,
-    pub cut: CutRecovery,
     /// Nudge lagging owners to sync once the oldest published batch above the
     /// cut is this old (milliseconds). A quarter of it (at most 5 s) is the
     /// long-poll wait of each owner.
@@ -235,8 +205,6 @@ pub struct DurableCutConfig {
 impl Default for DurableCutConfig {
     fn default() -> Self {
         Self {
-            recovery: NativeRecovery::DurablePrefix,
-            cut: CutRecovery::Extend,
             lag_ms: 1000,
             lag_bytes: 64 * 1024 * 1024,
         }

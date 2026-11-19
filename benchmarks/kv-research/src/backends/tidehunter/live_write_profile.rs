@@ -23,26 +23,12 @@ const COUNTERS: &[&str] = &[
     "control_samples",
     "validation_ns",
     "validation_samples",
-    "persistence_ns",
-    "persistence_samples",
-    "allocation_ns",
-    "allocation_samples",
     "publication_ns",
     "publication_samples",
     "namespace_setup_ns",
     "namespace_setup_samples",
     "read_io_ns",
     "read_io_samples",
-    "owner_completion_ns",
-    "owner_completion_samples",
-    "wal_persistence_ns",
-    "wal_persistence_samples",
-    "wal_namespace_ns",
-    "wal_namespace_samples",
-    "frontier_file_ns",
-    "frontier_file_samples",
-    "frontier_namespace_ns",
-    "frontier_namespace_samples",
     "lane_inflight_samples",
     "lane_inflight_request_sum",
     "lane_inflight_op_sum",
@@ -56,8 +42,6 @@ const COUNTERS: &[&str] = &[
     "grant_misses",
     "grant_evictions",
     "copy_bytes_avoided",
-    "reserve_exchanges",
-    "complete_exchanges",
     "lease_exchanges",
     "leased_frames",
     "leased_eventfd_unavailable",
@@ -116,7 +100,7 @@ fn counts(stats: Option<LiveNvmeStats>) -> Result<Value, String> {
 }
 
 /// Call only after API callers drain. The owner worker continues to harvest
-/// adoption replies while idle. Reserved and non-live routes never wait here.
+/// adoption replies while idle. Non-live routes never wait here.
 /// An adoption not yet submitted at the boundary falls outside the window.
 /// This excludes at most one adoption per boundary; the sum/count pair stays
 /// consistent. Return the second snapshot with equal submitted, validated and
@@ -466,8 +450,6 @@ mod tests {
         // Zero-sample timings remain present as unavailable observations, not
         // fabricated nonzero samples or fields dropped by the phase exporter.
         for name in [
-            "reserve_exchanges",
-            "complete_exchanges",
             "lease_exchanges",
             "leased_frames",
             "leased_eventfd_unavailable",

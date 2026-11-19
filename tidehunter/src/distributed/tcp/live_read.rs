@@ -2286,8 +2286,7 @@ pub(crate) mod tests {
             max_inflight_bytes: 65536,
             connect_timeout_ms: 1000,
             io_timeout_ms: 10_000,
-            write_mode: super::super::LiveWriteMode::Reserved,
-            leased_durability: None,
+            leased_durability: crate::distributed::durability::DurabilityTier::Native,
             inline_reads: true,
             queue_geometry: Default::default(),
         });
@@ -2683,8 +2682,7 @@ pub(crate) mod tests {
             max_inflight_bytes: 16 * (4096 + 4095),
             connect_timeout_ms: 1000,
             io_timeout_ms: 10_000,
-            write_mode: super::super::LiveWriteMode::Reserved,
-            leased_durability: None,
+            leased_durability: crate::distributed::durability::DurabilityTier::Native,
             inline_reads: true,
             queue_geometry: Default::default(),
         });
@@ -2871,8 +2869,6 @@ pub(crate) mod tests {
         lane.client.expected.wal_file_bytes = 8192;
         let config = lane.client.live_config.as_mut().unwrap();
         config.export_mode = super::super::LiveExportMode::PerOwner;
-        config.write_mode = super::super::LiveWriteMode::Leased;
-        config.leased_durability = Some(crate::distributed::durability::DurabilityTier::Native);
         lane
     }
 

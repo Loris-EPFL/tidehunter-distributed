@@ -110,7 +110,6 @@ fn write_model_concurrent_thousand_schedules() {
                         boundary: boundary
                             .checked_sub(1)
                             .map_or_else(String::new, |index| BOUNDARIES[index].into()),
-                        on_disk_history: schedule % 2 != 0,
                         ..case(seed.wrapping_add(schedule), owners, hot, native)
                     });
                 }
@@ -175,7 +174,6 @@ fn write_model_concurrent_every_rpc_boundary() {
         for (index, boundary) in BOUNDARIES.iter().enumerate() {
             run_case(&Case {
                 boundary: (*boundary).into(),
-                on_disk_history: index % 2 != 0,
                 ..case(
                     0xc011 + index as u64,
                     1 + index % 16,

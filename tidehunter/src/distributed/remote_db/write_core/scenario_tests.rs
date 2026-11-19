@@ -584,17 +584,17 @@ fn concurrent_first_writes_of_one_id_allocate_once() {
     db.shutdown().unwrap();
 }
 
-/// PR #63 P1: with receipt history, caller A misses the table and history and
-/// is held after its first-write grant. Caller B then allocates the same
-/// operation, publishes, and a checkpoint retires B's identity into history.
-/// A's stale miss must not allocate a second version: it repeats the lookup,
-/// takes the retry path and returns B's outcome, or the conflict error when
-/// its batch differs.
+/// PR #63 P1: caller A misses the identity table and the retry window and is
+/// held after its first-write grant. Caller B then allocates the same
+/// operation, publishes, and a checkpoint relabels B's identity `Recent`; it
+/// stays only while the WAL replay retry window holds the same version and
+/// digest. A's stale miss must not allocate a second version: it revalidates
+/// against the retry window, takes the retry path and returns B's outcome, or
+/// the conflict error when its batch differs.
 #[test]
 fn negative_identity_lookup_revalidates_after_checkpoint_retirement() {
-    use crate::distributed::storage::HistoryPersistence;
     for same_batch in [true, false] {
-        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
+        let fixture = Fixture::new();
         let mut db = fixture.open();
         let core = Arc::clone(&db.core);
         let operation = fixture.operation(0, 1);
@@ -611,11 +611,12 @@ fn negative_identity_lookup_revalidates_after_checkpoint_retirement() {
         let winner = core.write(operation, original, None).unwrap();
         assert_eq!(winner, version(&core, 0));
         core.flush_index().unwrap();
-        assert!(
-            core.identities
-                .with_operation(operation, |entries| entries.get(&operation).copied())
-                .is_none(),
-            "checkpoint retired the winner's identity into receipt history"
+        assert_eq!(
+            core.identities.with_operation(operation, |entries| entries
+                .get(&operation)
+                .map(|entry| (entry.class, entry.version))),
+            Some((super::identity::IdentityClass::Recent, winner)),
+            "checkpoint relabels the winner's identity Recent while the retry window holds it"
         );
         assert_eq!(core.next_sequence(), 1);
 

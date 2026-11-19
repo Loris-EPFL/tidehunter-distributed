@@ -621,6 +621,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
     prefix = 'runs/' + cfg['run_id'] + '/qualification/' + label + '/'
     capsule_key = 'runs/' + cfg['run_id'] + '/private-' + label + '.json'
     binary = package / 'runtime/bin/kv-research'
+    archive_binary = 'case_binaries' in json.loads((package / 'manifest.json').read_text())
     environment = dict(os.environ, LD_LIBRARY_PATH=str(package / 'runtime/lib'))
     def barrier(name):
         return bootstrap._wait(store, prefix + name + '.json', deadline, identity)
@@ -628,7 +629,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         bootstrap._put(store, prefix + name + '.json', {**identity, **data})
     if not own_is_owner:
         preparation = {'guest_root': str(root), 'addresses': [owner_control + ':9400'], 'transport': {'kind': 'tcp'},
-            'owner_wal_geometry': 'research', 'history_persistence': 'wal_replay',
+            'owner_wal_geometry': 'research',
             'durability_tier': tier, 'max_batches_per_partition': 16384, 'max_admitted_batches': 16384, 'max_index_bytes': 128 * 1024**2,
             'max_epochs': 4, 'coordinator_cache_bytes': 4 * 1024**2, 'owner_read_workers': 2,
             'owner_wal_member_read': 'async', 'owner_read_resident_first': False,
@@ -636,8 +637,10 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
             'live_nvmeof': {'transport': transport, 'addresses': [owner_fabric], 'service': 4420, 'port_id': 1000,
                 'commissioning_service': 4421, 'commissioning_port_id': 1001,
                 'max_inflight_requests': 32, 'max_inflight_bytes': 16 * 1024**2,
-                'connect_timeout_ms': 30000, 'io_timeout_ms': 30000, 'write_mode': 'leased',
-                'export_mode': 'per_owner'}}
+                'connect_timeout_ms': 30000, 'io_timeout_ms': 30000, 'export_mode': 'per_owner'}}
+        if archive_binary:
+            preparation['history_persistence'] = 'wal_replay'
+            preparation['live_nvmeof']['write_mode'] = 'leased'
         input_path = root / 'prepare.json'
         input_path.write_text(json.dumps(preparation))
         prepared = root / 'prepared'

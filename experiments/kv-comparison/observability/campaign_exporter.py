@@ -52,13 +52,11 @@ LIVE_NVMEOF_FIELDS = (
     "metadata_requests", "namespace_connects", "payload_rpc_requests",
     "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
 LIVE_NVMEOF_STAGES = (
-    "queue", "submit", "cq", "control", "validation", "allocation",
-    "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
-    "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace")
+    "queue", "submit", "cq", "control", "validation", "publication", "namespace_setup", "read_io")
 LIVE_NVMEOF_EXTRA_FIELDS = (
     "lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
     "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
-    "reserve_exchanges", "complete_exchanges", "lease_exchanges", "leased_frames",
+    "lease_exchanges", "leased_frames",
     "leased_bytes", "leased_skip_markers", "extents_leased", "adoption_async_exchanges",
     "adoption_sync_exchanges", "fua_writes", "leased_failed_writes", "leased_short_writes",
     "leased_timed_out_writes", "leased_full_writes", "failed_write_ops", "short_write_ops",
@@ -87,6 +85,14 @@ LIVE_NVMEOF_PEAKS = ("lane_inflight_request_max", "lane_inflight_op_max", "max_l
 def live_nvmeof_expected_counters():
     return set(LIVE_NVMEOF_FIELDS) | {stage + suffix for stage in LIVE_NVMEOF_STAGES
                                       for suffix in ("_ns", "_samples")}
+
+
+# Sealed Q0 binaries and earlier reports can still carry these counters.
+ARCHIVE_LIVE_NVME_FIELDS = ("reserve_exchanges", "complete_exchanges")
+ARCHIVE_LIVE_NVME_STAGES = ("owner_completion", "allocation", "persistence",
+                            "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace")
+ARCHIVE_LIVE_NVME_COUNTERS = set(ARCHIVE_LIVE_NVME_FIELDS) | {
+    stage + suffix for stage in ARCHIVE_LIVE_NVME_STAGES for suffix in ("_ns", "_samples")}
 
 
 def live_nvmeof_allowed_counters():
@@ -585,8 +591,10 @@ def live_nvmeof_metrics(evidence, labels):
         return result
     counters = evidence.get("counters")
     fields, stages = LIVE_NVMEOF_FIELDS, LIVE_NVMEOF_STAGES
-    extra_fields, extra_stages = LIVE_NVMEOF_EXTRA_FIELDS, LIVE_NVMEOF_EXTRA_STAGES
-    expected, allowed = live_nvmeof_expected_counters(), live_nvmeof_allowed_counters()
+    extra_fields = LIVE_NVMEOF_EXTRA_FIELDS + ARCHIVE_LIVE_NVME_FIELDS
+    extra_stages = LIVE_NVMEOF_EXTRA_STAGES + ARCHIVE_LIVE_NVME_STAGES
+    expected = live_nvmeof_expected_counters()
+    allowed = live_nvmeof_allowed_counters() | ARCHIVE_LIVE_NVME_COUNTERS
     if not isinstance(counters, dict) or not expected <= counters.keys() or counters.keys() - allowed:
         raise ValueError("incomplete live NVMe-oF measurement counters")
     for field in fields + tuple(field for field in extra_fields if field in counters):
@@ -927,7 +935,7 @@ LIVE_NVME_WRITE_COUNTERS = {
     "unknown_writes", "errors", "payload_rpc_requests",
     "lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
     "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
-    "reserve_exchanges", "complete_exchanges", "lease_exchanges", "leased_frames", "leased_bytes",
+    "lease_exchanges", "leased_frames", "leased_bytes",
     "leased_skip_markers", "extents_leased", "adoption_async_exchanges", "adoption_sync_exchanges",
     "fua_writes", "leased_failed_writes", "leased_short_writes", "leased_timed_out_writes",
     "leased_full_writes", "failed_write_ops", "short_write_ops", "short_write_bytes",
@@ -937,10 +945,8 @@ LIVE_NVME_WRITE_COUNTERS = {
     "read_lane_pin_failures",
     "adopt_close_scan_bytes", "extent_preleases", "extent_switch_waits",
     *LIVE_NVME_WRITE_SHARED_CLOCKS, *LIVE_NVME_WRITE_SHARED_SAMPLES,
-    *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
-                                   "allocation", "publication", "namespace_setup", "read_io",
-                                   "owner_completion", "wal_persistence", "wal_namespace",
-                                   "frontier_file", "frontier_namespace", "delivery",
+    *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation",
+                                   "publication", "namespace_setup", "read_io", "delivery",
                                    "controller_connect", "controller_disconnect", "leased_write",
                                    "extent_switch", "adoption_async", "adoption_settle")
       for suffix in ("_ns", "_samples")),
@@ -1031,7 +1037,7 @@ def write_diagnostic_metrics(evidence, labels):
                 or type(profile.get("requested_limit")) is not int
                 or profile["requested_limit"] != selection["requested_limit"]
                 or not isinstance(counters, dict) or set(stages) != {"live_nvmeof"}
-                or set(counters) - LIVE_NVME_WRITE_COUNTERS
+                or set(counters) - (LIVE_NVME_WRITE_COUNTERS | ARCHIVE_LIVE_NVME_COUNTERS)
                 or type(profile.get("selected_operations")) is not int
                 or type(counters.get("completed_write_ops")) is not int
                 or profile["selected_operations"] != observed

@@ -1,7 +1,6 @@
 //! Coordinator-only disk bound for a fresh, finite replay; owner WAL files are not here.
 use super::*;
 use tidehunter::distributed::native_index::NativeIndex;
-use tidehunter::distributed::storage::HistoryPersistence;
 use tidehunter::distributed::types::ValueRecordReference;
 
 fn add(a: u64, b: u64) -> BackendResult<u64> {
@@ -189,7 +188,7 @@ pub(super) fn reservation(
         )?
         .min(batches);
         // Strict fresh-run disk bound:
-        // (C+2)*I + 2*(128MiB checkpoint metadata + 1MiB CRC authority manifest) + H.
+        // (C+2)*I + 2*(128MiB checkpoint metadata + 1MiB CRC authority manifest).
         // I = 114-byte root header + encoded rows + at most one cell per distinct prefix
         // (uniform cells are capped by table_mutexes), each charged 12 bytes for its CRC
         // frame/count and 155 bytes for its root directory entry (21-byte cell identity,
@@ -197,20 +196,11 @@ pub(super) fn reservation(
         // current/staged/obsolete roots cannot accumulate: cleanup precedes the next capture.
         // Reused cells can keep older containers reachable, so retain ALL C full-image
         // containers, plus two generation working images; never assume only two containers.
-        // H=130*256 bytes per appended batch for OnDisk: one receipt slot, one leaf,
-        // one new branch and <=127 copied Patricia branches. WalReplay has no such files;
-        // its bounded recent receipt window is already in the checkpoint metadata cap.
+        // WAL replay is the only history; its bounded recent receipt window is already
+        // in the checkpoint metadata cap.
         let image = add(114, add(encoded_rows, mul(cells, 167)?)?)?;
-        let history = if remote.map_or(HistoryPersistence::default(), |config| {
-            config.history_persistence
-        }) == HistoryPersistence::OnDisk
-        {
-            mul(batches, 130 * 256)?
-        } else {
-            0
-        };
         let metadata = 2 * (128 * 1024 * 1024 + 1024 * 1024);
-        let metadata_reserve = add(add(mul(add(checkpoints, 2)?, image)?, metadata)?, history)?;
+        let metadata_reserve = add(mul(add(checkpoints, 2)?, image)?, metadata)?;
         // The loopback harness nests owners under the same root. Only external
         // topologies may exclude their six-whole-file WAL allocation allowance.
         let local_wal = if remote.is_none() {
@@ -226,7 +216,7 @@ pub(super) fn reservation(
         total = add(total, reserve)?;
         databases.push(serde_json::json!({"db_id":db,"reservation_bytes":reserve,
             "maximum_checkpoints":checkpoints,"full_index_image_bytes":image,
-            "checkpoint_and_manifest_bytes":metadata,"receipt_history_bytes":history,
+            "checkpoint_and_manifest_bytes":metadata,
             "coordinator_metadata_reservation_bytes":metadata_reserve,
             "local_owner_wal_reservation_bytes":local_wal,
             "batches":batches,"encoded_batch_bytes":encoded,"persistent_directory_bytes":directory,
@@ -236,7 +226,7 @@ pub(super) fn reservation(
     }
     Ok(serde_json::json!({"reservation_bytes":total,
         "local_owner_wal_reservation_bytes":local_owner_wal,"databases":databases,
-        "model":"coordinator metadata: (maximum checkpoints + 2) * full encoded index image + two capped checkpoint metadata/authority manifests + retained receipt history; six whole owner WAL files additionally charged only for the colocated loopback harness, external owner WAL allocation enforced on each owner"}))
+        "model":"coordinator metadata: (maximum checkpoints + 2) * full encoded index image + two capped checkpoint metadata/authority manifests; six whole owner WAL files additionally charged only for the colocated loopback harness, external owner WAL allocation enforced on each owner"}))
 }
 
 #[cfg(test)]
@@ -259,7 +249,7 @@ mod tests {
             "max_batches_per_partition":32768,"max_admitted_batches":1000000,"max_index_bytes":512*1024*1024,
             "coordinator_cache_bytes":0,"owner_wal_member_read":"async",
             "owner_read_memory_allowance_bytes":128*1024*1024,"polling":"adaptive",
-            "owner_read_resident_first":false,"history_persistence":"wal_replay"
+            "owner_read_resident_first":false
         });
         let input_path = root.join("input.json");
         std::fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
@@ -271,7 +261,7 @@ mod tests {
             &std::fs::read(prepared.join("external_owner_read_config.json")).unwrap(),
         )
         .unwrap();
-        let mut value = serde_json::json!({"databases":[{"db_id":0,"options":{
+        let value = serde_json::json!({"databases":[{"db_id":0,"options":{
             "transport":{"kind":"tcp-trusted"},"path":root.join("db"),"owners":2,
             "external_remote_config":remote,
             "external_owner_read_config":owner_read,"owner_read_resident_first":false,
@@ -287,7 +277,6 @@ mod tests {
         let bound = reservation(&value, &trace, 4096).unwrap();
         let database = &bound["databases"][0];
         assert_eq!(bound["local_owner_wal_reservation_bytes"], 0);
-        assert_eq!(database["receipt_history_bytes"], 0);
         assert_eq!(database["batches"], 20480);
         assert_eq!(database["full_index_image_bytes"], 797_710_617_u64);
         assert_eq!(database["maximum_checkpoints"], 219);
@@ -295,14 +284,6 @@ mod tests {
         // z4m-highmem-16: one 14,000 GiB local SSD; keep the owner's 50% guard.
         assert!(bound["reservation_bytes"].as_u64().unwrap() < 14000 * 1024_u64.pow(3) / 2);
         eprintln!("cloud-replay-coordinator-bound={bound}");
-
-        value["databases"][0]["options"]["external_remote_config"]["history_persistence"] =
-            "on_disk".into();
-        let history = reservation(&value, &trace, 4096).unwrap();
-        assert_eq!(
-            history["databases"][0]["receipt_history_bytes"],
-            20480_u64 * 130 * 256
-        );
 
         let local = serde_json::json!({"databases":[{"db_id":0,"options":{
             "transport":{"kind":"tcp-trusted"},"path":root.join("local-db"),"database":vec![7;16],

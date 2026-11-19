@@ -1,7 +1,6 @@
 //! Shared write engine. Callers allocate/encode; owner workers publish durable
 //! batches. Checkpoint persistence owns no foreground or publication lock.
 
-use super::super::receipt_history::ReceiptHistory;
 use super::super::{
     AppendedBatch, AuthorityManifest, AuthorityWriteStats, BackgroundCheckpoint, BatchId,
     CheckpointDiagnostic, CheckpointDiagnosticSummary, ControlHandle, IndexReadCut, LocalDbError,
@@ -30,7 +29,6 @@ use std::sync::{
 /// without cloning maps or exposing the legacy authority's clients/admission.
 pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub known: &'a mut HashMap<BatchId, AppendedBatch>,
-    pub receipt_history: &'a mut Option<ReceiptHistory>,
     pub stream_last: &'a mut BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: &'a mut BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: &'a mut BTreeSet<(u32, u64)>,
@@ -55,7 +53,6 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     /// publication path (writer → publisher) installs views from it.
     pub view_budget: crate::distributed::native_index::StandingViewBudget,
     pub known: HashMap<BatchId, AppendedBatch>,
-    pub receipt_history: Option<ReceiptHistory>,
     pub stream_last: BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: BTreeSet<(u32, u64)>,
@@ -85,7 +82,6 @@ impl PublisherState {
     ) -> PublisherCheckpoint<'_> {
         PublisherCheckpoint {
             known: &mut self.known,
-            receipt_history: &mut self.receipt_history,
             stream_last: &mut self.stream_last,
             positions: &mut self.positions,
             committed_complete: &mut self.committed_complete,
@@ -383,65 +379,19 @@ impl WriteCore {
         Ok(coalesced)
     }
 
-    /// Check the in-flight table before snapshotting persisted retry authority.
-    /// Checkpoint installs the new history root before removing covered table
-    /// entries; cloning only after a shard miss therefore cannot miss a retired
-    /// identity. The allocation critical section must recheck the shard after
-    /// this no-lock I/O, because a concurrent first writer can insert meanwhile.
+    /// Check the identity table, which holds in-flight, suffix and recent
+    /// WAL-replay retry identities. The allocation critical section must
+    /// recheck the shard, because a concurrent first writer can insert meanwhile.
     pub(super) fn lookup_identity(
         &self,
         operation: [u8; 16],
     ) -> Result<Option<IdentityEntry>, LocalDbError> {
-        self.lookup_identity_at(operation)
-            .map(|(identity, _)| identity)
+        self.ensure_healthy()?;
+        Ok(self.identities.lookup(operation))
     }
 
-    /// `lookup_identity` plus the identity shard's retirement generation,
-    /// captured with the table miss and before the history snapshot. A miss
-    /// is a valid first-write decision at allocation only while the generation
-    /// is unchanged: a concurrent writer of the same operation may otherwise
-    /// have published and been retired into a newer history root meanwhile.
-    pub(super) fn lookup_identity_at(
-        &self,
-        operation: [u8; 16],
-    ) -> Result<(Option<IdentityEntry>, u64), LocalDbError> {
-        self.ensure_healthy()?;
-        let (identity, retirements) = self.identities.lookup(operation);
-        if identity.is_some()
-            || self.config.history_persistence
-                == crate::distributed::storage::HistoryPersistence::WalReplay
-        {
-            return Ok((identity, retirements));
-        }
-        let history = self
-            .publisher
-            .lock()
-            .checkpoint_state()
-            .receipt_history
-            .clone();
-        let receipt = history
-            .as_ref()
-            .map(|history| {
-                history.lookup(BatchId {
-                    database: self.config.storage.database,
-                    operation,
-                })
-            })
-            .transpose()
-            .inspect_err(|error| self.fail(LocalDbError::new(error.message())))?
-            .flatten();
-        self.ensure_healthy()?;
-        let identity = receipt.map(|receipt| IdentityEntry {
-            version: receipt.version(),
-            digest: Some(receipt.digest()),
-            seq: receipt.version().sequence,
-            class: IdentityClass::Recent,
-        });
-        Ok((identity, retirements))
-    }
-
-    /// Resident completed/in-flight write bookkeeping, excluding pageable
-    /// receipt files, allocator overhead and the separately reported index.
+    /// Resident completed/in-flight write bookkeeping, excluding allocator
+    /// overhead and the separately reported index.
     /// Publisher, identity and key shards are locked one at a time.
     pub(in crate::distributed::remote_db) fn metadata_history_bytes(&self) -> usize {
         let publisher = Self::publisher_resident_bytes(&self.publisher.lock());
@@ -462,10 +412,6 @@ impl WriteCore {
     fn publisher_resident_bytes(publisher: &PublisherState) -> usize {
         publisher.known.capacity()
             * (std::mem::size_of::<BatchId>() + std::mem::size_of::<AppendedBatch>())
-            + publisher
-                .receipt_history
-                .as_ref()
-                .map_or(0, ReceiptHistory::cached_metadata_bytes)
             + publisher.recent.capacity() * std::mem::size_of::<RecentReceipt>()
     }
 
@@ -1061,55 +1007,6 @@ mod tests {
         );
         drop(credit);
         assert!(core.shutdown().is_err());
-    }
-
-    #[test]
-    fn history_lookup_covers_identity_retired_by_concurrent_checkpoint() {
-        use crate::distributed::codec::Mutation;
-        use crate::distributed::storage::HistoryPersistence;
-        use crate::key_shape::KeySpace;
-        use std::time::Duration;
-
-        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
-        let database = fixture.open();
-        let operation = fixture.operation(0, 19);
-        let version = database
-            .write_batch(
-                operation,
-                vec![Mutation::Put {
-                    keyspace: KeySpace(0),
-                    key: 19u32.to_be_bytes().to_vec().into(),
-                    value: vec![9; 32].into(),
-                }],
-            )
-            .unwrap();
-        assert_eq!(version.sequence, 0);
-        let (entered, waiting) = mpsc::sync_channel(1);
-        let (resume, gate) = mpsc::sync_channel(1);
-        database.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-        let core = Arc::clone(&database.core);
-        let before = core.lookup_identity(operation).unwrap().unwrap();
-        assert_eq!(before.version, version);
-        assert_eq!(before.class, IdentityClass::Suffix);
-        core.start_checkpoint().unwrap();
-        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-        let during = core.lookup_identity(operation).unwrap().unwrap();
-        assert_eq!(during.version, version);
-        assert_eq!(during.digest, before.digest);
-        assert_eq!(during.class, IdentityClass::Suffix);
-        resume.send(()).unwrap();
-        core.progress_checkpoint(true).unwrap();
-        assert!(
-            core.identities
-                .with_operation(operation, |entries| entries.get(&operation).copied())
-                .is_none()
-        );
-        let after = core.lookup_identity(operation).unwrap().unwrap();
-        assert_eq!(after.version, version);
-        assert_eq!(after.digest, before.digest);
-        assert_eq!(after.class, IdentityClass::Recent);
-        core.wait_published_before(1).unwrap();
-        core.shutdown().unwrap();
     }
 
     /// Replaces the deleted PublicationTracker sparse test on the live

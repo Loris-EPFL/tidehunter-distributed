@@ -394,50 +394,19 @@ fn inline_export_counts_follow_the_request_that_created_the_export() {
     };
     assert_eq!(locations.entries.len(), 1);
 
-    // Kind 27: the first reservation of epoch 2 exports its file; a second
-    // reservation in the same file does not.
-    let mut reserve = |sequence| {
-        let group = CompleteGroup::new_live(
-            &writer.shape,
-            vec![tests::batch(&owner.config, 2, sequence)],
-            owner.config.partition.batch_limits,
-            owner.config.partition.group_limits,
-        )
-        .unwrap();
-        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-        let LiveReserveResponse::Reserved(reserved) =
-            writer.reserve_live_group(2, descriptor).unwrap()
-        else {
-            panic!("expected a new reservation")
-        };
-        let reservation = &reserved.reservation;
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&reservation.segment.path)
-            .unwrap()
-            .write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
-            .unwrap();
-        writer.complete_live_group(2, reservation.token).unwrap();
-        reservation.segment.file_index
-    };
-    let first_file = reserve(0);
-    assert_eq!(reserve(1), first_file);
-
     let stats = owner.node.live_inline_export_stats();
     assert_eq!(
         stats,
         LiveInlineExportStats {
-            reserve: 1,
             lease: 1,
             rollover: 1,
             prelease: 1,
             resolve: 1,
-            recover: 0,
-            replay: 0,
+            ..LiveInlineExportStats::default()
         }
     );
     // Every export in this sequence was created inline by a request.
-    assert_eq!(exposed() - exposed_before, 5);
+    assert_eq!(exposed() - exposed_before, 4);
 }
 
 #[test]

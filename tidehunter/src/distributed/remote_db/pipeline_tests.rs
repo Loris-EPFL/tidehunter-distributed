@@ -26,14 +26,6 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
-    pub(super) fn history(mut self, mode: HistoryPersistence) -> Self {
-        self.config.history_persistence = mode;
-        for node in &self.nodes {
-            node.set_history_persistence(mode).unwrap();
-        }
-        self
-    }
-
     pub(super) fn new() -> Self {
         Self::new_with_capacity(128)
     }
@@ -98,7 +90,6 @@ impl Fixture {
         let certs = tls_material::TestCertificates::generate(&temp.path().join("tls"), owner_count)
             .unwrap();
         let mut config = RemoteDatabaseConfig {
-            history_persistence: HistoryPersistence::default(),
             storage: LocalInventoryConfig {
                 database: [71; 16],
                 partitions: (0..owner_count as u32).collect(),
@@ -145,7 +136,6 @@ impl Fixture {
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,
             live_nvme: None,
-            checkpoint_mode: CheckpointMode::Exact,
             durable_cut: Default::default(),
         };
         configure(&mut config);
@@ -170,8 +160,6 @@ impl Fixture {
                 live_target: None,
             };
             let node = open_node(node_config.clone());
-            node.set_history_persistence(config.history_persistence)
-                .unwrap();
             node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
                 tier,
             ))
@@ -228,7 +216,6 @@ impl Fixture {
         self.shutdown.store(false, Ordering::Release);
         for (config, tls, listener) in &self.startups {
             let node = StorageNode::open(config.clone(), metrics())?;
-            node.set_history_persistence(self.config.history_persistence)?;
             let serving = node.clone();
             let tls = tls.clone();
             let listener = listener.try_clone().unwrap();
@@ -1623,9 +1610,7 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
 #[test]
 fn tail_flush_dispatches_third_group_before_prior_durability() {
     let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-    let fixture = Fixture::new_with_shape_and_group(128, shape, 1)
-        .synchronous()
-        .history(HistoryPersistence::OnDisk);
+    let fixture = Fixture::new_with_shape_and_group(128, shape, 1).synchronous();
     let mut db = fixture.open();
     let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
     let operations: Vec<_> = (0..3u64)
@@ -1687,9 +1672,7 @@ fn tail_flush_dispatches_third_group_before_prior_durability() {
 #[test]
 fn tail_flush_respects_bounded_owner_command_window() {
     let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-    let mut fixture = Fixture::new_with_shape_and_group(128, shape, 1)
-        .synchronous()
-        .history(HistoryPersistence::OnDisk);
+    let mut fixture = Fixture::new_with_shape_and_group(128, shape, 1).synchronous();
     fixture.config.owner_append_occupancy = super::super::tcp::APPEND_COMMAND_WINDOW;
     let db = fixture.open();
     let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
@@ -1722,24 +1705,8 @@ fn tail_flush_respects_bounded_owner_command_window() {
         in_flight,
         &(0..in_flight as u64).collect::<Vec<_>>(),
     );
-    let (checkpoint_reply, checkpoint_result) = mpsc::sync_channel(1);
-    db.core.clients[0]
-        .send(Command::Checkpoint(
-            db.epoch(),
-            db.epoch(),
-            0,
-            checkpoint_reply,
-        ))
-        .unwrap();
-    let checkpoint_held = matches!(checkpoint_result.try_recv(), Err(mpsc::TryRecvError::Empty));
     release.send(()).unwrap();
     assert_eq!(in_flight, super::super::tcp::APPEND_COMMAND_WINDOW);
-    assert!(checkpoint_held);
-    let proof = checkpoint_result
-        .recv_timeout(Duration::from_secs(10))
-        .unwrap()
-        .unwrap();
-    assert_eq!(proof.prefix, 0);
     assert_eq!(staged, count - super::super::tcp::APPEND_COMMAND_WINDOW);
     let sequences: Vec<_> = (0..count as u64).collect();
     assert_eq!(

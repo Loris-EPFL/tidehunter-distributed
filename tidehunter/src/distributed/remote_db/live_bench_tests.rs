@@ -8,9 +8,7 @@ use crate::distributed::nvmeof::{
     live_metrics::{LiveNvmeCounts, LiveNvmeMetrics},
     live_target::LiveTargetManager,
 };
-use crate::distributed::tcp::{
-    LeasedSync, LiveClientConfig, LiveWriteMode, NodeConfig, StorageNode, Transport,
-};
+use crate::distributed::tcp::{LeasedSync, LiveClientConfig, NodeConfig, StorageNode, Transport};
 use crate::key_shape::KeyType;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -26,7 +24,7 @@ const MIB: usize = 1024 * 1024;
 fn metrics() -> Arc<Metrics> {
     Metrics::new_in_enabled(&prometheus::Registry::new(), false)
 }
-fn live_config(mode: LiveWriteMode, tier: DurabilityTier) -> LiveClientConfig {
+fn live_config(tier: DurabilityTier) -> LiveClientConfig {
     LiveClientConfig {
         lease_ahead: true,
         polled_writes: false,
@@ -40,8 +38,7 @@ fn live_config(mode: LiveWriteMode, tier: DurabilityTier) -> LiveClientConfig {
         max_inflight_bytes: 4 * MIB,
         connect_timeout_ms: 10000,
         io_timeout_ms: 30000,
-        write_mode: mode,
-        leased_durability: (mode == LiveWriteMode::Leased).then_some(tier),
+        leased_durability: tier,
         inline_reads: true,
         queue_geometry: Default::default(),
         export_mode: Default::default(),
@@ -133,7 +130,6 @@ impl Fixture {
             server_name: "trusted-test-cluster".into(),
         };
         let mut config = RemoteDatabaseConfig {
-            history_persistence: HistoryPersistence::default(),
             storage: LocalInventoryConfig {
                 database: [81; 16],
                 partitions: vec![0],
@@ -171,17 +167,7 @@ impl Fixture {
             max_pending_reads: 64,
             max_pending_read_bytes: 16 * MIB,
             write_profile_limit: 0,
-            live_nvme: (arm != "A").then(|| {
-                live_config(
-                    if arm == "B" {
-                        LiveWriteMode::Reserved
-                    } else {
-                        LiveWriteMode::Leased
-                    },
-                    tier,
-                )
-            }),
-            checkpoint_mode: CheckpointMode::Exact,
+            live_nvme: (arm != "A").then(|| live_config(tier)),
             durable_cut: Default::default(),
         };
         if let Some(live) = &mut config.live_nvme {
@@ -206,8 +192,6 @@ impl Fixture {
             metrics(),
         )
         .unwrap();
-        node.set_history_persistence(config.history_persistence)
-            .unwrap();
         node.set_durability(DurabilityConfig::with_tier(tier))
             .unwrap();
         let target_root = std::env::var_os("TH_TAIL_TARGET_DIR")
@@ -324,10 +308,7 @@ fn pin_read_lanes_defaults_off_and_validates_queue_count() {
     serialized.as_object_mut().unwrap().remove("pin_read_lanes");
     let legacy: RemoteDatabaseConfig = serde_json::from_value(serialized).unwrap();
     assert!(!legacy.pin_read_lanes);
-    fixture.config.live_nvme = Some(live_config(
-        LiveWriteMode::Reserved,
-        DurabilityTier::Synchronous,
-    ));
+    fixture.config.live_nvme = Some(live_config(DurabilityTier::Synchronous));
     fixture.config.pin_read_lanes = true;
     fixture.config.read_lanes = Some(4);
     fixture.config.validate().unwrap();
@@ -385,27 +366,16 @@ fn leased_submit_redrain_defaults_on_and_is_valid_off_only_for_leased_writes() {
         false
     );
     fixture.config.leased_submit_redrain = false;
-    for live_nvme in [
-        None,
-        Some(live_config(
-            LiveWriteMode::Reserved,
-            DurabilityTier::Synchronous,
-        )),
-    ] {
-        fixture.config.live_nvme = live_nvme;
-        assert!(
-            fixture
-                .config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("leased_submit_redrain=false requires live_nvme.write_mode=leased")
-        );
-    }
-    fixture.config.live_nvme = Some(live_config(
-        LiveWriteMode::Leased,
-        DurabilityTier::Synchronous,
-    ));
+    fixture.config.live_nvme = None;
+    assert!(
+        fixture
+            .config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("leased_submit_redrain=false requires live_nvme")
+    );
+    fixture.config.live_nvme = Some(live_config(DurabilityTier::Synchronous));
     fixture.config.validate().unwrap();
     fixture.config.leased_submit_redrain = true;
     fixture.config.validate().unwrap();
@@ -415,7 +385,7 @@ fn leased_submit_redrain_defaults_on_and_is_valid_off_only_for_leased_writes() {
 fn owner_initiator_map_is_pinned_across_authority_reopen() {
     use crate::distributed::tcp::LiveInitiatorIdentity;
     let base = tempdir::TempDir::new("live-owner-identities").unwrap();
-    let mut f = Fixture::new(base.path(), "owner-map", DurabilityTier::Native, "B");
+    let mut f = Fixture::new(base.path(), "owner-map", DurabilityTier::Native, "C");
     let identity = LiveInitiatorIdentity {
         host_nqn: f.config.live_nvme.as_ref().unwrap().host_nqn.clone(),
         host_id: [2; 16],
@@ -584,8 +554,6 @@ fn write_counters(
     };
     counts["frames"] = if arm == "A" {
         Value::Null
-    } else if arm == "B" {
-        counts["completed_write_ops"].clone()
     } else {
         counts["leased_frames"].clone()
     };
@@ -696,8 +664,6 @@ fn run_write(
     );
     if matches!(arm, "C" | "C-buf") {
         let c = &result.lifetime_counters;
-        assert_eq!(c["reserve_exchanges"], 0);
-        assert_eq!(c["complete_exchanges"], 0);
         assert_eq!(c["lease_exchanges"], c["extents_leased"]);
         assert_eq!(c["leased_skip_markers"], 0);
         assert_eq!(
@@ -1111,14 +1077,12 @@ fn markdown(rows: &[Row], environment: &Value) -> String {
             ));
         }
     }
-    text.push_str("\n## Route counters (measured phase)\n\nLive writes are namespace io_uring SQEs, not all owner WAL writes. RPC append exchanges are derived from fresh owner appended-group counts (no retries). `n/a` means no counter or not applicable. Syncer fsync calls include background AND demanded calls and can overlap explicit barriers; DO NOT add them. No background-only or total fdatasync counter exists. F/P is frames/put, SQE/C is read SQEs/API call.\n\n| Case | Cache contract | RPC append | Reserve | Complete | Lease | Adopt async | Adopt sync | Live block writes | Data/FUA requests | Skip | Extents | Frames | F/P or SQE/C | Owner explicit barriers | Syncer fsync calls | Background-only calls | Inline | Fallbacks |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n");
+    text.push_str("\n## Route counters (measured phase)\n\nLive writes are namespace io_uring SQEs, not all owner WAL writes. RPC append exchanges are derived from fresh owner appended-group counts (no retries). `n/a` means no counter or not applicable. Syncer fsync calls include background AND demanded calls and can overlap explicit barriers; DO NOT add them. No background-only or total fdatasync counter exists. F/P is frames/put, SQE/C is read SQEs/API call.\n\n| Case | Cache contract | RPC append | Lease | Adopt async | Adopt sync | Live block writes | Data/FUA requests | Skip | Extents | Frames | F/P or SQE/C | Owner explicit barriers | Syncer fsync calls | Background-only calls | Inline | Fallbacks |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n");
     for r in rows {
         let c = &r.counters;
         let mut cells = vec![r.case.clone(), r.cache.clone()];
         for name in [
             "append_rpc_exchanges",
-            "reserve_exchanges",
-            "complete_exchanges",
             "lease_exchanges",
             "adoption_async_exchanges",
             "adoption_sync_exchanges",
@@ -1168,15 +1132,6 @@ fn markdown(rows: &[Row], environment: &Value) -> String {
         );
         text.push_str(&format!("| {} |\n", cells.join(" | ")));
     }
-    text.push_str("\n### Native reserved barrier evidence\n\n");
-    for r in rows.iter().filter(|r| r.arm == "B" && r.tier == "native") {
-        let reserve = r.counters["reserve_exchanges"].as_u64().unwrap();
-        let barriers = r.counters["owner_explicit_persistence_barriers"]
-            .as_u64()
-            .unwrap();
-        text.push_str(&format!("- `{}` ({}): {} reserves, {} owner explicit barriers; aggregate one-barrier-per-reserve equality: {}. Aggregate counters alone do not time each individual reserve.\n",
-            r.case, r.cache, reserve, barriers, if reserve == barriers { "yes" } else { "no" }));
-    }
     text.push_str("\n## C versus C-buf timings and adoptions\n\nMicroseconds. CQE timing is the existing transport submit-to-CQE aggregate mean, not device time. Leased-write timing is successful admission-to-CQE mean. Adoption async is successful submission to validated reply. Adoption settle keeps the extent open and includes the wait for pending adoption. Both report mean, no distribution. Aggregate timing cannot supply percentiles.\n\n| Case | Cache contract | p99 | p99.9 | Async adopt | Sync adopt | Mean submit-to-CQE | Mean leased write | Mean async adoption | Mean adoption settle | History-full settles |\n|---|---|---:|---:|---:|---:|---|---|---|---|---:|\n");
     for r in rows
         .iter()
@@ -1197,7 +1152,7 @@ fn markdown(rows: &[Row], environment: &Value) -> String {
             counter(&r.counters, "adoption_history_full_settles"),
         ));
     }
-    text.push_str("\n## Whole-case leased counters (warm-up + measurement, before close)\n\n| Case | Cache contract | Lease | Extents | Reserve | Complete | Frames | Data/FUA requests | Async adopt | Sync adopt | Skip |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    text.push_str("\n## Whole-case leased counters (warm-up + measurement, before close)\n\n| Case | Cache contract | Lease | Extents | Frames | Data/FUA requests | Async adopt | Sync adopt | Skip |\n|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
     for r in rows
         .iter()
         .filter(|r| matches!(r.arm.as_str(), "C" | "C-buf"))
@@ -1206,8 +1161,6 @@ fn markdown(rows: &[Row], environment: &Value) -> String {
         for name in [
             "lease_exchanges",
             "extents_leased",
-            "reserve_exchanges",
-            "complete_exchanges",
             "leased_frames",
             "fua_writes",
             "adoption_async_exchanges",
@@ -1224,7 +1177,7 @@ fn markdown(rows: &[Row], environment: &Value) -> String {
         .map(|r| &r.case)
         .collect();
     text.push_str(&format!("\nSynchronous 4x reductions (warm-up projected >60 s): {reduced:?}. Intentional R2 disable does not increment a fallback counter. Interference is yes for load1m >2, any foreign build/test process, or foreign process >30% of one core. Own process and ancestors (including its cargo runner) are excluded. ps %CPU is lifetime-average, not an instantaneous trace; every case records its pre-arm snapshot.\n\n"));
-    text.push_str("## Selection controls\n\nComma-separated env lists; omitted variables select the full matrix: `P11_BENCH_ARMS=A,B,C,C-buf,R1,R2,R3`, `P11_BENCH_TIERS=native,synchronous`, `P11_BENCH_VALUE_BYTES=1024,65536`, `P11_BENCH_WRITERS=1,16`, `P11_BENCH_REPETITIONS=1,2`. Read rows are native 1KiB/one-reader and selected only when native, 1024 and one writer are included. Odd repetitions use A/B/C/C-buf order; even ones reverse it; scalar read pairs also reverse.\n\nFull: `RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n\nShort subset: `P11_BENCH_ARMS=C,C-buf P11_BENCH_TIERS=native P11_BENCH_VALUE_BYTES=1024 P11_BENCH_WRITERS=1 P11_BENCH_REPETITIONS=1 RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n");
+    text.push_str("## Selection controls\n\nComma-separated env lists; omitted variables select the full matrix: `P11_BENCH_ARMS=A,C,C-buf,R1,R2,R3`, `P11_BENCH_TIERS=native,synchronous`, `P11_BENCH_VALUE_BYTES=1024,65536`, `P11_BENCH_WRITERS=1,16`, `P11_BENCH_REPETITIONS=1,2`. Read rows are native 1KiB/one-reader and selected only when native, 1024 and one writer are included. Odd repetitions use A/C/C-buf order; even ones reverse it; scalar read pairs also reverse.\n\nFull: `RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n\nShort subset: `P11_BENCH_ARMS=C,C-buf P11_BENCH_TIERS=native P11_BENCH_VALUE_BYTES=1024 P11_BENCH_WRITERS=1 P11_BENCH_REPETITIONS=1 RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n");
     text
 }
 fn counter(c: &Value, name: &str) -> String {
@@ -1263,8 +1216,8 @@ fn live_bench_closed_loop() {
     );
     let arms = selection(
         "P11_BENCH_ARMS",
-        "A,B,C,C-buf,R1,R2,R3",
-        &["A", "B", "C", "C-buf", "R1", "R2", "R3"],
+        "A,C,C-buf,R1,R2,R3",
+        &["A", "C", "C-buf", "R1", "R2", "R3"],
     );
     let tiers = selection(
         "P11_BENCH_TIERS",
@@ -1305,9 +1258,9 @@ fn live_bench_closed_loop() {
             {
                 for &rep in &repetitions {
                     for arm in if rep % 2 == 1 {
-                        ["A", "B", "C", "C-buf"]
+                        ["A", "C", "C-buf"]
                     } else {
-                        ["C-buf", "C", "B", "A"]
+                        ["C-buf", "C", "A"]
                     } {
                         if !arms.iter().any(|selected| selected == arm) {
                             continue;
@@ -1602,7 +1555,7 @@ fn small_put_multiowner_workstation() {
                     max_batches: calls + 4096,
                     max_encoded_bytes: 256 * MIB,
                 };
-                let mut live = live_config(LiveWriteMode::Leased, DurabilityTier::Synchronous);
+                let mut live = live_config(DurabilityTier::Synchronous);
                 live.leased_write_window = None;
                 live.leased_sync = LeasedSync::GroupFlush;
                 live.leased_flush_min_frame_bytes = 65536;
@@ -1993,7 +1946,7 @@ fn overhead_case(
                 max_encoded_bytes: 256 * MIB,
             };
             if leased {
-                let mut live = live_config(LiveWriteMode::Leased, tier);
+                let mut live = live_config(tier);
                 live.leased_write_window = None;
                 live.leased_sync = LeasedSync::GroupFlush;
                 live.leased_flush_min_frame_bytes = 65536;
@@ -2258,7 +2211,7 @@ fn lone_batch_with_empty_queue_is_submitted_without_waiting() {
                 config.storage.group_limits.max_encoded_bytes = 2 * MIB;
                 config.storage.fragment_bytes = 8 * MIB as u64;
                 config.storage.wal_file_bytes = 16 * MIB as u64;
-                let mut live = live_config(LiveWriteMode::Leased, tier);
+                let mut live = live_config(tier);
                 live.leased_write_window = None;
                 live.leased_sync = LeasedSync::GroupFlush;
                 live.leased_flush_min_frame_bytes = 65536;

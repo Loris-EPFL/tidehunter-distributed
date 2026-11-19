@@ -1,12 +1,12 @@
-//! Finite post-checkpoint replay work, shared by admission and recovery.
+//! Post-checkpoint replay suffix that triggers a background checkpoint.
 //!
-//! These limits bound recovery work, not acknowledgement durability. A durable
-//! authority manifest records the writer's bound; recovery validates against
-//! that recorded bound before a larger bound can be activated.
+//! WAL replay has no hard suffix bound, as the native engine has none; these
+//! limits only decide when a checkpoint starts. The authority manifest
+//! records the writer's limits.
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum complete suffix retained after the last committed checkpoint.
+/// Suffix retained after the last committed checkpoint that triggers the next one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplayLimits {
@@ -24,7 +24,7 @@ impl Default for ReplayLimits {
 }
 
 impl ReplayLimits {
-    /// Implicit bounds of the format-2 authority manifest.
+    /// Default of an authority manifest that records no limits.
     pub(super) const fn legacy() -> Self {
         Self {
             max_batches: 1024,
@@ -42,34 +42,10 @@ impl ReplayLimits {
         Ok(())
     }
 
-    /// Start well before the hard bound; a larger window alone does not make a
-    /// checkpointer that cannot keep up sustainable.
+    /// Start a checkpoint at a quarter of either limit; a larger window alone
+    /// does not make a checkpointer that cannot keep up sustainable.
     pub(super) fn checkpoint_due(self, batches: usize, bytes: usize) -> bool {
         batches >= (self.max_batches / 4).max(1) || bytes >= (self.max_encoded_bytes / 4).max(1)
-    }
-
-    /// Hard bound: the granted tail plus an incoming window must fit, with
-    /// overflow treated as not fitting.
-    pub(super) fn admits(
-        self,
-        batches: usize,
-        bytes: usize,
-        incoming_batches: usize,
-        incoming_bytes: usize,
-    ) -> bool {
-        batches
-            .checked_add(incoming_batches)
-            .is_some_and(|total| total <= self.max_batches)
-            && bytes
-                .checked_add(incoming_bytes)
-                .is_some_and(|total| total <= self.max_encoded_bytes)
-    }
-
-    /// A smaller operator setting cannot reinterpret an already acknowledged
-    /// suffix as corruption. Shrinking requires an explicit checkpoint cutover.
-    pub(super) fn covers(self, recorded: Self) -> bool {
-        self.max_batches >= recorded.max_batches
-            && self.max_encoded_bytes >= recorded.max_encoded_bytes
     }
 }
 
@@ -78,22 +54,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_checks_the_next_complete_batch_and_overflow() {
-        let limits = ReplayLimits {
-            max_batches: 3,
-            max_encoded_bytes: 100,
-        };
-        assert!(limits.admits(2, 80, 1, 20));
-        assert!(!limits.admits(3, 0, 1, 1));
-        assert!(!limits.admits(2, 80, 1, 21));
-        assert!(!limits.admits(0, usize::MAX, 1, 1));
-        assert!(!limits.admits(usize::MAX, 0, 1, 0));
-        assert!(limits.admits(1, 60, 2, 40));
-        assert!(!limits.admits(1, 60, 3, 0));
-    }
-
-    #[test]
-    fn checkpoint_leaves_headroom_before_either_hard_bound() {
+    fn checkpoint_is_due_at_a_quarter_of_either_limit() {
         let limits = ReplayLimits {
             max_batches: 16,
             max_encoded_bytes: 400,
@@ -101,43 +62,12 @@ mod tests {
         assert!(!limits.checkpoint_due(3, 99));
         assert!(limits.checkpoint_due(4, 0));
         assert!(limits.checkpoint_due(0, 100));
-        assert!(limits.admits(4, 100, 1, 1));
         let tiny = ReplayLimits {
             max_batches: 1,
             max_encoded_bytes: 1,
         };
         assert!(!tiny.checkpoint_due(0, 0));
         assert!(tiny.checkpoint_due(1, 0));
-    }
-
-    #[test]
-    fn reopen_cannot_shrink_either_recorded_recovery_dimension() {
-        let recorded = ReplayLimits {
-            max_batches: 8,
-            max_encoded_bytes: 100,
-        };
-        assert!(recorded.covers(recorded));
-        assert!(
-            ReplayLimits {
-                max_batches: 16,
-                max_encoded_bytes: 200
-            }
-            .covers(recorded)
-        );
-        assert!(
-            !ReplayLimits {
-                max_batches: 7,
-                max_encoded_bytes: 200
-            }
-            .covers(recorded)
-        );
-        assert!(
-            !ReplayLimits {
-                max_batches: 16,
-                max_encoded_bytes: 99
-            }
-            .covers(recorded)
-        );
     }
 
     #[test]

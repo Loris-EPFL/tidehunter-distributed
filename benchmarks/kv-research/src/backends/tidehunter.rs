@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
 use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, ReplayLimits};
-use tidehunter::distributed::storage::HistoryPersistence;
 use tidehunter::distributed::storage::{NATIVE_FRAGMENT_BYTES, NATIVE_WAL_FILE_BYTES};
 use tidehunter::distributed::sui;
 use tidehunter::distributed::tcp::{FabricSecurity, PollingPolicy, Transport};
@@ -173,8 +172,6 @@ struct ExternalLiveNvmeof {
     max_inflight_bytes: usize,
     connect_timeout_ms: u64,
     io_timeout_ms: u64,
-    #[serde(default)]
-    write_mode: tidehunter::distributed::tcp::LiveWriteMode,
     #[serde(default = "default_resident_first")]
     inline_reads: bool,
     #[serde(default)]
@@ -230,8 +227,6 @@ struct ExternalPreparationInput {
     /// Tier written into every owner launch file; absent means the native tier.
     #[serde(default)]
     durability_tier: DurabilityTier,
-    #[serde(default = "HistoryPersistence::legacy")]
-    history_persistence: HistoryPersistence,
     polling: PollingPolicy,
 }
 
@@ -390,8 +385,8 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     if let Some(live) = &input.live_nvmeof {
         if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
             return Err(format!(
-                "live NVMe-oF preparation ({:?}, inline_reads={}, lease_ahead={}, polled_writes={}) requires Linux and the nvmeof feature",
-                live.write_mode, live.inline_reads, live.lease_ahead, live.polled_writes
+                "live NVMe-oF preparation (inline_reads={}, lease_ahead={}, polled_writes={}) requires Linux and the nvmeof feature",
+                live.inline_reads, live.lease_ahead, live.polled_writes
             ).into());
         }
         live.queue_geometry.validate()?;
@@ -518,7 +513,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     let remote_path = prepared.join("remote.yaml");
     let mut remote: tidehunter::distributed::remote_db::RemoteDatabaseConfig =
         serde_yaml::from_slice(&fs::read(&remote_path)?)?;
-    remote.history_persistence = input.history_persistence;
     remote.pin_read_lanes = input.pin_read_lanes;
     remote.read_lanes = input.read_lanes;
     remote.read_cache_bytes = input.coordinator_cache_bytes;
@@ -551,10 +545,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             max_inflight_bytes: live.max_inflight_bytes,
             connect_timeout_ms: live.connect_timeout_ms,
             io_timeout_ms: live.io_timeout_ms,
-            write_mode: live.write_mode,
-            leased_durability: (live.write_mode
-                == tidehunter::distributed::tcp::LiveWriteMode::Leased)
-                .then_some(input.durability_tier),
+            leased_durability: input.durability_tier,
             inline_reads: live.inline_reads,
             queue_geometry: live.queue_geometry,
         });
@@ -581,8 +572,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             .join(format!("node-{partition}"))
             .join("launch.yaml");
         let mut launch: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&launch_path)?)?;
-        launch["history_persistence"] = serde_yaml::to_value(input.history_persistence)?;
-        fs::write(&launch_path, serde_yaml::to_string(&launch)?)?;
         if let Some(live) = &input.live_nvmeof {
             let (_, host_nqn) = &live_identities[partition as usize];
             let port_offset = 2 * partition as u16;
@@ -1217,7 +1206,6 @@ async fn open_with_shape(
     };
     let mut effective_configuration = serde_json::json!({
         "backend": selected_backend,
-        "history_persistence": remote_config.history_persistence,
         "live_queue_geometry": remote_config.live_nvme.as_ref().map(|live| live.queue_geometry),
         "live_export_mode": remote_config.live_nvme.as_ref().map(|live| live.export_mode),
         "transport": transport.label(),
@@ -1314,10 +1302,7 @@ async fn open_with_shape(
     );
     effective_configuration["live_leased_write_window_bound"] =
         serde_json::json!(remote_config.live_nvme.as_ref().map(|live| {
-            let occupancy = if live.write_mode
-                == tidehunter::distributed::tcp::LiveWriteMode::Leased
-                && live.leased_write_window.is_none()
-            {
+            let occupancy = if live.leased_write_window.is_none() {
                 tidehunter::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY
             } else {
                 remote_config.owner_append_occupancy
@@ -1337,10 +1322,9 @@ async fn open_with_shape(
             .map(|live| live.polled_writes)
     );
     let live_write_evidence = remote_config.live_nvme.as_ref().map(|live| serde_json::json!({
-        "write_mode": live.write_mode,
         "leased_durability": live.leased_durability,
         "inline_reads": live.inline_reads,
-        "acknowledgement_contract": live.write_mode.acknowledgement(options.durability_tier),
+        "acknowledgement_contract": tidehunter::distributed::tcp::LiveClientConfig::acknowledgement(options.durability_tier),
         "recovery_outcome": "an operation with a lost acknowledgement can be present after recovery: unknown outcome, not exactly-once",
     }));
     fs::create_dir_all(&coordinator_path)?;
@@ -1454,7 +1438,7 @@ impl TidehunterBackend {
         &self,
         db: &sui::Db,
     ) -> BackendResult<Option<tidehunter::distributed::nvmeof::live_metrics::LiveNvmeStats>> {
-        let leased = self.effective_configuration["live_write"]["write_mode"] == "leased";
+        let leased = !self.effective_configuration["live_write"].is_null();
         Ok(live_write_profile::boundary_snapshot(
             leased,
             || db.live_nvmeof_stats(),
@@ -2583,10 +2567,6 @@ mod tests {
             serde_json::to_value(parsed.queue_geometry).unwrap(),
             serde_json::json!({"io_queues": 4, "queue_size": 128, "poll_queues": 0})
         );
-        assert_eq!(
-            parsed.write_mode,
-            tidehunter::distributed::tcp::LiveWriteMode::Reserved
-        );
         input["leased_flush_min_frame_bytes"] = serde_json::json!(0);
         assert_eq!(
             serde_json::from_value::<ExternalLiveNvmeof>(input.clone())
@@ -2633,7 +2613,7 @@ mod tests {
     }
 
     #[test]
-    fn external_preparation_history_persistence_is_feature_gated() {
+    fn external_preparation_launches_wal_replay_owners_and_rejects_history_key() {
         let root = std::env::temp_dir().join(format!(
             "kv-history-{}-{}",
             std::process::id(),
@@ -2641,43 +2621,30 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         let input = root.join("input.json");
-        for mode in [
-            None,
-            Some("on_disk"),
-            Some("wal_replay"),
-            Some("memory_only"),
-        ] {
-            let mut config = serde_json::json!({
-                "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
-                "transport": {"kind": "tcp"}, "max_batches_per_partition": 16384,
-                "max_admitted_batches": 16384, "max_index_bytes": 536870912,
-                "coordinator_cache_bytes": 0,
-                "owner_wal_member_read": "async", "owner_read_memory_allowance_bytes": 268435456,
-                "polling": "adaptive"
-            });
-            if let Some(mode) = mode {
-                config["history_persistence"] = serde_json::json!(mode);
-            }
-            fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
-            let output = root.join(mode.unwrap_or("legacy"));
-            if mode == Some("memory_only") && !cfg!(feature = "test-utils") {
-                assert!(prepare_external_case_file(&input, &output).is_err());
-                assert!(!output.exists());
-                continue;
-            }
-            prepare_external_case_file(&input, &output).unwrap();
-            let launch: serde_yaml::Value =
-                serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap())
-                    .unwrap();
-            assert_eq!(launch["node"].get("read_workers"), None);
-            assert_eq!(
-                launch["history_persistence"].as_str(),
-                Some(mode.unwrap_or("on_disk"))
-            );
-            let remote: serde_json::Value =
-                serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
-            assert_eq!(remote["history_persistence"], mode.unwrap_or("on_disk"));
-        }
+        let mut config = serde_json::json!({
+            "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
+            "transport": {"kind": "tcp"}, "max_batches_per_partition": 16384,
+            "max_admitted_batches": 16384, "max_index_bytes": 536870912,
+            "coordinator_cache_bytes": 0,
+            "owner_wal_member_read": "async", "owner_read_memory_allowance_bytes": 268435456,
+            "polling": "adaptive"
+        });
+        fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
+        let output = root.join("default");
+        prepare_external_case_file(&input, &output).unwrap();
+        let launch: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
+        assert_eq!(launch["node"].get("read_workers"), None);
+        assert_eq!(launch["history_persistence"].as_str(), Some("wal_replay"));
+        let remote: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
+        assert!(remote.get("history_persistence").is_none());
+        // WAL replay is the only history: the removed input key is rejected.
+        config["history_persistence"] = serde_json::json!("wal_replay");
+        fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
+        let rejected = root.join("rejected");
+        assert!(prepare_external_case_file(&input, &rejected).is_err());
+        assert!(!rejected.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2790,7 +2757,6 @@ mod tests {
             "addresses": ["10.128.15.228:9400"],
             "coordinator_cache_bytes": 0, "durability_tier": "native",
             "guest_root": "/mnt/tidehunter-kv-comparison/bench-b2eec4ef24bc4f90/cells/G18W-r0-219b8b655801a7844229",
-            "history_persistence": "wal_replay",
             "live_nvmeof": {
                 "addresses": ["10.20.15.197"],
                 "commissioning_port_id": 1001, "commissioning_service": 4421,
@@ -2799,7 +2765,7 @@ mod tests {
                 "max_inflight_bytes": 16777216, "max_inflight_requests": 32,
                 "port_id": 1000,
                 "queue_geometry": {"io_queues": 1, "poll_queues": 0, "queue_size": 32},
-                "service": 4420, "transport": "rdma", "write_mode": "leased",
+                "service": 4420, "transport": "rdma",
                 "lease_ahead": true, "polled_writes": false
             },
             "max_admitted_batches": 1000000, "max_batches_per_partition": 16384,
@@ -2837,7 +2803,6 @@ mod tests {
             tidehunter::distributed::tcp::LeasedSync::PerFrameFua
         );
         assert_eq!(live.leased_flush_min_frame_bytes, 8192);
-        assert_eq!(input.history_persistence, HistoryPersistence::WalReplay);
     }
 
     #[test]
@@ -2868,13 +2833,12 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         let input = root.join("input.json");
-        for (name, mode, export, ahead, polled) in [
-            ("controller", "leased", "per_owner", true, false),
-            ("polled", "leased", "per_owner", false, true),
-            ("reserved", "reserved", "on_demand", true, false),
+        for (name, export, ahead, polled) in [
+            ("controller", "per_owner", true, false),
+            ("polled", "per_owner", false, true),
+            ("on-demand", "on_demand", true, false),
         ] {
             let mut value = controller_live_preparation_input();
-            value["live_nvmeof"]["write_mode"] = serde_json::json!(mode);
             value["live_nvmeof"]["export_mode"] = serde_json::json!(export);
             value["live_nvmeof"]["lease_ahead"] = serde_json::json!(ahead);
             value["live_nvmeof"]["polled_writes"] = serde_json::json!(polled);
@@ -2886,10 +2850,9 @@ mod tests {
             prepare_external_case_file(&input, &output).unwrap();
             let remote: serde_json::Value =
                 serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
-            assert_eq!(remote["history_persistence"], "wal_replay");
+            assert!(remote.get("history_persistence").is_none());
             assert_eq!(remote["live_nvme"]["lease_ahead"], ahead);
             assert_eq!(remote["live_nvme"]["polled_writes"], polled);
-            assert_eq!(remote["live_nvme"]["write_mode"], mode);
             assert_eq!(remote["live_nvme"]["export_mode"], export);
             assert_eq!(remote["live_nvme"]["leased_flush_min_frame_bytes"], 8192);
             assert_eq!(
@@ -2981,16 +2944,16 @@ mod tests {
         .unwrap();
         assert!(cold_owners.iter().all(|owner| !owner.read_resident_first));
         #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        for mode in ["reserved", "leased"] {
+        {
             config["live_nvmeof"] = serde_json::json!({
                 "addresses": ["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"],
                 "transport": "rdma", "service": 4420, "port_id": 4420,
                 "commissioning_service": 4421, "commissioning_port_id": 4421,
                 "max_inflight_requests": 8, "max_inflight_bytes": 8388608,
-                "connect_timeout_ms": 10000, "io_timeout_ms": 10000, "write_mode": mode
+                "connect_timeout_ms": 10000, "io_timeout_ms": 10000
             });
             write_input(&config);
-            let output = root.join(format!("unavailable-{mode}"));
+            let output = root.join("unavailable");
             let error = prepare_external_case_file(&input, &output).unwrap_err();
             assert!(
                 error
@@ -3013,7 +2976,7 @@ mod tests {
             prepare_external_case_file(&input, &output).unwrap();
             let remote: serde_json::Value =
                 serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
-            assert_eq!(remote["live_nvme"]["write_mode"], "reserved");
+            assert_eq!(remote["live_nvme"]["leased_durability"], "native");
             assert_eq!(remote["pin_read_lanes"], false);
             assert!(remote.get("read_lanes").is_none());
             assert_eq!(remote["live_nvme"]["inline_reads"], true);
@@ -3055,7 +3018,6 @@ mod tests {
                 );
             }
             config["live_nvmeof"]["export_mode"] = serde_json::json!("per_owner");
-            config["live_nvmeof"]["write_mode"] = serde_json::json!("leased");
             write_input(&config);
             let permanent = root.join("live-per-owner");
             prepare_external_case_file(&input, &permanent).unwrap();
@@ -3117,22 +3079,17 @@ mod tests {
                 serde_json::json!({"io_queues": 4, "queue_size": 32, "poll_queues": 0});
             config["pin_read_lanes"] = serde_json::json!(true);
             config["read_lanes"] = serde_json::json!(4);
-            for (mode, tier) in [
-                ("reserved", "native"),
-                ("leased", "native"),
-                ("leased", "synchronous"),
-            ] {
+            for tier in ["native", "synchronous"] {
                 for inline_reads in [true, false] {
-                    config["live_nvmeof"]["write_mode"] = serde_json::json!(mode);
                     config["live_nvmeof"]["inline_reads"] = serde_json::json!(inline_reads);
                     config["durability_tier"] = serde_json::json!(tier);
                     write_input(&config);
-                    let output = root.join(format!("live-{mode}-{tier}-{inline_reads}"));
+                    let output = root.join(format!("live-{tier}-{inline_reads}"));
                     prepare_external_case_file(&input, &output).unwrap();
                     let remote: serde_json::Value =
                         serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap())
                             .unwrap();
-                    assert_eq!(remote["live_nvme"]["write_mode"], mode);
+                    assert_eq!(remote["live_nvme"]["leased_durability"], tier);
                     assert_eq!(remote["pin_read_lanes"], true);
                     assert_eq!(remote["read_lanes"], 4);
                     assert_eq!(remote["live_nvme"]["inline_reads"], inline_reads);
@@ -3145,14 +3102,6 @@ mod tests {
                     assert_eq!(client.queue_geometry.io_queues, 4);
                     assert_eq!(client.queue_geometry.queue_size, 32);
                     assert_eq!(client.queue_geometry.poll_queues, 0);
-                    assert_eq!(
-                        remote["live_nvme"]["leased_durability"],
-                        if mode == "leased" {
-                            serde_json::json!(tier)
-                        } else {
-                            serde_json::Value::Null
-                        }
-                    );
                 }
             }
             config["addresses"][1] = config["addresses"][0].clone();
@@ -3232,7 +3181,7 @@ mod tests {
             pid: 1,
             boot_id: "b".to_owned(),
             started_unix_ns: 1,
-            history_persistence: HistoryPersistence::OnDisk,
+            history_persistence: tidehunter::distributed::storage::HistoryPersistence::OnDisk,
             durability: tcp_cluster::ReceiptDurability {
                 tier,
                 max_unsynced_age_ms: None,

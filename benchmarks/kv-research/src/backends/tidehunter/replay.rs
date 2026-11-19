@@ -93,15 +93,13 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
             || first
                 .external_remote_config
                 .as_ref()
-                .and_then(|c| c.live_nvme.as_ref())
-                .map(|c| c.write_mode)
+                .is_some_and(|c| c.live_nvme.is_some())
                 != other
                     .external_remote_config
                     .as_ref()
-                    .and_then(|c| c.live_nvme.as_ref())
-                    .map(|c| c.write_mode)
+                    .is_some_and(|c| c.live_nvme.is_some())
         {
-            return Err("distributed replay node DBs must use the same transport, live write mode and durability tier".into());
+            return Err("distributed replay node DBs must use the same transport, live route and durability tier".into());
         }
     }
     Ok(result)

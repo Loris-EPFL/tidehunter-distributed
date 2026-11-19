@@ -52,7 +52,6 @@ struct Case {
     hot: bool,
     boundary: String,
     gate_waves: usize,
-    on_disk_history: bool,
     leased: Option<LeasedCase>,
     #[serde(default)]
     concurrent: bool,
@@ -75,7 +74,6 @@ impl Case {
             hot,
             boundary: String::new(),
             gate_waves: 2 + (seed as usize & 1),
-            on_disk_history: false,
             leased: None,
             concurrent: false,
             native: false,
@@ -183,7 +181,7 @@ fn synchronous(case: &Case) -> bool {
 
 /// Version B tracks Native owners with WAL replay under the default config.
 fn durable_prefix(case: &Case) -> bool {
-    !synchronous(case) && !case.on_disk_history
+    !synchronous(case)
 }
 
 fn key_bytes(key: usize) -> [u8; 4] {
@@ -470,12 +468,7 @@ fn write_child(directory: &Path, case: &Case) {
             }
             super::super::tcp::StorageNode::open(config, recovery_metrics()).unwrap()
         },
-    )
-    .history(if case.on_disk_history {
-        HistoryPersistence::OnDisk
-    } else {
-        HistoryPersistence::WalReplay
-    });
+    );
     let fixture = if synchronous(case) {
         fixture.synchronous()
     } else {
@@ -673,8 +666,6 @@ fn recover_child(directory: &Path) {
         #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
         let node =
             super::super::tcp::StorageNode::open(config.clone(), recovery_metrics()).unwrap();
-        node.set_history_persistence(restart.config.history_persistence)
-            .unwrap();
         node.set_durability(super::super::durability::DurabilityConfig::with_tier(
             if synchronous(&case) {
                 super::super::durability::DurabilityTier::Synchronous
@@ -1175,7 +1166,6 @@ fn write_model_seeded_crashes() {
     for (index, boundary) in BOUNDARIES.iter().enumerate() {
         run_case(&Case {
             boundary: (*boundary).into(),
-            on_disk_history: index % 2 != 0,
             ..Case::rpc(0x5a17 + index as u64, [1, 2, 4][index % 3], index % 2 == 0)
         });
     }
@@ -1198,7 +1188,6 @@ fn write_model_crash_soak() {
             env_number("TH_MODEL_HOT", iteration % 2) != 0,
         );
         case.gate_waves = env_number("TH_MODEL_GATE_WAVES", case.gate_waves as u64) as usize;
-        case.on_disk_history = env_number("TH_MODEL_ON_DISK_HISTORY", iteration % 2) != 0;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Ok(index) = std::env::var("TH_MODEL_LEASED") {
             case.leased = Some(leased::profile(index.parse().unwrap()));

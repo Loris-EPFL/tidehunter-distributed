@@ -1749,7 +1749,6 @@ fn fifo_admission(requests: usize, bytes: usize) -> Arc<Admission> {
         max_bytes: bytes,
         max_identities: requests,
         max_index_bytes: 1024 * 1024,
-        replay_limits: Some(ReplayLimits::default()),
         partition_batches: 1024,
         reference_bytes: 1024 * 1024,
         index: Arc::new(NativeIndex::new(&shape, [71; 16], 1024 * 1024).unwrap()),

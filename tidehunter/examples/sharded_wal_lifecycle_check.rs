@@ -919,10 +919,6 @@ fn exercise(launch: &Launch, report: &mut Report) -> Result<()> {
         &expected,
         "cold_reopen_after_retirement",
     )?;
-    require(
-        remote.recovery_stats().tail_batches <= launch.remote.replay_limits.max_batches as u64,
-        "recovery exceeded configured hard tail bound",
-    )?;
     report
         .metadata
         .push(metadata(&remote, "cold_reopen_after_retirement")?);

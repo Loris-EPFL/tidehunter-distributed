@@ -53,16 +53,6 @@ impl From<AppendedBatch> for CheckpointReceipt {
     }
 }
 
-impl CheckpointReceipt {
-    /// Caller must first compare the entire ordered prefix to a fresh proof
-    /// from the fenced, authenticated owning shard. Local metadata alone is not
-    /// a durability receipt.
-    pub(crate) fn authenticated(self) -> AppendedBatch {
-        DurableBatch::from_validated_parts(self.id, self.version, self.digest, self.address)
-            .appended()
-    }
-}
-
 pub(crate) fn prefix_digest(
     database: [u8; 16],
     partition: u32,
@@ -141,40 +131,8 @@ pub(crate) enum RetirementResult {
 }
 
 impl Client {
-    pub(crate) fn checkpoint_deadline(&self) -> Instant {
-        Instant::now() + self.timeout.max(LIFECYCLE_TIMEOUT)
-    }
-
     pub(crate) fn position_deadline(&self) -> Instant {
         Instant::now() + self.timeout
-    }
-
-    pub(crate) fn submit_checkpoint(
-        &mut self,
-        authority_epoch: u64,
-        epoch: u64,
-        prefix: usize,
-        deadline: Instant,
-    ) -> Result<bool, TcpError> {
-        self.submit_control(
-            &Request::Checkpoint {
-                authority_epoch,
-                epoch,
-                prefix,
-            },
-            deadline,
-        )
-    }
-
-    pub(crate) fn take_checkpoint(
-        &mut self,
-        epoch: u64,
-        prefix: usize,
-    ) -> Option<Result<CheckpointProof, TcpError>> {
-        self.take_control().map(|response| {
-            let response = response?;
-            self.validate_checkpoint_response(response, epoch, prefix)
-        })
     }
 
     fn validate_checkpoint_response(

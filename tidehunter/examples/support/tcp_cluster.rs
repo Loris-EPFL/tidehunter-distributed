@@ -248,7 +248,6 @@ pub fn prepare_external_case_with_durability(
         }
     };
     let config = RemoteDatabaseConfig {
-        history_persistence: HistoryPersistence::default(),
         storage,
         endpoints,
         tls: client_tls,
@@ -271,7 +270,6 @@ pub fn prepare_external_case_with_durability(
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
         index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
-        checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
         durable_cut: Default::default(),
     };
     fs::write(
@@ -1038,7 +1036,6 @@ impl LoopbackCluster {
             }
         };
         let config = RemoteDatabaseConfig {
-            history_persistence: HistoryPersistence::default(),
             storage,
             endpoints,
             tls: client_tls,
@@ -1061,7 +1058,6 @@ impl LoopbackCluster {
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,
             index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
-            checkpoint_mode: tidehunter::distributed::remote_db::CheckpointMode::Exact,
             durable_cut: Default::default(),
         };
         // TLS configuration contains only paths, but it must not be presented as

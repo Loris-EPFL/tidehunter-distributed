@@ -117,13 +117,12 @@ fn fixture(
             "scan_prefetch_pages":1,"read_lanes":2,"pin_read_lanes":false,
             "max_pending_reads":64,"max_pending_read_bytes":16777216,"write_profile_limit":0,"index_shards":64
         })).unwrap();
-        config.history_persistence =
-            tidehunter::distributed::storage::HistoryPersistence::WalReplay;
-        if let Some(mode) = live {
+        if let Some(route) = live {
+            assert_eq!(route, "leased", "leased is the only live write route");
             config.live_nvme = Some(serde_json::from_value(serde_json::json!({
                 "host_nqn":format!("nqn.2026-01.test:mainnet-replay-{id}"),"host_id":vec![id as u8+1;16],
                 "max_inflight_requests":16,"max_inflight_bytes":4194304,"connect_timeout_ms":10000,"io_timeout_ms":30000,
-                "write_mode":mode,"leased_durability":if mode=="leased" {Some("native")} else {None},
+                "leased_durability":"native",
                 "leased_write_window":1,"leased_sync":"per_frame_fua","leased_flush_min_frame_bytes":0,
                 "inline_reads":true,"lease_ahead":true,"polled_writes":false
             })).unwrap());
@@ -174,8 +173,10 @@ fn fixture(
         .unwrap();
         node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
             .unwrap();
-        node.set_history_persistence(config.history_persistence)
-            .unwrap();
+        node.set_history_persistence(
+            tidehunter::distributed::storage::HistoryPersistence::WalReplay,
+        )
+        .unwrap();
         #[cfg(all(feature = "nvmeof", feature = "test-utils", target_os = "linux"))]
         if live.is_some() {
             let state = base.join("target");
@@ -432,7 +433,6 @@ async fn real_distributed_mainnet_replay_matches_one_and_four_callers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_local_file_live_mainnet_replay_matches_owner_rpc() {
     let rpc = replay(None, 4).await;
-    assert_eq!(rpc, replay(Some("reserved"), 4).await);
     assert_eq!(rpc, replay(Some("leased"), 4).await);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

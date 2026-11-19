@@ -163,7 +163,7 @@ fn replay_preparation_rejects_implicit_identity_limits_and_unknown_node_db() {
     }
     fs::remove_dir_all(root).unwrap();
 }
-fn replay_outputs(mode: Option<&str>) {
+fn replay_outputs(live: bool) {
     use crate::mainnet_trace::Trace;
     use tidehunter::distributed::codec::{CompleteBatch, Mutation};
     use tidehunter::distributed::types::{BatchId, BatchVersion};
@@ -183,14 +183,13 @@ fn replay_outputs(mode: Option<&str>) {
         value["database"] = serde_json::json!(vec![id as u8 + 71; 16]);
         value["batch_limits"] =
             serde_json::json!({"max_operations":519,"max_encoded_bytes":500000});
-        if let Some(mode) = mode {
-            value["history_persistence"] = serde_json::json!("wal_replay");
+        if live {
             value["live_nvmeof"] = serde_json::json!({
                 "addresses":["127.0.0.1"],"transport":"tcp","service":4420+2*id,"port_id":1000+2*id,
                 "commissioning_service":4421+2*id,"commissioning_port_id":1001+2*id,
                 "max_inflight_requests":16,"max_inflight_bytes":8388608,"connect_timeout_ms":10000,"io_timeout_ms":30000,
-                "write_mode":mode,"leased_write_window":1,"leased_sync":"per_frame_fua",
-                "export_mode":if mode == "leased" {"per_owner"} else {"on_demand"},"inline_reads":true
+                "leased_write_window":1,"leased_sync":"per_frame_fua",
+                "export_mode":"per_owner","inline_reads":true
             });
         }
         let input = root.join(format!("input-{id}.json"));
@@ -256,9 +255,9 @@ fn replay_outputs(mode: Option<&str>) {
             members = members.max(batch.entries.len());
         }
         assert_eq!(members, [519, 3, 45][usize::from(id)]);
-        if let Some(mode) = mode {
+        if live {
             let live = remote.live_nvme.as_ref().unwrap();
-            assert_eq!(serde_json::to_value(live.write_mode).unwrap(), mode);
+            assert_eq!(live.leased_durability, DurabilityTier::Native);
             assert!(initiators.insert(live.host_id));
             let target = node.live_target.as_ref().unwrap();
             assert_eq!(target.host_nqn, live.host_nqn);
@@ -286,11 +285,10 @@ fn replay_outputs(mode: Option<&str>) {
 }
 #[test]
 fn external_tcp_replay_preparation_preserves_three_table_domains_and_atomic_output() {
-    replay_outputs(None);
+    replay_outputs(false);
 }
 #[cfg(all(feature = "nvmeof", target_os = "linux"))]
 #[test]
 fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_output() {
-    replay_outputs(Some("reserved"));
-    replay_outputs(Some("leased"));
+    replay_outputs(true);
 }

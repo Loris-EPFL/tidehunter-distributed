@@ -37,7 +37,7 @@ pub use super::nvmeof::{LiveExportMode, LiveQueueGeometry};
 pub(crate) use live_client::leased_tests;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) use live_client::{LeasedSubmit, LiveGroupBudget};
-pub use live_client::{LeasedSync, LiveClientConfig, LiveInitiatorIdentity, LiveWriteMode};
+pub use live_client::{LeasedSync, LiveClientConfig, LiveInitiatorIdentity};
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) mod export_pin_tests;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -49,8 +49,8 @@ mod live_recovery;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use live_control::{
-    AdoptProfile, LeaseProfile, LiveAdopted, LiveCompletion, LiveLeased, LiveRecordLocation,
-    LiveRecordLocations, LiveRecoveryEntry, LiveRecoveryPage, LiveReserveResponse, LiveReserved,
+    AdoptProfile, LeaseProfile, LiveAdopted, LiveLeased, LiveRecordLocation, LiveRecordLocations,
+    LiveRecoveryEntry, LiveRecoveryPage, LiveReserved,
 };
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use live_control::{
@@ -1830,7 +1830,7 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn append_flights_in_flight(&self) -> usize {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_leased_mode() {
+        if self.live_nvme_configured() {
             return self.leased_flights_in_flight();
         }
         self.reactor.pending_append_count()

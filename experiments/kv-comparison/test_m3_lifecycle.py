@@ -110,7 +110,7 @@ class CapsuleLayoutTests(unittest.TestCase):
                         'lease_ahead', 'polled_writes', 'leased_write_window')
                 live_client = {key: prep[key] for key in keys}
                 live_client.update(host_nqn=nqn, host_id=cloud.live_host_identity(nqn),
-                                   write_mode='leased', leased_durability=campaign.durability_tier(job))
+                                   leased_durability=campaign.durability_tier(job))
                 (prepared / 'remote.json').write_text(json.dumps(
                     {'tls': {}, 'storage': geometry, 'live_nvme': live_client}))
                 (prepared / 'external_owner_read_config.json').write_text('[]')

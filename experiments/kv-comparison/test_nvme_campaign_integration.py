@@ -490,7 +490,7 @@ class CampaignModeTests(unittest.TestCase):
             for inline in (False, True):
                 prep = {'max_inflight_requests': 32, 'max_inflight_bytes': 16777216,
                         'connect_timeout_ms': 30000, 'io_timeout_ms': 30000,
-                        'write_mode': 'leased', 'inline_reads': inline, 'export_mode': 'per_owner',
+                        'inline_reads': inline, 'export_mode': 'per_owner',
                         'lease_ahead': True, 'polled_writes': False,
                         'queue_geometry': {'io_queues': 1, 'queue_size': 32, 'poll_queues': 0}}
                 client = {**prep, 'host_nqn': host_nqn, 'host_id': controller.live_host_identity(host_nqn),

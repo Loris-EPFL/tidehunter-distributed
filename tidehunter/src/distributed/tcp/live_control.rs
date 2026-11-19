@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::distributed::nvmeof::live_storage::{
-    LiveAdoption, LiveGroupDescriptor, LiveWalSegment, LiveWriteExtent, LiveWriteReservation,
+    LiveAdoption, LiveWalSegment, LiveWriteExtent, LiveWriteReservation,
 };
 use crate::distributed::nvmeof::live_target::LiveTargetBinding;
 
@@ -230,24 +230,11 @@ pub struct LiveReserved {
     pub binding: LiveTargetBinding,
 }
 
-pub enum LiveReserveResponse {
-    Existing(Vec<DurableBatch>),
-    Reserved(LiveReserved),
-}
-
 #[derive(Serialize, Deserialize)]
 pub(super) enum LiveReserveWire {
     Existing(Vec<Receipt>),
     Reserved(LiveReserved),
 }
-/// Owner-side validation and persistence observations, separate from RPC RTT.
-pub struct LiveCompletion {
-    pub receipts: Vec<DurableBatch>,
-    pub validation_ns: u64,
-    pub validation_samples: u64,
-    pub persistence: crate::distributed::storage::StorageWriteProfile,
-}
-
 #[derive(Serialize, Deserialize)]
 pub(super) struct LiveCompletionWire {
     pub(super) receipts: Vec<Receipt>,
@@ -640,125 +627,6 @@ impl Client {
                 .and_then(|offset| offset.checked_add(u64::from(reference.descriptor.offset)))
                 == Some(offset)
             && offset.checked_add(len).is_some_and(|end| end <= file_bytes)
-    }
-
-    pub fn reserve_live_group(
-        &mut self,
-        epoch: u64,
-        descriptor: LiveGroupDescriptor,
-    ) -> Result<LiveReserveResponse, TcpError> {
-        let expected = descriptor.clone();
-        match self.request(Request::ReserveLiveGroup { epoch, descriptor })? {
-            Response::LiveReserved(LiveReserveWire::Reserved(reserved)) => {
-                let reservation = &reserved.reservation;
-                if !self.valid_live_segment(
-                    &reservation.segment,
-                    &reserved.binding,
-                    epoch,
-                    reservation.frame_offset,
-                ) || reservation.token == [0; 16]
-                    || reservation.frame_len != expected.frame_len
-                    || reservation.frame_offset % u64::from(reservation.segment.block_size) != 0
-                    || (reservation.frame_offset % reservation.segment.bytes)
-                        .checked_add(u64::from(reservation.frame_len))
-                        .is_none_or(|end| end > reservation.segment.bytes)
-                {
-                    return self.wrong_response("ReserveLiveGroup", "reservation authority, token, frame length, alignment or file range differs");
-                }
-                Ok(LiveReserveResponse::Reserved(reserved))
-            }
-            Response::LiveReserved(LiveReserveWire::Existing(receipts)) => {
-                if receipts.len() != expected.batches.len() {
-                    return self.wrong_response(
-                        "ReserveLiveGroup",
-                        format_args!(
-                            "existing receipts.len()={}, expected {}",
-                            receipts.len(),
-                            expected.batches.len()
-                        ),
-                    );
-                }
-                let mut durable = Vec::with_capacity(receipts.len());
-                for (receipt, summary) in receipts.into_iter().zip(expected.batches) {
-                    if receipt.id != summary.id
-                        || receipt.version != summary.version
-                        || receipt.digest != summary.digest
-                        || receipt.version.epoch != epoch
-                        || receipt.id.database != self.expected.inventory.database
-                        || self
-                            .expected
-                            .inventory
-                            .partition_for(receipt.id)
-                            .map_err(TcpError::component)?
-                            != self.expected.partition
-                        || receipt.address.partition != self.expected.partition
-                        || receipt.address.segment_generation != epoch
-                        || receipt.address.len != summary.encoded_len.saturating_add(8)
-                    {
-                        return self.wrong_response("ReserveLiveGroup", "existing receipt identity, version, digest, partition or length differs");
-                    }
-                    durable.push(receipt.durable());
-                }
-                Ok(LiveReserveResponse::Existing(durable))
-            }
-            response => self.invalid_live_response(epoch, response),
-        }
-    }
-
-    pub fn complete_live_group(
-        &mut self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<Vec<DurableBatch>, TcpError> {
-        self.complete_live_group_profiled(epoch, token)
-            .map(|completion| completion.receipts)
-    }
-
-    /// Returns owner validation and actual persistence timings, not wire RTT.
-    pub fn complete_live_group_profiled(
-        &mut self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<LiveCompletion, TcpError> {
-        match self.request(Request::CompleteLiveGroup { epoch, token })? {
-            Response::LiveCompleted(completion)
-                if !completion.receipts.is_empty()
-                    && completion.receipts.len()
-                        <= self.expected.group_limits.max_batches as usize
-                    && completion.validation_samples <= 1
-                    && (completion.validation_samples != 0 || completion.validation_ns == 0) =>
-            {
-                let mut durable = Vec::with_capacity(completion.receipts.len());
-                for receipt in completion.receipts {
-                    if receipt.version.epoch != epoch
-                        || receipt.id.database != self.expected.inventory.database
-                        || self
-                            .expected
-                            .inventory
-                            .partition_for(receipt.id)
-                            .map_err(TcpError::component)?
-                            != self.expected.partition
-                        || receipt.address.partition != self.expected.partition
-                        || receipt.address.segment_generation != epoch
-                        || receipt
-                            .address
-                            .offset
-                            .checked_add(u64::from(receipt.address.len))
-                            .is_none()
-                    {
-                        return self.wrong_response("CompleteLiveGroup", "receipt epoch, database, partition, segment generation or offset range differs");
-                    }
-                    durable.push(receipt.durable());
-                }
-                Ok(LiveCompletion {
-                    receipts: durable,
-                    validation_ns: completion.validation_ns,
-                    validation_samples: completion.validation_samples,
-                    persistence: completion.persistence,
-                })
-            }
-            response => self.invalid_live_response(epoch, response),
-        }
     }
 
     pub fn resolve_live_records(

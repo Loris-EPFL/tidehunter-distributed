@@ -331,15 +331,11 @@ pub enum WriteTimelineStage {
     LiveGroupBuilt,
     LiveExtentSwitchStarted,
     LiveExtentSwitchCompleted,
-    LiveReserveStarted,
-    LiveReserveCompleted,
     LiveNamespaceSetupStarted,
     LiveNamespaceSetupCompleted,
     LiveIoStarted,
     /// The CQE was observed. Leased groups can complete out of frame order.
     LiveIoCompleted,
-    LiveCompleteStarted,
-    LiveCompleteCompleted,
     /// Leased receipts release only after all prior frames complete.
     LiveReceiptsValidated,
     /// The request has been queued in the local reactor, not necessarily sent on the wire.
@@ -463,15 +459,12 @@ pub struct OwnerTimelineRecord {
     pub persistence_capture: Option<super::storage::PersistenceCapture>,
     pub ready_append_prefix: Option<ReadyAppendPrefix>,
 }
-/// A single live group; owner durations are returned by the completion RPC and
-/// are never compared to coordinator timestamps. Versions include sampled calls only.
+/// A single live group. Versions include sampled calls only.
 #[derive(Debug, Serialize)]
 pub struct LiveGroupTimeline {
     pub owner: u32,
     pub batches: Vec<BatchVersion>,
     pub reservation_token: Option<[u8; 16]>,
-    pub owner_validation_ns: Option<u64>,
-    pub owner_persistence: Option<super::storage::StorageWriteProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wal_position: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1033,8 +1026,6 @@ impl WriteTimeline {
             owner,
             batches: versions,
             reservation_token: None,
-            owner_validation_ns: None,
-            owner_persistence: None,
             wal_position: None,
             file_offset: None,
             frame_len: None,
@@ -1119,26 +1110,6 @@ impl WriteTimeline {
             .and_then(|s| s.export.live_groups.get_mut(group.index))
         {
             row.reservation_token = Some(token);
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn live_group_owner(
-        &self,
-        group: Option<LiveGroupSample>,
-        validation_ns: Option<u64>,
-        persistence: super::storage::StorageWriteProfile,
-    ) {
-        let Some(group) = group else { return };
-        if let Some(row) = self
-            .session
-            .lock()
-            .as_mut()
-            .filter(|s| s.generation == group.generation)
-            .and_then(|s| s.export.live_groups.get_mut(group.index))
-        {
-            row.owner_validation_ns = validation_ns;
-            row.owner_persistence = Some(persistence);
         }
     }
 
@@ -1405,28 +1376,26 @@ mod tests {
         timeline.batch([1; 16], versions[0]);
         timeline.batch([2; 16], versions[1]);
         let group = timeline.live_group(3, versions.into_iter()).unwrap();
-        timeline.live_group_event(Some(group), WriteTimelineStage::LiveReserveStarted);
         timeline.live_group_token(Some(group), [9; 16]);
-        timeline.live_group_event(Some(group), WriteTimelineStage::LiveCompleteStarted);
+        timeline.live_group_event(Some(group), WriteTimelineStage::LiveIoStarted);
         timeline.complete(a, Some("control failed".into()));
         timeline.complete(b, Some("control failed".into()));
         let export = timeline.finish().unwrap();
         assert_eq!(export.live_groups[0].batches, versions);
         assert_eq!(export.live_groups[0].reservation_token, Some([9; 16]));
-        assert!(export.live_groups[0].owner_persistence.is_none());
         for record in &export.records {
             assert_eq!(record.error.as_deref(), Some("control failed"));
             assert!(
                 record
                     .events
                     .iter()
-                    .any(|e| e.stage == WriteTimelineStage::LiveCompleteStarted)
+                    .any(|e| e.stage == WriteTimelineStage::LiveIoStarted)
             );
             assert!(
                 !record
                     .events
                     .iter()
-                    .any(|e| e.stage == WriteTimelineStage::LiveCompleteCompleted)
+                    .any(|e| e.stage == WriteTimelineStage::LiveIoCompleted)
             );
             assert!(
                 record

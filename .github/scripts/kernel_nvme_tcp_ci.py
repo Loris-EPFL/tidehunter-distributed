@@ -86,9 +86,9 @@ def run(args):
 
 
 def qualify(args):
-    """Run the four single-owner cells with independent cleanup checks."""
+    """Run the single-owner native and synchronous WAL-replay proofs."""
     sys.path.insert(0, str(ROOT / "experiments/kv-comparison"))
-    from local_dry_run_targets import KERNEL_LIVE_HISTORIES, _kernel_live_worker
+    from local_dry_run_targets import _kernel_live_worker
 
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
@@ -96,30 +96,23 @@ def qualify(args):
     root.mkdir(mode=0o700)
     before = inventory()
     dump(root / "before.json", before)
-    results = {}
-    for history in KERNEL_LIVE_HISTORIES:
-        output = root / history
-        output.mkdir(mode=0o700)
-        started = time.monotonic()
-        # Each history gets its own deadline. Sequential runs bound disk
-        # use and let the existing worker remove each clean fixture first.
-        seconds = 180
-        proof, evidence = _kernel_live_worker(
-            output, args.binary, "tcp", seconds, time.time() + seconds,
-            history_persistence=history, owner_wal_file_bytes=8 * 1024**2)
-        after = inventory()
-        dump(output / "after.json", after)
-        result = {"complete": proof["complete"], "fixture_removed": proof["fixture_removed"],
-                  "inventory_restored": before == after, "evidence": str(evidence.relative_to(root)),
-                  "elapsed_seconds": round(time.monotonic() - started, 3)}
-        results[history] = result
-        dump(root / "summary.json", results)
-        print(f"{history}: {json.dumps(result, sort_keys=True)}", flush=True)
-        if not result["fixture_removed"] or not result["inventory_restored"]:
-            raise RuntimeError("Single-owner kernel TCP cleanup unconfirmed; refusing another proof")
-        if signal.getsignal(signal.SIGTERM) == signal.SIG_IGN:
-            return 1
-    return 0 if all(result["complete"] for result in results.values()) else 1
+    output = root / "wal_replay"
+    output.mkdir(mode=0o700)
+    started = time.monotonic()
+    seconds = 180
+    proof, evidence = _kernel_live_worker(
+        output, args.binary, "tcp", seconds, time.time() + seconds,
+        owner_wal_file_bytes=8 * 1024**2)
+    after = inventory()
+    dump(output / "after.json", after)
+    result = {"complete": proof["complete"], "fixture_removed": proof["fixture_removed"],
+              "inventory_restored": before == after, "evidence": str(evidence.relative_to(root)),
+              "elapsed_seconds": round(time.monotonic() - started, 3)}
+    dump(root / "summary.json", {"wal_replay": result})
+    print(f"wal_replay: {json.dumps(result, sort_keys=True)}", flush=True)
+    if not result["fixture_removed"] or not result["inventory_restored"]:
+        raise RuntimeError("Single-owner kernel TCP cleanup unconfirmed")
+    return 0 if result["complete"] and signal.getsignal(signal.SIGTERM) != signal.SIG_IGN else 1
 
 
 def cleanup(args):

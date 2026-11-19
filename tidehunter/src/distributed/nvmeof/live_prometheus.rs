@@ -10,18 +10,6 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
     let c = s.counts;
     let mut values = vec![
         (
-            "reserve_exchanges_total",
-            c.reserve_exchanges,
-            false,
-            "Reserved mode reserve control exchanges",
-        ),
-        (
-            "complete_exchanges_total",
-            c.complete_exchanges,
-            false,
-            "Reserved mode completion control exchanges",
-        ),
-        (
             "lease_exchanges_total",
             c.lease_exchanges,
             false,
@@ -349,18 +337,6 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
         "Aggregate validation time in seconds"
     );
     stage!(
-        "persistence",
-        persistence_ns,
-        persistence_samples,
-        "Aggregate persistence time in seconds; nests WAL and frontier stages"
-    );
-    stage!(
-        "allocation",
-        allocation_ns,
-        allocation_samples,
-        "Aggregate allocation time in seconds"
-    );
-    stage!(
         "publication",
         publication_ns,
         publication_samples,
@@ -377,36 +353,6 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
         read_io_ns,
         read_io_samples,
         "Aggregate read I/O wait time in seconds"
-    );
-    stage!(
-        "owner_completion",
-        owner_completion_ns,
-        owner_completion_samples,
-        "Owner full-frame read and validation time in seconds, not client CPU"
-    );
-    stage!(
-        "wal_persistence",
-        wal_persistence_ns,
-        wal_persistence_samples,
-        "WAL persistence time in seconds; nested in persistence"
-    );
-    stage!(
-        "wal_namespace",
-        wal_namespace_ns,
-        wal_namespace_samples,
-        "WAL namespace persistence time in seconds; nested in persistence"
-    );
-    stage!(
-        "frontier_file",
-        frontier_file_ns,
-        frontier_file_samples,
-        "Frontier file persistence time in seconds; nested in persistence"
-    );
-    stage!(
-        "frontier_namespace",
-        frontier_namespace_ns,
-        frontier_namespace_samples,
-        "Frontier namespace persistence time in seconds; nested in persistence"
     );
     stage!(
         "delivery",

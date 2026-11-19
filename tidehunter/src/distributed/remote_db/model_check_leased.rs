@@ -4,7 +4,7 @@ use crate::distributed::durability::DurabilityTier;
 use crate::distributed::nvmeof::{
     LiveTargetConfig, NvmeofTransport, live_metrics::LiveNvmeMetrics,
 };
-use crate::distributed::tcp::{LeasedSync, LiveClientConfig, LiveWriteMode, StorageNode};
+use crate::distributed::tcp::{LeasedSync, LiveClientConfig, StorageNode};
 
 const LEASED_BOUNDARIES: &[&str] = &[
     "write_submitted_to_kernel",
@@ -71,12 +71,11 @@ pub(super) fn configure(config: &mut RemoteDatabaseConfig, profile: LeasedCase) 
         max_inflight_bytes: 4 * 1024 * 1024,
         connect_timeout_ms: 5000,
         io_timeout_ms: 5000,
-        write_mode: LiveWriteMode::Leased,
-        leased_durability: Some(if profile.synchronous {
+        leased_durability: if profile.synchronous {
             DurabilityTier::Synchronous
         } else {
             DurabilityTier::Native
-        }),
+        },
         lease_ahead: true,
         polled_writes: false,
         inline_reads: false,

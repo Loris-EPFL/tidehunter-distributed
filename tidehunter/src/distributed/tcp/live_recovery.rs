@@ -13,18 +13,8 @@ use crate::distributed::nvmeof::live_pool::LivePoolAcquisition;
 use std::time::{Duration, Instant};
 
 impl Client {
-    /// Runs during bounded open/recovery, never on the shared read reactor.
-    pub(crate) fn recover_live_page(
-        &mut self,
-        authority_epoch: u64,
-        source_epoch: u64,
-        cursor: usize,
-        limit: usize,
-    ) -> Result<RecoveryPage, TcpError> {
-        self.recover_live_page_inner(authority_epoch, source_epoch, cursor, limit, None)
-    }
-
     /// Replay whole WAL groups. `next` is a WAL byte offset, not a receipt ordinal.
+    /// Runs during bounded open/recovery, never on the shared read reactor.
     pub fn replay_live_wal_page(
         &mut self,
         authority_epoch: u64,
@@ -35,23 +25,6 @@ impl Client {
     ) -> Result<RecoveryPage, TcpError> {
         let cursor = usize::try_from(from)
             .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
-        self.recover_live_page_inner(
-            authority_epoch,
-            source_epoch,
-            cursor,
-            limit,
-            Some(require_end),
-        )
-    }
-
-    fn recover_live_page_inner(
-        &mut self,
-        authority_epoch: u64,
-        source_epoch: u64,
-        cursor: usize,
-        limit: usize,
-        require_end: Option<u64>,
-    ) -> Result<RecoveryPage, TcpError> {
         if limit == 0 || limit > 1024 {
             return Err(TcpError::new("invalid recovery page limit"));
         }
@@ -80,27 +53,21 @@ impl Client {
         }
         let page = {
             let _control = LiveReadTiming::start(&self.live_counters, LiveTimingStage::Control);
-            if let Some(require_end) = require_end {
-                let from = u64::try_from(cursor)
-                    .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
-                let response = self.request(super::Request::ReplayLiveWal {
-                    authority_epoch,
-                    source_epoch,
-                    from,
-                    limit: page_limit,
-                    require_end,
-                })?;
-                self.validate_live_recovery_page(
-                    response,
-                    authority_epoch,
-                    source_epoch,
-                    cursor,
-                    page_limit,
-                    true,
-                )?
-            } else {
-                self.recover_live_metadata(authority_epoch, source_epoch, cursor, page_limit)?
-            }
+            let response = self.request(super::Request::ReplayLiveWal {
+                authority_epoch,
+                source_epoch,
+                from,
+                limit: page_limit,
+                require_end,
+            })?;
+            self.validate_live_recovery_page(
+                response,
+                authority_epoch,
+                source_epoch,
+                cursor,
+                page_limit,
+                true,
+            )?
         };
         let token = page.epoch_pin_token;
         let result = (|| {

@@ -323,13 +323,11 @@ class CaseIdentityTests(unittest.TestCase):
                   "metadata_requests", "namespace_connects", "payload_rpc_requests",
                   "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
         counters = {field: index for index, field in enumerate(fields)}
-        for stage in ("queue", "submit", "cq", "control", "validation", "allocation",
-                      "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
-                      "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace"):
+        for stage in ("queue", "submit", "cq", "control", "validation",
+                      "publication", "namespace_setup", "read_io"):
             counters[stage + "_ns"] = 0
             counters[stage + "_samples"] = 0
         counters["queue_ns"], counters["queue_samples"] = 100, 2
-        counters["owner_completion_ns"], counters["owner_completion_samples"] = 250, 1
         evidence = {"scope": "measurement_boundary", "deltas": {"available": False},
                     "live_nvmeof": {"available": True, "counters": counters}}
         labels = campaign.context("run", job() | {"backend": "tidehunter_nvme_tcp", "nvmeof_route": "live"})
@@ -341,9 +339,6 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('stage="queue",statistic="sum"} 1e-07', text)
         self.assertIn('stage="cq"} 0', text)
         self.assertNotIn('stage="cq",statistic="sum"', text)
-        self.assertIn('stage="owner_completion",statistic="sum"} 2.5e-07', text)
-        self.assertIn('stage="frontier_file"} 0', text)
-        self.assertNotIn('stage="frontier_file",statistic="sum"', text)
         evidence["live_nvmeof"] = {"available": False}
         text = campaign.measurement_read_metrics(evidence, labels)
         self.assertIn('scope="measurement_boundary"} 0', text)
@@ -357,9 +352,8 @@ class CaseIdentityTests(unittest.TestCase):
             "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
             "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
             "payload_rpc_requests", "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")}
-        for stage in ("queue", "submit", "cq", "control", "validation", "allocation", "publication",
-                      "namespace_setup", "read_io", "persistence", "owner_completion", "wal_persistence",
-                      "wal_namespace", "frontier_file", "frontier_namespace"):
+        for stage in ("queue", "submit", "cq", "control", "validation", "publication",
+                      "namespace_setup", "read_io"):
             counters.update({stage + "_ns": 0, stage + "_samples": 0})
         counters.update(lane_inflight_samples=2, lane_inflight_request_sum=3, grant_hits=4,
                         copy_bytes_avoided=4096, delivery_ns=200, delivery_samples=2)

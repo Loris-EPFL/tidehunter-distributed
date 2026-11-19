@@ -82,7 +82,7 @@ class ReplayCITests(unittest.TestCase):
                 kernel.interrupted(15, None)
             self.assertEqual(handler.call_count, 2)
 
-    def test_kernel_live_qualification_gates_both_history_modes_and_cleanup(self):
+    def test_kernel_live_qualification_gates_wal_replay_and_cleanup(self):
         import argparse
         import local_dry_run_targets
         for complete, clean, restored in ((True, True, True), (False, True, True),
@@ -93,14 +93,12 @@ class ReplayCITests(unittest.TestCase):
                 args = argparse.Namespace(state=state, binary=state / "binary")
                 calls = []
 
-                def worker(output, binary, route, seconds, deadline, *,
-                           history_persistence, owner_wal_file_bytes):
+                def worker(output, binary, route, seconds, deadline, *, owner_wal_file_bytes):
                     self.assertEqual((binary, route), (args.binary, "tcp"))
                     self.assertEqual(owner_wal_file_bytes, 8 * 1024**2)
-                    self.assertEqual(output.name, history_persistence)
-                    calls.append(history_persistence)
-                    return ({"complete": complete or history_persistence == "wal_replay",
-                             "fixture_removed": clean}, output / "evidence")
+                    self.assertEqual(output.name, "wal_replay")
+                    calls.append(output.name)
+                    return ({"complete": complete, "fixture_removed": clean}, output / "evidence")
 
                 with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
                         patch.object(kernel.signal, "signal"), \
@@ -110,11 +108,11 @@ class ReplayCITests(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
                             kernel.qualify(args)
-                expected = ["on_disk", "wal_replay"] if clean and restored else ["on_disk"]
+                expected = ["wal_replay"]
                 self.assertEqual(calls, expected)
                 summary = json.loads((state / "single-owner/summary.json").read_text())
                 self.assertEqual(list(summary), expected)
-                self.assertEqual(summary["on_disk"]["inventory_restored"], restored)
+                self.assertEqual(summary["wal_replay"]["inventory_restored"], restored)
 
     def test_prewrite_pass_is_non_gating_but_cleanup_is_required(self):
         import argparse

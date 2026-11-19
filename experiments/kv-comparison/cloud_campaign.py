@@ -2002,14 +2002,8 @@ LIVE_NVME_COUNTERS = ("completed_read_ops", "completed_read_bytes", "completed_w
                       "unknown_writes", "errors", "queue_ns", "queue_samples",
                       "submit_ns", "submit_samples", "cq_ns", "cq_samples",
                       "control_ns", "control_samples", "validation_ns", "validation_samples",
-                      "allocation_ns", "allocation_samples", "publication_ns", "publication_samples",
+                      "publication_ns", "publication_samples",
                       "namespace_setup_ns", "namespace_setup_samples", "read_io_ns", "read_io_samples",
-                      "persistence_ns", "persistence_samples",
-                      "owner_completion_ns", "owner_completion_samples",
-                      "wal_persistence_ns", "wal_persistence_samples",
-                      "wal_namespace_ns", "wal_namespace_samples",
-                      "frontier_file_ns", "frontier_file_samples",
-                      "frontier_namespace_ns", "frontier_namespace_samples",
                       "route_evidence_dropped", "fence_evidence_dropped")
 
 def requested_leased_sync(job):

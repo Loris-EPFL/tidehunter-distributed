@@ -49,8 +49,7 @@ impl Case {
                     max_inflight_bytes: 128 * 1024,
                     connect_timeout_ms: 1000,
                     io_timeout_ms: 10_000,
-                    write_mode: crate::distributed::tcp::LiveWriteMode::Reserved,
-                    leased_durability: None,
+                    leased_durability: crate::distributed::durability::DurabilityTier::Native,
                     inline_reads,
                     queue_geometry: Default::default(),
                 });
