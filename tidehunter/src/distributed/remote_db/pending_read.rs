@@ -2727,6 +2727,20 @@ mod live_worker_tests {
             .write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
             .unwrap();
         let db = ConcurrentRemoteDatabase::new(original).unwrap();
+        // Every lane is live since R3: stop the fixture's own reactors before
+        // driving the same lanes, so that two lane workers never share one
+        // lane (an exiting fixture worker would shut down the lane's live
+        // cache under the test's worker and poison the read service).
+        let nodes = db.reads.lanes.read().len();
+        for node in 0..nodes {
+            let (detached, _) = mpsc::sync_channel(1);
+            db.reads.sender.lock()[node] = detached;
+        }
+        let fixture_reactors: Vec<_> = db.reads.thread.lock().drain(..).collect();
+        for reactor in fixture_reactors {
+            reactor.join().unwrap();
+        }
+        assert!(!db.reads.failed());
         let mut workers = Vec::new();
         for (node, lanes) in db.reads.lanes.read().iter().enumerate() {
             let lanes = lanes.clone();
