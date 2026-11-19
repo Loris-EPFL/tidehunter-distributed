@@ -10,6 +10,7 @@ import ssl
 import subprocess
 from pathlib import Path
 import tempfile
+import threading
 import time
 import urllib.error
 import unittest
@@ -957,7 +958,29 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                 state['policy'] = {'name': state['run_id'] + '-placement', 'id': '42'}
                 state['deadline'] = manual._utc(time.time() + 7200)
                 package = {'manifest_sha256': 'b' * 64}
+                loop = asyncio.get_running_loop()
+                deadline = asyncio.timeout(30)
+                release = threading.Event()
+                probe_finished = threading.Event()
+                missing_key = f'runs/{state["run_id"]}/qualification/{fleet[0]["name"]}/startup-error.json'
+
+                def expire_readiness():
+                    # Queue the already-expired deadline before releasing the I/O.
+                    deadline.reschedule(loop.time())
+                    loop.call_soon(release.set)
+
                 class GuestStore(Store):
+                    def head(self, key):
+                        if failure == 'missing' and key == missing_key:
+                            loop.call_soon_threadsafe(expire_readiness)
+                            if not release.wait(5):
+                                raise AssertionError('readiness timeout did not release status probe')
+                            try:
+                                return super().head(key)
+                            finally:
+                                probe_finished.set()
+                        return super().head(key)
+
                     def put(self, key, data, **kwargs):
                         result = super().put(key, data, **kwargs)
                         if key.endswith('/runtime.json'):
@@ -980,12 +1003,14 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                 store = GuestStore()
                 path = gcp_campaign.StateFile(Path(tmp) / 'state.json', store, state['run_id'])
                 with patch.object(manual.gcp_runtime, 'build_runtime_config',
-                                  return_value={'package_root': '/package'}) as build_runtime, \
-                     patch.object(manual, 'WORKER_READY_SECONDS', 0.02 if failure == 'missing' else 180):
+                                  return_value={'package_root': '/package'}) as build_runtime:
                     if failure == 'missing':
                         with self.assertRaises(TimeoutError):
-                            await asyncio.wait_for(manual._suite(
-                                store, CONFIG, state, path, fleet, package, manual.REVIEWED_SPEC, tmp, 'irdma0'), 30)
+                            async with deadline:
+                                await manual._suite(
+                                    store, CONFIG, state, path, fleet, package, manual.REVIEWED_SPEC, tmp, 'irdma0')
+                        self.assertTrue(deadline.expired())
+                        self.assertTrue(probe_finished.is_set())
                     else:
                         message = 'worker unit refused' if failure == 'startup-error' else 'identity mismatch'
                         with self.assertRaisesRegex(RuntimeError, message):
