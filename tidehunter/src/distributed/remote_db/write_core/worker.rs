@@ -20,22 +20,9 @@ impl ClientWorker {
             policy,
         } = diagnostics;
         client.trace_controls(Arc::clone(&write_timeline), partition);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let worker_wake = {
-            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-            // SAFETY: eventfd has plain value arguments. Check its result before taking ownership.
-            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: fd is a new, valid descriptor and has no other owner.
-            let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-            client.set_worker_wake(fd.as_raw_fd());
-            fd
-        };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let worker_wake = Arc::new(crate::distributed::sys::eventfd()?);
+        client.set_worker_wake(std::os::fd::AsRawFd::as_raw_fd(&*worker_wake));
         let thread_wake = Arc::clone(&worker_wake);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let leased_write_window = client.leased_write_window();
         let client = Arc::new(Mutex::new(client));
         let worker_client = Arc::clone(&client);
@@ -44,21 +31,19 @@ impl ClientWorker {
         let worker_queue = Arc::clone(&queue);
         let accounting = Arc::new(WorkerAccounting::default());
         let worker_accounting = Arc::clone(&accounting);
-        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+        #[cfg(test)]
         let caller_failure = Arc::clone(&failure);
-        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+        #[cfg(test)]
         let caller_first_failure = Arc::clone(&first_failure);
         let thread = thread::Builder::new()
             .name("value-wal-tcp".into())
             .spawn(move || {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let _thread_wake = thread_wake;
                 let mut write_profile_limit = write_profile_limit;
                 let mut profile_enabled = false;
                 let mut profile_requests = 0usize;
                 // The configured limit arms the profile before the first frame;
                 // ArmProfile replaces that attempt.
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut profile_attempted = false;
                 let mut checkpoint_samples = 0usize;
                 let mut checkpoint_stalls = 0u64;
@@ -74,14 +59,10 @@ impl ClientWorker {
                 let mut parked_checkpoint: Option<WorkerItem> = None;
                 let mut position: Option<(u64, u64, Reply<CheckpointPositionProof>)> = None;
                 let mut disconnected = false;
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut leased_replies: VecDeque<(u64, LeasedMembers)> =
                     VecDeque::with_capacity(leased_write_window);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut deferred: Option<(u64, Vec<CompleteBatch>, LeasedMembers)> = None;
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut released = Vec::with_capacity(leased_write_window);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let prepare_leased_command =
                     |client: &mut Client,
                      command: &WorkerItem,
@@ -134,7 +115,6 @@ impl ClientWorker {
                 // disconnection or the first fail-stop condition.
                 'worker: loop {
                     if failure.load(std::sync::atomic::Ordering::Acquire) {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         worker_client.lock().record_live_write_error();
                         break;
                     }
@@ -142,7 +122,6 @@ impl ClientWorker {
                     // Failure may have arrived while a control/test holder kept
                     // this mutex. Recheck before taking any READY queue entry.
                     if failure.load(std::sync::atomic::Ordering::Acquire) {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         client.record_live_write_error();
                         break;
                     }
@@ -159,7 +138,6 @@ impl ClientWorker {
                         },
                     );
                     disconnected |= closed;
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     let mut queue_credit_blocked = false;
                     for _ in 0..queue_capacity + policy.append_occupancy {
                         if controls
@@ -197,10 +175,7 @@ impl ClientWorker {
                                 break;
                             }
                             Ok(GroupDrain::CreditBlocked) => {
-                                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                                {
-                                    queue_credit_blocked = true;
-                                }
+                                queue_credit_blocked = true;
                                 break;
                             }
                             Err(error) => {
@@ -222,7 +197,6 @@ impl ClientWorker {
                         crate::distributed::write_timeline::WriteOwnerQueue::WorkerQueued,
                         queued.len(),
                     );
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if client.live_nvme_configured() {
                         write_timeline.owner_queue(
                             partition,
@@ -351,16 +325,8 @@ impl ClientWorker {
                         && queued.is_empty()
                         && parked_checkpoint.is_none()
                         && !client.has_pending_io()
-                        && {
-                            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                            {
-                                client.leased_flights_in_flight() == 0 && deferred.is_none()
-                            }
-                            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                            {
-                                true
-                            }
-                        }
+                        && client.leased_flights_in_flight() == 0
+                        && deferred.is_none()
                     {
                         if !worker_queue.park() {
                             continue;
@@ -378,7 +344,6 @@ impl ClientWorker {
                         worker_queue.unpark();
                         continue;
                     }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if let Some((epoch, batches, members)) = deferred.take() {
                         match client.submit_leased_group(
                             epoch,
@@ -418,7 +383,6 @@ impl ClientWorker {
                             }
                         }
                     }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if client.leased_flights_in_flight() != 0
                         && (deferred.is_some()
                             || !matches!(queued.front(), Some(WorkerItem::Append(..)))
@@ -454,7 +418,6 @@ impl ClientWorker {
                     }
                     // Merge ready same-epoch appends without crossing a control
                     // barrier. Leased frames use the configured completion window.
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     if client.live_nvme_configured()
                         && deferred.is_none()
                         && client.leased_flights_in_flight() < client.leased_write_window()
@@ -667,7 +630,6 @@ impl ClientWorker {
                             _,
                         ))) = queued.front()
                     {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if let Some(command) = queued.front()
                             && !prepare_leased_command(
                                 &mut client,
@@ -839,7 +801,6 @@ impl ClientWorker {
                             }
                         }
                     }
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     // Acquire observes checkpoint submission/completion failure in
                     // this pass before profile control, queued commands or close.
                     if client.live_nvme_configured()
@@ -856,7 +817,6 @@ impl ClientWorker {
                     {
                         // The capture is a control exchange: settle the sampled
                         // frames and their adoption first, as for FinishProfile.
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if let Err(error) = settle_leased_for_control(
                             &mut client,
                             &mut released,
@@ -890,7 +850,6 @@ impl ClientWorker {
                             | Some(WorkerItem::Control(Command::ArmProfile(_, _)))
                             | Some(WorkerItem::Control(Command::FinishProfile(_)))
                             | Some(WorkerItem::Control(Command::Control(_))) => {
-                                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                                 if let Some(command) = queued.front()
                                     && !prepare_leased_command(
                                         &mut client,
@@ -927,13 +886,7 @@ impl ClientWorker {
                                     WorkerItem::Control(Command::ArmProfile(limit, reply)) => {
                                         write_profile_limit = limit;
                                         profile_requests = 0;
-                                        #[cfg(all(
-                                            feature = "experimental-nvmeof",
-                                            target_os = "linux"
-                                        ))]
-                                        {
-                                            profile_attempted = limit != 0;
-                                        }
+                                        profile_attempted = limit != 0;
                                         checkpoint_samples = 0;
                                         checkpoint_stalls = 0;
                                         let enabled = limit != 0;
@@ -987,7 +940,6 @@ impl ClientWorker {
                         && position.is_none()
                         && parked_checkpoint.is_none()
                     {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if client.live_nvme_configured()
                             && let Err(error) =
                                 client.close_leased_extent(&mut released, Some(&write_timeline))
@@ -1027,7 +979,6 @@ impl ClientWorker {
                         _ => unreachable!("only fixed-cut proofs may be parked"),
                     }
                 }
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 {
                     let message = failure_context(
                         &first_failure,
@@ -1077,30 +1028,20 @@ impl ClientWorker {
                 }
             })?;
         sender.set_worker(thread.thread().clone());
-        #[cfg(not(any(
-            feature = "experimental-fabric",
-            all(feature = "experimental-nvmeof", target_os = "linux")
-        )))]
-        let _ = client;
         Ok(Self {
-            #[cfg(any(
-                feature = "experimental-fabric",
-                all(feature = "experimental-nvmeof", target_os = "linux")
-            ))]
             client,
             sender: Some(Arc::new(sender)),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             worker_wake,
             thread: Mutex::new(Some(thread)),
             queue,
             accounting,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             failure: caller_failure,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             first_failure: caller_first_failure,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             partition,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             test_completion: None,
         })
     }

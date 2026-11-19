@@ -396,7 +396,6 @@ fn client_polls_over_a_dedicated_connection() {
     server_thread.join().unwrap();
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn leased_owner_reports_the_adopted_and_synced_prefix() {
     use crate::distributed::write_timeline::WriteTimeline;

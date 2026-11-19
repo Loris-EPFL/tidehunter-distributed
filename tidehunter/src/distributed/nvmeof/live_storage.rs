@@ -173,7 +173,6 @@ pub struct LiveTargetBinding {
 
 /// Owner-local authority and inode pin. Keep it until namespace and read
 /// completions retire; it is not a transport message.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub struct LiveRecordLease {
     pub segment: LiveWalSegment,
     pub offset: u64,
@@ -181,7 +180,6 @@ pub struct LiveRecordLease {
     pub(crate) _plan: crate::distributed::storage::RecordReadPlan,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl Drop for LiveRecordLease {
     fn drop(&mut self) {
         self._plan._log.release_live_read_pin();

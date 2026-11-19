@@ -176,7 +176,6 @@ impl WriteCore {
         self.shutdown_with(|_| Ok(()))
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(in crate::distributed::remote_db) fn shutdown_live_target_final(
         self: &Arc<Self>,
     ) -> Result<Vec<(u32, crate::distributed::nvmeof::LiveTargetStats)>, LocalDbError> {
@@ -265,9 +264,7 @@ impl WriteCore {
                 "asynchronous read failed before shutdown",
             ));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let mut drain_failed = false;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.live_pool.is_some() {
             for worker in &self.clients {
                 let (closed, failed_writer) = {
@@ -314,7 +311,6 @@ impl WriteCore {
         // A failed close or drain retains the poisoned clients' controllers in
         // the pool for recovery; a failed retirement stays owned by its queue's
         // fail-stop Drop, so the pool is not shut down underneath it.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if !drain_failed
             && let Some(pool) = &self.live_pool
             && let Err(error) = pool.shutdown(Instant::now() + self.config.timeout)

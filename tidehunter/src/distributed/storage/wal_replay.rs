@@ -41,7 +41,7 @@ thread_local! {
 
 /// Test hook: replace the result of the next `read` at WAL `offset` on this thread
 /// with EIO. The faulted reads are on live streams, which need the NVMe-oF feature.
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 pub(crate) fn inject_read_fault(read: RecoveryRead, offset: u64) {
     READ_FAULT.with(|slot| slot.set(Some((read, offset))));
 }
@@ -160,11 +160,7 @@ pub struct ReplayPage {
 }
 
 fn position_lifecycle(state: &State) -> (bool, bool, bool) {
-    #[cfg(feature = "experimental-nvmeof")]
-    let sealing = state.sealing;
-    #[cfg(not(feature = "experimental-nvmeof"))]
-    let sealing = false;
-    (state.sealed, state.writer.is_some(), sealing)
+    (state.sealed, state.writer.is_some(), state.sealing)
 }
 
 impl PartitionLog {
@@ -211,10 +207,7 @@ impl PartitionLog {
                     "checkpoint position beyond allocated WAL",
                 ));
             }
-            #[cfg(feature = "experimental-nvmeof")]
             let leased = state.open_live_extent.is_some();
-            #[cfg(not(feature = "experimental-nvmeof"))]
-            let leased = false;
             // Owner-RPC cuts must be below the owner's completed-write frontier.
             // An open lease has no owner-visible CQE; only its coordinator may
             // name a fully written acknowledged cut above that frontier.
@@ -238,7 +231,7 @@ impl PartitionLog {
                 let _ = resume.recv();
             }
         }
-        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        #[cfg(test)]
         self.pause_live_at(LivePausePoint::PositionBeforeData);
         #[cfg(test)]
         self.fail_position_at(4)?;
@@ -280,7 +273,7 @@ impl PartitionLog {
         }
         #[cfg(test)]
         self.fail_position_at(5)?;
-        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        #[cfg(test)]
         self.pause_live_at(LivePausePoint::PositionBeforeRoot);
         timing.stage(Some(WriteStage::PersistSerializationLock));
         let _persistence = self.persistence.lock();
@@ -299,7 +292,7 @@ impl PartitionLog {
                 .clone()
                 .ok_or(StorageError::Invalid("position root removed during sync"))?
         };
-        #[cfg(all(test, feature = "experimental-nvmeof"))]
+        #[cfg(test)]
         self.pause_live_at(LivePausePoint::PositionRootLocked);
         let scan_from =
             through.saturating_sub(1) / self.config().fragment_bytes * self.config().fragment_bytes;
@@ -316,7 +309,7 @@ impl PartitionLog {
             self.state.lock().wal_root = Some(root);
             #[cfg(test)]
             self.fail_position_at(6)?;
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             self.pause_live_at(LivePausePoint::PositionAfterRoot);
             timing.success(0);
             proof_span.end_at(through);
@@ -412,7 +405,6 @@ impl PartitionLog {
             ids.push(id);
         }
         let mut admission = self.read_admission.write();
-        #[cfg(feature = "experimental-nvmeof")]
         if self.live_read_pins.load(Ordering::Acquire) != 0 {
             return Err(StorageError::Invalid(
                 "live namespace or read pin prevents retirement",
@@ -573,7 +565,6 @@ impl PartitionLog {
     }
 
     pub(super) fn leased_address(state: &State, address: PhysicalValueAddress) -> bool {
-        #[cfg(feature = "experimental-nvmeof")]
         if let Some(open) = &state.open_live_extent {
             let end = state
                 .next_live_extent
@@ -658,14 +649,10 @@ impl PartitionLog {
                     "replay requires sealed immutable epoch",
                 ));
             }
-            #[cfg(feature = "experimental-nvmeof")]
-            let live = state.live;
-            #[cfg(not(feature = "experimental-nvmeof"))]
-            let live = false;
             (
                 state.appended_end,
                 state.wal_root.as_ref().map(|root| root.retired.clone()),
-                live,
+                state.live,
                 state.wal_root.as_ref().map_or(0, |root| root.synced_end),
             )
         };
@@ -881,19 +868,12 @@ impl PartitionLog {
         wal.retire_files(&retired)?;
         let mut log = Self {
             state: Mutex::new(State {
-                #[cfg(feature = "experimental-nvmeof")]
                 open_live_extent: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 next_live_extent: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 last_live_adoption: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 live,
-                #[cfg(feature = "experimental-nvmeof")]
                 sealing: false,
-                #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 live_root_end: physical_end,
                 writer: None,
                 wal_root: Some(root.clone()),
@@ -905,9 +885,8 @@ impl PartitionLog {
                 poison: None,
                 sealed: true,
                 stats: PartitionStats::default(),
-                #[cfg(feature = "experimental-nvmeof")]
                 live_file_preparation: LiveFilePreparationStats::default(),
-                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                #[cfg(test)]
                 live_test_diagnostics: LiveTestDiagnostics::default(),
             }),
             references,
@@ -920,9 +899,7 @@ impl PartitionLog {
             serve_unsynced: AtomicBool::new(false),
             persistence: Mutex::new(()),
             read_admission: parking_lot::RwLock::new(true),
-            #[cfg(feature = "experimental-nvmeof")]
             live_read_pins: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(feature = "experimental-nvmeof")]
             live_stream: live,
             // Set after the scan below.
             recovery_hole: false,
@@ -938,11 +915,11 @@ impl PartitionLog {
             fail_persist: AtomicBool::new(false),
             #[cfg(test)]
             fail_namespace_persist: AtomicBool::new(false),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             fail_live_frontier: AtomicU8::new(0),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             live_pause: Mutex::new(None),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             fail_after_live_publish: AtomicBool::new(false),
             wal,
             registration,
@@ -1193,7 +1170,6 @@ impl PartitionLog {
             state.appended_end = physical_end;
             state.durable_end = physical_end;
             state.progress = ProgressTail::recovered(physical_end);
-            #[cfg(feature = "experimental-nvmeof")]
             {
                 state.live_root_end = physical_end;
             }

@@ -122,7 +122,7 @@ fn configuration_admission_accepts_estimates_that_execution_rejects() {
     let cfg = config(&root);
     // The distributed arm needs the leased live route; replay::tests owns its
     // fixture options and is gated the same way.
-    #[cfg(all(feature = "nvmeof", feature = "test-utils", target_os = "linux"))]
+    #[cfg(feature = "test-utils")]
     let arms = [
         cfg.clone(),
         ReplayConfig {
@@ -133,7 +133,7 @@ fn configuration_admission_accepts_estimates_that_execution_rejects() {
             ..cfg.clone()
         },
     ];
-    #[cfg(not(all(feature = "nvmeof", feature = "test-utils", target_os = "linux")))]
+    #[cfg(not(feature = "test-utils"))]
     let arms = [cfg.clone()];
     for cfg in arms {
         let kind = cfg.backend.kind.clone();

@@ -61,7 +61,6 @@ fn checkpoint_position_syncs_and_advances_owner_root() {
     assert_eq!(position_proof(&node, 2, 1, 0), proof);
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn replay_live_wal_page_reads_frames_through_namespace_fixture() {
     use crate::distributed::durability::DurabilityTier;

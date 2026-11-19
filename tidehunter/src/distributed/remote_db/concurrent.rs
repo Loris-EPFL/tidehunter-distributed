@@ -56,7 +56,7 @@ pub(in crate::distributed::remote_db) struct WriteGrant {
 }
 
 impl WriteGrant {
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn request(bytes: usize) -> Self {
         Self {
             requests: 1,
@@ -87,7 +87,7 @@ impl WriteGrant {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::distributed::remote_db) struct AdmissionCharges {
     pub requests: usize,
@@ -253,18 +253,18 @@ impl Admission {
         (budget.peak_requests, budget.peak_bytes)
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn queued_waiters(&self) -> usize {
         self.budget.lock().waiters.len()
     }
 
     /// Every charged dimension, copied under the budget mutex.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn charges(&self) -> AdmissionCharges {
         Self::charges_of(&self.budget.lock())
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn charges_of(budget: &WriteBudget) -> AdmissionCharges {
         AdmissionCharges {
             requests: budget.requests,
@@ -282,7 +282,7 @@ impl Admission {
     /// Waits on the existing drained condvar until `done` holds. Every release
     /// path notifies it through grant_waiters once no request credit remains,
     /// so callers must not hold an unreleased request credit while waiting.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn wait_charges(
         &self,
         deadline: Instant,
@@ -482,7 +482,7 @@ impl Admission {
 
     /// Lower the identity (checkpoint receipt metadata) bound for a test,
     /// under the budget mutex so every later grant predicate observes it.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn limit_identities_for_test(&self, limit: usize) {
         self.budget.lock().identity_limit = Some(limit);
     }
@@ -554,7 +554,7 @@ impl Admission {
         }
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn charge(budget: &mut WriteBudget, bytes: usize) {
         Self::charge_grant(budget, &WriteGrant::request(bytes));
     }
@@ -607,12 +607,12 @@ impl Admission {
         }
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn enqueue<'a>(&'a self, budget: &mut WriteBudget, bytes: usize) -> WaitingReservation<'a> {
         self.enqueue_grant(budget, WriteGrant::request(bytes))
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn reserve(
         self: &Arc<Self>,
         bytes: usize,
@@ -788,11 +788,9 @@ pub struct FabricProviderEvidence {
     pub open_profile: Option<tidehunter_fabric::OpenProfile>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type LiveTargetReports = Vec<(u32, super::super::nvmeof::LiveTargetStats)>;
 
 /// Evidence collected only after the final sealed authority and initiator drain.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub struct LiveFinalShutdownEvidence {
     pub metrics: super::super::nvmeof::live_metrics::LiveNvmeStats,
     pub targets: LiveTargetReports,
@@ -808,7 +806,6 @@ pub struct ConcurrentRemoteDatabase {
     pub(super) reads: Arc<ReadService>,
     pub(super) cache: Arc<ReadCache>,
     write_profile: Arc<Mutex<WriteProfileSnapshot>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_metrics: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>>,
     pub(crate) write_timeline: Arc<WriteTimeline>,
     pub(super) shape: KeyShape,
@@ -850,7 +847,6 @@ impl ConcurrentRemoteDatabase {
         self.database.storage_stats()
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
         self.live_metrics.as_ref().map(|metrics| metrics.snapshot())
     }
@@ -1011,7 +1007,6 @@ impl ConcurrentRemoteDatabase {
             .collect()
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn register_nvmeof_metrics(
         &self,
         registry: &prometheus::Registry,
@@ -1034,7 +1029,6 @@ impl ConcurrentRemoteDatabase {
             reads: Arc::clone(&core.reads),
             cache: Arc::clone(&core.read_cache),
             write_profile: Arc::clone(&core.write_profile),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics: core.live_metrics.clone(),
             write_timeline: Arc::clone(&core.write_timeline),
             shape: core.shape.clone(),
@@ -1452,7 +1446,6 @@ impl ConcurrentRemoteDatabase {
 
     /// Final campaign teardown, distinct from ordinary close/reopen.
     /// Returns only owner-reported target evidence after successful drain and seal.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn shutdown_live_target_final(mut self) -> Result<LiveFinalShutdownEvidence, LocalDbError> {
         let metrics = self
             .live_metrics

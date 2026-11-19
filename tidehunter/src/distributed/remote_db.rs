@@ -53,7 +53,6 @@ use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
 pub use concurrent::FabricProviderEvidence;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use concurrent::LiveFinalShutdownEvidence;
 use coordinator_profile::{
     CoordinatorResolutionDiagnostics, MemberOutcome, ResolutionSample, ResolutionStage,
@@ -62,7 +61,6 @@ pub use coordinator_profile::{CoordinatorResolutionSnapshot, CoordinatorResoluti
 mod durable_cut;
 pub use durable_cut::{DurableCutStats, RecoveredCut};
 mod pending_read;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use pending_read::ReadTraceChild;
 pub use pending_read::ReadTraceSnapshot;
 mod replay_limits;
@@ -335,7 +333,6 @@ impl RemoteDatabaseConfig {
                     "live owner identities must cover every partition",
                 ));
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             {
                 if self.storage.fragment_bytes >= 1 << 30 {
                     return Err(LocalDbError::new(
@@ -375,7 +372,6 @@ impl RemoteDatabaseConfig {
         }
         self.replay_limits.validate().map_err(LocalDbError::new)?;
         validate_owner_occupancy(self.owner_append_occupancy).map_err(LocalDbError::new)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self
             .live_nvme
             .leased_write_window
@@ -447,12 +443,6 @@ impl RemoteDatabaseConfig {
             ));
         }
         self.recovery_page_limit()?;
-        // Every remote database uses the leased live route.
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        return Err(LocalDbError::new(
-            "live NVMe-oF requires the Linux experimental-nvmeof feature",
-        ));
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         Ok(())
     }
 
@@ -744,12 +734,12 @@ type DependencyKey = SmallVec<[u8; 32]>;
 pub(crate) enum OpenInterruption {
     #[cfg(any(test, feature = "test-utils"))]
     AfterFences(usize),
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     AfterReadSetup,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     DuringReplay,
     /// After the durable-cut record is persisted, before the epoch activates.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     AfterCutRecord,
 }
 
@@ -1074,7 +1064,6 @@ pub struct RemoteDatabase {
 }
 
 impl RemoteDatabase {
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_nvmeof_stats(&self) -> Option<super::nvmeof::live_metrics::LiveNvmeStats> {
         self.core
             .live_metrics
@@ -1161,11 +1150,7 @@ impl RemoteDatabase {
     /// the fixture before any live I/O, so WAL replay during open and later
     /// reads of earlier files use it too. No kernel controller or physical NVMe
     /// device is qualified by this route.
-    #[cfg(all(
-        any(test, feature = "test-utils"),
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn open_with_local_live_fixture(
         path: &Path,
         shape: &KeyShape,
@@ -1208,7 +1193,7 @@ impl RemoteDatabase {
     /// Open with a hook over the read-lane clients and a read-only config clone
     /// before `ReadService::from_clients`. The write route, worker clients and
     /// manifest identity use the unmodified `config`.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn open_with_read_hook(
         path: &Path,
         shape: &KeyShape,
@@ -1231,18 +1216,14 @@ impl RemoteDatabase {
             interruption,
             #[cfg(test)]
             None,
-            #[cfg(all(
-                any(test, feature = "test-utils"),
-                feature = "experimental-nvmeof",
-                target_os = "linux"
-            ))]
+            #[cfg(any(test, feature = "test-utils"))]
             None,
         )
     }
 
     /// `open` over the unbuffered ordinary-file live I/O fixture (see
     /// `open_with_local_live_fixture`).
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn open_local_live_fixture(
         path: &Path,
         shape: &KeyShape,
@@ -1253,7 +1234,7 @@ impl RemoteDatabase {
 
     /// `open_inner` over the ordinary-file live I/O fixture (see
     /// `open_local_live_fixture`), with an optional injected interruption.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn open_inner_local_fixture(
         path: &Path,
         shape: &KeyShape,
@@ -1271,13 +1252,11 @@ impl RemoteDatabase {
         #[cfg(test)] read_hook: Option<ReadHook<'_>>,
         // `Some(buffered)` selects the ordinary-file live I/O fixture on every
         // client before any live I/O; `None` uses the real live route.
-        #[cfg(all(
-            any(test, feature = "test-utils"),
-            feature = "experimental-nvmeof",
-            target_os = "linux"
-        ))]
-        local_fixture: Option<bool>,
+        #[cfg(any(test, feature = "test-utils"))] local_fixture: Option<bool>,
     ) -> Result<Self, LocalDbError> {
+        if let Some(error) = super::sys::route_unavailable() {
+            return Err(LocalDbError::new(error));
+        }
         config.validate()?;
         config.validate_read_lane_pinning(config.effective_read_lanes())?;
         let mut index = NativeIndex::with_shards(
@@ -1362,7 +1341,6 @@ impl RemoteDatabase {
             .replay_limits
             .validate()
             .map_err(LocalDbError::new)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live_pool = {
             let registry = super::nvmeof::live_connect::LiveConnectionRegistry::open(
                 &path.join("live-nvme-connections"),
@@ -1381,11 +1359,9 @@ impl RemoteDatabase {
                     .map_err(LocalDbError::component)?,
             ))
         };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let mut live_open_guard = live_pool
             .as_ref()
             .map(|pool| transports::LivePoolOpenGuard::new(pool.clone(), config.timeout));
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live_metrics = Some(super::nvmeof::live_metrics::LiveNvmeMetrics::new());
         let mut recovery_stats = RecoveryStats::default();
         let tls_started = Instant::now();
@@ -1400,15 +1376,9 @@ impl RemoteDatabase {
             config.clone(),
             shape.clone(),
             tls_config.clone(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool.clone(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics.clone(),
-            #[cfg(all(
-                any(test, feature = "test-utils"),
-                feature = "experimental-nvmeof",
-                target_os = "linux"
-            ))]
+            #[cfg(any(test, feature = "test-utils"))]
             local_fixture,
         )?;
         let connected = transports::connect(
@@ -1416,15 +1386,9 @@ impl RemoteDatabase {
             &shape,
             &tls_config,
             1,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool.clone(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics.clone(),
-            #[cfg(all(
-                any(test, feature = "test-utils"),
-                feature = "experimental-nvmeof",
-                target_os = "linux"
-            ))]
+            #[cfg(any(test, feature = "test-utils"))]
             local_fixture,
         )?;
         recovery_stats.connection_setup_ns = connected.elapsed_ns;
@@ -1471,8 +1435,6 @@ impl RemoteDatabase {
         #[cfg(any(test, feature = "test-utils"))]
         let fence_count = fail_after_fences.unwrap_or(clients.len());
         let fenced = endpoint_map(&mut clients[..fence_count], |node, client| {
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            let _ = node;
             let status = client.fence_to(epoch).map_err(LocalDbError::component)?;
             if !status.healthy
                 || status.active_epoch != Some(epoch)
@@ -1483,7 +1445,6 @@ impl RemoteDatabase {
                     "node did not establish the complete fenced inventory",
                 ));
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             if let Some(metrics) = &live_metrics {
                 metrics.record_fence(super::nvmeof::live_metrics::LiveFenceEvidence {
                     partition: config.endpoints[node].partition,
@@ -1568,7 +1529,7 @@ impl RemoteDatabase {
             &mut positions,
             &mut cut_plan,
             &mut recovery_stats,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             interruption,
         )?;
         recovery_stats.cut_discarded_batches = cut_plan.discarded;
@@ -1667,7 +1628,7 @@ impl RemoteDatabase {
             &mut recovery_stats,
             first_failure.clone(),
         )?;
-        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+        #[cfg(test)]
         if matches!(interruption, Some(OpenInterruption::AfterReadSetup)) {
             return Err(LocalDbError::new("injected interruption after read setup"));
         }
@@ -1676,7 +1637,7 @@ impl RemoteDatabase {
         if let Some(record) = &cut_record {
             durable_cut::persist_open_record(&path, record)?;
         }
-        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+        #[cfg(test)]
         if matches!(interruption, Some(OpenInterruption::AfterCutRecord)) {
             return Err(LocalDbError::new("injected interruption after cut record"));
         }
@@ -1742,9 +1703,7 @@ impl RemoteDatabase {
             read_cache: Arc::new(ReadCache::new(config.read_cache_bytes)),
             write_profile,
             write_timeline,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics,
             inventory: config.inventory(epoch),
             config,
@@ -1803,7 +1762,6 @@ impl RemoteDatabase {
             database.core.commit_checkpoint()?;
             database.core.stats.lock().recovery.checkpoint_commit_ns = elapsed(started);
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(guard) = &mut live_open_guard {
             guard.disarm();
         }
@@ -2392,30 +2350,12 @@ impl Drop for RemoteDatabase {
 struct ReplayPage {
     batches: VecDeque<(CompleteBatch, DurableBatch)>,
     next: Option<usize>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     last: Option<BatchVersion>,
     position: StreamPosition,
     replayed_end: u64,
     replay_last: Option<(u64, u32)>,
 }
 
-/// WAL replay reads frames over live NVMe-oF only; configuration validation
-/// rejects a database before open where that route is not compiled.
-#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-fn fill_replay_page(
-    _client: &mut Client,
-    _state: &mut ReplayPage,
-    _epoch: u64,
-    _authority_epoch: u64,
-    _cursor: usize,
-    _limit: usize,
-) -> Result<(), LocalDbError> {
-    Err(LocalDbError::new(
-        "WAL replay requires the Linux experimental-nvmeof feature",
-    ))
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn fill_replay_page(
     client: &mut Client,
     state: &mut ReplayPage,
@@ -2491,9 +2431,7 @@ fn replay_history(
     positions: &mut BTreeMap<(u32, u64), StreamPosition>,
     cut: &mut durable_cut::RecoveryPlan,
     stats: &mut RecoveryStats,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))] interruption: Option<
-        OpenInterruption,
-    >,
+    #[cfg(test)] interruption: Option<OpenInterruption>,
 ) -> Result<(), LocalDbError> {
     let mut index = index.writer();
     let page_limit = config
@@ -2505,7 +2443,6 @@ fn replay_history(
             let mut page = ReplayPage {
                 batches: VecDeque::new(),
                 next: None,
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 last: None,
                 position: positions
                     .get(&(config.endpoints[node].partition, epoch))
@@ -2578,7 +2515,7 @@ fn replay_history(
                 known.insert(batch.id(), durable.appended());
                 stats.tail_batches += 1;
                 stats.tail_bytes += batch.encoded().len() as u64;
-                #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+                #[cfg(test)]
                 if matches!(interruption, Some(OpenInterruption::DuringReplay)) {
                     return Err(LocalDbError::new("injected interruption during WAL replay"));
                 }
@@ -3094,17 +3031,12 @@ fn trace_worker_dequeue(timeline: &WriteTimeline, partition: u32, command: &Work
 }
 #[derive(Clone)]
 struct ControlHandle {
-    #[cfg(any(
-        all(test, feature = "experimental-nvmeof", target_os = "linux"),
-        feature = "experimental-fabric"
-    ))]
+    #[cfg(any(test, feature = "experimental-fabric"))]
     client: Arc<Mutex<Client>>,
     sender: std::sync::Weak<OwnerSender>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     worker_wake: std::sync::Weak<std::os::fd::OwnedFd>,
 }
 impl ControlHandle {
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn wake_worker(&self) -> Result<(), LocalDbError> {
         let fd = self
             .worker_wake
@@ -3119,7 +3051,6 @@ impl ControlHandle {
             .upgrade()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
             .send(Command::OwnerTimelineArm(limit, reply))?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.wake_worker()?;
         receive(pending)
     }
@@ -3135,7 +3066,6 @@ impl ControlHandle {
             .upgrade()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
             .send(command)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.wake_worker()?;
         receive(pending)
     }
@@ -3155,21 +3085,18 @@ impl ControlHandle {
             .upgrade()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?;
         sender.send_until(command, deadline)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.wake_worker()?;
         pending
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|_| LocalDbError::new("owner timeline control deadline expired"))?
     }
 }
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type LeasedMembers = Vec<(BatchVersion, usize, GroupCompletion)>;
 
 /// Releases leased receipts to their callers in frame order. Each released
 /// frame is one harvested completion: its receipts enter W3
 /// (`HarvestToDurable`) here and leave it in `WriteCore::on_durable`, which
 /// runs on this worker inside `reply.send`, so the handoff never needs a hint.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn release_leased_replies(
     released: &mut Vec<(u64, Vec<DurableBatch>)>,
     replies: &mut VecDeque<(u64, LeasedMembers)>,
@@ -3202,7 +3129,6 @@ fn release_leased_replies(
 /// write-profile arm and capture): drains the frames in flight and the pending
 /// adoption, then releases their receipts in frame order. Commands use
 /// `prepare_leased_command` for the same step.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn settle_leased_for_control(
     client: &mut Client,
     released: &mut Vec<(u64, Vec<DurableBatch>)>,
@@ -3220,7 +3146,6 @@ fn settle_leased_for_control(
 /// flight, else the frame deferred before submission. A transport failure
 /// leaves the outcome of every such frame unknown, so a failure record names
 /// this version as its uncertain version.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn first_unresolved_leased(
     replies: &VecDeque<(u64, LeasedMembers)>,
     deferred: Option<&LeasedMembers>,
@@ -3233,7 +3158,6 @@ fn first_unresolved_leased(
         .map(|(version, _, _)| *version)
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn signal_worker_wake(fd: &std::os::fd::OwnedFd) -> Result<(), LocalDbError> {
     use std::os::fd::AsRawFd;
     let value = 1u64;
@@ -3251,26 +3175,21 @@ fn signal_worker_wake(fd: &std::os::fd::OwnedFd) -> Result<(), LocalDbError> {
 }
 
 struct ClientWorker {
-    #[cfg(any(
-        feature = "experimental-fabric",
-        all(feature = "experimental-nvmeof", target_os = "linux")
-    ))]
     client: Arc<Mutex<Client>>,
     sender: Option<Arc<OwnerSender>>,
     /// The worker owns this fd. Command senders and CQEs add to its counter.
     /// The worker reads it after poll; drop closes it after the queue stops.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     worker_wake: Arc<std::os::fd::OwnedFd>,
     thread: Mutex<Option<JoinHandle<()>>>,
     queue: Arc<OwnerQueue>,
     accounting: Arc<WorkerAccounting>,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     failure: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     partition: u32,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     test_completion: Option<Arc<write_core::test_completion::TestCompletion>>,
 }
 struct WorkerDiagnostics {
@@ -3285,13 +3204,9 @@ struct WorkerDiagnostics {
 impl ClientWorker {
     fn control_handle(&self) -> ControlHandle {
         ControlHandle {
-            #[cfg(any(
-                all(test, feature = "experimental-nvmeof", target_os = "linux"),
-                feature = "experimental-fabric"
-            ))]
+            #[cfg(any(test, feature = "experimental-fabric"))]
             client: self.client.clone(),
             sender: self.sender.as_ref().map(Arc::downgrade).unwrap_or_default(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             worker_wake: Arc::downgrade(&self.worker_wake),
         }
     }
@@ -3308,11 +3223,10 @@ impl ClientWorker {
             .as_ref()
             .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
             .send(command)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         signal_worker_wake(&self.worker_wake)?;
         Ok(())
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn enqueue_batch(&self, batch: CompleteBatch) -> Result<(), LocalDbError> {
         if self.failure.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LocalDbError::unknown(
@@ -3336,13 +3250,12 @@ impl ClientWorker {
                     return Err(LocalDbError::new("TCP worker lost queue wake"));
                 }
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             signal_worker_wake(&self.worker_wake)?;
         }
         Ok(())
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn enqueue(
         &self,
         epoch: u64,
@@ -3414,7 +3327,6 @@ impl ClientWorker {
             let result = worker
                 .join()
                 .map_err(|_| LocalDbError::new("TCP worker panicked during shutdown"));
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             self.client.lock().clear_worker_wake();
             result?;
         }
@@ -3435,11 +3347,11 @@ fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod leased_tests;
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod live_bench_tests;
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod position_tests;
 
 #[cfg(test)]

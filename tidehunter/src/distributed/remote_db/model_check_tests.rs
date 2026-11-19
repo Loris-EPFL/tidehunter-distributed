@@ -8,7 +8,6 @@
 //! gates follow a seed-selected acknowledged prefix, never a count of physical
 //! writes/flushes. Every failure retains its exact history, gate and boundary
 //! trace.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::pipeline_tests::{Fixture, open_live_node};
 use super::*;
 use crate::failpoints::write_model;

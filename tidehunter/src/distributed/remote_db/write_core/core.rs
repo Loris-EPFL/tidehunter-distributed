@@ -149,9 +149,7 @@ pub(in crate::distributed::remote_db) struct OpenState {
     pub write_timeline: Arc<WriteTimeline>,
     pub clients: Vec<super::super::ClientWorker>,
     pub durable_cut: Option<super::super::durable_cut::DurableCut>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     pub publisher: PublisherState,
     pub stats: CoreStats,
@@ -212,9 +210,7 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub clients: Vec<super::super::ClientWorker>,
     /// Present when this epoch is tracked under durable-prefix recovery.
     pub durable_cut: Option<super::super::durable_cut::DurableCut>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     #[cfg(test)]
     pub test_hooks: Mutex<TestHooks>,
@@ -288,9 +284,7 @@ impl WriteCore {
             owner_controls,
             clients: open.clients,
             durable_cut: open.durable_cut,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool: open.live_pool,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics: open.live_metrics,
             #[cfg(test)]
             test_hooks: Mutex::new(TestHooks::default()),
@@ -365,7 +359,6 @@ impl WriteCore {
                 return Err(LocalDbError::new("TCP worker stopped"));
             }
         };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         handle.wake_worker()?;
         Ok(coalesced)
     }
@@ -390,7 +383,7 @@ impl WriteCore {
     }
 
     /// Retained operation identities of every class (Active, Suffix, Recent).
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn resident_identities(&self) -> usize {
         [
             IdentityClass::Active,
@@ -413,7 +406,7 @@ impl WriteCore {
     /// registries shrink a shard above four slots per entry), so the shard sums
     /// add at most 12 slots per shard. A `VecDeque` at most doubles past its
     /// peak length or its initial window capacity.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn metadata_history_bound(&self) -> usize {
         let window = super::super::WAL_REPLAY_WINDOW_BATCHES;
         let admitted = self.config.max_admitted_batches;
@@ -714,7 +707,6 @@ impl WriteCore {
         for (_, owner) in &self.owner_controls {
             if let Some(sender) = owner.sender.upgrade() {
                 let _ = sender.try_send(super::super::Command::QueueReady);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let _ = owner.wake_worker();
             }
         }
@@ -728,7 +720,7 @@ impl WriteCore {
 
 /// Exact test observations of the shared write state. Each helper takes at
 /// most one lock at a time and never holds it across another call.
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 impl WriteCore {
     /// True when this epoch's version is published in its live slot, or has
     /// left the ring below the published floor (aborts are not distinguished
@@ -856,7 +848,7 @@ impl WriteCore {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::distributed::remote_db::pipeline_tests::Fixture;

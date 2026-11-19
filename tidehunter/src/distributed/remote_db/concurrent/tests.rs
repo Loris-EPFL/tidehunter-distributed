@@ -1,6 +1,5 @@
 //! Real five-node mTLS/Value-WAL regressions. Holding the existing authenticated
 //! control stream mutex pauses append actors, not a mock storage implementation.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::super::pipeline_tests::Fixture;
 use super::*;
 

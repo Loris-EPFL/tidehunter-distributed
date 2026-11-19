@@ -158,17 +158,17 @@ impl IdentityTable {
     }
 
     /// Bytes per resident slot, as charged by `resident_bytes`.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) const fn entry_bytes() -> usize {
         std::mem::size_of::<([u8; 16], IdentityEntry)>()
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn count(&self, class: IdentityClass) -> usize {
         self.shards
             .iter()

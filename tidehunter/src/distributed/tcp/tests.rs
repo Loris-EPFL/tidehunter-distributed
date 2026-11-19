@@ -153,13 +153,8 @@ fn static_node_validation_opens_no_runtime_resources() {
         commissioning_port_id: 43,
         commissioning_service: 4421,
     });
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    {
-        assert!(config.validate().is_ok());
-        config.live_target.as_mut().unwrap().commissioning_port_id = 42;
-        assert!(config.validate().is_err());
-    }
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+    assert!(config.validate().is_ok());
+    config.live_target.as_mut().unwrap().commissioning_port_id = 42;
     assert!(config.validate().is_err());
     assert!(!config.root.exists());
     assert!(!config.live_target.unwrap().state_dir.exists());
@@ -194,30 +189,23 @@ fn owner_launch_target_rejects_removed_export_keys() {
     }
 }
 
-#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+/// Compiled and run only off Linux; on this Linux workstation it is checked by
+/// `cargo check --tests --target x86_64-apple-darwin` and never executed.
+#[cfg(not(target_os = "linux"))]
 #[test]
-fn unsupported_live_target_is_rejected_before_node_creation() {
-    let temp = tempdir::TempDir::new("unsupported-live-target").unwrap();
-    let mut config = config(&temp.path().join("node"));
-    config.live_target = Some(crate::distributed::nvmeof::LiveTargetConfig {
-        address: "127.0.0.1".into(),
-        service: 4420,
-        transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
-        host_nqn: "nqn.2026-01.test:host".into(),
-        port_id: 42,
-        state_dir: temp.path().join("target"),
-        commissioning_port_id: 43,
-        commissioning_service: 4421,
-    });
-    let serialized = serde_yaml::to_string(&config).unwrap();
-    let parsed: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
-    assert_eq!(parsed.live_target, config.live_target);
-    let error = match StorageNode::open(parsed, metrics()) {
-        Ok(_) => panic!("unsupported target was accepted"),
-        Err(error) => error,
+fn owner_open_off_linux_fails_with_named_error() {
+    let temp = tempdir::TempDir::new("owner-open-off-linux").unwrap();
+    let config = config(&temp.path().join("node"));
+    let root = config.root.clone();
+    let Err(error) = StorageNode::open(config, metrics()) else {
+        panic!("owner open succeeded off Linux");
     };
-    assert!(error.to_string().contains("requires experimental-nvmeof"));
-    assert!(!config.root.exists());
+    let expected = format!(
+        "distributed route requires Linux (leased NVMe-oF): {}",
+        std::env::consts::OS
+    );
+    assert!(error.to_string().contains(&expected), "{error}");
+    assert!(!root.exists(), "the refused open must not create its root");
 }
 
 #[test]

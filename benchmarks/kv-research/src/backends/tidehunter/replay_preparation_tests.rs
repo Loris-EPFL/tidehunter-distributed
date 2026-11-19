@@ -1,5 +1,4 @@
 // Preparation always emits leased live NVMe-oF configurations, which need the feature.
-#![cfg(all(feature = "nvmeof", target_os = "linux"))]
 
 use super::*;
 use blake2::{Blake2b512, Digest};

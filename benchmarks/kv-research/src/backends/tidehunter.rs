@@ -1,7 +1,5 @@
 // Reuse the engine's existing harness unchanged, including its explicit startup sequences.
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
 mod live_qualification;
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
 mod live_write_profile;
 pub mod replay;
 #[allow(clippy::too_many_lines)]
@@ -10,11 +8,9 @@ pub mod replay;
 #[path = "../../../../tidehunter/examples/support/tcp_cluster.rs"]
 mod tcp_cluster;
 
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
 pub fn qualify_live_nvmeof(input: &Path, output: &Path) -> BackendResult<()> {
     live_qualification::run(input, output)
 }
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
 pub fn qualify_live_nvmeof_child(input: &Path, ready: &Path) -> BackendResult<()> {
     live_qualification::run_abrupt_child(input, ready)
 }
@@ -25,7 +21,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 // Only the Linux live-route boundary snapshot waits with a timeout.
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
 use std::time::Duration;
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, ReplayLimits};
@@ -322,12 +317,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         return Err("invalid owner WAL file size override".into());
     }
     let live = &input.live_nvmeof;
-    if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
-        return Err(format!(
-            "live NVMe-oF preparation (inline_reads={}, lease_ahead={}, polled_writes={}) requires Linux and the nvmeof feature",
-            live.inline_reads, live.lease_ahead, live.polled_writes
-        ).into());
-    }
     live.queue_geometry.validate()?;
     if live.queue_geometry.poll_queues > 0 && !live.inline_reads {
         return Err("polled live reads require inline reads".into());
@@ -632,7 +621,6 @@ pub struct TidehunterBackend {
     effective_configuration: serde_json::Value,
     read_evidence_written: bool,
     coordinator_interval_baseline: std::sync::Mutex<Option<BTreeMap<&'static str, u64>>>,
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     live_write_profile: std::sync::Mutex<Option<live_write_profile::Window>>,
 }
 
@@ -663,9 +651,6 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
         return Err(
             format!("{name} owner append occupancy exceeds the reserved-control window").into(),
         );
-    }
-    if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
-        return Err("live NVMe-oF requires the Linux nvmeof benchmark feature".into());
     }
     if options.path.as_os_str().is_empty()
         || options
@@ -998,12 +983,9 @@ async fn open_with_shape(
         .ok_or("empty distributed key shape")?
         .id();
     let db = sui::Db::open_remote(&coordinator_path, shape, remote_config).map_err(native_error)?;
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     if db.live_nvmeof_stats().is_some() {
         db.register_nvmeof_metrics(registry).map_err(native_error)?;
     }
-    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-    let _ = registry;
     #[cfg(feature = "fabric")]
     {
         effective_configuration["fabric_provider_evidence"] =
@@ -1057,13 +1039,11 @@ async fn open_with_shape(
         read_evidence_written: false,
         owner_sample_gate: OwnerSampleGate::default(),
         coordinator_interval_baseline: std::sync::Mutex::new(None),
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         live_write_profile: std::sync::Mutex::new(None),
     })
 }
 
 impl TidehunterBackend {
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     fn live_boundary_snapshot(
         &self,
         db: &sui::Db,
@@ -1104,10 +1084,7 @@ impl TidehunterBackend {
                 })
             })
         });
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         let live_nvmeof = self.db.as_ref().and_then(|db| db.live_nvmeof_stats());
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        let live_nvmeof: Option<serde_json::Value> = None;
         let evidence = serde_json::json!({
             "schema_version": 1,
             "backend": self.backend_name,
@@ -1179,10 +1156,7 @@ impl KvBackend for TidehunterBackend {
 
     fn read_observation(&self) -> BackendResult<serde_json::Value> {
         let db = self.db.as_ref().ok_or("backend is shutting down")?;
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         let live_nvmeof = self.live_boundary_snapshot(db)?;
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        let live_nvmeof: Option<serde_json::Value> = None;
         let mut coordinator = db.remote_counters().map(|(cache, _, rpc)| serde_json::json!({
             "read_rpc_count": rpc,
             "hits": cache.hits, "misses": cache.misses, "inserts": cache.inserts,
@@ -1544,7 +1518,6 @@ impl KvBackend for TidehunterBackend {
             .db
             .as_ref()
             .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         if self.backend_name == "tidehunter_live_nvmeof" {
             let window = live_write_profile::Window::arm(limit, self.live_boundary_snapshot(db)?)?;
             *self
@@ -1554,8 +1527,6 @@ impl KvBackend for TidehunterBackend {
         } else {
             db.arm_write_profile(limit).map_err(native_error)?;
         }
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        db.arm_write_profile(limit).map_err(native_error)?;
         let baseline = coordinator_counter_snapshot(db);
         *self
             .coordinator_interval_baseline
@@ -1569,7 +1540,6 @@ impl KvBackend for TidehunterBackend {
             .db
             .as_ref()
             .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         if self.backend_name == "tidehunter_live_nvmeof" {
             let stats = self.live_boundary_snapshot(db)?;
             self.live_write_profile
@@ -1611,7 +1581,6 @@ impl KvBackend for TidehunterBackend {
             },
             Err(_) => Err("coordinator interval baseline lock poisoned".to_owned()),
         };
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         if self.backend_name == "tidehunter_live_nvmeof" {
             let window = self
                 .live_write_profile
@@ -2044,7 +2013,6 @@ mod tests {
         assert_eq!(OwnerWalGeometry::from_layout(4096, 8192), None);
     }
 
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn external_preparation_launches_leased_owners_and_rejects_removed_keys() {
         let root = std::env::temp_dir().join(format!(
@@ -2100,36 +2068,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-    #[test]
-    fn external_preparation_requires_the_nvmeof_feature() {
-        let root = std::env::temp_dir().join(format!(
-            "kv-external-no-nvmeof-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
-        let input = root.join("input.json");
-        let config = serde_json::json!({
-            "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
-            "transport": {"kind": "tcp"}, "max_batches_per_partition": 16384,
-            "max_admitted_batches": 16384, "max_index_bytes": 536870912,
-            "coordinator_cache_bytes": 0,
-            "owner_wal_member_read": "async", "polling": "adaptive",
-            "live_nvmeof": test_live_nvmeof(1)
-        });
-        fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
-        let output = root.join("unavailable");
-        let error = prepare_external_case_file(&input, &output).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires Linux and the nvmeof feature")
-        );
-        assert!(!output.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[test]
     fn backends_require_external_remote_config() {
         let error = validate_options(&serde_json::json!({
@@ -2139,7 +2077,6 @@ mod tests {
         assert!(error.to_string().contains("require external_remote_config"));
     }
 
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn external_preparation_selects_owner_wal_geometry() {
         let root = std::env::temp_dir().join(format!(
@@ -2226,7 +2163,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn external_preparation_rejects_invalid_owner_file_sizes() {
         let root = std::env::temp_dir().join(format!("kv-invalid-wal-{}", rand::random::<u64>()));
@@ -2314,7 +2250,7 @@ mod tests {
         assert_eq!(live.leased_flush_min_frame_bytes, 65536);
     }
 
-    #[cfg(all(feature = "fabric", feature = "nvmeof", target_os = "linux"))]
+    #[cfg(feature = "fabric")]
     #[test]
     fn controller_live_input_preserves_write_settings_and_owner_documents() {
         let root = std::env::temp_dir().join(format!(
@@ -2361,7 +2297,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn external_coordinator_cache_requires_explicit_adequate_allowance() {
         let root = std::env::temp_dir().join(format!(

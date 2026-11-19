@@ -591,7 +591,6 @@ impl Remote {
 impl Db {
     /// Live payload counters and verified namespace evidence, not configuration
     /// intent. Returns `None` when this database does not use live NVMe-oF.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_nvmeof_stats(&self) -> Option<super::nvmeof::live_metrics::LiveNvmeStats> {
         match &self.backend {
             Backend::Remote(remote) => remote.db.live_nvmeof_stats(),
@@ -618,7 +617,6 @@ impl Db {
 
     /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
     /// live target's exported namespaces and is not a reopen operation.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn shutdown_live_target_final(
         self: Arc<Self>,
     ) -> Result<super::remote_db::LiveFinalShutdownEvidence> {
@@ -630,7 +628,6 @@ impl Db {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn register_nvmeof_metrics(&self, registry: &prometheus::Registry) -> Result<()> {
         match &self.backend {
             Backend::Remote(remote) => remote.db.register_nvmeof_metrics(registry).map_err(error),
@@ -671,11 +668,7 @@ impl Db {
     /// Ordinary-file live I/O fixture only; never a hardware qualification route.
     /// The fixture is selected before open replays the live WAL, so reopening a
     /// nonempty database never touches the real route.
-    #[cfg(all(
-        feature = "test-utils",
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
+    #[cfg(feature = "test-utils")]
     pub fn open_remote_with_local_live_fixture(
         path: &Path,
         shape: KeyShape,
@@ -688,11 +681,7 @@ impl Db {
     }
     /// `open_remote` over the unbuffered ordinary-file live I/O fixture;
     /// never a hardware qualification route.
-    #[cfg(all(
-        any(test, feature = "test-utils"),
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn open_remote_local_fixture(
         path: &Path,
         shape: KeyShape,
@@ -712,6 +701,10 @@ impl Db {
             RemoteDatabaseConfig,
         ) -> std::result::Result<RemoteDatabase, super::storage::LocalDbError>,
     ) -> Result<Arc<Self>> {
+        // Before capture: a refused open must not create capture files.
+        if let Some(unavailable) = super::sys::route_unavailable() {
+            return Err(error(unavailable));
+        }
         let timeout = config.timeout;
         let batch_limits = config.storage.batch_limits;
         let capture_id =
@@ -1477,14 +1470,14 @@ impl Db {
             _ => None,
         }
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn remote_for_test(&self) -> &ConcurrentRemoteDatabase {
         match &self.backend {
             Backend::Remote(remote) => &remote.db,
             Backend::Native(_) => panic!("test requires the remote backend"),
         }
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn shared_write_gate_for_test(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
         self.writes.read()
     }

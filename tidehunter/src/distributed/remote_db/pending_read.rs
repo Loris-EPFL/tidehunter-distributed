@@ -22,11 +22,9 @@ struct PlannedMember {
 }
 #[cfg(test)]
 mod kv_capture_tests;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_inline;
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod live_inline_tests;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_lane;
 mod read_trace;
 
@@ -483,7 +481,6 @@ read_diagnostics!(
     live_inline_fallback_coalesced,
 );
 impl ReadDiagnostics {
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn inline_complete(&self, elapsed_ns: u64) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.inline_completed.fetch_add(1, Ordering::Relaxed);
@@ -687,30 +684,25 @@ impl FlightSignal {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 type ReactorPause = Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>;
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type UnreleasedLiveGrant = (Arc<Mutex<Client>>, u64, Vec<[u8; 16]>);
 
 struct State {
     failed: AtomicBool,
     first_failure: Arc<std::sync::OnceLock<super::FirstFailure>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_inline_reads: bool,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pin_read_lanes: bool,
     /// Drain commands accepted by live workers and not yet completed.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_drains: AtomicUsize,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_unreleased: Mutex<Vec<UnreleasedLiveGrant>>,
     stopped: AtomicBool,
     retained: Mutex<(usize, usize)>,
     admission_paused: AtomicBool,
     admission_generation: AtomicU64,
     admission_changed: parking_lot::Condvar,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     wake_pending: Box<[AtomicBool]>,
     // Fixed flight signals, weak slots and exact-reference index are reserved from pending bytes.
     flight_ready: Box<[FlightSignal]>,
@@ -722,17 +714,17 @@ struct State {
     flights: Mutex<FlightRegistry>,
     coalesced_members: AtomicU64,
     flight_metadata_bytes: usize,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     inline_mutex_fallbacks: AtomicUsize,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     inline_result_copies: AtomicUsize,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     inline_retirement_pause: ReactorPause,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     inline_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     #[cfg(test)]
     completion_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     reactor_pause: Box<[ReactorPause]>,
 }
 
@@ -777,9 +769,7 @@ impl Drop for Credit {
         self.state.admission_changed.notify_all();
     }
 }
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) struct AdmissionPause(Arc<State>);
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl Drop for AdmissionPause {
     fn drop(&mut self) {
         let _retained = self.0.retained.lock();
@@ -794,9 +784,7 @@ impl Drop for AdmissionPause {
 struct LaneScheduling {
     inline_reserved: bool,
 }
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct InlineLaneReservation(Arc<Mutex<LaneScheduling>>);
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl Drop for InlineLaneReservation {
     fn drop(&mut self) {
         self.0.lock().inline_reserved = false;
@@ -812,11 +800,8 @@ impl Drop for LaneCredit {
     }
 }
 struct Request {
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     lane: usize,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     references: Vec<ValueRecordReference>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     deadline: Instant,
     submitted: Option<Instant>,
     sampled: bool,
@@ -828,13 +813,11 @@ struct Request {
 enum ReadCommand {
     Request(Request),
     /// Test barrier: the actor clears `wake_pending[node]` when it takes this.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     Wake,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     DrainLive(mpsc::SyncSender<Result<(), String>>),
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 enum LiveLaneCommand {
     Request(Request),
     Drain(mpsc::SyncSender<Result<(), String>>),
@@ -933,12 +916,10 @@ struct Lane {
     client: Arc<Mutex<Client>>,
     outstanding: Arc<AtomicUsize>,
     scheduling: Arc<Mutex<LaneScheduling>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     driver: Arc<Mutex<ReactorLane>>,
 }
 // Live processing takes `driver` before `client`. Callers try both locks;
 // the live endpoint actor uses neither, so one inline I/O cannot stall it.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct ReactorLane {
     /// Endpoint whose reactor drives this lane; tests pause that reactor.
     #[cfg(test)]
@@ -946,13 +927,11 @@ struct ReactorLane {
     live_cache: Option<super::super::tcp::live_read::LiveReadCache>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct ReadLanePlacement {
     device: std::io::Result<PathBuf>,
     counters: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeCounters>>,
 }
 /// Affinity is a best-effort placement hint, never part of read correctness.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn pin_live_read_lane(placement: Option<ReadLanePlacement>, lane: usize) {
     let Some(ReadLanePlacement { device, counters }) = placement else {
         return;
@@ -969,7 +948,7 @@ fn pin_live_read_lane(placement: Option<ReadLanePlacement>, lane: usize) {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 #[test]
 fn live_read_lane_pin_failure_is_counted_without_failing_the_read() {
     let temp = tempdir::TempDir::new("read-lane-pin-failure").unwrap();
@@ -987,7 +966,6 @@ fn live_read_lane_pin_failure_is_counted_without_failing_the_read() {
 
 // Live control and CQ waits must not occupy the shared multi-lane reactor.
 // Global flight credits bound all channel entries, including these lane queues.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn drive_live_reads(
     state: Arc<State>,
     receiver: mpsc::Receiver<ReadCommand>,
@@ -1211,7 +1189,7 @@ fn drive_live_reads(
                     lane.pending.push_back((Instant::now(), request));
                 }
             }
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             ReadCommand::Wake => state.wake_pending[node].store(false, Ordering::Release),
             ReadCommand::DrainLive(reply) => {
                 for lane in &inboxes {
@@ -1238,21 +1216,6 @@ fn drive_live_reads(
     }
 }
 
-/// Remote values are read only over live NVMe-oF. Without that route the
-/// actor fails every request; configuration validation already rejects such a
-/// database before open.
-#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-fn drive_reads(state: Arc<State>, receiver: mpsc::Receiver<ReadCommand>) {
-    let _poison = PoisonOnPanic(&state);
-    while let Ok(command) = receiver.recv() {
-        match command {
-            ReadCommand::Request(request) => request.complete_nvme(Err(LocalDbError::new(
-                "remote reads require the Linux experimental-nvmeof feature",
-            ))),
-        }
-    }
-}
-
 pub(super) struct ReadService {
     state: Arc<State>,
     lanes: RwLock<Vec<Vec<Lane>>>,
@@ -1262,7 +1225,7 @@ pub(super) struct ReadService {
     max_requests: usize,
     max_bytes: usize,
     timeout: Duration,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     epoch: u64,
     /// Test-only override of `max_bytes`; `usize::MAX` means none. Relaxed:
     /// a knob read on admission, set by the test thread between operations.
@@ -1272,7 +1235,7 @@ pub(super) struct ReadService {
     #[cfg(test)]
     test_timeout_ns: AtomicU64,
     /// Test-only override of `live_inline_reads`: 0 none, 1 off, 2 on.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     test_inline_reads: std::sync::atomic::AtomicU8,
 }
 impl ReadService {
@@ -1298,11 +1261,11 @@ impl ReadService {
             nanos => Duration::from_nanos(nanos),
         }
     }
-    #[cfg(all(not(test), feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(not(test))]
     fn live_inline_reads(&self) -> bool {
         self.state.live_inline_reads
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn live_inline_reads(&self) -> bool {
         match self.test_inline_reads.load(Ordering::Relaxed) {
             0 => self.state.live_inline_reads,
@@ -1311,13 +1274,13 @@ impl ReadService {
     }
     /// Switch the immutable live inline-read policy for later reads, in place
     /// on the same lanes and dataset (tests only).
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn set_inline_reads_for_test(&self, inline_reads: bool) {
         self.test_inline_reads
             .store(if inline_reads { 2 } else { 1 }, Ordering::Relaxed);
     }
     /// Replace the immutable read limits for later admissions (tests only).
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn set_limits_for_test(&self, max_bytes: Option<usize>, timeout: Option<Duration>) {
         if let Some(bytes) = max_bytes {
             assert_ne!(bytes, usize::MAX);
@@ -1487,8 +1450,6 @@ impl ReadService {
         recovery_stats: &mut RecoveryStats,
         first_failure: Arc<std::sync::OnceLock<super::FirstFailure>>,
     ) -> Result<Self, LocalDbError> {
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let _ = epoch;
         let index_capacity = (config.max_pending_read_bytes
             - std::mem::size_of::<FlightRegistry>()
             - Self::FLIGHT_SLOT_BYTES
@@ -1506,20 +1467,16 @@ impl ReadService {
         let state = Arc::new(State {
             failed: AtomicBool::new(false),
             first_failure,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             pin_read_lanes: config.pin_read_lanes,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_inline_reads: config.live_nvme.inline_reads,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_drains: AtomicUsize::new(0),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_unreleased: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             retained: Mutex::new((0, 0)),
             admission_paused: AtomicBool::new(false),
             admission_generation: AtomicU64::new(0),
             admission_changed: parking_lot::Condvar::new(),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             wake_pending: (0..config.endpoints.len())
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
@@ -1541,17 +1498,17 @@ impl ReadService {
             flights: Mutex::new(FlightRegistry::new(flight_slots, index_capacity)),
             coalesced_members: AtomicU64::new(0),
             flight_metadata_bytes,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             inline_mutex_fallbacks: AtomicUsize::new(0),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             inline_result_copies: AtomicUsize::new(0),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             inline_retirement_pause: Mutex::new(None),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             inline_pause: Mutex::new(None),
             #[cfg(test)]
             completion_pause: Mutex::new(None),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             reactor_pause: (0..config.endpoints.len())
                 .map(|_| Mutex::new(None))
                 .collect::<Vec<_>>()
@@ -1570,13 +1527,13 @@ impl ReadService {
                 .max_pending_read_bytes
                 .saturating_sub(flight_metadata_bytes),
             timeout: config.timeout,
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             epoch,
             #[cfg(test)]
             test_max_bytes: AtomicUsize::new(usize::MAX),
             #[cfg(test)]
             test_timeout_ns: AtomicU64::new(u64::MAX),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             test_inline_reads: std::sync::atomic::AtomicU8::new(0),
         };
         let mut clients = clients.into_iter();
@@ -1592,7 +1549,6 @@ impl ReadService {
                 let scheduling = Arc::new(Mutex::new(LaneScheduling {
                     inline_reserved: false,
                 }));
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let driver = Arc::new(Mutex::new(ReactorLane {
                     #[cfg(test)]
                     node,
@@ -1603,7 +1559,6 @@ impl ReadService {
                     client,
                     outstanding: Arc::new(AtomicUsize::new(0)),
                     scheduling,
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     driver,
                 };
                 lanes.push(lane);
@@ -1617,10 +1572,7 @@ impl ReadService {
             let thread = thread::Builder::new()
                 .name(format!("wal-read-reactor-{node}"))
                 .spawn(move || {
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     drive_live_reads(state, receiver, lanes, node, base, epoch, flight_slots);
-                    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                    drive_reads(state, receiver);
                 });
             match thread {
                 Ok(thread) => {
@@ -1632,7 +1584,6 @@ impl ReadService {
         }
         Ok(service)
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn pause_idle_nvmeof(&self, allow_failed: bool) -> Result<AdmissionPause, LocalDbError> {
         let retained = self.state.retained.lock();
         if (!allow_failed && self.failed()) || self.state.stopped.load(Ordering::Acquire) {
@@ -1654,7 +1605,6 @@ impl ReadService {
     /// Pause new admissions and retire every lane's cached live file grants.
     /// Outstanding callers receive an explicit retryable error instead of
     /// relinquishing their read/cut pins on their behalf.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn pause_live_for_retirement(&self) -> Result<AdmissionPause, LocalDbError> {
         let pause = self.pause_idle_nvmeof(false)?;
         let lanes = self.lanes.read().iter().map(Vec::len).sum::<usize>();
@@ -1717,7 +1667,7 @@ impl ReadService {
     pub(super) fn failed(&self) -> bool {
         self.state.failed.load(Ordering::Acquire)
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn lane_client(&self, node: usize, lane: usize) -> Arc<Mutex<Client>> {
         self.lanes.read()[node][lane].client.clone()
     }
@@ -1822,11 +1772,6 @@ impl ReadService {
         self.read_inline_traced(node, epoch, reference, extra_bytes, pin, None)
     }
 
-    // Only the live route reads inline; elsewhere the caller uses the actor.
-    #[cfg_attr(
-        not(all(feature = "experimental-nvmeof", target_os = "linux")),
-        allow(unused_variables)
-    )]
     fn read_inline_traced(
         &self,
         node: usize,
@@ -1839,7 +1784,6 @@ impl ReadService {
         if self.failed() || self.state.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new("read authority is poisoned or closed"));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.live_inline_reads() {
             return self.read_live_inline(node, epoch, reference, extra_bytes, pin, trace);
         }
@@ -2051,11 +1995,8 @@ impl ReadService {
             });
             flights.insert(&flight);
             let request = Request {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 lane: lane.index,
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 references: missing,
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 deadline,
                 submitted: (profiled || sampled).then(Instant::now),
                 sampled,
@@ -2112,7 +2053,6 @@ impl ReadService {
             }
             // One remote value request handed to the live lane worker. Relaxed:
             // a diagnostic count; no data is published through it.
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
             Some(flight)
         } else {
@@ -2702,7 +2642,7 @@ mod concurrent;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod live_worker_tests {
     use super::*;
     use crate::distributed::remote_db::pipeline_tests::Fixture;

@@ -1,7 +1,6 @@
 //! Durable-prefix recovery against real loopback owners. A coordinator crash is
 //! a shutdown without its checkpoint: owners keep every appended batch, and the
 //! reopen fence syncs them, so only the cut decides what recovery keeps.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::durable_cut::RECORD;
 use super::pipeline_tests::Fixture;

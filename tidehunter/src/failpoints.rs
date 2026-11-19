@@ -62,27 +62,22 @@ impl FailPoint {
 #[cfg(all(test, feature = "experimental-distributed"))]
 pub(crate) mod write_model {
     use std::fs::File;
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
     pub(crate) const CRASH_EXIT: i32 = 86;
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    #[cfg(feature = "experimental-nvmeof")]
     static FLUSH_SUBMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     struct State {
         trace: File,
         target: String,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         acknowledged: usize,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         after_acks: usize,
         enabled: bool,
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn arm(trace: &std::path::Path, target: String, after_acks: usize) {
         assert!(after_acks >= 7);
         assert!(
@@ -102,7 +97,6 @@ pub(crate) mod write_model {
         );
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn acknowledged() {
         if let Some(state) = STATE.get() {
             state.lock().unwrap().acknowledged += 1;
@@ -111,7 +105,6 @@ pub(crate) mod write_model {
 
     /// Enable only at a quiescent, seed-selected acknowledged prefix. Physical
     /// grouping and background sync counts cannot move or remove this gate.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn open_gate() {
         let mut state = STATE.get().unwrap().lock().unwrap();
         assert_eq!(state.acknowledged, state.after_acks);
@@ -120,7 +113,6 @@ pub(crate) mod write_model {
         state.enabled = true;
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn submitted(write: bool, flush: bool) {
         if flush {
             // Relaxed: this is an independent test observation, not a hand-off.
@@ -135,13 +127,11 @@ pub(crate) mod write_model {
         }
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn flush_submissions() -> u64 {
         // Relaxed: callers observe this after draining their own I/O.
         FLUSH_SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn adoption(actual: bool, submitted: bool) {
         if actual {
             boundary(if submitted {

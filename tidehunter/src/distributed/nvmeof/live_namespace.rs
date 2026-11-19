@@ -1,6 +1,7 @@
 //! Verified Linux live namespaces. Control-plane authentication and lease lifetime
 //! remain the caller's responsibility; a device identity is not an authority grant.
 use super::NvmeofTransport;
+use crate::distributed::sys;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -168,7 +169,7 @@ impl LiveNamespace {
         OpenOptions::new()
             .read(true)
             .write(binding.access == LiveNamespaceAccess::ReadWrite)
-            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+            .custom_flags(sys::direct_io_flag()? | libc::O_CLOEXEC)
             .open(&binding.namespace_path)
     }
 
@@ -180,11 +181,9 @@ impl LiveNamespace {
         if !meta.file_type().is_block_device() {
             return Err(invalid("not a block namespace"));
         }
-        let dev = meta.rdev();
         let sysfs = PathBuf::from(format!(
-            "/sys/dev/block/{}:{}",
-            libc::major(dev),
-            libc::minor(dev)
+            "/sys/dev/block/{}",
+            sys::device_number(meta.rdev())
         ));
         let u = binding.uuid;
         let uuid = format!(
@@ -224,7 +223,7 @@ impl LiveNamespace {
         } else {
             libc::O_RDONLY
         };
-        if flags & libc::O_DIRECT == 0 || flags & libc::O_ACCMODE != expected_mode {
+        if flags & sys::direct_io_flag()? == 0 || flags & libc::O_ACCMODE != expected_mode {
             return Err(invalid("namespace descriptor access mismatch"));
         }
         let mut readonly: libc::c_int = 0;
@@ -312,10 +311,11 @@ impl LiveNamespace {
         if !Self::valid_geometry(bytes, block_size) {
             return Err(invalid("invalid fixture geometry"));
         }
+        let direct = if direct { sys::direct_io_flag()? } else { 0 };
         let file = OpenOptions::new()
             .read(true)
             .write(access == LiveNamespaceAccess::ReadWrite)
-            .custom_flags(libc::O_CLOEXEC | if direct { libc::O_DIRECT } else { 0 })
+            .custom_flags(libc::O_CLOEXEC | direct)
             .open(path)?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() != bytes {

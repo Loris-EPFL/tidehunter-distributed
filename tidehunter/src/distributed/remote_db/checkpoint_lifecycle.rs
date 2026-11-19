@@ -627,7 +627,6 @@ pub(super) fn core_retire_history_before(
     if core.take_retirement_preflight_busy() {
         return Err(LocalDbError::new("injected retirement preflight busy"));
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     let _live_pause = core.reads.pause_live_for_retirement()?;
     let result = (|| {
         core.wait_published_before(core.next_sequence())?;
@@ -1055,7 +1054,7 @@ fn persist_checkpoint(
 }
 
 // The pipeline Fixture serves only the leased live route.
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::super::pipeline_tests::{Fixture, LIVE_HOST_NQN};
     use super::*;
@@ -1332,7 +1331,7 @@ mod tests {
 }
 
 // The pipeline Fixture serves only the leased live route.
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod core_tests {
     use super::super::pipeline_tests::Fixture;
     use super::*;
@@ -1647,7 +1646,7 @@ mod core_tests {
 }
 
 // The pipeline Fixture serves only the leased live route.
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod retirement_request_tests {
     use super::super::pipeline_tests::Fixture;
     use super::*;

@@ -349,7 +349,7 @@ pub(super) fn persist_open_record(path: &Path, record: &CutRecord) -> Result<(),
 }
 
 /// Test hook: edit the persisted owner marks (for example, to model an owner restart).
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 pub(super) fn rewrite_marks_for_test(path: &Path, edit: impl FnOnce(&mut [OwnerMark])) {
     let mut record: CutRecord = read_metadata(&path.join(RECORD)).unwrap();
     edit(&mut record.owners);
@@ -696,7 +696,7 @@ impl DurableCut {
     }
 
     /// Test hook: receive every cut the actor persists from now on.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn persisted_events(&self) -> mpsc::Receiver<u64> {
         let (sender, receiver) = mpsc::sync_channel(4096);
         *self.shared.persisted_events.lock() = Some(sender);

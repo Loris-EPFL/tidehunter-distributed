@@ -1,5 +1,4 @@
 //! WAL-position checkpoint and retry-window regressions over real owner files.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::pipeline_tests::Fixture;
 use super::tests::{checkpoint_put, fail_stop_without_checkpoint, reopen_result};
 use super::*;

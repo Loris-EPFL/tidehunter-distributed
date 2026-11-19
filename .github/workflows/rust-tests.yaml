@@ -216,7 +216,7 @@ jobs:
           sudo install -d -m 0700 "$KERNEL_TCP_STATE" "$KERNEL_TCP_STATE/libs"
       - name: Build shared kernel TCP proof binary
         timeout-minutes: 10
-        run: cargo +1.90 build --locked --offline -p kv-research --bin kv-research --features nvmeof
+        run: cargo +1.90 build --locked --offline -p kv-research --bin kv-research
       - name: Gate single-owner abrupt-crash recovery in both durability tiers
         # CI uses 8 MiB WAL members with 4 MiB fragments, crossing both boundaries.
         # Cloud qualification keeps its 1 GiB members.
@@ -394,6 +394,19 @@ jobs:
       # not evidence of RDMA hardware activity or network performance.
       - name: Run selected profile
         run: python3 .github/scripts/checks.py "${{ matrix.profile }}"
+
+      - name: Prepare Darwin standard library for boundary check
+        if: matrix.profile == 'lint'
+        run: rustup target add --toolchain 1.90 x86_64-apple-darwin
+
+      - name: Type-check distributed code off Linux (Linux-only code confined to distributed/sys/)
+        if: matrix.profile == 'lint'
+        env:
+          CC_x86_64_apple_darwin: ${{ github.workspace }}/.github/scripts/darwin-check-cc.sh
+          AR_x86_64_apple_darwin: ar
+          # Do not cache the empty objects in the normal profile build directory.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/darwin-boundary-check
+        run: cargo +1.90 check --locked --offline -p tidehunter --all-targets --features experimental-distributed --target x86_64-apple-darwin
 
       - name: Run default adapter suite
         if: matrix.profile == 'native'

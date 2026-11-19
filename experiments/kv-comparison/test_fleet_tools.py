@@ -461,7 +461,7 @@ class FleetToolsTests(unittest.TestCase):
         command = ['cargo', '--config', 'build.rustflags=["-C","target-cpu=x86-64"]',
                    'build', '--release', '--frozen', '--target', cloud_package.TARGET,
                    '-p', 'kv-research', '--bin', 'kv-research', '--no-default-features',
-                   '--features', 'fabric,nvmeof,test-utils']
+                   '--features', 'fabric,test-utils']
         expected = command[:command.index('-p')] + ['-p', 'tidehunter', '--example',
                                                     'admission_options', '--no-default-features']
         self.assertEqual(cloud_package.admission_options_command(command), expected)

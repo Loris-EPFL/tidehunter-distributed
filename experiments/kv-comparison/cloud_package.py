@@ -23,8 +23,8 @@ import time
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "garnet", "kvrocks", "fabric", "nvmeof", "test-utils"]
-FOCUSED_FEATURES = ["fabric", "nvmeof", "test-utils"]
+FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "garnet", "kvrocks", "fabric", "test-utils"]
+FOCUSED_FEATURES = ["fabric", "test-utils"]
 ADMISSION_OPTIONS_SOURCES = frozenset({
     "tidehunter/examples/admission_options.rs",
     "tidehunter/benches/admission_options/core.rs",

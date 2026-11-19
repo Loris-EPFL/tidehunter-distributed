@@ -1,22 +1,15 @@
 //! Live native WAL data paths over Linux NVMe-oF (kernel target, buffered
 //! file backing, one permanent export subsystem per owner).
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod live_connect;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod live_io;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod live_metrics;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod live_namespace;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod live_pool;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) mod live_prometheus;
 /// Live WAL metadata types. Compiled in every feature set: owner-protocol
 /// payloads carry them (see `tcp::live_wire`).
 pub mod live_storage;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod live_target;
 use serde::{Deserialize, Serialize};
 

@@ -1,6 +1,5 @@
 //! Reopen regressions over the leased live fixture. Every open connects fresh
 //! owner sessions: the shared transport pool was removed with R3.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::super::pipeline_tests::Fixture;
 use super::*;

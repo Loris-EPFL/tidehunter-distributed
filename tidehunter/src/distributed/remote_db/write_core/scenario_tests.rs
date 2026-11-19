@@ -3,7 +3,6 @@
 //! one-shot test hooks and condition predicates, never from elapsed time; the
 //! only deadline-driven case is the caller timeout, whose resolution is held
 //! by a hook until the caller has returned.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::core::WriteCore;
 use super::sequencer::Resolution;

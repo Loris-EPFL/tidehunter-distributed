@@ -1,7 +1,6 @@
 //! Deterministic lifecycle cuts over real five-node authenticated WAL storage.
 //! These are recovery/retention regressions, not performance measurements.
 //! Every case opens the leased live fixture, so the module needs nvmeof.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::pipeline_tests::Fixture;
 use super::*;

@@ -1253,15 +1253,15 @@ impl Client {
             || self.reactor.control.is_some()
             || self.reactor.position.is_some()
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn checkpoint_pending(&self) -> bool {
         self.reactor.control.is_some() || self.reactor.position.is_some()
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn checkpoint_control_pending(&self) -> bool {
         self.reactor.control.is_some()
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn checkpoint_position_pending(&self) -> bool {
         self.reactor.position.is_some()
     }
@@ -1274,7 +1274,6 @@ impl Client {
         }
         Ok(())
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn pause_session_poll(&mut self, polling: &mut ActivePoll) {
         polling.pause(
             self.polling,
@@ -1379,7 +1378,7 @@ impl Client {
         }
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn expire_position_for_test(&mut self) {
         self.reactor.position.as_mut().unwrap().1 = Instant::now();
     }
@@ -1427,7 +1426,6 @@ impl Client {
     }
 
     /// Nonblocking control slot of the live route (and of reactor tests).
-    #[cfg(any(test, all(feature = "experimental-nvmeof", target_os = "linux")))]
     pub(super) fn submit_control(
         &mut self,
         request: &Request,
@@ -1458,7 +1456,6 @@ impl Client {
         Ok(true)
     }
 
-    #[cfg(any(test, all(feature = "experimental-nvmeof", target_os = "linux")))]
     pub(super) fn take_control(&mut self) -> Option<Result<Response, TcpError>> {
         let (id, _) = self.reactor.control?;
         if self.reactor.control_result.is_none() || self.stream.output_pending(id) {

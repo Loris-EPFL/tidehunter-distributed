@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileExt;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -269,7 +268,6 @@ impl DurableBatch {
     /// It must first bind the reply to the requested database, version, digest,
     /// registered partition/generation and physical bounds. Deserializing an
     /// arbitrary peer receipt is not evidence of persistence.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn from_validated_parts(
         id: BatchId,
         version: BatchVersion,
@@ -285,7 +283,6 @@ impl DurableBatch {
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 struct OpenLiveExtent {
     extent: super::nvmeof::live_storage::LiveWriteExtent,
     allocation: crate::wal::ExternalWalAllocation,
@@ -302,7 +299,6 @@ struct OpenLiveExtent {
 // it; read/maintenance/seal scans enter without state or persistence held.
 // Lifecycle FIFO ordering stays unchanged: a queued fence can wait for the
 // active request, bounded by the extent's frames and retry count.
-#[cfg(feature = "experimental-nvmeof")]
 #[derive(Default)]
 struct AdoptionRound {
     buffers: [Vec<u8>; 2],
@@ -312,36 +308,28 @@ struct AdoptionRound {
     maximum_active: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 const ADOPTION_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-#[cfg(feature = "experimental-nvmeof")]
 const ADOPTION_ROUND_FRAMES: usize = 32;
-#[cfg(feature = "experimental-nvmeof")]
 const ADOPTION_ROUND_BYTES: u64 = 8 * 1024 * 1024;
-#[cfg(feature = "experimental-nvmeof")]
 const ADOPTION_PARALLEL_BYTES: u64 = 256 * 1024;
 
-#[cfg(feature = "experimental-nvmeof")]
 struct PlannedLiveFrame {
     start: u64,
     len: u64,
     probe: Result<u32, StorageError>,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 struct ValidatedLiveFrame {
     group: CompleteGroup,
     crc: u32,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 struct PreparedLiveFrame {
     start: u64,
     len: u64,
     validated: Result<ValidatedLiveFrame, StorageError>,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[derive(Clone, Copy)]
 struct LiveFrameDemand {
     batches: usize,
@@ -349,7 +337,6 @@ struct LiveFrameDemand {
     bytes: u64,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 impl LiveFrameDemand {
     fn fits(self, state: &State, root_end: u64) -> bool {
         state
@@ -360,14 +347,13 @@ impl LiveFrameDemand {
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 enum LiveFrameStep {
     Adopted,
     End,
     Pressure(LiveFrameDemand),
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum LivePausePoint {
     ScanSnapshot,
@@ -388,7 +374,7 @@ pub(crate) enum LivePausePoint {
     ColdReadAfterPin,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 type LivePauseHook = (
     LivePausePoint,
     std::sync::mpsc::SyncSender<()>,
@@ -399,30 +385,22 @@ type LivePauseHook = (
 enum WriterPoison {
     // Validation failed before publication. Only the earlier appended prefix
     // may still be synced; the unresolved external allocation stays pinned.
-    #[cfg(feature = "experimental-nvmeof")]
     IncompleteLiveFrame,
     Fatal,
 }
 
 struct State {
     // This must drop before writer: the tracker can be waiting for this pin.
-    #[cfg(feature = "experimental-nvmeof")]
     open_live_extent: Option<OpenLiveExtent>,
-    #[cfg(feature = "experimental-nvmeof")]
     next_live_extent: Option<OpenLiveExtent>,
-    #[cfg(feature = "experimental-nvmeof")]
     last_live_adoption: Option<super::nvmeof::live_storage::LiveAdoption>,
-    #[cfg(feature = "experimental-nvmeof")]
     live: bool,
-    #[cfg(feature = "experimental-nvmeof")]
     sealing: bool,
-    #[cfg(feature = "experimental-nvmeof")]
     live_tail: Option<LiveFrontierTail>,
     /// End below which this handle owes no live-frontier root. Zero after
     /// create, so the first barrier or fragment crossing installs a root. After
     /// recovery it is the recovered end: recovery leaves that end described by
     /// its own durable roots and seal, and a sealed handle has no live tail.
-    #[cfg(feature = "experimental-nvmeof")]
     live_root_end: u64,
     // Writer drops before the directory lock. The experimental feature strictly
     // joins its native workers; shutdown can wait but cannot release a live path.
@@ -440,9 +418,8 @@ struct State {
     poison: Option<WriterPoison>,
     sealed: bool,
     stats: PartitionStats,
-    #[cfg(feature = "experimental-nvmeof")]
     live_file_preparation: LiveFilePreparationStats,
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     live_test_diagnostics: LiveTestDiagnostics,
 }
 
@@ -488,7 +465,6 @@ pub struct PartitionStats {
 }
 
 /// Owner-local preparation counters; not carried by the statistics protocol.
-#[cfg(feature = "experimental-nvmeof")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LiveFilePreparationStats {
     pub live_files_prepared: u64,
@@ -499,7 +475,7 @@ pub struct LiveFilePreparationStats {
     pub live_file_prewrite_files: u64,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct LiveTestLeaseTiming {
     pub persistence_wait_ns: u64,
@@ -509,7 +485,7 @@ pub(crate) struct LiveTestLeaseTiming {
     pub lookup_inventory_wait_ns: u64,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct LiveTestExport {
     file_index: u64,
@@ -518,7 +494,7 @@ pub(crate) struct LiveTestExport {
     success: bool,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub(crate) struct LiveTestDiagnostics {
     lease: LiveTestLeaseTiming,
@@ -528,7 +504,7 @@ pub(crate) struct LiveTestDiagnostics {
     cold_read_syncs: u64,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub(crate) struct LiveTestAdoption {
     pub bytes: u64,
@@ -773,9 +749,7 @@ enum WriteStage {
     PersistNamespace,
     PersistInventoryFile,
     PersistInventoryNamespace,
-    #[cfg(feature = "experimental-nvmeof")]
     LiveFrontierFile,
-    #[cfg(feature = "experimental-nvmeof")]
     LiveFrontierNamespace,
     PersistPublication,
 }
@@ -798,9 +772,7 @@ impl WriteStage {
             Self::PersistNamespace => &mut profile.persist_namespace_ns,
             Self::PersistInventoryFile => &mut profile.persist_inventory_file_ns,
             Self::PersistInventoryNamespace => &mut profile.persist_inventory_namespace_ns,
-            #[cfg(feature = "experimental-nvmeof")]
             Self::LiveFrontierFile => &mut profile.live_frontier_file_ns,
-            #[cfg(feature = "experimental-nvmeof")]
             Self::LiveFrontierNamespace => &mut profile.live_frontier_namespace_ns,
             Self::PersistPublication => &mut profile.persist_publication_ns,
         }
@@ -923,9 +895,7 @@ pub struct PartitionLog {
     // New file pins serialize only with retirement, never ordinary WAL fsync.
     // False permanently closes read admission after an interrupted retirement.
     read_admission: parking_lot::RwLock<bool>,
-    #[cfg(feature = "experimental-nvmeof")]
     live_read_pins: std::sync::atomic::AtomicUsize,
-    #[cfg(feature = "experimental-nvmeof")]
     live_stream: bool,
     // Recovery of this handle stopped at a lost, torn or invalid frame and a valid
     // frame followed later: a hole below the recovered tail. Owner continuity input.
@@ -947,13 +917,13 @@ pub struct PartitionLog {
     fail_persist: AtomicBool,
     #[cfg(test)]
     fail_namespace_persist: AtomicBool,
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     fail_live_frontier: AtomicU8,
     // Test handshake owner: the selected live operation; capacity one in each
     // direction, blocking send/recv, dropping either peer unblocks shutdown.
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     live_pause: Mutex<Option<LivePauseHook>>,
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     fail_after_live_publish: AtomicBool,
     wal: Arc<Wal>,
     registration: Registration,
@@ -965,7 +935,6 @@ pub struct PartitionLog {
     _local_authority: Option<Arc<DbLock>>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone)]
 pub(crate) struct RecordReadPlan {
     pub(crate) member: crate::wal::WalMemberReadPlan,
@@ -975,7 +944,6 @@ pub(crate) struct RecordReadPlan {
     pub(crate) _log: Arc<PartitionLog>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl RecordReadPlan {
     #[cfg(test)]
     pub(crate) fn authority_bytes(&self) -> usize {
@@ -1018,14 +986,7 @@ impl PartitionLog {
         shape: &KeyShape,
         metrics: Arc<Metrics>,
     ) -> Result<Self, StorageError> {
-        Self::create_inner(
-            path,
-            config,
-            shape,
-            metrics,
-            #[cfg(feature = "experimental-nvmeof")]
-            false,
-        )
+        Self::create_inner(path, config, shape, metrics, false)
     }
 
     fn create_inner(
@@ -1033,7 +994,7 @@ impl PartitionLog {
         config: PartitionConfig,
         shape: &KeyShape,
         metrics: Arc<Metrics>,
-        #[cfg(feature = "experimental-nvmeof")] prewrite: bool,
+        prewrite: bool,
     ) -> Result<Self, StorageError> {
         config.validate()?;
         let shape_yaml = shape
@@ -1058,14 +1019,11 @@ impl PartitionLog {
         .sync_all()?;
         let lock = DbLock::acquire(&path, Duration::ZERO)?;
         let (references, reference_writer) = ReferenceDirectory::open(&registration.config)?;
-        #[cfg(feature = "experimental-nvmeof")]
         let wal = if prewrite {
             Wal::open_external_prewrite(&path, registration.config.layout(), metrics)?
         } else {
             Wal::open(&path, registration.config.layout(), metrics)?
         };
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let wal = Wal::open(&path, registration.config.layout(), metrics)?;
         wal.persist_registered_files()?;
         install_metadata(&path, REGISTRATION, &metadata)?;
         let wal_root = WalRoot::new(&registration.config);
@@ -1073,19 +1031,12 @@ impl PartitionLog {
         let writer = wal.writer_after(None).map_err(StorageError::Wal)?;
         Ok(Self {
             state: Mutex::new(State {
-                #[cfg(feature = "experimental-nvmeof")]
                 open_live_extent: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 next_live_extent: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 last_live_adoption: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 live: false,
-                #[cfg(feature = "experimental-nvmeof")]
                 sealing: false,
-                #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 live_root_end: 0,
                 writer: Some(writer),
                 wal_root: Some(wal_root),
@@ -1097,9 +1048,8 @@ impl PartitionLog {
                 poison: None,
                 sealed: false,
                 stats: PartitionStats::default(),
-                #[cfg(feature = "experimental-nvmeof")]
                 live_file_preparation: LiveFilePreparationStats::default(),
-                #[cfg(all(test, feature = "experimental-nvmeof"))]
+                #[cfg(test)]
                 live_test_diagnostics: LiveTestDiagnostics::default(),
             }),
             references,
@@ -1112,9 +1062,7 @@ impl PartitionLog {
             serve_unsynced: AtomicBool::new(false),
             persistence: Mutex::new(()),
             read_admission: parking_lot::RwLock::new(true),
-            #[cfg(feature = "experimental-nvmeof")]
             live_read_pins: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(feature = "experimental-nvmeof")]
             live_stream: false,
             recovery_hole: false,
             #[cfg(test)]
@@ -1129,11 +1077,11 @@ impl PartitionLog {
             fail_persist: AtomicBool::new(false),
             #[cfg(test)]
             fail_namespace_persist: AtomicBool::new(false),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             fail_live_frontier: AtomicU8::new(0),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             live_pause: Mutex::new(None),
-            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            #[cfg(test)]
             fail_after_live_publish: AtomicBool::new(false),
             wal,
             registration,
@@ -1146,7 +1094,6 @@ impl PartitionLog {
 
     /// Create an exclusively block-aligned external-write stream. Selection is
     /// persisted before the handle can be exposed to a target manager.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn create_live(
         path: &Path,
         config: PartitionConfig,
@@ -1156,7 +1103,6 @@ impl PartitionLog {
         Self::create_live_with_prewrite(path, config, shape, metrics, false)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn create_live_with_prewrite(
         path: &Path,
         config: PartitionConfig,
@@ -1192,7 +1138,6 @@ impl PartitionLog {
 
     /// The callback must synchronously revoke and drain all writable targets
     /// for this stream before recovery touches any WAL inode.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn recover_live_sealed(
         path: &Path,
         expected: &PartitionConfig,
@@ -1266,7 +1211,6 @@ impl PartitionLog {
         &self,
         evict: bool,
     ) -> std::io::Result<crate::read_probe::ReadEvidence> {
-        #[cfg(feature = "experimental-nvmeof")]
         if self.live_stream {
             let state = self.state.lock();
             if !state.sealed
@@ -1305,7 +1249,6 @@ impl PartitionLog {
     /// Whether monotonic allocation has permanently passed a live WAL file.
     /// The target owner must separately wait for its namespace/read I/O pins
     /// and synchronously revoke/drain before removing a binding.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn can_release_live_segment(&self, file_index: u64) -> Result<bool, StorageError> {
         let state = self.state.lock();
         if !state.live {
@@ -1332,7 +1275,6 @@ impl PartitionLog {
     }
 
     /// Grant exactly one native fragment remainder to the single live writer.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn lease_live_extent(
         &self,
         authority: RequestAuthority,
@@ -1346,7 +1288,6 @@ impl PartitionLog {
         self.lease_live_extent_impl(authority, None)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn prelease_live_extent(
         &self,
         authority: RequestAuthority,
@@ -1364,7 +1305,6 @@ impl PartitionLog {
     /// Prepare after the durable namespace highwater: at most one file beyond the
     /// allocator-position file (two beyond the last grant with two-fragment files).
     /// Allocation/file sync run unlocked; publication uses persistence -> state.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn prepare_next_live_file(&self) -> Result<Option<u64>, StorageError> {
         use crate::wal::position::WalFileId;
         let config = self.config();
@@ -1475,12 +1415,10 @@ impl PartitionLog {
         Ok(Some(target))
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn live_file_published(&self) {
         self.state.lock().live_file_preparation.live_files_published += 1;
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn lease_live_extent_impl(
         &self,
         authority: RequestAuthority,
@@ -1609,7 +1547,6 @@ impl PartitionLog {
     }
 
     /// Validate without changing the allocator; both grant paths use this check.
-    #[cfg(feature = "experimental-nvmeof")]
     fn validate_live_extent_grant(
         &self,
         state: &State,
@@ -1672,7 +1609,6 @@ impl PartitionLog {
 
     /// Reserve/install atomically under state. Any uncertain reservation leaves
     /// fatal poison; successful transient poison never escapes this lock hold.
-    #[cfg(feature = "experimental-nvmeof")]
     fn reserve_live_extent_grant(
         &self,
         state: &mut State,
@@ -1756,7 +1692,6 @@ impl PartitionLog {
 
     /// A failed declared frame fences writes while its earlier validated prefix
     /// remains persistable. An opportunistic scan never declares torn bytes.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn adopt_live_extent(
         &self,
         authority: RequestAuthority,
@@ -1773,7 +1708,6 @@ impl PartitionLog {
         self.adopt_live_extent_impl(authority, token, through, close, None)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn self_adopt_live_extent(&self) -> Result<(), StorageError> {
         if !self.live_stream {
             return Ok(());
@@ -1804,7 +1738,6 @@ impl PartitionLog {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn adopt_live_extent_impl(
         &self,
         authority: RequestAuthority,
@@ -2111,7 +2044,6 @@ impl PartitionLog {
         result.map(|adoption| (adoption, profile))
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn adoption_status(
         state: &State,
         token: [u8; 16],
@@ -2164,7 +2096,6 @@ impl PartitionLog {
         Ok(None)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn drain_adoption_pressure(
         &self,
         mut state: parking_lot::MutexGuard<'_, State>,
@@ -2179,7 +2110,6 @@ impl PartitionLog {
         }
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn plan_adoption_round(
         &self,
         file: &File,
@@ -2217,7 +2147,6 @@ impl PartitionLog {
         plans
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn probe_adoption_frame(
         &self,
         file: &File,
@@ -2252,7 +2181,6 @@ impl PartitionLog {
         Ok(len)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn validate_planned_frame(
         &self,
         file: &File,
@@ -2286,7 +2214,6 @@ impl PartitionLog {
         Ok(ValidatedLiveFrame { group, crc })
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn adoption_read_error(error: io::Error) -> StorageError {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             StorageError::IncompleteLiveFrame
@@ -2299,7 +2226,6 @@ impl PartitionLog {
     // without state. Ordered publication rechecks token, lifecycle and cursor;
     // concurrent adopters cannot publish the same frame twice. The revoked-tail
     // seal scan below retains its existing single-frame locked read semantics.
-    #[cfg(feature = "experimental-nvmeof")]
     fn adopt_live_frame(
         &self,
         state: &mut State,
@@ -2329,7 +2255,6 @@ impl PartitionLog {
         self.publish_adoption_frame(state, open, start, len, validated)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn publish_adoption_frame(
         &self,
         state: &mut State,
@@ -2399,7 +2324,6 @@ impl PartitionLog {
     /// persistence -> state where both are needed; close takes state only to
     /// mark/revalidate ownership, never during suffix I/O. `closing` prevents
     /// mutation or regrant while the local file pin and buffer are borrowed.
-    #[cfg(feature = "experimental-nvmeof")]
     fn close_live_extent(
         &self,
         token: [u8; 16],
@@ -2485,7 +2409,6 @@ impl PartitionLog {
         Ok(summary)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn validate_live_extent_close(
         &self,
         file: &File,
@@ -2514,7 +2437,7 @@ impl PartitionLog {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     pub(crate) fn pause_live(
         &self,
         point: LivePausePoint,
@@ -2528,7 +2451,7 @@ impl PartitionLog {
         (started, resume)
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     fn pause_live_at(&self, point: LivePausePoint) {
         let hook = {
             let mut slot = self.live_pause.lock();
@@ -2544,7 +2467,6 @@ impl PartitionLog {
         }
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn decode_live_frame(&self, frame: &[u8]) -> Result<CompleteGroup, StorageError> {
         let payload =
             CrcFrame::read_from_slice(frame, 0).map_err(|_| StorageError::IncompleteLiveFrame)?;
@@ -2565,7 +2487,6 @@ impl PartitionLog {
         Ok(group)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn publish_live_group(
         &self,
         state: &mut State,
@@ -2703,7 +2624,6 @@ impl PartitionLog {
         if state.sealed {
             return Err(StorageError::Sealed);
         }
-        #[cfg(feature = "experimental-nvmeof")]
         if state.live {
             return Err(StorageError::Invalid(
                 "ordinary append forbidden in live WAL stream",
@@ -2940,7 +2860,6 @@ impl PartitionLog {
     /// call makes every group appended before it captured the frontier durable.
     /// Returns the durable frontier after the call.
     pub fn persist_appended(&self) -> Result<u64, StorageError> {
-        #[cfg(feature = "experimental-nvmeof")]
         self.self_adopt_live_extent()?;
         self.persist_scope(PersistScope::Appended, None)?;
         Ok(self.durable_frontier.load(Ordering::Acquire))
@@ -2951,7 +2870,6 @@ impl PartitionLog {
         &self,
         profile: &mut StorageWriteProfile,
     ) -> Result<u64, StorageError> {
-        #[cfg(feature = "experimental-nvmeof")]
         self.self_adopt_live_extent()?;
         self.persist_scope(PersistScope::Appended, Some(profile))?;
         Ok(self.durable_frontier.load(Ordering::Acquire))
@@ -2989,7 +2907,7 @@ impl PartitionLog {
     }
 
     /// Generation, scan origin and fixed cut for root/lease interleaving tests.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn position_root_for_test(&self) -> (u64, u64, u64) {
         let state = self.state.lock();
         let root = state.wal_root.as_ref().unwrap();
@@ -2997,7 +2915,6 @@ impl PartitionLog {
     }
 
     /// Count one adoption-triggered live-frontier persistence request.
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn note_live_frontier_request(&self) {
         self.state.lock().stats.live_frontier_requests += 1;
     }
@@ -3007,7 +2924,6 @@ impl PartitionLog {
     /// current, the log is not live, or persistence already failed (a failed
     /// log never writes another root; recovery scans its valid suffix).
     /// Flush, fence/retire and shutdown call it.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn persist_live_root(&self) -> Result<(), StorageError> {
         {
             let state = self.state.lock();
@@ -3023,7 +2939,6 @@ impl PartitionLog {
     /// [`Self::durable_progress`]). A no-op when the report already covers the
     /// appended end, as on a recovered handle. Returns false when the stream is not
     /// live: its reports follow every sync, so the syncer serves the nudge.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn persist_live_progress(&self) -> Result<bool, StorageError> {
         {
             let state = self.state.lock();
@@ -3077,10 +2992,7 @@ impl PartitionLog {
     /// uses the bounded live-root policy; explicit barriers catch the root up.
     pub fn sync_for_frontier(&self) -> io::Result<()> {
         let mut profile = StorageWriteProfile::default();
-        #[cfg(feature = "experimental-nvmeof")]
         let adopted = self.self_adopt_live_extent();
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let adopted: Result<(), StorageError> = Ok(());
         let result = adopted.and_then(|()| {
             // The final drain at syncer shutdown (fence, retire, owner stop)
             // is an explicit barrier: it leaves the root covering the prefix.
@@ -3224,7 +3136,6 @@ impl PartitionLog {
         timing.stage(Some(WriteStage::PersistSerializationLock));
         let _persistence = self.persistence.lock();
         timing.stage(Some(WriteStage::PersistStateLock));
-        #[cfg(feature = "experimental-nvmeof")]
         let mut live_frontier = None;
         let (start, end, namespace_synced_file, captured) = {
             let mut state = self.state.lock();
@@ -3261,7 +3172,6 @@ impl PartitionLog {
             // syncer defers it within a fragment, and only with windowed
             // (WAL-replay) history: on-disk history requires the root at or past
             // the history root that this barrier may advance.
-            #[cfg(feature = "experimental-nvmeof")]
             if state.live
                 && (root == RootPolicy::Barrier
                     || state.appended_end / self.config().fragment_bytes
@@ -3300,7 +3210,6 @@ impl PartitionLog {
         let namespace_sync = previous_namespace.is_none_or(|file| last_file > file);
         let mut witness_persisted = 0u64;
         let mut wal_file_syncs = 0u64;
-        #[cfg(feature = "experimental-nvmeof")]
         let mut frontier_io = LiveFrontierIo::default();
         let result = (|| -> io::Result<()> {
             // A root catch-up after a deferred root has no new data to sync.
@@ -3329,7 +3238,6 @@ impl PartitionLog {
                 &mut timing,
                 &mut witness_persisted,
             )?;
-            #[cfg(feature = "experimental-nvmeof")]
             if let Some(frontier) = &live_frontier {
                 self.persist_live_frontier(frontier, &mut timing, &mut frontier_io)?;
             }
@@ -3343,7 +3251,6 @@ impl PartitionLog {
         if result.is_ok() {
             state.stats.wal_file_syncs += wal_file_syncs;
         }
-        #[cfg(feature = "experimental-nvmeof")]
         {
             state.stats.live_frontier_file_syncs += frontier_io.file_syncs;
             state.stats.live_frontier_namespace_syncs += frontier_io.namespace_syncs;
@@ -3372,10 +3279,7 @@ impl PartitionLog {
         state.durable_end = end;
         // A live sync that deferred the strict root publishes no progress: recovery
         // enforces no frame beyond the root, so a report must not cover one.
-        #[cfg(feature = "experimental-nvmeof")]
         let reportable = live_frontier.is_some() || !state.live;
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let reportable = true;
         if reportable {
             state.progress.synced(captured, end);
         }
@@ -3407,7 +3311,6 @@ impl PartitionLog {
                 )
             })
             .ok_or(StorageError::Invalid("unknown or foreign address"))?;
-        #[cfg(feature = "experimental-nvmeof")]
         if self.live_stream && _authority.group_end() > self.readable_frontier() {
             // A position proof need not publish the adopted receipt frontier.
             // Serving a batch obtains its own covering receipt barrier.
@@ -3421,7 +3324,6 @@ impl PartitionLog {
         }
         let _admission = self.read_admission()?;
         let position = WalPosition::new(appended.address.offset, appended.address.len);
-        #[cfg(feature = "experimental-nvmeof")]
         let bytes = if self.live_stream {
             let payload_len = position
                 .frame_len()
@@ -3446,8 +3348,6 @@ impl PartitionLog {
         } else {
             self.wal.read(position).map_err(StorageError::Wal)?.1
         };
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let bytes = self.wal.read(position).map_err(StorageError::Wal)?.1;
         let batch = CompleteBatch::decode(
             &self.shape,
             bytes.ok_or(StorageError::Invalid("authoritative value disappeared"))?,
@@ -3487,7 +3387,6 @@ impl PartitionLog {
     ) -> Result<Option<Arc<RegisteredBatch>>, StorageError> {
         match self.references.lookup(address) {
             Ok(None) => {
-                #[cfg(feature = "experimental-nvmeof")]
                 if self.live_stream {
                     let adopt_current =
                         self.state
@@ -3544,7 +3443,6 @@ impl PartitionLog {
                     let _admission = self.read_admission()?;
                     return self.member_authority(address).map(Some);
                 }
-                #[cfg(feature = "experimental-nvmeof")]
                 if self.live_stream {
                     self.self_adopt_live_extent()?;
                     return self.references.lookup(address);
@@ -3626,13 +3524,11 @@ impl PartitionLog {
     /// Blocking owner-serving boundary. A position proof can cover bytes without
     /// publishing the receipt frontier. The read obtains its own covering barrier
     /// before record bytes or a namespace grant leave the owner.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn load_serving_record_authority(
         &self,
         reference: &ValueRecordReference,
     ) -> Result<Arc<RegisteredBatch>, StorageError> {
         match self.load_durable_record_authority(reference) {
-            #[cfg(feature = "experimental-nvmeof")]
             Err(StorageError::NeedsPersistence) if self.live_stream => {
                 self.persist_for_read()?;
                 self.load_durable_record_authority(reference)
@@ -3644,7 +3540,6 @@ impl PartitionLog {
     /// On-demand data barrier for a read beyond the durable prefix. A read is
     /// not a lifecycle barrier: a live root keeps the syncer's bounded policy.
     fn persist_for_read(&self) -> Result<(), StorageError> {
-        #[cfg(feature = "experimental-nvmeof")]
         self.self_adopt_live_extent()?;
         self.persist_scope_with(PersistScope::Appended, None, syncer_root_policy(false))?;
         self.state.lock().stats.read_persist_requests += 1;
@@ -3675,7 +3570,7 @@ impl PartitionLog {
 
     /// Reference-directory membership can precede persistence. Expose a record
     /// only after its physical group lies within the release-published frontier.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn validate_durable_record_reference(
         &self,
         reference: &ValueRecordReference,
@@ -3685,7 +3580,7 @@ impl PartitionLog {
     }
     /// Cold authority lookup for tests of the owner serving boundary. The
     /// returned plan owns both descriptor authority and the native file.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn plan_record_read(
         self: &Arc<Self>,
         reference: &ValueRecordReference,
@@ -3695,7 +3590,6 @@ impl PartitionLog {
         self.plan_registered_record_read(reference, registered)
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn plan_registered_record_read(
         self: &Arc<Self>,
         reference: &ValueRecordReference,
@@ -3721,7 +3615,6 @@ impl PartitionLog {
     /// Cold leased authority is scoped to this exact record. The captured inode
     /// and charged descriptors outlive unlocked I/O; neither adoption's round
     /// gate nor the durable-metadata gate participates in this read barrier.
-    #[cfg(feature = "experimental-nvmeof")]
     fn resolve_leased_record(
         self: &Arc<Self>,
         reference: &ValueRecordReference,
@@ -3812,7 +3705,6 @@ impl PartitionLog {
         Ok(Some(lease))
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn record_extent(state: &State, address: PhysicalValueAddress) -> Option<&OpenLiveExtent> {
         let end = address.offset.checked_add(u64::from(address.len))?;
         state
@@ -3822,7 +3714,6 @@ impl PartitionLog {
             .find(|open| address.offset >= open.extent.start && end <= open.extent.end)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn check_cold_read_state(
         &self,
         state: &State,
@@ -3846,7 +3737,6 @@ impl PartitionLog {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn check_cold_read_extent(
         &self,
         state: &State,
@@ -3869,7 +3759,6 @@ impl PartitionLog {
     }
 
     /// Resolve a durable exact record reference to an owner-pinned file range.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn resolve_live_record(
         self: &Arc<Self>,
         reference: &ValueRecordReference,
@@ -3887,7 +3776,6 @@ impl PartitionLog {
 
     /// Resolve a durable receipt to its complete inner native CRC frame for
     /// recovery. Metadata only; the caller reads and validates the frame.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn resolve_live_batch(
         self: &Arc<Self>,
         receipt: AppendedBatch,
@@ -3931,7 +3819,6 @@ impl PartitionLog {
         self.live_lease(plan, receipt.address.offset)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn live_file_count(&self) -> Result<u64, StorageError> {
         let state = self.state.lock();
         if !state.live {
@@ -3945,7 +3832,6 @@ impl PartitionLog {
             .div_ceil(self.config().wal_file_bytes))
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn live_segment(
         &self,
         file_index: u64,
@@ -3973,7 +3859,6 @@ impl PartitionLog {
         })
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn live_lease(
         &self,
         plan: RecordReadPlan,
@@ -4007,7 +3892,6 @@ impl PartitionLog {
         })
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub(crate) fn release_live_read_pin(&self) {
         self.live_read_pins.fetch_sub(1, Ordering::AcqRel);
     }
@@ -4040,7 +3924,6 @@ impl PartitionLog {
         reference: &ValueRecordReference,
         policy: WalMemberReadPolicy,
     ) -> Result<minibytes::Bytes, StorageError> {
-        #[cfg(feature = "experimental-nvmeof")]
         let policy = if self.live_stream && policy == WalMemberReadPolicy::Mapped {
             WalMemberReadPolicy::Positional
         } else {
@@ -4107,7 +3990,6 @@ impl PartitionLog {
         stats
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn live_file_preparation_stats(&self) -> LiveFilePreparationStats {
         let mut stats = self.state.lock().live_file_preparation;
         (
@@ -4118,12 +4000,12 @@ impl PartitionLog {
         stats
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     pub(crate) fn live_test_lease_timing(&self) -> LiveTestLeaseTiming {
         self.state.lock().live_test_diagnostics.lease
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     pub(crate) fn record_test_lease_publication(
         &self,
         inventory_wait_ns: u64,
@@ -4136,7 +4018,7 @@ impl PartitionLog {
         state.live_test_diagnostics.lease.lookup_inventory_wait_ns = lookup_inventory_wait_ns;
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     pub(crate) fn record_test_file_export(
         &self,
         file_index: u64,
@@ -4158,7 +4040,7 @@ impl PartitionLog {
         }
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    #[cfg(test)]
     pub(crate) fn live_test_diagnostics(&self) -> LiveTestDiagnostics {
         self.state.lock().live_test_diagnostics.clone()
     }
@@ -4170,7 +4052,6 @@ impl PartitionLog {
 
     /// A stopped worker may have emitted an unreported group. Preserve it for
     /// sealed recovery instead of allowing another writer to guess its outcome.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn poison_writer(&self) {
         self.state.lock().poison = Some(WriterPoison::Fatal);
         self.fail_frontier("writer poisoned");
@@ -4275,7 +4156,6 @@ impl PartitionLog {
     /// The control service's exclusive FIFO barrier waits for stream requests,
     /// so its seal cannot overlap close. Direct API callers get the same
     /// exclusion from the state-owned sealing flag; closing is refused.
-    #[cfg(feature = "experimental-nvmeof")]
     pub fn seal_live_epoch(
         &self,
         authority: RequestAuthority,
@@ -4284,7 +4164,6 @@ impl PartitionLog {
         self.seal_epoch_impl(authority, revoke_and_drain)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
     fn finish_live_extent_for_seal(&self) -> Result<(), StorageError> {
         // Revocation has drained external writes. Each retry either discovers
         // another frame or drains pressure; the finite extent bounds progress.
@@ -4389,7 +4268,6 @@ impl PartitionLog {
         if authority.epoch != self.config().inventory.epoch {
             return Err(StorageError::Fenced);
         }
-        #[cfg(feature = "experimental-nvmeof")]
         let exclusive = {
             let mut state = self.state.lock();
             if state.live && !state.sealed {
@@ -4414,7 +4292,6 @@ impl PartitionLog {
             }
         };
         let result = self.seal_epoch_inner(authority, revoke_and_drain);
-        #[cfg(feature = "experimental-nvmeof")]
         if exclusive {
             self.state.lock().sealing = false;
         }
@@ -4426,14 +4303,11 @@ impl PartitionLog {
         authority: RequestAuthority,
         revoke_and_drain: impl FnOnce() -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
-        #[cfg(feature = "experimental-nvmeof")]
         let mut revoke_and_drain = Some(revoke_and_drain);
-        #[cfg(feature = "experimental-nvmeof")]
         let has_extents = {
             let state = self.state.lock();
             state.open_live_extent.is_some() || state.next_live_extent.is_some()
         };
-        #[cfg(feature = "experimental-nvmeof")]
         if has_extents {
             revoke_and_drain
                 .take()
@@ -4449,7 +4323,6 @@ impl PartitionLog {
                 Ok(())
             };
         }
-        #[cfg(feature = "experimental-nvmeof")]
         if state.live {
             if let Some(revoke_and_drain) = revoke_and_drain.take() {
                 revoke_and_drain()?;
@@ -4461,15 +4334,11 @@ impl PartitionLog {
                 ));
             }
         }
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let _ = revoke_and_drain;
         if state.poison.is_some() {
             return Err(StorageError::Poisoned);
         }
         // Stop writer workers while retaining exclusive ownership of the path.
-        #[cfg(feature = "experimental-nvmeof")]
         drop(state.open_live_extent.take());
-        #[cfg(feature = "experimental-nvmeof")]
         drop(state.next_live_extent.take());
         drop(state.writer.take());
         state.sealed = true; // I/O errors must never reopen this writer.
@@ -4624,7 +4493,6 @@ enum RootPolicy {
     Bounded,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 fn live_root_lags(state: &State) -> bool {
     state.live && state.live_root_end < state.durable_end
 }
@@ -4637,15 +4505,12 @@ fn pending_with_root(
     root: RootPolicy,
 ) -> Result<Option<u64>, StorageError> {
     let pending = pending_scope(state, scope)?;
-    #[cfg(feature = "experimental-nvmeof")]
     if pending.is_none() && root == RootPolicy::Barrier && live_root_lags(state) {
         if persistence_poisoned(state, scope) {
             return Err(StorageError::Poisoned);
         }
         return Ok(Some(state.durable_end));
     }
-    #[cfg(not(feature = "experimental-nvmeof"))]
-    let _ = root;
     Ok(pending)
 }
 
@@ -4669,7 +4534,6 @@ impl PersistScope<'_> {
 fn persistence_poisoned(state: &State, _scope: PersistScope<'_>) -> bool {
     match state.poison {
         None => false,
-        #[cfg(feature = "experimental-nvmeof")]
         Some(WriterPoison::IncompleteLiveFrame) => !matches!(_scope, PersistScope::Appended),
         Some(WriterPoison::Fatal) => true,
     }
@@ -4702,7 +4566,6 @@ pub(crate) fn encode_metadata(value: &impl Serialize) -> Result<Vec<u8>, Storage
 }
 
 /// Live-frontier root I/O done by one persistence barrier.
-#[cfg(feature = "experimental-nvmeof")]
 #[derive(Default)]
 struct LiveFrontierIo {
     file_syncs: u64,
@@ -4713,7 +4576,6 @@ struct LiveFrontierIo {
 
 /// Commit the CRC-protected live durability frontier after the WAL file and
 /// its namespace witnesses, before returning any durable receipt.
-#[cfg(feature = "experimental-nvmeof")]
 impl PartitionLog {
     fn persist_live_frontier(
         &self,

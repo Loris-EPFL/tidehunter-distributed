@@ -131,7 +131,7 @@ impl Drop for SparseIndexView {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 impl SparseIndexView {
     /// Test observation of the installed view: (upper, floor, excluded).
     pub(crate) fn parts(&self) -> (MutationVersion, Option<MutationVersion>, &[BatchVersion]) {

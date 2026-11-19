@@ -32,7 +32,7 @@ use std::time::Instant;
 static LOG: OnceLock<OwnerEventLog> = OnceLock::new();
 
 /// Serialize tests that drain or assert the process-global diagnostic capture.
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 pub(crate) static OWNER_EVENTS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 macro_rules! event_kinds {
@@ -290,7 +290,7 @@ pub fn drain_json(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[cfg(test)]
 pub(crate) fn snapshot() -> (Vec<OwnerEvent>, u64) {
     LOG.get().map_or_else(
         || (Vec::new(), 0),

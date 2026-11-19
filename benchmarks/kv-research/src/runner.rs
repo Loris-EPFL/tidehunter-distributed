@@ -7050,7 +7050,6 @@ mod tests {
     }
 
     /// Every serialized live counter is either a measurement delta or a lifetime peak.
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn live_nvmeof_counter_fields_cover_every_serialized_live_counter() {
         let stats = serde_json::to_value(

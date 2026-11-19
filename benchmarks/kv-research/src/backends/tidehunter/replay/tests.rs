@@ -1,7 +1,7 @@
 //! Distributed replay over the rootless leased ordinary-file live fixture:
 //! real owner processes' control plane in-process, live I/O to local files.
 //! Leased live NVMe-oF is the only distributed route, so every test needs it.
-#![cfg(all(feature = "nvmeof", feature = "test-utils", target_os = "linux"))]
+#![cfg(feature = "test-utils")]
 
 use super::*;
 use crate::mainnet_replay::{execute, prepare};

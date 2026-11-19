@@ -24,13 +24,10 @@ fn entry() -> BackendResult<()> {
         if arguments.len() != 3 {
             return Err("qualification child requires INPUT.json and a fresh READY.json".into());
         }
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         return backends::tidehunter::qualify_live_nvmeof_child(
             Path::new(&arguments[1]),
             Path::new(&arguments[2]),
         );
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
     }
     if arguments
         .first()
@@ -39,13 +36,10 @@ fn entry() -> BackendResult<()> {
         if arguments.len() != 4 || arguments[2] != "--output" {
             return Err("usage: kv-research --experimental-live-nvmeof-qualification INPUT.json --output FRESH_DIR".into());
         }
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         return backends::tidehunter::qualify_live_nvmeof(
             Path::new(&arguments[1]),
             Path::new(&arguments[3]),
         );
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
     }
     if arguments
         .first()

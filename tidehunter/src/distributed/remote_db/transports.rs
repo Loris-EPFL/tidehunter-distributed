@@ -4,14 +4,12 @@ use super::*;
 
 /// A failed open must not leave idle kernel controllers connected. The durable
 /// connection journal retains uncertain ownership if the bounded drain fails.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) struct LivePoolOpenGuard {
     pool: Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
     timeout: Duration,
     armed: bool,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LivePoolOpenGuard {
     pub(super) fn new(
         pool: Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
@@ -29,7 +27,6 @@ impl LivePoolOpenGuard {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl Drop for LivePoolOpenGuard {
     fn drop(&mut self) {
         if self.armed
@@ -52,18 +49,9 @@ pub(super) fn connect(
     shape: &KeyShape,
     tls_config: &super::super::tcp::ClientTlsConfig,
     lanes: usize,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] pool: Option<
-        Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
-    >,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] metrics: Option<
-        Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>,
-    >,
-    #[cfg(all(
-        any(test, feature = "test-utils"),
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
-    local_fixture: Option<bool>,
+    pool: Option<Arc<super::super::nvmeof::live_pool::LiveControllerPool>>,
+    metrics: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>>,
+    #[cfg(any(test, feature = "test-utils"))] local_fixture: Option<bool>,
 ) -> Result<Connections, LocalDbError> {
     let started = Instant::now();
     let mut jobs: Vec<_> = config
@@ -88,7 +76,6 @@ pub(super) fn connect(
                 "owner and coordinator data-plane modes differ",
             ));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let client = {
             let mut client = client;
             let pool = pool
@@ -103,11 +90,7 @@ pub(super) fn connect(
                 .map_err(LocalDbError::component)?;
             // Select the ordinary-file fixture before any live I/O, including
             // WAL replay during open.
-            #[cfg(all(
-                any(test, feature = "test-utils"),
-                feature = "experimental-nvmeof",
-                target_os = "linux"
-            ))]
+            #[cfg(any(test, feature = "test-utils"))]
             if let Some(buffered) = local_fixture {
                 client.bench_local_live_fixture(buffered);
             }
@@ -134,18 +117,9 @@ impl ReadSetup {
         config: RemoteDatabaseConfig,
         shape: KeyShape,
         tls_config: super::super::tcp::ClientTlsConfig,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] pool: Option<
-            Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
-        >,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] metrics: Option<
-            Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>,
-        >,
-        #[cfg(all(
-            any(test, feature = "test-utils"),
-            feature = "experimental-nvmeof",
-            target_os = "linux"
-        ))]
-        local_fixture: Option<bool>,
+        pool: Option<Arc<super::super::nvmeof::live_pool::LiveControllerPool>>,
+        metrics: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>>,
+        #[cfg(any(test, feature = "test-utils"))] local_fixture: Option<bool>,
     ) -> Result<Self, LocalDbError> {
         let thread = thread::Builder::new()
             .name("wal-read-setup".to_owned())
@@ -155,15 +129,9 @@ impl ReadSetup {
                     &shape,
                     &tls_config,
                     config.effective_read_lanes(),
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     pool,
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     metrics,
-                    #[cfg(all(
-                        any(test, feature = "test-utils"),
-                        feature = "experimental-nvmeof",
-                        target_os = "linux"
-                    ))]
+                    #[cfg(any(test, feature = "test-utils"))]
                     local_fixture,
                 )
             })

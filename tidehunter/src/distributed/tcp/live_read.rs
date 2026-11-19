@@ -40,7 +40,7 @@ use crate::distributed::nvmeof::live_storage::{
 use crate::distributed::remote_db::ReadTraceChild;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -168,13 +168,8 @@ const EINTR_RETRIES: usize = 64;
 pub(crate) struct LiveReadWaker(Arc<OwnedFd>);
 impl LiveReadWaker {
     pub(crate) fn new() -> Result<Self, TcpError> {
-        // SAFETY: eventfd takes no pointer arguments; a failure is checked.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(TcpError::component(std::io::Error::last_os_error()));
-        }
-        // SAFETY: `fd` was just created and nothing else owns it.
-        Ok(Self(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) })))
+        let fd = crate::distributed::sys::eventfd().map_err(TcpError::component)?;
+        Ok(Self(Arc::new(fd)))
     }
     /// Makes the next or current `wait` return. Wakes coalesce. `Err` means the
     /// eventfd failed: the notification may be lost, so the caller must stop

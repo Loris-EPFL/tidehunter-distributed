@@ -102,22 +102,24 @@ def check(profile, env):
     if profile == "format":
         cargo(env, "fmt", "--all", "--", "--check")
     elif profile == "lint":
-        for features in ((), ("--features", "experimental-nvmeof,test-utils")):
+        for features in ((), ("--features", "experimental-distributed,test-utils")):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "tidehunter-fabric", "--all-targets", "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--", "-D", "warnings")
     elif profile == "native":
         cargo(env, "test", "-p", "tidehunter")
     elif profile == "distributed":
-        cargo(env, "test", "-p", "tidehunter", "--features", "experimental-nvmeof,test-utils")
-        cargo(env, "test", "-p", "kv-research", "--features", "nvmeof,test-utils")
+        cargo(env, "test", "-p", "tidehunter", "--features", "experimental-distributed,test-utils")
+        cargo(env, "test", "-p", "kv-research", "--features", "test-utils")
     elif profile == "fabric":
         fabric = fabric_environment(env)
         cargo(fabric, "clippy", "-p", "tidehunter", "--all-targets", "--features",
-              "experimental-nvmeof,experimental-fabric", "--", "-D", "warnings")
+              "experimental-distributed,experimental-fabric", "--", "-D", "warnings")
+        cargo(fabric, "clippy", "-p", "kv-research", "--all-targets", "--features",
+              "fabric", "--", "-D", "warnings")
         for package, features in (("tidehunter-fabric", "native"),
-                                  ("tidehunter", "experimental-nvmeof,experimental-fabric,test-utils"),
-                                  ("kv-research", "nvmeof,fabric,test-utils")):
+                                  ("tidehunter", "experimental-distributed,experimental-fabric,test-utils"),
+                                  ("kv-research", "fabric,test-utils")):
             cargo(fabric, "clippy", "-p", package, "--all-targets", "--features", features,
                   "--", "-D", "warnings")
             cargo(fabric, "test", "-p", package, "--features", features)

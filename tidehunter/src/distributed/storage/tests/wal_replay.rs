@@ -187,10 +187,6 @@ fn wal_replay_read_authority_decodes_member_from_wal_after_eviction() {
 #[test]
 fn replay_page_walks_groups_skip_markers_and_fragments_in_order() {
     for live in [false, true] {
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        if live {
-            continue;
-        }
         let temp = tempdir::TempDir::new("wal-replay-pages").unwrap();
         let mut config = config(vec![3], 3);
         config.fragment_bytes = 4096;
@@ -201,16 +197,12 @@ fn replay_page_walks_groups_skip_markers_and_fragments_in_order() {
             config.group_limits.max_encoded_bytes = 4088;
         }
         let path = temp.path().join("stream");
-        #[cfg(feature = "experimental-nvmeof")]
         let log = if live {
             PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap()
         } else {
             PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap()
         };
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
         let mut receipts = Vec::new();
-        #[cfg(feature = "experimental-nvmeof")]
         if live {
             use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
             for n in 0..10 {
@@ -289,14 +281,11 @@ fn replay_page_walks_groups_skip_markers_and_fragments_in_order() {
             assert!(erased);
         }
         drop(log);
-        #[cfg(feature = "experimental-nvmeof")]
         let log = if live {
             PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap()
         } else {
             PartitionLog::recover_sealed(&path, &config, metrics()).unwrap()
         };
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let log = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
         let mut cursor = 0;
         let mut replayed = Vec::new();
         let before_decodes = log.replay_decodes.load(Ordering::Relaxed);
@@ -553,7 +542,6 @@ fn wal_replay_persists_synced_end_without_advancing_scan_fragment() {
     );
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn wal_replay_live_scan_stops_before_a_later_valid_fragment() {
     let temp = tempdir::TempDir::new("wal-live-stop").unwrap();
@@ -586,7 +574,6 @@ fn wal_replay_live_scan_stops_before_a_later_valid_fragment() {
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn position_proof_rejects_allocated_but_uncompleted_owner_rpc_bytes() {
     let temp = tempdir::TempDir::new("position-owner-frontier").unwrap();
@@ -644,7 +631,6 @@ fn position_root_can_advance_without_another_file_barrier() {
     assert_eq!(root.generation, generation + 1);
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn position_recheck_rejects_a_direct_lifecycle_change_during_data_sync() {
     let temp = tempdir::TempDir::new("position-lifecycle-recheck").unwrap();

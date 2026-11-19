@@ -17,7 +17,6 @@ pub struct CheckpointPositionProof {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetirementResult {
     Completed,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     Busy,
 }
 
@@ -132,7 +131,6 @@ impl Client {
     ) -> Result<(), TcpError> {
         match self.retire_files_if_idle(authority_epoch, epoch, files)? {
             RetirementResult::Completed => Ok(()),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             RetirementResult::Busy => Err(TcpError::new("retirement controller is in use")),
         }
     }
@@ -152,7 +150,6 @@ impl Client {
         {
             return Err(TcpError::new("invalid retained WAL retirement decision"));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(pool) = &self.live_pool
             && pool
                 .evict_files(

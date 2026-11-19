@@ -59,7 +59,6 @@ fn owner_deadline_close_names_the_expired_request_to_the_client() {
     );
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn session_and_node_use_the_same_stream_class_for_every_wal_request() {
     use crate::distributed::durability::DurabilityTier;
@@ -149,7 +148,6 @@ fn session_and_node_use_the_same_stream_class_for_every_wal_request() {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn seal_fence_and_retirement_wait_for_active_position_proofs() {
     use crate::distributed::durability::DurabilityTier;
@@ -297,7 +295,6 @@ fn position_and_control_admission_keep_the_existing_session_bound() {
     assert!(bytes <= SESSION_BYTES);
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn lease_triggers_file_preparation_and_fence_joins_its_worker() {
     use crate::distributed::durability::DurabilityTier;

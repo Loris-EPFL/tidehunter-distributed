@@ -8,7 +8,6 @@
 //! the ordinary-file LiveIo fixture: a commissioned fixture target per owner,
 //! the production leased worker, real frame I/O and CRC checks, and no kernel
 //! controller or NVMe device.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::*;
 use crate::distributed::codec::BatchLimits;
@@ -50,6 +49,58 @@ pub(super) fn live_config(tier: DurabilityTier) -> LiveClientConfig {
         polled_writes: false,
         inline_reads: true,
         queue_geometry: Default::default(),
+    }
+}
+
+/// Fixture coordinator configuration at the native tier, with no endpoints.
+pub(super) fn coordinator_config(
+    owner_count: usize,
+    max_batches: usize,
+    group_max_batches: u32,
+    tls: TlsFiles,
+) -> RemoteDatabaseConfig {
+    RemoteDatabaseConfig {
+        storage: LocalInventoryConfig {
+            database: [71; 16],
+            partitions: (0..owner_count as u32).collect(),
+            batch_limits: BatchLimits {
+                max_operations: 4,
+                max_encoded_bytes: 2048,
+            },
+            group_limits: GroupLimits {
+                max_batches: group_max_batches,
+                max_encoded_bytes: 4088,
+            },
+            fragment_bytes: 4096,
+            wal_file_bytes: 8192,
+            max_batches_per_partition: max_batches,
+            max_reference_metadata_bytes: 1024 * 1024,
+            max_epochs: 8,
+        },
+        endpoints: Vec::new(),
+        tls,
+        // Five-node startup/replay shares disk and CPU with the full suite.
+        // This is a bounded liveness guard, not a latency assertion.
+        timeout: Duration::from_secs(30),
+        max_admitted_batches: max_batches,
+        max_index_bytes: 1024 * 1024,
+        max_pending_batches: 64,
+        max_pending_bytes: 1024 * 1024,
+        replay_limits: Default::default(),
+        owner_append_occupancy: DEFAULT_OWNER_APPEND_OCCUPANCY,
+        pipelined_writes: true,
+        leased_submit_redrain: true,
+        read_cache_bytes: 64 * 1024,
+        index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
+        read_memory_allowance_bytes: 512 * 1024 * 1024,
+        scan_prefetch_pages: 2,
+        read_lanes: Some(2),
+        pin_read_lanes: false,
+        max_pending_reads: 256,
+        max_pending_read_bytes: 64 * 1024 * 1024,
+        write_profile_limit: 0,
+        live_nvme: live_config(DurabilityTier::Native),
+        durable_cut: Default::default(),
     }
 }
 
@@ -155,55 +206,18 @@ impl Fixture {
         let tier = DurabilityTier::Native;
         let certs = tls_material::TestCertificates::generate(&temp.path().join("tls"), owner_count)
             .unwrap();
-        let mut config = RemoteDatabaseConfig {
-            storage: LocalInventoryConfig {
-                database: [71; 16],
-                partitions: (0..owner_count as u32).collect(),
-                batch_limits: BatchLimits {
-                    max_operations: 4,
-                    max_encoded_bytes: 2048,
-                },
-                group_limits: GroupLimits {
-                    max_batches: group_max_batches,
-                    max_encoded_bytes: 4088,
-                },
-                fragment_bytes: 4096,
-                wal_file_bytes: 8192,
-                max_batches_per_partition: max_batches,
-                max_reference_metadata_bytes: 1024 * 1024,
-                max_epochs: 8,
-            },
-            endpoints: Vec::new(),
-            tls: TlsFiles {
+        let mut config = coordinator_config(
+            owner_count,
+            max_batches,
+            group_max_batches,
+            TlsFiles {
                 transport: Default::default(),
                 ca: certs.ca.clone(),
                 cert: certs.authority.certificate.clone(),
                 key: certs.authority.private_key.clone(),
                 server_name: String::new(),
             },
-            // Five-node startup/replay shares disk and CPU with the full suite.
-            // This is a bounded liveness guard, not a latency assertion.
-            timeout: Duration::from_secs(30),
-            max_admitted_batches: max_batches,
-            max_index_bytes: 1024 * 1024,
-            max_pending_batches: 64,
-            max_pending_bytes: 1024 * 1024,
-            replay_limits: Default::default(),
-            owner_append_occupancy: DEFAULT_OWNER_APPEND_OCCUPANCY,
-            pipelined_writes: true,
-            leased_submit_redrain: true,
-            read_cache_bytes: 64 * 1024,
-            index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
-            read_memory_allowance_bytes: 512 * 1024 * 1024,
-            scan_prefetch_pages: 2,
-            read_lanes: Some(2),
-            pin_read_lanes: false,
-            max_pending_reads: 256,
-            max_pending_read_bytes: 64 * 1024 * 1024,
-            write_profile_limit: 0,
-            live_nvme: live_config(tier),
-            durable_cut: Default::default(),
-        };
+        );
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut nodes = Vec::new();

@@ -213,7 +213,7 @@ pub(super) fn reservation(
 }
 
 // The reservation input comes from a prepared leased configuration.
-#[cfg(all(test, feature = "nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

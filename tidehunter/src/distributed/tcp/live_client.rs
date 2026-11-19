@@ -3,24 +3,14 @@
 use super::LiveQueueGeometry;
 use serde::{Deserialize, Serialize};
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use std::time::Instant;
 
-#[cfg(all(
-    any(test, feature = "test-utils"),
-    feature = "experimental-nvmeof",
-    target_os = "linux"
-))]
+#[cfg(any(test, feature = "test-utils"))]
 static BENCH_LOCAL_BUFFERED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(all(
-    any(test, feature = "test-utils"),
-    feature = "experimental-nvmeof",
-    target_os = "linux"
-))]
+#[cfg(any(test, feature = "test-utils"))]
 fn bench_open_local_file(
     path: &std::path::Path,
     bytes: u64,
@@ -117,7 +107,6 @@ impl LiveClientConfig {
         }
     }
 
-    #[cfg(any(test, all(feature = "experimental-nvmeof", target_os = "linux")))]
     fn for_owner(&self, partition: u32) -> Result<std::borrow::Cow<'_, Self>, &'static str> {
         if self.owner_identities.is_empty() {
             return Ok(std::borrow::Cow::Borrowed(self));
@@ -194,7 +183,6 @@ impl LiveClientConfig {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) struct LiveWriteQueue {
     target: crate::distributed::nvmeof::live_connect::LiveConnectTarget,
     io: crate::distributed::nvmeof::live_io::LiveIo,
@@ -206,19 +194,17 @@ pub(crate) struct LiveWriteQueue {
     drain_pause: Option<WriteDrainPause>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct FailedWriteAccounting {
     before: crate::distributed::nvmeof::live_io::LiveIoStats,
     counters: std::sync::Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeCounters>,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 struct WriteDrainPause {
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LiveWriteQueue {
     /// The caller owns this detached queue, not the client mutex, while waiting.
     pub(crate) fn drain_failed(&mut self) -> Result<(), super::TcpError> {
@@ -266,7 +252,6 @@ impl LiveWriteQueue {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl Drop for LiveWriteQueue {
     fn drop(&mut self) {
         // Direct Client drop also retains DMA to terminal retirement. Worker
@@ -278,7 +263,6 @@ impl Drop for LiveWriteQueue {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
 struct LeasedPrefix {
     end: u64,
@@ -286,7 +270,6 @@ struct LeasedPrefix {
     digest: [u8; 32],
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy)]
 struct PendingAdoption {
     through: u64,
@@ -295,7 +278,6 @@ struct PendingAdoption {
     target: PendingTarget,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingTarget {
     Current,
@@ -303,7 +285,6 @@ enum PendingTarget {
     Prelease,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct ExtentState {
     lease: super::LiveLeased,
     cursor: u64,
@@ -316,7 +297,6 @@ struct ExtentState {
     prefixes: std::collections::VecDeque<LeasedPrefix>,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct LeasedFlight {
     id: u64,
     start: u64,
@@ -331,14 +311,12 @@ struct LeasedFlight {
     frame_len: usize,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) enum LeasedSubmit {
     Submitted(u64),
     Deferred(Vec<super::CompleteBatch>),
 }
 
 /// The existing per-owner worker owns this state, with no additional lock.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Default)]
 pub(super) struct LeasedWriter {
     current: Option<ExtentState>,
@@ -377,7 +355,6 @@ pub(super) struct LeasedWriter {
     largest_close_profile: super::AdoptProfile,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LiveWriteQueue {
     fn matches(
         &self,
@@ -396,7 +373,6 @@ impl LiveWriteQueue {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn record_write_io(
     counters: &crate::distributed::nvmeof::live_metrics::LiveNvmeCounters,
     before: &crate::distributed::nvmeof::live_io::LiveIoStats,
@@ -439,7 +415,6 @@ fn record_write_io(
 /// How many queued append groups one leased frame can carry. One frame has one
 /// extent allocation, one NVMe write and one adoption record, so merging queued
 /// groups divides all three by the merge factor.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LiveGroupBudget {
     max_batches: usize,
@@ -447,7 +422,6 @@ pub(crate) struct LiveGroupBudget {
     max_frame: usize,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LiveGroupBudget {
     /// Size of an empty group: header only.
     pub(crate) const EMPTY_PAYLOAD: usize = crate::distributed::group::GROUP_HEADER_LEN;
@@ -473,7 +447,6 @@ impl LiveGroupBudget {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl super::Client {
     pub(crate) fn live_group_budget(&self) -> LiveGroupBudget {
         LiveGroupBudget {
@@ -519,7 +492,6 @@ impl super::Client {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl super::Client {
     pub(crate) fn set_live_pool(
         &mut self,
@@ -667,7 +639,6 @@ impl super::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn io_timings_use_retired_cq_and_submission_counts() {
         use crate::distributed::nvmeof::{live_io::LiveIoStats, live_metrics::LiveNvmeMetrics};
@@ -705,7 +676,6 @@ mod tests {
         assert_eq!((counts.cq_ns, counts.cq_samples), (34, 2));
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn local_file_reuses_write_queue_with_per_group_stats() {
         use crate::distributed::nvmeof::{
@@ -882,7 +852,6 @@ mod tests {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LeasedWriter {
     fn install(&mut self, leased: super::LiveLeased, expected: &super::PartitionConfig) {
         // Client.expected is the immutable handshake identity. Retain one config
@@ -928,7 +897,6 @@ impl LeasedWriter {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl ExtentState {
     fn validate_adoption(
         &mut self,
@@ -983,7 +951,6 @@ impl ExtentState {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl super::Client {
     fn install_leased_extent(&mut self, leased: super::LiveLeased) -> Result<(), super::TcpError> {
         if !self.valid_live_extent(&leased, leased.extent.segment.epoch) {
@@ -2417,7 +2384,7 @@ impl super::Client {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 pub(crate) mod leased_tests {
     use super::*;
     use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
@@ -2807,7 +2774,7 @@ pub(crate) mod leased_tests {
         }
     }
 
-    #[cfg(feature = "test-utils")]
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
     #[test]
     fn mapped_residency_probe_accepts_closed_leased_extent() {
         let fixture = Fixture::new(DurabilityTier::Native, 16384);
@@ -5087,11 +5054,7 @@ pub(crate) mod leased_tests {
     }
 }
 
-#[cfg(all(
-    any(test, feature = "test-utils"),
-    feature = "experimental-nvmeof",
-    target_os = "linux"
-))]
+#[cfg(any(test, feature = "test-utils"))]
 impl super::Client {
     pub(crate) fn bench_local_live_fixture(&mut self, buffered: bool) {
         self.live_write_local_fixture = true;
@@ -5099,7 +5062,7 @@ impl super::Client {
         BENCH_LOCAL_BUFFERED.store(buffered, std::sync::atomic::Ordering::Relaxed);
     }
 }
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 impl super::Client {
     pub(crate) fn leased_test_frontier(&self) -> (u64, bool, bool) {
         (
@@ -5238,7 +5201,7 @@ impl super::Client {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 impl super::StorageNode {
     pub(crate) fn bench_open_live_fixture(
         config: super::NodeConfig,
@@ -5262,7 +5225,7 @@ impl super::StorageNode {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod leased_rollover_tests {
     use super::*;
     use crate::distributed::durability::DurabilityTier;

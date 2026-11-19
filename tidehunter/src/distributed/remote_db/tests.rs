@@ -1,5 +1,3 @@
-//! Every Fixture case opens the leased live fixture, so the module needs nvmeof.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::pipeline_tests::Fixture;
 use super::*;
 
@@ -42,6 +40,90 @@ fn checkpoint_tail(db: &RemoteDatabase) -> (usize, usize) {
         publisher.checkpoint_tail_bytes,
     )
 }
+
+/// Config and named error of the off-Linux open tests. Those tests compile and
+/// run only off Linux; on this Linux workstation they are checked by
+/// `cargo check --tests --target x86_64-apple-darwin` and never executed.
+#[cfg(not(target_os = "linux"))]
+fn off_linux_open() -> (RemoteDatabaseConfig, KeyShape, String) {
+    let config = super::pipeline_tests::coordinator_config(
+        1,
+        16,
+        2,
+        TlsFiles {
+            transport: Default::default(),
+            ca: std::path::PathBuf::new(),
+            cert: std::path::PathBuf::new(),
+            key: std::path::PathBuf::new(),
+            server_name: String::new(),
+        },
+    );
+    let shape = KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1));
+    let expected = format!(
+        "distributed route requires Linux (leased NVMe-oF): {}",
+        std::env::consts::OS
+    );
+    (config, shape, expected)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn remote_open_off_linux_fails_with_named_error() {
+    let temp = tempdir::TempDir::new("remote-open-off-linux").unwrap();
+    let path = temp.path().join("coordinator");
+    let (config, shape, expected) = off_linux_open();
+    let Err(error) = RemoteDatabase::open(&path, &shape, config, recovery_metrics()) else {
+        panic!("remote open succeeded off Linux");
+    };
+    assert!(error.to_string().contains(&expected), "{error}");
+    assert!(
+        !path.exists(),
+        "the refused open must not create its directory"
+    );
+}
+
+/// The Sui entry point refuses before API capture: with capture enabled, the
+/// error is still the named one and no capture file is created. Capture state
+/// is process-wide, so the open runs in a child test process.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn sui_open_remote_off_linux_fails_before_capture() {
+    let root = tempdir::TempDir::new("sui-open-off-linux").unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "distributed::remote_db::tests::sui_open_remote_off_linux_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SUI_TH_KV_CAPTURE_DIR", root.path().join("trace"))
+        .env("SUI_CAPTURE_TEST_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.path().join("trace").exists());
+    assert!(!root.path().join("coordinator").exists());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+#[ignore = "subprocess fixture used by sui_open_remote_off_linux_fails_before_capture"]
+fn sui_open_remote_off_linux_child() {
+    let root = std::path::PathBuf::from(std::env::var_os("SUI_CAPTURE_TEST_ROOT").unwrap());
+    let (config, shape, expected) = off_linux_open();
+    let Err(error) =
+        crate::distributed::sui::Db::open_remote(&root.join("coordinator"), shape, config)
+    else {
+        panic!("Sui remote open succeeded off Linux");
+    };
+    let error = format!("{error:?}");
+    assert!(error.contains(&expected), "{error}");
+}
+
 #[test]
 fn read_lanes_default_to_parallelism_and_validate_bounds() {
     let fixture = Fixture::new();
@@ -853,7 +935,6 @@ fn explicit_cache_host_slice_accepts_large_budgets_and_rejects_overflow() {
     assert!(config.validate().is_err());
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn live_frame_can_fill_one_fragment() {
     let fixture = Fixture::new();

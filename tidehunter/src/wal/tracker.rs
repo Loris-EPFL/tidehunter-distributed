@@ -47,12 +47,12 @@ pub struct WalGuardMaker {
 /// A cross-thread external allocation pin. Only validated adoption may release
 /// it. Dropping it without release stops the tracker rather than advancing its
 /// processed frontier across an uncertain WAL hole.
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 pub(crate) struct ExternalWalGuard {
     release: mpsc::Sender<()>,
 }
 
-#[cfg(feature = "experimental-nvmeof")]
+#[cfg(feature = "experimental-distributed")]
 impl ExternalWalGuard {
     pub(crate) fn release(self) -> Result<(), std::sync::mpsc::SendError<()>> {
         self.release.send(())
@@ -131,7 +131,7 @@ enum WalTrackerMessage {
         mutex: Arc<Mutex<()>>,
         result: AllocationResult,
     },
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     ExternalAllocation {
         release: mpsc::Receiver<()>,
         result: AllocationResult,
@@ -208,7 +208,7 @@ impl WalTracker {
         }
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn allocated_external(
         &self,
         result: AllocationResult,
@@ -227,7 +227,7 @@ impl WalTracker {
         Ok(ExternalWalGuard { release })
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn ensure_external_file(
         &self,
         id: super::position::WalFileId,
@@ -235,7 +235,7 @@ impl WalTracker {
         self.mapper.ensure_external_file(id)
     }
 
-    #[cfg(feature = "experimental-nvmeof")]
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn external_file_preparer(&self) -> super::mapper::ExternalFilePreparer {
         self.mapper.external_file_preparer()
     }
@@ -392,7 +392,7 @@ impl WalTrackerThread {
                         self.publish();
                     }
                 }
-                #[cfg(feature = "experimental-nvmeof")]
+                #[cfg(feature = "experimental-distributed")]
                 WalTrackerMessage::ExternalAllocation { release, result } => {
                     // Disconnect means the external write is unknown. Never
                     // advance or finalize a fragment across that allocation.

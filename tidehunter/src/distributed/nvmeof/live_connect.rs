@@ -4,6 +4,7 @@
 pub use super::LiveQueueGeometry;
 use super::NvmeofTransport;
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
+use crate::distributed::sys;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
@@ -106,7 +107,7 @@ fn parse_cpu_list(list: &str) -> io::Result<Vec<usize>> {
             .parse::<usize>()
             .map_err(|_| invalid("invalid CPU index"))?;
         // Bound expansion to the mask supported by pin_current_thread.
-        if start > end || end >= libc::CPU_SETSIZE as usize {
+        if start > end || end >= sys::affinity_cpu_limit() {
             return Err(invalid("CPU range outside affinity mask"));
         }
         cpus.extend(start..=end);
@@ -118,30 +119,8 @@ fn parse_cpu_list(list: &str) -> io::Result<Vec<usize>> {
 
 /// Pin only the calling thread. Failure leaves its existing affinity unchanged.
 pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
-    let path = Path::new("/proc/thread-self");
-    if cpu >= libc::CPU_SETSIZE as usize {
-        return Err(with_context(
-            "set thread affinity",
-            path,
-            invalid("CPU outside affinity mask"),
-        ));
-    }
-    // SAFETY: cpu is inside cpu_set_t's bounds; the initialized mask lives for
-    // the whole syscall. pid 0 changes only the calling thread's affinity.
-    let result = unsafe {
-        let mut mask: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut mask);
-        libc::CPU_SET(cpu, &mut mask);
-        libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask)
-    };
-    if result != 0 {
-        return Err(with_context(
-            "set thread affinity",
-            path,
-            io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
+    sys::set_thread_affinity(cpu)
+        .map_err(|error| with_context("set thread affinity", Path::new("/proc/thread-self"), error))
 }
 
 /// A sysfs attribute read during controller teardown can return ENODEV, which
@@ -566,7 +545,7 @@ fn lock_controller_disks(
             }
         };
         let rdev = disk.metadata()?.rdev();
-        if format!("{}:{}", libc::major(rdev), libc::minor(rdev)) == dev {
+        if sys::device_number(rdev) == dev {
             opened.push((rdev, path, disk));
         }
     }
@@ -1136,9 +1115,7 @@ impl LiveNamespaceResolver {
                     || OpenOptions::new().read(true).open(&path),
                 )?;
                 let meta = file.metadata()?;
-                if !meta.file_type().is_block_device()
-                    || format!("{}:{}", libc::major(meta.rdev()), libc::minor(meta.rdev())) != dev
-                {
+                if !meta.file_type().is_block_device() || sys::device_number(meta.rdev()) != dev {
                     return Err(invalid("namespace device number mismatch"));
                 }
                 if access == LiveNamespaceAccess::ReadOnly {
@@ -1251,11 +1228,7 @@ impl LiveController {
             },
         )?;
         let metadata = file.metadata()?;
-        let device = format!(
-            "{}:{}",
-            libc::major(metadata.rdev()),
-            libc::minor(metadata.rdev())
-        );
+        let device = sys::device_number(metadata.rdev());
         if !metadata.file_type().is_char_device() || device != attr(&self.pinned().join("dev"))? {
             return Err(invalid("controller device number mismatch"));
         }
@@ -1402,7 +1375,7 @@ mod tests {
             assert!(parse_cpu_list(invalid).is_err(), "{invalid:?}");
         }
         assert!(parse_cpu_list(&format!("0-{}", usize::MAX)).is_err());
-        assert!(parse_cpu_list(&libc::CPU_SETSIZE.to_string()).is_err());
+        assert!(parse_cpu_list(&sys::affinity_cpu_limit().to_string()).is_err());
     }
 
     #[test]

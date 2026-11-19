@@ -26,7 +26,7 @@ impl CoreCompletion {
         );
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     fn new(core: &Arc<WriteCore>) -> Self {
         let completion = Self::unbound();
         completion.bind(core);
@@ -79,7 +79,6 @@ pub(crate) enum DrainStop {
 impl DrainStop {
     pub(crate) const COUNT: usize = 5;
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn live(self) -> crate::distributed::nvmeof::live_metrics::OwnerDrainStop {
         use crate::distributed::nvmeof::live_metrics::OwnerDrainStop;
         match self {
@@ -191,7 +190,7 @@ impl Drop for GroupCompletion {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::distributed::remote_db::pipeline_tests::Fixture;

@@ -86,7 +86,7 @@ impl OwnerSender {
         }
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub fn observe_full_park(&self, entered: mpsc::SyncSender<()>) {
         *self.capacity.full_park.lock() = Some(entered);
     }
@@ -174,7 +174,6 @@ impl OwnerReceiver {
 
     /// `park_full` for a worker that must still drive a pending leased
     /// adoption and its deadline: wake after `timeout` at the latest.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn park_full_timeout(&self, timeout: Duration) {
         self.note_full_park();
         thread::park_timeout(timeout);
@@ -236,7 +235,6 @@ impl OwnerReceiver {
     }
 
     /// Only the leased worker loop waits with a deadline on the control channel.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn recv_timeout(
         &self,
         timeout: Duration,
@@ -365,7 +363,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn control_handles_preserve_closed_and_deadline_admission_errors() {
         use crate::distributed::remote_db::pipeline_tests::Fixture;
         use std::sync::atomic::{AtomicBool, Ordering};

@@ -75,7 +75,6 @@ fn metrics() -> Arc<Metrics> {
     Metrics::new_in_enabled(&prometheus::Registry::new(), false)
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 fn live_config() -> PartitionConfig {
     let mut config = config(vec![3], 3);
     config.group_limits.max_encoded_bytes = 4088;
@@ -87,7 +86,6 @@ fn live_config() -> PartitionConfig {
 /// Leased-route position for a frame of `span` bytes: the open extent when the
 /// frame fits, otherwise the next extent after closing the open one behind a
 /// skip marker (or exactly at its end).
-#[cfg(feature = "experimental-nvmeof")]
 fn live_fixture_extent(
     log: &PartitionLog,
     config: &PartitionConfig,
@@ -124,7 +122,6 @@ fn live_fixture_extent(
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 fn write_live_fixture(
     extent: &crate::distributed::nvmeof::live_storage::LiveWriteExtent,
     offset: u64,
@@ -140,7 +137,6 @@ fn write_live_fixture(
 
 /// Write one single-batch live frame on the leased route and adopt it, closing
 /// the extent when the frame fills it. Returns the adopted receipt.
-#[cfg(feature = "experimental-nvmeof")]
 fn append_live_fixture(log: &PartitionLog, config: &PartitionConfig, n: u64) -> AppendedBatch {
     use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
     let group = CompleteGroup::new_live(
@@ -168,7 +164,6 @@ fn append_live_fixture(log: &PartitionLog, config: &PartitionConfig, n: u64) -> 
 
 /// Live geometry whose fragment holds several 4 KiB frames, so the syncer can
 /// defer the root within a fragment.
-#[cfg(feature = "experimental-nvmeof")]
 fn live_multi_frame_config() -> PartitionConfig {
     let mut config = live_config();
     config.fragment_bytes = 64 * 1024;
@@ -176,14 +171,12 @@ fn live_multi_frame_config() -> PartitionConfig {
     config
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 fn live_root_end(path: &Path) -> u64 {
     read_metadata::<LiveFrontier>(&path.join(LIVE_FRONTIER))
         .unwrap()
         .end
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 fn live_log_for(
     path: &Path,
     config: &PartitionConfig,
@@ -195,7 +188,6 @@ fn live_log_for(
     log
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 const TIERS: [crate::distributed::durability::DurabilityTier; 2] = [
     crate::distributed::durability::DurabilityTier::Native,
     crate::distributed::durability::DurabilityTier::Synchronous,
@@ -204,7 +196,6 @@ const TIERS: [crate::distributed::durability::DurabilityTier; 2] = [
 /// The syncer syncs the WAL but defers the root inside a fragment (WAL-replay
 /// history, the only history). A crash recovers every synced frame by
 /// scanning past the root.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn syncer_defers_live_root_and_recovers_by_scan() {
     for tier in TIERS {
@@ -235,7 +226,6 @@ fn syncer_defers_live_root_and_recovers_by_scan() {
 /// Crash at every step of the explicit root catch-up after a deferral: the
 /// failed barrier reports an unknown outcome, and recovery still finds every
 /// synced frame whichever root (old or new) survived.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn live_root_catch_up_crash_cuts_recover_every_synced_frame() {
     for tier in TIERS {
@@ -272,7 +262,6 @@ fn live_root_catch_up_crash_cuts_recover_every_synced_frame() {
 
 /// A fragment crossing installs the root even under the bounded policy, and
 /// only that install reports durable progress.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn syncer_installs_live_root_on_fragment_crossing() {
     let temp = tempdir::TempDir::new("live-root-crossing").unwrap();
@@ -306,7 +295,6 @@ fn syncer_installs_live_root_on_fragment_crossing() {
 /// Recovery leaves no unsynced data and no root debt, so none of them may need
 /// a live tail. A second recovery proves these operations leave the stream
 /// recoverable.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn recovered_live_log_serves_recovery_barriers_after_abrupt_crash() {
     use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
@@ -368,7 +356,6 @@ fn recovered_live_log_serves_recovery_barriers_after_abrupt_crash() {
 
 /// With a lagging root, recovery scans forward and stops at the first invalid
 /// frame beyond it (a torn tail), keeping every valid frame before it.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn lagging_live_root_recovery_stops_at_first_invalid_frame() {
     for tier in TIERS {
@@ -392,7 +379,6 @@ fn lagging_live_root_recovery_stops_at_first_invalid_frame() {
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 fn version(config: &PartitionConfig, sequence: u64) -> BatchVersion {
     BatchVersion {
         epoch: config.inventory.epoch,
@@ -402,7 +388,6 @@ fn version(config: &PartitionConfig, sequence: u64) -> BatchVersion {
 
 /// Overwrite the CRC-covered start of `receipt`'s frame and sync the file. The
 /// first WAL file is the only directory entry of the full file size.
-#[cfg(feature = "experimental-nvmeof")]
 fn tear_live_frame(path: &Path, config: &PartitionConfig, receipt: AppendedBatch) {
     let wal = fs::read_dir(path)
         .unwrap()
@@ -426,7 +411,6 @@ fn tear_live_frame(path: &Path, config: &PartitionConfig, receipt: AppendedBatch
 /// nudge barrier rooted and reported all three frames (a cut `next = 3`), the
 /// same corruption of the middle frame is fatal at recovery: certified batches
 /// are never dropped silently. Each run stops abruptly, without a barrier.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn durable_progress_covers_only_the_rooted_prefix_and_recovery_enforces_it() {
     for tier in TIERS {
@@ -494,7 +478,6 @@ fn durable_progress_covers_only_the_rooted_prefix_and_recovery_enforces_it() {
 /// it, and installs nothing when the report is current. A recovered handle has
 /// identical byte ends and its recovery root, so its nudge needs no live tail.
 /// A stream that is not live leaves the nudge to its syncer.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn progress_nudge_roots_the_appended_prefix_once() {
     for tier in TIERS {
@@ -551,7 +534,6 @@ fn progress_nudge_roots_the_appended_prefix_once() {
 /// returns it in both tiers: Synchronous persists the WAL on demand first
 /// (one fdatasync, no root install); Native serves the page-cache copy without
 /// a sync. Either way a crash after the read recovers the batch.
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn owner_read_of_newest_batch_persists_on_demand_only_in_synchronous_tier() {
     for tier in TIERS {
@@ -594,7 +576,6 @@ fn owner_read_of_newest_batch_persists_on_demand_only_in_synchronous_tier() {
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn live_recovery_fails_on_acknowledged_corruption_even_skip_header() {
     for skip_header in [false, true] {
@@ -639,7 +620,6 @@ fn live_recovery_fails_on_acknowledged_corruption_even_skip_header() {
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn live_corrupt_frontier_is_not_treated_as_empty() {
     let temp = tempdir::TempDir::new("live-frontier-root").unwrap();
@@ -656,7 +636,6 @@ fn live_corrupt_frontier_is_not_treated_as_empty() {
     assert!(PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).is_err());
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn live_frontier_commit_failures_preserve_prior_ack_and_return_unknown() {
     for phase in 1..=3 {
@@ -711,7 +690,6 @@ fn live_frontier_commit_failures_preserve_prior_ack_and_return_unknown() {
     }
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn live_frontier_commit_uses_capture_not_later_completed_append() {
     let temp = tempdir::TempDir::new("live-frontier-capture").unwrap();
@@ -1383,7 +1361,6 @@ fn registered_value_reads_do_not_acquire_the_partition_metadata_mutex() {
 }
 
 // Owned read plans (`plan_record_read`) exist only with the live route.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn reference_metadata_budget_rejects_before_any_authority_bytes() {
     let temp = tempdir::TempDir::new("native-reference-budget").unwrap();
@@ -2069,7 +2046,6 @@ fn failed_seal_cannot_be_acknowledged_by_a_retry() {
     );
 }
 
-#[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn missing_live_registration_cannot_downgrade_frontier_recovery() {
     let temp = tempdir::TempDir::new("missing-live-registration").unwrap();
@@ -2091,8 +2067,6 @@ fn missing_live_registration_cannot_downgrade_frontier_recovery() {
 }
 
 mod conflict_index;
-#[cfg(feature = "experimental-nvmeof")]
 mod live_extent;
-#[cfg(feature = "experimental-nvmeof")]
 mod live_native;
 mod wal_replay;

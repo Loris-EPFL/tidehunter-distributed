@@ -197,7 +197,6 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
     );
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn live_resolution_rejects_forged_reference_and_stale_authority() {
     let temp = tempdir::TempDir::new("live-owner-reference").unwrap();
@@ -239,7 +238,6 @@ fn live_resolution_rejects_forged_reference_and_stale_authority() {
     assert!(node.status().is_ok());
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn unknown_live_pin_release_is_not_acknowledged() {
     let temp = tempdir::TempDir::new("live-unknown-pin").unwrap();
@@ -416,7 +414,6 @@ fn position_root_does_not_replace_read_barriers() {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_fencing {
     use super::*;
     use crate::distributed::group::CompleteGroup;
@@ -479,6 +476,7 @@ mod live_fencing {
     }
 
     /// Lease the first live extent and return its whole WAL file.
+    #[cfg(target_os = "linux")]
     fn leased_wal_file(node: &StorageNode) -> (fs::File, u64) {
         let Response::LiveLeased(leased) =
             extent_exchange(node, Request::LeaseLiveExtent { epoch: 1 })
@@ -489,6 +487,8 @@ mod live_fencing {
         (fs::File::open(&segment.path).unwrap(), segment.bytes)
     }
 
+    // FIEMAP is Linux only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn default_owner_grants_prewritten_files_without_unwritten_extents() {
         let temp = tempdir::TempDir::new("default-owner-prewrite").unwrap();
@@ -503,6 +503,7 @@ mod live_fencing {
         assert!(node.wal_prewrite_stats().0 >= bytes);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn explicit_false_owner_grants_files_with_unwritten_extents() {
         let temp = tempdir::TempDir::new("explicit-false-owner-prewrite").unwrap();
@@ -2353,7 +2354,6 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
             panic!("{name}: status reply");
         };
         assert_eq!(status.max_reads, expected, "{name}");
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             node.inventory.lock().fence_to(1).unwrap();
             let appended = node

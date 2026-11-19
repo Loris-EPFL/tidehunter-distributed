@@ -1,6 +1,5 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::*;
 use crate::distributed::remote_db::pipeline_tests::Fixture;

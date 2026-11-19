@@ -18,11 +18,9 @@ const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
 const LEGACY_EXPORT_LEASES: &str = "nvmeof-export-leases-v1";
 // Bound idle history namespaces, subsystem objects and pinned target FDs
 // independently of WAL history size. In-flight pages keep their separate pins.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
 /// The owner request that created a live export inline, while its caller
 /// waited; selects the `LiveInlineExportStats` field it counts in.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InlineExport {
     Lease,
@@ -51,21 +49,20 @@ struct Manifest {
     max_epochs: usize,
     epochs: Vec<Epoch>,
 }
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Serialize, Deserialize)]
 struct LiveTargetMarker {
     config: super::super::nvmeof::LiveTargetConfig,
     identity: super::super::nvmeof::live_target::LiveTargetIdentity,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 std::thread_local! {
     static LIVE_FIXTURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Select only configfs emulation; `open` still commissions and validates the
 /// normal durable marker while holding the node lock, before recovering WALs.
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 pub(super) fn with_live_target_fixture<R>(configfs: PathBuf, open: impl FnOnce() -> R) -> R {
     struct Reset;
     impl Drop for Reset {
@@ -78,7 +75,7 @@ pub(super) fn with_live_target_fixture<R>(configfs: PathBuf, open: impl FnOnce()
     open()
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 fn open_live_target_fixture(
     config: super::super::nvmeof::LiveTargetConfig,
     expected: Option<super::super::nvmeof::live_target::LiveTargetIdentity>,
@@ -97,12 +94,8 @@ fn open_live_target_fixture(
 }
 
 /// What the lifecycle gate owns: the live target registry when one is
-/// configured. Builds without the Linux NVMe-oF feature own nothing; the gate
-/// still serializes their epoch lifecycle.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+/// configured.
 pub(super) type LifecycleSlot = Option<super::super::nvmeof::live_target::LiveTargetManager>;
-#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-pub(super) type LifecycleSlot = ();
 
 /// The node lifecycle gate. It is the single writer of the node's durable
 /// lifecycle metadata: the epoch manifest, the set of logs, live bindings and
@@ -148,7 +141,6 @@ impl InventoryAccess for &mut NodeInventory {
 /// The configured live target of a gated lifecycle step: `None` for a node
 /// without one. A live inventory reached without its gate content (an owned
 /// inventory, or a caller that skipped the gate) is refused, never skipped.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn live_target<'a>(
     inventory: &NodeInventory,
     slot: &'a mut LifecycleSlot,
@@ -162,16 +154,13 @@ fn live_target<'a>(
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type LiveTarget = super::super::nvmeof::live_target::LiveTargetManager;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type LiveBinding = (
     super::super::nvmeof::live_storage::LiveWalSegment,
     super::super::nvmeof::live_storage::LiveTargetBinding,
     bool,
 );
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn live_file(
     segment: &super::super::nvmeof::live_storage::LiveWalSegment,
 ) -> super::super::nvmeof::live_target::LiveFileIdentity {
@@ -184,7 +173,6 @@ fn live_file(
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn export_span(
     segment: &super::super::nvmeof::live_storage::LiveWalSegment,
 ) -> super::super::owner_events::OwnerEventSpan {
@@ -197,7 +185,6 @@ fn export_span(
     )
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn revoke_span(
     segment: &super::super::nvmeof::live_storage::LiveWalSegment,
 ) -> super::super::owner_events::OwnerEventSpan {
@@ -212,7 +199,6 @@ fn revoke_span(
 
 /// Revoke claimed bindings with one fence and one cleanup pass. Runs with the
 /// inventory released and the lifecycle gate held.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn revoke_bindings<'a>(
     target: &mut LiveTarget,
     claimed: impl Iterator<Item = &'a LiveBinding>,
@@ -241,25 +227,18 @@ pub struct NodeInventory {
     incarnation: [u8; 16],
     /// Whether a live target is installed. Immutable after installation, so
     /// reading it needs no gate.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) live_target_configured: bool,
     /// Cloned out at node open. Never locked by inventory methods: callers
     /// take it before the inventory (see `LifecycleGate`).
     pub(super) lifecycle: LifecycleGate,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_shutdown: bool,
     // Keep preparation costs when fencing replaces an active log with recovery.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     retired_prewrite_bytes: u64,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     retired_prewrite_ns: u64,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     retired_prewrite_files: u64,
     // Changed only under this inventory's lock, when an export's binding is
     // installed.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) inline_exports: LiveInlineExportStats,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_bindings: BTreeMap<
         (u64, u64),
         (
@@ -269,9 +248,7 @@ pub struct NodeInventory {
         ),
     >,
     // Least recently released first; only unpinned readonly bindings enter.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     idle_history_exports: std::collections::VecDeque<(u64, u64)>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) live_pins: BTreeMap<
         [u8; 16],
         (
@@ -281,11 +258,9 @@ pub struct NodeInventory {
     >,
     // Connection pins are distinct from record/page pins. One bounded pool
     // entry owns one token until its controller is confirmed disconnected.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) live_export_pins: BTreeMap<[u8; 16], (u64, (u64, u64))>,
     // At most 1024 outstanding tokens are fenced per retained epoch. Keep
     // tombstones so only tokens actually cleared by a fence are idempotent.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fenced_export_pins: BTreeMap<[u8; 16], u64>,
     lock: Arc<DbLock>,
 }
@@ -294,13 +269,10 @@ pub struct NodeInventory {
 pub(super) struct ReaderAuthority {
     active_epoch: Option<u64>,
     logs: BTreeMap<u64, Arc<PartitionLog>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     database: [u8; 16],
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     partition: u32,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) struct ReaderSnapshot {
     pub(super) members: Vec<(Arc<PartitionLog>, ValueRecordReference)>,
 }
@@ -314,7 +286,6 @@ impl ReaderAuthority {
         self.logs.clone_from(logs);
         self.active_epoch = Some(epoch);
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn snapshot(
         &self,
         epoch: u64,
@@ -346,7 +317,6 @@ impl ReaderAuthority {
         }
         Ok(ReaderSnapshot { members })
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn active_valid(&self, epoch: u64, terminal: &AtomicBool) -> bool {
         !terminal.load(Ordering::Acquire) && self.active_epoch == Some(epoch)
     }
@@ -400,16 +370,6 @@ impl NodeInventory {
         config.root = config.root.canonicalize()?;
         let lock = Arc::new(DbLock::acquire(&config.root, Duration::ZERO)?);
         reject_legacy_owner_state(&config.root)?;
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        match fs::symlink_metadata(config.root.join(LIVE_TARGET_CONFIG)) {
-            Ok(_) => {
-                return Err(TcpError::new(
-                    "live NVMe-oF target requires recovery with the Linux NVMe-oF feature",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
         let manifest_path = config.root.join(MANIFEST);
         let mut manifest = match fs::symlink_metadata(&manifest_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
@@ -454,7 +414,6 @@ impl NodeInventory {
         }
         // Hold the node lock before revoking capabilities: another process
         // must never revoke a currently running owner's namespaces.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live_target = {
             let marker = config.root.join(LIVE_TARGET_CONFIG);
             #[cfg(not(test))]
@@ -538,7 +497,6 @@ impl NodeInventory {
                     let path = epoch_path(&config.root, epoch.epoch);
                     directory(&path)?;
                     let expected = partition_at(&config.partition, epoch.epoch);
-                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                     let log = if PartitionLog::is_live_path(&path).map_err(TcpError::component)? {
                         if live_target.is_none() {
                             return Err(TcpError::new(
@@ -553,8 +511,6 @@ impl NodeInventory {
                     } else {
                         PartitionLog::recover_sealed(&path, &expected, metrics.clone())
                     };
-                    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                    let log = PartitionLog::recover_sealed(&path, &expected, metrics.clone());
                     let log = log.map_err(TcpError::component)?;
                     if log.key_shape().to_yaml().map_err(TcpError::component)? != config.shape_yaml
                     {
@@ -573,9 +529,7 @@ impl NodeInventory {
         // down cleanly. It never resumes an old logical counter/writer epoch.
         persist(&config.root, &manifest)?;
         let readers = Arc::new(RwLock::new(ReaderAuthority {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             database: config.partition.inventory.database,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             partition: config.partition.partition,
             ..ReaderAuthority::default()
         }));
@@ -590,31 +544,17 @@ impl NodeInventory {
             readers,
             metrics,
             incarnation: super::durable_progress::new_incarnation()?,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_target_configured: live_target.is_some(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             lifecycle: Arc::new(Mutex::new(live_target)),
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            lifecycle: Arc::new(Mutex::new(())),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_shutdown: false,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             retired_prewrite_bytes: 0,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             retired_prewrite_ns: 0,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             retired_prewrite_files: 0,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             inline_exports: LiveInlineExportStats::default(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_bindings: BTreeMap::new(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             idle_history_exports: std::collections::VecDeque::new(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pins: BTreeMap::new(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_export_pins: BTreeMap::new(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             fenced_export_pins: BTreeMap::new(),
             lock,
         })
@@ -632,7 +572,6 @@ impl NodeInventory {
         self.ensure_healthy()?;
         self.status_snapshot(true)
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn recoverable_status(&self) -> Result<NodeStatus, TcpError> {
         if !self.healthy || !self.live_target_configured || self.live_shutdown {
             return Err(TcpError::new("live owner requires restart"));
@@ -664,10 +603,7 @@ impl NodeInventory {
             max_reads: 256,
             recovery_page_batches: 1024,
             polling: PollingPolicy::Adaptive,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_nvmeof: self.live_target_configured && !self.live_shutdown,
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            live_nvmeof: false,
             // The control owner holds the tier; it sets this field in its replies.
             durability_tier: super::super::durability::DurabilityTier::default(),
             incarnation: self.incarnation,
@@ -700,7 +636,6 @@ impl NodeInventory {
     }
     /// Live recovery fence after a recoverable live failure. Same gate contract
     /// as `fence`.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn fence_recoverable_live<H: InventoryAccess>(
         inventory: &mut H,
         slot: &mut LifecycleSlot,
@@ -737,7 +672,6 @@ impl NodeInventory {
         if !recovering {
             inventory.ensure_healthy()?;
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if inventory.live_shutdown {
             return Err(TcpError::new("live target has shut down; reopen required"));
         }
@@ -763,11 +697,8 @@ impl NodeInventory {
         if inventory.manifest.epochs.len() == inventory.config.max_epochs {
             return Err(TcpError::new("retained node epoch capacity reached"));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let target = live_target(inventory, slot)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live = target.is_some();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(target) = target {
             // The new authority fences the prior coordinator before any old
             // allocation is scanned or its namespace-backed pins are dropped.
@@ -795,7 +726,6 @@ impl NodeInventory {
             .filter(|e| e.state == EpochState::Active)
             .copied()
         {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             if live {
                 // Revocation and pin release above fence external writers/readers.
                 // Join the control owner's syncer too: both its slot and callback
@@ -848,11 +778,7 @@ impl NodeInventory {
             } else {
                 Self::seal_epoch(inventory, slot, old.epoch, |_| Ok(()))?;
             }
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            Self::seal_epoch(inventory, slot, old.epoch, |_| Ok(()))?;
         }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let _ = &drain_log;
         inventory.healthy = false;
         inventory.readers.write().invalidate();
         inventory.manifest.epochs.push(Epoch {
@@ -864,18 +790,14 @@ impl NodeInventory {
         let partition = partition_at(&inventory.config.partition, epoch);
         let shape = inventory.shape.clone();
         let metrics = inventory.metrics.clone();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let prewrite = inventory.config.wal_prewrite;
         let authority = inventory.lock.clone();
         let log = inventory.released(|| {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             let log = if live {
                 PartitionLog::create_live_with_prewrite(&path, partition, &shape, metrics, prewrite)
             } else {
                 PartitionLog::create(&path, partition, &shape, metrics)
             };
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            let log = PartitionLog::create(&path, partition, &shape, metrics);
             let log = Arc::new(
                 log.map_err(TcpError::component)?
                     .retain_local_authority(authority),
@@ -917,7 +839,6 @@ impl NodeInventory {
             .cloned()
             .ok_or_else(|| TcpError::new("active stream missing"))
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn live_segment_writable(
         &self,
         authority_epoch: u64,
@@ -936,7 +857,6 @@ impl NodeInventory {
     /// lifecycle gate; the claimed bindings leave `live_bindings` before the
     /// inventory is released, so no pin can attach to a namespace that is
     /// being revoked, and they return if the revocation fails.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn reap_idle_live_segments<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
@@ -982,7 +902,6 @@ impl NodeInventory {
     }
 
     /// Count one export that `kind` created inline.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn record_inline_export(&mut self, kind: InlineExport) {
         let stats = &mut self.inline_exports;
         let count = match kind {
@@ -999,7 +918,6 @@ impl NodeInventory {
     /// the export for the request `kind`. The caller holds the lifecycle gate;
     /// the export's journal syncs and configfs work run with the inventory
     /// released, and the binding is installed after.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn publish_live_segment<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
@@ -1036,7 +954,6 @@ impl NodeInventory {
     }
 
     /// Same gate contract as `publish_live_segment`, for permanent exports.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn publish_permanent_segment<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
@@ -1070,7 +987,6 @@ impl NodeInventory {
         Ok((binding, true))
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn revoke_live_targets<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
@@ -1084,7 +1000,6 @@ impl NodeInventory {
         }
         result
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn revoke_live_files<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
@@ -1114,7 +1029,6 @@ impl NodeInventory {
         Ok(())
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn acquire_live_export_pin(
         &mut self,
         epoch: u64,
@@ -1151,7 +1065,6 @@ impl NodeInventory {
     }
 
     /// The caller holds the lifecycle gate; `target` is its content.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn release_live_export_pin<H: InventoryAccess>(
         inventory: &mut H,
         target: Option<&mut LiveTarget>,
@@ -1176,7 +1089,6 @@ impl NodeInventory {
     }
 
     /// The caller holds the lifecycle gate; `target` is its content.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn release_live_pin<H: InventoryAccess>(
         inventory: &mut H,
         target: Option<&mut LiveTarget>,
@@ -1209,7 +1121,6 @@ impl NodeInventory {
         result
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn release_live_bindings<H: InventoryAccess>(
         inventory: &mut H,
         mut target: Option<&mut LiveTarget>,
@@ -1277,7 +1188,6 @@ impl NodeInventory {
         Ok(())
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn retain_idle_history_export<H: InventoryAccess>(
         inventory: &mut H,
         target: Option<&mut LiveTarget>,
@@ -1325,7 +1235,6 @@ impl NodeInventory {
         drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<(), TcpError> {
         inventory.ensure_healthy()?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if !inventory.live_pins.is_empty() || !inventory.live_export_pins.is_empty() {
             return Err(TcpError::new("live NVMe-oF pins must drain before sealing"));
         }
@@ -1335,13 +1244,9 @@ impl NodeInventory {
             return Ok(());
         }
         let log = inventory.active(epoch)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let target = live_target(inventory, slot)?;
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let _ = slot;
         inventory.healthy = false;
         inventory.readers.write().invalidate();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(target) = target {
             Self::revoke_live_targets(inventory, target)?;
             inventory.released(|| {
@@ -1354,13 +1259,6 @@ impl NodeInventory {
                 .released(|| log.seal_epoch(RequestAuthority { epoch }))
                 .map_err(TcpError::component)?;
         }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        {
-            let _ = &drain_log;
-            inventory
-                .released(|| log.seal_epoch(RequestAuthority { epoch }))
-                .map_err(TcpError::component)?;
-        }
         drop(log);
         inventory.manifest.epochs.last_mut().unwrap().state = EpochState::Sealed;
         Self::persist_manifest(inventory)?;
@@ -1368,7 +1266,6 @@ impl NodeInventory {
         Ok(())
     }
     /// The caller holds the lifecycle gate; `target` is its content.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn shutdown_live_target<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
@@ -1394,7 +1291,6 @@ impl NodeInventory {
     }
 
     /// The caller holds the lifecycle gate; `slot` is its content.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn finish_live_target_shutdown<H: InventoryAccess>(
         inventory: &mut H,
         slot: &mut LifecycleSlot,
@@ -1420,7 +1316,6 @@ impl NodeInventory {
         Self::finish_target_shutdown(inventory, target)
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn wal_prewrite_stats(&self) -> (u64, u64, u64) {
         let mut bytes = self.retired_prewrite_bytes;
         let mut ns = self.retired_prewrite_ns;
@@ -1434,7 +1329,6 @@ impl NodeInventory {
         (bytes, ns, files)
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn finish_target_shutdown<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
@@ -1461,7 +1355,6 @@ impl NodeInventory {
         inventory.idle_history_exports.clear();
         Ok(stats)
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn live_recovery_log(
         &self,
         authority_epoch: u64,
@@ -1544,13 +1437,11 @@ impl NodeInventory {
             return Err(TcpError::new("retirement file count exceeds bound"));
         }
         let log = inventory.retirement_log(authority_epoch, epoch)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if !inventory.live_pins.is_empty() {
             return Err(TcpError::new(
                 "live NVMe-oF pins must drain before retirement",
             ));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if inventory
             .live_export_pins
             .values()
@@ -1563,11 +1454,7 @@ impl NodeInventory {
                 "live connection pins must drain before retirement",
             ));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let mut target = live_target(inventory, slot)?;
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let _ = slot;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let retired_identities = if let Some(target) = target.as_deref_mut() {
             if let Err(error) = Self::revoke_live_files(inventory, target, epoch, files) {
                 inventory.healthy = false;
@@ -1594,7 +1481,6 @@ impl NodeInventory {
             log.retire_wal_files(files).map_err(TcpError::component)?;
             // Each tombstone release syncs the WAL directory before its marker
             // removal, so a crash cannot resurrect an untracked old file.
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             if let Some(target) = target {
                 for identity in &retired_identities {
                     target
@@ -1892,24 +1778,6 @@ mod tests {
             );
         }
     }
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-    #[test]
-    fn feature_disabled_reopen_rejects_unreleased_nvme_capability() {
-        let temporary = tempdir::TempDir::new("node-nvme-feature-downgrade").unwrap();
-        let config = config(&temporary.path().join("node"));
-        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
-        inventory.fence_to(1).unwrap();
-        drop(inventory);
-        let before = fs::read(config.root.join(MANIFEST)).unwrap();
-        let marker = config.root.join("nvmeof-export-leases-v1");
-        fs::write(&marker, b"unreleased or corrupt capability state").unwrap();
-        assert!(NodeInventory::open(config.clone(), metrics()).is_err());
-        assert_eq!(fs::read(config.root.join(MANIFEST)).unwrap(), before);
-        fs::remove_file(marker).unwrap();
-        let reopened = NodeInventory::open(config, metrics()).unwrap();
-        assert_eq!(reopened.status().unwrap().active_epoch, None);
-    }
-
     #[test]
     fn interrupted_preparing_epoch_is_retained_and_never_activated() {
         let temporary = tempdir::TempDir::new("node-preparing-fence").unwrap();

@@ -1,5 +1,4 @@
 //! Reads over the leased live fixture, so the module needs nvmeof.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::*;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 
@@ -241,7 +240,6 @@ fn poison_and_stop_wake_waiting_batch_without_forging_readiness() {
     }
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn nvme_profile_counts_completion_without_inventing_owner_timing() {
     let diagnostics = ReadDiagnostics::default();

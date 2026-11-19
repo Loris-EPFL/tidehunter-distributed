@@ -529,7 +529,6 @@ pub(crate) struct WriteTimelineSample {
     generation: u64,
     index: usize,
 }
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy)]
 pub(crate) struct LiveGroupSample {
     generation: u64,
@@ -542,7 +541,6 @@ struct Session {
     export: WriteTimelineExport,
     operations: HashMap<[u8; 16], usize>,
     versions: HashMap<BatchVersion, usize>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_memberships: usize,
 }
 
@@ -583,7 +581,6 @@ impl WriteTimeline {
         counter.max_depth.fetch_max(depth as u64, Ordering::Relaxed);
     }
 
-    #[cfg(any(test, feature = "experimental-nvmeof"))]
     pub(crate) fn owner_frame(
         &self,
         owner: u32,
@@ -671,7 +668,6 @@ impl WriteTimeline {
                 },
                 operations: HashMap::new(),
                 versions: HashMap::new(),
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 live_memberships: 0,
             });
             self.enabled.store(true, Ordering::Release);
@@ -995,7 +991,6 @@ impl WriteTimeline {
             Self::push(s, sample.index, stage, None, None);
         }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_group(
         &self,
         owner: u32,
@@ -1036,7 +1031,6 @@ impl WriteTimeline {
         })
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn live_group_position(
         &self,
         group: Option<LiveGroupSample>,
@@ -1062,7 +1056,6 @@ impl WriteTimeline {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_group_event(&self, group: Option<LiveGroupSample>, stage: WriteTimelineStage) {
         if group.is_none() {
             return;
@@ -1070,7 +1063,6 @@ impl WriteTimeline {
         self.live_group_event_at(group, stage, Instant::now());
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn live_group_event_at(
         &self,
         group: Option<LiveGroupSample>,
@@ -1097,7 +1089,6 @@ impl WriteTimeline {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_group_token(&self, group: Option<LiveGroupSample>, token: [u8; 16]) {
         let Some(group) = group else { return };
         if let Some(row) = self
@@ -1326,7 +1317,6 @@ mod tests {
         assert_eq!(next.write_wait_metrics.windows[0].wake_attempts, 0);
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn live_group_links_coalesced_calls_and_preserves_failed_control() {
         let timeline = WriteTimeline::default();
@@ -1379,7 +1369,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn live_group_limit_and_stale_generation_are_explicit() {
         let timeline = WriteTimeline::default();

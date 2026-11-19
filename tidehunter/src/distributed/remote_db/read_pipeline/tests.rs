@@ -1,5 +1,4 @@
 //! Scans over the leased live fixture, so the module needs nvmeof.
-#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::*;
 use crate::distributed::native_index::IndexReadCut;
 use crate::distributed::remote_db::pipeline_tests::Fixture;

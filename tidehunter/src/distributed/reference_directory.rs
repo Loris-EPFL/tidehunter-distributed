@@ -63,7 +63,7 @@ impl RegisteredBatch {
         self.credit = Some(credit);
         self
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn authority_bytes(&self) -> usize {
         self.credit.as_ref().map_or(0, |credit| credit.bytes)
     }

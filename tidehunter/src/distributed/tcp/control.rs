@@ -7,7 +7,6 @@
 //! first drains the ordered flush queue.
 
 use super::super::durability::DurabilityConfig;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::super::durability::DurabilityTier;
 use super::super::durability::frontier::{Frontier, Syncer, flush_all};
 use super::super::storage::LogDurableProgress;
@@ -30,7 +29,6 @@ const FLUSH_QUEUE: usize = 2 * MAX_COMMANDS + 16;
 // partition's state lock orders their state changes, not this pool.
 const CONTROL_WORKERS: usize = 4;
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type PublishedLiveLeases = (
     [u8; 16],
     Vec<(
@@ -54,9 +52,7 @@ pub(super) struct ControlContext {
     /// not even by a successful live recovery fence. Shared with the inventory, which
     /// reports `NodeStatus::recovery_clean = false` once it is set.
     pub(super) persistence_failed: Arc<AtomicBool>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) recoverable_live_failure: AtomicBool,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) poison_gate: Mutex<()>,
     pub(super) wal_member_read: super::super::storage::WalMemberReadPolicy,
     /// With async member reads, caps `NodeStatus::max_reads` and each
@@ -69,7 +65,6 @@ pub(super) struct ControlContext {
     /// gate, then the inventory, then `readers`. Fence, seal, retirement, live
     /// read publication, live pin release and target shutdown take it first;
     /// terminal publication only `try_lock`s it and defers while it is held.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) live_control_gate: Mutex<()>,
 }
 
@@ -115,7 +110,6 @@ struct Shared {
     // old log's worker before recovery; shutdown joins any remaining workers.
     syncers: Mutex<Vec<SyncerSlot>>,
     // Leaf lock: never hold with `durability` or `syncers`; join off-lock.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     preparers: Mutex<Vec<PreparerSlot>>,
     // Parked durable-progress polls. Log syncers notify it after each sync.
     progress: HubSender,
@@ -125,9 +119,9 @@ struct Shared {
     progress_cap_ms: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     session_barrier_waits: std::sync::atomic::AtomicU64,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     grant_profiles: Mutex<(Vec<TestGrantProfile>, u64)>,
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     before_target_shutdown: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
 }
 
@@ -143,7 +137,6 @@ struct SyncerSlot {
     syncer: Syncer,
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct PreparerSlot {
     log: Arc<super::super::storage::PartitionLog>,
     trigger: mpsc::SyncSender<()>,
@@ -153,7 +146,7 @@ struct PreparerSlot {
     worker: JoinHandle<()>,
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 #[derive(Clone, serde::Serialize)]
 struct TestGrantProfile {
     envelope_id: u64,
@@ -172,7 +165,6 @@ impl Shared {
     /// One worker owns each log's preparation triggers. Capacity one: a full
     /// queue coalesces triggers because the worker recomputes the target.
     /// Shutdown sets stopping, wakes publication retries, drops the sender and joins.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn trigger_file_preparation(&self, log: &Arc<super::super::storage::PartitionLog>) {
         let mut slots = self.preparers.lock();
         let slot = if let Some(index) = slots.iter().position(|slot| Arc::ptr_eq(&slot.log, log)) {
@@ -226,7 +218,6 @@ impl Shared {
         let _ = slot.trigger.try_send(());
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn join_preparer(&self, slot: PreparerSlot) -> Result<(), TcpError> {
         let PreparerSlot {
             log,
@@ -290,7 +281,6 @@ impl Shared {
             .iter()
             .map(|slot| slot.log.clone())
             .collect();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         for log in &logs {
             log.self_adopt_live_extent().map_err(TcpError::component)?;
         }
@@ -306,7 +296,6 @@ impl Shared {
             .map_err(|error| TcpError::new(format!("log frontier flush failed: {error}")))?;
         // An explicit flush also catches up a live root the syncer deferred. The
         // catch-up publishes durable progress, so parked polls re-check.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             for log in &logs {
                 log.persist_live_root()
@@ -323,7 +312,6 @@ impl Shared {
         &self,
         log: &Arc<super::super::storage::PartitionLog>,
     ) -> Result<(), TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             let slot = {
                 let mut slots = self.preparers.lock();
@@ -346,7 +334,6 @@ impl Shared {
         if let Some(SyncerSlot { log, syncer }) = slot {
             let result = syncer.shutdown().map_err(|error| error.to_string());
             // Fence and retirement also catch up a deferred live root.
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             let result =
                 result.and_then(|()| log.persist_live_root().map_err(|error| error.to_string()));
             drop(log);
@@ -401,11 +388,10 @@ impl ControlOwner {
                 started: false,
             }),
             syncers: Mutex::new(Vec::new()),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             preparers: Mutex::new(Vec::new()),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             grant_profiles: Mutex::new((Vec::new(), 0)),
-            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            #[cfg(test)]
             before_target_shutdown: Mutex::new(None),
             #[cfg(test)]
             session_barrier_waits: std::sync::atomic::AtomicU64::new(0),
@@ -486,7 +472,7 @@ impl ControlOwner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn session_barrier_waits(&self) -> u64 {
         self.shared.session_barrier_waits.load(Ordering::Relaxed)
     }
@@ -496,7 +482,7 @@ impl ControlOwner {
         self.shared.queue.lock().requests
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn exclusive_waits_for_stream(&self) -> bool {
         let queue = self.shared.queue.lock();
         queue.active_appends != 0
@@ -526,7 +512,6 @@ impl ControlOwner {
     }
     /// Final process teardown: prevent new controls only after the session
     /// owner and all admitted work have quiesced.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn finish_live_target_shutdown(
         &self,
     ) -> Result<super::super::nvmeof::LiveTargetStats, TcpError> {
@@ -576,7 +561,7 @@ impl ControlOwner {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 impl ControlOwner {
     pub(super) fn grant_profiles(&self) -> serde_json::Value {
         let profiles = self.shared.grant_profiles.lock();
@@ -588,7 +573,7 @@ impl ControlOwner {
     }
 }
 
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 #[test]
 fn preparation_triggers_coalesce_when_the_worker_is_busy() {
     use crate::distributed::storage::LivePausePoint;
@@ -627,7 +612,6 @@ impl Drop for ControlOwner {
                 self.shared.context.poison_readers();
             }
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             let slots = std::mem::take(&mut *self.shared.preparers.lock());
             for slot in slots {
@@ -645,10 +629,7 @@ impl Drop for ControlOwner {
         let syncers = std::mem::take(&mut *self.shared.syncers.lock());
         for SyncerSlot { log, syncer } in syncers {
             let drained = syncer.shutdown().is_ok();
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             let drained = drained && log.persist_live_root().is_ok();
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            let _ = log;
             if !drained {
                 self.shared.context.poison_readers();
             }
@@ -811,7 +792,6 @@ fn run(shared: &Shared) {
             continue;
         }
         let request = match request {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             request @ (Request::LeaseLiveExtent { .. }
             | Request::PreleaseLiveExtent { .. }
             | Request::AdoptLiveExtent { .. }) => {
@@ -1113,12 +1093,8 @@ fn durable_progress_poll(
         ));
     };
     let wake = if sync {
-        #[cfg(feature = "experimental-nvmeof")]
         log.self_adopt_live_extent().map_err(TcpError::component)?;
-        #[cfg(feature = "experimental-nvmeof")]
         let live = log.persist_live_progress().map_err(TcpError::component)?;
-        #[cfg(not(feature = "experimental-nvmeof"))]
-        let live = false;
         if live {
             // Other parked polls of this log see the barrier's publication.
             shared.progress.advanced();
@@ -1240,7 +1216,6 @@ pub(super) fn deliver(
 
 impl ControlContext {
     fn status(&self) -> Result<NodeStatus, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.poison_pending.load(Ordering::Acquire)
             && self.recoverable_live_failure.load(Ordering::Acquire)
         {
@@ -1256,22 +1231,13 @@ impl ControlContext {
         }
     }
     fn permits_recovery_control(&self, request: &Request) -> bool {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        {
-            // Terminal publication does not revoke idle exports. Their pool
-            // must still be able to release pins after confirmed disconnects.
-            matches!(request, Request::ReleaseLiveExportPin { .. })
-                || (self.recoverable_live_failure.load(Ordering::Acquire)
-                    && matches!(request, Request::Status { .. } | Request::Fence { .. }))
-        }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        {
-            let _ = request;
-            false
-        }
+        // Terminal publication does not revoke idle exports. Their pool
+        // must still be able to release pins after confirmed disconnects.
+        matches!(request, Request::ReleaseLiveExportPin { .. })
+            || (self.recoverable_live_failure.load(Ordering::Acquire)
+                && matches!(request, Request::Status { .. } | Request::Fence { .. }))
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn poison_incomplete_live(&self) {
         // Release: before the flags below, so a fence that observes the recoverable
         // failure (Acquire) also observes the latch.
@@ -1286,15 +1252,12 @@ impl ControlContext {
         self.finish_poison_if_quiescent();
     }
     pub(super) fn poison_readers(&self) {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let _gate = self.poison_gate.lock();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.recoverable_live_failure
             .store(false, Ordering::Release);
         // Release, before `poison_pending`: see `poison_incomplete_live`.
         self.persistence_failed.store(true, Ordering::Release);
         self.poison_pending.store(true, Ordering::Release);
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         drop(_gate);
         self.finish_poison_if_quiescent();
     }
@@ -1306,7 +1269,6 @@ impl ControlContext {
         // exports only and must not delay terminal authority publication.
         // A held live-control gate defers publication, as a held lifecycle
         // gate does below.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let Some(_gate) = self.live_control_gate.try_lock() else {
             return;
         };
@@ -1318,7 +1280,6 @@ impl ControlContext {
         // drop their gate guard before poisoning; a poison raised inside a
         // gated step (drain, history failure) defers exactly as it did when
         // that step held the inventory.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         {
             let Some(_lifecycle) = self.lifecycle.try_lock() else {
                 return;
@@ -1336,7 +1297,6 @@ impl ControlContext {
     }
     /// `kind` names the request (resolve, recovery or replay) that counts an
     /// export created inline here.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn publish_live_leases(
         &self,
         epoch: u64,
@@ -1400,7 +1360,6 @@ impl ControlContext {
         }
         Ok((token, locations))
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn bounded_live_response(
         &self,
         epoch: u64,
@@ -1437,7 +1396,6 @@ impl ControlContext {
     /// shutdown hold it while joining us. Retry at most 30,000 times, parking
     /// 1 ms between attempts. Once it holds the gate it may wait for the
     /// inventory, whose holders never wait for the gate or for this worker.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn publish_prepared_file(
         &self,
         log: &Arc<super::super::storage::PartitionLog>,
@@ -1503,7 +1461,6 @@ impl ControlContext {
 
     /// `kind` names the request (lease, prelease or rollover) that counts an
     /// export created inline here.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn lease_live_published(
         &self,
         epoch: u64,
@@ -1591,7 +1548,6 @@ impl ControlContext {
         })
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn handle_live_extent(
         &self,
         request: Request,
@@ -1674,7 +1630,6 @@ impl ControlContext {
         profile: Option<&mut ConnectionProfile>,
         _drain_log: impl FnOnce(&Arc<super::super::storage::PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<Response, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Request::ReleaseLiveEpochPin { epoch, token } = &request {
             let (result, failed) = {
                 let _gate = self.live_control_gate.lock();
@@ -1701,7 +1656,6 @@ impl ControlContext {
             self.finish_poison_if_quiescent();
             return Ok(Response::NvmeofEpochReleased);
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Request::ReleaseLiveExportPin { epoch, token } = &request {
             let (result, failed) = {
                 let mut lifecycle = self.lifecycle.lock();
@@ -1732,7 +1686,6 @@ impl ControlContext {
             ));
         }
         match request {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::OpenLiveExports { authority_epoch } => {
                 let mut lifecycle = self.lifecycle.lock();
                 let mut inventory = self.inventory.lock();
@@ -1771,13 +1724,11 @@ impl ControlContext {
                     exported_files: count,
                 }))
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::LeaseLiveExtent { .. }
             | Request::PreleaseLiveExtent { .. }
             | Request::AdoptLiveExtent { .. } => Err(TcpError::new(
                 "live extent requires the stream durability dispatch",
             )),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ResolveLiveRecords {
                 authority_epoch,
                 references,
@@ -1835,7 +1786,6 @@ impl ControlContext {
                     limits.max_frame_bytes,
                 )
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ReplayLiveWal {
                 authority_epoch,
                 source_epoch,
@@ -1916,7 +1866,6 @@ impl ControlContext {
                     limits.max_frame_bytes,
                 )
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::AcquireLiveExportPin {
                 epoch,
                 segment,
@@ -1930,7 +1879,6 @@ impl ControlContext {
                     .acquire_live_export_pin(epoch, &segment, &binding)
                     .map(Response::NvmeofEpochPinned)
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::LiveTargetStats => {
                 // Stats verify configfs objects: file I/O, gate only.
                 let mut lifecycle = self.lifecycle.lock();
@@ -1941,7 +1889,6 @@ impl ControlContext {
                     target.stats().map_err(TcpError::component)?,
                 ))
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ShutdownLiveTarget { epoch } => {
                 let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
@@ -1951,23 +1898,8 @@ impl ControlContext {
                 NodeInventory::shutdown_live_target(&mut self.inventory.lock(), target, epoch)
                     .map(Response::LiveTargetStats)
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ReleaseLiveEpochPin { .. } | Request::ReleaseLiveExportPin { .. } => {
                 unreachable!("release handled before health check")
-            }
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            Request::OpenLiveExports { .. }
-            | Request::LeaseLiveExtent { .. }
-            | Request::PreleaseLiveExtent { .. }
-            | Request::AdoptLiveExtent { .. }
-            | Request::ResolveLiveRecords { .. }
-            | Request::ReplayLiveWal { .. }
-            | Request::AcquireLiveExportPin { .. }
-            | Request::LiveTargetStats
-            | Request::ShutdownLiveTarget { .. }
-            | Request::ReleaseLiveEpochPin { .. }
-            | Request::ReleaseLiveExportPin { .. } => {
-                Err(TcpError::new(super::LIVE_ROUTE_UNAVAILABLE))
             }
             Request::CheckpointPosition {
                 authority_epoch,
@@ -2033,7 +1965,6 @@ impl ControlContext {
                 epoch,
                 files,
             } => {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::retire_wal_files(
@@ -2057,12 +1988,10 @@ impl ControlContext {
                 Ok(Response::Status(status))
             }
             Request::Fence { epoch } => {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let _gate = self.live_control_gate.lock();
                 // Lock order: live-control gate, lifecycle gate, inventory. The
                 // fence releases the inventory across every revocation and sync.
                 let mut lifecycle = self.lifecycle.lock();
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut status = if self.recoverable_live_failure.load(Ordering::Acquire) {
                     let status = NodeInventory::fence_recoverable_live(
                         &mut self.inventory.lock(),
@@ -2088,14 +2017,6 @@ impl ControlContext {
                         _drain_log,
                     )?
                 };
-                #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-                let mut status = NodeInventory::fence(
-                    &mut self.inventory.lock(),
-                    &mut lifecycle,
-                    epoch,
-                    false,
-                    _drain_log,
-                )?;
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
                 status.recovery_page_batches = limits.recovery_page_batches;
@@ -2107,7 +2028,6 @@ impl ControlContext {
                 "durable progress poll bypassed the log control owner",
             )),
             Request::Seal { epoch } => {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::seal_epoch(

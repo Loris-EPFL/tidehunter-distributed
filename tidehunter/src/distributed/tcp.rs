@@ -30,24 +30,18 @@ pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
 mod inventory;
 mod live_client;
 pub use super::nvmeof::LiveQueueGeometry;
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 pub(crate) use live_client::leased_tests;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) use live_client::{LeasedSubmit, LiveGroupBudget};
 pub use live_client::{LeasedSync, LiveClientConfig, LiveInitiatorIdentity};
-#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+#[cfg(test)]
 pub(crate) mod export_pin_tests;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_control;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) mod live_read;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_recovery;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use live_control::{LiveRecoveryEntry, LiveRecoveryPage};
 mod live_wire;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use live_control::{
     LiveExportPin, LiveExportPinControl, LiveExportPinRequest, LivePinRecipe,
 };
@@ -67,7 +61,6 @@ pub(super) fn software_transport(security: FabricSecurity) -> Transport {
     Transport::ofi(FabricBackend::SoftwareTcp, security)
 }
 use super::codec::{CompleteBatch, Mutation};
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::storage::StorageError;
 use super::storage::{DurableBatch, PartitionConfig, PartitionStats};
 use super::types::{
@@ -186,7 +179,6 @@ impl NodeConfig {
     pub fn validate(&self) -> Result<(), TcpError> {
         self.validated_shape()?;
         self.validate_reads()?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(target) = &self.live_target {
             super::nvmeof::live_target::validate_config(target).map_err(TcpError::component)?;
         }
@@ -205,12 +197,6 @@ impl NodeConfig {
     }
 
     fn validate_reads(&self) -> Result<(), TcpError> {
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        if self.live_target.is_some() {
-            return Err(TcpError::new(
-                "live NVMe-oF target requires experimental-nvmeof on Linux",
-            ));
-        }
         // Same bound the removed read executor applied to max_device_reads.
         if !(1..=4096).contains(&self.read_max_device_reads) {
             return Err(TcpError::new("read_max_device_reads must be in 1..=4096"));
@@ -597,7 +583,6 @@ struct Receipt {
     address: PhysicalValueAddress,
 }
 impl Receipt {
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn from_durable(batch: DurableBatch) -> Self {
         let batch = batch.appended();
         Self {
@@ -607,7 +592,6 @@ impl Receipt {
             address: batch.address(),
         }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn durable(self) -> DurableBatch {
         DurableBatch::from_validated_parts(self.id, self.version, self.digest, self.address)
     }
@@ -696,9 +680,6 @@ enum Response {
     ProcessResources(crate::read_probe::ProcessResources),
 }
 
-/// Named error of a live request this owner build cannot serve.
-#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-const LIVE_ROUTE_UNAVAILABLE: &str = "live NVMe-oF requests require experimental-nvmeof on Linux";
 /// Named error of a benchmark evidence request this owner build cannot serve.
 #[cfg(not(all(target_os = "linux", feature = "test-utils")))]
 const EVIDENCE_UNAVAILABLE: &str = "benchmark evidence requests require test-utils on Linux";
@@ -733,16 +714,17 @@ pub struct StorageNode {
     inventory: Arc<Mutex<NodeInventory>>,
     control: control::ControlOwner,
     control_context: Arc<control::ControlContext>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) live_nvme_selected: bool,
 }
 impl StorageNode {
     pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>, TcpError> {
+        if let Some(error) = super::sys::route_unavailable() {
+            return Err(TcpError::new(error));
+        }
         config.validate_reads()?;
         let wal_member_read = config.wal_member_read;
         let read_max_device_reads = config.read_max_device_reads;
         let inventory = NodeInventory::open(config, metrics)?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live_nvme_selected = inventory.live_target_configured;
         let lifecycle = inventory.lifecycle.clone();
         let readers = inventory.readers.clone();
@@ -758,14 +740,11 @@ impl StorageNode {
             terminal,
             poison_pending: Arc::new(AtomicBool::new(false)),
             persistence_failed,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             recoverable_live_failure: AtomicBool::new(false),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             poison_gate: Mutex::new(()),
             wal_member_read,
             read_max_device_reads,
             transport: Arc::default(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_control_gate: Mutex::new(()),
         });
         let control = control::ControlOwner::start(control_context.clone())?;
@@ -773,7 +752,6 @@ impl StorageNode {
             inventory,
             control,
             control_context,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_nvme_selected,
         }))
     }
@@ -792,59 +770,32 @@ impl StorageNode {
     pub fn finish_live_target_shutdown(
         &self,
     ) -> Result<Option<super::nvmeof::LiveTargetStats>, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        {
-            if !self.live_nvme_selected {
-                return Ok(None);
-            }
-            self.control.finish_live_target_shutdown().map(Some)
+        if !self.live_nvme_selected {
+            return Ok(None);
         }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        {
-            Ok(None)
-        }
+        self.control.finish_live_target_shutdown().map(Some)
     }
 
     /// Owner-process preparation totals (bytes, nanoseconds, completed files),
     /// including streams replaced by fencing. Not part of the wire protocol.
     pub fn wal_prewrite_stats(&self) -> (u64, u64, u64) {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        {
-            self.inventory.lock().wal_prewrite_stats()
-        }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        {
-            // These builds cannot prepare or grant external NVMe-oF WAL files.
-            (0, 0, 0)
-        }
+        self.inventory.lock().wal_prewrite_stats()
     }
 
     /// Owner-process count of live exports that a request created inline, by
     /// request kind, including epochs replaced by fencing. Not part of the
     /// wire protocol.
     pub fn live_inline_export_stats(&self) -> LiveInlineExportStats {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        {
-            self.inventory.lock().inline_exports
-        }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        {
-            // These builds have no live target, so no request can export.
-            LiveInlineExportStats::default()
-        }
+        self.inventory.lock().inline_exports
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn bench_live_grant_profiles(&self) -> serde_json::Value {
         self.control.grant_profiles()
     }
     /// Install the ordinary-file live target fixture before serving any requests.
     /// This exercises the protocol, not a kernel NVMe target.
-    #[cfg(all(
-        feature = "test-utils",
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
+    #[cfg(feature = "test-utils")]
     pub fn set_live_target_fixture(
         &self,
         config: super::nvmeof::LiveTargetConfig,
@@ -857,11 +808,7 @@ impl StorageNode {
     }
     /// Install a live target manager after open: the gate owns the manager and
     /// the inventory records that one is installed.
-    #[cfg(all(
-        any(test, feature = "test-utils"),
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn install_live_target(
         &self,
         target: super::nvmeof::live_target::LiveTargetManager,
@@ -876,7 +823,7 @@ impl StorageNode {
         Ok(())
     }
     /// Test access to the installed live target, taken through the gate.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn with_live_target<R>(
         &self,
         f: impl FnOnce(&mut super::nvmeof::live_target::LiveTargetManager) -> R,
@@ -885,7 +832,7 @@ impl StorageNode {
         f(slot.as_mut().expect("live target installed"))
     }
     /// Test access to a gated lifecycle step: the gate, then the inventory.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn with_lifecycle<R>(
         &self,
         f: impl FnOnce(
@@ -897,7 +844,7 @@ impl StorageNode {
         let mut inventory = self.inventory.lock();
         f(&mut inventory, &mut slot)
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn pause_next_persist(
         &self,
         epoch: u64,
@@ -915,7 +862,7 @@ impl StorageNode {
             .map_err(TcpError::component)?;
         Ok(log.pause_next_persist())
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn pause_inventory(
         &self,
     ) -> (
@@ -932,7 +879,7 @@ impl StorageNode {
         });
         (waiting, release)
     }
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn contains_batch(&self, epoch: u64, id: BatchId) -> Result<bool, TcpError> {
         let log = self
             .inventory
@@ -1184,7 +1131,6 @@ pub struct ClientConnectProfile {
 pub(crate) struct ClientTlsConfig {
     pub config: Option<Arc<ClientConfig>>,
     /// Live-target connection key component (the credential digest).
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub identity: [u8; 32],
 }
 
@@ -1211,33 +1157,18 @@ pub struct Client {
     connected_status: Option<NodeStatus>,
     connect_profile: ClientConnectProfile,
     polling: PollingPolicy,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_config: Option<LiveClientConfig>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_pin_recipe: Arc<LivePinRecipe>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_exports: Option<(u64, LiveExportInfo, u64)>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_writer: Option<live_client::LiveWriteQueue>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_writer_closing: bool,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_leased: live_client::LeasedWriter,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_write_failed: bool,
-    #[cfg(all(
-        any(test, feature = "test-utils"),
-        feature = "experimental-nvmeof",
-        target_os = "linux"
-    ))]
+    #[cfg(any(test, feature = "test-utils"))]
     live_write_local_fixture: bool,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_unreleased_tokens: Vec<(u64, [u8; 16])>,
 }
 impl Client {
@@ -1248,7 +1179,7 @@ impl Client {
 
     /// Outstanding leased transport groups, distinct from worker-local queued
     /// groups.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn append_flights_in_flight(&self) -> usize {
         self.leased_flights_in_flight()
     }
@@ -1289,7 +1220,6 @@ impl Client {
         shape: &KeyShape,
         query_status: bool,
     ) -> Result<Self, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live_pin_recipe = Arc::new(LivePinRecipe::new(
             endpoint,
             tls,
@@ -1389,33 +1319,18 @@ impl Client {
                 fabric_open: None,
             },
             polling: PollingPolicy::Adaptive,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_config: None,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pin_recipe,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_exports: None,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool: None,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_writer: None,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_writer_closing: false,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_leased: live_client::LeasedWriter::default(),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_write_failed: false,
-            #[cfg(all(
-                any(test, feature = "test-utils"),
-                feature = "experimental-nvmeof",
-                target_os = "linux"
-            ))]
+            #[cfg(any(test, feature = "test-utils"))]
             live_write_local_fixture: false,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_counters: None,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics: None,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_unreleased_tokens: Vec::new(),
         };
         if query_status {
@@ -1813,7 +1728,6 @@ impl Client {
             response => self.wrong_variant("Fence", &response, "Status"),
         }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn check_receipt(
         &self,
         batch: &CompleteBatch,
@@ -1859,46 +1773,38 @@ impl Client {
         epoch: u64,
         references: &[ValueRecordReference],
     ) -> Result<Vec<Mutation>, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        {
-            if self.live_config.is_none() {
-                return Err(TcpError::new("reads require live NVMe-oF configuration"));
-            }
-            if !self.live_unreleased_tokens.is_empty() {
-                return Err(TcpError::new("live read has quarantined owner grants"));
-            }
-            let mut cache = live_read::LiveReadCache::default();
-            let result = self.live_read_records(
-                &mut cache,
-                epoch,
-                references,
-                Instant::now() + self.timeout,
-                None,
-            );
-            let cleanup = cache.close(self, epoch);
-            self.live_unreleased_tokens.extend(
-                cache
-                    .take_unreleased()
-                    .into_iter()
-                    .map(|token| (epoch, token)),
-            );
-            // Live I/O and validation clocks come from live_nvmeof_stats.
-            match (result, cleanup) {
-                (Ok(values), Ok(())) => Ok(values),
-                (Err(error), Ok(())) => Err(error),
-                (result, Err(cleanup)) => {
-                    self.broken = true;
-                    Err(TcpError::new(format!(
-                        "live read result {:?}; owner grant cleanup remains quarantined: {cleanup}",
-                        result.err(),
-                    )))
-                }
-            }
+        if self.live_config.is_none() {
+            return Err(TcpError::new("reads require live NVMe-oF configuration"));
         }
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        {
-            let _ = (epoch, references);
-            Err(TcpError::new(LIVE_ROUTE_UNAVAILABLE))
+        if !self.live_unreleased_tokens.is_empty() {
+            return Err(TcpError::new("live read has quarantined owner grants"));
+        }
+        let mut cache = live_read::LiveReadCache::default();
+        let result = self.live_read_records(
+            &mut cache,
+            epoch,
+            references,
+            Instant::now() + self.timeout,
+            None,
+        );
+        let cleanup = cache.close(self, epoch);
+        self.live_unreleased_tokens.extend(
+            cache
+                .take_unreleased()
+                .into_iter()
+                .map(|token| (epoch, token)),
+        );
+        // Live I/O and validation clocks come from live_nvmeof_stats.
+        match (result, cleanup) {
+            (Ok(values), Ok(())) => Ok(values),
+            (Err(error), Ok(())) => Err(error),
+            (result, Err(cleanup)) => {
+                self.broken = true;
+                Err(TcpError::new(format!(
+                    "live read result {:?}; owner grant cleanup remains quarantined: {cleanup}",
+                    result.err(),
+                )))
+            }
         }
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
@@ -2015,7 +1921,6 @@ impl TlsFiles {
         if self.trusted_mode()? {
             return Ok(ClientTlsConfig {
                 config: None,
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 identity: [0; 32],
             });
         }
@@ -2034,11 +1939,8 @@ impl TlsFiles {
             .with_client_auth_cert(cert, key)
             .map_err(TcpError::component)?;
         config.alpn_protocols = vec![self.transport.alpn()];
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let _ = identity;
         Ok(ClientTlsConfig {
             config: Some(Arc::new(config)),
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             identity,
         })
     }
