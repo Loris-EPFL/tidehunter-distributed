@@ -151,6 +151,53 @@ fn read_lanes_default_to_parallelism_and_validate_bounds() {
     }
 }
 
+/// Open keeps the caller's key shape: relocation filters and compactors are
+/// closures that the shape YAML cannot carry, and coordinator code that reads
+/// them (relocation, retirement guards) must see the caller's.
+#[test]
+fn open_keeps_the_callers_relocation_filters_and_compactors() {
+    use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = KeyShapeBuilder::new();
+    let counted = Arc::clone(&calls);
+    builder.add_key_space_config(
+        "filtered",
+        4,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new()
+            .with_relocation_filter(move |_, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                crate::Decision::StopRelocation
+            })
+            .with_compactor(Box::new(|keys| {
+                keys.next_back().cloned().into_iter().collect()
+            })),
+    );
+    builder.add_key_space_config("plain", 4, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    let fixture = Fixture::new_with_shape(128, builder.build());
+    // First open, then a reopen of the existing authority.
+    for open in 1..=2 {
+        let db = fixture.open();
+        let keyspace = |name: &str| {
+            db.core
+                .shape
+                .iter_ks()
+                .find(|keyspace| keyspace.name() == name)
+                .unwrap()
+        };
+        let filter = keyspace("filtered").relocation_filter().unwrap();
+        // The caller's closure itself: its decision and its side effect.
+        assert!(matches!(filter(&[], &[]), crate::Decision::StopRelocation));
+        assert_eq!(calls.load(Ordering::Relaxed), open);
+        assert!(keyspace("filtered").compactor().is_some());
+        assert!(keyspace("plain").relocation_filter().is_none());
+        assert!(keyspace("plain").compactor().is_none());
+        drop(db);
+    }
+}
+
 #[test]
 fn recorded_live_identity_cannot_reopen_as_tcp() {
     let fixture = Fixture::new();

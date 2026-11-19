@@ -1267,7 +1267,9 @@ impl RemoteDatabase {
         )
         .map_err(LocalDbError::component)?;
         let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
-        let shape = KeyShape::from_yaml(&shape_yaml).map_err(LocalDbError::component)?;
+        // Keep the caller's shape: relocation filters and compactors are
+        // closures, which the YAML form (manifest and owner check) drops.
+        let shape = shape.clone();
         match fs::create_dir(path) {
             Ok(()) => File::open(
                 path.parent()
