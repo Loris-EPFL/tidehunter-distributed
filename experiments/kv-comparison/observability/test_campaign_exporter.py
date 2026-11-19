@@ -427,6 +427,19 @@ class CaseIdentityTests(unittest.TestCase):
                      "leased_submit_ready_left_full_batches", "leased_deferred_submits"):
             self.assertIn(f'kv_live_nvmeof_events{{scope="measurement_boundary",counter="{name}"}} 1', text)
 
+    def test_q0_counter_contract_has_exact_fields_and_measured_rates(self):
+        fixture = json.loads((Path(__file__).parent / "q0_overhead_counter_fields.json").read_text())
+        self.assertEqual(tuple(fixture), campaign.Q0_OVERHEAD_FIELDS)
+        counters = dict(zip(fixture, (30, 6)))
+        evidence = {"scope": "measurement_boundary", "deltas": {"available": False},
+                    "q0_overhead": {"elapsed_ns": 2_000_000_000, "counts": counters}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('kv_q0_events_per_second{scope="measurement_boundary",event="live_frontier_installs"} 15', text)
+        self.assertIn('kv_q0_events_per_second{scope="measurement_boundary",event="durable_cut_nudges"} 3', text)
+        counters["extra"] = 1
+        with self.assertRaisesRegex(ValueError, "invalid Q0 overhead counter"):
+            campaign.measurement_read_metrics(evidence, {})
+
     def test_new_transport_observations_do_not_require_cq_timing(self):
         evidence = read_diagnostics()
         counters = evidence["profile"]["counters"]

@@ -20,6 +20,8 @@ import analyze
 from cloud_layout import OWNER_HOST_COUNTS, LOGICAL_OWNER_COUNTS
 import local
 import resource_accounting
+import q0_campaign
+from q0_campaign import SELECTION as Q0_SELECTION
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from portable_transport import runtime_backend, transport_for_case, validate_transport, protocol_key, select_backends
@@ -50,10 +52,11 @@ REDRAIN_AB_SELECTION = "nvmeof_p16_redrain_ab"
 WRITE_ENGINE_ARCHIVE_LIMIT_BYTES = {
     "nvmeof_p13_write_engine": 12_874_071_655,
     REDRAIN_AB_SELECTION: 4_177_736_500,
+    Q0_SELECTION: q0_campaign.ARCHIVE_LIMIT_BYTES,
 }
 WRITE_ENGINE_SELECTIONS = ("nvmeof_p9_write_engine", "nvmeof_p13_write_engine")
 M3_SELECTIONS = ("nvmeof_m3_t1", "nvmeof_m3_t2_2", "nvmeof_m3_t2_5", "nvmeof_p9_small_put",
-                 *WRITE_ENGINE_SELECTIONS, REDRAIN_AB_SELECTION)
+                 *WRITE_ENGINE_SELECTIONS, REDRAIN_AB_SELECTION, Q0_SELECTION)
 M3_OWNER_ADMISSION_TIMEOUT_SECONDS = 95
 M3_OWNER_ADMISSION_MARGIN_SECONDS = 5
 NVMEOF_PATH_SELECTIONS += M3_SELECTIONS
@@ -819,6 +822,7 @@ FOCUSED_COUNTS["nvmeof_p9_small_put"] = 7
 FOCUSED_COUNTS["nvmeof_p9_write_engine"] = 18
 FOCUSED_COUNTS["nvmeof_p13_write_engine"] = 50
 FOCUSED_COUNTS[REDRAIN_AB_SELECTION] = 22
+FOCUSED_COUNTS[Q0_SELECTION] = 60
 FOCUSED_COUNTS["nvmeof_f7_highmem32"] = 8
 FOCUSED_COUNTS["nvmeof_f9_tools"] = 34
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
@@ -877,6 +881,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_p9_write_engine": {"G35W": 12, "G35R": 2, "G35S": 4},
     "nvmeof_p13_write_engine": {"G35W": 16, "G35R": 2, "G35S": 32},
     REDRAIN_AB_SELECTION: {"G36W": 18, "G36T": 4},
+    Q0_SELECTION: {"G37W": 48, "G37S": 12},
     "nvmeof_f7_highmem32": {"G30R": 4, "G30S": 2, "G30W": 2},
     "nvmeof_reads_geometry": {"G24R": 24, "G24Q": 24, "G24L": 2, "G24P": 2,
                               "G24S": 2, "G24M": 2, "G24C": 6, "G24W": 8, "G24N": 4},
@@ -890,7 +895,7 @@ _FOCUSED_GROUP_COUNTS = {
 def selection_owner_hosts(selection):
     """Return the reviewed layout's owner host count."""
     if selection in M3_SELECTIONS:
-        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2, 2, 2)))[selection]
+        return dict(zip(M3_SELECTIONS, (1, 2, 5, 5, 2, 2, 2, 2)))[selection]
     return 1 if selection in ("parity_compact", "remote_rw_compact", "fabric_ab_compact", "leased_ab_compact", "valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS, *TOOL_SELECTIONS) else 5
 
 
@@ -2278,6 +2283,7 @@ def _m3_cases():
     for selection in WRITE_ENGINE_SELECTIONS:
         jobs.extend(_write_engine_matrix(selection))
     jobs.extend(_nvmeof_p16_redrain_ab(jobs))
+    jobs.extend(q0_campaign.jobs(jobs, _clone_job))
     return {job["case_id"]: job for job in jobs}
 
 
@@ -4170,6 +4176,10 @@ def summarize_case(directory, *, local_mode=False):
              "ack_contract": ack_contract.selected(job["backend"], job.get("ack_contract", "synced")),
              "error": receipt.get("error"), "measurement_evidence": receipt.get("measurement_evidence"),
              "counter_evidence": receipt.get("counter_evidence")}
+    if job.get("selection") == Q0_SELECTION:
+        value["case_binary"] = receipt.get("case_binary")
+        if receipt.get("q0_overhead", {}).get("available") is False:
+            value["q0_overhead"] = receipt["q0_overhead"]
     if "case_kind" in job:
         validate_focused_job(job)
         focused = analyze.admit_focused_artifacts(
@@ -4509,9 +4519,16 @@ def summarize_case(directory, *, local_mode=False):
         interference["qualification"]["qualified"] &= route["qualified"]
         interference["qualification"]["reasons"].extend(route["reasons"])
         interference["qualification"]["notes"] = route["notes"]
-    elapsed = (max(row["completed_ns"] for row in samples) - min(row["scheduled_ns"] for row in samples)) / 1e9
+    elapsed_ns = max(row["completed_ns"] for row in samples) - min(row["scheduled_ns"] for row in samples)
+    elapsed = elapsed_ns / 1e9
     if elapsed <= 0:
         raise ValueError("measurement exposure must be positive")
+    if job.get("selection") == Q0_SELECTION and job.get("arm") in q0_campaign.AB_ROLES and receipt.get("status") == "completed":
+        overhead = q0_campaign.overhead_counts(read_interval["observed"], elapsed_ns, job["durability_tier"])
+        if overhead != receipt.get("q0_overhead"):
+            raise ValueError("Q0 overhead differs from admitted counter boundaries")
+        value["q0_overhead"] = {**overhead, "events_per_second": {
+            field: count / elapsed for field, count in overhead["counts"].items()}}
     good = [row for row in samples if row["outcome"] in ("ok", "success")]
     planned = planned_measurement_calls(config)
     totals.update({"elapsed_seconds": elapsed, "exposure": "observed raw measurement span",
@@ -4876,6 +4893,13 @@ def write_diagnostic_report(rows):
 def report(root):
     root = Path(root)
     planned = json.loads((root / "matrix.json").read_text())
+    q0_spec = planned.get("spec", {})
+    q0_seals = None
+    if q0_spec.get("selection") == Q0_SELECTION:
+        q0_seals = q0_spec["case_binaries"]
+        q0_campaign.validate_binaries(q0_seals)
+        if planned["jobs"] != make_focused_matrix(Q0_SELECTION):
+            raise ValueError("Q0 result matrix differs from the reviewed workload")
     results = []
     focused_ids = set()
     for job in planned["jobs"]:
@@ -4891,6 +4915,8 @@ def report(root):
                 row = summarize_case(directory)
                 if "case_kind" in job and row["job"] != job:
                     raise ValueError("focused receipt job differs from planned job")
+                if q0_seals is not None and row.get("case_binary") != q0_seals[job["binary_role"]]:
+                    raise ValueError("Q0 case receipt binary differs from the fleet matrix")
                 results.append(row)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 receipt = json.loads((directory / "receipt.json").read_text())

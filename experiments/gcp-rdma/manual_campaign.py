@@ -32,6 +32,7 @@ import gcp_qualify_bootstrap as qualify
 import gcp_runtime
 import prepare
 import workflow_input
+import q0_campaign
 from cloud_campaign import NVMEOF_PATH_SELECTIONS, REDRAIN_AB_SELECTION
 from gcp_api import ApiError
 from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, DelegatedArtifacts, TRANSPORT
@@ -140,6 +141,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
     'nvmeof_p13_write_engine': '674cd71e117824550abb4624747e462b739cb9535912b5a6415782e186e03d18',
     REDRAIN_AB_SELECTION: '33349d644ad5295f39bc88d23d0fcd8dbf088a6fb9e2dec429545a792f631808',
+    q0_campaign.SELECTION: 'ec7b1e585125b53a952b97f8da54b4fb10376c9b54db1f45163c8d442b9a82ec',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -254,6 +256,14 @@ REVIEWED_SPECS[REDRAIN_AB_SELECTION] = {
     "selection": REDRAIN_AB_SELECTION, "job_count": 22, "max_cases": 22, "repeats": 2,
     "reservation_hours": 4.5, "hard_deadline_seconds": 16200, "case_deadline_seconds": 386,
     "matrix_sha256": FOCUSED_MATRIX_SHA256[REDRAIN_AB_SELECTION],
+}
+REVIEWED_SPECS[q0_campaign.SELECTION] = {
+    **copy.deepcopy(REVIEWED_SPECS[REDRAIN_AB_SELECTION]),
+    'selection': q0_campaign.SELECTION, 'machine_type': 'z4m-highmem-16',
+    'job_count': 60, 'max_cases': 60, 'repeats': q0_campaign.REPEATS,
+    'reservation_hours': q0_campaign.RESERVATION_HOURS,
+    'hard_deadline_seconds': q0_campaign.RESERVATION_HOURS * 3600,
+    'matrix_sha256': FOCUSED_MATRIX_SHA256[q0_campaign.SELECTION],
 }
 SELECTED_MATRIX_SHA256 = {
     "nvmeof_p13_write_engine": {
@@ -393,7 +403,47 @@ def reviewed_window_spec(spec):
             'hard_deadline_seconds': FLEET_SECONDS}
 
 
+def q0_spec(case_binaries):
+    """Bind the fixed workload to the exact sealed binaries for this fleet."""
+    q0_campaign.validate_binaries(case_binaries)
+    return {**copy.deepcopy(REVIEWED_SPECS[q0_campaign.SELECTION]),
+            'case_binaries': copy.deepcopy(case_binaries)}
+
+
+def q0_quote(spec):
+    """Quote the measured historical case-wall model, including P13 fixed reserves."""
+    jobs = _reviewed_jobs(spec)
+    if spec.get('selection') != q0_campaign.SELECTION:
+        raise ValueError('Q0 quote requires the selected Q0 matrix')
+    replay = sum(job['case_kind'] == 'mainnet_replay' for job in jobs)
+    cases = len(jobs)
+    put = cases - replay
+    fixed = (qualify.M3_PAIR_SECONDS + PAIR_CLEANUP_SECONDS + PREPARATION_SECONDS
+             + EXPORT_RESERVE_SECONDS + CAMPAIGN_MARGIN_SECONDS)
+    modeled = put * q0_campaign.PUT_MODEL_SECONDS + replay * q0_campaign.REPLAY_MODEL_SECONDS + fixed
+    reservation, compute, ceiling = reservation_quote(spec, spec['machine_type'])
+    guard = reservation - q0_campaign.GUARD_MARGIN_SECONDS
+    if guard - modeled < q0_campaign.MINIMUM_GUARD_SLACK_SECONDS:
+        raise ValueError('Q0 empirical time model lacks required guard slack')
+    archive = sum(job['measurement_sizing']['expected_archive_bytes'] for job in jobs)
+    if archive > q0_campaign.ARCHIVE_LIMIT_BYTES:
+        raise ValueError('Q0 sample archive exceeds reviewed bound')
+    return {'cases': cases, 'put_cases': put, 'replay_cases': replay,
+            'case_model_seconds': modeled - fixed, 'fixed_reserve_seconds': fixed,
+            'model_seconds': modeled, 'reservation_seconds': reservation,
+            'guard_seconds': guard, 'guard_slack_seconds': guard - modeled,
+            'compute_cents': compute, 'surcharge_cents': ceiling - compute, 'ceiling_cents': ceiling,
+            'modeled_archive_bytes': archive}
+
+
 def _reviewed_jobs(spec):
+    if isinstance(spec, dict) and spec.get('selection') == q0_campaign.SELECTION:
+        if _json(spec) != _json(q0_spec(spec.get('case_binaries'))):
+            raise ValueError('an exact reviewed Q0 specification is required')
+        jobs = workflow_input.cloud_campaign.make_focused_matrix(q0_campaign.SELECTION)
+        if len(jobs) != spec['job_count'] or _digest(_json(jobs)) != spec['matrix_sha256']:
+            raise ValueError('Q0 workload differs from the reviewed matrix')
+        return jobs
     # P13 and P16 pin the reservation as part of their exact reviews;
     # historical selections retain the legacy variable-window normalization.
     if not isinstance(spec, dict) or spec.get("selection") not in (
@@ -462,7 +512,10 @@ def _check_config(config, spec, surcharge_cents):
             or len(config.get('candidates', [])) != 1
             or config['candidates'][0].get('zone') != 'us-central1-a'):
         raise ValueError('manual campaign requires the reviewed single zonal configuration')
-    _reviewed_jobs(spec)
+    if spec.get('selection') == q0_campaign.SELECTION:
+        q0_quote(spec)
+    else:
+        _reviewed_jobs(spec)
     machine = config.get('machine_type', 'z4m-highmem-16')
     if machine != spec.get('machine_type', 'z4m-highmem-16'):
         raise ValueError('machine type differs from reviewed specification')
@@ -501,6 +554,8 @@ def _admit_package(package_dir, revision, spec):
     verified = package.verify_directory(root)
     focused = spec.get('mode') == 'focused'
     expected_profile = 'focused_valkey' if spec.get('selection') == 'valkey_rdma_reads' else 'focused'
+    if spec.get('selection') == q0_campaign.SELECTION:
+        package.admit_case_binaries(root, spec['case_binaries'])
     if focused and verified.get('build_profile') != expected_profile:
         raise ValueError('focused campaign requires its exact package profile')
     if not focused and verified.get('build_profile') is not None:

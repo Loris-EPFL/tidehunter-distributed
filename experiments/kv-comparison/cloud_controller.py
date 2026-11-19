@@ -56,6 +56,7 @@ import local
 import physical_storage
 import rdma_diagnostics
 import resource_accounting
+import q0_campaign
 from portable_transport import is_trusted, protocol_key, validate_transport
 from control_execution import MAX_JSON_BYTES, execute_at_most_once
 
@@ -127,6 +128,33 @@ def logical_owner_hosts(config, job):
     if count > len(hosts):
         raise SafetyError("logical owners exceed separate owner hosts")
     return hosts[:count]
+
+
+def resolve_case_binary(config, job):
+    """Select a staged executable and check its bytes before starting a case process."""
+    import cloud_package
+    binary = Path(config["binary"])
+    role = job.get("binary_role")
+    selection = config.get("spec", {}).get("selection")
+    if selection != q0_campaign.SELECTION and role is None:
+        return binary, None
+    if selection != q0_campaign.SELECTION:
+        raise SafetyError("case-specific binary requested outside the admitted selection")
+    try:
+        expected = cloud_campaign._m3_cases()[job["case_id"]]
+        if expected["binary_role"] != role:
+            raise ValueError("case binary role differs from reviewed job")
+        stage = Path(config["repository_root"]).parent
+        seals = config["spec"]["case_binaries"]
+        cloud_package.admit_case_binaries(stage, seals)
+        seal = seals[role]
+        if role != "land4":
+            binary = cloud_package.case_binary_path(stage, seal["sha256"])
+        if not binary.stat().st_mode & 0o111 or cloud_package.identity(binary)["sha256"] != seal["sha256"]:
+            raise ValueError("executable is not installed with the reviewed SHA-256")
+        return binary, seal
+    except (KeyError, OSError, ValueError, TypeError) as exc:
+        raise SafetyError(f"case binary admission failed for {job.get('case_id')}: {exc}") from exc
 
 
 def case_owner_job(config, case):
@@ -1109,6 +1137,8 @@ def verify_package(config):
         if platform_module(config):
             options["provider"] = "gcp"
         admission = cloud_package.verify_directory(stage, **options)
+        if config["spec"].get("selection") == q0_campaign.SELECTION:
+            cloud_package.admit_case_binaries(stage, config["spec"]["case_binaries"])
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise SafetyError("sealed source/runtime package admission failed: " + str(exc)) from exc
     inventory = json.loads((stage / "source.json").read_text())
@@ -2863,6 +2893,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
                   "nvme_owner_target_snapshot"):
         if config["spec"].get("mode") not in ("focused", "nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") or index < 0:
             raise SafetyError("NVMe owner operations require an admitted NVMe fleet owner")
+        if action == "nvme_owner_restart" and config["spec"].get("selection") == q0_campaign.SELECTION:
+            raise SafetyError("Q0 does not admit owner restarts")
         if action == "nvme_owner_target_cleanup":
             expected = f"{config['prefix']}/results/cells/{request['case_id']}/storage/{index}/nvme-disconnect/{request['generation']}.json"
             if request.get("host_disconnected_key") != expected:
@@ -3075,6 +3107,9 @@ def guest_operation(config, request, clients, *, local_mode=None):
             return {"available": False, "reason": type(exc).__name__ + ": " + str(exc)}
     name = unit_name(config, case, "storage-" + str(index))
     if action == "tide_start":
+        executable, binary_seal = resolve_case_binary(config, case_owner_job(config, case))
+        if request.get("case_binary") != binary_seal:
+            raise SafetyError("owner and coordinator binary seals differ")
         expected_key = f"{config['prefix']}/deploy/cells/{case}/storage-{index}.tar.gz"
         if request["key"] != expected_key:
             raise SafetyError("unexpected capsule S3 path")
@@ -3107,7 +3142,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
                         if case_owner_job(config, case).get("owner_topology") == "colocated" else None)
         command(systemd_argv(config, case, "storage-" + str(index), cpus,
                              memory, seconds,
-                             [config["binary"], "--experimental-storage-node", capsule_root / "launch.yaml"],
+                             [str(executable), "--experimental-storage-node", capsule_root / "launch.yaml"],
                              setenv={**({"TIDEHUNTER_HISTORY_DIAGNOSTICS": "1"} if request.get("owner_history_diagnostics") else {}),
                                      **({"TIDEHUNTER_OWNER_EVENTS": "1"} if request.get("owner_trace") else {})}), timeout=20)
         deadline = time.monotonic() + min(90, seconds)
@@ -3121,6 +3156,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
                 if address != launch["listen"]:
                     raise SafetyError("storage readiness endpoint differs from typed launch")
                 result = {"ready": address, "launch_sha256": digest(capsule_root / "launch.yaml"), "unit": status}
+                if binary_seal is not None:
+                    result["case_binary"] = binary_seal
                 result["durability_receipt"] = owner_durability_receipt(launch)
                 if before_wal is not None:
                     result["case_device"] = before_wal
@@ -3567,6 +3604,9 @@ class Controller:
             interval = receipt.get("measurement_read_evidence", {}).get("observed")
             if isinstance(interval, dict):
                 observed["measurement_read_evidence"] = interval
+            overhead = receipt.get("q0_overhead")
+            if overhead is not None and overhead.get("available") is not False:
+                observed["measurement_read_evidence"] = {**interval, "q0_overhead": overhead}
             resources = receipt.get("resource_evidence", {}).get("observed")
             if isinstance(resources, dict):
                 observed["resource_evidence"] = resources
@@ -3826,7 +3866,8 @@ class Controller:
             prep = platform_module(self.config).prepare_transport(self.config, prep)
         dump(directory / "prepare-input.json", prep)
         prepared = directory / "prepared"
-        command([self.config["binary"], "--prepare-external-case", directory / "prepare-input.json", "--output", prepared],
+        executable, binary_seal = resolve_case_binary(self.config, job)
+        command([str(executable), "--prepare-external-case", directory / "prepare-input.json", "--output", prepared],
                 timeout=min(60, self.remaining()), env=environment(self.config))
         geometry = {"native_default": (134217728, 10737418240), "research": (4194304, 1073741824),
                     "sui_harness": (16777216, 268435456)}.get(prep["owner_wal_geometry"])
@@ -3913,8 +3954,11 @@ class Controller:
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
                 "sha256": digest(archive), "files": list(files), "timeout": service_seconds,
                 "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
+                **({"case_binary": binary_seal} if binary_seal is not None else {}),
                 "owner_trace": job.get("owner_trace", False)}, case=case, timeout=120)
             dump(directory / "server-proofs" / f"start-{index}.json", proof)
+            if proof.get("case_binary") != binary_seal:
+                raise SafetyError("owner reported a different executable seal")
             receipts[index] = confirm_owner_durability(proof, tier, index, nonces[index])
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = [pool.submit(start, index) for index in range(owner_count)]
@@ -3944,7 +3988,9 @@ class Controller:
         selected = copy.deepcopy(options)
         selected.update(path=str(directory / "database"), evidence=str(cell / "read-evidence"),
                         coordinator_read_cache_bytes=0)
-        config = cloud_campaign.make_run_config(job, cell, selected, self.config["source_revision"],
+        _, binary_seal = resolve_case_binary(self.config, job)
+        revision = binary_seal["revision"] if binary_seal is not None else self.config["source_revision"]
+        config = cloud_campaign.make_run_config(job, cell, selected, revision,
                                                 cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS)
         return self.run_logical_owner_admission(job, directory, config)
 
@@ -3959,7 +4005,8 @@ class Controller:
         keys = 16 * job["owner_count"]
         dump(cell / "config.json", config)
         began = self.clock()
-        command([self.config["binary"], "--config", cell / "config.json", "--output", cell / "result"],
+        executable, _ = resolve_case_binary(self.config, job)
+        command([str(executable), "--config", cell / "config.json", "--output", cell / "result"],
                 timeout=min(cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, self.remaining()), env=environment(self.config))
         elapsed = self.clock() - began
         summary = json.loads((cell / "result/summary.json").read_text())
@@ -4865,11 +4912,17 @@ class Controller:
         if job.get("case_kind") == "fio_floor":
             return self.run_fio_case(job)
         directory = guarded(self.root / "cases" / job["case_id"], self.root)
+        case_binary, binary_seal = resolve_case_binary(self.config, job)
+        revision = binary_seal["revision"] if binary_seal is not None else self.config["source_revision"]
         directory.mkdir(parents=True, exist_ok=False)
         case_started_utc = utc().isoformat()
         receipt = {"job": job, "status": "failed", "binary_blake2b512": self.config["binary_blake2b512"],
                    "artifacts_sha256": {}, "measurement_evidence": {}, "counter_evidence": {},
                    "raw_artifacts_validated": False}
+        if binary_seal is not None:
+            import cloud_package
+            receipt["case_binary"] = binary_seal
+            receipt["binary_blake2b512"] = cloud_package.identity(case_binary)["blake2b512"]
         if job.get("backend") in cloud_campaign.TRANSPORTS:
             receipt.update(owner_control_settings(job))
         client = unit_name(self.config, job["case_id"], "client")
@@ -5039,7 +5092,7 @@ class Controller:
             minimum_deadline = (job["interference"]["duration_seconds"] + 1
                                 if job.get("case_kind") == "interference" else 1)
             seconds = self.client_runtime_seconds(client_deadline, minimum=minimum_deadline)
-            config = cloud_campaign.make_run_config(job, directory, options, self.config["source_revision"], seconds)
+            config = cloud_campaign.make_run_config(job, directory, options, revision, seconds)
             apply_case_namespace(config, job, self.config["prefix"])
             if backend == "native" and "sealed_dataset" in job:
                 import nvme_campaign_native
@@ -5097,7 +5150,7 @@ class Controller:
             (dump_compact if backend in cloud_campaign.NVME_BACKENDS else dump)(directory / "config.json", config)
             try:
                 admission_timeout = min(120 if backend in cloud_campaign.NVME_BACKENDS else 30, self.remaining())
-                admitted = campaign.admit_config(Path(self.config["binary"]), directory / "config.json", directory,
+                admitted = campaign.admit_config(case_binary, directory / "config.json", directory,
                                                  environment(self.config), timeout=admission_timeout)
                 analyze.verify_normalization(config, admitted)
             except (RuntimeError, ValueError, KeyError) as exc:
@@ -5128,7 +5181,7 @@ class Controller:
             # Record possible ownership before the systemd request: a timeout
             # may have started the service despite losing the response.
             started = True
-            executable = [self.config["binary"], "--config", directory / "config.json", "--output", directory / "result"]
+            executable = [str(case_binary), "--config", directory / "config.json", "--output", directory / "result"]
             if self.local_mode is None:
                 command(systemd_argv(self.config, job["case_id"], "client", budget["cpus"], budget["memory_mib"], seconds,
                                      executable), timeout=20)
@@ -5341,7 +5394,8 @@ class Controller:
                 if manifest["status"] == "completed":
                     cloud_campaign.admit_redrain_arm(job, summary["backend"])
                 cloud_campaign.admit_replay_summary(admitted, summary)
-                phase_windows = ({} if job.get("measurement_sizing", {}).get("minimum_phase_seconds") else None)
+                q0_ab = job.get("selection") == q0_campaign.SELECTION and job.get("arm") in q0_campaign.AB_ROLES
+                phase_windows = ({} if q0_ab or job.get("measurement_sizing", {}).get("minimum_phase_seconds") else None)
                 observed_counts = campaign.verify_timing_result(
                     directory / "result", admitted, allow_partial=True, phase_windows=phase_windows)
                 if phase_windows is not None:
@@ -5428,6 +5482,13 @@ class Controller:
                     qualification_error = "; ".join(filter(None, [
                         qualification_error, "read phase windows were not qualified: "
                         + "; ".join(window_qualification["reasons"])]))
+            if q0_ab and manifest["status"] == "completed":
+                overhead = q0_campaign.qualify_overhead(
+                    read_interval, phase_windows.get("measurement"), job["durability_tier"])
+                receipt["q0_overhead"] = overhead
+                if overhead.get("available") is False:
+                    qualification_error = "; ".join(filter(None, [
+                        qualification_error, "Q0 overhead counters unavailable: " + overhead["reason"]]))
             core_error = core_workload_failure(directory / "result", manifest, status, gate_released, completion_observed)
             if core_error is not None:
                 if manifest.get("run", {}).get("qualification_failure"):

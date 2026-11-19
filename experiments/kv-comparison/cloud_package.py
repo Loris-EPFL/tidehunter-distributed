@@ -690,8 +690,60 @@ def admit_nvmet_assets(directory, files, declared):
 
 
 
+def case_binary_path(directory, sha256):
+    if not isinstance(sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", sha256):
+        raise ValueError("invalid case binary SHA-256")
+    return directory / "runtime/case-binaries" / sha256 / "kv-research"
+
+
+def _case_binary_inventory(directory, manifest, expected):
+    import q0_campaign
+    q0_campaign.validate_binaries(expected)
+    if manifest.get("case_binaries") != expected:
+        raise ValueError("package case binary seals differ from reviewed Q0 spec")
+    default = expected["land4"]
+    if (manifest.get("revision") != default["revision"]
+            or manifest.get("binary_sha256") != default["sha256"] or manifest.get("dirty") is not False):
+        raise ValueError("Q0 default binary must be the clean instrumented land4 revision")
+    alternate_paths = {
+        case_binary_path(directory, seal["sha256"]).relative_to(directory).as_posix(): seal["sha256"]
+        for role, seal in expected.items() if role != "land4"
+    }
+    inventory = manifest["files"]
+    if ({name for name in inventory if name.startswith("runtime/case-binaries/")} != set(alternate_paths)
+            or any(inventory[name].get("sha256") != sha for name, sha in alternate_paths.items())):
+        raise ValueError("Q0 binary artifact missing, extra or mismatched in package inventory")
+    return [directory / name for name in sorted(alternate_paths)]
+
+
+def admit_case_binaries(directory, expected):
+    """Bind externally reviewed binary identities to the already verified package."""
+    manifest = json.loads((directory / "manifest.json").read_text())
+    return _case_binary_inventory(directory, manifest, expected)
+
+
+def _stage_case_binaries(output, packages, seals):
+    import q0_campaign
+    q0_campaign.validate_binaries(seals)
+    if not isinstance(packages, dict) or set(packages) != set(seals) - {"land4"}:
+        raise ValueError("Q0 requires an exact alternate package set")
+    for role, source in packages.items():
+        source = Path(source)
+        verified = verify_directory(source)
+        manifest = json.loads((source / "manifest.json").read_text())
+        seal = seals[role]
+        if (verified.get("build_profile") != "focused" or "case_binaries" in manifest
+                or manifest["revision"] != seal["revision"] or verified["binary_sha256"] != seal["sha256"]
+                or manifest["dirty"] is not (role == "baseline_ab")):
+            raise ValueError(f"case package does not bind the Q0 seal for {role}")
+        target = case_binary_path(output, seal["sha256"])
+        target.parent.mkdir(parents=True, exist_ok=False)
+        shutil.copyfile(source / "runtime/bin/kv-research", target)
+        target.chmod(0o755)
+
+
 def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None, spdk_prefix=None, nvmet_fix_prefix=None,
-          *, focused=False, focused_valkey=False):
+          *, focused=False, focused_valkey=False, case_packages=None, case_binaries=None):
     source, receipt = admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source,
                                   focused=focused, focused_valkey=focused_valkey)
     profile = "focused_valkey" if focused_valkey else "focused"
@@ -742,6 +794,10 @@ def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None,
             shutil.copyfile(original, output / "nvmet-fix" / name)
         if nvmet_fix_identity(output / "source", output / "nvmet-fix") != nvmet_fix:
             raise ValueError("nvmet fix identity changed while staging")
+    if case_packages is not None or case_binaries is not None:
+        if not focused or focused_valkey:
+            raise ValueError("Q0 case binaries require a focused TideHunter package")
+        _stage_case_binaries(output, case_packages, case_binaries)
     files = {p.relative_to(output).as_posix(): p for p in output.rglob("*") if p.is_file()}
     manifest = {"schema_version": 1, "revision": source["revision"], "branch": source["branch"], "dirty": source["dirty"],
                 "source_sha256": source["snapshot_sha256"], "source_tree_sha256": source["tree_sha256"],
@@ -751,6 +807,9 @@ def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None,
                 "runtime_efa": EFA, "files": {name: identity(path) for name, path in sorted(files.items())}}
     if focused:
         manifest["build_profile"] = profile
+    if case_binaries is not None:
+        manifest["case_binaries"] = case_binaries
+        _case_binary_inventory(output, manifest, case_binaries)
     if nvmet_fix is not None:
         manifest["nvmet_fix"] = nvmet_fix
     dump(output / "manifest.json", manifest)
@@ -803,6 +862,13 @@ def verify_directory(directory, runtime=False, provider="aws"):
     actual = {p.relative_to(directory).as_posix() for p in directory.rglob("*") if p.is_symlink() or not p.is_dir()}
     if actual - {"manifest.json", "bundle.tar.gz", "bundle.json"} != set(files):
         raise ValueError("runtime directory contains extra or missing files")
+    alternates = []
+    if "case_binaries" in manifest:
+        if profile != "focused":
+            raise ValueError("case binaries require a focused TideHunter package")
+        alternates = _case_binary_inventory(directory, manifest, manifest["case_binaries"])
+    elif any(name.startswith("runtime/case-binaries/") for name in files):
+        raise ValueError("case binaries missing their sealed inventory")
     source = admit_source(directory, directory / "source")
     if focused and not FOCUSED_SOURCE_CLOSURE <= set(source.get("sha256", {})):
         raise ValueError("focused qualification source closure is incomplete")
@@ -826,6 +892,13 @@ def verify_directory(directory, runtime=False, provider="aws"):
                                  or native["sha256"] != FDB_SHA256 or native["blake2b512"] != FDB_BLAKE2B))):
         raise ValueError("manifest source/binary/native-client binding mismatch")
     roots = [elf_identity(binary)]
+    for alternate in alternates:
+        if not alternate.stat().st_mode & 0o111:
+            raise ValueError(f"sealed case binary is not executable: {alternate}")
+        alternate_elf = elf_identity(alternate)
+        if "libfdb_c.so" in alternate_elf["needed"]:
+            raise ValueError("focused case binary links FoundationDB")
+        roots.append(alternate_elf)
     admission = admit_admission_options(build_receipt.get("admission_options"),
                                         build_receipt.get("build_command", []), directory / "runtime/bin/admission-options")
     if admission is not None:
@@ -874,6 +947,8 @@ def verify_directory(directory, runtime=False, provider="aws"):
         environment["LD_LIBRARY_PATH"] = (f"{library.parent.resolve()}:{EFA['runtime_library_dir']}"
                                           if provider == "aws" else str(library.parent.resolve()))
         result["linkage"] = linked_libraries(binary, environment, provider)
+        for alternate in alternates:
+            linked_libraries(alternate, environment, provider)
         if "valkey-rdma" in manifest["features"]:
             result["valkey_runtime_linkage"] = {
                 name: linked_libraries(directory / "runtime/bin" / name, environment, provider)

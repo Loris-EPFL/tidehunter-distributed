@@ -1489,7 +1489,10 @@ class CommandSafetyTests(unittest.TestCase):
     def test_qualification_failure_preserves_manifest_cause(self):
         self._exercise_live_case_diagnostics(failed=True, qualification=True)
 
-    def _exercise_live_case_diagnostics(self, failed, observe=False, cold=False, qualification=False):
+    def test_q0_unavailable_overhead_fails_one_case_without_stopping_fleet(self):
+        self._exercise_live_case_diagnostics(failed=False, q0=True)
+
+    def _exercise_live_case_diagnostics(self, failed, observe=False, cold=False, qualification=False, q0=False):
         config = config_fixture()
         runtime = controller.Controller(config, clients_fixture(config))
         runtime.config["platform"] = {"name": "gcp", "runtime": {}}
@@ -1531,6 +1534,9 @@ class CommandSafetyTests(unittest.TestCase):
         elif observe:
             job["diagnostics"] = {"write_timeline_limit": 16}
         job.pop("read_tier", None)
+        if q0:
+            job.update(selection=controller.cloud_campaign.Q0_SELECTION, arm="baseline_ab",
+                       durability_tier="native", measurement_sizing={"case_deadline_seconds": 30})
         admitted = {"dataset": {"keys": 2}, "phases": {"preload": True, "warmup_operations": 0,
             "aging_operations": 0, "measurement_operations": 1}, "execution": {"concurrency": 1}}
         run_config = {"backend": {"options": {}}, "limits": {"deadline_seconds": 30}}
@@ -1594,6 +1600,41 @@ class CommandSafetyTests(unittest.TestCase):
                 mock(controller, "snapshot", return_value={})
                 mock(controller.resource_accounting, "interval", return_value={})
                 mock(controller, "host_cpu_interval", return_value={})
+                if q0:
+                    b = {"owner_storage": {"available": True, "live_frontier_installs": 5},
+                         "durable_cut": {"enabled": True, "epoch": 1, "nudges": 2}}
+                    mock(controller.cloud_campaign, "qualify_live_nvme_route", return_value={"qualified": True})
+                    mock(controller.cloud_campaign, "admit_live_write_contract")
+                    mock(controller.cloud_campaign, "admit_measurement_read_evidence", side_effect=[
+                        {"observed": {}}, {"observed": {"measurement_attempted": True, "measurement_drained": True,
+                                                       "start": b, "end": b}},
+                    ])
+                    def verify_rows(*_args, phase_windows, **_kwargs):
+                        phase_windows["measurement"] = {"elapsed_ns": 1_000_000_000}
+                        return counts
+                    mock(controller.campaign, "verify_timing_result", side_effect=verify_rows)
+                    mock(controller, "unit_status", side_effect=[active, terminal, stopped] * 2)
+                    mock(controller, "verify_counter_evidence")
+                    def start_with_cache_evidence(argv, **kwargs):
+                        result = run_command(argv, **kwargs)
+                        if argv[0] == "systemd-run":
+                            evidence = directory / "read-evidence" / "read-evidence.json"
+                            evidence.parent.mkdir()
+                            controller.dump(evidence, {})
+                        return result
+                    mock(controller, "command", side_effect=start_with_cache_evidence)
+                    receipt = runtime.run_case(job)
+                    self.assertEqual(receipt["status"], "failed")
+                    self.assertIn("Q0 overhead counters unavailable", receipt["error"])
+                    self.assertFalse(receipt["q0_overhead"]["available"])
+                    self.assertTrue(receipt["raw_artifacts_validated"])
+                    self.assertFalse(runtime.tide_cleanup_forbidden)
+                    job = {**job, "case_id": job["case_id"] + "-next"}
+                    directory = runtime.root / "cases" / job["case_id"]
+                    receipt = runtime.run_case(job)
+                    self.assertEqual(receipt["status"], "completed")
+                    self.assertEqual(receipt["q0_overhead"]["counts"]["durable_cut_nudges"], 0)
+                    return
                 if failed:
                     with self.assertRaises(controller.InfrastructureError) as raised:
                         runtime.run_case(job)

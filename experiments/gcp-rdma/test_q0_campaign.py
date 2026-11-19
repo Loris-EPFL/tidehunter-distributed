@@ -1,0 +1,162 @@
+import copy
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import manual_campaign as manual
+import cloud_campaign
+import cloud_controller as controller
+import cloud_package
+import q0_campaign as q0
+import workflow_input
+
+
+def seals():
+    return {role: {
+        'revision': q0.BASELINE if role == 'baseline_ab' else 'a' * 40 if role == 'land4' else role,
+        'sha256': hashlib.sha256(role.encode()).hexdigest(),
+        **({'instrumentation_patch_sha256': q0.COUNTER_PATCH_SHA256} if role in q0.AB_ROLES else {}),
+    } for role in q0.ROLES}
+
+
+class SelectionTests(unittest.TestCase):
+    def test_matrix_and_quote(self):
+        spec = workflow_input.specification('kv', 'tidehunter_nvme_rdma', 'focused', q0.SELECTION,
+                                            case_binaries=seals())
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual(jobs, controller.controller_matrix(spec))
+        self.assertEqual(spec['matrix_sha256'], 'ec7b1e585125b53a952b97f8da54b4fb10376c9b54db1f45163c8d442b9a82ec')
+        self.assertEqual(len({j['case_id'] for j in jobs}), 60)
+        self.assertEqual(jobs[0]['binary_role'], q0.BISECT_REVISIONS[5])
+        orders = []
+        for repeat in range(3):
+            block = [j for j in jobs if j['repeat'] == repeat]
+            probes = [j for j in block if j['arm'] == 'bisect']
+            orders.append(tuple(j['binary_role'] for j in probes))
+            self.assertEqual(set(orders[-1]), set(q0.BISECT_REVISIONS))
+            ab = [(j['binary_role'], j['case_kind'], j['durability_tier']) for j in block if j['arm'] != 'bisect']
+            self.assertCountEqual(ab, [(role, workload, tier) for role in q0.AB_ROLES
+                                       for workload in ('remote_put', 'mainnet_replay')
+                                       for tier in ('native', 'synchronous')])
+            for job in block:
+                self.assertEqual(cloud_campaign.validate_focused_job(job), job)
+                self.assertEqual((job['value_size'], job['owner_count'], job['target_io']),
+                                 (512, 2, 'buffered'))
+                if job['case_kind'] == 'mainnet_replay':
+                    self.assertEqual(job['concurrency'], 16)
+                    self.assertEqual(job.get('checkpoint_pipeline_depth', 1), 1)
+                else:
+                    self.assertEqual(job['concurrency'], 64)
+                    self.assertEqual(job['mix']['put'], 100)
+        self.assertEqual(len(set(orders)), 3)
+        quote = manual.q0_quote(spec)
+        self.assertEqual((quote['put_cases'], quote['replay_cases']), (48, 12))
+        self.assertEqual((quote['model_seconds'], quote['reservation_seconds'], quote['ceiling_cents']),
+                         (11340, 14400, 4834))
+        self.assertEqual(quote['guard_slack_seconds'], 2460)
+
+    def test_rejects_incomplete_or_wrong_bindings(self):
+        value = seals()
+        with self.assertRaisesRegex(ValueError, 'every selected'):
+            manual.q0_spec({})
+        spec = manual.q0_spec(value)
+        del spec['case_binaries'][q0.F1]
+        with self.assertRaisesRegex(ValueError, 'every selected'):
+            manual._reviewed_jobs(spec)
+        value['baseline_ab']['sha256'] = value[q0.BASELINE]['sha256']
+        with self.assertRaisesRegex(ValueError, 'reused'):
+            manual.q0_spec(value)
+        value = seals()
+        value['land4']['instrumentation_patch_sha256'] = 'b' * 64
+        with self.assertRaisesRegex(ValueError, 'reviewed instrumentation'):
+            manual.q0_spec(value)
+
+    def test_rejects_generated_matrix_drift(self):
+        spec = manual.q0_spec(seals())
+        jobs = cloud_campaign.make_focused_matrix(q0.SELECTION)
+        jobs[0]['value_size'] += 1
+        with patch.object(cloud_campaign, 'make_focused_matrix', return_value=jobs):
+            with self.assertRaisesRegex(ValueError, 'differs from the reviewed matrix'):
+                manual._reviewed_jobs(spec)
+
+    def test_counter_delta_never_interprets_missing_or_reset_as_zero(self):
+        evidence = {'measurement_drained': True, 'measurement_attempted': True,
+                    'start': {'owner_storage': {'available': True, 'live_frontier_installs': 7},
+                              'durable_cut': {'enabled': True, 'epoch': 1, 'nudges': 2}},
+                    'end': {'owner_storage': {'available': True, 'live_frontier_installs': 37},
+                            'durable_cut': {'enabled': True, 'epoch': 1, 'nudges': 8}}}
+        self.assertEqual(q0.overhead_counts(evidence, 2_000_000_000, 'native')['counts'],
+                         {'live_frontier_installs': 30, 'durable_cut_nudges': 6})
+        for field, value, failure in (('nudges', 1, 'decreased'), ('epoch', 2, 'population'),
+                                      ('enabled', False, 'population')):
+            altered = copy.deepcopy(evidence)
+            altered['end']['durable_cut'][field] = value
+            with self.assertRaisesRegex(ValueError, failure):
+                q0.overhead_counts(altered, 2_000_000_000, 'native')
+
+
+class DispatchTests(unittest.TestCase):
+    def setUp(self):
+        stage = tempfile.TemporaryDirectory()
+        self.addCleanup(stage.cleanup)
+        self.stage = Path(stage.name)
+        self.seals = seals()
+        self.spec = manual.q0_spec(self.seals)
+        self.paths = {}
+        default = self.stage / 'runtime/bin/kv-research'
+        files = {}
+        for role, seal in self.seals.items():
+            path = default if role == 'land4' else cloud_package.case_binary_path(self.stage, seal['sha256'])
+            path.parent.mkdir(parents=True)
+            path.write_bytes(role.encode())
+            path.chmod(0o755)
+            self.paths[role] = path
+            files[path.relative_to(self.stage).as_posix()] = cloud_package.identity(path)
+        self.manifest = {'files': files, 'case_binaries': self.seals, 'dirty': False,
+                         'binary_sha256': self.seals['land4']['sha256'],
+                         'revision': self.seals['land4']['revision']}
+        cloud_package.dump(self.stage / 'manifest.json', self.manifest)
+        self.config = {'binary': str(default), 'repository_root': str(self.stage / 'source'), 'spec': self.spec,
+                       'prefix': 'bench-0000000000000000',
+                       'fleet': {'nodes': [{'index': 0}, {'index': 1}], 'data_root': str(self.stage)}}
+        self.jobs = {j['binary_role']: j for j in controller.controller_matrix(self.spec)}
+
+    def test_distinct_exact_and_instrumented_pair(self):
+        for job in controller.controller_matrix(self.spec):
+            role = job['binary_role']
+            self.assertEqual(controller.resolve_case_binary(self.config, job),
+                             (self.paths[role], self.seals[role]))
+        self.assertEqual(controller.resolve_case_binary({'binary': '/legacy'}, {}), (Path('/legacy'), None))
+        changed = {**self.jobs[q0.F1], 'binary_role': 'land4'}
+        with self.assertRaisesRegex(controller.SafetyError, 'role differs'):
+            controller.resolve_case_binary(self.config, changed)
+
+    def test_no_fallback_when_bytes_or_manifest_do_not_match(self):
+        path = self.paths[q0.F1]
+        path.write_bytes(b'wrong bytes')
+        with self.assertRaisesRegex(controller.SafetyError, 'reviewed SHA'):
+            controller.resolve_case_binary(self.config, self.jobs[q0.F1])
+        path.unlink()
+        with self.assertRaisesRegex(controller.SafetyError, 'case binary admission failed'):
+            controller.resolve_case_binary(self.config, self.jobs[q0.F1])
+        del self.manifest['files'][path.relative_to(self.stage).as_posix()]
+        cloud_package.dump(self.stage / 'manifest.json', self.manifest)
+        with self.assertRaisesRegex(ValueError, 'missing, extra or mismatched'):
+            cloud_package.admit_case_binaries(self.stage, self.seals)
+
+    def test_owner_refuses_cross_revision_before_accepting_capsule(self):
+        req = {'index': 0, 'action': 'tide_start', 'case_id': self.jobs[q0.F1]['case_id'],
+               'case_binary': self.seals['land4']}
+        with patch.object(controller, 'verify_local_identity'), patch.object(
+                controller, 'guarded', side_effect=lambda path, *_args, **_kwargs: Path(path)), patch.object(
+                controller, 'download_object') as download:
+            with self.assertRaisesRegex(controller.SafetyError, 'owner and coordinator binary seals differ'):
+                controller.guest_operation(self.config, req, {})
+            download.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

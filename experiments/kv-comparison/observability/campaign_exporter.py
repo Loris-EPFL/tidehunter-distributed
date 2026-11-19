@@ -41,6 +41,7 @@ COORDINATOR_INTERVAL_COUNTERS = {
     "write_checkpoint_diagnostic_owner_adoption_ns", "write_checkpoint_diagnostic_owner_adoption_count",
     "write_checkpoint_diagnostic_obsolete_cleanup_ns", "write_checkpoint_diagnostic_obsolete_cleanup_count",
     "write_checkpoint_diagnostic_index_prepare_ns", "write_checkpoint_diagnostic_index_prepare_count"} | AUTHORITY_INTERVAL_COUNTERS
+Q0_OVERHEAD_FIELDS = ("live_frontier_installs", "durable_cut_nudges")
 
 # Live NVMe-oF measurement deltas (kv-research `runner.rs` LIVE_NVMEOF_DELTA_FIELDS). The
 # expected set must be present; the allowed set must equal the Rust delta list exactly, which
@@ -281,9 +282,21 @@ def measurement_read_metrics(evidence, labels):
     if not isinstance(deltas, dict):
         raise ValueError("measurement read deltas missing")
     labels = labels | {"scope": "measurement_boundary"}
+    overhead = evidence.get("q0_overhead")
     supplemental = client_pool_metrics(evidence.get("client_pool"), labels)
     supplemental += live_nvmeof_peak_metrics(evidence.get("live_nvmeof_peaks"), labels)
     supplemental += nvmeof_reader_boundaries(evidence, labels)
+    if overhead is not None:
+        if (not isinstance(overhead, dict) or set(overhead) != {"elapsed_ns", "counts"}
+                or not isinstance(overhead["counts"], dict)
+                or set(overhead["counts"]) != set(Q0_OVERHEAD_FIELDS)):
+            raise ValueError("invalid Q0 overhead counter evidence")
+        elapsed = count(overhead["elapsed_ns"])
+        if elapsed <= 0:
+            raise ValueError("invalid Q0 overhead exposure")
+        for field in Q0_OVERHEAD_FIELDS:
+            rate = count(overhead["counts"][field]) * 1e9 / elapsed
+            supplemental += sample("kv_q0_events_per_second", rate, labels | {"event": field})
     result = ""
     if deltas.get("available") is False:
         return (sample("kv_case_read_evidence_available", 0, labels | {"component": "measurement"})
