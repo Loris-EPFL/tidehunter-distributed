@@ -170,6 +170,21 @@ class TargetsContractTests(unittest.TestCase):
                     self.root, '/binary', transport='tcp', history_persistence=history)['complete'])
                 self.assertEqual(run.call_args.args[0][-1], history)
 
+    def test_kernel_qualification_requires_prepared_leased_per_owner_route(self):
+        for tier in ('native', 'synchronous'):
+            live = {'write_mode': 'leased', 'export_mode': 'per_owner', 'leased_durability': tier}
+            target = {'export_mode': 'per_owner'}
+            with self.subTest(tier=tier):
+                targets._admit_kernel_leased_route({'live_nvme': live}, target, tier)
+            for field, value in (('write_mode', 'reserved'), ('export_mode', 'on_demand'),
+                                 ('leased_durability', None)):
+                with self.subTest(tier=tier, field=field), self.assertRaisesRegex(
+                        targets.TargetError, 'not leased per-owner'):
+                    targets._admit_kernel_leased_route({'live_nvme': live | {field: value}}, target, tier)
+            with self.subTest(tier=tier, field='target'), self.assertRaisesRegex(
+                    targets.TargetError, 'not leased per-owner'):
+                targets._admit_kernel_leased_route({'live_nvme': live}, {'export_mode': 'on_demand'}, tier)
+
     def test_kernel_worker_rejects_untrusted_output_before_creating_artifacts(self):
         self.root.chmod(0o777)
         before = set(self.root.iterdir())

@@ -330,6 +330,13 @@ def _kernel_live_ports(address, *, commissioning_address, control_address):
                       "service/commissioning pair after 32 attempts")
 
 
+def _admit_kernel_leased_route(remote, target, tier):
+    live = remote.get("live_nvme") or {}
+    if (live.get("write_mode") != "leased" or live.get("export_mode") != "per_owner"
+            or live.get("leased_durability") != tier or target.get("export_mode") != "per_owner"):
+        raise TargetError("prepared kernel qualification is not leased per-owner at the requested durability tier")
+
+
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         history_persistence, owner_wal_file_bytes=None):
     import hashlib
@@ -464,6 +471,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                 "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
                     "port_id": port_id, "commissioning_service": commissioning,
                     "commissioning_port_id": port_id + 1, "max_inflight_requests": 32,
+                    "write_mode": "leased", "export_mode": "per_owner",
                     "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
                     "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
             if owner_wal_file_bytes is not None:
@@ -483,6 +491,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     or launch["node"]["partition"]["wal_file_bytes"] != owner_wal_file_bytes):
                 raise TargetError("prepared qualification WAL member size differs from request")
             target = launch["node"]["live_target"]
+            _admit_kernel_leased_route(remote, target, tier)
             if (launch["listen"] != f"{control_address}:{control}" or target["address"] != addr
                     or target["transport"] != transport or target.get("spdk") is not None
                     or target["port_id"] != port_id or target["commissioning_port_id"] != port_id + 1):
