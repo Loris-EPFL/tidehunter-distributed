@@ -1189,8 +1189,16 @@ fn leased_recovery_reports_a_hole_only_below_a_later_valid_frame() {
 /// of fragment 1. With `damaged`, unsynced bytes inside v1 stop the scan there and
 /// recovery probes fragment 1. Returns the stream path and fragment 1's start.
 fn two_fragment_stream(damaged: bool) -> (tempdir::TempDir, PartitionConfig, u64) {
+    two_fragment_stream_in(HistoryPersistence::WalReplay, damaged)
+}
+
+fn two_fragment_stream_in(
+    history: HistoryPersistence,
+    damaged: bool,
+) -> (tempdir::TempDir, PartitionConfig, u64) {
     let (temp, config, log) = fixture();
-    assert_eq!(log.history_persistence(), HistoryPersistence::WalReplay);
+    log.set_history_persistence(history).unwrap();
+    assert_eq!(log.history_persistence(), history);
     let first = log.lease_live_extent(authority(&config)).unwrap().0;
     for n in 0..2 {
         let (_, frame) = encoded(&config, vec![batch(&config, n)]);
@@ -1257,6 +1265,63 @@ fn leased_recovery_scan_header_io_error_at_a_skip_marker_fails() {
         PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
     assert!(!recovered.recovery_found_hole());
     assert_eq!(recovered.receipt_count(), 3);
+}
+
+/// Live stream with on-disk history: recovery writes back every frame and skip
+/// marker it accepts above the synced live frontier, each from the validated
+/// bytes and each followed by a sync of its file before recovery returns.
+#[test]
+fn on_disk_live_recovery_rewrites_validated_frames_and_skip_markers() {
+    use crate::distributed::storage::wal_replay::suffix_rewrite_hook::{self as hook, Event};
+    let (temp, config, fragment) = two_fragment_stream_in(HistoryPersistence::OnDisk, false);
+    let path = temp.path().join("stream");
+    let synced: LiveFrontier = read_metadata(&path.join(LIVE_FRONTIER)).unwrap();
+    let mut before = vec![0u8; 2 * config.wal_file_bytes as usize];
+    for file in 0..2usize {
+        let bytes = fs::read(path.join(format!("wal_{file:016x}"))).unwrap();
+        let start = file * config.wal_file_bytes as usize;
+        let len = bytes.len().min(config.wal_file_bytes as usize);
+        before[start..start + len].copy_from_slice(&bytes[..len]);
+    }
+    hook::install(hook::Hook::default());
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    let events = hook::take().unwrap().events;
+    assert_eq!(recovered.history_persistence(), HistoryPersistence::OnDisk);
+    assert_eq!(recovered.receipt_count(), 3);
+    let mut pending = Vec::new();
+    let mut written = Vec::new();
+    for event in events {
+        match event {
+            Event::Write { offset, bytes } => pending.push((offset, bytes)),
+            Event::Sync { file_start } => {
+                for (offset, bytes) in pending.drain(..) {
+                    assert_eq!(
+                        offset / config.wal_file_bytes * config.wal_file_bytes,
+                        file_start
+                    );
+                    let range = offset as usize..offset as usize + bytes.len();
+                    assert_eq!(bytes[..], before[range], "offset {offset}");
+                    written.push((offset, bytes.len()));
+                }
+            }
+        }
+    }
+    assert!(pending.is_empty(), "rewrite without a following sync");
+    // v0, v1, the skip marker (8 bytes plus zeros to the fragment end) and v2,
+    // except what the synced live frontier already covered.
+    let expected: Vec<_> = [
+        (0, 4096),
+        (4096, 4096),
+        (8192, fragment - 8192),
+        (fragment, 4096),
+    ]
+    .into_iter()
+    .filter(|(offset, _)| *offset >= synced.end)
+    .map(|(offset, len)| (offset, len as usize))
+    .collect();
+    assert_eq!(written, expected);
+    assert!(!expected.is_empty());
 }
 
 #[test]
