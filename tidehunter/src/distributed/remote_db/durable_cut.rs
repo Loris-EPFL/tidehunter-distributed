@@ -37,7 +37,9 @@ use super::super::durability::DurableCutConfig;
 use super::super::storage::{
     LocalDbError, StorageError, encode_metadata, install_metadata, read_metadata,
 };
-use super::super::tcp::{Client, DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport, TcpError};
+use super::super::tcp::{
+    Client, DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport, TcpError, WakeFd,
+};
 use super::super::types::BatchVersion;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -102,7 +104,8 @@ pub(super) struct CutRecord {
     /// One entry per tracked epoch, written by the first recovery after it:
     /// that recovery kept only the batches of `epoch` below `next`. Every later
     /// recovery honours it, so a discarded batch never returns. Epochs ascend;
-    /// at most one entry per epoch, so the length is bounded by `max_epochs`.
+    /// at most one entry per retained fencing generation: an offline open drops
+    /// the entry of a trimmed generation (`forget_retired_generation`).
     truncations: Vec<EpochCut>,
 }
 
@@ -157,7 +160,37 @@ impl CutRecord {
                 "durable cut record {}: {error}",
                 path.join(RECORD).display()
             ))
-        })
+        })?;
+        // Coordinator device attribution: not Exact output.
+        super::checkpoint_attribution::record_installed(
+            path,
+            RECORD,
+            bytes.len(),
+            super::checkpoint_attribution::CoordinatorIoCategory::DurableCut,
+        );
+        Ok(())
+    }
+
+    /// The tracked generation, if any.
+    pub(super) fn live_generation(&self) -> Option<u64> {
+        self.live.map(|live| live.epoch)
+    }
+
+    /// Drop the truncation of a trimmed fencing generation. Offline open only:
+    /// after every owner acknowledged the trim and before a durable-cut actor
+    /// starts. Never touches `live`. Returns whether the record changed.
+    pub(super) fn forget_retired_generation(
+        &mut self,
+        generation: u64,
+    ) -> Result<bool, LocalDbError> {
+        if self.live.is_some_and(|live| live.epoch == generation) {
+            return Err(LocalDbError::new(format!(
+                "durable cut still tracks fencing generation {generation}"
+            )));
+        }
+        let before = self.truncations.len();
+        self.truncations.retain(|cut| cut.epoch != generation);
+        Ok(self.truncations.len() != before)
     }
 }
 
@@ -354,6 +387,12 @@ pub(super) fn rewrite_marks_for_test(path: &Path, edit: impl FnOnce(&mut [OwnerM
     let mut record: CutRecord = read_metadata(&path.join(RECORD)).unwrap();
     edit(&mut record.owners);
     record.persist(path).unwrap();
+}
+
+/// Test hook: persisted truncation entries (zero when no record exists).
+#[cfg(test)]
+pub(super) fn truncation_count_for_test(path: &Path) -> usize {
+    read_metadata::<CutRecord>(&path.join(RECORD)).map_or(0, |record| record.truncations.len())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -568,8 +607,9 @@ struct Running {
     /// queue: senders wait (blocking `send`); none of them holds a lock. Stop:
     /// sent after every poller joined; the actor exits on it or on disconnect.
     messages: mpsc::SyncSender<Message>,
-    /// One stop channel (capacity 1, `try_send`) and handle per poller.
-    pollers: Vec<(mpsc::SyncSender<()>, JoinHandle<()>)>,
+    /// One stop channel (capacity 1, `try_send`), stop wake and handle per
+    /// poller. The wake interrupts a parked progress wait; it is never drained.
+    pollers: Vec<(mpsc::SyncSender<()>, Arc<WakeFd>, JoinHandle<()>)>,
     actor: JoinHandle<()>,
 }
 
@@ -580,10 +620,11 @@ pub(in crate::distributed::remote_db) struct DurableCut {
     running: Mutex<Option<Running>>,
 }
 
-/// One owner endpoint as the poller needs it.
+/// One owner endpoint as the poller needs it. `connect` opens the dedicated
+/// progress lane (`Client::connect_progress_shared`) with the poller's stop wake.
 pub(super) struct PollTarget {
     pub partition: u32,
-    pub connect: Box<dyn Fn() -> Result<Client, TcpError> + Send>,
+    pub connect: Box<dyn Fn(Arc<WakeFd>) -> Result<Client, TcpError> + Send>,
 }
 
 impl DurableCut {
@@ -594,13 +635,23 @@ impl DurableCut {
         epoch: u64,
         config: DurableCutConfig,
         record: CutRecord,
-        mut targets: Vec<PollTarget>,
+        targets: Vec<PollTarget>,
     ) -> Result<Self, LocalDbError> {
         // Open every first session now, before open returns: the owner's Status
         // handshake flushes its logs, and here they hold nothing of this epoch,
         // so no handshake syncs a write ahead of the cut's nudge.
-        let clients = super::endpoint_map(&mut targets, |_, target| {
-            (target.connect)().map_err(|error| {
+        let mut targets = targets
+            .into_iter()
+            .map(|target| match WakeFd::for_progress("poller stop wake") {
+                Ok(stop) => Ok((target, Arc::new(stop))),
+                Err(error) => Err(LocalDbError::new(format!(
+                    "durable cut session to partition {}: {error}",
+                    target.partition
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let clients = super::endpoint_map(&mut targets, |_, (target, stop)| {
+            (target.connect)(stop.clone()).map_err(|error| {
                 LocalDbError::new(format!(
                     "durable cut session to partition {}: {error}",
                     target.partition
@@ -640,18 +691,27 @@ impl DurableCut {
                 actor,
             })),
         };
-        for (owner, (target, client)) in targets.into_iter().zip(clients).enumerate() {
+        for (owner, ((target, wake), client)) in targets.into_iter().zip(clients).enumerate() {
             let (stop, stopped) = mpsc::sync_channel(1);
             let shared = shared.clone();
             let messages = messages.clone();
+            let poller_wake = wake.clone();
             let handle = thread::Builder::new()
                 .name(format!("value-wal-durable-{}", target.partition))
                 .spawn(move || {
-                    poll_owner(owner, &target, client, &shared, &messages, &stopped, wait);
+                    poll_owner(
+                        owner,
+                        &target,
+                        client,
+                        &shared,
+                        &messages,
+                        (&stopped, &poller_wake),
+                        wait,
+                    );
                 })
                 .map_err(LocalDbError::component)?;
             if let Some(running) = cut.running.lock().as_mut() {
-                running.pollers.push((stop, handle));
+                running.pollers.push((stop, wake, handle));
             }
         }
         Ok(cut)
@@ -719,16 +779,19 @@ impl DurableCut {
         }
     }
 
-    /// Stop and join every thread. Idempotent. A poller inside a long poll
-    /// returns at the owner's next durable advance or after `lag_ms / 4` (at most 5 s).
+    /// Stop and join every thread. Idempotent. The stop wake ends a poller's
+    /// parked progress wait at once; an idle poller sees the stop channel.
     pub(super) fn stop(&self) {
         let Some(running) = self.running.lock().take() else {
             return;
         };
-        for (stop, _) in &running.pollers {
+        for (stop, wake, _) in &running.pollers {
             let _ = stop.try_send(());
+            // Cannot fail (a full eventfd counter is already readable); a lost
+            // wake would only delay this stop to the owner's poll deadline.
+            let _ = wake.signal();
         }
-        for (_, poller) in running.pollers {
+        for (_, _, poller) in running.pollers {
             if poller.join().is_err() {
                 Shared::bump(&self.shared.counters.poll_failures);
             }
@@ -757,23 +820,36 @@ fn stopped(stop: &mpsc::Receiver<()>, wait: Duration) -> bool {
 }
 
 /// Service loop: runs until stop. Each turn either waits on the stop channel
-/// (idle owner, failed connection) or completes one bounded long poll.
+/// (idle owner, failed connection) or completes one bounded long poll. The stop
+/// wake (second part of `stop`) ends a parked poll at once; that exit takes no
+/// failed-poll path and certifies nothing. A route that cannot wait without
+/// spinning (`TcpError::is_wait_unavailable`) ends this poller: reconnecting
+/// would repeat the owner's Status sync without fixing the route, and the cut of
+/// this owner then stays at its last report, so certification reports it.
 fn poll_owner(
     owner: usize,
     target: &PollTarget,
     client: Client,
     shared: &Shared,
     messages: &mpsc::SyncSender<Message>,
-    stop: &mpsc::Receiver<()>,
+    (stop, wake): (&mpsc::Receiver<()>, &Arc<WakeFd>),
     wait: Duration,
 ) {
     // A quarter of the lag bound: a nudge waits at most this long behind a
-    // parked poll, and so does shutdown when no owner sync ends the poll.
+    // parked poll. Shutdown does not wait for it (stop wake).
     let idle_wait = (wait / 4).max(Duration::from_millis(1));
     let max_wait = idle_wait.min(DURABLE_PROGRESS_MAX_WAIT);
     let epoch = shared.epoch;
     let Some(state) = shared.owners.get(owner) else {
         return;
+    };
+    let unavailable = |error: &TcpError| {
+        Shared::bump(&shared.counters.poll_failures);
+        // Observer output only; the stopped poller is the authority signal.
+        eprintln!(
+            "durable cut poller for partition {} stopped: {error}",
+            target.partition
+        );
     };
     let mut client = Some(client);
     let mut generation = 0;
@@ -791,8 +867,12 @@ fn poll_owner(
             return;
         }
         if client.is_none() {
-            match (target.connect)() {
+            match (target.connect)(wake.clone()) {
                 Ok(connection) => client = Some(connection),
+                Err(error) if error.is_wait_unavailable() => {
+                    unavailable(&error);
+                    return;
+                }
                 Err(_) => {
                     Shared::bump(&shared.counters.poll_failures);
                     if stopped(stop, wait) {
@@ -807,10 +887,16 @@ fn poll_owner(
         };
         // AcqRel: consume the actor's request exactly once.
         let sync = state.nudge.swap(false, Ordering::AcqRel);
-        let report = connection
-            .durable_progress(epoch, epoch, generation, max_wait, sync)
-            .ok()
-            .filter(|report| valid_report(report, epoch));
+        let report = match connection.durable_progress(epoch, epoch, generation, max_wait, sync) {
+            Ok(report) => Some(report).filter(|report| valid_report(report, epoch)),
+            // The stop wake ended the wait; not a failed poll.
+            Err(_) if stopped(stop, Duration::ZERO) => return,
+            Err(error) if error.is_wait_unavailable() => {
+                unavailable(&error);
+                return;
+            }
+            Err(_) => None,
+        };
         let Some(report) = report else {
             client = None;
             generation = 0;

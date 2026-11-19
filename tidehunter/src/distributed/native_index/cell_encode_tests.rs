@@ -26,7 +26,11 @@ fn legacy_append_cell(
     reference_bytes: &mut Vec<u8>,
 ) -> Result<WrittenCell, NativeIndexError> {
     let count = Rows::new(cell)
-        .filter(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
+        .filter(|(key, base, overlay)| {
+            retained(cell, key, base, overlay, cut, floor)
+                .next()
+                .is_some()
+        })
         .count();
     if count == 0 {
         return Err(NativeIndexError::Invalid("empty cell append"));
@@ -64,6 +68,7 @@ fn legacy_append_cell(
             floor: floor.clone(),
         },
         count,
+        rows: summary.rows,
         retained_bytes: summary.retained_bytes,
         retained_versions: summary.retained_versions,
     })
@@ -136,6 +141,12 @@ fn base(history: &History) -> Option<SortedBlock> {
         identity: (KeySpace(0), CellId::Integer(0)),
         base: None,
         overlay: overlay(history),
+        birth: 0,
+        masks: FrozenMasks::default(),
+        marks: None,
+        marks_changed: false,
+        policy: None,
+        fold: Vec::new(),
     };
     let mut frame = Vec::new();
     let written = legacy_append_cell(
@@ -164,6 +175,12 @@ fn cell(base_history: &History, overlay_history: &History) -> FrozenCell {
         identity: (KeySpace(0), CellId::Integer(0)),
         base: base(base_history),
         overlay: overlay(overlay_history),
+        birth: 0,
+        masks: FrozenMasks::default(),
+        marks: None,
+        marks_changed: false,
+        policy: None,
+        fold: Vec::new(),
     }
 }
 
@@ -636,6 +653,12 @@ fn limits_are_clamped_and_overflowing_bounds_stream() {
             vec![1],
             vec![reference(version(1, 0), RecordKind::Put, 1, 0)],
         )])),
+        birth: 0,
+        masks: FrozenMasks::default(),
+        marks: None,
+        marks_changed: false,
+        policy: None,
+        fold: Vec::new(),
     };
     // The candidate row count overflows: streaming is chosen before encoding.
     assert_eq!(buffered_bound(&impossible, usize::MAX), None);
@@ -733,6 +756,12 @@ fn persisted_images_are_identical_for_buffered_and_streamed_cells() {
                 identity: (KeySpace(0), id.clone()),
                 base: None,
                 overlay: overlay(history),
+                birth: 0,
+                masks: FrozenMasks::default(),
+                marks: None,
+                marks_changed: false,
+                policy: None,
+                fold: Vec::new(),
             })
             .collect()
     };
@@ -787,6 +816,12 @@ fn persisted_images_are_identical_for_buffered_and_streamed_cells() {
                     identity: cell.identity.clone(),
                     base: Some(base),
                     overlay: overlay(newer.get(&cell.identity.1).unwrap_or(&History::new())),
+                    birth: 0,
+                    masks: FrozenMasks::default(),
+                    marks: None,
+                    marks_changed: false,
+                    policy: None,
+                    fold: Vec::new(),
                 }
             })
             .collect()

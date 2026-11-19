@@ -241,6 +241,7 @@ fn verify_fences(sample: &serde_json::Value, partitions: &[u32]) -> BackendResul
 }
 fn shutdown_targets(
     config: &RemoteDatabaseConfig,
+    database: [u8; 16],
     shape: &KeyShape,
 ) -> BackendResult<Vec<serde_json::Value>> {
     use tidehunter::distributed::storage::{PartitionConfig, StaticInventory};
@@ -252,7 +253,7 @@ fn shutdown_targets(
         tls.server_name.clone_from(&endpoint.server_name);
         let partition = PartitionConfig {
             inventory: StaticInventory {
-                database: storage.database,
+                database,
                 epoch: 1,
                 segment_generation: 1,
                 partitions: storage.partitions.clone(),
@@ -269,16 +270,13 @@ fn shutdown_targets(
             Client::connect(&endpoint.address, &tls, config.timeout, partition, shape)?;
         let status = client.status()?;
         check(status.live_nvmeof, "owner does not report live target")?;
-        let epoch = status
-            .epochs
-            .last()
-            .ok_or("owner has no authority epoch")?
-            .epoch;
+        let epoch = status.highest_fenced_generation;
+        check(epoch != 0, "owner has no authority epoch")?;
         if status.active_epoch == Some(epoch) {
             client.seal(epoch)?;
         } else {
             check(
-                status.active_epoch.is_none() && status.epochs.last().is_some_and(|e| e.sealed),
+                status.active_epoch.is_none(),
                 "owner authority not in expected latest epoch",
             )?;
         }
@@ -289,7 +287,7 @@ fn shutdown_targets(
         )?;
         receipts.push(serde_json::json!({
             "partition": endpoint.partition, "endpoint": endpoint.address,
-            "database": storage.database, "epoch": epoch, "stats": stats
+            "database": database, "epoch": epoch, "stats": stats
         }));
     }
     Ok(receipts)
@@ -537,6 +535,148 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
     progress.mark("child_ready_synced", Some(&db));
     // Deliberately skip Rust destructors: a graceful Db shutdown checkpoints the tail.
     std::process::exit(0)
+}
+
+/// The initial database's writer routes, one per partition, as observed.
+fn writer_routes(sample: &serde_json::Value) -> BackendResult<Vec<serde_json::Value>> {
+    Ok(sample["routes"]
+        .as_array()
+        .ok_or("live namespace routes unavailable")?
+        .iter()
+        .filter(|route| !route["writer"].is_null())
+        .cloned()
+        .collect())
+}
+
+/// Effective initiator identity of `database` on every partition, as the
+/// owner host derives it (`tcp::host::identity`).
+fn effective_initiators(
+    remote: &RemoteDatabaseConfig,
+    database: [u8; 16],
+) -> BackendResult<Vec<serde_json::Value>> {
+    use tidehunter::distributed::tcp::host::identity;
+    let live = &remote.live_nvme;
+    remote
+        .storage
+        .partitions
+        .iter()
+        .map(|&partition| {
+            let configured = live
+                .owner_identities
+                .get(&partition)
+                .map_or(live.host_id, |owner| owner.host_id);
+            Ok(serde_json::json!({
+                "partition": partition,
+                "database": identity::database_hex(&database),
+                "host_nqn": identity::effective_host_nqn(&database, partition),
+                "host_id": identity::effective_host_id(&configured, &database, partition),
+            }))
+        })
+        .collect()
+}
+
+/// Drop the qualified database through the owner host and reopen the same
+/// path: the host reuses the freed target slot (same port and service) for a
+/// new identity whose subsystem and effective initiator NQNs differ, and new
+/// live I/O completes on it. With one host slot (`max_databases = 1`) the
+/// reprovision succeeds only after the drop has released the slot.
+fn qualify_target_reuse(
+    input: &Input,
+    remote: &RemoteDatabaseConfig,
+    shape: &KeyShape,
+    dropped: [u8; 16],
+    dropped_sample: &serde_json::Value,
+    progress: &mut QualificationProgress,
+) -> BackendResult<(serde_json::Value, [u8; 16])> {
+    use tidehunter::distributed::tcp::host::identity;
+    let before = writer_routes(dropped_sample)?;
+    check(!before.is_empty(), "no writer route before the drop")?;
+    progress.mark("target_reuse_drop", None);
+    sui::Db::drop_db(&input.coordinator_path)?;
+    check(
+        !input.coordinator_path.exists(),
+        "dropped coordinator directory remains",
+    )?;
+    progress.mark("target_reuse_reprovision", None);
+    // Fresh reads must reach the reused namespace, not the coordinator cache.
+    let mut fresh_remote = remote.clone();
+    fresh_remote.read_cache_bytes = 0;
+    let db = sui::Db::open_remote(&input.coordinator_path, shape.clone(), fresh_remote)
+        .map_err(native_error)?;
+    let database = db
+        .remote_database_id()
+        .ok_or("reprovisioned database is not remote")?;
+    check(
+        database != dropped,
+        "reprovision reused the dropped identity",
+    )?;
+    progress.mark("target_reuse_io", Some(&db));
+    let ks = db.ks("root");
+    let start = stats(&db)?;
+    let key = key_bytes(&input.namespace, 23, 1);
+    let value = value_bytes(&input.namespace, 31, 1, 65536, 1.0);
+    db.insert(ks, key.clone(), value.clone())
+        .map_err(native_error)?;
+    read_expected_live(&db, ks, &key, &value)?;
+    let end = stats(&db)?;
+    check(
+        delta(&start, &end, "completed_write_ops")? > 0
+            && delta(&start, &end, "errors")? == 0
+            && delta(&start, &end, "unknown_writes")? == 0,
+        "reused target did not complete live I/O",
+    )?;
+    verify_routes(&end, &input.expected_route)?;
+    let after = writer_routes(&end)?;
+    check(!after.is_empty(), "no writer route after the reprovision")?;
+    // One owner (checked by `run`): every route of either database names the
+    // same target slot. The subsystem and the effective initiator are scoped
+    // to each database, so they differ.
+    let partition = *remote
+        .storage
+        .partitions
+        .first()
+        .ok_or("qualification has no partition")?;
+    let scope = |database: &[u8; 16]| format!("db-{}-p", identity::database_hex(database));
+    let scoped = |routes: &[serde_json::Value], database: &[u8; 16]| {
+        routes.iter().all(|route| {
+            route["namespace_identity"]["nqn"]
+                .as_str()
+                .is_some_and(|nqn| nqn.contains(&scope(database)))
+                && route["host_nqn"].as_str()
+                    == Some(identity::effective_host_nqn(database, partition).as_str())
+        })
+    };
+    for (old, new) in before
+        .iter()
+        .flat_map(|old| after.iter().map(move |new| (old, new)))
+    {
+        check(
+            new["address"] == old["address"]
+                && new["service"] == old["service"]
+                && new["transport"] == old["transport"],
+            "reprovisioned database did not reuse the dropped target slot",
+        )?;
+    }
+    check(
+        scoped(&before, &dropped) && scoped(&after, &database),
+        "target subsystem or initiator is not scoped to its database",
+    )?;
+    progress.mark("target_reuse_close", Some(&db));
+    db.wait_for_background_threads_to_finish()
+        .map_err(native_error)?;
+    Ok((
+        serde_json::json!({
+            "dropped_database": identity::database_hex(&dropped),
+            "database": identity::database_hex(&database),
+            "dropped_initiators": effective_initiators(remote, dropped)?,
+            "initiators": effective_initiators(remote, database)?,
+            "routes_before_drop": before,
+            "routes_after_reprovision": after,
+            "start": start,
+            "end": end,
+        }),
+        database,
+    ))
 }
 
 /// Sentinels retained for the graceful and abrupt recovery checks.
@@ -826,10 +966,9 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     check(
         remote.endpoints.len() == 1
             && remote.storage.partitions.len() == 1
-            && remote.storage.max_epochs >= 4
             && remote.replay_limits.max_batches >= 8
             && remote.replay_limits.max_encoded_bytes >= 4 * (input.value_bytes + 4096),
-        "two-host qualification requires one owner, four epochs and a replay window above the child batch",
+        "two-host qualification requires one owner and a replay window above the child batch",
     )?;
     let partitions = &remote.storage.partitions;
     fs::create_dir(output)?;
@@ -1045,6 +1184,13 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     read_expected_live(&crash_reopened, crash_ks, &after_key, &after_value)?;
     read_expected(&crash_reopened, crash_ks, &delete_key, None)?;
     read_expected(&crash_reopened, crash_ks, &keys[0], Some(&values[0]))?;
+    // Reads never open a leased writer queue, so one live write after the
+    // abrupt reopen installs the writer route that the drop check compares.
+    let recovered_key = key_bytes(&input.namespace, 23, 2);
+    let recovered_value = value_bytes(&input.namespace, 31, 2, 65536, 1.0);
+    crash_reopened
+        .insert(crash_ks, recovered_key, recovered_value)
+        .map_err(native_error)?;
     let after_crash_reads = stats(&crash_reopened)?;
     verify_routes(&after_crash_reads, &input.expected_route)?;
     check(
@@ -1053,14 +1199,35 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     )?;
     progress.mark("abrupt_recovery_checks_complete", Some(&crash_reopened));
     progress.mark("before_final_close", Some(&crash_reopened));
+    let first_database = crash_reopened
+        .remote_database_id()
+        .ok_or("qualified database is not remote")?;
     crash_reopened
         .wait_for_background_threads_to_finish()
         .map_err(native_error)?;
+    let (target_reuse, database) = qualify_target_reuse(
+        &input,
+        remote,
+        &shape,
+        first_database,
+        &after_crash_reads,
+        &mut progress,
+    )?;
     progress.mark("target_shutdown", None);
-    let target_shutdown = shutdown_targets(remote, &shape)?;
+    let target_shutdown = shutdown_targets(remote, database, &shape)?;
     progress.mark("target_shutdown_complete", None);
     let scope = "verified_kernel_namespace_not_physical_media_performance";
-    let proof = serde_json::json!({"schema_version": 1, "kind": "live_nvmeof_qualification", "expected_route": input.expected_route, "durability_tier": input.durability_tier, "scope": scope, "start": start, "before_close": before_close, "member_transition": member_transition, "recovery": recovery, "after_miss": after_miss, "after_hit": after_hit, "after_reopen_reads": after_reopen_reads, "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery, "after_crash_reads": after_crash_reads, "target_shutdown": target_shutdown, "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_drain":true,"cache_miss_hit":true}});
+    let proof = serde_json::json!({
+        "schema_version": 2, "kind": "live_nvmeof_qualification",
+        "expected_route": input.expected_route, "durability_tier": input.durability_tier,
+        "scope": scope, "start": start, "before_close": before_close,
+        "member_transition": member_transition, "recovery": recovery,
+        "after_miss": after_miss, "after_hit": after_hit, "after_reopen_reads": after_reopen_reads,
+        "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery,
+        "after_crash_reads": after_crash_reads, "target_reuse": target_reuse,
+        "target_shutdown": target_shutdown,
+        "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_drain":true,"cache_miss_hit":true,"target_reuse":true}
+    });
     fs::write(
         output.join("qualification.json"),
         serde_json::to_vec_pretty(&proof)?,

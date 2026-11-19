@@ -3,6 +3,7 @@
 //! segments.
 
 use super::*;
+use crate::distributed::storage::{RetireProof, RetirementOutcome, RetirementWitness};
 
 /// Synced WAL position bound to one owner stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13,7 +14,8 @@ pub struct CheckpointPositionProof {
     pub durable_end: u64,
 }
 
-/// A busy controller defers maintenance, but is a refusal for a direct caller.
+/// A busy controller or owner defers maintenance, but is a refusal for a
+/// direct caller. `Busy` means no durable retirement decision was made.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetirementResult {
     Completed,
@@ -150,27 +152,86 @@ impl Client {
         {
             return Err(TcpError::new("invalid retained WAL retirement decision"));
         }
-        if let Some(pool) = &self.live_pool
-            && pool
-                .evict_files(
-                    self.expected.partition,
-                    epoch,
-                    self.expected.wal_file_bytes,
-                    &files,
-                    Instant::now() + self.timeout,
-                )
-                .map_err(TcpError::component)?
-                == RetirementResult::Busy
-        {
+        if self.evict_retirement_files(epoch, &files)? == RetirementResult::Busy {
             return Ok(RetirementResult::Busy);
         }
         let request = Request::RetireWalFiles {
             authority_epoch,
             epoch,
-            files,
+            files: files
+                .into_iter()
+                .map(|file_start| RetireProof {
+                    file_start,
+                    inode: None,
+                    seal_generation: None,
+                })
+                .collect(),
+            witness: None,
         };
+        self.retirement_reply(request)
+    }
+
+    /// Retire durably sealed files of the serving stream (`epoch ==
+    /// authority_epoch`). Every proof names the exact inode and seal; the
+    /// witness comes from one adopted Exact root. The coordinator proved the
+    /// files unreferenced by every retained root and view; a coordinator read
+    /// holds its index pin until its terminal completion, so no read of a
+    /// proved file is in flight. The owner drains its own target I/O.
+    pub(crate) fn retire_sealed_files(
+        &mut self,
+        authority_epoch: u64,
+        proofs: Vec<RetireProof>,
+        witness: RetirementWitness,
+    ) -> Result<RetirementResult, TcpError> {
+        let bytes = self.expected.wal_file_bytes;
+        if proofs.is_empty()
+            || proofs.len() > 256
+            || proofs
+                .windows(2)
+                .any(|pair| pair[0].file_start >= pair[1].file_start)
+            || proofs.iter().any(|proof| {
+                proof.file_start % bytes != 0
+                    || proof.inode.is_none()
+                    || proof.seal_generation.is_none()
+            })
+        {
+            return Err(TcpError::new("invalid sealed WAL retirement decision"));
+        }
+        let files: Vec<u64> = proofs.iter().map(|proof| proof.file_start).collect();
+        if self.evict_retirement_files(authority_epoch, &files)? == RetirementResult::Busy {
+            return Ok(RetirementResult::Busy);
+        }
+        self.retirement_reply(Request::RetireWalFiles {
+            authority_epoch,
+            epoch: authority_epoch,
+            files: proofs,
+            witness: Some(witness),
+        })
+    }
+
+    /// Disconnect only pinned controllers of the exact files; busy ones defer.
+    fn evict_retirement_files(
+        &self,
+        epoch: u64,
+        files: &[u64],
+    ) -> Result<RetirementResult, TcpError> {
+        let Some(pool) = &self.live_pool else {
+            return Ok(RetirementResult::Completed);
+        };
+        pool.evict_files(
+            self.expected.partition,
+            epoch,
+            self.expected.wal_file_bytes,
+            files,
+            Instant::now() + self.timeout,
+        )
+        .map_err(TcpError::component)
+    }
+
+    fn retirement_reply(&mut self, request: Request) -> Result<RetirementResult, TcpError> {
         match self.request(request)? {
-            Response::Retired => Ok(RetirementResult::Completed),
+            Response::Retired(RetirementOutcome::Completed) => Ok(RetirementResult::Completed),
+            Response::Retired(RetirementOutcome::Busy) => Ok(RetirementResult::Busy),
             response => self.wrong_variant("RetireWalFiles", &response, "Retired"),
         }
     }

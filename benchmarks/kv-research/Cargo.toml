@@ -14,6 +14,10 @@ tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "sync", "
 prometheus = { workspace = true }
 blake2 = "0.10.6"
 libc = { workspace = true }
+# Operation-trace format (op_replay): IEEE CRC-32 frames and SHA-256 row hashes.
+# Both are already in Cargo.lock through tidehunter (crc32fast, rustls/ring).
+crc32fast = "1.4.2"
+ring = "0.17.14"
 
 tikv-client = { version = "=0.4.0", default-features = false, optional = true }
 tonic = { version = "0.10", default-features = false, optional = true }
@@ -39,7 +43,7 @@ rocksdb = ["dep:rocksdb"]
 # Opt in to native OFI transports without tying selection to one provider.
 # Disabled builds reject OFI configuration rather than selecting TCP.
 fabric = ["tidehunter/experimental-fabric"]
-test-utils = ["tidehunter/test-utils"]
+test-utils = ["tidehunter/test-utils", "tidehunter/test_methods"]
 
 [lints.clippy]
 all = "warn"

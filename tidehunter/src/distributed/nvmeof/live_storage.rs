@@ -84,7 +84,12 @@ pub fn wal_export_name(
     WalExportName {
         subsystem,
         subsystem_id,
-        nqn: format!("nqn.2026-01.local.tidehunter:sub-{text}"),
+        // DB/partition scope first (L2): databases sharing a host target never
+        // share a subsystem name, and both sides derive the same name.
+        nqn: format!(
+            "nqn.2026-01.local.tidehunter:{}sub-{text}",
+            crate::distributed::tcp::host_identity::subsystem_scope(&database, partition)
+        ),
         nsid: (file_index % files_per_subsystem) as u32 + 1,
         uuid: digest(b"tidehunter-live-wal-v1", file_index),
     }

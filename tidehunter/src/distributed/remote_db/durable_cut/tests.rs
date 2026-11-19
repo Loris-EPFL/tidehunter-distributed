@@ -602,3 +602,79 @@ fn saturated_inbox_handles_every_report_and_certification() {
         ]
     );
 }
+
+/// A route whose progress lane cannot wait without spinning fails closed: the
+/// poller counts one failed poll and stops instead of reconnecting, and the cut
+/// keeps its last report. Here the first session ends with the owner shutdown
+/// (an ordinary failed poll) and the reconnect reports the route.
+#[test]
+fn poller_stops_instead_of_reconnecting_to_a_route_that_cannot_wait() {
+    use super::super::pipeline_tests::Fixture;
+    use crate::key_shape::{KeyShape, KeyType};
+    const WATCHDOG: Duration = Duration::from_secs(120);
+    let mut fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("durable-cut-wait-unavailable").unwrap(),
+        1,
+        128,
+        KeyShape::new_single(4, 1, KeyType::uniform(1)),
+        2,
+        |_| {},
+        |_| {},
+    );
+    let endpoint = fixture.config.endpoints[0].clone();
+    let mut tls = fixture.config.tls.clone();
+    tls.server_name = endpoint.server_name.clone();
+    let client_config = tls.client_config_with_identity().unwrap();
+    let expected = fixture.config.partition_config(1, endpoint.partition);
+    let shape = fixture.shape.clone();
+    let timeout = fixture.config.timeout;
+    // Each connect attempt reports its number. The poller thread owns the
+    // target, so the channel disconnects exactly when that thread exits.
+    let (calls, attempts) = mpsc::sync_channel(16);
+    let next_attempt = AtomicU64::new(0);
+    let target = PollTarget {
+        partition: endpoint.partition,
+        connect: Box::new(move |stop| {
+            let attempt = next_attempt.fetch_add(1, Ordering::Relaxed);
+            let _ = calls.try_send(attempt);
+            if attempt == 0 {
+                Client::connect_progress_shared(
+                    &endpoint.address,
+                    &tls,
+                    client_config.clone(),
+                    timeout,
+                    expected.clone(),
+                    &shape,
+                    stop,
+                )
+            } else {
+                Err(TcpError::wait_unavailable(
+                    "progress lane transport test has no completion queue wait fd",
+                ))
+            }
+        }),
+    };
+    let directory = tempdir::TempDir::new("durable-cut-wait-record").unwrap();
+    let cut = DurableCut::start(
+        directory.path().to_path_buf(),
+        1,
+        DurableCutConfig::default(),
+        record(Some(EpochCut { epoch: 1, next: 0 }), Vec::new()),
+        vec![target],
+    )
+    .unwrap();
+    assert_eq!(attempts.recv_timeout(WATCHDOG), Ok(0));
+    fixture.stop_owners();
+    // A receipt above the synced end makes the poller poll the closed session.
+    cut.receipted(0, 1);
+    assert_eq!(attempts.recv_timeout(WATCHDOG), Ok(1));
+    assert_eq!(
+        attempts.recv_timeout(WATCHDOG),
+        Err(mpsc::RecvTimeoutError::Disconnected),
+        "the poller reconnected to a route that cannot wait"
+    );
+    let stats = cut.stats();
+    assert_eq!((stats.poll_failures, stats.reports), (2, 0));
+    assert_eq!(stats.persisted_next, 0);
+    cut.stop();
+}

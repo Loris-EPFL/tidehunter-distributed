@@ -776,19 +776,21 @@ impl CacheTable {
             return InsertPreparation::Disabled;
         }
         let descriptor = reference.descriptor;
-        let (kind, value_len) = match mutation {
-            Mutation::Put { value, .. } => (RecordKind::Put, value.len()),
-            Mutation::Delete { .. } => (RecordKind::Delete, 0),
+        // A DropCells member has no value reference and is never cached.
+        let (kind, key, value_len) = match mutation {
+            Mutation::Put { key, value, .. } => (RecordKind::Put, key, value.len()),
+            Mutation::Delete { key, .. } => (RecordKind::Delete, key, 0),
+            Mutation::DropCells { .. } => return InsertPreparation::Mismatch,
         };
         if descriptor.kind != kind
             || descriptor.keyspace != mutation.keyspace().0
-            || descriptor.key_len as usize != mutation.key().len()
+            || descriptor.key_len as usize != key.len()
             || descriptor.value_len as usize != value_len
         {
             return InsertPreparation::Mismatch;
         }
-        let Some(payload_bytes) = mutation.key().len().checked_add(value_len).and_then(|n| {
-            let owners = usize::from(!mutation.key().is_empty()) + usize::from(value_len > 0);
+        let Some(payload_bytes) = key.len().checked_add(value_len).and_then(|n| {
+            let owners = usize::from(!key.is_empty()) + usize::from(value_len > 0);
             n.checked_add(owners * BYTE_OWNER_BYTES)
         }) else {
             return InsertPreparation::Oversize;
@@ -816,6 +818,7 @@ impl CacheTable {
                 keyspace: *keyspace,
                 key: detach(key),
             },
+            Mutation::DropCells { .. } => return InsertPreparation::Mismatch,
         };
         InsertPreparation::Prepared(PreparedEntry {
             reference,
@@ -1313,6 +1316,36 @@ impl ReadCache {
         }
     }
 
+    /// Evict every entry of `keyspace` older than the `DropCells` batch at
+    /// `version` whose key `dropped` places in the dropped cell range. Index
+    /// masks already hide these references from current reads; this returns
+    /// their memory. Locks one shard at a time and never holds two; the
+    /// matcher runs under that shard lock and takes no other lock. A newer
+    /// point reference in the range is kept.
+    pub(super) fn evict_dropped(
+        &self,
+        keyspace: crate::key_shape::KeySpace,
+        version: crate::distributed::types::BatchVersion,
+        dropped: impl Fn(&[u8]) -> bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        for shard in self.shards.iter() {
+            let mut table = shard.table.lock();
+            for slot in 0..table.slots.len() {
+                let evict = table.slots[slot].as_ref().is_some_and(|entry| {
+                    entry.reference.descriptor.keyspace == keyspace.0
+                        && entry.reference.batch_version < version
+                        && entry.mutation.point_key().is_some_and(|key| dropped(key))
+                });
+                if evict {
+                    table.evict(slot);
+                }
+            }
+        }
+    }
+
     /// Drop every entry and reset every counter, keeping the policy. Rare;
     /// locks each shard in turn and never holds two.
     pub(super) fn clear(&self) {
@@ -1349,7 +1382,7 @@ fn trace_preparation(
     kv_capture::reference(
         13,
         reference,
-        Some(mutation.key()),
+        mutation.point_key().map(|key| &key[..]),
         outcome,
         u64::from(post_publish),
     );
@@ -1571,8 +1604,8 @@ mod tests {
         assert_eq!(after.inserts, 1);
         assert_eq!(after.entries, 1);
         assert_eq!(
-            cache.get(&reference).unwrap().key().as_ptr(),
-            stored.key().as_ptr()
+            cache.get(&reference).unwrap().point_key().unwrap().as_ptr(),
+            stored.point_key().unwrap().as_ptr()
         );
     }
 
@@ -1590,7 +1623,7 @@ mod tests {
         let Mutation::Put { key, value, .. } = cache.get(&reference).unwrap() else {
             panic!()
         };
-        assert_ne!(key.as_ptr(), mutation.key().as_ptr());
+        assert_ne!(key.as_ptr(), mutation.point_key().unwrap().as_ptr());
         assert_eq!(key.downcast_ref::<Box<[u8]>>().unwrap().len(), 8);
         assert_eq!(value.downcast_ref::<Box<[u8]>>().unwrap().len(), 16);
         assert_eq!(
@@ -1692,7 +1725,7 @@ mod tests {
         del_ref.descriptor.kind = RecordKind::Delete;
         let delete = Mutation::Delete {
             keyspace: KeySpace(0),
-            key: put.key().clone(),
+            key: put.point_key().unwrap().clone(),
         };
         assert!(cache.insert_verified(put_ref, &put));
         assert!(cache.insert_verified(del_ref, &delete));
@@ -1945,7 +1978,7 @@ mod tests {
         assert!(cache.insert_verified(reference, &mutation));
         let stored_value_ptr = match &cache.slots.iter().flatten().next().unwrap().mutation {
             Mutation::Put { value, .. } => value.as_ptr(),
-            Mutation::Delete { .. } => panic!("inserted record is a put"),
+            _ => panic!("inserted record is a put"),
         };
         let hit = cache
             .get_point(&reference, KeySpace(0), b"same-key")

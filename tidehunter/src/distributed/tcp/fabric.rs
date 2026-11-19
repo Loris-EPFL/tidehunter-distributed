@@ -435,6 +435,28 @@ pub(super) fn bootstrap_idle_parking(
     Ok(endpoint)
 }
 
+/// Coordinator durable-progress lane bootstrap: the endpoint requests a CQ wait
+/// fd like an owner (`verbs`), and must have one. Without it the lane would have
+/// to spin, so setup fails with a named error before the Status handshake. The
+/// owner endpoint is qualified by the same rule when it parks the lane.
+#[cfg(feature = "experimental-fabric")]
+pub(super) fn bootstrap_progress(
+    stream: &mut (impl Read + Write),
+    transport: &Transport,
+) -> Result<tidehunter_fabric::Endpoint, TcpError> {
+    let endpoint = bootstrap_with(stream, transport, true)?;
+    if !endpoint.has_wait_fd() {
+        return Err(TcpError::wait_unavailable(format_args!(
+            "progress lane transport {} has no completion queue wait fd (provider {}: {}); \
+             use a TCP transport for this deployment",
+            transport.label(),
+            endpoint.provider_info().provider,
+            endpoint.provider_info().geometry.cq_wait
+        )));
+    }
+    Ok(endpoint)
+}
+
 #[cfg(feature = "experimental-fabric")]
 fn bootstrap_with(
     stream: &mut (impl Read + Write),

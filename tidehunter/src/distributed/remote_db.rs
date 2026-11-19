@@ -46,10 +46,21 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use typenum::U32;
 
+mod capacity_observer;
+pub use capacity_observer::CapacityObserver;
+mod checkpoint_attribution;
+use checkpoint_attribution::CoordinatorIoCategory;
+mod authority_lifecycle;
+pub(crate) use authority_lifecycle::drop_db;
+pub use authority_lifecycle::{AuthorityLifecycle, OwnerControlConfig};
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
+mod dead_wal_files;
+mod r1_events;
+mod relocation;
 use checkpoint_lifecycle::BackgroundCheckpoint;
+pub use checkpoint_lifecycle::{IndexForceError, IndexForceReport};
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
 pub use concurrent::FabricProviderEvidence;
@@ -58,8 +69,22 @@ use coordinator_profile::{
     CoordinatorResolutionDiagnostics, MemberOutcome, ResolutionSample, ResolutionStage,
 };
 pub use coordinator_profile::{CoordinatorResolutionSnapshot, CoordinatorResolutionStage};
+pub(crate) use relocation::RelocationReport;
+#[cfg(feature = "test_methods")]
+pub(crate) use relocation::{CallbackDecision, RelocationGate};
 mod durable_cut;
+pub use checkpoint_attribution::{
+    AgeQuality, AttributionTotals, CellPersistCounts, CheckpointAttribution, CheckpointIo,
+    CheckpointStage, CheckpointTriggerFlags, CoordinatorIoSnapshot, FileIo, GenerationStatus,
+    IndexCheckpointSnapshot, ReturnedCredits, SuffixPeaks, SuffixSample, TailCount,
+    coordinator_io_snapshot, diagnostics_clock_ns, set_coordinator_allocation_accounting,
+};
+pub use concurrent::{HardWaitSnapshot, WaitReasonTotals};
 pub use durable_cut::{DurableCutStats, RecoveredCut};
+mod fencing_generations;
+use fencing_generations::AuthorityGeneration;
+#[cfg(test)]
+use fencing_generations::GenerationState;
 mod pending_read;
 pub(crate) use pending_read::ReadTraceChild;
 pub use pending_read::ReadTraceSnapshot;
@@ -103,6 +128,9 @@ pub struct RemoteEndpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteDatabaseConfig {
+    /// Storage geometry. The database identity is provisioned at first open
+    /// and stored in the authority; it never appears in documents.
+    #[serde(with = "authority_lifecycle::storage_geometry")]
     pub storage: LocalInventoryConfig,
     pub endpoints: Vec<RemoteEndpoint>,
     pub tls: TlsFiles,
@@ -165,6 +193,21 @@ pub struct RemoteDatabaseConfig {
     /// The durable cut of Native-tier recovery. Absent means the default lags.
     #[serde(default, skip_serializing_if = "DurableCutConfig::is_default")]
     pub durable_cut: DurableCutConfig,
+    /// Native `relocation_max_reclaim_pct` (0..=100), carried from the
+    /// caller's native config: it caps only the per-owner physical reclaim
+    /// span of an R1 pass, never the callback scan. Zero keeps native's
+    /// one-file minimum. Absent means native's default.
+    #[serde(default = "default_relocation_max_reclaim_pct")]
+    pub relocation_max_reclaim_pct: u8,
+    /// Native cadence of callback-enabled (compactor) keyspaces at Exact
+    /// captures, built from the native `Config` the caller would use for a
+    /// native database. Runtime only: never serialized, never sent to owners.
+    #[serde(skip)]
+    pub compactor_cadence: super::native_index::CompactorCadence,
+}
+
+fn default_relocation_max_reclaim_pct() -> u8 {
+    crate::config::Config::default().relocation_max_reclaim_pct
 }
 
 fn default_max_pending_reads() -> usize {
@@ -314,6 +357,11 @@ impl RemoteDatabaseConfig {
                 "index_shards must be a power of two in 1..=MAX_INDEX_SHARDS",
             ));
         }
+        if self.relocation_max_reclaim_pct > 100 {
+            return Err(LocalDbError::new(
+                "relocation_max_reclaim_pct must be in 0..=100",
+            ));
+        }
         self.durable_cut.validate().map_err(LocalDbError::new)?;
         {
             let live = &self.live_nvme;
@@ -395,8 +443,6 @@ impl RemoteDatabaseConfig {
                 .endpoints
                 .iter()
                 .any(|e| e.address.is_empty() || e.server_name.is_empty())
-            || self.storage.max_epochs == 0
-            || self.storage.max_epochs > 1024
             || self.max_admitted_batches == 0
             || self.max_admitted_batches > 1_000_000
             || self.max_pending_batches == 0
@@ -427,13 +473,13 @@ impl RemoteDatabaseConfig {
                 .validate()
                 .map_err(LocalDbError::component)?;
         }
-        if !checkpoint_metadata_fits(self, 0) {
+        if !checkpoint_metadata_fits(self.endpoints.len(), 0) {
             return Err(LocalDbError::new(
                 "checkpoint epoch inventory exceeds metadata budget",
             ));
         }
         if !checkpoint_metadata_fits(
-            self,
+            self.endpoints.len(),
             self.replay_limits
                 .max_batches
                 .min(self.max_admitted_batches),
@@ -485,21 +531,15 @@ impl RemoteDatabaseConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct AuthorityEpoch {
-    epoch: u64,
-    /// False means no caller could have acquired a serving database handle.
-    active: bool,
-}
-
+/// Exact wrapper format with the per-stream callback starts (format 3 plus
+/// one trailing sorted vector). Readers accept 3 (no starts) and 4.
+const CALLBACK_START_WRAPPER_FORMAT: u32 = 4;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AuthorityManifest {
     format: u32,
     storage: LocalInventoryConfig,
-    /// Always `wal_replay`. Kept so that a legacy manifest (absent field means
-    /// `on_disk`, or `memory_only`) fails open with a named mode.
-    #[serde(default = "legacy_manifest_history")]
-    history_persistence: String,
+    #[serde(flatten)]
+    mode: AuthorityMode,
     endpoints: Vec<RemoteEndpoint>,
     shape_yaml: String,
     #[serde(default = "ReplayLimits::legacy")]
@@ -509,7 +549,15 @@ struct AuthorityManifest {
     live_nvme_identity: Option<(String, [u8; 16])>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     live_nvme_owner_identities: BTreeMap<u32, super::tcp::LiveInitiatorIdentity>,
-    epochs: Vec<AuthorityEpoch>,
+    /// Next fencing generation to allocate; never reused (L1).
+    next_generation: u64,
+    /// Retained generations, strictly ascending; see `fencing_generations`.
+    generations: Vec<AuthorityGeneration>,
+    /// Excluded generation whose owner trims are not all acknowledged yet.
+    trim_pending: Option<u64>,
+    /// In-memory only: the trim the next checkpoint adopts with its root.
+    #[serde(skip)]
+    adopt_trim: Option<u64>,
     #[serde(default)]
     checkpoint: Option<CheckpointCommit>,
     /// Ownership is reserved durably before any checkpoint output is created.
@@ -518,6 +566,16 @@ struct AuthorityManifest {
     /// Previous committed files, removable only after the new root is durable.
     #[serde(default)]
     checkpoint_obsolete: Option<CheckpointCommit>,
+    lifecycle: Option<AuthorityLifecycle>,
+    owner_control: Option<OwnerControlConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AuthorityMode {
+    /// Always `wal_replay`. Kept so that a legacy manifest (absent field means
+    /// `on_disk`, or `memory_only`) fails open with a named mode.
+    #[serde(default = "legacy_manifest_history")]
+    history_persistence: String,
     /// Presence markers of the removed per-cell checkpoint mode. Exact never
     /// writes these keys; any present value, explicit null included, fails
     /// open as a legacy mode.
@@ -563,10 +621,10 @@ fn legacy_mode_error(mode: &str) -> LocalDbError {
     ))
 }
 
-impl AuthorityManifest {
+impl AuthorityMode {
     /// Reject manifests of removed modes before any fence or cleanup.
-    fn reject_legacy_mode(&self) -> Result<(), LocalDbError> {
-        if self.format == PER_CELL_MANIFEST_FORMAT
+    fn reject_legacy_mode(&self, format: u32) -> Result<(), LocalDbError> {
+        if format == PER_CELL_MANIFEST_FORMAT
             || self.checkpoint_mode.is_some()
             || self.cell_checkpoint.is_some()
             || self.cell_checkpoint_obsolete.is_some()
@@ -577,6 +635,33 @@ impl AuthorityManifest {
             return Err(legacy_mode_error(&self.history_persistence));
         }
         Ok(())
+    }
+}
+
+fn new_authority_manifest(config: &RemoteDatabaseConfig, shape_yaml: &str) -> AuthorityManifest {
+    AuthorityManifest {
+        format: fencing_generations::AUTHORITY_FORMAT,
+        storage: config.storage.clone(),
+        mode: AuthorityMode {
+            history_persistence: MANIFEST_HISTORY.into(),
+            checkpoint_mode: None,
+            cell_checkpoint: None,
+            cell_checkpoint_obsolete: None,
+        },
+        endpoints: config.endpoints.clone(),
+        shape_yaml: shape_yaml.to_owned(),
+        replay_limits: config.replay_limits,
+        live_nvme_identity: Some((config.live_nvme.host_nqn.clone(), config.live_nvme.host_id)),
+        live_nvme_owner_identities: config.live_nvme.owner_identities.clone(),
+        next_generation: 1,
+        generations: Vec::new(),
+        trim_pending: None,
+        adopt_trim: None,
+        checkpoint: None,
+        checkpoint_staging: None,
+        checkpoint_obsolete: None,
+        lifecycle: None,
+        owner_control: None,
     }
 }
 
@@ -650,6 +735,33 @@ struct CheckpointImageV3 {
     recent: Vec<RecentReceipt>,
 }
 
+/// R1 durable callback cursor of one stream: the next relocation scan of
+/// `(partition, fencing_generation)` starts at file-aligned offset `from`.
+/// Monotone across adopted Exact roots; never an owner replay cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CallbackStart {
+    partition: u32,
+    fencing_generation: u64,
+    from: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckpointImageV4 {
+    format: u32,
+    database: [u8; 16],
+    shape_yaml: String,
+    authority_epoch: u64,
+    generation: u64,
+    cut: Option<MutationVersion>,
+    published_next: u64,
+    index_bytes: u64,
+    index_digest: [u8; 32],
+    positions: Vec<StreamPosition>,
+    recent: Vec<RecentReceipt>,
+    /// Sorted by `(partition, fencing_generation)`, unique.
+    callback_starts: Vec<CallbackStart>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RecoveryStats {
     pub checkpoint_loaded: bool,
@@ -689,6 +801,8 @@ pub struct RecoveryStats {
     pub cut_continuity_bound: Option<u64>,
     /// The bound this open decided for the previously tracked epoch.
     pub recovered_cut: Option<RecoveredCut>,
+    /// Process-unique identity of this open; joins checkpoint attribution rows.
+    pub open_id: u64,
 }
 impl RecoveryStats {
     fn add_connection(&mut self, profile: super::tcp::ClientConnectProfile) {
@@ -741,6 +855,15 @@ pub(crate) enum OpenInterruption {
     /// After the durable-cut record is persisted, before the epoch activates.
     #[cfg(test)]
     AfterCutRecord,
+    /// After the reservation is durable, before any owner is fenced.
+    #[cfg(test)]
+    AfterReservation,
+    /// After `Served(g)` is durable, before offline trim maintenance.
+    #[cfg(test)]
+    AfterServed,
+    /// Inside the offline trim transaction.
+    #[cfg(test)]
+    Trim(fencing_generations::TrimCrash),
 }
 
 /// Test-only open hook over a read-only config clone and the read-lane clients.
@@ -792,13 +915,6 @@ pub struct AuthorityWriteStats {
     pub checkpoint_count: u64,
     /// Captured checkpoint wall lifetimes, including concurrent suffix progress.
     pub background_checkpoint_ns: u64,
-    /// Actual owner blocking in admission backpressure (drain plus completed
-    /// durable cut), not the lifetime of an already running background worker.
-    pub foreground_checkpoint_ns: u64,
-    pub foreground_checkpoint_count: u64,
-    /// Actor writes deferred at a capacity boundary, and their elapsed queue wait.
-    pub concurrent_checkpoint_deferrals: u64,
-    pub concurrent_checkpoint_wait_ns: u64,
     /// New logical admissions while immutable checkpoint persistence was active.
     pub background_checkpoint_suffix_batches: u64,
     /// Receipts observed by the owner while a prior sequence is unpublished.
@@ -846,6 +962,8 @@ pub struct CheckpointDiagnostic {
     pub owner_adoption_ns: Option<u64>,
     pub obsolete_cleanup_ns: Option<u64>,
     pub outcome: Option<CheckpointProgressOutcome>,
+    /// Exact generation attribution; absent on rows from other producers.
+    pub attribution: Option<CheckpointAttribution>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -912,11 +1030,16 @@ pub struct CheckpointDiagnosticSummary {
     pub after_new_capture_relief_count: u64,
     pub capacity_error_count: u64,
     pub progress_error_count: u64,
+    /// Exact generation attribution totals (checkpoint_attribution.rs).
+    pub attribution: checkpoint_attribution::AttributionTotals,
 }
 
 impl CheckpointDiagnosticSummary {
     fn record(&mut self, record: CheckpointDiagnostic) {
         self.records = self.records.saturating_add(1);
+        if let Some(attribution) = &record.attribution {
+            self.attribution.record(attribution);
+        }
         match record.trigger {
             Some(CheckpointTrigger::Tail) => {
                 self.tail_pressure_count = self.tail_pressure_count.saturating_add(1);
@@ -1259,65 +1382,31 @@ impl RemoteDatabase {
         }
         config.validate()?;
         config.validate_read_lane_pinning(config.effective_read_lanes())?;
+        let compactor =
+            super::native_index::CompactorPolicy::from_shape(shape, config.compactor_cadence);
+        let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
+        // Preserve callback closures; YAML describes the shape, not its policy.
+        let shape = shape.clone();
+        // Namespace locks, native lock, pending-drop recovery and, for a new
+        // path, identity provisioning on every owner. The resolved config
+        // carries the provisioned database identity from here on.
+        let mut config = config;
+        let authority_lifecycle::OpenedAuthority {
+            lock,
+            path,
+            mut manifest,
+            namespace: _namespace,
+        } = authority_lifecycle::open_authority(path, &mut config, &shape_yaml, |config| {
+            new_authority_manifest(config, &shape_yaml)
+        })?;
         let mut index = NativeIndex::with_shards(
-            shape,
+            &shape,
             config.storage.database,
             config.max_index_bytes,
             config.index_shards,
         )
         .map_err(LocalDbError::component)?;
-        let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
-        let shape = KeyShape::from_yaml(&shape_yaml).map_err(LocalDbError::component)?;
-        match fs::create_dir(path) {
-            Ok(()) => File::open(
-                path.parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new(".")),
-            )
-            .and_then(|f| f.sync_all())
-            .map_err(LocalDbError::component)?,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(LocalDbError::component(e)),
-        }
-        let lock = DbLock::acquire(path, Duration::ZERO).map_err(LocalDbError::component)?;
-        let path = path.canonicalize().map_err(LocalDbError::component)?;
-        let mut manifest: AuthorityManifest = if path.join(MANIFEST).exists() {
-            read_metadata(&path.join(MANIFEST)).map_err(LocalDbError::component)?
-        } else {
-            for entry in fs::read_dir(&path).map_err(LocalDbError::component)? {
-                let name = entry.map_err(LocalDbError::component)?.file_name();
-                if name != "LOCK" && name != format!(".{MANIFEST}.pending").as_str() {
-                    return Err(LocalDbError::new(
-                        "missing authority manifest beside retained data",
-                    ));
-                }
-            }
-            let manifest = AuthorityManifest {
-                format: 4,
-                storage: config.storage.clone(),
-                history_persistence: MANIFEST_HISTORY.into(),
-                endpoints: config.endpoints.clone(),
-                shape_yaml: shape_yaml.clone(),
-                replay_limits: config.replay_limits,
-                live_nvme_identity: Some((
-                    config.live_nvme.host_nqn.clone(),
-                    config.live_nvme.host_id,
-                )),
-                live_nvme_owner_identities: config.live_nvme.owner_identities.clone(),
-                epochs: Vec::new(),
-                checkpoint: None,
-                checkpoint_staging: None,
-                checkpoint_obsolete: None,
-                checkpoint_mode: None,
-                cell_checkpoint: None,
-                cell_checkpoint_obsolete: None,
-            };
-            persist_manifest(&path, &manifest)?;
-            manifest
-        };
-        manifest.reject_legacy_mode()?;
-        if !matches!(manifest.format, 2..=4)
-            || manifest.storage != config.storage
+        if manifest.storage != config.storage
             || manifest.endpoints != config.endpoints
             || manifest.shape_yaml != shape_yaml
             || manifest
@@ -1326,21 +1415,20 @@ impl RemoteDatabase {
                 .map(|(host_nqn, host_id)| (host_nqn.as_str(), *host_id))
                 != Some((config.live_nvme.host_nqn.as_str(), config.live_nvme.host_id))
             || config.live_nvme.owner_identities != manifest.live_nvme_owner_identities
-            || manifest.epochs.len() >= config.storage.max_epochs
-            || manifest
-                .epochs
-                .iter()
-                .enumerate()
-                .any(|(i, e)| e.epoch != i as u64 + 1)
         {
             return Err(LocalDbError::new(
-                "authority configuration/history differs or epoch limit reached",
+                "authority configuration differs from the recorded authority",
             ));
         }
+        fencing_generations::validate(&manifest)?;
         manifest
             .replay_limits
             .validate()
             .map_err(LocalDbError::new)?;
+        // Use the configured identity for comparisons, and the provisioned
+        // per-database identity for actual namespace grants and connections.
+        authority_lifecycle::apply_effective_initiators(&mut config);
+        let config = config;
         let live_pool = {
             let registry = super::nvmeof::live_connect::LiveConnectionRegistry::open(
                 &path.join("live-nvme-connections"),
@@ -1363,7 +1451,10 @@ impl RemoteDatabase {
             .as_ref()
             .map(|pool| transports::LivePoolOpenGuard::new(pool.clone(), config.timeout));
         let live_metrics = Some(super::nvmeof::live_metrics::LiveNvmeMetrics::new());
-        let mut recovery_stats = RecoveryStats::default();
+        let mut recovery_stats = RecoveryStats {
+            open_id: checkpoint_attribution::next_open_id(),
+            ..RecoveryStats::default()
+        };
         let tls_started = Instant::now();
         let tls_config = config
             .tls
@@ -1396,31 +1487,18 @@ impl RemoteDatabase {
         let mut clients = connected.clients;
         for client in &clients {
             let status = client.connected_status();
-            if status.max_epochs != config.storage.max_epochs
-                || status
-                    .epochs
-                    .iter()
-                    .any(|n| !manifest.epochs.iter().any(|e| e.epoch == n.epoch))
-                || manifest
-                    .epochs
-                    .iter()
-                    .filter(|e| e.active)
-                    .any(|e| !status.epochs.iter().any(|n| n.epoch == e.epoch))
-            {
-                return Err(LocalDbError::new(
-                    "node history disagrees with complete authority inventory",
-                ));
-            }
+            fencing_generations::check_owner_status(status.partition.partition, status, &manifest)?;
             recovery_stats.add_connection(client.connect_profile());
         }
-        let epoch = manifest.epochs.len() as u64 + 1;
-        manifest.epochs.push(AuthorityEpoch {
-            epoch,
-            active: false,
-        });
-        // Reserve the epoch before ANY node is allowed to activate it. A failed
-        // partial fence stays in this manifest; the next open advances again.
-        persist_manifest(&path, &manifest)?;
+        // One durable replacement folds a previous reservation into Aborted,
+        // appends Reserved(g) and advances the never-reused counter before ANY
+        // owner may activate g. A failed partial fence is aborted by the next open.
+        let epoch = fencing_generations::reserve(&mut manifest, config.storage.database)?;
+        persist_manifest(&path, &manifest, CoordinatorIoCategory::Open)?;
+        #[cfg(test)]
+        if matches!(interruption, Some(OpenInterruption::AfterReservation)) {
+            return Err(LocalDbError::new("injected interruption after reservation"));
+        }
         let fencing_started = Instant::now();
         // Fault injection retains a strict partial-fence boundary. Normal opens
         // fence all endpoints concurrently, after the inactive durable reservation.
@@ -1438,13 +1516,19 @@ impl RemoteDatabase {
             let status = client.fence_to(epoch).map_err(LocalDbError::component)?;
             if !status.healthy
                 || status.active_epoch != Some(epoch)
-                || !status.epochs.iter().any(|e| e.epoch == epoch && !e.sealed)
-                || status.epochs.iter().any(|e| e.epoch < epoch && !e.sealed)
+                || status.highest_fenced_generation != epoch
             {
                 return Err(LocalDbError::new(
                     "node did not establish the complete fenced inventory",
                 ));
             }
+            let partition = config.endpoints[node].partition;
+            // One frozen sweep of the complete ledger; no partial sweep is used.
+            let entries = client
+                .inventory_sweep(status.incarnation, status.inventory_revision)
+                .map_err(LocalDbError::component)?;
+            let history =
+                fencing_generations::owner_history(partition, &entries, &manifest, epoch)?;
             if let Some(metrics) = &live_metrics {
                 metrics.record_fence(super::nvmeof::live_metrics::LiveFenceEvidence {
                     partition: config.endpoints[node].partition,
@@ -1455,12 +1539,7 @@ impl RemoteDatabase {
                 });
             }
             Ok((
-                status
-                    .epochs
-                    .into_iter()
-                    .filter(|e| e.epoch < epoch)
-                    .map(|e| e.epoch)
-                    .collect::<Vec<_>>(),
+                history,
                 (
                     status.durability_tier,
                     durable_cut::OwnerFence {
@@ -1479,6 +1558,7 @@ impl RemoteDatabase {
                 "injected coordinator interruption during partial fencing",
             ));
         }
+        fencing_generations::check_stream_budget(&config, &histories)?;
         // Recovery is permitted only AFTER every registered node was fenced.
         // Unavailable RF1 nodes stop recovery; max observed sequence is not a
         // substitute for complete inventory or evidence of absent records.
@@ -1487,6 +1567,7 @@ impl RemoteDatabase {
         let mut positions = BTreeMap::new();
         let mut recent = VecDeque::with_capacity(WAL_REPLAY_WINDOW_BATCHES);
         let mut recent_ids = HashMap::with_capacity(WAL_REPLAY_WINDOW_BATCHES);
+        let mut callback_starts = BTreeMap::new();
         let mut latest = None;
         if let Some(checkpoint) = &manifest.checkpoint {
             load_checkpoint(
@@ -1502,6 +1583,7 @@ impl RemoteDatabase {
                 &mut positions,
                 &mut recent,
                 &mut recent_ids,
+                &mut callback_starts,
                 &mut recovery_stats,
             )?;
         }
@@ -1509,6 +1591,7 @@ impl RemoteDatabase {
             .iter()
             .filter_map(|(key, position)| position.complete.then_some(*key))
             .collect();
+        let committed_streams = positions.keys().copied().collect();
         let mut cut_plan = durable_cut::RecoveryPlan::new(
             durable_cut::CutRecord::load(&path, config.storage.database, epoch)?,
             config.storage.database,
@@ -1519,6 +1602,7 @@ impl RemoteDatabase {
         replay_history(
             &mut clients,
             &histories,
+            &fencing_generations::retained_below(&manifest, epoch),
             epoch,
             &config,
             &shape,
@@ -1545,7 +1629,12 @@ impl RemoteDatabase {
         recovery_stats.tail_replay_ns = elapsed(replay_started);
         // Current checkpoint/proofs and the complete tail have now validated.
         // Resolve only durably named cleanup intents before allowing more work.
-        cleanup_checkpoint_artifacts(&path, &mut manifest, false)?;
+        cleanup_checkpoint_artifacts(
+            &path,
+            &mut manifest,
+            false,
+            (CoordinatorIoCategory::Open, CoordinatorIoCategory::Open),
+        )?;
         // One constant sparse-view quota for the serialized publisher: the
         // installed view and its replacement at max_pending_batches - 1
         // exclusions. No write reserves view quota, and no publication can then
@@ -1641,12 +1730,17 @@ impl RemoteDatabase {
         if matches!(interruption, Some(OpenInterruption::AfterCutRecord)) {
             return Err(LocalDbError::new("injected interruption after cut record"));
         }
-        manifest.epochs.last_mut().unwrap().active = true;
+        fencing_generations::mark_served(&mut manifest, epoch)?;
         // Old suffixes validated against their original durable bound. Only a
         // fully recovered, not-yet-serving epoch may activate a larger bound.
-        manifest.format = 4;
+        // Before serving, gate DropCells and the Exact callback-start wrapper.
+        manifest.format = fencing_generations::AUTHORITY_FORMAT;
         manifest.replay_limits = config.replay_limits;
-        persist_manifest(&path, &manifest)?;
+        persist_manifest(&path, &manifest, CoordinatorIoCategory::Open)?;
+        #[cfg(test)]
+        if matches!(interruption, Some(OpenInterruption::AfterServed)) {
+            return Err(LocalDbError::new("injected interruption after served"));
+        }
         let partition_indexes = config
             .endpoints
             .iter()
@@ -1656,47 +1750,46 @@ impl RemoteDatabase {
         let checkpoint_diagnostics =
             (config.write_profile_limit != 0).then(|| VecDeque::with_capacity(128));
         let reads = Arc::new(reads);
-        let durable_cut = match cut_record.filter(|_| tracked) {
-            Some(record) => Some(durable_cut::DurableCut::start(
-                path.clone(),
-                epoch,
-                config.durable_cut,
-                record,
-                config
-                    .endpoints
-                    .iter()
-                    .map(|endpoint| {
-                        let mut tls = config.tls.clone();
-                        tls.server_name = endpoint.server_name.clone();
-                        let address = endpoint.address.clone();
-                        let client_config = tls_config.clone();
-                        let timeout = config.timeout;
-                        // Owners register with the epoch-1 inventory, as in `transports`.
-                        let expected = config.partition_config(1, endpoint.partition);
-                        let shape = shape.clone();
-                        durable_cut::PollTarget {
-                            partition: endpoint.partition,
-                            // The owner requires a Status handshake on every new
-                            // session, and Status flushes the owner's logs. The
-                            // first session therefore opens in `start`, before
-                            // this epoch can append; a reconnect after a failed
-                            // poll costs one extra owner sync.
-                            connect: Box::new(move || {
-                                Client::connect_shared(
-                                    &address,
-                                    &tls,
-                                    client_config.clone(),
-                                    timeout,
-                                    expected.clone(),
-                                    &shape,
-                                )
-                            }),
-                        }
-                    })
-                    .collect(),
-            )?),
-            None => None,
-        };
+        // The durable-cut actor starts only after offline trim maintenance below:
+        // trim may rewrite the open-time record, which the actor then owns.
+        let durable_cut_config = config.durable_cut;
+        let durable_cut_targets: Option<Vec<durable_cut::PollTarget>> = tracked.then(|| {
+            config
+                .endpoints
+                .iter()
+                .map(|endpoint| {
+                    let mut tls = config.tls.clone();
+                    tls.server_name = endpoint.server_name.clone();
+                    let address = endpoint.address.clone();
+                    let client_config = tls_config.clone();
+                    let timeout = config.timeout;
+                    // Owners register with the epoch-1 inventory, as in `transports`.
+                    let expected = config.partition_config(1, endpoint.partition);
+                    let shape = shape.clone();
+                    durable_cut::PollTarget {
+                        partition: endpoint.partition,
+                        // The owner requires a Status handshake on every new
+                        // session, and Status flushes the owner's logs. The
+                        // first session therefore opens in `start`, before
+                        // this epoch can append; a reconnect after a failed
+                        // poll costs one extra owner sync. The lane waits on
+                        // readiness and the poller's stop wake.
+                        connect: Box::new(move |stop| {
+                            Client::connect_progress_shared(
+                                &address,
+                                &tls,
+                                client_config.clone(),
+                                timeout,
+                                expected.clone(),
+                                &shape,
+                                stop,
+                            )
+                        }),
+                    }
+                })
+                .collect()
+        });
+        let mut cut_record = cut_record;
         let core = write_core::core::WriteCore::new(write_core::core::OpenState {
             clients: workers,
             reads,
@@ -1707,11 +1800,19 @@ impl RemoteDatabase {
             live_metrics,
             inventory: config.inventory(epoch),
             config,
-            durable_cut,
             shape,
             path,
             epoch,
-            index: Arc::new(index),
+            index: {
+                // The caller's shape carries the runtime compactor closures;
+                // the persisted shape YAML does not.
+                if let Some(policy) = compactor {
+                    index
+                        .set_compactor_policy(policy)
+                        .map_err(LocalDbError::component)?;
+                }
+                Arc::new(index)
+            },
             partition_indexes,
             publisher: write_core::core::PublisherState {
                 view_budget,
@@ -1719,10 +1820,13 @@ impl RemoteDatabase {
                 stream_last: BTreeMap::new(),
                 positions,
                 committed_complete,
+                committed_streams,
+                callback_starts,
                 recent,
                 published_next: 0,
                 upper: latest,
                 dependents: HashMap::new(),
+                range_barrier: None,
                 latest,
                 live_latest: latest,
                 snapshot_generation: 0,
@@ -1745,6 +1849,7 @@ impl RemoteDatabase {
                 next_checkpoint_diagnostic: 0,
                 dropped_checkpoint_diagnostics: 0,
                 last_checkpoint_diagnostic: None,
+                index_suffix: None,
             },
             concurrent_failure,
             first_failure,
@@ -1757,10 +1862,39 @@ impl RemoteDatabase {
         let database = Self { core, _lock: lock };
         // A successful recovery establishes a new baseline before admitting
         // another bounded tail, including after repeated crash/reopen cycles.
+        // It never runs a compactor callback (COMPACTOR-PARITY.md §2.7).
         if database.core.publisher.lock().checkpoint_tail_batches != 0 {
             let started = Instant::now();
-            database.core.commit_checkpoint()?;
+            database.core.commit_recovery_baseline()?;
             database.core.stats.lock().recovery.checkpoint_commit_ns = elapsed(started);
+        }
+        // Offline fencing-generation maintenance (L1): no handle escaped, no
+        // write was admitted and the durable-cut actor has not started.
+        #[cfg(test)]
+        let trim_crash = match interruption {
+            Some(OpenInterruption::Trim(point)) => Some(point),
+            _ => None,
+        };
+        fencing_generations::maintain(
+            &database.core,
+            &mut cut_record,
+            #[cfg(test)]
+            trim_crash,
+        )?;
+        if let (Some(record), Some(targets)) = (cut_record.filter(|_| tracked), durable_cut_targets)
+        {
+            let cut = durable_cut::DurableCut::start(
+                database.core.path.clone(),
+                epoch,
+                durable_cut_config,
+                record,
+                targets,
+            )?;
+            database
+                .core
+                .durable_cut
+                .set(cut)
+                .map_err(|_| LocalDbError::new("durable cut actor already attached"))?;
         }
         if let Some(guard) = &mut live_open_guard {
             guard.disarm();
@@ -1790,6 +1924,11 @@ impl RemoteDatabase {
     }
     pub fn epoch(&self) -> u64 {
         self.core.epoch
+    }
+
+    /// The database identity provisioned at this path's first open.
+    pub fn database_id(&self) -> [u8; 16] {
+        self.core.config.storage.database
     }
 
     pub fn validate_cached_read(&self) -> Result<(), LocalDbError> {
@@ -2112,7 +2251,7 @@ impl RemoteDatabase {
                 key: actual,
                 ..
             } => Ok(keyspace == ks && actual.as_ref() == key),
-            Mutation::Delete { .. } => Err(LocalDbError::new(
+            Mutation::Delete { .. } | Mutation::DropCells { .. } => Err(LocalDbError::new(
                 "live index reference resolves to tombstone",
             )),
         }
@@ -2316,8 +2455,8 @@ impl RemoteDatabase {
     }
     pub fn storage_stats(&self) -> Result<PartitionStats, LocalDbError> {
         let mut total = PartitionStats::default();
-        for client in &self.core.clients {
-            let stats = receive(client.stats()?)?;
+        for owner in self.owner_storage_stats() {
+            let (_, stats) = owner?;
             total.appended_groups += stats.appended_groups;
             total.persistence_barriers += stats.persistence_barriers;
             total.namespace_syncs += stats.namespace_syncs;
@@ -2335,6 +2474,22 @@ impl RemoteDatabase {
             total.reference_metadata_bytes += stats.reference_metadata_bytes;
         }
         Ok(total)
+    }
+
+    /// Owner persistence counters of each owner, in endpoint order.
+    pub fn storage_stats_by_partition(&self) -> Result<Vec<(u32, PartitionStats)>, LocalDbError> {
+        self.owner_storage_stats().collect()
+    }
+
+    fn owner_storage_stats(
+        &self,
+    ) -> impl Iterator<Item = Result<(u32, PartitionStats), LocalDbError>> + '_ {
+        self.core
+            .config
+            .endpoints
+            .iter()
+            .zip(&self.core.clients)
+            .map(|(endpoint, client)| Ok((endpoint.partition, receive(client.stats()?)?)))
     }
     pub fn shutdown(&self) -> Result<(), LocalDbError> {
         self.core.shutdown()
@@ -2401,15 +2556,13 @@ fn fill_replay_page(
     Ok(())
 }
 
-fn checkpoint_metadata_fits(config: &RemoteDatabaseConfig, receipts: usize) -> bool {
+fn checkpoint_metadata_fits(streams: usize, receipts: usize) -> bool {
     // Fixed-width bincode: a receipt is 104 bytes; a stream including its
     // vector header is 84. Charge 128 for each and reserve 1 MiB for schema
-    // and fixed fields (the authority's existing CRC metadata limit).
-    config
-        .endpoints
-        .len()
-        .checked_mul(config.storage.max_epochs)
-        .and_then(|streams| streams.checked_add(receipts))
+    // and fixed fields (the authority's existing CRC metadata limit). Streams
+    // are the actual retained (owner, generation) pairs, not a lifetime quota.
+    streams
+        .checked_add(receipts)
         .and_then(|entries| entries.checked_mul(128))
         .and_then(|bytes| bytes.checked_add(1024 * 1024))
         .is_some_and(|bytes| bytes as u64 <= MAX_CHECKPOINT_METADATA_BYTES)
@@ -2421,6 +2574,7 @@ fn checkpoint_metadata_fits(config: &RemoteDatabaseConfig, receipts: usize) -> b
 fn replay_history(
     clients: &mut [Client],
     histories: &[Vec<u64>],
+    retained: &[(u64, bool)],
     current_epoch: u64,
     config: &RemoteDatabaseConfig,
     shape: &KeyShape,
@@ -2438,7 +2592,9 @@ fn replay_history(
         .recovery_page_limit()?
         .max(config.storage.group_limits.max_batches as usize);
     let mut previous = latest.map(|cut| cut.batch);
-    for epoch in 1..current_epoch {
+    // Only the retained union, never `1..current_epoch`: trimmed and pending
+    // generations get no default position. Aborted streams must be empty.
+    for &(epoch, aborted) in retained {
         let mut pages = endpoint_map(clients, |node, client| {
             let mut page = ReplayPage {
                 batches: VecDeque::new(),
@@ -2483,6 +2639,11 @@ fn replay_history(
             // a retry identity, not a version floor. It precedes the duplicate
             // check because a later epoch may hold its retried identity.
             if cut.keep(version) {
+                if aborted {
+                    return Err(LocalDbError::new(format!(
+                        "aborted fencing generation {epoch} contains accepted WAL data"
+                    )));
+                }
                 if previous.is_some_and(|old| old >= version)
                     || known.contains_key(&batch.id())
                     || recent_ids.contains_key(&batch.id())
@@ -2492,12 +2653,15 @@ fn replay_history(
                     ));
                 }
                 previous = Some(version);
+                // A DropCells batch masks every cell now in its range: the
+                // reconstructed base and the already promoted replayed suffix.
+                let charge = match batch.drop_cells() {
+                    Some((keyspace, first, last)) => index.drop_cells_charge(keyspace, first, last),
+                    None => index.estimated_batch_bytes(&batch),
+                }
+                .map_err(LocalDbError::component)?;
                 index
-                    .check_capacity(
-                        index
-                            .estimated_batch_bytes(&batch)
-                            .map_err(LocalDbError::component)?,
-                    )
+                    .check_capacity(charge)
                     .map_err(LocalDbError::component)?;
                 PreparedNativePublication::prepare_authenticated(
                     shape,
@@ -2623,14 +2787,12 @@ fn load_checkpoint(
     positions: &mut BTreeMap<(u32, u64), StreamPosition>,
     recent: &mut VecDeque<RecentReceipt>,
     recent_ids: &mut HashMap<BatchId, (BatchVersion, super::types::PayloadDigest)>,
+    callback_starts: &mut BTreeMap<(u32, u64), u64>,
     stats: &mut RecoveryStats,
 ) -> Result<(), LocalDbError> {
     let started = Instant::now();
     if commit.generation == 0
-        || !manifest
-            .epochs
-            .iter()
-            .any(|epoch| epoch.epoch == commit.epoch && epoch.active)
+        || !fencing_generations::is_served(manifest, commit.epoch)
         || commit.epoch >= authority_epoch
     {
         return Err(LocalDbError::new(
@@ -2654,12 +2816,30 @@ fn load_checkpoint(
         .with_fixint_encoding()
         .deserialize(&header)
         .map_err(LocalDbError::component)?;
-    if format != 3 {
+    if !matches!(format, 3 | CALLBACK_START_WRAPPER_FORMAT) {
         return Err(LocalDbError::new(
-            "checkpoint image format is not the WAL-replay format 3",
+            "checkpoint image format is not a WAL-replay format (3 or 4)",
         ));
     }
-    let mut image: CheckpointImageV3 = read_checkpoint(&metadata_path)?;
+    let mut image: CheckpointImageV4 = if format == CALLBACK_START_WRAPPER_FORMAT {
+        read_checkpoint(&metadata_path)?
+    } else {
+        let image: CheckpointImageV3 = read_checkpoint(&metadata_path)?;
+        CheckpointImageV4 {
+            format: image.format,
+            database: image.database,
+            shape_yaml: image.shape_yaml,
+            authority_epoch: image.authority_epoch,
+            generation: image.generation,
+            cut: image.cut,
+            published_next: image.published_next,
+            index_bytes: image.index_bytes,
+            index_digest: image.index_digest,
+            positions: image.positions,
+            recent: image.recent,
+            callback_starts: Vec::new(),
+        }
+    };
     for position in std::mem::take(&mut image.positions) {
         if !config.storage.partitions.contains(&position.partition)
             || !histories[config
@@ -2696,6 +2876,22 @@ fn load_checkpoint(
             return Err(LocalDbError::new("invalid checkpoint retry identity"));
         }
         recent.push_back(receipt);
+    }
+    // A callback start is file-aligned, strictly sorted and covered by the
+    // same image's durable position of its stream.
+    let mut previous = None;
+    for start in std::mem::take(&mut image.callback_starts) {
+        let key = (start.partition, start.fencing_generation);
+        if previous.is_some_and(|previous| previous >= key)
+            || start.from % config.storage.wal_file_bytes != 0
+            || positions
+                .get(&key)
+                .is_none_or(|position| start.from > position.durable_end)
+        {
+            return Err(LocalDbError::new("invalid checkpoint callback start"));
+        }
+        previous = Some(key);
+        callback_starts.insert(key, start.from);
     }
     if image.format != format
         || image.database != config.storage.database
@@ -2747,11 +2943,14 @@ fn load_checkpoint(
     Ok(())
 }
 
+/// Returns the unlink directory sync and the cleanup manifest write, counted
+/// under `categories` (names, manifest); both are empty when nothing is staged.
 fn cleanup_checkpoint_artifacts(
     path: &Path,
     manifest: &mut AuthorityManifest,
     _interrupt_after_unlink: bool,
-) -> Result<(), LocalDbError> {
+    categories: (CoordinatorIoCategory, CoordinatorIoCategory),
+) -> Result<(FileIo, FileIo), LocalDbError> {
     let current = manifest
         .checkpoint
         .as_ref()
@@ -2766,18 +2965,17 @@ fn cleanup_checkpoint_artifacts(
             index_files: commit.index_files.clone(),
         });
     if staged.is_none() && obsolete.is_none() {
-        return Ok(());
+        return Ok((FileIo::default(), FileIo::default()));
     }
     // The CRC-protected ledger names only generations reserved by this authority.
     // Validate every intent before deleting anything, especially the live root.
     for (files, retiring) in [(staged, false), (obsolete.as_ref(), true)] {
         if let Some(files) = files {
             let identity = (files.epoch, files.generation);
+            // A retiring commit is strictly older than the current root; its
+            // producer may already be trimmed. A staged one must be served.
             if files.generation == 0
-                || !manifest
-                    .epochs
-                    .iter()
-                    .any(|epoch| epoch.epoch == files.epoch && epoch.active)
+                || (!retiring && !fencing_generations::is_served(manifest, files.epoch))
                 || if retiring {
                     current.is_none_or(|current| identity >= current)
                 } else {
@@ -2842,16 +3040,22 @@ fn cleanup_checkpoint_artifacts(
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(LocalDbError::component)?;
+    let names = checkpoint_attribution::record_unlink_sync(categories.0);
     manifest.checkpoint_staging = None;
     manifest.checkpoint_obsolete = None;
-    persist_manifest(path, manifest)
+    Ok((names, persist_manifest(path, manifest, categories.1)?))
 }
 
-fn persist_manifest(path: &Path, manifest: &AuthorityManifest) -> Result<(), LocalDbError> {
-    install_metadata(
+fn persist_manifest(
+    path: &Path,
+    manifest: &AuthorityManifest,
+    category: CoordinatorIoCategory,
+) -> Result<FileIo, LocalDbError> {
+    checkpoint_attribution::install_counted(
         path,
         MANIFEST,
         &encode_metadata(manifest).map_err(LocalDbError::component)?,
+        category,
     )
     .map_err(LocalDbError::component)
 }
@@ -3348,15 +3552,25 @@ fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {
 mod tests;
 
 #[cfg(test)]
+mod capacity_observer_tests;
+#[cfg(test)]
+mod dead_wal_files_tests;
+#[cfg(test)]
 mod leased_tests;
 #[cfg(test)]
 mod live_bench_tests;
 #[cfg(test)]
 mod position_tests;
+#[cfg(all(test, feature = "test_methods"))]
+mod relocation_tests;
 
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(test)]
+mod compactor_tests;
+#[cfg(test)]
+mod drop_cells_tests;
 #[cfg(test)]
 mod durable_cut_tests;
 #[cfg(test)]

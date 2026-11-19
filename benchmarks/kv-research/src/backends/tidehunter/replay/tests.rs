@@ -14,10 +14,12 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
+use tidehunter::distributed::durability::DurabilityTier;
 use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
 use tidehunter::distributed::sui;
-use tidehunter::distributed::tcp::{NodeConfig, StorageNode, TcpLimits, TlsFiles, Transport};
+use tidehunter::distributed::tcp::{
+    LiveTargetPool, OwnerHost, OwnerHostConfig, TcpLimits, TlsFiles, Transport,
+};
 use tidehunter::metrics::Metrics;
 
 fn trace() -> Trace {
@@ -49,11 +51,11 @@ fn tls() -> TlsFiles {
 /// Leased coordinator configuration of node DB `id` with one owner at `address`.
 fn remote_config(id: u16, address: &str) -> RemoteDatabaseConfig {
     serde_json::from_value(serde_json::json!({
-        "storage":{"database":vec![id as u8+1;16],"partitions":[0],
+        "storage":{"partitions":[0],
             "batch_limits":{"max_operations":519,"max_encoded_bytes":500000},
             "group_limits":{"max_batches":32,"max_encoded_bytes":2097152},
             "fragment_bytes":4194304,"wal_file_bytes":16777216,"max_batches_per_partition":8192,
-            "max_reference_metadata_bytes":67108864,"max_epochs":4},
+            "max_reference_metadata_bytes":67108864},
         "endpoints":[{"partition":0,"address":address,"server_name":"local-replay-fixture"}],
         "tls":tls(),"timeout":{"secs":30,"nanos":0},"max_admitted_batches":8192,"max_index_bytes":67108864,
         "max_pending_batches":64,"max_pending_bytes":33554432,"owner_append_occupancy":16,
@@ -92,7 +94,10 @@ fn explicit_domains_and_complete_batch_limits_are_admitted_before_open() {
     }
     let mut bad = good.clone();
     bad["databases"][1]["options"]["external_remote_config"]["storage"]["database"] =
-        bad["databases"][0]["options"]["external_remote_config"]["storage"]["database"].clone();
+        serde_json::json!(vec![1; 16]);
+    assert!(TidehunterReplayBackend::validate(&bad, &trace).is_err());
+    let mut bad = good.clone();
+    bad["databases"][1]["options"]["database"] = serde_json::json!(vec![1; 16]);
     assert!(TidehunterReplayBackend::validate(&bad, &trace).is_err());
     let mut bad = good.clone();
     bad["databases"][1]["options"]["path"] = bad["databases"][0]["options"]["path"].clone();
@@ -123,6 +128,7 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
         servers: Vec::new(),
     };
     let mut databases = BTreeMap::new();
+    let mut identities = BTreeSet::new();
     for id in trace
         .batches
         .iter()
@@ -134,64 +140,48 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
         let shape = shape(&trace.tables, id);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = remote_config(id, &listener.local_addr().unwrap().to_string());
-        let node_config = NodeConfig {
+        let host_config = OwnerHostConfig {
             root: base.join("owner"),
-            partition: tidehunter::distributed::storage::PartitionConfig {
-                inventory: tidehunter::distributed::storage::StaticInventory {
-                    database: config.storage.database,
-                    epoch: 1,
-                    segment_generation: 1,
-                    partitions: config.storage.partitions.clone(),
-                },
-                partition: 0,
-                batch_limits: config.storage.batch_limits,
-                group_limits: config.storage.group_limits,
-                fragment_bytes: config.storage.fragment_bytes,
-                wal_file_bytes: config.storage.wal_file_bytes,
-                max_batches: config.storage.max_batches_per_partition,
-                max_reference_metadata_bytes: config.storage.max_reference_metadata_bytes,
+            max_databases: 1,
+            live_target_pool: LiveTargetPool {
+                address: "127.0.0.1".into(),
+                transport: tidehunter::distributed::nvmeof::NvmeofTransport::Tcp,
+                public_port_base: 42,
+                public_service_base: 4420,
+                commissioning_port_base: 43,
+                commissioning_service_base: 4421,
             },
-            shape_yaml: serde_yaml::to_string(&shape).unwrap(),
-            max_epochs: 4,
+            trusted_coordinator_id: Some([1; 32]),
             wal_member_read: Default::default(),
             wal_prewrite: false,
             read_max_device_reads: 64,
-            live_target: None,
+            durability: Default::default(),
         };
-        let node = StorageNode::open(
-            node_config,
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-        )
-        .unwrap();
-        node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
-            .unwrap();
-        let state = base.join("target");
         let configfs = base.join("configfs");
-        std::fs::create_dir_all(&state).unwrap();
         for name in ["hosts", "ports", "subsystems"] {
             std::fs::create_dir_all(configfs.join(name)).unwrap();
         }
-        node.set_live_target_fixture(
-            tidehunter::distributed::nvmeof::LiveTargetConfig {
-                address: "127.0.0.1".into(),
-                service: 4420,
-                transport: tidehunter::distributed::nvmeof::NvmeofTransport::Tcp,
-                host_nqn: config.live_nvme.host_nqn.clone(),
-                port_id: 42,
-                state_dir: state,
-                commissioning_port_id: 43,
-                commissioning_service: 4421,
-            },
+        let host = OwnerHost::open_with_live_fixture(
+            host_config,
+            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
             configfs,
         )
         .unwrap();
-        let serving = Arc::clone(&node);
+        let serving = Arc::clone(&host);
         let stop = Arc::clone(&owners.stop);
         owners.servers.push(std::thread::spawn(move || {
             serving
                 .serve(listener, tls(), TcpLimits::default(), stop)
                 .unwrap()
         }));
+        let open_kind = if std::fs::read_dir(base.join("coordinator"))
+            .is_ok_and(|mut entries| entries.next().is_some())
+        {
+            crate::index_checkpoint::OpenKind::Reopen
+        } else {
+            crate::index_checkpoint::OpenKind::Create
+        };
+        let open_start_ns = tidehunter::distributed::remote_db::diagnostics_clock_ns();
         let db = sui::Db::open_remote_with_local_live_fixture(
             &base.join("coordinator"),
             shape,
@@ -199,6 +189,17 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             false,
         )
         .unwrap();
+        let database = db.remote_database_id().unwrap();
+        assert_ne!(database, [0; 16]);
+        assert!(identities.insert(database));
+        assert_eq!(host.databases(), [database]);
+        let open_record = crate::index_checkpoint::OpenRecord {
+            kind: open_kind,
+            open_start_ns,
+            open_return_ns: tidehunter::distributed::remote_db::diagnostics_clock_ns(),
+            first_get_ns: Arc::default(),
+            recovery: db.remote_recovery_stats(),
+        };
         let keyspace = db.ks(&trace
             .tables
             .iter()
@@ -209,9 +210,14 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             db:Some(db),keyspace,
             endpoints:config.endpoints.iter().map(|e|(e.partition,e.address.clone())).collect(),owners:1,
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
-            effective_configuration:serde_json::json!({"fixture_route":"leased","remote":config}),
+            effective_configuration:serde_json::json!({"fixture_route":"leased","database":tidehunter::distributed::tcp::host::identity::database_hex(&database),"remote":config}),
             read_evidence_written:false,owner_sample_gate:Default::default(),coordinator_interval_baseline:std::sync::Mutex::new(None),
+            coordinator_path:base.join("coordinator"),open_record,
             live_write_profile:std::sync::Mutex::new(None),
+            #[cfg(all(feature = "test-utils", target_os = "linux"))]
+            index_fixture:None,
+            #[cfg(all(feature = "test-utils", target_os = "linux"))]
+            local_owners: Vec::new(),
         });
     }
     let tables = trace
@@ -532,6 +538,82 @@ async fn real_local_file_live_replay_records_logical_wal_amplification() {
     eprintln!(
         "local-file-live-replay-amplification bytes={bytes} frames={} wal_per_value={} wal_per_key_value={}",
         wal["leased_frames"], wal["bytes_per_value_byte"], wal["bytes_per_key_value_byte"]
+    );
+    drop(backend);
+    drop(owners);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// R0 on the leased ordinary-file fixture through `run_prepared`: the report
+/// is written, nothing is unlinked, and a replay without a retention prune is
+/// labeled nonrepresentative instead of yielding a slope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_local_file_live_replay_writes_r0_json() {
+    let root = root();
+    let mut trace = trace();
+    trace.select_node_databases(&[0]).unwrap();
+    let prepared = Arc::new(prepare(&trace, 2).unwrap());
+    let (backend, owners) = fixture(&root, &trace);
+    let config: crate::mainnet_replay::ReplayConfig = serde_json::from_value(serde_json::json!({
+        "schema_version":1,"backend":{"kind":"tidehunter_tcp","options":{}},
+        "workload":{"kind":"sui_mainnet_replay",
+            "manifest_path":Path::new(env!("CARGO_MANIFEST_DIR")).join("../../experiments/sui-mainnet/fixture/manifest.json"),
+            "manifest_sha256":"4264e79e0cbe4a1e36d94468df2f049f988eac57877c9bf2e7e175489dc922fa",
+            "repetitions":2,"minimum_measurement_seconds":0.0,"node_databases":[0]},
+        "execution":{"mode":"closed_loop","concurrency":4,"client_shards":1,"queue_capacity":8,
+            "request_timeout_ms":30000,"offered_ops_per_second":null},
+        "limits":{"max_keys":10000,"max_bytes":67108864,"max_operations":10000,
+            "deadline_seconds":120,"shutdown_grace_seconds":5},
+        "capacity_r0":{"workload":"sui_mainnet_retention"}
+    }))
+    .unwrap();
+    let output = root.join("result");
+    let info = backend.info();
+    crate::mainnet_replay::run_prepared(
+        config,
+        &output,
+        trace,
+        prepared,
+        Arc::clone(&backend),
+        serde_json::json!({"binary":{"sha256":"test"}}),
+        (Instant::now(), 0.0, Some(info)),
+    )
+    .await
+    .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("r0.json")).unwrap()).unwrap();
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(report["value_wal_unlinks"], 0, "{report}");
+    assert_eq!(report["complete"], true, "{report}");
+    assert_eq!(report["fixture"], "leased");
+    assert_eq!(report["prune_events"], 0);
+    assert_eq!(
+        report["worst_owner"]["net_allocated_growth_bytes_per_day"],
+        serde_json::Value::Null
+    );
+    let samples = report["samples"].as_array().unwrap();
+    assert_eq!(samples.first().unwrap()["event"], "begin");
+    assert_eq!(samples.last().unwrap()["event"], "end");
+    // The leased writer allocated at least one owner WAL file, observed by stat.
+    let end_files = samples.last().unwrap()["files"].as_array().unwrap();
+    assert!(
+        end_files
+            .iter()
+            .any(|file| file["allocated_bytes"].as_u64().unwrap_or(0) > 0),
+        "{report}"
+    );
+    // The open file is still leased: never an empty proven blocker set.
+    assert!(
+        end_files
+            .iter()
+            .any(|file| file["shadow_eligible"] == false)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("summary.json")).unwrap()).unwrap();
+    let capacity = &summary["phase_counts"]["profile"]["capacity_r0"];
+    assert_eq!(
+        capacity["reports"][0]["summary"]["value_wal_unlinks"], 0,
+        "{capacity}"
     );
     drop(backend);
     drop(owners);

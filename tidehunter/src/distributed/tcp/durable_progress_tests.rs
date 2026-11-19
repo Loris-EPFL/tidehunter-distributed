@@ -18,6 +18,7 @@ fn submit(
         submitted: None,
         charge: 1,
         completed: completed.clone(),
+        progress: None,
     });
     assert!(admitted.is_ok(), "control queue rejected request {id}");
 }
@@ -272,10 +273,15 @@ fn status_and_fence_report_the_owner_durability_tier() {
         node.set_durability(DurabilityConfig::with_tier(tier))
             .unwrap();
         let (completed, completions) = mpsc::sync_channel(2);
-        submit(&node, 1, Request::Status { protocol: PROTOCOL }, &completed);
+        let status = Request::Status {
+            protocol: PROTOCOL,
+            database: Some(node.database()),
+        };
+        submit(&node, 1, status, &completed);
         submit(&node, 2, Request::Fence { epoch: 1 }, &completed);
         for id in 1..=2 {
-            let Ok(Response::Status(status)) = receive(&completions, id) else {
+            let Ok(Response::Status(StatusReply::Database(status))) = receive(&completions, id)
+            else {
                 panic!("expected a status reply")
             };
             assert_eq!(status.durability_tier, tier);
@@ -327,7 +333,11 @@ fn failed_sync_is_unclean_until_the_owner_restarts() {
     assert_eq!(status.incarnation, incarnation);
     assert!(!status.recovery_clean);
     // The barrier before the status meets the failed frontier: the owner stops.
-    submit(&node, 3, Request::Status { protocol: PROTOCOL }, &completed);
+    let status = Request::Status {
+        protocol: PROTOCOL,
+        database: Some(node.database()),
+    };
+    submit(&node, 3, status, &completed);
     assert!(receive(&completions, 3).is_err());
     assert!(
         node.control_context

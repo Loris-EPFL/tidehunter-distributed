@@ -27,36 +27,40 @@ class OwnerPrewriteTests(unittest.TestCase):
 
     def test_local_owner_writes_explicit_prewrite_before_validation(self):
         import yaml
-        # (local override, reviewed case job, explicit launch value)
-        for override, job, expected in ((None, {}, False), (False, {}, False), (True, {}, True),
-                                        (None, {"owner_wal_prewrite": False}, False),
-                                        (None, {"owner_wal_prewrite": True}, True)):
-            with self.subTest(override=override, job=job), tempfile.TemporaryDirectory() as temporary:
-                mode = object.__new__(local_dry_run.LocalMode)
-                mode.fixture = Path(temporary)
-                mode.config = {"prefix": "owned"}
-                if override is not None:
-                    mode.config["wal_prewrite"] = override
-                mode.controller = mock.Mock()
-                mode.cloud = mock.Mock()
-                mode.cloud.case_owner_job.return_value = job
-                mode.cloud.bind_owner_wal_prewrite.side_effect = cloud_controller.bind_owner_wal_prewrite
-                mode.cloud.digest.return_value = "digest"
-                mode.cloud.download_object.side_effect = (
-                    lambda clients, config, key, destination: destination.touch())
-                def extract(archive, guest, files):
-                    guest.mkdir()
-                    (guest / "launch.yaml").write_text(yaml.safe_dump({"node": {}}))
-                mode.cloud.safe_extract_capsule.side_effect = extract
-                mode.cloud.validate_launch.side_effect = RuntimeError("stop before launch")
-                request = {"case_id": "case", "key": "owned/deploy/cells/case/storage-0.tar.gz",
-                           "sha256": "digest", "files": []}
-                with self.assertRaisesRegex(RuntimeError, "stop before launch"):
-                    mode.start_owner(0, request, "case", 10)
-                launch = mode.cloud.validate_launch.call_args.args[1]
-                self.assertIs(launch["node"]["wal_prewrite"], expected)
-                saved = yaml.safe_load((mode.fixture / "cells/case/node-0/launch.yaml").read_text())
-                self.assertEqual(saved, launch)
+        # (local override, reviewed case job, explicit launch value), for an
+        # owner-host launch (`host`) and an archive single-database one (`node`).
+        for shape in ("host", "node"):
+            for override, job, expected in ((None, {}, False), (False, {}, False), (True, {}, True),
+                                            (None, {"owner_wal_prewrite": False}, False),
+                                            (None, {"owner_wal_prewrite": True}, True)):
+                with self.subTest(shape=shape, override=override, job=job), \
+                        tempfile.TemporaryDirectory() as temporary:
+                    mode = object.__new__(local_dry_run.LocalMode)
+                    mode.fixture = Path(temporary)
+                    mode.config = {"prefix": "owned"}
+                    if override is not None:
+                        mode.config["wal_prewrite"] = override
+                    mode.controller = mock.Mock()
+                    mode.cloud = mock.Mock()
+                    mode.cloud.cloud_campaign = cloud_controller.cloud_campaign
+                    mode.cloud.case_owner_job.return_value = job
+                    mode.cloud.bind_owner_wal_prewrite.side_effect = cloud_controller.bind_owner_wal_prewrite
+                    mode.cloud.digest.return_value = "digest"
+                    mode.cloud.download_object.side_effect = (
+                        lambda clients, config, key, destination: destination.touch())
+                    def extract(archive, guest, files):
+                        guest.mkdir()
+                        (guest / "launch.yaml").write_text(yaml.safe_dump({shape: {}}))
+                    mode.cloud.safe_extract_capsule.side_effect = extract
+                    mode.cloud.validate_launch.side_effect = RuntimeError("stop before launch")
+                    request = {"case_id": "case", "key": "owned/deploy/cells/case/storage-0.tar.gz",
+                               "sha256": "digest", "files": []}
+                    with self.assertRaisesRegex(RuntimeError, "stop before launch"):
+                        mode.start_owner(0, request, "case", 10)
+                    launch = mode.cloud.validate_launch.call_args.args[1]
+                    self.assertIs(launch[shape]["wal_prewrite"], expected)
+                    saved = yaml.safe_load((mode.fixture / "cells/case/node-0/launch.yaml").read_text())
+                    self.assertEqual(saved, launch)
 
     def test_local_cli_prewrite_defaults_on_with_explicit_opt_out(self):
         from local_multiowner_check import parse_args

@@ -1,6 +1,7 @@
 use super::super::tests::{batch, config, metrics};
 use super::*;
 use crate::distributed::durability::DurabilityTier;
+use crate::distributed::storage::RetirementOutcome;
 
 // Mirror the production ownership-preserving admission API without boxing.
 #[allow(clippy::result_large_err)]
@@ -20,6 +21,7 @@ fn command(
         queued: Some(Instant::now()),
         submitted: Some(Instant::now()),
         completed: completed.clone(),
+        progress: None,
     })
 }
 fn receive(
@@ -145,6 +147,11 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
         panic!("wrong retirement page response")
     };
     assert_eq!(files.len(), 1);
+    let proof = |file_start| crate::distributed::storage::RetireProof {
+        file_start,
+        inode: None,
+        seal_generation: None,
+    };
     let requests = [
         Request::RetirementFiles {
             authority_epoch: 1,
@@ -173,17 +180,20 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
         Request::RetireWalFiles {
             authority_epoch: 1,
             epoch: 1,
-            files: files.clone(),
+            files: files.iter().copied().map(proof).collect(),
+            witness: None,
         },
         Request::RetireWalFiles {
             authority_epoch: 2,
             epoch: 2,
-            files: files.clone(),
+            files: files.iter().copied().map(proof).collect(),
+            witness: None,
         },
         Request::RetireWalFiles {
             authority_epoch: 2,
             epoch: 1,
-            files: vec![files[0]; 257],
+            files: vec![proof(files[0]); 257],
+            witness: None,
         },
     ];
     for (index, request) in requests.into_iter().enumerate() {
@@ -414,7 +424,7 @@ fn position_root_does_not_replace_read_barriers() {
     }
 }
 
-mod live_fencing {
+pub(super) mod live_fencing {
     use super::*;
     use crate::distributed::group::CompleteGroup;
     use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
@@ -431,7 +441,10 @@ mod live_fencing {
 
     // Exercise the actual WAL/control lifecycle with the existing journal-only
     // target fixture. This is not evidence of kernel namespace I/O drain.
-    fn open_live(root: &std::path::Path, tier: DurabilityTier) -> (NodeConfig, Arc<StorageNode>) {
+    pub(in crate::distributed::tcp::control) fn open_live(
+        root: &std::path::Path,
+        tier: DurabilityTier,
+    ) -> (NodeConfig, Arc<StorageNode>) {
         open_live_with(root, tier, config(&root.join("node")))
     }
 
@@ -542,7 +555,10 @@ mod live_fencing {
         assert_eq!(node.wal_prewrite_stats(), final_stats);
     }
 
-    fn wait_prepared(log: &crate::distributed::storage::PartitionLog, published: u64) {
+    pub(in crate::distributed::tcp::control) fn wait_prepared(
+        log: &crate::distributed::storage::PartitionLog,
+        published: u64,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let stats = log.live_file_preparation_stats();
@@ -1189,7 +1205,7 @@ mod live_fencing {
         receive(&completions, 1).response
     }
 
-    fn shutdown(node: &StorageNode, epoch: u64) {
+    pub(in crate::distributed::tcp::control) fn shutdown(node: &StorageNode, epoch: u64) {
         let (completed, completions) = mpsc::sync_channel(1);
         for request in [
             Request::Seal { epoch },
@@ -1300,6 +1316,117 @@ mod live_fencing {
 
     fn target_stats(node: &StorageNode) -> crate::distributed::nvmeof::LiveTargetStats {
         node.with_live_target(|target| target.stats()).unwrap()
+    }
+
+    #[test]
+    fn trim_finishes_retired_tombstones_after_owner_restart() {
+        use crate::distributed::storage::{RetireProof, RetirementOutcome};
+        use crate::distributed::tcp::generation_control::TrimRequest;
+
+        let temp = tempdir::TempDir::new("trim-retired-tombstones").unwrap();
+        let root = temp.path();
+        let configfs = root.join("configfs");
+        let state_dir = root.join("target");
+        fs::create_dir(&configfs).unwrap();
+        fs::create_dir(&state_dir).unwrap();
+        for directory in ["hosts", "ports", "subsystems"] {
+            fs::create_dir(configfs.join(directory)).unwrap();
+        }
+        let mut config = config(&root.join("node"));
+        config.partition.fragment_bytes = 16 * 1024;
+        config.partition.wal_file_bytes = 32 * 1024;
+        config.live_target = Some(LiveTargetConfig {
+            address: "127.0.0.1".into(),
+            service: 4420,
+            transport: NvmeofTransport::Tcp,
+            host_nqn: "nqn.2026-01.local.test:trim-tombstones".into(),
+            port_id: 42,
+            state_dir: state_dir.clone(),
+            commissioning_port_id: 43,
+            commissioning_service: 4421,
+        });
+        let reopen = || {
+            StorageNode::bench_open_live_fixture(config.clone(), metrics(), configfs.clone())
+                .unwrap()
+        };
+        let node = reopen();
+        fence(&node, 1).unwrap();
+        leased_history(&node, &config, 12);
+        let log = node.source_log_for_test(2, 1);
+        let proofs: Vec<_> = log
+            .wal_file_page(None, 256)
+            .unwrap()
+            .into_iter()
+            .map(|file_start| RetireProof {
+                file_start,
+                inode: None,
+                seal_generation: None,
+            })
+            .collect();
+        // Stop after the retirement root and unlink, before target cleanup.
+        assert_eq!(
+            log.retire_sealed_stream_files(&proofs).unwrap(),
+            RetirementOutcome::Completed
+        );
+        let pending = log.pending_file_retirements();
+        let victim = pending
+            .iter()
+            .filter(|file| file.start != 0)
+            .map(|file| log.wal_file_path(file.start))
+            .find(|path| {
+                node.with_live_target(|target| target.sealed_file(path).unwrap().is_some())
+            })
+            .expect("a tombstone beyond the first WAL file");
+        assert!(
+            pending
+                .iter()
+                .all(|file| !log.wal_file_path(file.start).exists())
+        );
+        let generation_path = victim.parent().unwrap();
+        let sealed = state_dir.join("sealed");
+        let (marker, marker_bytes) = fs::read_dir(&sealed)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                let identity: LiveFileIdentity = serde_json::from_slice(&bytes[4..]).unwrap();
+                (identity.path == victim).then_some((path, bytes))
+            })
+            .unwrap();
+        drop(log);
+        drop(node);
+
+        let node = reopen();
+        fence(&node, 3).unwrap();
+        let trim = |authority_generation| {
+            Request::TrimGeneration(TrimRequest {
+                authority_generation,
+                generation: 1,
+            })
+        };
+        fs::write(&marker, b"bad").unwrap();
+        let err = node.handle(trim(3), TcpLimits::default()).err().unwrap();
+        assert!(
+            err.to_string().contains("truncated sealed WAL marker"),
+            "{err}"
+        );
+        assert!(generation_path.is_dir());
+        assert_eq!(
+            node.source_log_for_test(3, 1).pending_file_retirements(),
+            pending
+        );
+        fs::write(&marker, marker_bytes).unwrap();
+        drop(node);
+
+        let node = reopen();
+        fence(&node, 4).unwrap();
+        assert!(
+            matches!(node.handle(trim(4), TcpLimits::default()).unwrap(), Response::TrimGeneration(reply) if reply.generation == 1)
+        );
+        assert!(!generation_path.exists());
+        assert!(!marker.exists());
+        assert!(node.with_live_target(|target| target.sealed_file(&victim).unwrap().is_none()));
+        shutdown(&node, 4);
     }
 
     #[test]
@@ -1421,7 +1548,7 @@ mod live_fencing {
             });
             assert_eq!(
                 fence(&node, 1).err().unwrap().to_string(),
-                "epoch already fenced/sealed; cannot reactivate"
+                "fencing generation 1 already fenced or sealed (owner high-water 2)"
             );
             match lifecycle {
                 "seal" => {
@@ -1437,10 +1564,15 @@ mod live_fencing {
                             Request::RetireWalFiles {
                                 authority_epoch: 3,
                                 epoch: 1,
-                                files: vec![0],
+                                files: vec![crate::distributed::storage::RetireProof {
+                                    file_start: 0,
+                                    inode: None,
+                                    seal_generation: None,
+                                }],
+                                witness: None,
                             }
                         ),
-                        Response::Retired
+                        Response::Retired(RetirementOutcome::Completed)
                     ));
                     shutdown(&node, 3);
                 }
@@ -1451,10 +1583,15 @@ mod live_fencing {
                             Request::RetireWalFiles {
                                 authority_epoch: 2,
                                 epoch: 1,
-                                files: vec![0],
+                                files: vec![crate::distributed::storage::RetireProof {
+                                    file_start: 0,
+                                    inode: None,
+                                    seal_generation: None,
+                                }],
+                                witness: None,
                             }
                         ),
-                        Response::Retired
+                        Response::Retired(RetirementOutcome::Completed)
                     ));
                     shutdown(&node, 2);
                 }
@@ -1581,7 +1718,7 @@ mod live_fencing {
             // A later real completion proves the no-op/rejected fences did not
             // stop the old frontier. Its next control must still be able to sync.
             let second = adopt_leased_frame(&node, &config, &leased, 1, leased.extent.start + 4096);
-            let Response::Status(status) = fence(&node, 2).unwrap() else {
+            let Response::Status(StatusReply::Database(status)) = fence(&node, 2).unwrap() else {
                 panic!("expected fenced status")
             };
             assert_eq!(status.active_epoch, Some(2));
@@ -1655,7 +1792,9 @@ mod live_fencing {
             Err(mpsc::TryRecvError::Empty)
         ));
         resume_sync.send(()).unwrap();
-        let Response::Status(status) = receive(&completions, 2).response.unwrap() else {
+        let Response::Status(StatusReply::Database(status)) =
+            receive(&completions, 2).response.unwrap()
+        else {
             panic!("expected recovered authority")
         };
         assert_eq!(frontier.synced(), frontier.appended());
@@ -1866,7 +2005,10 @@ mod live_fencing {
         shutdown(&node, 1);
     }
 
-    fn extent_exchange(node: &StorageNode, request: Request) -> Response {
+    pub(in crate::distributed::tcp::control) fn extent_exchange(
+        node: &StorageNode,
+        request: Request,
+    ) -> Response {
         let (completed, completions) = mpsc::sync_channel(1);
         assert!(command(node, 1, request, 4096, &completed).is_ok());
         receive(&completions, 1).response.unwrap()
@@ -1940,7 +2082,9 @@ mod live_fencing {
             };
             assert_eq!(adopted.adoption.receipt_count, 1);
             assert_eq!(adopted.adoption.adopted_end, frame.len() as u64);
-            let Response::Status(status) = receive(&completions, 2).response.unwrap() else {
+            let Response::Status(StatusReply::Database(status)) =
+                receive(&completions, 2).response.unwrap()
+            else {
                 panic!("expected higher-epoch fence")
             };
             assert_eq!(status.active_epoch, Some(2));
@@ -2004,7 +2148,7 @@ mod live_fencing {
             .unwrap()
             .write_all_at(&frame, 0)
             .unwrap();
-        let Response::Status(status) = fence(&node, 2).unwrap() else {
+        let Response::Status(StatusReply::Database(status)) = fence(&node, 2).unwrap() else {
             panic!("expected fenced authority")
         };
         assert_eq!(status.active_epoch, Some(2));
@@ -2295,8 +2439,8 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 29);
-    preface[4..6].copy_from_slice(&28u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 34);
+    preface[4..6].copy_from_slice(&33u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }
 
@@ -2347,8 +2491,14 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
         config.wal_member_read = policy;
         config.read_max_device_reads = device_reads;
         let node = StorageNode::open(config.clone(), metrics()).unwrap();
-        let Response::Status(status) = node
-            .handle(Request::Status { protocol: PROTOCOL }, limits)
+        let Response::Status(StatusReply::Database(status)) = node
+            .handle(
+                Request::Status {
+                    protocol: PROTOCOL,
+                    database: Some(node.database()),
+                },
+                limits,
+            )
             .unwrap()
         else {
             panic!("{name}: status reply");

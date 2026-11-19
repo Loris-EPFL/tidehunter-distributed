@@ -33,25 +33,17 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
     {
         return Err("distributed replay requires strictly increasing node DB ids in 0..=2".into());
     }
-    let mut identities = BTreeSet::new();
     let mut paths = Vec::<std::path::PathBuf>::new();
     let mut result = Vec::with_capacity(3);
     for node in parsed {
         let opts = parse_options(&node.options)?;
-        let remote = &opts.external_remote_config;
+        let remote = external_config(&opts)?;
         remote.validate()?;
         if opts
-            .database
-            .is_some_and(|db| db != remote.storage.database)
-            || opts
-                .batch_limits
-                .is_some_and(|limits| limits != remote.storage.batch_limits)
+            .batch_limits
+            .is_some_and(|limits| limits != remote.storage.batch_limits)
         {
-            return Err("conflicting external replay database identity or batch limits".into());
-        }
-        let database = remote.storage.database;
-        if !identities.insert(database) {
-            return Err("distributed replay node DB identities must be distinct".into());
+            return Err("conflicting external replay batch limits".into());
         }
         if !opts.path.is_absolute()
             || opts
@@ -71,7 +63,7 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
             return Err("distributed replay node DB paths must not overlap".into());
         }
         paths.push(resolved);
-        batch_limits(&opts).validate()?;
+        remote.storage.batch_limits.validate()?;
         result.push((node.db_id, node.options, opts));
     }
     let first = &result[0].2;
@@ -101,8 +93,14 @@ fn resolve_path(path: &std::path::Path) -> BackendResult<std::path::PathBuf> {
     }
     Ok(resolved)
 }
-fn batch_limits(opts: &Options) -> BatchLimits {
-    opts.external_remote_config.storage.batch_limits
+fn external_config(opts: &Options) -> BackendResult<&super::RemoteDatabaseConfig> {
+    opts.external_remote_config
+        .as_ref()
+        .ok_or_else(|| "distributed mainnet replay requires external_remote_config".into())
+}
+
+fn batch_limits(opts: &Options) -> BackendResult<BatchLimits> {
+    Ok(external_config(opts)?.storage.batch_limits)
 }
 pub(super) fn shape(tables: &[Table], db: u16) -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
@@ -146,7 +144,7 @@ impl TidehunterReplayBackend {
         }
         for (id, _, opts) in &parsed {
             let shape = shape(&trace.tables, *id);
-            let limits = batch_limits(opts);
+            let limits = batch_limits(opts)?;
             // Use the actual codec on the immutable source rows before opening owners.
             // Expanded keys have identical lengths. Never split the 519-member output batch.
             for entries in trace
@@ -197,7 +195,7 @@ impl TidehunterReplayBackend {
         let opts = options(value)?;
         let mut wal = 0;
         for (_, _, node) in &opts {
-            let bytes = node.external_remote_config.storage.wal_file_bytes;
+            let bytes = external_config(node)?.storage.wal_file_bytes;
             wal = wal.max(
                 bytes
                     .checked_mul(node.owners as u64)
@@ -314,12 +312,15 @@ impl ReplayBackend for TidehunterReplayBackend {
             .get(usize::from(table))
             .and_then(Option::as_ref)
             .ok_or("unknown replay table")?;
-        self.databases[&db]
+        let backend = &self.databases[&db];
+        let value = backend
             .db
             .as_ref()
             .ok_or("replay DB closed")?
             .get(ks, key)
-            .map_err(native_error)
+            .map_err(native_error)?;
+        backend.open_record.observe_get();
+        Ok(value)
     }
     fn commit(&self, db: u16, entries: &[Row]) -> BackendResult<()> {
         let database = self
@@ -389,6 +390,42 @@ impl ReplayBackend for TidehunterReplayBackend {
                 .map_err(|e| format!("distributed replay node DB {id} health: {e:?}"))?;
         }
         Ok(())
+    }
+    fn capacity_r0_start(
+        &self,
+        request: &crate::capacity_r0::R0Request,
+        header: &crate::capacity_r0::R0Header,
+        output: &std::path::Path,
+    ) -> BackendResult<Vec<crate::capacity_r0::R0Session>> {
+        let mut sessions = Vec::with_capacity(self.databases.len());
+        for (id, backend) in &self.databases {
+            let configuration = &backend.effective_configuration;
+            let mut header = header.clone();
+            header.durability_tier = configuration["durability_tier"].clone();
+            header.route = configuration
+                .get("write_backend")
+                .or_else(|| configuration.get("backend"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            header.fixture = configuration["fixture_route"].clone();
+            let path = crate::capacity_r0::report_path(output, *id, self.databases.len());
+            sessions.push(crate::capacity_r0::R0Session::start(
+                backend.db.as_ref().ok_or("replay DB closed")?,
+                request,
+                &header,
+                &path,
+            )?);
+        }
+        Ok(sessions)
+    }
+
+    fn index_checkpoint_targets(
+        &self,
+    ) -> BackendResult<Vec<crate::index_checkpoint::IndexCheckpointTarget>> {
+        self.databases
+            .iter()
+            .map(|(id, backend)| backend.index_checkpoint_target(&format!("db{id}")))
+            .collect()
     }
 }
 

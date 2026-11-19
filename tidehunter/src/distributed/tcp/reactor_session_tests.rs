@@ -203,6 +203,7 @@ fn seal_fence_and_retirement_wait_for_active_position_proofs() {
                 authority_epoch: 2,
                 epoch: 1,
                 files: Vec::new(),
+                witness: None,
             },
         };
         assert!(!control::is_stream_request(&request));

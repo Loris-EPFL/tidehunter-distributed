@@ -214,7 +214,6 @@ pub(super) fn admission_error(error: &LocalDbError) -> bool {
 }
 
 struct ReadContext {
-    deadline: Instant,
     pin: Option<IndexReadPin>,
     trace: Option<ReadTraceChild>,
 }
@@ -225,7 +224,6 @@ struct ReadContext {
 pub(super) struct ReadBatch {
     pub(super) values: Vec<Option<Mutation>>,
     pub(super) reads: VecDeque<(Vec<usize>, ReadRequest)>,
-    pub(super) deadline: Instant,
     class: ReadClass,
     pub(super) pin: Option<IndexReadPin>,
     groups: VecDeque<(usize, VecDeque<PlannedMember>)>,
@@ -274,7 +272,6 @@ impl ReadBatch {
             class: ReadClass::Point,
             pin: None,
             reads: VecDeque::new(),
-            deadline: Instant::now() + service.timeout(),
             signal: None,
             groups: planned,
         })
@@ -337,7 +334,6 @@ impl ReadBatch {
                 0,
                 false,
                 ReadContext {
-                    deadline: self.deadline,
                     pin: self.pin.clone(),
                     trace: child.clone(),
                 },
@@ -374,13 +370,14 @@ impl ReadBatch {
     }
 
     pub(super) fn finish_one(&mut self) -> Result<(), LocalDbError> {
-        let state = &self
-            .reads
-            .front()
-            .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?
-            .1
-            .credit
-            .state;
+        let (state, timeout) = {
+            let request = &self
+                .reads
+                .front()
+                .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?
+                .1;
+            (&request.credit.state, request.timeout)
+        };
         let signal = self.signal.as_ref().expect("admitted batch has a signal");
         // Check only readiness atomics while holding this batch's predicate
         // mutex; producers take the same mutex before notifying.
@@ -397,16 +394,25 @@ impl ReadBatch {
             if state.failed.load(Ordering::Acquire) || state.stopped.load(Ordering::Acquire) {
                 return Err(LocalDbError::new("read authority is poisoned or closed"));
             }
-            if Instant::now() >= self.deadline {
+            // Time queued for a lane or device credit is load, not a failed read.
+            let now = Instant::now();
+            let io_deadline = self
+                .reads
+                .iter()
+                .filter_map(|(_, request)| request.io_deadline())
+                .min();
+            if io_deadline.is_some_and(|deadline| now >= deadline) {
                 drop(wait_guard);
                 state.poison();
                 return Err(LocalDbError::new(
                     "remote read deadline expired or worker stopped",
                 ));
             }
+            // Also recheck health and deadlines set by later submissions.
+            let wake = io_deadline.map_or(now + timeout, |deadline| deadline.min(now + timeout));
             #[cfg(test)]
             signal.waiters.fetch_add(1, Ordering::Release);
-            signal.changed.wait_until(&mut wait_guard, self.deadline);
+            signal.changed.wait_until(&mut wait_guard, wake);
             #[cfg(test)]
             signal.waiters.fetch_sub(1, Ordering::Release);
         };
@@ -802,7 +808,11 @@ impl Drop for LaneCredit {
 struct Request {
     lane: usize,
     references: Vec<ValueRecordReference>,
-    deadline: Instant,
+    /// Bound of the transport I/O, counted from its submission.
+    timeout: Duration,
+    /// Deadline of this request's outstanding transport I/O; `None` while
+    /// it is queued or parked for device credit. Mirrored in its flight.
+    io_deadline: Option<Instant>,
     submitted: Option<Instant>,
     sampled: bool,
     trace: Option<ReadTraceChild>,
@@ -824,6 +834,14 @@ enum LiveLaneCommand {
 }
 
 impl Request {
+    /// Publish the deadline of outstanding device I/O, or `None` when parked.
+    fn set_io_deadline(&mut self, deadline: Option<Instant>) {
+        if self.io_deadline != deadline {
+            self.io_deadline = deadline;
+            *self.flight.io_deadline.lock() = deadline;
+        }
+    }
+
     fn complete_nvme(self, result: ReadCompletion) {
         if self.sampled {
             let duration = self.submitted.map(elapsed);
@@ -888,9 +906,18 @@ struct ReadFlight {
     references: Vec<ValueRecordReference>,
     slot: usize,
     completion: FlightCompletion,
+    /// Deadline of the outstanding transport I/O, set by the transport at
+    /// submission; `None` before submission. Waiting callers time out only
+    /// against it, never against time spent queued.
+    io_deadline: Mutex<Option<Instant>>,
     _pin: Option<IndexReadPin>,
     // Keep retained-result credit while any caller can consume the flight.
     _credit: Arc<Credit>,
+}
+impl ReadFlight {
+    fn io_deadline(&self) -> Option<Instant> {
+        *self.io_deadline.lock()
+    }
 }
 
 struct FlightCompletion {
@@ -926,7 +953,6 @@ struct ReactorLane {
     node: usize,
     live_cache: Option<super::super::tcp::live_read::LiveReadCache>,
 }
-
 struct ReadLanePlacement {
     device: std::io::Result<PathBuf>,
     counters: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeCounters>>,
@@ -1061,14 +1087,8 @@ fn drive_live_reads(
     fn flush(lanes: &mut [LiveLane], state: &State, node: usize) {
         for lane in lanes {
             while let Some((queued, request)) = lane.pending.pop_front() {
-                if Instant::now() >= request.deadline {
-                    // Never reached a worker: fail it like an expired admission.
-                    state.poison();
-                    request.complete_nvme(Err(LocalDbError::new(
-                        "remote read admission deadline expired",
-                    )));
-                    continue;
-                }
+                // Time queued here is not I/O time: the lane worker starts
+                // the I/O deadline when it submits the request's I/O.
                 match offer(lane, request, state, node) {
                     None => {
                         let waited = elapsed(queued);
@@ -1308,11 +1328,22 @@ struct BatchSubscription {
 pub(super) struct ReadRequest {
     parts: SmallVec<[(Arc<ReadFlight>, usize); 1]>,
     credit: Arc<Credit>,
-    deadline: Instant,
+    admitted: Instant,
+    /// Longest wait between health and deadline rechecks.
+    timeout: Duration,
     trace: Option<ReadTraceChild>,
     subscription: Option<BatchSubscription>,
 }
 impl ReadRequest {
+    /// The earliest deadline of this request's outstanding transport I/O;
+    /// `None` while none of its incomplete flights is submitted.
+    fn io_deadline(&self) -> Option<Instant> {
+        self.parts
+            .iter()
+            .filter(|(flight, _)| !flight._credit.state.flight_ready[flight.slot].is_ready())
+            .filter_map(|(flight, _)| flight.io_deadline())
+            .min()
+    }
     fn subscribe(&mut self, signal: &Arc<BatchSignal>) {
         let mut slots = SmallVec::new();
         for (index, (flight, _)) in self.parts.iter().enumerate() {
@@ -1370,8 +1401,27 @@ impl ReadRequest {
 
     pub(super) fn finish(self) -> ReadCompletion {
         for (flight, _) in &self.parts {
-            if !flight._credit.state.flight_ready[flight.slot].wait_until(self.deadline) {
-                return Err(self.failure("remote read deadline expired or worker stopped"));
+            let state = &flight._credit.state;
+            // As in native, load never fails the read: only a submitted
+            // flight's I/O deadline or a failed or stopped authority ends this
+            // wait. It wakes at least once per timeout to recheck both.
+            loop {
+                let now = Instant::now();
+                let wake = flight.io_deadline().map_or(now + self.timeout, |deadline| {
+                    deadline.min(now + self.timeout)
+                });
+                if state.flight_ready[flight.slot].wait_until(wake) {
+                    break;
+                }
+                if flight
+                    .io_deadline()
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(self.failure("remote read deadline expired or worker stopped"));
+                }
+                if state.failed.load(Ordering::Acquire) || state.stopped.load(Ordering::Acquire) {
+                    return Err(LocalDbError::new("read authority is poisoned or closed"));
+                }
             }
         }
         let result = self
@@ -1735,28 +1785,36 @@ impl ReadService {
         self.state.admission_generation.load(Ordering::Acquire)
     }
 
+    /// Wait until read credit changes after `observed`. `None` waits without
+    /// a load deadline, as a native read never fails because of load: every
+    /// held credit is released by its read's completion, failure or per-I/O
+    /// timeout, and every release, poison, stop and unpause bumps the
+    /// generation under `retained` before notifying, so no wakeup is lost.
     pub(super) fn wait_admission(
         &self,
         observed: u64,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<(), LocalDbError> {
         let mut retained = self.state.retained.lock();
-        // The absolute deadline bounds retries even when other callers keep
-        // releasing credits before this caller can reserve them.
         loop {
             if self.failed() || self.state.stopped.load(Ordering::Acquire) {
                 return Err(LocalDbError::new("read authority is poisoned or closed"));
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(LocalDbError::new("remote read admission deadline expired"));
             }
             if self.admission_generation() != observed {
                 return Ok(());
             }
-            let _ = self
-                .state
-                .admission_changed
-                .wait_until(&mut retained, deadline);
+            match deadline {
+                Some(deadline) => {
+                    let _ = self
+                        .state
+                        .admission_changed
+                        .wait_until(&mut retained, deadline);
+                }
+                None => self.state.admission_changed.wait(&mut retained),
+            }
         }
     }
     /// A blocking scalar caller can own an idle lane directly. Deferred reads
@@ -1802,11 +1860,7 @@ impl ReadService {
             &references,
             extra_bytes,
             profiled,
-            ReadContext {
-                deadline: Instant::now() + self.timeout(),
-                pin,
-                trace: None,
-            },
+            ReadContext { pin, trace: None },
         )
     }
     fn submit_until(
@@ -1830,11 +1884,9 @@ impl ReadService {
         context: ReadContext,
         planned: Option<PlannedMembers<'_>>,
     ) -> Result<ReadRequest, LocalDbError> {
-        let ReadContext {
-            deadline,
-            pin,
-            trace,
-        } = context;
+        let admitted = Instant::now();
+        let timeout = self.timeout();
+        let ReadContext { pin, trace } = context;
         if let Some(trace) = &trace {
             trace.event("admission_started");
         }
@@ -1990,6 +2042,7 @@ impl ReadService {
                 references: missing.clone(),
                 slot,
                 completion: FlightCompletion::new(),
+                io_deadline: Mutex::new(None),
                 _pin: pin,
                 _credit: credit.clone(),
             });
@@ -1997,7 +2050,8 @@ impl ReadService {
             let request = Request {
                 lane: lane.index,
                 references: missing,
-                deadline,
+                timeout,
+                io_deadline: None,
                 submitted: (profiled || sampled).then(Instant::now),
                 sampled,
                 trace: trace.clone(),
@@ -2074,7 +2128,8 @@ impl ReadService {
         Ok(ReadRequest {
             parts,
             credit,
-            deadline,
+            admitted,
+            timeout,
             trace,
             subscription: None,
         })
@@ -2245,7 +2300,6 @@ impl RemoteDatabase {
                 0,
                 false,
                 ReadContext {
-                    deadline: Instant::now() + self.core.config.timeout,
                     pin: Some(pin),
                     trace: None,
                 },
@@ -2275,10 +2329,12 @@ impl RemoteDatabase {
         }
         self.ensure_healthy()?;
         let mutation = completed.result.inspect_err(|error| self.poison(error))?;
-        if matches!(mutation, Mutation::Delete { .. })
+        if !matches!(mutation, Mutation::Put { .. })
             || mutation.keyspace() != ks
             || completed.reference.descriptor.keyspace != ks.0
-            || self.core.shape.ks(ks).reduce_key(mutation.key()).as_ref() != reduced_key
+            || mutation
+                .point_key()
+                .is_none_or(|key| self.core.shape.ks(ks).reduce_key(key).as_ref() != reduced_key)
         {
             let error = LocalDbError::new("scan member does not match its live index reference");
             self.poison(&error);
@@ -2505,6 +2561,9 @@ impl RemoteDatabase {
             Mutation::Delete { .. } => Err(LocalDbError::new(
                 "live index reference resolves to tombstone",
             )),
+            Mutation::DropCells { .. } => Err(LocalDbError::new(
+                "DropCells does not have a value reference",
+            )),
         }
     }
     fn check_handle(&mut self, pending: &PendingGet) -> Result<(), LocalDbError> {
@@ -2577,7 +2636,14 @@ impl RemoteDatabase {
             }
             GetState::Pending { read, .. } => match read.try_result() {
                 Ok(Some(completion)) => Ok(completion),
-                Ok(None) if Instant::now() < read.deadline => return Ok(None),
+                // A queued read stays pending; only submitted I/O expires.
+                Ok(None)
+                    if read
+                        .io_deadline()
+                        .is_none_or(|deadline| Instant::now() < deadline) =>
+                {
+                    return Ok(None);
+                }
                 Ok(None) => {
                     return Err(read.failure("remote read deadline expired or worker stopped"));
                 }
@@ -2594,10 +2660,9 @@ impl RemoteDatabase {
         else {
             unreachable!()
         };
-        self.core.value_read_ns.fetch_add(
-            elapsed(read.deadline - self.core.config.timeout),
-            Ordering::Relaxed,
-        );
+        self.core
+            .value_read_ns
+            .fetch_add(elapsed(read.admitted), Ordering::Relaxed);
         let values = result?;
         self.complete_get(reference, ks, &key, values).map(Some)
     }
@@ -2618,7 +2683,7 @@ impl RemoteDatabase {
                 ks,
                 key,
             } => {
-                let value_started = read.deadline - self.core.config.timeout;
+                let value_started = read.admitted;
                 let wait_started = profile.as_ref().map(|_| Instant::now());
                 let result = read.finish();
                 self.core

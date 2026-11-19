@@ -1,11 +1,8 @@
-//! Frozen Exact checkpoint metadata (format 3) and authority manifest
-//! (format 4) fixtures. The bytes were produced at base revision e3b920d.
-//! Exact mode must keep writing and reading them byte for byte; the removed
-//! per-cell manifest keys stay absent.
+//! Frozen Exact checkpoint metadata (format 3) and the pre-L1 authority
+//! manifest (format 4), produced at base revision e3b920d. The checkpoint
+//! image keeps its bytes; L1 rejects the pre-cutover manifest unchanged.
 
 use super::*;
-use crate::distributed::codec::BatchLimits;
-use crate::distributed::group::GroupLimits;
 use crate::distributed::types::PayloadDigest;
 
 const MANIFEST_4: &[u8] = include_bytes!("fixtures/manifest-format4.bin");
@@ -18,76 +15,6 @@ fn version(epoch: u64, sequence: u64, operation_index: u32) -> MutationVersion {
     MutationVersion {
         batch: BatchVersion { epoch, sequence },
         operation_index,
-    }
-}
-
-fn commit(generation: u64, index_files: &[&str]) -> CheckpointCommit {
-    CheckpointCommit {
-        epoch: 2,
-        generation,
-        metadata_bytes: 300 + generation,
-        metadata_digest: [0xa0 + generation as u8; 32],
-        index_files: index_files.iter().map(|name| (*name).to_owned()).collect(),
-    }
-}
-
-fn frozen_manifest() -> AuthorityManifest {
-    AuthorityManifest {
-        format: 4,
-        storage: LocalInventoryConfig {
-            database: DATABASE,
-            partitions: vec![0, 1],
-            batch_limits: BatchLimits {
-                max_operations: 32,
-                max_encoded_bytes: 2048,
-            },
-            group_limits: GroupLimits {
-                max_batches: 4,
-                max_encoded_bytes: 4088,
-            },
-            fragment_bytes: 4096,
-            wal_file_bytes: 8192,
-            max_batches_per_partition: 16,
-            max_reference_metadata_bytes: 1 << 20,
-            max_epochs: 8,
-        },
-        history_persistence: MANIFEST_HISTORY.into(),
-        endpoints: (0..2)
-            .map(|partition| RemoteEndpoint {
-                partition,
-                address: format!("127.0.0.1:{}", 7000 + partition),
-                server_name: format!("owner-{partition}"),
-            })
-            .collect(),
-        shape_yaml: SHAPE_YAML.into(),
-        replay_limits: ReplayLimits {
-            max_batches: 4096,
-            max_encoded_bytes: 256 * 1024 * 1024,
-        },
-        live_nvme_identity: Some((
-            "nqn.2014-08.org.nvmexpress:uuid:22222222-2222-2222-2222-222222222222".into(),
-            [2; 16],
-        )),
-        live_nvme_owner_identities: BTreeMap::new(),
-        epochs: (1..=3)
-            .map(|epoch| AuthorityEpoch {
-                epoch,
-                active: epoch != 3,
-            })
-            .collect(),
-        checkpoint: Some(commit(5, &["index-2-5.snapshot.cells"])),
-        checkpoint_staging: Some(CheckpointFiles {
-            epoch: 3,
-            generation: 1,
-            index_files: Vec::new(),
-        }),
-        checkpoint_obsolete: Some(commit(
-            4,
-            &["index-2-3.snapshot.cells", "index-2-4.snapshot.cells"],
-        )),
-        checkpoint_mode: None,
-        cell_checkpoint: None,
-        cell_checkpoint_obsolete: None,
     }
 }
 
@@ -144,15 +71,17 @@ fn frozen_file(name: &str, bytes: &[u8]) -> (tempdir::TempDir, PathBuf) {
 }
 
 #[test]
-fn exact_manifest_format_4_bytes_are_frozen() {
-    let manifest = frozen_manifest();
-    assert_eq!(encode_metadata(&manifest).unwrap(), MANIFEST_4);
+fn pre_generation_manifest_format_4_is_rejected_unchanged() {
     let (_temp, path) = frozen_file(MANIFEST, MANIFEST_4);
-    let read: AuthorityManifest = read_metadata(&path).unwrap();
-    assert_eq!(encode_metadata(&read).unwrap(), MANIFEST_4);
-    read.reject_legacy_mode().unwrap();
-    let text = String::from_utf8(MANIFEST_4[8..].to_vec()).unwrap();
-    assert!(!text.contains("checkpoint_mode") && !text.contains("cell_checkpoint"));
+    let error = fencing_generations::read_authority_manifest(&path).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "unsupported distributed authority manifest format 4 (expected {})",
+            fencing_generations::AUTHORITY_FORMAT
+        )
+    );
+    assert_eq!(fs::read(&path).unwrap(), MANIFEST_4);
 }
 
 #[test]

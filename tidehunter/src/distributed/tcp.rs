@@ -14,6 +14,7 @@
 //! `FabricSecurity::MutualTls` (both mutual TLS), and `Transport::TcpTrusted`
 //! against OFI with `FabricSecurity::Trusted` (both trusted-network/no-TLS).
 
+mod capacity;
 pub mod checkpoint;
 mod diagnostics;
 mod fabric;
@@ -27,18 +28,37 @@ pub use tidehunter_fabric::ProviderInfo;
 mod control;
 mod durable_progress;
 pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
+mod generation_control;
+pub use generation_control::{InventoryGeneration, OwnerGenerationState, TrimReadiness};
+pub mod host;
 mod inventory;
+#[cfg(test)]
+pub(crate) use generation_control::OwnerTrimCrash;
 mod live_client;
+mod progress_wait;
+pub(crate) use progress_wait::WakeFd;
+#[cfg(test)]
+mod progress_wait_tests;
+#[cfg(any(test, feature = "test-utils"))]
+pub use host::DatabaseOpenHook;
+pub(crate) use host::identity as host_identity;
+pub use host::{
+    DatabaseLiveTarget, DatabaseProvisionSpec, HostDurabilityDefaults, HostStatus, LiveTargetPool,
+    OwnerHost, OwnerHostConfig,
+};
+mod listener;
 pub use super::nvmeof::LiveQueueGeometry;
 #[cfg(test)]
 pub(crate) use live_client::leased_tests;
 pub(super) use live_client::{LeasedSubmit, LiveGroupBudget};
 pub use live_client::{LeasedSync, LiveClientConfig, LiveInitiatorIdentity};
+pub(crate) use reactor::HostClient;
 #[cfg(test)]
 pub(crate) mod export_pin_tests;
 mod live_control;
 pub(super) mod live_read;
 mod live_recovery;
+mod relocation_scan;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 pub use live_control::{LiveRecoveryEntry, LiveRecoveryPage};
 mod live_wire;
@@ -86,7 +106,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use inventory::NodeInventory;
+pub use inventory::{FileMaintenanceStats, NodeInventory};
 /// Wire protocol version. 22 adds leased live WAL extents and adoption proofs.
 /// 23 adds OpenLiveExports for permanent live export.
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
@@ -102,7 +122,16 @@ pub use inventory::NodeInventory;
 /// `NodeStatus::{history_persistence, max_read_bytes}` and the SPDK, sealed-export
 /// and export-mode placeholders, and adds owner transport counters to
 /// `PartitionStats`.
-const PROTOCOL: u32 = 29;
+/// 30 (L1) replaces the retained generation vector and `max_epochs` in
+/// `NodeStatus` with the owner high-water and inventory revision, and appends
+/// InventoryPage, CheckTrimGeneration and TrimGeneration.
+/// 31 (R0) appends FileInventoryPage (request tag 29, response tag 26).
+/// 32 (R1 owner) gives RetireWalFiles inode-bound proofs and an Exact witness, and `Retired`
+/// a Completed/Busy outcome (payloads change in place; tags are unchanged).
+/// 33 (R1 logical) appends RelocationPage (request tag 30, response tag 27).
+/// 34 (L2) scopes Status and types Error in place, and appends ProvisionDatabase
+/// and DropDatabase (request tags 31–32, response tags 28–29).
+const PROTOCOL: u32 = 34;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -152,9 +181,10 @@ fn read_transport_mode(stream: &mut impl Read, expected: &Transport) -> Result<(
 pub struct NodeConfig {
     pub root: PathBuf,
     /// Full static cluster inventory, this node's partition; template epoch = 1.
+    /// Retained fencing generations are bounded by the ones still referenced,
+    /// not by a configured count.
     pub partition: PartitionConfig,
     pub shape_yaml: String,
-    pub max_epochs: usize,
     /// Member read policy of owner WAL reads; with `Async`, also bounds each
     /// live record resolution (see `read_max_device_reads`).
     #[serde(default = "default_async_read_policy")]
@@ -187,22 +217,22 @@ impl NodeConfig {
 
     fn validated_shape(&self) -> Result<KeyShape, TcpError> {
         self.partition.validate().map_err(TcpError::component)?;
-        if self.partition.inventory.epoch != 1
-            || self.partition.inventory.segment_generation != 1
-            || !(1..=1024).contains(&self.max_epochs)
-        {
+        if self.partition.inventory.epoch != 1 || self.partition.inventory.segment_generation != 1 {
             return Err(TcpError::new("invalid node epoch/configuration template"));
         }
         KeyShape::from_yaml(&self.shape_yaml).map_err(TcpError::component)
     }
 
     fn validate_reads(&self) -> Result<(), TcpError> {
-        // Same bound the removed read executor applied to max_device_reads.
-        if !(1..=4096).contains(&self.read_max_device_reads) {
-            return Err(TcpError::new("read_max_device_reads must be in 1..=4096"));
-        }
-        Ok(())
+        validate_device_read_limit(self.read_max_device_reads)
     }
+}
+
+fn validate_device_read_limit(limit: usize) -> Result<(), TcpError> {
+    if !(1..=4096).contains(&limit) {
+        return Err(TcpError::new("read_max_device_reads must be in 1..=4096"));
+    }
+    Ok(())
 }
 
 fn default_wal_prewrite() -> bool {
@@ -262,7 +292,7 @@ pub enum PollingPolicy {
 /// Other data requests, including position proofs, do not use it.
 pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(34_500);
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TcpLimits {
     pub max_frame_bytes: usize,
     pub max_connections: usize,
@@ -307,17 +337,15 @@ impl TcpLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeEpoch {
-    pub epoch: u64,
-    pub sealed: bool,
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub partition: PartitionConfig,
     pub shape_yaml: String,
-    pub max_epochs: usize,
-    pub epochs: Vec<NodeEpoch>,
+    /// Highest fencing generation the owner ever accepted. Never decreases;
+    /// retained generations are read with `Client::inventory_sweep`.
+    pub highest_fenced_generation: u64,
+    /// Owner-incarnation-local ledger revision that freezes one page sweep.
+    pub inventory_revision: u64,
     pub active_epoch: Option<u64>,
     /// False means only a strictly higher live fence may recover this owner.
     pub healthy: bool,
@@ -387,15 +415,27 @@ impl TcpReadProfile {
 #[derive(Debug)]
 pub struct TcpError {
     message: String,
+    kind: io::ErrorKind,
+    wait_unavailable: bool,
 }
 impl TcpError {
     fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(io::ErrorKind::Other, message)
+    }
+    /// An error with a typed class that survives the wire (`WireError`).
+    pub(crate) fn with_kind(kind: io::ErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind,
+            wait_unavailable: false,
         }
     }
     fn component(error: impl fmt::Display) -> Self {
         Self::new(error.to_string())
+    }
+    /// Typed class: local I/O kind, or the remote error code of the owner.
+    pub fn kind(&self) -> io::ErrorKind {
+        self.kind
     }
 }
 impl fmt::Display for TcpError {
@@ -406,7 +446,151 @@ impl fmt::Display for TcpError {
 impl std::error::Error for TcpError {}
 impl From<io::Error> for TcpError {
     fn from(error: io::Error) -> Self {
-        Self::component(error)
+        Self::with_kind(error.kind(), error.to_string())
+    }
+}
+impl From<TcpError> for io::Error {
+    fn from(error: TcpError) -> Self {
+        io::Error::new(error.kind, error.message)
+    }
+}
+impl From<&str> for WireError {
+    fn from(message: &str) -> Self {
+        Self::other(message)
+    }
+}
+impl From<String> for WireError {
+    fn from(message: String) -> Self {
+        Self::other(message)
+    }
+}
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+/// `Response::Error` body: an explicit `u8` class and the message. Codes:
+/// 0 Other, 1 InvalidInput, 2 InvalidData, 3 PermissionDenied, 4 NotFound,
+/// 5 AlreadyExists, 6 WouldBlock, 7 TimedOut. Unknown codes decode as Other.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WireError {
+    pub code: u8,
+    pub message: String,
+}
+impl WireError {
+    pub(crate) fn other(message: impl Into<String>) -> Self {
+        Self {
+            code: 0,
+            message: message.into(),
+        }
+    }
+    fn code_of(kind: io::ErrorKind) -> u8 {
+        match kind {
+            io::ErrorKind::InvalidInput => 1,
+            io::ErrorKind::InvalidData => 2,
+            io::ErrorKind::PermissionDenied => 3,
+            io::ErrorKind::NotFound => 4,
+            io::ErrorKind::AlreadyExists => 5,
+            io::ErrorKind::WouldBlock => 6,
+            io::ErrorKind::TimedOut => 7,
+            _ => 0,
+        }
+    }
+    fn kind(&self) -> io::ErrorKind {
+        match self.code {
+            1 => io::ErrorKind::InvalidInput,
+            2 => io::ErrorKind::InvalidData,
+            3 => io::ErrorKind::PermissionDenied,
+            4 => io::ErrorKind::NotFound,
+            5 => io::ErrorKind::AlreadyExists,
+            6 => io::ErrorKind::WouldBlock,
+            7 => io::ErrorKind::TimedOut,
+            _ => io::ErrorKind::Other,
+        }
+    }
+}
+impl From<&TcpError> for WireError {
+    fn from(error: &TcpError) -> Self {
+        Self {
+            code: Self::code_of(error.kind),
+            message: error.message.clone(),
+        }
+    }
+}
+impl From<TcpError> for WireError {
+    fn from(error: TcpError) -> Self {
+        Self {
+            code: Self::code_of(error.kind),
+            message: error.message,
+        }
+    }
+}
+impl From<WireError> for TcpError {
+    fn from(error: WireError) -> Self {
+        Self {
+            wait_unavailable: error.message.starts_with(progress_wait::WAIT_UNAVAILABLE),
+            ..Self::with_kind(error.kind(), error.message)
+        }
+    }
+}
+
+/// Status reply of either session scope. Encoded as an explicit `u8` scope
+/// (`Host = 0`, `Database = 1`) followed by the scope's body, inside the
+/// existing `Response::Status` tag. A Fence reply is always `Database`.
+#[derive(Clone, Debug)]
+pub(crate) enum StatusReply {
+    Host(HostStatus),
+    Database(NodeStatus),
+}
+impl Serialize for StatusReply {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(2)?;
+        match self {
+            Self::Host(status) => {
+                tuple.serialize_element(&0u8)?;
+                tuple.serialize_element(status)?;
+            }
+            Self::Database(status) => {
+                tuple.serialize_element(&1u8)?;
+                tuple.serialize_element(status)?;
+            }
+        }
+        tuple.end()
+    }
+}
+impl<'de> Deserialize<'de> for StatusReply {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StatusReply;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a u8 status scope followed by its status body")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<StatusReply, A::Error> {
+                let scope: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                match scope {
+                    0 => seq
+                        .next_element()?
+                        .map(StatusReply::Host)
+                        .ok_or_else(|| serde::de::Error::invalid_length(1, &self)),
+                    1 => seq
+                        .next_element()?
+                        .map(StatusReply::Database)
+                        .ok_or_else(|| serde::de::Error::invalid_length(1, &self)),
+                    other => Err(serde::de::Error::custom(format!(
+                        "unknown status scope {other}"
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_tuple(2, Visitor)
     }
 }
 
@@ -425,8 +609,11 @@ enum Request {
         after: Option<u64>,
         limit: usize,
     },
-    /// Tag 1.
-    Status { protocol: u32 },
+    /// Tag 1. The first Status binds a session to the host (`None`) or one database.
+    Status {
+        protocol: u32,
+        database: Option<[u8; 16]>,
+    },
     /// Tag 2.
     Fence { epoch: u64 },
     /// Tag 3.
@@ -447,11 +634,14 @@ enum Request {
         epoch: u64,
         through: u64,
     },
-    /// Tag 10.
+    /// Tag 10. Whole-file retirement. `epoch` older than the authority: older
+    /// sealed stream (no seals, no witness). `epoch` equal to it: durably
+    /// sealed files of the serving stream, with the adopted Exact witness.
     RetireWalFiles {
         authority_epoch: u64,
         epoch: u64,
-        files: Vec<u64>,
+        files: Vec<super::storage::RetireProof>,
+        witness: Option<super::storage::RetirementWitness>,
     },
     /// Tag 11. Owner durable progress of stream `epoch` for the coordinator's
     /// durable cut. A long-poll: see `DurableProgressReport` for the reply
@@ -512,6 +702,44 @@ enum Request {
     /// Tag 25. Benchmark evidence; owners built without Linux `test-utils`
     /// reply with an error.
     ProcessResources { epoch: u64 },
+    /// Tag 26.
+    InventoryPage(generation_control::InventoryPageRequest),
+    /// Tag 27.
+    CheckTrimGeneration(generation_control::CheckTrimRequest),
+    /// Tag 28.
+    TrimGeneration(generation_control::TrimRequest),
+    /// Tag 29. Read-only owner WAL file inventory for capacity accounting.
+    FileInventoryPage {
+        authority_generation: u64,
+        source_generation: u64,
+        after: Option<u64>,
+        limit: u16,
+    },
+    /// Tag 30. R1 relocation scan: metadata of the complete batches of one
+    /// stream in `[from, end)`, active or older sealed
+    /// (`storage::RelocationPage`).
+    RelocationPage {
+        authority_generation: u64,
+        source_generation: u64,
+        from: u64,
+        end: u64,
+        limit: u16,
+    },
+    /// Tag 31. Host scope only; idempotent for an identical request.
+    /// The authority may retry after an unknown outcome.
+    ProvisionDatabase {
+        database: [u8; 16],
+        partition: PartitionConfig,
+        shape_yaml: String,
+        live_target: DatabaseLiveTarget,
+    },
+    /// Tag 32. Host scope only. `authority` is the bound trust principal and
+    /// `generation` the coordinator's highest fencing reservation (0 if none).
+    DropDatabase {
+        database: [u8; 16],
+        authority: [u8; 32],
+        generation: u64,
+    },
 }
 impl Request {
     /// Startup/recovery negotiation, durable epoch/retirement maintenance and
@@ -524,7 +752,13 @@ impl Request {
             | Self::Status { .. }
             | Self::Fence { .. }
             | Self::Seal { .. }
-            | Self::RetireWalFiles { .. } => true,
+            | Self::RetireWalFiles { .. }
+            // A directory scan with `lstat` per file, like retirement pages.
+            | Self::FileInventoryPage { .. }
+            // Reads and decodes up to one page of WAL groups.
+            | Self::RelocationPage { .. }
+            | Self::ProvisionDatabase { .. }
+            | Self::DropDatabase { .. } => true,
             Self::Stats
             | Self::StatsDetailed
             | Self::PartitionStats
@@ -553,6 +787,10 @@ impl Request {
             | Self::LiveTargetStats
             | Self::ProcessResources { .. } => false,
             Self::ReadEvidence { evict, .. } => *evict,
+            // Cold control lane with normal lifecycle deadlines.
+            Self::InventoryPage(_) | Self::CheckTrimGeneration(_) | Self::TrimGeneration(_) => {
+                true
+            }
         };
         if lifecycle {
             data_timeout.max(LIFECYCLE_TIMEOUT)
@@ -617,9 +855,9 @@ enum Response {
     /// Tag 1.
     RetirementFiles(Vec<u64>),
     /// Tag 2.
-    Retired,
+    Retired(super::storage::RetirementOutcome),
     /// Tag 3.
-    Status(NodeStatus),
+    Status(StatusReply),
     /// Tag 4.
     Sealed,
     /// Tag 5.
@@ -631,7 +869,7 @@ enum Response {
         metadata: usize,
     },
     /// Tag 6.
-    Error(String),
+    Error(WireError),
     /// Tag 7.
     StatsDetailed {
         groups: u64,
@@ -678,6 +916,24 @@ enum Response {
     ReadEvidence(crate::read_probe::ReadEvidence),
     /// Tag 22.
     ProcessResources(crate::read_probe::ProcessResources),
+    /// Tag 23.
+    InventoryPage(generation_control::InventoryPageReply),
+    /// Tag 24.
+    CheckTrimGeneration(generation_control::CheckTrimReply),
+    /// Tag 25.
+    TrimGeneration(generation_control::TrimReply),
+    /// Tag 26. Boxed so ordinary responses do not grow.
+    FileInventoryPage(Box<super::capacity::FileInventoryReply>),
+    /// Tag 27. Boxed like FileInventoryPage.
+    RelocationPage(Box<super::storage::RelocationPage>),
+    /// Tag 28.
+    ProvisionDatabase {
+        database: [u8; 16],
+        partition: u32,
+        durability_tier: super::durability::DurabilityTier,
+    },
+    /// Tag 29.
+    DropDatabase { database: [u8; 16], generation: u64 },
 }
 
 /// Named error of a benchmark evidence request this owner build cannot serve.
@@ -708,23 +964,34 @@ pub struct LiveInlineExportStats {
     pub replay: u64,
 }
 
-/// One partition's durable epoch authority. Writes/fences serialize at the node;
-/// read requests retain Arc log handles and perform disk I/O outside this mutex.
+/// One database's durable fencing authority within an [`OwnerHost`].
 pub struct StorageNode {
     inventory: Arc<Mutex<NodeInventory>>,
     control: control::ControlOwner,
     control_context: Arc<control::ControlContext>,
+    close_wake: WakeFd,
+    #[cfg(test)]
+    progress_wait_hook: Mutex<Option<Arc<progress_wait::WaitHook>>>,
     pub(super) live_nvme_selected: bool,
 }
 impl StorageNode {
     pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>, TcpError> {
+        Self::open_inner(config, metrics, inventory::OpenMode::Prepare)
+    }
+
+    fn open_inner(
+        config: NodeConfig,
+        metrics: Arc<Metrics>,
+        mode: inventory::OpenMode,
+    ) -> Result<Arc<Self>, TcpError> {
         if let Some(error) = super::sys::route_unavailable() {
             return Err(TcpError::new(error));
         }
         config.validate_reads()?;
+        let close_wake = WakeFd::for_progress("database close wake")?;
         let wal_member_read = config.wal_member_read;
         let read_max_device_reads = config.read_max_device_reads;
-        let inventory = NodeInventory::open(config, metrics)?;
+        let inventory = NodeInventory::open_with_mode(config, metrics, mode)?;
         let live_nvme_selected = inventory.live_target_configured;
         let lifecycle = inventory.lifecycle.clone();
         let readers = inventory.readers.clone();
@@ -737,6 +1004,7 @@ impl StorageNode {
             inventory: inventory.clone(),
             lifecycle,
             readers,
+            closed: AtomicBool::new(false),
             terminal,
             poison_pending: Arc::new(AtomicBool::new(false)),
             persistence_failed,
@@ -746,14 +1014,29 @@ impl StorageNode {
             read_max_device_reads,
             transport: Arc::default(),
             live_control_gate: Mutex::new(()),
+            #[cfg(test)]
+            before_fence: Mutex::new(None),
         });
         let control = control::ControlOwner::start(control_context.clone())?;
         Ok(Arc::new(Self {
             inventory,
             control,
             control_context,
+            close_wake,
+            #[cfg(test)]
+            progress_wait_hook: Mutex::new(None),
             live_nvme_selected,
         }))
+    }
+
+    /// Rootless unit tests for one directly attached inventory (no host RPCs).
+    #[cfg(test)]
+    pub(crate) fn bench_open_live_fixture(
+        config: NodeConfig,
+        metrics: Arc<Metrics>,
+        configfs: PathBuf,
+    ) -> Result<Arc<Self>, TcpError> {
+        inventory::with_live_target_fixture(configfs, || Self::open(config, metrics))
     }
     pub fn status(&self) -> Result<NodeStatus, TcpError> {
         if self.control_context.poison_pending.load(Ordering::Acquire) {
@@ -776,6 +1059,42 @@ impl StorageNode {
         self.control.finish_live_target_shutdown().map(Some)
     }
 
+    /// The database this node serves (session binding in protocol tests).
+    #[cfg(test)]
+    pub(crate) fn database(&self) -> [u8; 16] {
+        self.control_context.partition.inventory.database
+    }
+
+    /// Database drop: stop routing, close every session and invalidate read
+    /// authority. Irreversible; the host drops the node once sessions exit.
+    pub(crate) fn close_for_drop(&self, generation: u64) -> Result<(), TcpError> {
+        let _gate = self.control_context.live_control_gate.lock();
+        let _lifecycle = self.control_context.lifecycle.lock();
+        let high_water = self.inventory.lock().highest_fenced_generation();
+        if generation < high_water {
+            return Err(TcpError::with_kind(
+                io::ErrorKind::InvalidInput,
+                format!("DropDatabase: stale fencing generation {generation} < {high_water}"),
+            ));
+        }
+        self.control_context.closed.store(true, Ordering::Release);
+        self.control_context.readers.write().invalidate();
+        // Interrupt a parked DurableProgress request of this database.
+        self.close_wake.signal().map_err(TcpError::component)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.control_context.closed.load(Ordering::Acquire)
+    }
+
+    /// Highest fencing generation this owner ever recorded for the database
+    /// (its fence high-water). Zero when never fenced.
+    #[cfg(test)]
+    pub(crate) fn fence_high_water(&self) -> Result<u64, TcpError> {
+        let _lifecycle = self.control_context.lifecycle.lock();
+        Ok(self.inventory.lock().highest_fenced_generation())
+    }
+
     /// Owner-process preparation totals (bytes, nanoseconds, completed files),
     /// including streams replaced by fencing. Not part of the wire protocol.
     pub fn wal_prewrite_stats(&self) -> (u64, u64, u64) {
@@ -787,6 +1106,63 @@ impl StorageNode {
     /// wire protocol.
     pub fn live_inline_export_stats(&self) -> LiveInlineExportStats {
         self.inventory.lock().inline_exports
+    }
+
+    /// Owner-process R1 seal/retirement counters and the grant-path gate
+    /// waits they must not cause. Not part of the wire protocol.
+    pub fn file_maintenance_stats(&self) -> FileMaintenanceStats {
+        self.inventory.lock().file_maintenance
+    }
+
+    /// Start this owner incarnation's ordered R1 evidence stream at
+    /// `<case_output>/capacity/r1-events/owner_O<partition>/<incarnation>.jsonl`.
+    /// Events cover live grants that roll files, durable seals, retirement
+    /// steps and record/connection pins taken from now on. Not wire-visible.
+    pub fn enable_r1_events(
+        &self,
+        config: &crate::distributed::r1_events::R1EventConfig,
+    ) -> Result<(), TcpError> {
+        NodeInventory::enable_r1_events(&self.inventory, config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> NodeConfig {
+        self.inventory.lock().config.clone()
+    }
+
+    /// Write the terminal line and close this owner's stream. A process that
+    /// never calls this leaves an incomplete (`.partial`) stream.
+    pub fn finish_r1_events(&self) -> Result<(), TcpError> {
+        let events = self
+            .inventory
+            .lock()
+            .r1_events
+            .take()
+            .ok_or_else(|| TcpError::new("r1 event stream is not enabled"))?;
+        events.log().finish().map_err(TcpError::component)
+    }
+
+    /// Test-only: revoke one file's live binding (as an eviction or an
+    /// earlier retirement attempt would), emitting no event.
+    #[cfg(test)]
+    pub(crate) fn revoke_file_binding_for_test(
+        &self,
+        generation: u64,
+        start: u64,
+    ) -> Result<usize, TcpError> {
+        NodeInventory::revoke_file_binding_for_test(
+            &self.inventory,
+            &self.control_context.lifecycle,
+            generation,
+            start,
+        )
+    }
+
+    /// Test-only: stop the file preparers after their current step (see
+    /// `ControlOwner::stop_preparers_for_test`). No grant may follow.
+    #[cfg(test)]
+    pub(crate) fn stop_file_preparers_for_test(&self) {
+        self.control.stop_preparers_for_test();
     }
 
     #[cfg(test)]
@@ -891,8 +1267,9 @@ impl StorageNode {
             .map_err(TcpError::component)
     }
 
-    /// Bounded reusable session workers. Shutdown stops acceptance, drains the
-    /// bounded socket queue and joins workers; frame I/O has absolute deadlines.
+    /// Serve this one database directly: protocol tests only. Production
+    /// owners serve through [`OwnerHost::serve`], which routes by database.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn serve(
         self: &Arc<Self>,
         listener: TcpListener,
@@ -901,6 +1278,22 @@ impl StorageNode {
         shutdown: Arc<AtomicBool>,
     ) -> Result<(), TcpError> {
         limits.validate()?;
+        self.validate_limits(limits)?;
+        let node = self.clone();
+        listener::serve_listener(
+            listener,
+            tls,
+            limits,
+            shutdown,
+            Arc::new(move |session, verifier, shutdown, wake| {
+                reactor::serve_session(&node, session, limits, shutdown, wake, verifier, None)
+            }),
+        )
+    }
+
+    /// This database's geometry must fit the transport's frame bound and its
+    /// largest Status reply.
+    pub(crate) fn validate_limits(&self, limits: TcpLimits) -> Result<(), TcpError> {
         if self
             .inventory
             .lock()
@@ -910,199 +1303,43 @@ impl StorageNode {
             .max_encoded_bytes
             > limits.max_frame_bytes.saturating_sub(512)
         {
-            return Err(TcpError::new(
+            return Err(TcpError::with_kind(
+                io::ErrorKind::InvalidInput,
                 "transport frame cannot carry configured complete groups",
             ));
         }
+        // The status no longer grows with retained history; the largest reply
+        // carrying generation data is a full inventory page.
         let mut largest_status = self.status()?;
         largest_status.active_epoch = Some(u64::MAX);
-        largest_status.epochs.resize(
-            largest_status.max_epochs,
-            NodeEpoch {
-                epoch: 1,
-                sealed: true,
-            },
-        );
+        largest_status.highest_fenced_generation = u64::MAX;
+        largest_status.inventory_revision = u64::MAX;
         wire_codec(limits.max_frame_bytes)
             .serialized_size(&reactor::Envelope {
                 protocol: PROTOCOL,
                 id: u64::MAX,
-                body: Response::Status(largest_status),
+                body: Response::Status(StatusReply::Database(largest_status)),
             })
             .map_err(TcpError::component)?;
-        tls.transport.validate()?;
-        let server = tls.server_config()?;
-        let transport = tls.transport;
-        listener.set_nonblocking(true)?;
-        struct ConnectionPermit(Arc<AtomicUsize>);
-        impl Drop for ConnectionPermit {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let connections = Arc::new(AtomicUsize::new(0));
-        let (accepted, sockets) =
-            std::sync::mpsc::sync_channel::<(TcpStream, ConnectionPermit)>(limits.max_connections);
-        let sockets = Arc::new(Mutex::new(sockets));
-        let mut threads: Vec<thread::JoinHandle<()>> = Vec::new();
-        let mut accept_error = None;
-        // This service loop intentionally lives until shutdown. Workers grow
-        // only to the admitted peak, never beyond max_connections. Do not join
-        // individual sessions here: is_finished does not mean OS thread exit
-        // has finished, including io_uring's kernel-task cleanup.
-        while !shutdown.load(Ordering::Acquire) {
-            if threads.iter().any(thread::JoinHandle::is_finished) {
-                accept_error = Some(io::Error::other("session worker exited unexpectedly"));
-                break;
-            }
-            match listener.accept() {
-                Ok((socket, _)) => {
-                    let active = connections.load(Ordering::Acquire);
-                    if active >= limits.max_connections {
-                        drop(socket);
-                        continue;
-                    }
-                    if active >= threads.len() {
-                        let node = self.clone();
-                        let server = server.clone();
-                        let shutdown = shutdown.clone();
-                        let sockets = sockets.clone();
-                        let transport = transport.clone();
-                        match thread::Builder::new()
-                            .name("wal-mtls-session".into())
-                            .spawn(move || {
-                                // The listener closes this bounded channel at
-                                // shutdown. A worker retains one session owner
-                                // at a time and is reused across disconnects.
-                                loop {
-                                    let work = sockets.lock().recv();
-                                    let Ok((socket, _permit)) = work else {
-                                        break;
-                                    };
-                                    if shutdown.load(Ordering::Acquire) {
-                                        continue;
-                                    }
-                                    if let Err(error) = node.connection(
-                                        socket,
-                                        server.clone(),
-                                        limits,
-                                        &shutdown,
-                                        &transport,
-                                    ) {
-                                        eprintln!("storage control connection closed: {error}");
-                                    }
-                                }
-                            }) {
-                            Ok(handle) => threads.push(handle),
-                            Err(error) => {
-                                accept_error = Some(error);
-                                break;
-                            }
-                        }
-                    }
-                    connections.fetch_add(1, Ordering::AcqRel);
-                    if let Err(error) =
-                        accepted.try_send((socket, ConnectionPermit(connections.clone())))
-                    {
-                        accept_error = Some(io::Error::other(format!(
-                            "bounded session queue failed: {error}"
-                        )));
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    // Connection setup is outside steady-state progress. Do
-                    // not spend another CPU polling an idle listener.
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => {
-                    accept_error = Some(error);
-                    break;
-                }
-            }
-        }
-        shutdown.store(true, Ordering::Release);
-        drop(accepted);
-        drop(sockets);
-        for handle in threads {
-            if handle.join().is_err() && accept_error.is_none() {
-                accept_error = Some(io::Error::other("session worker panicked"));
-            }
-        }
-        match accept_error {
-            Some(error) => Err(error.into()),
-            None => Ok(()),
-        }
-    }
-
-    fn connection(
-        self: &Arc<Self>,
-        socket: TcpStream,
-        config: ServerTlsConfig,
-        limits: TcpLimits,
-        shutdown: &AtomicBool,
-        transport: &Transport,
-    ) -> Result<(), TcpError> {
-        let mut io = DeadlineIo::new(socket, limits.io_timeout)?;
-        if transport.is_native() {
-            read_transport_mode(&mut io, transport)?;
-            if !transport.is_fabric() {
-                return reactor::serve_session(
-                    self,
-                    reactor::Session::new_plain(io)?,
-                    limits,
-                    shutdown,
-                    None,
-                );
-            }
-            #[cfg(feature = "experimental-fabric")]
-            {
-                let endpoint = fabric::bootstrap_idle_parking(&mut io, transport)?;
-                io.fabric = Some(endpoint);
-                return reactor::serve_session(
-                    self,
-                    reactor::Session::new_native(io)?,
-                    limits,
-                    shutdown,
-                    None,
-                );
-            }
-            #[cfg(not(feature = "experimental-fabric"))]
-            return Err(TcpError::new("trusted OFI transport was not compiled"));
-        }
-        let server_config = config
-            .config
-            .ok_or_else(|| TcpError::new("TLS transport has no server credentials"))?;
-        let verifier = config
-            .verifier
-            .ok_or_else(|| TcpError::new("TLS transport has no peer verifier"))?;
-        let mut conn = ServerConnection::new(server_config).map_err(TcpError::component)?;
-        conn.set_buffer_limit(Some(reactor::TLS_BUFFER_BYTES));
-        while conn.is_handshaking() {
-            conn.complete_io(&mut io)?;
-        }
-        if conn.alpn_protocol() != Some(transport.alpn().as_slice()) {
-            return Err(TcpError::new("unsupported authenticated protocol"));
-        }
-        let stream = StreamOwned::new(conn, io);
-        #[cfg(feature = "experimental-fabric")]
-        let mut stream = stream;
-        if transport.is_fabric() {
-            #[cfg(feature = "experimental-fabric")]
-            {
-                let endpoint = fabric::bootstrap_idle_parking(&mut stream, transport)?;
-                stream.sock.fabric = Some(endpoint);
-            }
-            #[cfg(not(feature = "experimental-fabric"))]
-            return Err(TcpError::new("OFI transport was not compiled"));
-        }
-        reactor::serve_session(
-            self,
-            reactor::Session::new(stream.conn.into(), stream.sock)?,
-            limits,
-            shutdown,
-            Some(verifier.as_ref()),
-        )
+        wire_codec(limits.max_frame_bytes)
+            .serialized_size(&reactor::Envelope {
+                protocol: PROTOCOL,
+                id: u64::MAX,
+                body: Response::InventoryPage(generation_control::InventoryPageReply {
+                    incarnation: [u8::MAX; 16],
+                    revision: u64::MAX,
+                    entries: vec![
+                        InventoryGeneration {
+                            generation: u64::MAX,
+                            state: OwnerGenerationState::Abandoned,
+                        };
+                        generation_control::page_capacity(limits.max_frame_bytes)
+                    ],
+                    next: Some(u64::MAX),
+                }),
+            })
+            .map_err(TcpError::component)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1170,6 +1407,7 @@ pub struct Client {
     live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
     live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
     live_unreleased_tokens: Vec<(u64, [u8; 16])>,
+    progress_wait: Option<progress_wait::ClientProgressWait>,
 }
 impl Client {
     /// The node's authenticated policy, adopted by ordinary read/control drivers.
@@ -1201,24 +1439,45 @@ impl Client {
         expected: PartitionConfig,
         shape: &KeyShape,
     ) -> Result<Self, TcpError> {
-        Self::connect_shared_with_status(
+        Self::connect_shared_with_progress(
             endpoint,
             tls,
             client_config,
             timeout,
             expected,
             shape,
-            true,
+            None,
         )
     }
-    fn connect_shared_with_status(
+
+    pub(crate) fn connect_progress_shared(
         endpoint: &str,
         tls: &TlsFiles,
         client_config: ClientTlsConfig,
         timeout: Duration,
         expected: PartitionConfig,
         shape: &KeyShape,
-        query_status: bool,
+        stop: Arc<WakeFd>,
+    ) -> Result<Self, TcpError> {
+        Self::connect_shared_with_progress(
+            endpoint,
+            tls,
+            client_config,
+            timeout,
+            expected,
+            shape,
+            Some(stop),
+        )
+    }
+
+    fn connect_shared_with_progress(
+        endpoint: &str,
+        tls: &TlsFiles,
+        client_config: ClientTlsConfig,
+        timeout: Duration,
+        expected: PartitionConfig,
+        shape: &KeyShape,
+        progress: Option<Arc<WakeFd>>,
     ) -> Result<Self, TcpError> {
         let live_pin_recipe = Arc::new(LivePinRecipe::new(
             endpoint,
@@ -1229,74 +1488,18 @@ impl Client {
             shape,
         ));
         expected.validate().map_err(TcpError::component)?;
-        tls.transport.validate()?;
-        if timeout.is_zero() || timeout > Duration::from_secs(300) {
-            return Err(TcpError::new("invalid client timeout"));
-        }
-        let address: SocketAddr = endpoint.parse().map_err(|_| {
-            TcpError::new("endpoint must be numeric IP:port; set TLS server_name separately")
-        })?;
-        let began = Instant::now();
-        let socket = TcpStream::connect_timeout(&address, timeout)?;
-        let connect_ns = elapsed_ns(began);
-        let mut io = DeadlineIo::new(socket, timeout)?;
-        let setup_started = Instant::now();
-        if tls.transport.is_native() {
-            write_transport_mode(&mut io, &tls.transport)?;
-        }
-        let (session, tls_ns, fabric_ns) = if tls.transport.is_native() {
-            if !tls.transport.is_fabric() {
-                (reactor::Session::new_plain(io)?, 0, None)
-            } else {
-                #[cfg(feature = "experimental-fabric")]
-                {
-                    let endpoint = fabric::bootstrap(&mut io, &tls.transport)?;
-                    io.fabric = Some(endpoint);
-                    let fabric_ns = Some(elapsed_ns(setup_started));
-                    (reactor::Session::new_native(io)?, 0, fabric_ns)
-                }
-                #[cfg(not(feature = "experimental-fabric"))]
-                {
-                    return Err(TcpError::new("trusted OFI transport was not compiled"));
-                }
-            }
-        } else {
-            let name =
-                ServerName::try_from(tls.server_name.clone()).map_err(TcpError::component)?;
-            let client_tls_config = client_config
-                .config
-                .ok_or_else(|| TcpError::new("TLS transport has no client credentials"))?;
-            let mut conn =
-                ClientConnection::new(client_tls_config, name).map_err(TcpError::component)?;
-            conn.set_buffer_limit(Some(reactor::TLS_BUFFER_BYTES));
-            while conn.is_handshaking() {
-                conn.complete_io(&mut io)?;
-            }
-            let tls_ns = elapsed_ns(setup_started);
-            if conn.alpn_protocol() != Some(tls.transport.alpn().as_slice()) {
-                return Err(TcpError::new(
-                    "required authenticated transport was not negotiated",
-                ));
-            }
-            let stream = StreamOwned::new(conn, io);
-            #[cfg(feature = "experimental-fabric")]
-            let mut stream = stream;
-            #[cfg(feature = "experimental-fabric")]
-            let fabric_ns = if tls.transport.is_fabric() {
-                let began = Instant::now();
-                stream.sock.fabric = Some(fabric::bootstrap(&mut stream, &tls.transport)?);
-                Some(elapsed_ns(began))
-            } else {
-                None
-            };
-            #[cfg(not(feature = "experimental-fabric"))]
-            let fabric_ns = None;
-            (
-                reactor::Session::new(stream.conn.into(), stream.sock)?,
-                tls_ns,
-                fabric_ns,
-            )
-        };
+        let listener::ClientSession {
+            session,
+            connect_ns,
+            tls_ns,
+            fabric_ns,
+        } = listener::open_client_session(
+            endpoint,
+            tls,
+            client_config,
+            timeout,
+            progress.is_some(),
+        )?;
         let shape = shape.clone();
         let mut client = Self {
             stream: session,
@@ -1332,12 +1535,11 @@ impl Client {
             live_counters: None,
             live_metrics: None,
             live_unreleased_tokens: Vec::new(),
+            progress_wait: progress.map(progress_wait::ClientProgressWait::new),
         };
-        if query_status {
-            let began = Instant::now();
-            client.connected_status = Some(client.status()?);
-            client.connect_profile.status_ns = elapsed_ns(began);
-        }
+        let began = Instant::now();
+        client.connected_status = Some(client.status()?);
+        client.connect_profile.status_ns = elapsed_ns(began);
         #[cfg(feature = "experimental-fabric")]
         {
             // Provider setup may defer bounded resources until its first CQ
@@ -1638,12 +1840,6 @@ impl Client {
                 ),
             );
         }
-        if !(1..=1024).contains(&status.max_epochs) {
-            return self.wrong_response(
-                request,
-                format_args!("max_epochs={}; expected 1..=1024", status.max_epochs),
-            );
-        }
         if !(1024..=HARD_FRAME_LIMIT).contains(&status.max_frame_bytes) {
             return self.wrong_response(
                 request,
@@ -1668,39 +1864,16 @@ impl Client {
                 ),
             );
         }
-        if status.epochs.len() > status.max_epochs {
-            return self.wrong_response(
-                request,
-                format_args!(
-                    "epochs.len()={} exceeds max_epochs={}",
-                    status.epochs.len(),
-                    status.max_epochs
-                ),
-            );
-        }
-        if status.epochs.iter().any(|e| e.epoch == 0) {
-            return self.wrong_response(request, "epochs contains epoch zero");
-        }
-        if status.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch) {
-            return self.wrong_response(request, "epochs are not strictly increasing");
-        }
-        if status.epochs.iter().filter(|e| !e.sealed).count()
-            != usize::from(status.active_epoch.is_some())
+        // An active generation is always the owner high-water.
+        if status
+            .active_epoch
+            .is_some_and(|epoch| epoch == 0 || epoch != status.highest_fenced_generation)
         {
-            return self.wrong_response(request, "unsealed epoch count differs from active_epoch");
-        }
-        if status.active_epoch.is_some_and(|epoch| {
-            status.epochs.last()
-                != Some(&NodeEpoch {
-                    epoch,
-                    sealed: false,
-                })
-        }) {
             return self.wrong_response(
                 request,
                 format_args!(
-                    "active_epoch={:?} is not the last unsealed epoch",
-                    status.active_epoch
+                    "active_epoch={:?} is not the owner high-water {}",
+                    status.active_epoch, status.highest_fenced_generation
                 ),
             );
         }
@@ -1711,21 +1884,26 @@ impl Client {
         Ok(status)
     }
     pub fn status(&mut self) -> Result<NodeStatus, TcpError> {
-        match self.request(Request::Status { protocol: PROTOCOL })? {
-            Response::Status(status) => self.check_status("Status", status),
-            response => self.wrong_variant("Status", &response, "Status"),
+        match self.request(Request::Status {
+            protocol: PROTOCOL,
+            database: Some(self.expected.inventory.database),
+        })? {
+            Response::Status(StatusReply::Database(status)) => self.check_status("Status", status),
+            response => self.wrong_variant("Status", &response, "Status(Database)"),
         }
     }
     pub fn fence_to(&mut self, epoch: u64) -> Result<NodeStatus, TcpError> {
         match self.request(Request::Fence { epoch })? {
-            Response::Status(status) if status.active_epoch == Some(epoch) => {
+            Response::Status(StatusReply::Database(status))
+                if status.active_epoch == Some(epoch) =>
+            {
                 self.check_status("Fence", status)
             }
-            Response::Status(status) => self.wrong_response(
+            Response::Status(StatusReply::Database(status)) => self.wrong_response(
                 "Fence",
                 format_args!("active_epoch={:?}, expected {epoch}", status.active_epoch),
             ),
-            response => self.wrong_variant("Fence", &response, "Status"),
+            response => self.wrong_variant("Fence", &response, "Status(Database)"),
         }
     }
     fn check_receipt(

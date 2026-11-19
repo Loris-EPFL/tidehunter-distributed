@@ -4,10 +4,15 @@
 //! owner never waits for a single append before accepting another batch. Like
 //! `FoundationDB` §§2.3–2.6, read cuts and durable ordered publication remain
 //! separate from scheduling. This RF1 path still requires synced WAL receipts.
+use super::checkpoint_attribution::{TailCount, diagnostics_clock_ns};
 #[allow(clippy::wildcard_imports)]
 // Private implementation shares its parent's internal types.
 use super::*;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+mod hard_wait;
+mod index_attribution;
+pub use hard_wait::{HardWaitSnapshot, WaitReasonTotals};
 
 #[derive(Default)]
 struct CheckpointBudget {
@@ -37,6 +42,10 @@ struct WriteBudget {
     waiters: VecDeque<Arc<AdmissionWaiter>>,
     live_waiters: usize,
     checkpoint: CheckpointBudget,
+    /// Granted replay-tail high-water marks, updated at each charge.
+    peak_replay_batches: usize,
+    peak_replay_bytes: usize,
+    hard_wait: hard_wait::HardWaitTracker,
     /// Test-only lower identity bound, applied inside the grant predicate.
     #[cfg(test)]
     identity_limit: Option<usize>,
@@ -167,6 +176,8 @@ struct WaitingReservation<'a> {
     admission: &'a Admission,
     waiter: Arc<AdmissionWaiter>,
     claimed: bool,
+    /// Blocking reasons, ended under the budget mutex at claim or drop.
+    wait: hard_wait::WaiterWait,
 }
 
 impl Drop for WaitingReservation<'_> {
@@ -175,6 +186,9 @@ impl Drop for WaitingReservation<'_> {
             return;
         }
         let mut budget = self.admission.budget.lock();
+        budget
+            .hard_wait
+            .set(&mut self.wait, 0, diagnostics_clock_ns());
         if let Some(position) = budget
             .waiters
             .iter()
@@ -201,16 +215,19 @@ fn wake_granted(granted: SmallVec<[Arc<AdmissionWaiter>; 4]>) {
 impl Admission {
     pub(super) fn for_open(database: &super::write_core::core::OpenState) -> Arc<Self> {
         // This is the exact fixed-width checkpoint_metadata_fits inequality,
-        // solved once at open rather than recomputed on every FIFO grant.
+        // solved once at open rather than recomputed on every FIFO grant. The
+        // streams are the actual retained (owner, generation) pairs; open-time
+        // trims only shrink them, and no generation is added while serving.
+        let streams: usize = database
+            .publisher
+            .retained_epochs
+            .iter()
+            .map(Vec::len)
+            .sum();
         let metadata_identities = MAX_CHECKPOINT_METADATA_BYTES
             .checked_sub(1024 * 1024)
             .map(|bytes| bytes / 128)
-            .and_then(|entries| {
-                entries.checked_sub(
-                    (database.config.endpoints.len() as u64)
-                        .checked_mul(database.config.storage.max_epochs as u64)?,
-                )
-            })
+            .and_then(|entries| entries.checked_sub(u64::try_from(streams).ok()?))
             .and_then(|entries| usize::try_from(entries).ok())
             .unwrap_or(0);
         let max_identities = if metadata_identities >= WAL_REPLAY_WINDOW_BATCHES {
@@ -308,10 +325,32 @@ impl Admission {
         }
     }
 
+    /// Granted checkpoint charge and the granted replay-tail high-water mark.
+    pub(super) fn checkpoint_charge_and_peak(&self) -> (CheckpointPressureSnapshot, TailCount) {
+        let budget = self.budget.lock();
+        let current = CheckpointPressureSnapshot {
+            identities: budget.checkpoint.identities,
+            replay_batches: budget.checkpoint.replay_batches,
+            replay_bytes: budget.checkpoint.replay_bytes,
+        };
+        let peak = TailCount::new(
+            budget.peak_replay_batches.max(current.replay_batches),
+            budget.peak_replay_bytes.max(current.replay_bytes),
+        );
+        (current, peak)
+    }
+
+    pub(super) fn hard_wait_snapshot(&self) -> HardWaitSnapshot {
+        let now = diagnostics_clock_ns();
+        self.budget.lock().hard_wait.snapshot(now)
+    }
+
+    /// Returns the granted replay tail immediately before and after the release,
+    /// both observed under this mutation's own lock.
     pub(super) fn release_checkpoint(
         &self,
         released: super::write_core::core::CheckpointCredits,
-    ) -> Result<(), LocalDbError> {
+    ) -> Result<(TailCount, TailCount), LocalDbError> {
         let mut budget = self.budget.lock();
         let current = &mut budget.checkpoint;
         if released.identities > current.identities
@@ -322,10 +361,14 @@ impl Admission {
                 "checkpoint credit release exceeds admission charge",
             ));
         }
+        let before = TailCount::new(current.replay_batches, current.replay_bytes);
         current.identities -= released.identities;
         current.replay_batches -= released.replay_batches;
         current.replay_bytes -= released.replay_bytes;
-        Ok(())
+        Ok((
+            before,
+            TailCount::new(current.replay_batches, current.replay_bytes),
+        ))
     }
 
     /// Publication converts reserved index bytes into native-index charges.
@@ -369,6 +412,41 @@ impl Admission {
         drop(budget);
         wake_granted(granted);
         Ok(())
+    }
+
+    /// Nonblocking secondary index reservation for the masks of one
+    /// `DropCells` slot, taken after allocation and before any WAL byte. The
+    /// slot's metadata charge then includes it, so publication or a pre-READY
+    /// abort returns it through `release_publication`. A full budget rejects:
+    /// the caller aborts the slot instead of waiting with a barrier held.
+    pub(in crate::distributed::remote_db) fn reserve_index_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<(), LocalDbError> {
+        let mut budget = self.budget.lock();
+        if budget.closed {
+            return Err(self.closed_error());
+        }
+        budget.index_bytes = budget
+            .index_bytes
+            .checked_add(bytes)
+            .filter(|total| self.index.check_capacity(*total).is_ok())
+            .ok_or_else(|| LocalDbError::new("DropCells exceeds index metadata capacity"))?;
+        Ok(())
+    }
+
+    /// Return bytes taken by `reserve_index_bytes` outside publication: the
+    /// prune-mark reservation of a checkpoint image, after live install (the
+    /// index then charges the marks) or when the image is abandoned.
+    pub(in crate::distributed::remote_db) fn release_index_bytes(&self, bytes: usize) {
+        let mut budget = self.budget.lock();
+        budget.index_bytes = budget
+            .index_bytes
+            .checked_sub(bytes)
+            .expect("index reservation release exceeds its charge");
+        let granted = self.grant_waiters(&mut budget);
+        drop(budget);
+        wake_granted(granted);
     }
 
     pub(super) fn return_slots(&self, count: usize) -> Result<(), LocalDbError> {
@@ -447,29 +525,7 @@ impl Admission {
         grant: &WriteGrant,
     ) -> Option<CheckpointPressure> {
         let tail = &budget.checkpoint;
-        #[cfg(test)]
-        let max_identities = budget
-            .identity_limit
-            .map_or(self.max_identities, |limit| limit.min(self.max_identities));
-        #[cfg(not(test))]
-        let max_identities = self.max_identities;
-        // WAL replay has no hard tail bound, as the native engine has none:
-        // the replay charges are counted only for checkpoint_due and release.
-        let reason = if tail
-            .identities
-            .checked_add(grant.identities)
-            .is_none_or(|n| n > max_identities)
-        {
-            "identity"
-        } else if budget
-            .index_bytes
-            .checked_add(grant.index_bytes)
-            .is_none_or(|n| self.index.check_capacity(n).is_err())
-        {
-            "index"
-        } else {
-            return None;
-        };
+        let reason = self.checkpoint_block(budget, grant, false).0?;
         Some(CheckpointPressure {
             reason,
             batches: tail.replay_batches,
@@ -478,6 +534,55 @@ impl Admission {
             max_encoded_bytes: usize::MAX,
             incoming_encoded_bytes: Some(grant.replay_bytes),
         })
+    }
+
+    /// The first blocking checkpoint dimension, in priority order, and the
+    /// wait bits of the dimensions evaluated. `all` evaluates every dimension
+    /// (waiting path); otherwise evaluation stops at the first block.
+    fn checkpoint_block(
+        &self,
+        budget: &WriteBudget,
+        grant: &WriteGrant,
+        all: bool,
+    ) -> (Option<&'static str>, u8) {
+        let tail = &budget.checkpoint;
+        #[cfg(test)]
+        let max_identities = budget
+            .identity_limit
+            .map_or(self.max_identities, |limit| limit.min(self.max_identities));
+        #[cfg(not(test))]
+        let max_identities = self.max_identities;
+        // WAL replay deliberately has no hard tail bound.
+        let identity = tail
+            .identities
+            .checked_add(grant.identities)
+            .is_none_or(|n| n > max_identities);
+        if identity && !all {
+            return (Some("identity"), hard_wait::WAIT_IDENTITY);
+        }
+        let index = budget
+            .index_bytes
+            .checked_add(grant.index_bytes)
+            .is_none_or(|n| self.index.check_capacity(n).is_err());
+        let first = if identity {
+            Some("identity")
+        } else {
+            index.then_some("index")
+        };
+        let bits = (if identity {
+            hard_wait::WAIT_IDENTITY
+        } else {
+            0
+        }) | (if index { hard_wait::WAIT_INDEX } else { 0 });
+        (first, bits)
+    }
+
+    /// Wait bits of a queued grant: its checkpoint dimensions, or `other`.
+    fn wait_bits(&self, budget: &WriteBudget, grant: &WriteGrant) -> u8 {
+        match self.checkpoint_block(budget, grant, true).1 {
+            0 => hard_wait::WAIT_OTHER,
+            bits => bits,
+        }
     }
 
     /// Lower the identity (checkpoint receipt metadata) bound for a test,
@@ -502,6 +607,10 @@ impl Admission {
         }
         budget.peak_requests = budget.peak_requests.max(budget.requests);
         budget.peak_bytes = budget.peak_bytes.max(budget.bytes);
+        budget.peak_replay_batches = budget
+            .peak_replay_batches
+            .max(budget.checkpoint.replay_batches);
+        budget.peak_replay_bytes = budget.peak_replay_bytes.max(budget.checkpoint.replay_bytes);
     }
 
     fn resources_owned(budget: &WriteBudget, grant: &WriteGrant) -> bool {
@@ -600,11 +709,17 @@ impl Admission {
         budget.live_waiters += 1;
         budget.waiters.push_back(waiter.clone());
         debug_assert!(budget.waiters.len() <= budget.live_waiters);
-        WaitingReservation {
+        let mut reservation = WaitingReservation {
             admission: self,
             waiter,
             claimed: false,
-        }
+            wait: hard_wait::WaiterWait::default(),
+        };
+        let bits = self.wait_bits(budget, &reservation.waiter.grant);
+        budget
+            .hard_wait
+            .set(&mut reservation.wait, bits, diagnostics_clock_ns());
+        reservation
     }
 
     #[cfg(test)]
@@ -681,6 +796,9 @@ impl Admission {
                 WAITER_GRANTED => {
                     healthy()?;
                     let mut budget = self.budget.lock();
+                    budget
+                        .hard_wait
+                        .set(&mut waiting.wait, 0, diagnostics_clock_ns());
                     if budget.closed {
                         return Err(self.closed_error());
                     }
@@ -702,7 +820,11 @@ impl Admission {
                         return Err(LocalDbError::new("write admission deadline expired"));
                     }
                     let pressure = {
-                        let budget = self.budget.lock();
+                        let mut budget = self.budget.lock();
+                        let bits = self.wait_bits(&budget, &waiting.waiter.grant);
+                        budget
+                            .hard_wait
+                            .set(&mut waiting.wait, bits, diagnostics_clock_ns());
                         self.checkpoint_pressure_for(&budget, &waiting.waiter.grant)
                     };
                     if let Some(pressure) = pressure {
@@ -845,6 +967,26 @@ impl ConcurrentRemoteDatabase {
         &self,
     ) -> Result<crate::distributed::storage::PartitionStats, LocalDbError> {
         self.database.storage_stats()
+    }
+
+    /// The provisioned database identity of the wrapped authority.
+    pub fn database_id(&self) -> [u8; 16] {
+        self.database.database_id()
+    }
+
+    /// Owner persistence counters of each owner, in endpoint order.
+    pub fn storage_stats_by_partition(
+        &self,
+    ) -> Result<Vec<(u32, crate::distributed::storage::PartitionStats)>, LocalDbError> {
+        self.database.storage_stats_by_partition()
+    }
+
+    /// Upper mutation version of the published cut (the logical frontier);
+    /// `None` before the first publication. Benchmark observation only.
+    pub fn published_frontier(
+        &self,
+    ) -> Result<Option<crate::distributed::types::MutationVersion>, LocalDbError> {
+        Ok(self.published_cut()?.upper())
     }
 
     pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
@@ -1052,6 +1194,11 @@ impl ConcurrentRemoteDatabase {
         self.database.core.ensure_healthy()
     }
 
+    /// The shared write core, for maintenance passes in sibling modules.
+    pub(super) fn write_core(&self) -> &Arc<super::write_core::core::WriteCore> {
+        &self.database.core
+    }
+
     pub(super) fn poison(&self, cause: &LocalDbError) {
         // One fail-stop path: records the exact cause, closes Admission,
         // resolves every unresolved slot as unknown and wakes owner workers.
@@ -1074,15 +1221,6 @@ impl ConcurrentRemoteDatabase {
     pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
         self.ensure_healthy()?;
         let cut = self.index.latest_cut().map_err(LocalDbError::component)?;
-        self.ensure_healthy()?;
-        Ok(cut)
-    }
-
-    /// Like [`Self::published_cut`] without the owner charge. Hold the cut
-    /// only until the calling API returns (see `StandingViewBudget`).
-    pub(crate) fn call_published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
-        self.ensure_healthy()?;
-        let cut = self.index.call_cut();
         self.ensure_healthy()?;
         Ok(cut)
     }
@@ -1184,25 +1322,6 @@ impl ConcurrentRemoteDatabase {
         result
     }
 
-    pub(crate) fn relocation_history(
-        &self,
-        ks: KeySpace,
-        cut: IndexReadCut,
-    ) -> Result<super::super::native_index::NativeIndexHistory, LocalDbError> {
-        self.ensure_healthy()?;
-        self.index
-            .relocation_history(ks, cut)
-            .map_err(LocalDbError::component)
-    }
-
-    pub(crate) fn next_relocation_record(
-        &self,
-        history: &mut super::super::native_index::NativeIndexHistory,
-    ) -> Result<Option<(Bytes, ValueRecordReference)>, LocalDbError> {
-        self.ensure_healthy()?;
-        Ok(history.next(&self.index))
-    }
-
     /// Submit one complete batch and wait for synced, ordered publication.
     ///
     /// # Errors
@@ -1234,17 +1353,66 @@ impl ConcurrentRemoteDatabase {
         self.database.core.write(operation, mutations, sample)
     }
 
+    /// Commit one singleton `DropCells` batch over the inclusive reduced-cell
+    /// range and wait for its ordered publication. One WAL batch whatever the
+    /// number of keys or cells; the caller validates the endpoints first.
+    ///
+    /// # Errors
+    /// Returns validation, capacity, storage or publication errors. After an
+    /// unknown owner completion the error carries the uncertain version.
+    pub(crate) fn drop_cells(
+        &self,
+        operation: [u8; 16],
+        keyspace: crate::key_shape::KeySpace,
+        first_cell: crate::cell::CellId,
+        last_cell: crate::cell::CellId,
+    ) -> Result<BatchVersion, LocalDbError> {
+        self.database.core.write_drop_cells(
+            operation,
+            Mutation::DropCells {
+                keyspace,
+                first_cell,
+                last_cell,
+            },
+        )
+    }
+
     /// # Errors
     /// Returns authority, owner, or checkpoint persistence errors.
     pub fn flush_index(&self) -> Result<(), LocalDbError> {
         self.database.core.flush_index()
     }
 
+    /// Named index rebuild: the leased equivalent of native
+    /// `force_rebuild_control_region`. Returns after one Exact generation that
+    /// covers every write allocated before the call has evaluated every dirty
+    /// compactor cell and is durably adopted and live-installed. Takes no
+    /// write gate; later writes proceed.
+    ///
+    /// # Errors
+    /// `Busy` while another named force runs; `DeadlineExpired` withdraws the
+    /// force if no capture has taken it, otherwise drops only the waiter;
+    /// `Failed` carries the checkpoint or authority error.
+    pub fn force_rebuild_index(&self) -> Result<super::IndexForceReport, super::IndexForceError> {
+        self.database.core.force_rebuild_index()
+    }
+
+    #[cfg(test)]
     /// Persist a Stop-aware floor and reclaim wholly unreachable sealed files.
     /// Live retirement can return a non-fatal busy error while a read is held;
     /// finish or drop the read and retry without reopening the authority.
     pub(crate) fn retire_history_before(&self, floor: IndexReadCut) -> Result<(), LocalDbError> {
         self.database.core.retire_history_before(floor)
+    }
+
+    /// Enable R0 shadow capacity observation (read-only; suppresses physical
+    /// retirement until the observer finishes). One observer per database.
+    pub fn start_capacity_observer(
+        &self,
+        config: crate::distributed::capacity::CapacityObserverConfig,
+        sink: Box<dyn crate::distributed::capacity::R0Sink>,
+    ) -> Result<super::CapacityObserver, crate::distributed::capacity::R0Error> {
+        super::CapacityObserver::start(&self.database.core, config, sink)
     }
 
     pub fn read_cache_stats(&self) -> ReadCacheStats {
@@ -1427,12 +1595,16 @@ impl ConcurrentRemoteDatabase {
     pub fn read_admission_generation(&self) -> u64 {
         self.reads.admission_generation()
     }
+    /// Wait for read credit to change after `observed`. Ordinary reads pass
+    /// `None`: like a native read, load alone never fails them (see
+    /// `ReadService::wait_admission`).
+    ///
     /// # Errors
-    /// Returns an absolute admission deadline, failure, or closed-owner error.
+    /// Returns an expired explicit deadline, failure, or closed-owner error.
     pub fn wait_read_admission(
         &self,
         observed: u64,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
         self.reads.wait_admission(observed, deadline)?;

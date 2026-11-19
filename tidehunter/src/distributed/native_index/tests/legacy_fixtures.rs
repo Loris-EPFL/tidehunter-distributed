@@ -1,6 +1,8 @@
-//! Frozen exact-mode index root 4 fixtures. The bytes were produced by the
-//! encoder before the buffered cell encoder (base revision e3b920d). Exact
-//! mode must keep writing them byte for byte and keep reading them.
+//! Frozen exact-mode index root fixtures. The root 4 bytes were produced by
+//! the encoder before the buffered cell encoder (base revision e3b920d) and
+//! stay readable. The writer now produces root 5 only: the same payload with
+//! format 5 and an empty `DropCells` mask section (`be_u32` 0) appended, in a
+//! fresh CRC frame. The cell containers are unchanged byte for byte.
 
 use super::*;
 
@@ -63,15 +65,24 @@ pub(super) fn build_fixture_index(dir: &Path) -> (NativeIndex, PartitionLog) {
     (index, log)
 }
 
+/// The pinned root 5 encoding of a frozen root 4 file without masks.
+fn root_5(root_4: &[u8]) -> Vec<u8> {
+    let mut payload = CrcFrame::read_from_slice(root_4, 0).unwrap().to_vec();
+    assert_eq!(payload[8..10], PREVIOUS_FORMAT.to_be_bytes());
+    payload[8..10].copy_from_slice(&FORMAT.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    CrcFrame::new(&payload).as_ref().to_vec()
+}
+
 #[test]
-fn exact_mode_writes_the_frozen_root_4_bytes() {
-    let temp = tempdir::TempDir::new("native-legacy-root4").unwrap();
+fn exact_mode_writes_the_pinned_root_5_bytes() {
+    let temp = tempdir::TempDir::new("native-legacy-root5").unwrap();
     let (index, _log) = build_fixture_index(temp.path());
     for (name, frozen) in [
-        ("index-1-1.snapshot", ROOT_1),
-        ("index-1-1.snapshot.cells", CELLS_1),
-        ("index-1-2.snapshot", ROOT_2),
-        ("index-1-2.snapshot.cells", CELLS_2),
+        ("index-1-1.snapshot", root_5(ROOT_1)),
+        ("index-1-1.snapshot.cells", CELLS_1.to_vec()),
+        ("index-1-2.snapshot", root_5(ROOT_2)),
+        ("index-1-2.snapshot.cells", CELLS_2.to_vec()),
     ] {
         assert_eq!(
             std::fs::read(temp.path().join(name)).unwrap(),

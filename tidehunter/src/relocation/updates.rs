@@ -41,6 +41,11 @@ impl RelocationUpdates {
         }
     }
 
+    /// Reduced keys of the updates, in insertion order.
+    pub(crate) fn reduced_keys(&self) -> impl Iterator<Item = &Bytes> {
+        self.updates.iter().map(|update| &update.reduced_key)
+    }
+
     pub fn last_processed(&self) -> u64 {
         self.last_processed
     }

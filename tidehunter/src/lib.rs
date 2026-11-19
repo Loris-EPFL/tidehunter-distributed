@@ -53,6 +53,11 @@ pub use minibytes;
 
 pub use index::index_table::IndexWalPosition;
 pub use relocation::{Decision, RelocationStrategy, compute_target_position_from_ratio};
+#[cfg(feature = "test_methods")]
+pub use relocation::{
+    RelocationCallback, RelocationGate, RelocationObservation, RelocationStreamId,
+    RelocationTestError, RelocationWorkerWitness, StreamObservation,
+};
 
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub use cell::CellId;

@@ -254,23 +254,18 @@ establish a hardware data path. Software OFI correctness does not qualify
 hardware or performance. Exercised local checks and explicit hardware limits
 are recorded in the [27 October fabric qualification](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026).
 
-Every distributed adapter accepts the existing `external_remote_config` object plus an `external_owner_read_config` array. The latter is required for external owners and must have exactly one entry for every configured partition:
-
-```json
-{
-  "partition": 0,
-  "read_workers": 2,
-  "wal_member_read": "async",
-  "read_resident_first": false,
-  "read_memory_allowance_bytes": 536870912,
-  "read_max_inflight_requests": 32,
-  "read_max_inflight_bytes": 67108864,
-  "read_max_device_reads": 128
-}
-```
+Distributed adapters require `external_remote_config` with `live_nvme`, except
+on Linux builds with `test-utils`: `tidehunter_tcp_trusted` can omit it to
+launch supervised loopback OwnerHosts on ordinary files. Reopening reuses
+the saved fixture endpoints and rejects changed fixture settings. This route
+does not qualify kernel NVMe-oF or a fleet run.
+The owner launch describes an `OwnerHost` and has no database ID, shape or WAL
+geometry. The coordinator supplies those on first open. Subsequent opens of
+the same authority recover its provisioned identity; dropping it removes
+owner state before the path can provision a new identity.
 
 The coordinator's `external_remote_config` serializes its engine `Transport`
-under its `tls` settings; each owner's generated `NodeConfig` serializes its
+under its `tls` settings; each owner's launch serializes its
 own selected `Transport`. Prep input `owner_transports` supplies the per-owner
 transport vector and its selectors for generated launch/config metadata; it is
 not a field added to `RemoteDatabaseConfig`. Client and owner provider/security
@@ -302,25 +297,18 @@ Use the built binary's pure prep mode to generate engine-native external configs
 kv-research --prepare-external-case input.json --output FRESH_DIR
 ```
 
-`input.json` has the required fields: absolute `guest_root`; five unique
-`addresses` as `IPv4:port`/`[IPv6]:port`; canonical `transport` as a structured
-engine `Transport`; optional `owner_transports` for per-owner selectors;
-positive `max_batches_per_partition`, `max_admitted_batches`, and
-`max_index_bytes`; nonnegative `coordinator_cache_bytes`; positive
-`owner_read_workers` and `owner_read_memory_allowance_bytes`;
-`owner_wal_member_read` (`async`, `mapped`, or `positional`); optional
-`owner_read_resident_first` (default `true`) enables Linux page-cache NOWAIT with
-async reads; set it explicitly to `false` for `mapped`, `positional`, or forced
-async controls;
-and `polling` (`adaptive` or `busy`). The helper fixes the keyshape at 16 mutexes
-× 64 cells and writes `node-{0..4}/launch.yaml`, `remote.yaml`, `remote.json`,
-`shape.yaml`, generated `tls/` material when TLS is selected, and
-`external_owner_read_config.json` extracted from each actual launch file. Owner
-limits remain as configured by the prep helper. Each launch states
-`wal_prewrite: false` explicitly (the legacy harness behaviour; an owner reads
-an absent key as on). The cloud and local harnesses rebind it to the case's
-`owner_wal_prewrite` before starting the owner. A pre-existing output
-directory is rejected. The signing key stays in the generated
+`input.json` specifies an absolute `guest_root`, one, two, four, five, or sixteen
+unique `addresses` as `IPv4:port`/`[IPv6]:port`, a structured engine `transport`,
+optional `owner_transports`, and the required `live_nvmeof` settings below.
+Set positive `max_batches_per_partition`, `max_admitted_batches` and
+`max_index_bytes`, a nonnegative `coordinator_cache_bytes`, an
+`owner_wal_member_read` policy (`async`, `mapped` or `positional`), and
+`polling` (`adaptive` or `busy`). The default synthetic keyshape has 16 mutexes
+× 64 cells. The helper writes `node-*/launch.yaml`, `remote.yaml`, `remote.json`,
+`shape.yaml`, and generated TLS material when TLS is selected. Each launch
+sets `host.wal_prewrite: false`; the cloud and local harnesses can set it from
+`owner_wal_prewrite` before starting the owner. A pre-existing output directory
+is rejected. The signing key stays in the generated
 coordinator-side TLS tree; stage each node's launch config and required CA
 certificate/server leaf certificate+key to that owner, never the CA signing
 key. The coordinator uses `remote.json` credentials.
@@ -363,9 +351,13 @@ scalar writes/deletes, atomic batches and mixed workloads. Historical sealed
 controls carry the explicit `sealed_read` route and remain separate populations.
 See [live WAL architecture and source map](../../experiments/nvmeof/LIVE_WAL.md).
 
-The external preparation CLI accepts one, two or five owners and a
-`live_nvmeof` target configuration. It emits the exact owner target settings
-and persistent initiator NQN/UUID into the generated remote configuration.
+External preparation accepts one, two, four, five, or sixteen owners. In
+`live_nvmeof`, `port_id` and `service` are the public pool bases for owner 0.
+`max_databases` is optional (default 1, valid range 1–16). With `M` slots per
+owner, owner `p` gets `M` public slots starting at `base + 2*p*M`, followed
+by `M` private commissioning slots. These ranges apply to both port IDs and
+services. Launch files contain `host.live_target_pool`, not a per-database
+target. The coordinator provisions database and effective target identities.
 Selected RDMA requires the actual Linux NVMe/RDMA initiator; there is no TCP payload fallback.
 Private loopback TCP commissioning is a target-control prerequisite, not the
 selected payload route.
@@ -476,22 +468,17 @@ barrier. It syncs the same registered Value-WAL files and directory. A failed sy
 all waiters and later calls; there is no retry. This is an adapter change, not an engine
 change. See `NATIVE.md` for group-size metrics and the limits of this comparison.
 
-The tier is applied inside each owner process: the launch file carries `durability` (omitted
-means `native`; fields `tier`, optional `max_unsynced_age_ms`) and a fresh `launch_nonce`. The
-process calls `StorageNode::set_durability` before it listens, then writes a receipt to
-`<ready_file>.durability.json` (temporary file, fsync, rename, directory fsync) before the ready
-file. The receipt names the owner (`partition`, `database`, bound `address`), the process (`pid`,
-`boot_id`, `started_unix_ns`), the launch (`launch_nonce`) and its `durability` with an explicit
-`tier` and `max_unsynced_age_ms` (`null` allowed, absent rejected); an incomplete receipt is never
-read as native. A local cluster checks each receipt against its launch and request after every
-start and restart. An external topology (`external_remote_config`) lists one receipt file per
-owner in `external_owner_durability_receipts`; the adapter pairs a receipt with a partition by the
-partition it names, and accepts it only if its database, endpoint address, nonce (non-empty) and
-tier match, so one receipt cannot confirm several partitions. After an owner restart the
-orchestrator replaces each copy with the restarted process's own later receipt. A missing list,
-file or mismatch fails the open. `prepare` input accepts `durability_tier`. The adapter receipt
-`configuration.durability` lists every owner receipt, the receipt label (`appended` for `native`,
-`synced` for `synchronous`) and the comparison cohort.
+For external topology, the OwnerHost launch carries the tier and a fresh `launch_nonce`.
+The owner publishes `<ready_file>.durability.json` before readiness. It names the
+partition, bound address, process (`pid`, `boot_id`, `started_unix_ns`), launch
+nonce and durability policy. It does not name a database: the coordinator
+provisions the database and verifies its tier on open.
+`external_owner_durability_receipts` must provide one startup receipt per
+partition with the matching endpoint and tier. Replace the receipt whenever an
+owner process restarts. A missing list, unreadable file or mismatch fails open.
+The adapter records the tier and comparison cohort in `configuration.durability`.
+The ordinary-file route instead keeps its fixture startup and shutdown records
+under the case evidence directory; those records are not kernel qualification.
 
 ## Measurement gate for external cold-state capture
 

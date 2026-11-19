@@ -18,6 +18,10 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Handles of retired files removed by `DetachRetiredFiles`, or the refusal.
+#[cfg(feature = "experimental-distributed")]
+pub(crate) type DetachReply = std::io::Result<Vec<(WalFileId, Arc<File>)>>;
+
 pub(crate) enum WalMapperMessage {
     MapFinalized(MapId),
     MinWalPositionUpdated(u64, mpsc::SyncSender<()>),
@@ -31,6 +35,10 @@ pub(crate) enum WalMapperMessage {
         mpsc::Receiver<()>,
         mpsc::SyncSender<()>,
     ),
+    /// Remove retired distributed files from the maps and the file registry
+    /// and return their handles; no I/O. The caller unlinks and syncs.
+    #[cfg(feature = "experimental-distributed")]
+    DetachRetiredFiles(Vec<WalFileId>, mpsc::SyncSender<DetachReply>),
 }
 
 pub(crate) struct WalMapper {
@@ -70,6 +78,23 @@ impl ExternalFilePreparer {
         let (tx, rx) = mpsc::sync_channel(1);
         self.sender
             .send(WalMapperMessage::EnsureExternalFile(id, tx))
+            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?;
+        rx.recv()
+            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?
+    }
+
+    /// Detach durably retired files (sorted, at most 256, all below the
+    /// current file) from this live mapper. The mapper is the only publisher
+    /// of maps and files, so detaching here cannot lose a concurrently created
+    /// successor or restore a stale handle. A file that still has a writable
+    /// map is refused with `WouldBlock`; nothing is detached then.
+    pub(crate) fn detach_retired_files(
+        &self,
+        ids: Vec<WalFileId>,
+    ) -> std::io::Result<Vec<(WalFileId, Arc<File>)>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(WalMapperMessage::DetachRetiredFiles(ids, tx))
             .map_err(|_| std::io::Error::other("WAL mapper stopped"))?;
         rx.recv()
             .map_err(|_| std::io::Error::other("WAL mapper stopped"))?
@@ -441,6 +466,11 @@ impl WalMapperThread {
                     self.map_pause = Some((map, entered, resume));
                     let _ = ack.send(());
                 }
+                #[cfg(feature = "experimental-distributed")]
+                WalMapperMessage::DetachRetiredFiles(ids, reply) => {
+                    let result = self.detach_retired_files(&ids);
+                    let _ = reply.send(result);
+                }
             }
         }
         Ok(())
@@ -471,6 +501,46 @@ impl WalMapperThread {
             self.layout.wal_file_size,
             &mut self.prewrite_buffer,
         )
+    }
+
+    /// See `ExternalFilePreparer::detach_retired_files`. Read-only maps over a
+    /// victim are dropped (in-flight readers keep their own clones); the
+    /// removed file handles go back to the caller, never to the unlink worker.
+    #[cfg(feature = "experimental-distributed")]
+    fn detach_retired_files(&mut self, ids: &[WalFileId]) -> DetachReply {
+        let files = self.files.load_full();
+        let current = files.current_file_id();
+        if ids.is_empty()
+            || ids.len() > 256
+            || ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || ids.iter().any(|id| *id >= current)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid retired WAL detach request",
+            ));
+        }
+        let layout = &self.layout;
+        let victim = |map_id: &MapId| ids.binary_search(&layout.file_for_map(*map_id)).is_ok();
+        if self
+            .maps
+            .maps
+            .iter()
+            .any(|(map_id, map)| map.writeable && victim(map_id))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "retired WAL file still has a writable map",
+            ));
+        }
+        let before = self.maps.maps.len();
+        self.maps.maps.retain(|map_id, _| !victim(map_id));
+        if self.maps.maps.len() != before {
+            self.publish_maps();
+        }
+        let (remaining, removed) = files.without_files(ids);
+        self.files.store(Arc::new(remaining));
+        Ok(removed)
     }
 
     /// Delete files forming a prefix below `watermark`.

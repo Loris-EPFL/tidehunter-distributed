@@ -353,6 +353,12 @@ pub(super) struct LeasedWriter {
     flight_adoption_waits: u64,
     #[cfg(test)]
     largest_close_profile: super::AdoptProfile,
+    /// R0 file-crossing cursor; `None` unless capacity observation is enabled.
+    capacity_roll: Option<std::sync::Arc<crate::distributed::capacity::RollCursor>>,
+    /// File of the last installed extent while observation is enabled.
+    capacity_file: Option<u64>,
+    /// One above the highest batch sequence submitted while observing.
+    capacity_sequence_next: u64,
 }
 
 impl LiveWriteQueue {
@@ -884,6 +890,19 @@ impl LeasedWriter {
             declared_through: start,
             prefixes,
         });
+        if let Some(roll) = &self.capacity_roll {
+            let file = self
+                .current
+                .as_ref()
+                .map(|c| c.lease.extent.segment.file_index);
+            // Every batch of the previous file was submitted before this install.
+            if let (Some(previous), Some(file)) = (self.capacity_file, file)
+                && previous != file
+            {
+                roll.crossed(file, self.capacity_sequence_next);
+            }
+            self.capacity_file = file;
+        }
     }
 
     fn recycle(&mut self, mut extent: ExtentState) {
@@ -894,6 +913,27 @@ impl LeasedWriter {
             1
         };
         self.prefix_buffers[index] = extent.prefixes;
+    }
+}
+
+impl super::Client {
+    /// Enable or disable R0 file-crossing reports. `sequence_start` bounds
+    /// every batch sequence submitted before this call, so the first reported
+    /// crossing still covers batches written before observation began.
+    pub(crate) fn set_capacity_roll(
+        &mut self,
+        cursor: Option<std::sync::Arc<crate::distributed::capacity::RollCursor>>,
+        sequence_start: u64,
+    ) {
+        let leased = &mut self.live_leased;
+        leased.capacity_file = cursor.as_ref().and(
+            leased
+                .current
+                .as_ref()
+                .map(|current| current.lease.extent.segment.file_index),
+        );
+        leased.capacity_sequence_next = sequence_start;
+        leased.capacity_roll = cursor;
     }
 }
 
@@ -2117,6 +2157,15 @@ impl super::Client {
             return Err(super::TcpError::new(
                 "leased batch epoch differs from stream",
             ));
+        }
+        if self.live_leased.capacity_roll.is_some() {
+            // No allocation or wait: a running max, only while observing.
+            for batch in &batches {
+                self.live_leased.capacity_sequence_next = self
+                    .live_leased
+                    .capacity_sequence_next
+                    .max(batch.version().sequence.saturating_add(1));
+            }
         }
         let build_started = timeline.enabled().then(Instant::now);
         // Keep ownership of immutable members, but encode only in the queue buffer.
@@ -5198,30 +5247,6 @@ impl super::Client {
         } else {
             self.live_leased.corrupt_next_digest = true;
         }
-    }
-}
-
-#[cfg(test)]
-impl super::StorageNode {
-    pub(crate) fn bench_open_live_fixture(
-        config: super::NodeConfig,
-        metrics: std::sync::Arc<crate::metrics::Metrics>,
-        configfs: std::path::PathBuf,
-    ) -> Result<std::sync::Arc<Self>, super::TcpError> {
-        let mut node =
-            super::inventory::with_live_target_fixture(configfs, || Self::open(config, metrics))?;
-        // Match the existing local-file fixture: allow owner RPC oracle reads,
-        // but keep the commissioned target/marker and the real leased writer.
-        std::sync::Arc::get_mut(&mut node)
-            .unwrap()
-            .live_nvme_selected = false;
-        Ok(node)
-    }
-    pub(crate) fn bench_install_live_target(
-        &self,
-        target: crate::distributed::nvmeof::live_target::LiveTargetManager,
-    ) {
-        self.install_live_target(target).unwrap();
     }
 }
 

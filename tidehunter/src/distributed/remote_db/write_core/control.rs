@@ -49,7 +49,7 @@ impl WriteCore {
         })?;
         // Every sequence below `next` is now published and synced, or aborted:
         // the explicit flush survives recovery only once the record says so.
-        if let Some(cut) = &self.durable_cut {
+        if let Some(cut) = self.durable_cut.get() {
             cut.certify(next)?;
         }
         self.ensure_healthy()
@@ -59,7 +59,7 @@ impl WriteCore {
         &self,
     ) -> super::super::DurableCutStats {
         self.durable_cut
-            .as_ref()
+            .get()
             .map_or_else(super::super::DurableCutStats::default, |cut| cut.stats())
     }
 
@@ -129,19 +129,23 @@ impl WriteCore {
         self.progress_checkpoint(true)?;
         {
             let mut publisher = self.publisher.lock();
-            if limit == 0 {
-                publisher.checkpoint_diagnostics = None;
-            } else if let Some(records) = &mut publisher.checkpoint_diagnostics {
-                records.clear();
-            } else {
-                publisher.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
+            // Armed index checkpoint diagnostics own the ring for the whole run:
+            // a profile window must not clear unread rows or reset the counters.
+            if publisher.index_suffix.is_none() {
+                if limit == 0 {
+                    publisher.checkpoint_diagnostics = None;
+                } else if let Some(records) = &mut publisher.checkpoint_diagnostics {
+                    records.clear();
+                } else {
+                    publisher.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
+                }
+                publisher.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
+                    available: limit != 0,
+                    ..CheckpointDiagnosticSummary::default()
+                };
+                publisher.dropped_checkpoint_diagnostics = 0;
+                publisher.last_checkpoint_diagnostic = None;
             }
-            publisher.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
-                available: limit != 0,
-                ..CheckpointDiagnosticSummary::default()
-            };
-            publisher.dropped_checkpoint_diagnostics = 0;
-            publisher.last_checkpoint_diagnostic = None;
         }
         *self.write_profile.lock() = WriteProfileSnapshot {
             limit_per_connection: limit,
@@ -253,7 +257,7 @@ impl WriteCore {
         self.stats.lock().shutdown.checkpoint_ns = elapsed(started);
         // After the checkpoint: its owner syncs end every parked poll, and the
         // checkpoint then covers everything the cut covered.
-        if let Some(cut) = &self.durable_cut {
+        if let Some(cut) = self.durable_cut.get() {
             cut.stop();
         }
         let started = Instant::now();
