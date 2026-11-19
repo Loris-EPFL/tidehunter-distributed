@@ -35,6 +35,16 @@ pub(super) struct FrozenCell {
     pub base: Option<SortedBlock>,
     pub overlay: std::sync::Arc<Overlay<ValueRecordReference>>,
     pub masks: FrozenMasks,
+    /// Adopted prune marks at capture; persistence replaces them with the
+    /// next image's marks (adopted minus folded, plus new). Stored in the
+    /// cell's frame.
+    pub marks: Option<std::sync::Arc<[PruneMark]>>,
+    /// True when persistence added marks to this cell, so its stored frame
+    /// is stale and the cell is rewritten.
+    pub marks_changed: bool,
+    /// Sorted `(key, fold_through)`: versions this image omits with the
+    /// marks it folds. Empty unless the floor reached a mark.
+    pub fold: Vec<(Bytes, MutationVersion)>,
 }
 
 /// `DropCells` masks frozen at the capture boundary.
@@ -83,6 +93,12 @@ pub(crate) struct PreparedIndexImage {
     lease: CaptureLease,
     /// Payload scratch limit of the one encoder that persists this image.
     scratch_limit: usize,
+    /// Install epoch of the marks this image adds.
+    install_epoch: u64,
+    /// Reservation of the resident charge of the marks this image adds.
+    mark_budget: Box<dyn MarkBudget>,
+    /// Removals planned on an earlier cut, checked on this image.
+    prune_plan: PrunePlan,
 }
 
 pub(crate) struct PersistedIndexImage {
@@ -97,6 +113,15 @@ pub(crate) struct PersistedIndexImage {
         expect(dead_code, reason = "exported by the checkpoint metrics stage")
     )]
     pub(crate) encode_stats: CellEncodeStats,
+    pub(super) install_epoch: u64,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reported by R1 logical pruning")
+    )]
+    pub(crate) prune_stats: PruneStats,
+    /// Holds the charge of the added marks until the caller ends it after
+    /// live install, when the index itself charges them.
+    pub(crate) mark_budget: Box<dyn MarkBudget>,
 }
 
 impl PersistedIndexImage {
@@ -126,7 +151,32 @@ impl PreparedIndexImage {
             cut,
             lease,
             scratch_limit,
+            install_epoch: 0,
+            mark_budget: Box::new(UnboundedMarkBudget),
+            prune_plan: PrunePlan::default(),
         }
+    }
+
+    /// Epoch that publishes the marks this image adds, after its last cell
+    /// is installed.
+    pub(super) fn with_install_epoch(mut self, install_epoch: u64) -> Self {
+        self.install_epoch = install_epoch;
+        self
+    }
+
+    /// Reserve the resident charge of new marks through `budget` before they
+    /// are created. Without it, reservations always succeed.
+    pub(crate) fn with_mark_budget(mut self, budget: Box<dyn MarkBudget>) -> Self {
+        self.mark_budget = budget;
+        self
+    }
+
+    /// Check `plan` on this image: each candidate whose cell birth and exact
+    /// head still match at the image's cut becomes a mark.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by R1 logical pruning"))]
+    pub(crate) fn with_prune_plan(mut self, plan: PrunePlan) -> Self {
+        self.prune_plan = plan;
+        self
     }
 
     /// Reserve the generation-specific container even if persistence later
@@ -162,6 +212,32 @@ impl PreparedIndexImage {
                 .then_with(|| a.identity.1.cmp(&b.identity.1))
         });
         let (parent, root_name) = output_parts(path)?;
+        // Fold, then apply the prune plan to every cell once, off-lock,
+        // before any encoding. The container decision below then sees the
+        // final rows and marks.
+        let mut prune_stats = PruneStats::default();
+        let candidates = std::mem::take(&mut self.prune_plan.candidates);
+        let mut planned = candidates.as_slice();
+        for cell in &mut self.cells {
+            prune_marks::fold_cell(cell, &self.lease.floor, &mut prune_stats);
+            // The plan and the cells share the `(keyspace, cell)` order; a
+            // candidate of a cell this image does not hold is stale.
+            let identity = (cell.identity.0.0, &cell.identity.1);
+            let before = planned.partition_point(|c| (c.keyspace.0, &c.cell) < identity);
+            prune_stats.plan_stale += before as u64;
+            planned = &planned[before..];
+            let run = planned.partition_point(|c| (c.keyspace.0, &c.cell) == identity);
+            prune_marks::apply_plan(
+                cell,
+                &planned[..run],
+                &self.cut,
+                self.install_epoch,
+                self.mark_budget.as_mut(),
+                &mut prune_stats,
+            )?;
+            planned = &planned[run..];
+        }
+        prune_stats.plan_stale += planned.len() as u64;
         match std::fs::symlink_metadata(path) {
             Ok(_) => {
                 return Err(std::io::Error::new(
@@ -230,7 +306,10 @@ impl PreparedIndexImage {
                     if cell_digest(&frame) != file.digest {
                         return Err(NativeIndexError::Invalid("cell range digest"));
                     }
-                    base.bytes = frame_payload(&frame)?;
+                    let payload = frame_payload(&frame)?;
+                    // The block holds the rows only; the trailer stores the
+                    // cell's marks, which are resident in `cell.marks`.
+                    base.bytes = payload.slice(..SortedBlock::rows_len(&payload)?);
                     base.mapped = true;
                 }
             }
@@ -245,7 +324,7 @@ impl PreparedIndexImage {
             for (number, encoded) in written {
                 let frame = cell_frame(&mapped, encoded.file.offset, encoded.file.bytes)?;
                 self.cells[number].base = Some(SortedBlock {
-                    bytes: frame.slice(8..),
+                    bytes: frame.slice(8..8 + encoded.rows),
                     count: encoded.count,
                     mapped: true,
                     cut: self.cut.clone(),
@@ -310,6 +389,12 @@ impl PreparedIndexImage {
         }
         // The mask section is always present, so one writer format exists.
         encode_masks(&self.cells, masked, &mut payload)?;
+        // A cell without stored rows keeps no mark: nothing at or below the
+        // cut remains for a mark to hide. Marks of stored cells are in their
+        // frames, so the root ends at the mask section.
+        for cell in self.cells.iter_mut().filter(|cell| cell.base.is_none()) {
+            cell.marks = None;
+        }
         let frame = CrcFrame::new(&payload);
         let mut root_file = OpenOptions::new().write(true).create_new(true).open(path)?;
         root_file.write_all(frame.as_ref())?;
@@ -328,24 +413,31 @@ impl PreparedIndexImage {
             lease: self.lease,
             metadata,
             encode_stats: encoder.stats,
+            install_epoch: self.install_epoch,
+            prune_stats,
+            mark_budget: self.mark_budget,
         })
     }
 }
 
 fn reusable(cell: &FrozenCell, parent: &Path, cut: &IndexReadCut, floor: &IndexReadCut) -> bool {
     // Captures retain the complete sealed generation. A cell is still clean
-    // for this prefix when all its overlay references are newer than the cut.
-    cell.overlay.values().all(|values| {
-        values
-            .first()
-            .is_none_or(|reference| !cut.contains(reference))
-    }) && cell.base.as_ref().is_some_and(|base| {
-        retention::position(&base.cut) <= retention::position(cut)
-            && base.file.as_ref().is_some_and(|file| {
-                file.path.parent() == Some(parent)
-                    && retention::position(&file.floor) >= retention::position(floor)
-            })
-    })
+    // for this prefix when all its overlay references are newer than the cut
+    // and its marks are unchanged: no mark folds and none was added.
+    cell.fold.is_empty()
+        && !cell.marks_changed
+        && cell.overlay.values().all(|values| {
+            values
+                .first()
+                .is_none_or(|reference| !cut.contains(reference))
+        })
+        && cell.base.as_ref().is_some_and(|base| {
+            retention::position(&base.cut) <= retention::position(cut)
+                && base.file.as_ref().is_some_and(|file| {
+                    file.path.parent() == Some(parent)
+                        && retention::position(&file.floor) >= retention::position(floor)
+                })
+        })
 }
 
 pub(super) fn container_names<'a>(files: impl Iterator<Item = &'a CellFile>) -> Vec<String> {
@@ -635,7 +727,7 @@ pub(super) fn open(
         if cell_digest(&frame) != digest {
             return Err(NativeIndexError::Invalid("cell range digest"));
         }
-        let mut block = SortedBlock::validated(
+        let (mut block, trailer) = SortedBlock::validated(
             frame_payload(&frame)?,
             true,
             database,
@@ -644,6 +736,18 @@ pub(super) fn open(
             &cell_id,
             cut.clone(),
         )?;
+        // Only the current format stores prune marks after the rows.
+        let prune_marks = if trailer.is_empty() {
+            None
+        } else if format == FORMAT {
+            let (marks, charge) =
+                prune_marks::decode_trailer(&trailer, index.descriptor(keyspace)?, &cell_id, &cut)?;
+            index.check_capacity(charge)?;
+            super::shards::add(&index.accounting.directory, charge);
+            Some(std::sync::Arc::from(marks))
+        } else {
+            return Err(NativeIndexError::Invalid("trailing block bytes"));
+        };
         block.file = Some(CellFile {
             path: cell_path,
             offset,
@@ -669,6 +773,7 @@ pub(super) fn open(
                 CellIndex {
                     base: Some(block),
                     birth,
+                    prune_marks,
                     ..Default::default()
                 },
             )
@@ -696,7 +801,7 @@ pub(super) fn open(
     Ok(index)
 }
 
-struct Rows<'a> {
+pub(super) struct Rows<'a> {
     base: Option<&'a SortedBlock>,
     position: usize,
     overlay: std::iter::Peekable<
@@ -705,7 +810,7 @@ struct Rows<'a> {
 }
 
 impl<'a> Rows<'a> {
-    fn new(cell: &'a FrozenCell) -> Self {
+    pub(super) fn new(cell: &'a FrozenCell) -> Self {
         Self {
             base: cell.base.as_ref(),
             position: 0,
@@ -810,12 +915,16 @@ impl Iterator for Versions<'_> {
 }
 
 fn retained<'a>(
+    cell: &FrozenCell,
+    key: &[u8],
     base: &'a [u8],
     overlay: &'a [ValueRecordReference],
     cut: &IndexReadCut,
     floor: &IndexReadCut,
-    absorbed: Option<MutationVersion>,
 ) -> Versions<'a> {
+    let absorbed = cell.masks.absorbed;
+    // A prune mark the floor reached folds with every version it covers.
+    let fold = prune_marks::fold_through(&cell.fold, key);
     // Preserve one anchor at/before the floor, including a tombstone, and every
     // later version. Binary-search old histories instead of scanning discarded
     // versions once per serialization pass. A `DropCells` mask at or below the
@@ -835,12 +944,14 @@ fn retained<'a>(
     let omitted = |version: MutationVersion| {
         anchor.is_some_and(|anchor| version < anchor)
             || absorbed.is_some_and(|absorbed| version <= absorbed)
+            || fold.is_some_and(|fold| version <= fold)
     };
     let base_start = lower_bound_by(count, |n| omitted(reference(n).mutation_version()));
     let base_end = lower_bound_by(count, |n| cut.contains(&reference(n)));
     let overlay_start = overlay.partition_point(|value| omitted(value.mutation_version()));
     let overlay_end = overlay.partition_point(|value| cut.contains(value));
-    // The absorbed mask is within the cut, so the starts never pass the ends.
+    // The absorbed mask and every fold bound are within the cut, so the starts
+    // never pass the ends.
     Versions::new(
         &base[base_start.min(base_end) * REFERENCE_BYTES..base_end * REFERENCE_BYTES],
         &overlay[overlay_start.min(overlay_end)..overlay_end],
@@ -849,8 +960,8 @@ fn retained<'a>(
 
 fn has_rows(cell: &FrozenCell, cut: &IndexReadCut, floor: &IndexReadCut) -> bool {
     *cut != IndexReadCut::BeforeAll
-        && Rows::new(cell).any(|(_, base, overlay)| {
-            retained(base, overlay, cut, floor, cell.masks.absorbed)
+        && Rows::new(cell).any(|(key, base, overlay)| {
+            retained(cell, key, base, overlay, cut, floor)
                 .next()
                 .is_some()
         })
@@ -859,6 +970,8 @@ fn has_rows(cell: &FrozenCell, cut: &IndexReadCut, floor: &IndexReadCut) -> bool
 struct WrittenCell {
     file: CellFile,
     count: usize,
+    /// Payload bytes of the rows; a mark trailer may follow them.
+    rows: usize,
     retained_bytes: usize,
     retained_versions: usize,
 }
@@ -866,6 +979,8 @@ struct WrittenCell {
 #[derive(Debug, PartialEq)]
 struct PayloadSummary {
     length: usize,
+    /// Bytes of the rows; the mark trailer, if any, follows them.
+    rows: usize,
     retained_bytes: usize,
     retained_versions: usize,
 }
@@ -899,7 +1014,7 @@ fn encode_cell_payload(
         .checked_add(count.checked_mul(4).ok_or(NativeIndexError::Capacity)?)
         .ok_or(NativeIndexError::Capacity)?;
     for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor, cell.masks.absorbed).count();
+        let n = retained(cell, key, base, overlay, cut, floor).count();
         if n == 0 {
             continue;
         }
@@ -919,7 +1034,7 @@ fn encode_cell_payload(
     let mut retained_bytes = 0usize;
     let mut retained_versions = 0usize;
     for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor, cell.masks.absorbed).count();
+        let n = retained(cell, key, base, overlay, cut, floor).count();
         if n == 0 {
             continue;
         }
@@ -934,7 +1049,7 @@ fn encode_cell_payload(
                 .map_err(|_| NativeIndexError::Capacity)?
                 .to_be_bytes(),
         )?;
-        for reference in retained(base, overlay, cut, floor, cell.masks.absorbed) {
+        for reference in retained(cell, key, base, overlay, cut, floor) {
             reference_bytes.clear();
             encode_reference(&reference, reference_bytes);
             write(reference_bytes)?;
@@ -942,8 +1057,12 @@ fn encode_cell_payload(
             retained_versions += 1;
         }
     }
+    super::prune_marks::encode_trailer(cell.marks.as_ref(), &mut write)?;
+    let trailer =
+        super::prune_marks::trailer_len(cell.marks.as_ref()).ok_or(NativeIndexError::Capacity)?;
     Ok(PayloadSummary {
         length,
+        rows: length - trailer,
         retained_bytes,
         retained_versions,
     })
@@ -1039,8 +1158,8 @@ impl CellEncoder {
                 (count, bytes, digest, summary)
             } else {
                 let count = Rows::new(cell)
-                    .filter(|(_, base, overlay)| {
-                        retained(base, overlay, cut, floor, cell.masks.absorbed)
+                    .filter(|(key, base, overlay)| {
+                        retained(cell, key, base, overlay, cut, floor)
                             .next()
                             .is_some()
                     })
@@ -1071,6 +1190,7 @@ impl CellEncoder {
                 floor: floor.clone(),
             },
             count,
+            rows: summary.rows,
             retained_bytes: summary.retained_bytes,
             retained_versions: summary.retained_versions,
         }))
@@ -1102,7 +1222,7 @@ impl CellEncoder {
         let mut retained_bytes = 0usize;
         let mut retained_versions = 0usize;
         for (key, base, overlay) in Rows::new(cell) {
-            let mut versions = retained(base, overlay, cut, floor, cell.masks.absorbed);
+            let mut versions = retained(cell, key, base, overlay, cut, floor);
             let Some(first) = versions.next() else {
                 continue;
             };
@@ -1151,11 +1271,17 @@ impl CellEncoder {
                 .map_err(|_| NativeIndexError::Capacity)?
                 .to_be_bytes(),
         );
+        let row_bytes = payload.len();
+        super::prune_marks::encode_trailer(cell.marks.as_ref(), &mut |bytes| {
+            payload.extend_from_slice(bytes);
+            Ok(())
+        })?;
         debug_assert!(payload.len() <= upper, "cell payload above its bound");
         Ok(Some((
             rows,
             PayloadSummary {
                 length: payload.len(),
+                rows: row_bytes,
                 retained_bytes,
                 retained_versions,
             },
@@ -1170,8 +1296,13 @@ impl CellEncoder {
 /// bound covers the reserved directory plus row bodies and the final payload.
 /// The overlay walk stops at the limit and decodes no reference.
 fn buffered_bound(cell: &FrozenCell, limit: usize) -> Option<(usize, usize)> {
-    // A base payload is `[count][offsets][rows]` with one offset per row.
-    let mut upper = cell.base.as_ref().map_or(4, |base| base.bytes.len());
+    // A base payload is `[count][offsets][rows]` with one offset per row,
+    // then the exact trailer of the marks this image stores.
+    let mut upper = cell
+        .base
+        .as_ref()
+        .map_or(4, |base| base.bytes.len())
+        .checked_add(super::prune_marks::trailer_len(cell.marks.as_ref())?)?;
     if upper > limit {
         return None;
     }

@@ -395,6 +395,20 @@ impl Admission {
         Ok(())
     }
 
+    /// Return bytes taken by `reserve_index_bytes` outside publication: the
+    /// prune-mark reservation of a checkpoint image, after live install (the
+    /// index then charges the marks) or when the image is abandoned.
+    pub(in crate::distributed::remote_db) fn release_index_bytes(&self, bytes: usize) {
+        let mut budget = self.budget.lock();
+        budget.index_bytes = budget
+            .index_bytes
+            .checked_sub(bytes)
+            .expect("index reservation release exceeds its charge");
+        let granted = self.grant_waiters(&mut budget);
+        drop(budget);
+        wake_granted(granted);
+    }
+
     pub(super) fn return_slots(&self, count: usize) -> Result<(), LocalDbError> {
         if count == 0 {
             return Ok(());

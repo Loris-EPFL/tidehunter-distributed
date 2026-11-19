@@ -1,8 +1,43 @@
 //! Native-style freeze/persist/install checkpoints. Only the final authority
 //! manifest adopts an image; all acknowledged suffix batches remain WAL-backed.
 
-use super::super::native_index::{PersistedIndexImage, PreparedIndexImage};
+use super::super::native_index::{
+    MarkBudget, PersistedIndexImage, PreparedIndexImage, UnboundedMarkBudget,
+};
 use super::*;
+
+/// Admission-backed reservation of the resident charge of the prune marks
+/// one image adds. Owned by the checkpoint worker; never touched under the
+/// writer or publisher lock (admission is never taken under publisher). It
+/// returns its bytes when dropped: after live install, or with an abandoned
+/// image.
+struct AdmissionMarkBudget {
+    admission: Arc<super::concurrent::Admission>,
+    held: usize,
+}
+
+impl MarkBudget for AdmissionMarkBudget {
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if self.admission.reserve_index_bytes(bytes).is_err() {
+            return false;
+        }
+        self.held += bytes;
+        true
+    }
+
+    fn release(&mut self, bytes: usize) {
+        if bytes != 0 {
+            self.held -= bytes;
+            self.admission.release_index_bytes(bytes);
+        }
+    }
+}
+
+impl Drop for AdmissionMarkBudget {
+    fn drop(&mut self) {
+        self.release(self.held);
+    }
+}
 
 struct CompletedCheckpoint {
     commit: CheckpointCommit,
@@ -397,6 +432,12 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
             break prepared;
         }
     };
+    // New prune marks reserve their resident charge in admission's index
+    // budget before they are created; the reservation ends after live install.
+    let prepared = prepared.with_mark_budget(Box::new(AdmissionMarkBudget {
+        admission: Arc::clone(&core.admission),
+        held: 0,
+    }));
     if let (Some(total), Some(started)) = (&mut capture.prepare_work_ns, prepare_started) {
         *total = total.saturating_add(elapsed(started));
     }
@@ -454,15 +495,18 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     crate::failpoints::write_model::boundary("checkpoint_install_before");
     // R0 observers walk the installed image only between installs (seqlock).
     core.capacity.begin_install();
+    // Hold the mark reservation until installation has charged the marks.
+    let mark_reservation;
     {
+        let mut persisted = completed
+            .persisted
+            .take()
+            .ok_or_else(|| LocalDbError::new("checkpoint persisted image missing"))?;
+        mark_reservation =
+            std::mem::replace(&mut persisted.mark_budget, Box::new(UnboundedMarkBudget));
         let mut writer = core.index.writer();
         let _publisher = core.publisher.lock();
-        writer.begin_install_image(
-            completed
-                .persisted
-                .take()
-                .ok_or_else(|| LocalDbError::new("checkpoint persisted image missing"))?,
-        );
+        writer.begin_install_image(persisted);
     }
     loop {
         let mut writer = core.index.writer();
@@ -471,6 +515,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
             break;
         }
     }
+    drop(mark_reservation);
     // Reap the cells the installation left empty (absorbed `DropCells`
     // masks), one bounded writer step at a time. Reaping changes no cut, so
     // publication is not held out.

@@ -22,6 +22,7 @@ use parking_lot::MutexGuard;
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 /// Ordered cell directory key: native keyspace byte, then cell. Cells of one
 /// keyspace share one `CellId` variant, so the derived order never compares
@@ -40,6 +41,8 @@ pub(super) struct ImageInstallation {
     cells: std::vec::IntoIter<FrozenCell>,
     cut: IndexReadCut,
     lease: CaptureLease,
+    /// Published after the last cell, so new marks appear together.
+    install_epoch: u64,
 }
 
 pub(super) struct ImageCapture {
@@ -57,6 +60,7 @@ pub(super) struct ImageCapture {
     cut: IndexReadCut,
     lease: CaptureLease,
     schema: [u8; 32],
+    install_epoch: u64,
 }
 
 /// State only the writer touches. Held under `NativeIndex::writer`.
@@ -528,6 +532,12 @@ impl IndexWriter<'_> {
             cut,
             lease,
             schema,
+            // Only the writer stores the epoch, so this load cannot race.
+            install_epoch: index
+                .prune_epoch
+                .load(AtomicOrdering::Relaxed)
+                .checked_add(1)
+                .ok_or(NativeIndexError::Capacity)?,
         });
         Ok(())
     }
@@ -561,12 +571,16 @@ impl IndexWriter<'_> {
             }
             let masks =
                 FrozenMasks::capture(&cell.drop_versions, &capture.cut, &capture.lease.floor);
+            // Handles only: the marks are shared, not copied.
             capture.cells.push(FrozenCell {
                 identity,
                 birth,
                 base: cell.base.clone(),
                 overlay: Arc::clone(cell.sealed.as_ref().expect("sealed generation")),
                 masks,
+                marks: cell.prune_marks.clone(),
+                marks_changed: false,
+                fold: Vec::new(),
             });
             capture.remaining -= 1;
         }
@@ -579,14 +593,17 @@ impl IndexWriter<'_> {
             index.max_metadata_bytes,
             cell_flushers(index.shards.len()),
         );
-        Some(PreparedIndexImage::new(
-            index.database,
-            capture.schema,
-            capture.cells,
-            capture.cut,
-            capture.lease,
-            scratch_limit,
-        ))
+        Some(
+            PreparedIndexImage::new(
+                index.database,
+                capture.schema,
+                capture.cells,
+                capture.cut,
+                capture.lease,
+                scratch_limit,
+            )
+            .with_install_epoch(capture.install_epoch),
+        )
     }
 
     /// Restore abandoned generations before another barrier. No history is
@@ -646,6 +663,7 @@ impl IndexWriter<'_> {
             cells: persisted.cells.into_iter(),
             cut: persisted.cut,
             lease: persisted.lease,
+            install_epoch: persisted.install_epoch,
         });
     }
 
@@ -713,6 +731,17 @@ impl IndexWriter<'_> {
                 }
             }
             cell.base = captured.base;
+            // Marks of the adopted image. New marks carry the pending epoch
+            // and stay hidden until the last cell installs.
+            sub(
+                &accounting.directory,
+                prune_marks::marks_charge(cell.prune_marks.as_ref()),
+            );
+            add(
+                &accounting.directory,
+                prune_marks::marks_charge(captured.marks.as_ref()),
+            );
+            cell.prune_marks = captured.marks;
             // The new base omits every reference at or below the absorbed
             // mask, the cut's references left the sealed generation and later
             // publications are above the cut: the mask covers nothing.
@@ -731,6 +760,12 @@ impl IndexWriter<'_> {
             }
         }
         if installation.cells.len() == 0 {
+            // Release pairs with the Acquire load in `prune_marks::suppressed`:
+            // every mark of this image is in its cell before the epoch that
+            // exposes it.
+            index
+                .prune_epoch
+                .store(installation.install_epoch, AtomicOrdering::Release);
             installation.lease.install();
             true
         } else {

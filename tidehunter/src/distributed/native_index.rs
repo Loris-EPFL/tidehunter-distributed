@@ -43,10 +43,14 @@ use std::ops::Bound;
 use std::path::Path;
 use typenum::U32;
 
+mod prune_marks;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
+use prune_marks::PruneMark;
+pub use prune_marks::PruneStats;
+pub(crate) use prune_marks::{MarkBudget, PrunePlan, UnboundedMarkBudget};
 
 /// Fixed cap of the Exact checkpoint cell flusher pool. Not a measured optimum.
 pub(crate) const MAX_CELL_FLUSHERS: usize = 8;
@@ -58,7 +62,6 @@ pub(crate) fn cell_flushers(shards: usize) -> usize {
         .min(shards)
         .clamp(1, MAX_CELL_FLUSHERS)
 }
-
 pub use retention::IndexReadPin;
 use retention::{CaptureLease, RetentionState, position, view_charge};
 pub(crate) use retention::{PublicationViewReservation, StandingViewBudget};
@@ -68,6 +71,7 @@ pub use shards::{
     PUBLICATION_HISTOGRAM_BUCKETS,
 };
 pub(crate) use snapshot::{PersistedIndexImage, PreparedIndexImage};
+use std::sync::atomic::AtomicU64;
 pub use writer::IndexWriter;
 use writer::WriterState;
 pub(crate) use writer::drop_mask_charge;
@@ -273,6 +277,9 @@ struct CellIndex {
     /// Runtime identity of this materialization; a repopulated cell gets a
     /// fresh one. Never persisted.
     birth: u64,
+    /// Adopted index-only suppression marks, sorted by key then cut. Replaced
+    /// only by installation (one writer); `None` means none.
+    prune_marks: Option<std::sync::Arc<[PruneMark]>>,
 }
 
 /// One database's native-routed cells with typed logical versions and locations.
@@ -296,6 +303,9 @@ pub struct NativeIndex {
     accounting: Accounting,
     publication_shards: PublicationHistogram,
     retention: std::sync::Arc<RetentionState>,
+    /// Install epoch reached by the last completed installation. Marks with
+    /// a larger epoch belong to an installation in progress and stay hidden.
+    prune_epoch: AtomicU64,
 }
 
 /// Digest of the exact durable CRC-framed image, usable by its manifest owner.
@@ -363,8 +373,10 @@ impl NativeIndexScan {
 
     fn advance(&mut self, index: &NativeIndex, cell: usize) {
         while let Some((key, reference)) = self.cells[cell].next(index, self.reverse, &self.cut) {
+            let cursor = &self.cells[cell];
             if reference.descriptor.kind == RecordKind::Put
-                && unmasked(&reference, self.cells[cell].mask)
+                && unmasked(&reference, cursor.mask)
+                && !cursor.suppressed
             {
                 self.heads.push(ScanHead {
                     key,
@@ -389,6 +401,8 @@ struct CellScan {
     /// staged later are above the cut; an absorbed mask leaves with the
     /// references it covers, so the value stays exact for the whole scan.
     mask: Option<MutationVersion>,
+    /// True when a visible prune mark suppresses the row `next` returned.
+    suppressed: bool,
 }
 
 impl CellScan {
@@ -408,6 +422,7 @@ impl CellScan {
             base_owner: source.base.as_ref().map(|block| block.bytes.clone()),
             after: after.cloned(),
             mask: source.mask_at(cut),
+            suppressed: false,
         };
         cursor.advance_base(source, reverse, cut);
         cursor
@@ -505,6 +520,13 @@ impl CellScan {
             }
             self.advance_base(source, reverse, cut);
         }
+        self.suppressed = prune_marks::suppressed(
+            source.prune_marks.as_ref(),
+            &result.0,
+            result.1.mutation_version(),
+            cut,
+            &index.prune_epoch,
+        );
         self.after = Some(result.0.clone());
         Some(result)
     }
@@ -553,6 +575,7 @@ impl NativeIndex {
             accounting: Accounting::default(),
             publication_shards: PublicationHistogram::default(),
             retention: RetentionState::new(),
+            prune_epoch: AtomicU64::new(0),
         })
     }
 
@@ -717,10 +740,20 @@ impl NativeIndex {
             &cut
         };
         self.validate_resolved(cut)?;
-        Ok(shard
-            .get(&identity)
-            .and_then(|cell| cell.get(&reduced, cut))
-            .filter(|reference| reference.descriptor.kind == RecordKind::Put))
+        Ok(shard.get(&identity).and_then(|cell| {
+            // A visible prune mark makes the selected version absent; the
+            // lookup never falls back to an older version.
+            cell.get(&reduced, cut).filter(|reference| {
+                reference.descriptor.kind == RecordKind::Put
+                    && !prune_marks::suppressed(
+                        cell.prune_marks.as_ref(),
+                        &reduced,
+                        reference.mutation_version(),
+                        cut,
+                        &self.prune_epoch,
+                    )
+            })
+        }))
     }
 
     /// Ordered index references; cursors and ordering are reduced native index
@@ -867,8 +900,9 @@ impl NativeIndex {
         let mut retained = self.accounting.overlay();
         for shard in self.shards.iter_mut() {
             for ((_, cell_id), cell) in shard.get_mut().iter() {
-                directory +=
-                    cell_directory_charge(cell_id) + cell.drop_versions.len() * MASK_CHARGE;
+                directory += cell_directory_charge(cell_id)
+                    + cell.drop_versions.len() * MASK_CHARGE
+                    + prune_marks::marks_charge(cell.prune_marks.as_ref());
                 versions += cell
                     .overlay
                     .values()
@@ -1354,6 +1388,10 @@ struct SortedBlock {
     retained_versions: usize,
 }
 impl SortedBlock {
+    /// Validate the rows of a cell payload. Returns the block, which holds
+    /// only the rows, and the bytes after the last row: the cell's prune-mark
+    /// trailer, empty for a cell without marks. The caller validates the
+    /// trailer.
     fn validated(
         bytes: Bytes,
         mapped: bool,
@@ -1362,7 +1400,7 @@ impl SortedBlock {
         descriptor: &KeySpaceDesc,
         cell: &CellId,
         cut: IndexReadCut,
-    ) -> Result<Self, NativeIndexError> {
+    ) -> Result<(Self, Bytes), NativeIndexError> {
         let mut cursor = Cursor::new(&bytes);
         let count = cursor.u32()? as usize;
         if count == 0 || count > cursor.remaining() / 4 {
@@ -1416,18 +1454,42 @@ impl SortedBlock {
             prior_key = Some(key);
             expected = cursor.position;
         }
-        if cursor.remaining() != 0 {
-            return Err(NativeIndexError::Invalid("trailing block bytes"));
+        let rows = cursor.position;
+        Ok((
+            Self {
+                bytes: bytes.slice(..rows),
+                count,
+                mapped,
+                cut,
+                file: None,
+                retained_bytes,
+                retained_versions,
+            },
+            bytes.slice(rows..),
+        ))
+    }
+
+    /// Length of the rows of an already validated cell payload: the end of
+    /// its last row. The payload may continue with a prune-mark trailer.
+    fn rows_len(payload: &[u8]) -> Result<usize, NativeIndexError> {
+        let field = |at: usize| -> Result<usize, NativeIndexError> {
+            payload
+                .get(at..at + 4)
+                .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
+                .ok_or(NativeIndexError::Invalid("truncated cell payload"))
+        };
+        let count = field(0)?;
+        if count == 0 {
+            return Err(NativeIndexError::Invalid("block offset count"));
         }
-        Ok(Self {
-            bytes,
-            count,
-            mapped,
-            cut,
-            file: None,
-            retained_bytes,
-            retained_versions,
-        })
+        let last = field(4 + (count - 1) * 4)?;
+        let key = field(last)?;
+        let versions = field(last + 4 + key)?;
+        let end = last + 8 + key + versions * REFERENCE_BYTES;
+        if end > payload.len() {
+            return Err(NativeIndexError::Invalid("truncated cell payload"));
+        }
+        Ok(end)
     }
     fn entry(&self, index: usize) -> (&[u8], &[u8]) {
         let offset =
@@ -1689,6 +1751,7 @@ mod tests {
     mod drop_cells;
     mod legacy_fixtures;
     mod lifecycle;
+    mod mark_frames;
     mod owners;
     mod sharding;
     mod sparse;
