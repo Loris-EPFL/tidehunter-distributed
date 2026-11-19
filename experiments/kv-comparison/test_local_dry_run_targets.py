@@ -353,9 +353,9 @@ class KernelPortsContractTests(unittest.TestCase):
         self.configfs = self.root / "nvmet"
         (self.configfs / "ports").mkdir(parents=True)
 
-    def allocate(self, evidence="run"):
+    def allocate(self, evidence="run", address="10.99.0.2"):
         return targets._kernel_live_ports(
-            "10.99.0.2", commissioning_address="127.0.0.1", control_address="127.0.0.1",
+            address, commissioning_address="127.0.0.1", control_address="127.0.0.1",
             state=self.state, evidence=self.root / evidence, deadline=time.monotonic() + 5,
             sysctls=self.sysctls, configfs=self.configfs)
 
@@ -419,6 +419,75 @@ class KernelPortsContractTests(unittest.TestCase):
                 self.allocate()
         probe.bind.assert_called_once_with(("127.0.0.1", 0))
         self.assertEqual(list(self.state.glob("*.claim")), [])
+
+    def geometry_fixture(self):
+        address = "127.0.0.1"
+        with patch.object(targets.socket, "socket", side_effect=self.socket_probe):
+            _, public, private, _ = self.allocate(address=address)
+        sysfs = self.root / "sysfs"
+        sysfs.mkdir()
+        host_nqn, host_id = "nqn.2014-08.org.nvmexpress:uuid:fixture", "fixture-host-id"
+
+        def controller(instance, service, subsystem, queues="2", initiator=host_nqn):
+            directory = sysfs / f"nvme{instance}"
+            directory.mkdir()
+            for key, value in {"transport": "tcp", "address": f"traddr={address},trsvcid={service}",
+                               "hostnqn": initiator, "hostid": host_id, "subsysnqn": subsystem,
+                               "queue_count": queues, "sqsize": "31"}.items():
+                (directory / key).write_text(value)
+            return directory
+
+        expected = controller(0, public, "nqn.writer")
+        unrelated = controller(1, public, "nqn.other")
+        controller(2, private, "nqn.writer", queues="5", initiator="nqn.commissioning")
+        proof = {"member_transition": {"writer_routes": [
+            {"namespace_identity": {"controller_instance": 0, "nqn": "nqn.writer"}}]}}
+        def scan(errors):
+            return targets._owned_controllers(sysfs, "tcp", address, (public, private), host_nqn,
+                                              sample_errors=errors)
+
+        return proof, host_id, expected, unrelated, scan
+
+    def test_geometry_on_allocator_chosen_public_service(self):
+        proof, host_id, _, _, scan = self.geometry_fixture()
+        record = {"sample_errors": [], "sample_errors_truncated": False}
+        rows = scan(record["sample_errors"])
+        targets._admit_kernel_geometry(record, proof, host_id, rows)
+        self.assertEqual([row["controller"] for row in record["queue_samples"]], ["nvme0"])
+        self.assertEqual(record["sample_errors"], [])
+
+    def test_geometry_records_errno_path_and_identity_without_tolerating_errors(self):
+        proof, host_id, expected, unrelated, scan = self.geometry_fixture()
+        earlier = scan([])
+        read = Path.read_text
+        for directory, code in ((unrelated, errno.ENODEV), (expected, errno.ENODEV), (unrelated, errno.EIO)):
+            with self.subTest(controller=directory.name, errno=code):
+                failed = directory / "sqsize"
+                moved = self.root / "disconnected"
+
+                def during_teardown(path, *args, **kwargs):
+                    if path == failed:
+                        if code == errno.ENODEV:
+                            directory.rename(moved)
+                        raise OSError(code, "test", str(path))
+                    return read(path, *args, **kwargs)
+
+                record = {"sample_errors": [], "sample_errors_truncated": False}
+                try:
+                    with patch.object(Path, "read_text", during_teardown):
+                        scan(record["sample_errors"])
+                finally:
+                    if moved.exists():
+                        moved.rename(directory)
+                error, = record["sample_errors"]
+                self.assertEqual(error["path"], str(failed))
+                self.assertEqual(error["errno"], code)
+                self.assertEqual(error["identity"]["controller"], directory.name)
+                self.assertEqual(error["disappeared"], code == errno.ENODEV)
+                with self.assertRaisesRegex(targets.TargetError, "sampling errors: 1"):
+                    targets._admit_kernel_geometry(record, proof, host_id, earlier)
+                self.assertEqual(record["missing_queue_identities"], [])
+                self.assertEqual(record["invalid_queue_samples"], [])
 
 
 if __name__ == '__main__':

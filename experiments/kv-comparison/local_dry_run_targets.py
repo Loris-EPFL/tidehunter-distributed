@@ -38,23 +38,39 @@ KERNEL_SERVICE_PORTS = range(20000, 65535, 2)
 DIAGNOSTIC_ENTRIES = 256
 
 
-def _owned_controllers(sysfs, transport, address, services, hostnqn):
+def _owned_controllers(sysfs, transport, address, services, hostnqn, *, sample_errors=None):
     """Initiator controllers of this run: the host NQN is fresh per run."""
     rows = []
     for path in sysfs.glob("nvme*"):
         if not re.fullmatch(r"nvme[0-9]+", path.name):
             continue
+        attrs, attribute = {}, path
         try:
-            attrs = {name: (path / name).read_text().strip() for name in
-                     ("transport", "address", "subsysnqn", "hostnqn", "hostid", "queue_count", "sqsize")}
+            for name in ("transport", "address", "subsysnqn", "hostnqn", "hostid", "queue_count", "sqsize"):
+                attribute = path / name
+                attrs[name] = attribute.read_text().strip()
             fields = dict(p.split("=", 1) for p in attrs["address"].split(",") if "=" in p)
             if (attrs["transport"] == transport and fields.get("traddr") == address
                     and fields.get("trsvcid") in {str(s) for s in services}
                     and attrs["hostnqn"] == hostnqn):
+                attribute = path
                 stat = path.stat()
                 rows.append(dict(attrs, controller=path.name, device=stat.st_dev, inode=stat.st_ino))
         except FileNotFoundError:
             continue
+        except OSError as error:
+            if sample_errors is None:
+                raise
+            disappeared = False
+            if error.errno == errno.ENODEV:
+                try:
+                    path.stat()
+                except OSError as probe:
+                    disappeared = probe.errno in (errno.ENOENT, errno.ENODEV)
+            sample_errors.append({"path": str(attribute), "errno": error.errno, "disappeared": disappeared,
+                                  "identity": dict(controller=path.name, **{
+                                      key: attrs[key] for key in ("transport", "address", "subsysnqn", "hostnqn", "hostid")
+                                      if key in attrs})})
     return rows
 
 
@@ -543,6 +559,25 @@ def _kernel_live_ports(address, *, commissioning_address, control_address, state
     raise TargetError(f"no free adjacent non-ephemeral kernel NVMe services ({busy} bind conflicts)")
 
 
+def _queue_identity(row):
+    return row["controller"], row["subsysnqn"], row["hostid"]
+
+
+def _admit_kernel_geometry(record, proof, hostid, samples):
+    routes = proof.get("member_transition", {}).get("writer_routes", [])
+    expected = {(f"nvme{r['namespace_identity']['controller_instance']}",
+                 r["namespace_identity"]["nqn"], hostid) for r in routes}
+    matched = [r for r in samples if _queue_identity(r) in expected]
+    missing = sorted(expected - {_queue_identity(r) for r in matched})
+    invalid = [r for r in matched if (r["queue_count"], r["sqsize"]) != ("2", "31")]
+    record.update(queue_samples=matched, missing_queue_identities=missing, invalid_queue_samples=invalid)
+    hard_errors = len(record["sample_errors"])
+    truncated = record["sample_errors_truncated"]
+    if not expected or missing or invalid or hard_errors or truncated:
+        raise TargetError(f"live 1x32 controller geometry not proven; missing identities: {missing!r}; "
+                          f"wrong geometry: {len(invalid)}; sampling errors: {hard_errors}; truncated: {truncated}")
+
+
 def _admit_kernel_durability(remote, tier):
     if (remote.get("live_nvme") or {}).get("leased_durability") != tier:
         raise TargetError("prepared kernel qualification durability differs from the requested tier")
@@ -625,7 +660,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         client = None
         sampler = None
         stop = threading.Event()
-        samples, sample_errors = {}, []
+        samples = {}
+        record.update(sample_errors=[], sample_errors_truncated=False)
         launch = remote = None
 
         def remaining(cap):
@@ -645,14 +681,24 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
 
         def sample():
             while not stop.wait(.02):
+                errors = []
                 try:
-                    for row in controllers(addr, (service, commissioning), remote["live_nvme"]["host_nqn"]):
-                        key = (row["controller"], row["device"], row["inode"])
-                        if len(samples) < 4096:
-                            samples[key] = row
+                    rows = _owned_controllers(SYSFS_NVME, transport, addr, (service, commissioning),
+                                              remote["live_nvme"]["host_nqn"], sample_errors=errors)
                 except OSError as error:
-                    if len(sample_errors) < 20:
-                        sample_errors.append(repr(error))
+                    rows = []
+                    errors.append({"path": str(error.filename or SYSFS_NVME), "errno": error.errno,
+                                   "disappeared": False, "identity": {}})
+                for row in rows:
+                    key = (row["controller"], row["device"], row["inode"])
+                    if len(samples) < 4096:
+                        samples[key] = row
+                if errors:
+                    seen = sorted({_queue_identity(row) for row in rows})
+                    kept = record["sample_errors"]
+                    available = 20 - len(kept)
+                    kept.extend(dict(error, observed_identities=seen) for error in errors[:available])
+                    record["sample_errors_truncated"] |= len(errors) > available
 
         def diagnose(name, capture):
             # Failure evidence is best-effort; it never replaces the failure.
@@ -795,20 +841,12 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     or proof.get("durability_tier") != receipt["durability"]["tier"]
                     or any(checks.get(k) is not True for k in required)):
                 raise TargetError("kernel qualification proof incomplete")
-            routes = proof.get("member_transition", {}).get("writer_routes", [])
-            identities = {(f"nvme{r['namespace_identity']['controller_instance']}",
-                           r["namespace_identity"]["nqn"]) for r in routes}
+            stop.set()
+            sampler.join(timeout=5)
+            if sampler.is_alive():
+                raise TargetError("controller sampler did not stop")
             hostid = str(uuid.UUID(bytes=bytes(remote["live_nvme"]["host_id"])))
-            matched = [r for r in samples.values()
-                       if (r["controller"], r["subsysnqn"]) in identities and r["hostid"] == hostid]
-            record["queue_samples"] = matched
-            observed = {(r["controller"], r["subsysnqn"]) for r in matched}
-            missing = sorted(identities - observed)
-            record["missing_queue_identities"] = missing
-            if not identities or missing or sample_errors or any(
-                    r["queue_count"] != "2" or r["sqsize"] != "31" for r in matched):
-                raise TargetError("live 1x32 controller geometry not proven; missing identities: "
-                                  + repr(missing))
+            _admit_kernel_geometry(record, proof, hostid, samples.values())
             record["qualification_sha256"] = hashlib.sha256(
                 (evidence / "native/qualification.json").read_bytes()).hexdigest()
             record["qualified"] = True
