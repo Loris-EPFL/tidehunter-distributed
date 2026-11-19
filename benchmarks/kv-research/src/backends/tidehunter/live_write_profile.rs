@@ -516,6 +516,24 @@ mod tests {
     }
 
     #[test]
+    fn live_write_profile_fields_match_the_observer_fixture() {
+        let mut window = Window::arm(2, Some(LiveNvmeStats::default())).unwrap();
+        let mut end = LiveNvmeStats::default();
+        end.counts.completed_write_ops = 3;
+        window.freeze(Some(end)).unwrap();
+        let output = window.finish().unwrap();
+        let deltas = output["stages"]["live_nvmeof"].as_object().unwrap();
+        let mut fields: Vec<&str> = deltas.keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        let expected: Vec<&str> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../experiments/kv-comparison/observability/live_nvmeof_write_profile_fields.json"
+        )))
+        .unwrap();
+        assert_eq!(fields, expected);
+    }
+
+    #[test]
     fn missing_scalar_is_an_error() {
         let mut window = Window::arm(1, Some(LiveNvmeStats::default())).unwrap();
         window.freeze(Some(LiveNvmeStats::default())).unwrap();

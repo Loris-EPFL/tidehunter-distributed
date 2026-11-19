@@ -3549,6 +3549,14 @@ def admit_write_timeline(directory, job, config, *, completed):
                                         expected_backend=diagnostic_backend(job))
 
 
+def _write_diagnostic_exporter():
+    observer_path = str(Path(__file__).resolve().parent / "observability")
+    if observer_path not in sys.path:
+        sys.path.insert(0, observer_path)
+    import campaign_exporter
+    return campaign_exporter
+
+
 def admit_write_diagnostics(directory, job, *, completed):
     path = Path(directory) / "result/write-diagnostics.json"
     requested = job.get("diagnostics", {}).get("write_profile_limit", 0)
@@ -3578,11 +3586,7 @@ def admit_write_diagnostics(directory, job, *, completed):
             raise ValueError("requested live NVMe write diagnostics have an unrecognized observation mode")
         if data.get("measurement_drained") is not True:
             raise ValueError("live NVMe write diagnostics require a drained measurement")
-    observer_path = str(Path(__file__).resolve().parent / "observability")
-    if observer_path not in sys.path:
-        sys.path.insert(0, observer_path)
-    import campaign_exporter
-    campaign_exporter.write_diagnostic_metrics(data, {})
+    _write_diagnostic_exporter().write_diagnostic_metrics(data, {})
     return {"path": "result/write-diagnostics.json", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "observed": data}
 
@@ -4805,9 +4809,10 @@ def write_diagnostic_summary(row):
             and evidence.get("runtime_observation_mode") == "live_nvmeof_phase_counters"
             and profile.get("scope") == "measurement_nvme_io_cumulative_delta"):
         nvme = stages.get("live_nvmeof") or {}
+        samples_field = _write_diagnostic_exporter().live_nvmeof_write_samples_field
         for field in sorted(nvme):
             if field.endswith("_ns"):
-                observe(field[:-3], nvme, field, field[:-3] + "_samples",
+                observe(field[:-3], nvme, field, samples_field(field),
                         "measurement_nvme_io_cumulative_delta",
                         eligible and evidence.get("measurement_drained") is True)
     observe("checkpoint_wait", stages, "write_profile_checkpoint_wait_ns",

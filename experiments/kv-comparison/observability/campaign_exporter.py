@@ -898,6 +898,16 @@ def resource_interval_metrics(evidence, labels):
     return result
 
 
+# The owner reports each phase clock with one shared count per profile.
+LIVE_NVME_WRITE_SHARED_CLOCKS = {
+    "lease_profile_samples": ("lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns"),
+    "adopt_profile_samples": ("adopt_owner_ns", "adopt_close_scan_ns"),
+}
+LIVE_NVME_WRITE_SHARED_SAMPLES = {
+    clock: samples for samples, clocks in LIVE_NVME_WRITE_SHARED_CLOCKS.items() for clock in clocks
+}
+
+
 LIVE_NVME_WRITE_COUNTERS = {
     "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
     "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
@@ -912,6 +922,8 @@ LIVE_NVME_WRITE_COUNTERS = {
     "leased_worker_waits", "leased_worker_wait_timeouts",
     "leased_flushes", "leased_flush_ns", "leased_flush_samples", "leased_flush_covered_frames",
     "read_lane_pin_failures",
+    "adopt_close_scan_bytes", "extent_preleases", "extent_switch_waits",
+    *LIVE_NVME_WRITE_SHARED_CLOCKS, *LIVE_NVME_WRITE_SHARED_SAMPLES,
     *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
                                    "allocation", "publication", "namespace_setup", "read_io",
                                    "owner_completion", "wal_persistence", "wal_namespace",
@@ -920,6 +932,10 @@ LIVE_NVME_WRITE_COUNTERS = {
                                    "extent_switch", "adoption_async", "adoption_settle")
       for suffix in ("_ns", "_samples")),
 }
+
+
+def live_nvmeof_write_samples_field(clock):
+    return LIVE_NVME_WRITE_SHARED_SAMPLES.get(clock, clock[:-3] + "_samples")
 
 
 def write_diagnostic_metrics(evidence, labels):
@@ -1017,9 +1033,12 @@ def write_diagnostic_metrics(evidence, labels):
             count(value)
         for field in counters:
             if field.endswith("_ns"):
-                samples_field = field[:-3] + "_samples"
+                samples_field = live_nvmeof_write_samples_field(field)
                 if samples_field not in counters:
                     raise ValueError("live NVMe clock lacks its sample count")
+            elif field in LIVE_NVME_WRITE_SHARED_CLOCKS:
+                if any(clock not in counters for clock in LIVE_NVME_WRITE_SHARED_CLOCKS[field]):
+                    raise ValueError("live NVMe profile sample count lacks its clocks")
             elif field.endswith("_samples") and field != "lane_inflight_samples":
                 if field[:-8] + "_ns" not in counters:
                     raise ValueError("live NVMe sample count lacks its clock")
@@ -1095,17 +1114,23 @@ def write_diagnostic_metrics(evidence, labels):
                 continue
             else:
                 value = count(value)
-                if nvme and component == "stages.live_nvmeof" and field.endswith("_ns") and tree.get(field[:-3] + "_samples") == 0:
-                    continue
+                live_window = nvme and component == "stages.live_nvmeof"
+                if live_window and field.endswith("_ns"):
+                    samples_field = live_nvmeof_write_samples_field(field)
+                    if tree[samples_field] == 0:
+                        continue
                 if field.endswith("_ns"):
                     counters.append(("kv_case_write_diagnostic_stage_seconds", value / 1e9,
                                      {"component": component, "stage": field}))
+                elif live_window and (field.endswith("_bytes") or field == "copy_bytes_avoided"):
+                    counters.append(("kv_live_nvmeof_bytes", value,
+                                     {"component": component, "counter": field}))
                 elif (field in ("sampled_registered_files_min", "sampled_registered_files_max")
                       or field.endswith(("_calls", "_errors", "_samples", "_requests", "_retries", "_groups",
                                          "_receipts", "_publications", "_successes", "_operations", "_barriers",
                                          "_connections", "_count", "_batches", "_appends", "_admitted", "_completed",
                                          "_polls", "_would_block", "_stalls", "_completions", "_ops", "_bytes"))
-                      or (nvme and component == "stages.live_nvmeof")):
+                      or live_window):
                     counters.append(("kv_case_write_diagnostic_stage_count", value,
                                      {"component": component, "counter": field}))
 

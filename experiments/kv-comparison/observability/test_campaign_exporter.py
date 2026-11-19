@@ -470,6 +470,38 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('stage="delivery_ns"} 9e-09', text)
         self.assertNotIn('stage="controller_connect_ns"', text)
 
+    def test_live_write_profile_fields_and_shared_clocks_match_rust_contract(self):
+        expected = json.loads(Path(__file__).with_name("live_nvmeof_write_profile_fields.json").read_text())
+        self.assertEqual(sorted(campaign.LIVE_NVME_WRITE_COUNTERS), expected)
+        evidence = live_write_diagnostics()
+        counters = dict.fromkeys(expected, 0) | evidence["profile"]["stages"]["live_nvmeof"]
+        evidence["profile"]["stages"]["live_nvmeof"] = counters
+        clocks = {"lease_reserve_ns": 125_000_000, "lease_namespace_sync_ns": 250_000_000,
+                  "lease_publish_ns": 375_000_000, "adopt_owner_ns": 500_000_000,
+                  "adopt_close_scan_ns": 625_000_000}
+        events = {"lease_profile_samples": 2, "adopt_profile_samples": 3,
+                  "extent_preleases": 4, "extent_switch_waits": 5}
+        counters.update(clocks | events | {"adopt_close_scan_bytes": 8_192})
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        labels = ('phase="measurement",scope="measurement_nvme_io_cumulative_delta",'
+                  'diagnostic_backend="tidehunter_live_nvmeof",component="stages.live_nvmeof"')
+        for name, value in clocks.items():
+            self.assertIn(f'kv_case_write_diagnostic_stage_seconds{{{labels},stage="{name}"}} {value / 1e9}\n', text)
+        for name, value in events.items():
+            self.assertIn(f'kv_case_write_diagnostic_stage_count{{{labels},counter="{name}"}} {value}\n', text)
+        self.assertIn(f'kv_live_nvmeof_bytes{{{labels},counter="adopt_close_scan_bytes"}} 8192\n', text)
+        self.assertNotIn(f'kv_case_write_diagnostic_stage_count{{{labels},counter="adopt_close_scan_bytes"}}', text)
+        counters["lease_profile_samples"] = 0
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertNotIn('stage="lease_reserve_ns"', text)
+        self.assertIn('stage="adopt_owner_ns"', text)
+        for missing in ("lease_profile_samples", "adopt_close_scan_ns"):
+            with self.subTest(missing=missing):
+                previous = counters.pop(missing)
+                with self.assertRaisesRegex(ValueError, "lacks its clock|lacks its sample count"):
+                    campaign.write_diagnostic_metrics(evidence, {})
+                counters[missing] = previous
+
     def test_leased_fields_are_strict_and_zero_stages_unavailable(self):
         evidence = live_write_diagnostics()
         counters = evidence["profile"]["stages"]["live_nvmeof"]
