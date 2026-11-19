@@ -650,44 +650,51 @@ async def _wait_status(store, state, name, manifest, *, filename='status.json', 
     raise TimeoutError('qualification status missing before deadline')
 
 
+def _status_probe(function, *args, **kwargs):
+    """Return absence inside the I/O task, before cancellation joins it."""
+    try:
+        return function(*args, **kwargs)
+    except ApiError as error:
+        if error.status != 404:
+            raise
+        return None
+
+
+async def _read_status_object(store, key):
+    meta = await _blocking(_status_probe, store.head, key)
+    if meta is None:
+        return None
+    raw = await _blocking(_status_probe, store.get, key, generation=meta['generation'], max_bytes=1024 * 1024)
+    if raw is None:
+        return None
+    return meta, raw
+
+
 async def _wait_status_poll(store, state, name, manifest, *, filename='status.json', host=None):
     key = 'runs/' + state['run_id'] + '/qualification/' + name + '/' + filename
     while time.time() < campaign.parse_time(state['deadline']).timestamp():
-        try:
-            meta = await _blocking(store.head, key)
-            raw = await _blocking(store.get, key, generation=meta['generation'], max_bytes=1024 * 1024)
-            value = json.loads(raw)
-            if host is not None and (_digest(raw) != meta.get('metadata', {}).get('sha256')
-                                     or not re.fullmatch(r'[1-9][0-9]*', str(meta.get('generation', '')))):
-                raise ValueError('qualification status checksum or generation mismatch')
-        except ApiError as exc:
-            if exc.status != 404:
-                raise
+        observed = await _read_status_object(store, key)
+        if observed is None:
             failure_key = 'runs/' + state['run_id'] + '/qualification/' + name + '/startup-error.json'
-            try:
-                failure_meta = await _blocking(store.head, failure_key)
-                failure = json.loads(await _blocking(store.get, failure_key, generation=failure_meta['generation'], max_bytes=1024 * 1024))
-            except ApiError as failure_error:
-                if failure_error.status != 404:
-                    raise
-            else:
+            failure_object = await _read_status_object(store, failure_key)
+            if failure_object is not None:
+                failure = json.loads(failure_object[1])
                 if failure.get('source_sha256') != state['source_sha256'] or failure.get('complete') is not False:
                     raise RuntimeError('startup error identity mismatch')
                 raise RuntimeError('qualification startup failed: ' + str(failure.get('error')))
             if filename == 'preparation.json':
-                status_key = key.removesuffix(filename) + 'status.json'
-                try:
-                    status_meta = await _blocking(store.head, status_key)
-                    status = json.loads(await _blocking(store.get, status_key, generation=status_meta['generation'],
-                                                        max_bytes=1024 * 1024))
-                except ApiError as status_error:
-                    if status_error.status != 404:
-                        raise
-                else:
+                status_object = await _read_status_object(store, key.removesuffix(filename) + 'status.json')
+                if status_object is not None:
+                    status = json.loads(status_object[1])
                     if status.get('complete') is False:
                         raise RuntimeError('guest preparation failed: ' + str(status.get('error')))
             await asyncio.sleep(1)
             continue
+        meta, raw = observed
+        value = json.loads(raw)
+        if host is not None and (_digest(raw) != meta.get('metadata', {}).get('sha256')
+                                 or not re.fullmatch(r'[1-9][0-9]*', str(meta.get('generation', '')))):
+            raise ValueError('qualification status checksum or generation mismatch')
         expected = {'run_id': state['run_id'], 'source_sha256': state['source_sha256'],
                     'manifest_sha256': manifest, 'deadline_utc': state['deadline']}
         if host is not None:
