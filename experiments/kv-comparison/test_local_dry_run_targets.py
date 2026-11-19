@@ -1,4 +1,5 @@
 """Contract tests only; no hardware or target processes are started."""
+from contextlib import nullcontext
 import errno
 import tempfile
 from pathlib import Path
@@ -193,6 +194,159 @@ class TargetsContractTests(unittest.TestCase):
                 targets._kernel_live_worker(self.root, self.root / 'missing-binary',
                                             'rdma', 120, 0, history_persistence='on_disk')
         self.assertEqual(set(self.root.iterdir()), before)
+
+
+class OwnedControllerTeardownTests(unittest.TestCase):
+    HOST = 'nqn.2014-08.org.nvmexpress:uuid:run'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sysfs = Path(self.tmp.name) / 'nvme'
+        self.sysfs.mkdir()
+
+    def controller(self, name, hostnqn=HOST, service=4420, transport='tcp'):
+        path = self.sysfs / name
+        path.mkdir()
+        for attr, value in (('transport', transport), ('subsysnqn', 'nqn.sub'), ('hostnqn', hostnqn),
+                            ('hostid', 'id'), ('queue_count', '2'), ('sqsize', '31'),
+                            ('address', f'traddr=127.0.0.1,trsvcid={service}')):
+            (path / attr).write_text(value + '\n')
+        (path / 'delete_controller').write_text('')
+        return path
+
+    def delete(self, deadline):
+        return targets._delete_owned_controllers(self.sysfs, 'tcp', '127.0.0.1', (4420, 4421),
+                                                 self.HOST, deadline)
+
+    def test_deletes_only_this_runs_controllers_and_waits_for_removal(self):
+        owned = self.controller('nvme0')
+        self.controller('nvme1', hostnqn='nqn.other')
+        self.controller('nvme2', service=9999)
+        self.controller('nvme3', transport='rdma')
+        writes = []
+
+        def kernel_delete(fd, data, timeout):
+            writes.append((targets.os.readlink(f'/proc/self/fd/{fd}'), data))
+            targets.os.close(fd)
+            for child in owned.iterdir():
+                child.unlink()
+            owned.rmdir()
+
+        with patch.object(targets, '_write_fd_bounded', side_effect=kernel_delete):
+            self.assertEqual(self.delete(targets.time.monotonic() + 5), ['nvme0'])
+        self.assertEqual(writes, [(str(owned / 'delete_controller'), b'1')])
+        self.assertEqual(sorted(p.name for p in self.sysfs.iterdir()), ['nvme1', 'nvme2', 'nvme3'])
+
+    def test_controller_that_survives_delete_fails_at_the_deadline(self):
+        owned = self.controller('nvme0')
+        with self.assertRaisesRegex(targets.TargetError, 'remain after delete'):
+            self.delete(targets.time.monotonic() + .2)
+        self.assertEqual((owned / 'delete_controller').read_text(), '1')
+
+    def test_replacement_or_changed_identity_after_enumeration_is_never_deleted(self):
+        real = targets._owned_controllers
+
+        def replace(path):
+            path.rename(Path(self.tmp.name) / 'enumerated')
+            return self.controller('nvme0')
+
+        def rename_host(path):
+            (path / 'hostnqn').write_text('nqn.foreign\n')
+            return path
+
+        for change in (replace, rename_host):
+            with self.subTest(change=change.__name__):
+                original = self.controller('nvme0')
+                changed = []
+
+                def enumerate_then_change(*args):
+                    rows = real(*args)
+                    if not changed:
+                        changed.append(change(original))
+                    return rows
+
+                with patch.object(targets, '_owned_controllers', side_effect=enumerate_then_change):
+                    with self.assertRaises(targets.TargetError) if change is replace else nullcontext():
+                        self.delete(targets.time.monotonic() + .2)
+                self.assertEqual((changed[0] / 'delete_controller').read_text(), '')
+                for path in (self.sysfs / 'nvme0', Path(self.tmp.name) / 'enumerated'):
+                    if path.exists():
+                        self.assertEqual((path / 'delete_controller').read_text(), '')
+                        for child in path.iterdir():
+                            child.unlink()
+                        path.rmdir()
+
+    def test_replacement_after_identity_check_deletes_only_the_pinned_object(self):
+        original = self.controller('nvme0')
+        enumerated = Path(self.tmp.name) / 'enumerated'
+        real_fstat = targets.os.fstat
+
+        def fstat_then_replace(fd):
+            result = real_fstat(fd)
+            if not enumerated.exists():
+                original.rename(enumerated)
+                self.controller('nvme0')
+            return result
+
+        with patch.object(targets.os, 'fstat', side_effect=fstat_then_replace):
+            with self.assertRaisesRegex(targets.TargetError, 'remain after delete'):
+                self.delete(targets.time.monotonic() + .2)
+        self.assertEqual((enumerated / 'delete_controller').read_text(), '1')
+        self.assertEqual((self.sysfs / 'nvme0' / 'delete_controller').read_text(), '')
+
+    def test_no_owned_controller_is_a_no_op(self):
+        self.controller('nvme0', hostnqn='nqn.other')
+        with patch.object(targets, '_write_fd_bounded') as write:
+            self.assertEqual(self.delete(targets.time.monotonic()), [])
+        write.assert_not_called()
+
+    def test_blocking_sysfs_write_is_bounded(self):
+        reader, writer = targets.os.pipe()
+        self.addCleanup(targets.os.close, reader)
+        targets.os.set_blocking(writer, False)
+        try:
+            while True:
+                targets.os.write(writer, b'x' * 65536)
+        except BlockingIOError:
+            pass
+        targets.os.set_blocking(writer, True)
+        with self.assertRaisesRegex(targets.TargetError, 'did not return'):
+            targets._write_fd_bounded(writer, b'1', .2)
+        # Drain the pipe; the helper thread then writes and closes its descriptor.
+        targets.os.set_blocking(reader, False)
+        deadline = targets.time.monotonic() + 5
+        while targets.time.monotonic() < deadline:
+            try:
+                if not targets.os.read(reader, 1 << 20):
+                    break
+            except BlockingIOError:
+                targets.time.sleep(.01)
+
+
+class FailureEvidenceTests(unittest.TestCase):
+    def test_nvme_state_reports_host_and_target_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'nvme/nvme0').mkdir(parents=True)
+            (root / 'nvme/nvme0/state').write_text('live\n')
+            (root / 'block/nvme0n2').mkdir(parents=True)
+            (root / 'block/nvme0n2/nsid').write_text('2\n')
+            namespace = root / 'nvmet/subsystems/nqn.sub/namespaces/2'
+            namespace.mkdir(parents=True)
+            (namespace / 'enable').write_text('1\n')
+            (root / 'nvmet/ports/7/subsystems/nqn.sub').mkdir(parents=True)
+            state = targets._nvme_state(root / 'nvme', root / 'block', root / 'nvmet')
+        self.assertEqual(state['controllers']['nvme0']['state'], 'live')
+        self.assertIn('FileNotFoundError', state['controllers']['nvme0']['subsysnqn'])
+        self.assertEqual(state['disks']['nvme0n2']['nsid'], '2')
+        self.assertEqual(state['target_namespaces']['nqn.sub/2']['enable'], '1')
+        self.assertEqual(state['target_ports'], {'7': ['nqn.sub']})
+
+    def test_process_threads_lists_every_thread_state(self):
+        state = targets._process_threads(targets.os.getpid())
+        self.assertEqual(state['task_count'], len(state['threads']))
+        self.assertTrue(all(row['state'] and 'comm' in row and 'stack' in row for row in state['threads']))
 
 
 class KernelPortsContractTests(unittest.TestCase):

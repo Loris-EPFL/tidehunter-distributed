@@ -43,6 +43,10 @@ impl PartialEq for Identity {
 }
 impl Eq for Identity {}
 
+/// Members opened through one shared controller, keyed by NSID and write
+/// access. Each handle keeps the binding it was resolved and verified from.
+type LeaseNamespaces = HashMap<(u32, bool), (Arc<LiveNamespace>, LiveNamespaceBinding)>;
+
 /// The lease is cheap to share. Namespace handles opened through this object
 /// retain an independent shutdown pin until their file descriptor is dropped.
 /// Clients must release idle leases and namespace handles to permit rollover
@@ -54,11 +58,13 @@ pub struct LiveControllerLease {
     resolver: Arc<LiveNamespaceResolver>,
     // Cold-path lock only: first file open is serialized and bounded by the
     // connect deadline. In-flight reads hold an Arc and never take this lock.
-    namespaces: Mutex<HashMap<(u32, bool), Arc<LiveNamespace>>>,
+    namespaces: Mutex<LeaseNamespaces>,
     #[cfg(any(test, feature = "test-utils"))]
     local_fixture: bool,
 }
 impl LiveControllerLease {
+    /// The namespace this controller was connected and verified with. Under a
+    /// shared lease, other members of the subsystem have their own bindings.
     pub fn binding(&self) -> &LiveNamespaceBinding {
         &self.binding
     }
@@ -82,20 +88,22 @@ impl LiveControllerLease {
         namespace.controller_lease = Some(self.pin.clone());
         Ok(namespace)
     }
+    /// Opens one member of a shared subsystem. Returns the handle and the
+    /// binding of that member, which route evidence must name.
     pub fn namespace(
         &self,
         nsid: u32,
         uuid: [u8; 16],
         access: LiveNamespaceAccess,
         deadline: Instant,
-    ) -> io::Result<Arc<LiveNamespace>> {
+    ) -> io::Result<(Arc<LiveNamespace>, LiveNamespaceBinding)> {
         let mut namespaces = self
             .namespaces
             .lock()
             .map_err(|_| invalid("namespace map poisoned"))?;
         let key = (nsid, access == LiveNamespaceAccess::ReadWrite);
-        if let Some(namespace) = namespaces.get(&key) {
-            return Ok(namespace.clone());
+        if let Some((namespace, binding)) = namespaces.get(&key) {
+            return Ok((namespace.clone(), binding.clone()));
         }
         let binding = self
             .resolver
@@ -103,8 +111,8 @@ impl LiveControllerLease {
         let mut namespace = LiveNamespace::open(&binding)?;
         namespace.controller_lease = Some(self.pin.clone());
         let namespace = Arc::new(namespace);
-        namespaces.insert(key, namespace.clone());
-        Ok(namespace)
+        namespaces.insert(key, (namespace.clone(), binding.clone()));
+        Ok((namespace, binding))
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,8 +140,40 @@ fn idle(lease: &Arc<LiveControllerLease>) -> bool {
     };
     namespaces
         .values()
-        .all(|namespace| Arc::strong_count(namespace) == 1)
+        .all(|(namespace, _)| Arc::strong_count(namespace) == 1)
         && Arc::strong_count(&lease.pin) == namespaces.len() + 1
+}
+/// Local-file fixture member of a shared lease, keyed like `namespace`.
+#[cfg(any(test, feature = "test-utils"))]
+fn cache_local_member(
+    lease: &LiveControllerLease,
+    target: &LiveConnectTarget,
+    access: LiveNamespaceAccess,
+    path: &std::path::Path,
+) -> io::Result<()> {
+    let mut namespace =
+        LiveNamespace::open_local_file(path, target.bytes, target.block_size, access)?;
+    namespace.controller_lease = Some(lease.pin.clone());
+    let binding = LiveNamespaceBinding {
+        namespace_path: path.to_owned(),
+        transport: target.transport,
+        nqn: target.nqn.clone(),
+        uuid: target.uuid,
+        nsid: target.nsid,
+        bytes: target.bytes,
+        block_size: target.block_size,
+        access,
+        spdk: None,
+    };
+    lease
+        .namespaces
+        .lock()
+        .map_err(|_| invalid("namespace map poisoned"))?
+        .insert(
+            (target.nsid, access == LiveNamespaceAccess::ReadWrite),
+            (Arc::new(namespace), binding),
+        );
+    Ok(())
 }
 // Keep bounded controller state inline; boxing would add an allocation at setup.
 #[allow(clippy::large_enum_variant)]
@@ -195,34 +235,12 @@ impl LiveControllerPool {
             }
         };
         if let Some(lease) = existing {
-            let mut namespace = LiveNamespace::open_local_file(
-                path,
-                target.bytes,
-                target.block_size,
-                LiveNamespaceAccess::ReadShared,
-            )?;
-            namespace.controller_lease = Some(lease.pin.clone());
-            lease
-                .namespaces
-                .lock()
-                .map_err(|_| invalid("namespace map poisoned"))?
-                .insert((target.nsid, false), Arc::new(namespace));
-            return Ok(());
+            return cache_local_member(&lease, target, LiveNamespaceAccess::ReadShared, path);
         }
         let parent = path
             .parent()
             .ok_or_else(|| invalid("fixture path has no parent"))?;
         let controller = LiveController::deleted_for_test(&self.registry, parent, target)?;
-        let pin = Arc::new(());
-        let mut namespace = LiveNamespace::open_local_file(
-            path,
-            target.bytes,
-            target.block_size,
-            LiveNamespaceAccess::ReadShared,
-        )?;
-        namespace.controller_lease = Some(pin.clone());
-        let mut namespaces = HashMap::new();
-        namespaces.insert((target.nsid, false), Arc::new(namespace));
         let lease = Arc::new(LiveControllerLease {
             binding: LiveNamespaceBinding {
                 namespace_path: path.to_owned(),
@@ -235,12 +253,13 @@ impl LiveControllerPool {
                 access: LiveNamespaceAccess::ReadShared,
                 spdk: None,
             },
-            pin,
+            pin: Arc::new(()),
             instance: 0,
             resolver: controller.resolver(),
-            namespaces: Mutex::new(namespaces),
+            namespaces: Mutex::new(HashMap::new()),
             local_fixture: true,
         });
+        cache_local_member(&lease, target, LiveNamespaceAccess::ReadShared, path)?;
         let mut identity = Identity {
             target: target.clone(),
             host_nqn: host_nqn.to_owned(),
@@ -288,6 +307,27 @@ impl LiveControllerPool {
         identity.target = target.clone();
         identity.access = access;
         Ok(())
+    }
+
+    /// Local-file fixture: one more member of an already cached shared lease.
+    #[cfg(test)]
+    pub(crate) fn cache_local_member_for_test(
+        &self,
+        target: &LiveConnectTarget,
+        access: LiveNamespaceAccess,
+        path: &std::path::Path,
+    ) -> io::Result<()> {
+        let lease = match self
+            .state
+            .lock()
+            .map_err(|_| invalid("controller pool poisoned"))?
+            .entries
+            .get(&target.nqn)
+        {
+            Some(Entry::Ready { lease, .. }) => lease.clone(),
+            _ => return Err(invalid("fixture controller absent")),
+        };
+        cache_local_member(&lease, target, access, path)
     }
 
     pub fn new(

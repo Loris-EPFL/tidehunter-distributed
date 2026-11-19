@@ -2024,15 +2024,19 @@ impl super::Client {
             .map(|(lease, acquisition, _)| (lease, acquisition))
         }
         .map_err(super::TcpError::component)?;
-        let namespace = if shared {
-            lease.namespace(
-                binding.nsid,
-                binding.uuid,
-                LiveNamespaceAccess::ReadWrite,
-                deadline,
-            )
+        let (namespace, opened) = if shared {
+            lease
+                .namespace(
+                    binding.nsid,
+                    binding.uuid,
+                    LiveNamespaceAccess::ReadWrite,
+                    deadline,
+                )
+                .map(|(namespace, opened)| (namespace, Some(opened)))
         } else {
-            lease.open_namespace().map(std::sync::Arc::new)
+            lease
+                .open_namespace()
+                .map(|namespace| (std::sync::Arc::new(namespace), None))
         }
         .map_err(super::TcpError::component)?;
         let io = LiveIo::new(
@@ -2051,7 +2055,9 @@ impl super::Client {
             counters.record_namespace_connect();
         }
         if let Some(metrics) = &self.live_metrics {
-            let observed = lease.binding();
+            // A shared controller serves every member of its subsystem: name
+            // the member this queue opened, not the one used to connect.
+            let observed = opened.as_ref().unwrap_or_else(|| lease.binding());
             let segment = &leased.extent.segment;
             metrics.record_route(
                 crate::distributed::nvmeof::live_metrics::LiveRouteEvidence {
@@ -3039,6 +3045,26 @@ pub(crate) mod leased_tests {
         }
 
         fn new_with_partitions(tier: DurabilityTier, fragment: u64, partitions: Vec<u32>) -> Self {
+            Self::with_export_mode(tier, fragment, partitions, Default::default())
+        }
+
+        /// Leased owner whose target exports every WAL member of the owner
+        /// under one subsystem, as the kernel CI qualification does.
+        pub(crate) fn per_owner(tier: DurabilityTier, fragment: u64) -> Self {
+            Self::with_export_mode(
+                tier,
+                fragment,
+                vec![2],
+                crate::distributed::nvmeof::LiveExportMode::PerOwner,
+            )
+        }
+
+        fn with_export_mode(
+            tier: DurabilityTier,
+            fragment: u64,
+            partitions: Vec<u32>,
+            export_mode: crate::distributed::nvmeof::LiveExportMode,
+        ) -> Self {
             let temp = tempdir::TempDir::new("leased-coordinator").unwrap();
             let mut config = tcp::tests::config(&temp.path().join("node"));
             config.partition.inventory.partitions = partitions;
@@ -3048,7 +3074,7 @@ pub(crate) mod leased_tests {
             config.partition.group_limits.max_encoded_bytes = 16376.min(fragment as usize - 8);
             config.partition.max_batches = 4096;
             config.partition.max_reference_metadata_bytes = 64 * 1024 * 1024;
-            Self::open(tier, config, temp, Duration::from_secs(10))
+            Self::open_exported(tier, config, temp, Duration::from_secs(10), export_mode)
         }
 
         pub(crate) fn native_geometry() -> Self {
@@ -3076,6 +3102,16 @@ pub(crate) mod leased_tests {
             temp: tempdir::TempDir,
             client_timeout: Duration,
         ) -> Self {
+            Self::open_exported(tier, config, temp, client_timeout, Default::default())
+        }
+
+        fn open_exported(
+            tier: DurabilityTier,
+            config: NodeConfig,
+            temp: tempdir::TempDir,
+            client_timeout: Duration,
+            export_mode: crate::distributed::nvmeof::LiveExportMode,
+        ) -> Self {
             let node = StorageNode::open(config.clone(), tcp::tests::metrics()).unwrap();
             node.set_durability(DurabilityConfig::with_tier(tier))
                 .unwrap();
@@ -3097,7 +3133,7 @@ pub(crate) mod leased_tests {
                     commissioning_port_id: 43,
                     commissioning_service: 4421,
                     spdk: None,
-                    export_mode: Default::default(),
+                    export_mode,
                 },
                 configfs,
             )
@@ -5910,6 +5946,91 @@ mod leased_rollover_tests {
             assert_eq!(owner.receipt_count(), 9, "{tier:?}");
             assert_eq!(owner.receipt_page(0, 16).unwrap(), appended, "{tier:?}");
         }
+    }
+
+    /// per_owner: the queue rebinds to WAL member 2 on the controller that was
+    /// connected for member 1. The writer route must name member 2, which the
+    /// kernel qualification's member-transition proof requires.
+    #[test]
+    fn per_owner_rebind_route_names_the_opened_member() {
+        use crate::distributed::nvmeof::LiveExportMode;
+        use crate::distributed::nvmeof::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
+        use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
+        use crate::distributed::nvmeof::live_pool::LiveControllerPool;
+        let fixture = leased_tests::Fixture::per_owner(DurabilityTier::Native, 16384);
+        let mut client = fixture.writer();
+        client.live_config.as_mut().unwrap().export_mode = LiveExportMode::PerOwner;
+        client.leased_test_set_window(4);
+        let pool_dir = tempdir::TempDir::new("per-owner-route-pool").unwrap();
+        let pool = std::sync::Arc::new(
+            LiveControllerPool::new(
+                LiveConnectionRegistry::open(&pool_dir.path().join("registry")).unwrap(),
+                8,
+                4,
+            )
+            .unwrap(),
+        );
+        client.set_live_pool(pool.clone());
+        // The ordinary-file queue caches both members under one shared lease
+        // and records no route; drive it into member 2.
+        let timeline = WriteTimeline::default();
+        let mut released = Vec::new();
+        for sequence in 0..9 {
+            let mut batches = vec![fixture.batch(sequence)];
+            loop {
+                match client
+                    .submit_leased_group(1, batches, &timeline, 2, true)
+                    .unwrap()
+                {
+                    LeasedSubmit::Submitted(_) => break,
+                    LeasedSubmit::Deferred(deferred) => {
+                        batches = deferred;
+                        client.drain_leased_flights(&mut released, None).unwrap();
+                        client.wait_closing_extent(true).unwrap();
+                    }
+                }
+            }
+        }
+        client.drain_leased_flights(&mut released, None).unwrap();
+        assert!(fixture.metrics.snapshot().routes.is_empty());
+        let lease = &client.live_leased.current.as_ref().unwrap().lease;
+        assert_eq!(lease.extent.segment.file_index, 1);
+        let (binding, path) = (lease.binding.clone(), lease.extent.segment.path.clone());
+        let config = client.live_config.clone().unwrap();
+        pool.cache_local_member_for_test(
+            &LiveConnectTarget {
+                nqn: binding.nqn.clone(),
+                uuid: binding.uuid,
+                nsid: binding.nsid,
+                bytes: binding.bytes,
+                block_size: binding.block_size,
+                address: binding.address.clone(),
+                service: binding.service,
+                transport: binding.transport,
+                spdk: None,
+                geometry: config.queue_geometry,
+            },
+            LiveNamespaceAccess::ReadWrite,
+            &path,
+        )
+        .unwrap();
+        // Rebind through the controller-pool path the kernel route uses.
+        client.drain_live_queue().unwrap();
+        client.live_write_local_fixture = false;
+        client.ensure_leased_queue().unwrap();
+        let routes = fixture.metrics.snapshot().routes;
+        assert_eq!(routes.len(), 1);
+        let writer = routes[0].writer.as_ref().unwrap();
+        let identity = &routes[0].namespace_identity;
+        assert_eq!(writer.file_index, 1);
+        assert_eq!(binding.nsid, 2);
+        assert_eq!(
+            (identity.nqn.as_str(), identity.nsid),
+            (binding.nqn.as_str(), 2)
+        );
+        assert_eq!(identity.uuid, binding.uuid);
+        assert_eq!(identity.namespace_path, path);
+        client.drain_live_queue().unwrap();
     }
 
     #[test]
