@@ -1,5 +1,4 @@
-use crate::distributed::local_db::LocalDbError;
-use crate::distributed::storage::DurableBatch;
+use crate::distributed::storage::{DurableBatch, LocalDbError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

@@ -80,7 +80,6 @@ pub(super) fn configure(config: &mut RemoteDatabaseConfig, profile: LeasedCase) 
         polled_writes: false,
         inline_reads: false,
         queue_geometry: Default::default(),
-        export_mode: Default::default(),
     });
 }
 
@@ -106,8 +105,6 @@ fn try_open_node(
         state_dir,
         commissioning_port_id: 43,
         commissioning_service: 4421,
-        spdk: None,
-        export_mode: Default::default(),
     });
     StorageNode::bench_open_live_fixture(config, recovery_metrics(), configfs)
 }

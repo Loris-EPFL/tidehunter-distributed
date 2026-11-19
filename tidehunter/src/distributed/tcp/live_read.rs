@@ -34,7 +34,9 @@ use crate::distributed::nvmeof::live_metrics::{
 };
 use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
 use crate::distributed::nvmeof::live_pool::{LiveControllerLease, LivePoolAcquisition};
-use crate::distributed::nvmeof::live_storage::{LiveWalSegment, wal_export_name};
+use crate::distributed::nvmeof::live_storage::{
+    FILES_PER_SUBSYSTEM, LiveWalSegment, wal_export_name,
+};
 use crate::distributed::remote_db::ReadTraceChild;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1145,12 +1147,9 @@ impl LiveReadCache {
         position: usize,
         connect_timeout: Duration,
     ) -> Result<Opened, TcpError> {
-        if client
-            .live_config
-            .as_ref()
-            .is_some_and(|config| config.export_mode.files_per_subsystem().is_some())
-            && state.references[position].batch_version.epoch == epoch
-        {
+        // Active-generation records are read through the permanent per-owner
+        // export; older fencing generations resolve a pinned read-only grant.
+        if client.live_config.is_some() && state.references[position].batch_version.epoch == epoch {
             return self.open_permanent(client, epoch, state, position, connect_timeout);
         }
         if self.grants.len() >= LIVE_READ_CACHE_CAPACITY {
@@ -1230,11 +1229,7 @@ impl LiveReadCache {
         let reference = &state.references[position];
         let file_bytes = client.expected.wal_file_bytes;
         let file = reference.batch_address.offset / file_bytes;
-        let files = client
-            .live_config
-            .as_ref()
-            .and_then(|config| config.export_mode.files_per_subsystem())
-            .ok_or_else(|| TcpError::new("permanent live export is not configured"))?;
+        let files = FILES_PER_SUBSYSTEM;
         self.failed_subsystems
             .retain(|(current, _)| *current == epoch);
         if self.failed_subsystems.contains(&(epoch, file / files)) {
@@ -1322,7 +1317,6 @@ impl LiveReadCache {
             address: info.address.clone(),
             service: info.service,
             transport: info.transport,
-            spdk: None,
             geometry: config.queue_geometry,
         };
         if self.grants.len() >= LIVE_READ_CACHE_CAPACITY {
@@ -1397,6 +1391,9 @@ impl LiveReadCache {
             )));
         };
         let binding = &location.binding;
+        binding
+            .require_kernel_target()
+            .map_err(|error| ConnectError::Failed(TcpError::component(error)))?;
         let target = LiveConnectTarget {
             nqn: binding.nqn.clone(),
             uuid: binding.uuid,
@@ -1406,7 +1403,6 @@ impl LiveReadCache {
             address: binding.address.clone(),
             service: binding.service,
             transport: binding.transport,
-            spdk: binding.spdk.clone(),
             geometry: config.queue_geometry,
         };
         let access = if binding.readonly {
@@ -1516,9 +1512,6 @@ impl LiveReadCache {
                 service: target.service,
                 host_nqn: config.host_nqn.clone(),
                 host_id: config.host_id,
-                target_implementation:
-                    crate::distributed::nvmeof::live_metrics::target_implementation(&observed.spdk),
-                spdk: observed.spdk.clone(),
                 writer: None,
                 namespace_identity: LiveNamespaceIdentity {
                     namespace_path: observed.namespace_path.clone(),
@@ -1528,10 +1521,6 @@ impl LiveReadCache {
                     nsid: observed.nsid,
                     bytes: observed.bytes,
                     block_size: observed.block_size,
-                    target_implementation:
-                        crate::distributed::nvmeof::live_metrics::target_implementation(
-                            &observed.spdk,
-                        ),
                 },
             });
         }
@@ -1954,7 +1943,6 @@ pub(crate) mod tests {
                 address: binding.address.clone(),
                 service: binding.service,
                 transport: binding.transport,
-                spdk: binding.spdk.clone(),
                 geometry: Default::default(),
             };
             let dir = tempdir::TempDir::new("export-pool-regression").unwrap();
@@ -2275,7 +2263,6 @@ pub(crate) mod tests {
         client.live_config = Some(super::super::live_client::LiveClientConfig {
             lease_ahead: true,
             polled_writes: false,
-            export_mode: Default::default(),
             host_nqn: "nqn.2026-01.test:inline".into(),
             host_id: [1; 16],
             owner_identities: Default::default(),
@@ -2671,7 +2658,6 @@ pub(crate) mod tests {
         client.live_config = Some(super::super::live_client::LiveClientConfig {
             lease_ahead: true,
             polled_writes: false,
-            export_mode: Default::default(),
             host_nqn: "nqn.2026-01.test:host".into(),
             host_id: [1; 16],
             owner_identities: Default::default(),
@@ -2867,8 +2853,6 @@ pub(crate) mod tests {
             lease: None,
         });
         lane.client.expected.wal_file_bytes = 8192;
-        let config = lane.client.live_config.as_mut().unwrap();
-        config.export_mode = super::super::LiveExportMode::PerOwner;
         lane
     }
 
@@ -2901,7 +2885,6 @@ pub(crate) mod tests {
             address: "127.0.0.1".into(),
             service: 4420,
             transport: NvmeofTransport::Tcp,
-            spdk: None,
             geometry: config.queue_geometry,
         };
         for nsid in [1, 2] {
@@ -3046,7 +3029,6 @@ pub(crate) mod tests {
             address: "127.0.0.1".into(),
             service: 4420,
             transport: NvmeofTransport::Tcp,
-            spdk: None,
             geometry: config.queue_geometry,
         };
         pool.cache_local_shared_namespace(
@@ -3070,7 +3052,7 @@ pub(crate) mod tests {
         lane.client.live_exports = Some((
             1,
             super::super::live_control::LiveExportInfo {
-                mode: super::super::LiveExportMode::PerOwner,
+                mode: crate::distributed::nvmeof::legacy_wire::LiveExportMode::PerOwner,
                 address: target.address.clone(),
                 service: target.service,
                 transport: target.transport,
@@ -3101,50 +3083,6 @@ pub(crate) mod tests {
         lane.client.live_pool = None;
         pool.shutdown(Instant::now() + Duration::from_secs(1))
             .unwrap();
-    }
-
-    #[test]
-    fn open_live_exports_checks_owner_mode_before_pool_access() {
-        use crate::distributed::nvmeof::{
-            LiveTargetConfig, NvmeofTransport, live_target::LiveTargetManager,
-        };
-        let mut lane = lane(4);
-        let root = lane._dir.path();
-        let state = root.join("target");
-        let configfs = root.join("configfs");
-        std::fs::create_dir(&state).unwrap();
-        std::fs::create_dir(&configfs).unwrap();
-        for directory in ["hosts", "ports", "subsystems"] {
-            std::fs::create_dir(configfs.join(directory)).unwrap();
-        }
-        let target = LiveTargetManager::open_fixture(
-            LiveTargetConfig {
-                address: "127.0.0.1".into(),
-                service: 4420,
-                transport: NvmeofTransport::Tcp,
-                host_nqn: "nqn.2026-01.test:host".into(),
-                port_id: 42,
-                state_dir: state,
-                commissioning_port_id: 43,
-                commissioning_service: 4421,
-                spdk: None,
-                export_mode: super::super::LiveExportMode::OnDemand,
-            },
-            configfs,
-        )
-        .unwrap();
-        lane._running.node.install_live_target(target).unwrap();
-        lane.client.fence_to(1).unwrap();
-        lane.client.open_live_exports(1).unwrap();
-        assert_eq!(lane.client.live_exports.as_ref().unwrap().2, 0);
-        lane.client.live_config.as_mut().unwrap().export_mode =
-            super::super::LiveExportMode::PerOwner;
-        assert_eq!(
-            lane.client.open_live_exports(1).unwrap_err().to_string(),
-            "live export mode differs between owner and coordinator"
-        );
-        assert!(lane.client.broken);
-        assert_eq!(lane.metrics.snapshot().counts.metadata_requests, 2);
     }
 
     impl Lane {

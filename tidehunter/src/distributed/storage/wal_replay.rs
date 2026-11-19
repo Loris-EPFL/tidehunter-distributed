@@ -890,8 +890,6 @@ impl PartitionLog {
         let mut log = Self {
             state: Mutex::new(State {
                 #[cfg(feature = "experimental-nvmeof")]
-                pending_live: None,
-                #[cfg(feature = "experimental-nvmeof")]
                 open_live_extent: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 next_live_extent: None,
@@ -901,8 +899,6 @@ impl PartitionLog {
                 live,
                 #[cfg(feature = "experimental-nvmeof")]
                 sealing: false,
-                #[cfg(feature = "experimental-nvmeof")]
-                last_live_complete: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
                 #[cfg(feature = "experimental-nvmeof")]
@@ -930,7 +926,6 @@ impl PartitionLog {
             frontier: std::sync::OnceLock::new(),
             sync_profile: Mutex::new(StorageWriteProfile::default()),
             serve_unsynced: AtomicBool::new(false),
-            worker_claimed: AtomicBool::new(false),
             persistence: Mutex::new(()),
             read_admission: parking_lot::RwLock::new(true),
             #[cfg(feature = "experimental-nvmeof")]

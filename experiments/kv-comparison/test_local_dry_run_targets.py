@@ -172,19 +172,13 @@ class TargetsContractTests(unittest.TestCase):
                 targets._kernel_live_worker(self.root, self.root / 'missing-binary',
                                             'rdma', 120, 0)
         self.assertEqual(set(self.root.iterdir()), before)
-    def test_kernel_qualification_requires_prepared_leased_per_owner_route(self):
-        for tier in ('native', 'synchronous'):
-            live = {'export_mode': 'per_owner', 'leased_durability': tier}
-            target = {'export_mode': 'per_owner'}
+    def test_kernel_qualification_requires_prepared_durability(self):
+        for tier, wrong_tier in (('native', 'synchronous'), ('synchronous', 'native')):
             with self.subTest(tier=tier):
-                targets._admit_kernel_leased_route({'live_nvme': live}, target, tier)
-            for field, value in (('export_mode', 'on_demand'), ('leased_durability', None)):
-                with self.subTest(tier=tier, field=field), self.assertRaisesRegex(
-                        targets.TargetError, 'not per-owner'):
-                    targets._admit_kernel_leased_route({'live_nvme': live | {field: value}}, target, tier)
-            with self.subTest(tier=tier, field='target'), self.assertRaisesRegex(
-                    targets.TargetError, 'not per-owner'):
-                targets._admit_kernel_leased_route({'live_nvme': live}, {'export_mode': 'on_demand'}, tier)
+                targets._admit_kernel_durability({'live_nvme': {'leased_durability': tier}}, tier)
+                for remote in ({}, {'live_nvme': {'leased_durability': wrong_tier}}):
+                    with self.assertRaisesRegex(targets.TargetError, 'durability differs'):
+                        targets._admit_kernel_durability(remote, tier)
 
 
 

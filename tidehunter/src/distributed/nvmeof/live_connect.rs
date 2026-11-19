@@ -263,8 +263,6 @@ pub struct LiveConnectTarget {
     pub service: u16,
     pub transport: NvmeofTransport,
     #[serde(default)]
-    pub spdk: Option<std::sync::Arc<super::SpdkTarget>>,
-    #[serde(default)]
     pub geometry: LiveQueueGeometry,
 }
 
@@ -1163,7 +1161,6 @@ impl LiveNamespaceResolver {
                     nsid: expected_nsid,
                     bytes: self.target.bytes,
                     block_size: self.target.block_size,
-                    spdk: self.target.spdk.clone(),
                     access,
                 };
                 let file = wait_for_device(
@@ -1237,10 +1234,6 @@ impl LiveController {
     pub fn set_read_only(&mut self, nsid: u32, deadline: Instant) -> io::Result<()> {
         if nsid != self.resolver.target.nsid {
             return Err(invalid("namespace id mismatch"));
-        }
-        if self.resolver.target.spdk.is_some() {
-            remaining(deadline)?;
-            return self.verify();
         }
         let controller_path = Path::new("/dev").join(&self.resolver.name);
         let file = wait_for_device(
@@ -1648,7 +1641,6 @@ mod tests {
                 address: "127.0.0.1".into(),
                 service: 4420,
                 transport: NvmeofTransport::Tcp,
-                spdk: None,
                 geometry: Default::default(),
             },
             host_nqn: "nqn.2026-01.test:host".into(),

@@ -1013,44 +1013,11 @@ impl ConcurrentRemoteDatabase {
             .collect()
     }
 
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn install_nvmeof_file_fixture(
-        &self,
-        config: super::super::nvmeof::NvmeofReaderConfig,
-        path: &std::path::Path,
-    ) -> Result<(), LocalDbError> {
-        self.ensure_healthy()?;
-        self.reads
-            .install_nvmeof_file_fixture(config, &self.config, &self.shape, path)
-    }
-
-    /// Install a verified sealed-WAL reader while all reads are idle.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn install_nvmeof_reader(
-        &self,
-        config: super::super::nvmeof::NvmeofReaderConfig,
-    ) -> Result<(), LocalDbError> {
-        self.ensure_healthy()?;
-        self.reads
-            .install_nvmeof_reader(config, &self.config, &self.shape)
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn clear_nvmeof_reader(&self) -> Result<(), LocalDbError> {
-        self.reads.clear_nvmeof_reader()
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn nvmeof_stats(&self) -> Vec<super::super::nvmeof::NvmeofStats> {
-        self.reads.nvmeof_stats()
-    }
-
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn register_nvmeof_metrics(
         &self,
         registry: &prometheus::Registry,
     ) -> Result<(), LocalDbError> {
-        self.reads.register_nvmeof_metrics(registry)?;
         if let Some(metrics) = &self.live_metrics {
             super::super::nvmeof::live_prometheus::register(registry, metrics.clone())
                 .map_err(LocalDbError::component)?;

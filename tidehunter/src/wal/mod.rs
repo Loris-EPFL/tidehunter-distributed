@@ -124,6 +124,8 @@ pub enum WalRandomRead {
 /// cannot advance over it until validated adoption explicitly releases it.
 #[cfg(feature = "experimental-nvmeof")]
 pub(crate) struct ExternalWalAllocation {
+    /// Allocated frame position; only tests inspect it after allocation.
+    #[cfg(test)]
     pub(crate) position: WalPosition,
     pub(crate) file: Arc<File>,
     pub(crate) path: std::path::PathBuf,
@@ -169,6 +171,7 @@ impl WalWriter {
         let path = self.wal.layout.wal_file_name(&files.base_path, file_id);
         let guard = self.wal_tracker.allocated_external(allocation)?;
         Ok(ExternalWalAllocation {
+            #[cfg(test)]
             position: WalPosition::new(position, frame_len),
             file,
             path,

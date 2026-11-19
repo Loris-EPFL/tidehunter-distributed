@@ -406,17 +406,6 @@ impl CompleteBatch {
         self
     }
 
-    /// Bound used after `into_canonical_owned`; excludes the enclosing batch
-    /// struct and allocator bookkeeping. Caller-owned oversized buffers do not
-    /// survive canonicalization. Private constructor backing permits 128 slack.
-    pub(crate) fn canonical_heap_bytes(&self) -> Option<usize> {
-        self.mutations
-            .len()
-            .checked_mul(std::mem::size_of::<Mutation>() + std::mem::size_of::<RecordDescriptor>())
-            .and_then(|metadata| metadata.checked_add(self.encoded.len()))
-            .and_then(|bytes| bytes.checked_add(128))
-    }
-
     pub fn id(&self) -> BatchId {
         self.id
     }

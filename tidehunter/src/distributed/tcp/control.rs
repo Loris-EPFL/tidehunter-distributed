@@ -1,7 +1,7 @@
 //! One bounded FIFO owner for this node's physical append stream and controls.
 //!
-//! Like `GroupCommitWorker`, accepted work owns its payload through completion,
-//! drains on shutdown and never runs synchronous WAL I/O on network progress.
+//! Accepted work owns its payload through completion, drains on shutdown and
+//! never runs synchronous WAL I/O on network progress.
 //! TiKV WriteBarrier::enter services an empty queue immediately, then takes only
 //! callers already behind active work; no timer is needed here. Each Append RPC
 //! remains a complete recovery group, while multiple groups may append during an
@@ -35,6 +35,10 @@ const CONTROL_WORKERS: usize = 4;
 // may still be on its way to the flush queue when a drain runs, so one drain does
 // not always free capacity; each retry's drain then covers it.
 const ADMISSION_RETRIES: usize = 8;
+// Reply to requests of the removed Reserved write, sealed export and record
+// validation routes, whose wire variants stay until the protocol bump.
+#[cfg(feature = "experimental-nvmeof")]
+const REMOVED_ROUTE: &str = "removed owner request (Reserved write, sealed export or record validation route): use archive/multi-design";
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type PublishedLiveLeases = (
@@ -70,8 +74,12 @@ pub(super) struct ControlContext {
     pub(super) wal_member_read: super::super::storage::WalMemberReadPolicy,
     pub(super) read_config: read_executor::ReadExecutorConfig,
     pub(super) read_admission: Arc<read_executor::ReadAdmission>,
+    /// Data-free live-control gate. Lock order: this gate, then the lifecycle
+    /// gate, then the inventory, then `readers`. Fence, seal, retirement, live
+    /// read publication, live pin release and target shutdown take it first;
+    /// terminal publication only `try_lock`s it and defers while it is held.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
+    pub(super) live_control_gate: Mutex<()>,
     #[cfg(test)]
     pub(super) panic_after_append: Arc<AtomicBool>,
 }
@@ -378,23 +386,12 @@ impl Shared {
     }
 }
 
-/// What the owner replies once the covering barrier has completed.
-enum FlushReply {
-    Appended,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    LiveCompleted {
-        validation_ns: u64,
-        validation_samples: u64,
-    },
-}
-
 struct PendingFlush {
     id: u64,
     charge: usize,
     completed: mpsc::SyncSender<reactor::WorkCompletion>,
     log: Arc<super::super::storage::PartitionLog>,
     receipts: Vec<AppendedBatch>,
-    reply: FlushReply,
     profile: ConnectionProfile,
     measured: bool,
     began: Option<Instant>,
@@ -604,10 +601,7 @@ impl ControlOwner {
         &self,
     ) -> Result<super::super::nvmeof::LiveTargetStats, TcpError> {
         let context = &self.shared.context;
-        let leases = context.nvmeof_leases.lock();
-        if leases.has_live_or_quarantined() {
-            return Err(TcpError::new("NVMe-oF leases must drain before shutdown"));
-        }
+        let _gate = context.live_control_gate.lock();
         // Teardown owns the lifecycle gate from here on, so the preparer cannot
         // expose a capability after teardown starts. The inventory is taken
         // only to check and, at the end, to install the shutdown state.
@@ -799,9 +793,7 @@ pub(super) fn is_stream_request(request: &Request) -> bool {
         | Request::CheckpointPosition { .. }
         | Request::DurableProgress { .. } => true,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReserveLiveGroup { .. }
-        | Request::CompleteLiveGroup { .. }
-        | Request::LeaseLiveExtent { .. }
+        Request::LeaseLiveExtent { .. }
         | Request::PreleaseLiveExtent { .. }
         | Request::AdoptLiveExtent { .. }
         | Request::ResolveLiveRecords { .. } => true,
@@ -980,7 +972,6 @@ fn run(shared: &Shared) {
                             completed,
                             log,
                             receipts,
-                            reply: FlushReply::Appended,
                             profile,
                             measured,
                             began,
@@ -1093,54 +1084,6 @@ fn run(shared: &Shared) {
                 complete(
                     shared, id, charge, completed, response, profile, measured, began,
                 );
-                continue;
-            }
-            // Validation and publication run here. Persistence is handed to the
-            // flusher exactly like an append, so the WAL and frontier barriers of
-            // several completions are shared and never run inside this worker.
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::CompleteLiveGroup { epoch, token } => {
-                let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    shared.context.complete_live_published(epoch, token)
-                }))
-                .unwrap_or_else(|_| {
-                    shared.context.poison_readers();
-                    Err(TcpError::new(
-                        "log control owner panicked during live completion; outcome may be unknown; reopen authority",
-                    ))
-                });
-                match completion {
-                    Ok((log, receipts, validation_ns, validation_samples)) => hand_off(
-                        shared,
-                        PendingFlush {
-                            id,
-                            charge,
-                            completed,
-                            log,
-                            receipts,
-                            reply: FlushReply::LiveCompleted {
-                                validation_ns,
-                                validation_samples,
-                            },
-                            profile,
-                            measured,
-                            began,
-                            enqueued: measured.then(Instant::now),
-                            end: 0,
-                        },
-                        None,
-                    ),
-                    Err(error) => complete(
-                        shared,
-                        id,
-                        charge,
-                        completed,
-                        Err(error),
-                        profile,
-                        measured,
-                        began,
-                    ),
-                }
                 continue;
             }
             Request::DurableProgress {
@@ -1403,29 +1346,6 @@ fn wire_receipts(receipts: &[AppendedBatch]) -> Vec<Receipt> {
         .collect()
 }
 
-fn reply_for(
-    reply: &FlushReply,
-    receipts: Vec<Receipt>,
-    persistence: super::super::storage::StorageWriteProfile,
-) -> Response {
-    match reply {
-        FlushReply::Appended => {
-            let _ = persistence;
-            Response::Appended(receipts)
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        FlushReply::LiveCompleted {
-            validation_ns,
-            validation_samples,
-        } => Response::LiveCompleted(Box::new(live_control::LiveCompletionWire {
-            receipts,
-            validation_ns: *validation_ns,
-            validation_samples: *validation_samples,
-            persistence,
-        })),
-    }
-}
-
 /// A persistence owner failure: nothing later may be acknowledged.
 fn fail_open(shared: &Shared, pending: PendingFlush, error: TcpError) {
     shared.context.poison_readers();
@@ -1482,11 +1402,7 @@ fn hand_off(shared: &Shared, mut pending: PendingFlush, prefix_epoch: Option<u64
                 )),
             );
         }
-        let response = reply_for(
-            &pending.reply,
-            wire_receipts(&pending.receipts),
-            super::super::storage::StorageWriteProfile::default(),
-        );
+        let response = Response::Appended(wire_receipts(&pending.receipts));
         complete(
             shared,
             pending.id,
@@ -1705,17 +1621,8 @@ fn flush_batch(shared: &Shared, batch: &mut Vec<PendingFlush>) -> bool {
         }
         match synced {
             Ok(()) => {
-                for (index, pending) in batch.drain(..run).enumerate() {
-                    let persistence = if index == leader {
-                        sync_profile
-                    } else {
-                        super::super::storage::StorageWriteProfile::default()
-                    };
-                    let response = reply_for(
-                        &pending.reply,
-                        wire_receipts(&pending.receipts),
-                        persistence,
-                    );
+                for pending in batch.drain(..run) {
+                    let response = Response::Appended(wire_receipts(&pending.receipts));
                     complete(
                         shared,
                         pending.id,
@@ -1896,16 +1803,14 @@ impl ControlContext {
         if !self.poison_pending.load(Ordering::Acquire) {
             return;
         }
-        // Record/sealed pins protect in-flight I/O. Idle controller pins protect
+        // Record pins protect in-flight I/O. Idle controller pins protect
         // exports only and must not delay terminal authority publication.
+        // A held live-control gate defers publication, as a held lifecycle
+        // gate does below.
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let Some(leases) = self.nvmeof_leases.try_lock() else {
+        let Some(_gate) = self.live_control_gate.try_lock() else {
             return;
         };
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if leases.has_live_or_quarantined() {
-            return;
-        }
         // A lifecycle step holds the gate while it releases the inventory
         // across its syncs; its intermediate states (cleared pins, a fence
         // that resets `terminal` at its end) must not publish terminal
@@ -1943,11 +1848,11 @@ impl ControlContext {
             .iter()
             .map(|lease| (lease.segment.clone(), lease.offset, u64::from(lease.len)))
             .collect();
-        let registry = self.nvmeof_leases.lock();
+        let gate = self.live_control_gate.lock();
         if !self.readers.read().active_valid(epoch, &self.terminal) {
             return Err(TcpError::new("stale live read authority"));
         }
-        // Lock order: registry, lifecycle gate, inventory. Each export below
+        // Lock order: live-control gate, lifecycle gate, inventory. Each export below
         // releases the inventory across its journal syncs and configfs work.
         let mut lifecycle = self.lifecycle.lock();
         let mut inventory = self.inventory.lock();
@@ -1986,7 +1891,7 @@ impl ControlContext {
                     // the durable target registry is drained on restart.
                     drop(inventory);
                     drop(lifecycle);
-                    drop(registry);
+                    drop(gate);
                     self.poison_readers();
                     return Err(TcpError::new(format!(
                         "live read export failed; outcome unknown: {error}"
@@ -2161,35 +2066,6 @@ impl ControlContext {
         );
         Ok((log, receipts))
     }
-    /// Validate the written live frame and publish its receipts. Durability is
-    /// not established here: the caller makes the covering sync follow.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn complete_live_published(
-        &self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<
-        (
-            Arc<super::super::storage::PartitionLog>,
-            Vec<AppendedBatch>,
-            u64,
-            u64,
-        ),
-        TcpError,
-    > {
-        let log = self.inventory.lock().active(epoch)?;
-        let (receipts, validation_ns, validation_samples) = log
-            .complete_live_group_profiled(RequestAuthority { epoch }, token)
-            .map_err(|error| {
-                if matches!(&error, StorageError::IncompleteLiveFrame) {
-                    self.poison_incomplete_live();
-                } else if matches!(&error, StorageError::Unknown(_) | StorageError::Poisoned) {
-                    self.poison_readers();
-                }
-                TcpError::component(error)
-            })?;
-        Ok((log, receipts, validation_ns, validation_samples))
-    }
     /// The preparer never waits for the lifecycle gate: fence, seal and final
     /// shutdown hold it while joining us. Retry at most 30,000 times, parking
     /// 1 ms between attempts. Once it holds the gate it may wait for the
@@ -2226,12 +2102,6 @@ impl ControlContext {
                 return;
             };
             let mut inventory = self.inventory.lock();
-            if inventory
-                .live_export_mode
-                .is_none_or(|mode| mode.files_per_subsystem().is_none())
-            {
-                return;
-            }
             // Acquire observes authority loss during unlocked file preparation.
             if self.poison_pending.load(Ordering::Acquire)
                 || self.terminal.load(Ordering::Acquire)
@@ -2317,29 +2187,13 @@ impl ControlContext {
                 .as_mut()
                 .ok_or_else(|| TcpError::new("live target not configured"))?;
             NodeInventory::reap_idle_live_segments(&mut inventory, target, epoch)?;
-            if inventory
-                .live_export_mode
-                .is_some_and(|mode| mode.files_per_subsystem().is_some())
-            {
-                let (binding, created) = NodeInventory::publish_permanent_segment(
-                    &mut inventory,
-                    target,
-                    &extent.segment,
-                )?;
-                if created {
-                    // Background preparation had not published this file yet.
-                    inventory.record_inline_export(kind);
-                }
-                Ok(binding)
-            } else {
-                NodeInventory::publish_live_segment(
-                    &mut inventory,
-                    target,
-                    &extent.segment,
-                    true,
-                    kind,
-                )
+            let (binding, created) =
+                NodeInventory::publish_permanent_segment(&mut inventory, target, &extent.segment)?;
+            if created {
+                // Background preparation had not published this file yet.
+                inventory.record_inline_export(kind);
             }
+            Ok(binding)
         })();
         #[cfg(test)]
         let publication_call_ns = publication_started
@@ -2453,27 +2307,9 @@ impl ControlContext {
         _drain_log: impl FnOnce(&Arc<super::super::storage::PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<Response, TcpError> {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Request::ReleaseNvmeofExport { epoch, token } = &request {
-            self.nvmeof_leases
-                .lock()
-                .release(*epoch, *token)
-                .map_err(TcpError::component)?;
-            self.finish_poison_if_quiescent();
-            return Ok(Response::NvmeofExportReleased);
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Request::ReleaseNvmeofEpochPin { epoch, token } = &request {
-            self.nvmeof_leases
-                .lock()
-                .release_epoch_pin(*epoch, *token)
-                .map_err(TcpError::component)?;
-            self.finish_poison_if_quiescent();
-            return Ok(Response::NvmeofEpochReleased);
-        }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Request::ReleaseLiveEpochPin { epoch, token } = &request {
             let (result, failed) = {
-                let _leases = self.nvmeof_leases.lock();
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 let mut inventory = self.inventory.lock();
                 let result = if inventory.live_pins.contains_key(token) {
@@ -2536,13 +2372,8 @@ impl ControlContext {
                 let target = lifecycle
                     .as_mut()
                     .ok_or_else(|| TcpError::new("live target not configured"))?;
-                let mode = target.export_mode();
                 let (address, service, transport) = target.endpoint();
-                let count = if mode.files_per_subsystem().is_some() {
-                    log.live_file_count().map_err(TcpError::component)?
-                } else {
-                    0
-                };
+                let count = log.live_file_count().map_err(TcpError::component)?;
                 for file in 0..count {
                     let segment = match log.live_segment(file) {
                         Ok(segment) => segment,
@@ -2564,7 +2395,7 @@ impl ControlContext {
                     }
                 }
                 Ok(Response::LiveExports(live_control::LiveExportInfo {
-                    mode,
+                    mode: super::super::nvmeof::legacy_wire::LiveExportMode::PerOwner,
                     address,
                     service,
                     transport,
@@ -2580,107 +2411,12 @@ impl ControlContext {
                 "live extent requires the stream durability dispatch",
             )),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ReserveLiveGroup { epoch, descriptor } => {
-                use super::super::nvmeof::live_storage::LiveReserveResult;
-                // The inventory covers only the active-log lookup: the
-                // reservation and its history wait are log I/O, and fence or
-                // seal cannot run while this stream request holds its slot.
-                let log = {
-                    let inventory = self.inventory.lock();
-                    if inventory
-                        .live_export_mode
-                        .is_some_and(|mode| mode.files_per_subsystem().is_some())
-                    {
-                        return Err(TcpError::new(
-                            "permanent live export requires leased write mode",
-                        ));
-                    }
-                    inventory.active(epoch)?
-                };
-                let mut result =
-                    log.reserve_live_group(RequestAuthority { epoch }, descriptor.clone());
-                if matches!(result, Err(StorageError::NeedsPersistence)) {
-                    log.wait_history().map_err(TcpError::component)?;
-                    result = log.reserve_live_group(RequestAuthority { epoch }, descriptor);
-                }
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        if matches!(&error, StorageError::Unknown(_) | StorageError::Poisoned) {
-                            self.poison_readers();
-                        }
-                        return Err(TcpError::component(error));
-                    }
-                };
-                match result {
-                    LiveReserveResult::Existing(receipts) => {
-                        let durable = log.persist_many(&receipts).map_err(|error| {
-                            self.poison_readers();
-                            TcpError::component(error)
-                        })?;
-                        Ok(Response::LiveReserved(
-                            live_control::LiveReserveWire::Existing(
-                                durable.into_iter().map(Receipt::from_durable).collect(),
-                            ),
-                        ))
-                    }
-                    LiveReserveResult::Reserved(reservation) => {
-                        let mut lifecycle = self.lifecycle.lock();
-                        let mut inventory = self.inventory.lock();
-                        let binding = (|| {
-                            if !Arc::ptr_eq(&inventory.active(epoch)?, &log) {
-                                return Err(TcpError::new("live reservation authority changed"));
-                            }
-                            let target = lifecycle
-                                .as_mut()
-                                .ok_or_else(|| TcpError::new("live target not configured"))?;
-                            NodeInventory::reap_idle_live_segments(&mut inventory, target, epoch)?;
-                            NodeInventory::publish_live_segment(
-                                &mut inventory,
-                                target,
-                                &reservation.segment,
-                                true,
-                                super::inventory::InlineExport::Reserve,
-                            )
-                        })();
-                        drop(inventory);
-                        drop(lifecycle);
-                        let binding = binding.map_err(|error| {
-                            log.poison_writer();
-                            self.poison_readers();
-                            TcpError::new(format!(
-                                "live target publication failed; outcome unknown: {error}"
-                            ))
-                        })?;
-                        Ok(Response::LiveReserved(
-                            live_control::LiveReserveWire::Reserved(LiveReserved {
-                                reservation,
-                                binding,
-                            }),
-                        ))
-                    }
-                }
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::CompleteLiveGroup { epoch, token } => {
-                let (log, receipts, validation_ns, validation_samples) =
-                    self.complete_live_published(epoch, token)?;
-                let mut persistence = super::super::storage::StorageWriteProfile::default();
-                let durable = log
-                    .persist_many_profiled(&receipts, &mut persistence)
-                    .map_err(|error| {
-                        self.poison_readers();
-                        TcpError::component(error)
-                    })?;
-                Ok(Response::LiveCompleted(Box::new(
-                    live_control::LiveCompletionWire {
-                        receipts: durable.into_iter().map(Receipt::from_durable).collect(),
-                        validation_ns,
-                        validation_samples,
-                        persistence,
-                    },
-                )))
-            }
+            Request::ReserveLiveGroup { .. }
+            | Request::CompleteLiveGroup { .. }
+            | Request::RegisterNvmeofEpochPin { .. }
+            | Request::ReleaseNvmeofEpochPin { .. }
+            | Request::RegisterNvmeofExport { .. }
+            | Request::ReleaseNvmeofExport { .. } => Err(TcpError::new(REMOVED_ROUTE)),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ResolveLiveRecords {
                 authority_epoch,
@@ -2689,11 +2425,7 @@ impl ControlContext {
                 if references
                     .iter()
                     .any(|reference| reference.batch_version.epoch == authority_epoch)
-                    && self
-                        .inventory
-                        .lock()
-                        .live_export_mode
-                        .is_some_and(|mode| mode.files_per_subsystem().is_some())
+                    && self.inventory.lock().live_target_configured
                 {
                     return Err(TcpError::new(
                         "live record resolution is disabled for the active epoch in permanent export mode",
@@ -2923,10 +2655,7 @@ impl ControlContext {
             }
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ShutdownLiveTarget { epoch } => {
-                let leases = self.nvmeof_leases.lock();
-                if leases.has_live_or_quarantined() {
-                    return Err(TcpError::new("NVMe-oF leases must drain before shutdown"));
-                }
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 let target = lifecycle
                     .as_mut()
@@ -2935,131 +2664,11 @@ impl ControlContext {
                     .map(Response::LiveTargetStats)
             }
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::RegisterNvmeofEpochPin { epoch } => {
-                let mut leases = self.nvmeof_leases.lock();
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                {
-                    return Err(TcpError::new("NVMe-oF epoch pin authority mismatch"));
-                }
-                let token = leases
-                    .register_epoch_pin(epoch)
-                    .map_err(TcpError::component)?;
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                {
-                    leases
-                        .release_epoch_pin(epoch, token)
-                        .map_err(TcpError::component)?;
-                    return Err(TcpError::new("authority changed during NVMe-oF epoch pin"));
-                }
-                Ok(Response::NvmeofEpochPinned(token))
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ReleaseNvmeofEpochPin { .. }
-            | Request::ReleaseLiveEpochPin { .. }
-            | Request::ReleaseLiveExportPin { .. } => {
-                unreachable!("release handled before health check")
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::RegisterNvmeofExport {
-                epoch,
-                binding,
-                reference,
-            } => {
-                let mut leases = self.nvmeof_leases.lock();
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                    || binding.database_uuid != self.partition.inventory.database
-                    || binding.partition != self.partition.partition
-                    || binding.epoch > epoch
-                    || binding.generation != binding.epoch
-                    || binding.wal_file_bytes != self.partition.wal_file_bytes
-                {
-                    return Err(TcpError::new("NVMe-oF export authority mismatch"));
-                }
-                // Retirement is serialized by this same lease gate. Recheck a
-                // durable member of the exact source file at the admission
-                // boundary, after any earlier paged catalog validation.
-                let snapshot = self.readers.read().snapshot(
-                    epoch,
-                    std::slice::from_ref(&reference),
-                    &self.terminal,
-                )?;
-                let (log, member) = snapshot
-                    .members
-                    .first()
-                    .ok_or_else(|| TcpError::new("missing export authority member"))?;
-                let location = log
-                    .nvmeof_record_location(member)
-                    .map_err(TcpError::component)?;
-                if location.reference != reference
-                    || reference.batch_version.epoch != binding.epoch
-                    || reference.batch_address.segment_generation != binding.generation
-                    || location.wal_file_bytes != binding.wal_file_bytes
-                    || location.source_file_index != binding.source_file_index
-                    || location.source_device != binding.source_device
-                    || location.source_inode != binding.source_inode
-                    || location.source_file_len != binding.image_len
-                    || location.durable_frontier != binding.durable_frontier
-                    || !self.readers.read().snapshot_valid(
-                        epoch,
-                        snapshot.generation,
-                        &self.terminal,
-                    )
-                {
-                    return Err(TcpError::new(
-                        "NVMe-oF source no longer matches owner authority",
-                    ));
-                }
-                let token = leases
-                    .register(epoch, &binding)
-                    .map_err(TcpError::component)?;
-                if self.poison_pending.load(Ordering::Acquire)
-                    || !self.readers.read().active_valid(epoch, &self.terminal)
-                {
-                    leases.release(epoch, token).map_err(TcpError::component)?;
-                    return Err(TcpError::new(
-                        "authority changed during NVMe-oF registration",
-                    ));
-                }
-                Ok(Response::NvmeofExportRegistered(token))
-            }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Request::ReleaseNvmeofExport { .. } => {
+            Request::ReleaseLiveEpochPin { .. } | Request::ReleaseLiveExportPin { .. } => {
                 unreachable!("release handled before health check")
             }
             #[cfg(feature = "experimental-nvmeof")]
-            Request::ValidateRecordReferences { epoch, references } => {
-                if references.is_empty() || references.len() > limits.max_reads.min(256) {
-                    return Err(TcpError::new("record validation count exceeds bound"));
-                }
-                let snapshot = self
-                    .readers
-                    .read()
-                    .snapshot(epoch, &references, &self.terminal)?;
-                let generation = snapshot.generation;
-                // Pageable descriptor I/O runs on this bounded control owner,
-                // never under reader authority or on the network reactor.
-                let locations = snapshot
-                    .members
-                    .iter()
-                    .map(|(log, reference)| {
-                        log.nvmeof_record_location(reference)
-                            .map_err(TcpError::component)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if !self
-                    .readers
-                    .read()
-                    .snapshot_valid(epoch, generation, &self.terminal)
-                {
-                    return Err(TcpError::new(
-                        "reader authority changed during export admission",
-                    ));
-                }
-                Ok(Response::ValidatedRecordReferences(locations))
-            }
+            Request::ValidateRecordReferences { .. } => Err(TcpError::new(REMOVED_ROUTE)),
             Request::Checkpoint {
                 authority_epoch,
                 epoch,
@@ -3160,13 +2769,7 @@ impl ControlContext {
                 files,
             } => {
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before retirement"));
-                    }
-                    leases
-                };
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::retire_files(
                     &mut self.inventory.lock(),
@@ -3185,13 +2788,7 @@ impl ControlContext {
             } => {
                 self.inventory.lock().require_history(true)?;
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before retirement"));
-                    }
-                    leases
-                };
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::retire_wal_files(
                     &mut self.inventory.lock(),
@@ -3230,15 +2827,9 @@ impl ControlContext {
             }
             Request::Fence { epoch } => {
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before fencing"));
-                    }
-                    leases
-                };
-                // Lock order: leases, lifecycle gate, inventory. The fence
-                // releases the inventory across every revocation and sync.
+                let _gate = self.live_control_gate.lock();
+                // Lock order: live-control gate, lifecycle gate, inventory. The
+                // fence releases the inventory across every revocation and sync.
                 let mut lifecycle = self.lifecycle.lock();
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 let mut status = if self.recoverable_live_failure.load(Ordering::Acquire) {
@@ -3324,13 +2915,7 @@ impl ControlContext {
             }
             Request::Seal { epoch } => {
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let _leases = {
-                    let leases = self.nvmeof_leases.lock();
-                    if leases.has_live_or_quarantined() {
-                        return Err(TcpError::new("NVMe-oF leases must drain before sealing"));
-                    }
-                    leases
-                };
+                let _gate = self.live_control_gate.lock();
                 let mut lifecycle = self.lifecycle.lock();
                 NodeInventory::seal_epoch(
                     &mut self.inventory.lock(),

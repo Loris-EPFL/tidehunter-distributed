@@ -1139,8 +1139,6 @@ mod tests {
                     state_dir,
                     commissioning_port_id: 43,
                     commissioning_service: 4421,
-                    spdk: None,
-                    export_mode: Default::default(),
                 },
                 configfs,
             )
@@ -1175,7 +1173,6 @@ mod tests {
                     address: binding.address.clone(),
                     service: binding.service,
                     transport: binding.transport,
-                    spdk: binding.spdk.clone(),
                     geometry: Default::default(),
                 };
                 let (lease, _, _) = worker_pool.acquire_pinned(

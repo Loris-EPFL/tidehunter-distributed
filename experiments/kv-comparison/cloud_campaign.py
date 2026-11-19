@@ -2002,8 +2002,13 @@ LIVE_NVME_COUNTERS = ("completed_read_ops", "completed_read_bytes", "completed_w
                       "unknown_writes", "errors", "queue_ns", "queue_samples",
                       "submit_ns", "submit_samples", "cq_ns", "cq_samples",
                       "control_ns", "control_samples", "validation_ns", "validation_samples",
-                      "publication_ns", "publication_samples",
+                      "allocation_ns", "allocation_samples", "publication_ns", "publication_samples",
                       "namespace_setup_ns", "namespace_setup_samples", "read_io_ns", "read_io_samples",
+                      "persistence_ns", "persistence_samples",
+                      "wal_persistence_ns", "wal_persistence_samples",
+                      "wal_namespace_ns", "wal_namespace_samples",
+                      "frontier_file_ns", "frontier_file_samples",
+                      "frontier_namespace_ns", "frontier_namespace_samples",
                       "route_evidence_dropped", "fence_evidence_dropped")
 
 def requested_leased_sync(job):
@@ -2234,7 +2239,7 @@ def admit_live_write_contract(job, backend_info):
         configuration = backend_info.get("configuration", {})
         geometry = {"io_queues": job["live_io_queues"], "queue_size": job["live_io_queue_size"],
                     "poll_queues": job["live_poll_queues"]}
-        if (configuration.get("live_export_mode") != job["live_export_mode"]
+        if (configuration.get("live_export_mode", "per_owner") != "per_owner"
                 or configuration.get("live_queue_geometry") != geometry
                 or any(configuration.get(key, None if key in job else default) != job.get(key, default)
                        for key, default in (("live_lease_ahead", True), ("live_polled_writes", False)))):

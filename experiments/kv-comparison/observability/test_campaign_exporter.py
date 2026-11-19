@@ -725,6 +725,17 @@ class CaseIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected a nonnegative count"):
             campaign.read_diagnostic_metrics(evidence, {})
 
+    def test_retired_read_retry_counters_remain_admissible_without_exporting_them(self):
+        evidence = read_diagnostics()
+        evidence["profile"]["counters"].update(
+            read_profile_admission_retry_credit=1,
+            read_profile_admission_retry_config=2,
+            read_profile_admission_retry_mixed=3)
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('counter="read_profile_admission_retry_credit"', text)
+        self.assertNotIn("read_profile_admission_retry_config", text)
+        self.assertNotIn("read_profile_admission_retry_mixed", text)
+
     def test_read_diagnostics_no_data_and_validation(self):
         self.assertEqual(campaign.read_diagnostic_metrics(None, {}), "")
         evidence = read_diagnostics()

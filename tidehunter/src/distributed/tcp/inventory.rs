@@ -1,5 +1,5 @@
-//! One node's durable epoch fence. Mirrors LocalInventory's preparing-before-
-//! files and active-after-registration ordering, with one physical partition.
+//! One node's durable epoch fence: an epoch is recorded preparing before its
+//! files exist and active after registration, with one physical partition.
 //! This is a static RF1 deployment: local filesystem locks exclude node restarts,
 //! while the service rejects stale epochs. It does not elect a coordinator.
 
@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MANIFEST: &str = "tcp-node-inventory-v1";
 const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
+/// Registry of the removed sealed-export route; see `reject_legacy_owner_state`.
+const LEGACY_EXPORT_LEASES: &str = "nvmeof-export-leases-v1";
 // Bound idle history namespaces, subsystem objects and pinned target FDs
 // independently of WAL history size. In-flight pages keep their separate pins.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -23,7 +25,6 @@ pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InlineExport {
-    Reserve,
     Lease,
     Rollover,
     Prelease,
@@ -112,7 +113,8 @@ pub(super) type LifecycleSlot = ();
 /// that needs a durable record (a configfs object, an export, a revocation)
 /// runs only after that record's sync returned.
 ///
-/// Lock order: `nvmeof_leases` → lifecycle gate → `NodeInventory` →
+/// Lock order: the control context's live-control gate → lifecycle gate →
+/// `NodeInventory` →
 /// `readers`. The inventory mutex is never held across a sync: holders of the
 /// gate release it for every I/O step (`InventoryAccess::released`) and
 /// retake it only to read or install state. The gate is never taken while the
@@ -152,7 +154,7 @@ fn live_target<'a>(
     inventory: &NodeInventory,
     slot: &'a mut LifecycleSlot,
 ) -> Result<Option<&'a mut super::super::nvmeof::live_target::LiveTargetManager>, TcpError> {
-    match (inventory.live_export_mode.is_some(), slot.as_mut()) {
+    match (inventory.live_target_configured, slot.as_mut()) {
         (false, None) => Ok(None),
         (true, Some(target)) => Ok(Some(target)),
         _ => Err(TcpError::new(
@@ -262,13 +264,10 @@ pub struct NodeInventory {
     history_failure_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     // Owner incarnation, created once at open (see `durable_progress::new_incarnation`).
     incarnation: [u8; 16],
-    // Partition handles each retain this root lock as well.
+    /// Whether a live target is installed. Immutable after installation, so
+    /// reading it needs no gate.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
-    /// Export mode of the installed live target; `None` when no live target is
-    /// configured. Immutable after installation, so reading it needs no gate.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(super) live_export_mode: Option<super::super::nvmeof::LiveExportMode>,
+    pub(super) live_target_configured: bool,
     /// Cloned out at node open. Never locked by inventory methods: callers
     /// take it before the inventory (see `LifecycleGate`).
     pub(super) lifecycle: LifecycleGate,
@@ -314,91 +313,6 @@ pub struct NodeInventory {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fenced_export_pins: BTreeMap<[u8; 16], u64>,
     lock: Arc<DbLock>,
-}
-
-/// Offline access to one explicitly sealed owner epoch, retaining the owner lock.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-pub struct SealedOwnerExport {
-    log: Arc<PartitionLog>,
-    _lock: DbLock,
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-impl SealedOwnerExport {
-    pub fn open(config: &NodeConfig, epoch: u64, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
-        config.partition.validate().map_err(TcpError::component)?;
-        if epoch == 0
-            || config.partition.inventory.epoch != 1
-            || config.partition.inventory.segment_generation != 1
-            || !(1..=1024).contains(&config.max_epochs)
-        {
-            return Err(TcpError::new("invalid owner export configuration"));
-        }
-        let root = config.root.canonicalize()?;
-        let lock = DbLock::acquire(&root, Duration::ZERO)?;
-        let path = root.join(MANIFEST);
-        if !fs::symlink_metadata(&path)?.file_type().is_file() {
-            return Err(TcpError::new("node manifest is not a regular file"));
-        }
-        let manifest: Manifest = read_metadata(&path).map_err(TcpError::component)?;
-        let shape = KeyShape::from_yaml(&config.shape_yaml).map_err(TcpError::component)?;
-        if manifest.format != 1
-            || manifest.partition != config.partition
-            || manifest.shape_yaml != shape.to_yaml().map_err(TcpError::component)?
-            || manifest.max_epochs != config.max_epochs
-            || manifest.epochs.len() > config.max_epochs
-            || manifest.epochs.iter().any(|e| e.epoch == 0)
-            || manifest.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch)
-            || !manifest
-                .epochs
-                .iter()
-                .any(|e| e.epoch == epoch && e.state == EpochState::Sealed)
-        {
-            return Err(TcpError::new(
-                "owner inventory does not contain the requested sealed epoch",
-            ));
-        }
-        let leases = super::super::nvmeof::lease::ExportLeaseRegistry::open(
-            &root,
-            1024,
-            super::super::nvmeof::MAX_EXPORT_MANIFEST_BYTES,
-        )
-        .map_err(TcpError::component)?;
-        if leases.has_live_or_quarantined() {
-            return Err(TcpError::new(
-                "owner export blocked by live or quarantined NVMe-oF leases",
-            ));
-        }
-        let path = epoch_path(&root, epoch);
-        directory(&path)?;
-        let log =
-            PartitionLog::recover_sealed(&path, &partition_at(&config.partition, epoch), metrics)
-                .map_err(TcpError::component)?;
-        if log.key_shape().to_yaml().map_err(TcpError::component)? != manifest.shape_yaml {
-            return Err(TcpError::new(
-                "owner export key shape differs from inventory",
-            ));
-        }
-        Ok(Self {
-            log: Arc::new(log),
-            _lock: lock,
-        })
-    }
-
-    pub fn log(&self) -> &PartitionLog {
-        &self.log
-    }
-
-    /// Export through the retained owner lock without exposing a clonable log handle.
-    pub fn export_sealed_readset(
-        &self,
-        directory: &Path,
-        references: &[ValueRecordReference],
-        config: &super::super::nvmeof::ExportConfig,
-    ) -> Result<super::super::nvmeof::ExportManifest, super::super::storage::StorageError> {
-        self.log
-            .export_sealed_readset(directory, references, config)
-    }
 }
 
 #[derive(Default)]
@@ -523,18 +437,7 @@ impl NodeInventory {
         directory(&config.root)?;
         config.root = config.root.canonicalize()?;
         let lock = Arc::new(DbLock::acquire(&config.root, Duration::ZERO)?);
-        // A build without the NVMe-oF revoker must never silently open an
-        // owner whose prior kernel namespace capabilities may still exist.
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        match fs::symlink_metadata(config.root.join("nvmeof-export-leases-v1")) {
-            Ok(_) => {
-                return Err(TcpError::new(
-                    "NVMe-oF lease registry requires recovery with the Linux NVMe-oF feature",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        reject_legacy_owner_state(&config.root)?;
         #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
         match fs::symlink_metadata(config.root.join(LIVE_TARGET_CONFIG)) {
             Ok(_) => {
@@ -652,23 +555,6 @@ impl NodeInventory {
                 Err(error) => return Err(error.into()),
             }
         };
-        // Registry recovery occurs under the node lock, before any old epoch is
-        // recovered or sealed. Orphaned admissions stay quarantined.
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let nvmeof_leases = Arc::new(Mutex::new(
-            super::super::nvmeof::lease::ExportLeaseRegistry::open(
-                &config.root,
-                1024,
-                super::super::nvmeof::MAX_EXPORT_MANIFEST_BYTES,
-            )
-            .map_err(TcpError::component)?,
-        ));
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if nvmeof_leases.lock().has_live_or_quarantined() {
-            return Err(TcpError::new(
-                "unreleased NVMe-oF leases are quarantined; owner recovery requires proven initiator fencing",
-            ));
-        }
         for entry in fs::read_dir(&config.root)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -756,9 +642,7 @@ impl NodeInventory {
             history_failure_notifier: None,
             incarnation: super::durable_progress::new_incarnation()?,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            nvmeof_leases,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            live_export_mode: live_target.as_ref().map(|target| target.export_mode()),
+            live_target_configured: live_target.is_some(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             lifecycle: Arc::new(Mutex::new(live_target)),
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
@@ -853,7 +737,7 @@ impl NodeInventory {
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn recoverable_status(&self) -> Result<NodeStatus, TcpError> {
-        if !self.healthy || self.live_export_mode.is_none() || self.live_shutdown {
+        if !self.healthy || !self.live_target_configured || self.live_shutdown {
             return Err(TcpError::new("live owner requires restart"));
         }
         self.status_snapshot(false)
@@ -886,7 +770,7 @@ impl NodeInventory {
             recovery_page_batches: 1024,
             polling: PollingPolicy::Adaptive,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            live_nvmeof: self.live_export_mode.is_some() && !self.live_shutdown,
+            live_nvmeof: self.live_target_configured && !self.live_shutdown,
             #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
             live_nvmeof: false,
             // The control owner holds the tier; it sets this field in its replies.
@@ -929,7 +813,7 @@ impl NodeInventory {
         drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<NodeStatus, TcpError> {
         if !inventory.healthy
-            || inventory.live_export_mode.is_none()
+            || !inventory.live_target_configured
             || !inventory
                 .manifest
                 .epochs
@@ -1218,7 +1102,6 @@ impl NodeInventory {
     pub(super) fn record_inline_export(&mut self, kind: InlineExport) {
         let stats = &mut self.inline_exports;
         let count = match kind {
-            InlineExport::Reserve => &mut stats.reserve,
             InlineExport::Lease => &mut stats.lease,
             InlineExport::Rollover => &mut stats.rollover,
             InlineExport::Prelease => &mut stats.prelease,
@@ -1284,11 +1167,7 @@ impl NodeInventory {
             }
             return Ok((binding.clone(), false));
         }
-        let files = inventory
-            .live_export_mode
-            .ok_or_else(|| TcpError::new("live target not configured"))?
-            .files_per_subsystem()
-            .ok_or_else(|| TcpError::new("permanent live export is not configured"))?;
+        let files = super::super::nvmeof::live_storage::FILES_PER_SUBSYSTEM;
         let name = wal_export_name(
             files,
             segment.database,
@@ -1460,11 +1339,8 @@ impl NodeInventory {
             let inventory: &NodeInventory = inventory;
             for key in keys {
                 let releasable = match inventory.live_bindings.get(&key) {
-                    Some((_, binding, _)) if binding.permanent => false,
-                    Some((_, _, false)) => inventory
-                        .live_export_mode
-                        .is_none_or(|mode| mode.files_per_subsystem().is_none()),
-                    Some((_, _, true)) => inventory
+                    Some((_, binding, writable)) if binding.permanent || !writable => false,
+                    Some(_) => inventory
                         .logs
                         .get(&key.0)
                         .ok_or_else(|| TcpError::new("live segment stream absent"))?
@@ -1547,25 +1423,6 @@ impl NodeInventory {
         }
         inventory.idle_history_exports.push_back(key);
         Ok(())
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", any(test, feature = "test-utils")))]
-    pub(super) fn sealed_nvmeof_log(&self, epoch: u64) -> Result<Arc<PartitionLog>, TcpError> {
-        self.ensure_healthy()?;
-        if !self
-            .manifest
-            .epochs
-            .iter()
-            .any(|entry| entry.epoch == epoch && entry.state == EpochState::Sealed)
-        {
-            return Err(TcpError::new(
-                "NVMe-oF export requires a sealed source epoch",
-            ));
-        }
-        self.logs
-            .get(&epoch)
-            .cloned()
-            .ok_or_else(|| TcpError::new("sealed export source is absent"))
     }
     /// Seal an exclusively owned inventory. A live inventory needs its target
     /// registry: use `seal_epoch` with the lifecycle gate instead.
@@ -1961,7 +1818,7 @@ impl NodeInventory {
         inventory.require_history(false)?;
         inventory.ensure_healthy()?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if inventory.live_export_mode.is_some() {
+        if inventory.live_target_configured {
             return Err(TcpError::new(
                 "live NVMe-oF recovery requires metadata-only control",
             ));
@@ -2109,7 +1966,7 @@ impl NodeInventory {
         inventory.require_history(true)?;
         inventory.active(authority_epoch)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if inventory.live_export_mode.is_some() {
+        if inventory.live_target_configured {
             return Err(TcpError::new(
                 "live NVMe-oF recovery requires metadata-only control",
             ));
@@ -2223,6 +2080,65 @@ fn persist(root: &Path, manifest: &Manifest) -> Result<(), TcpError> {
     .map_err(TcpError::component)
 }
 
+/// Fail before any mutation if this owner root holds state of a removed mode:
+/// admissions of the sealed-export registry, or a live target marker written
+/// before the removal of the `spdk` and `export_mode` keys. An empty sealed
+/// registry holds nothing and is ignored. No compatibility path exists.
+fn reject_legacy_owner_state(root: &Path) -> Result<(), TcpError> {
+    #[derive(Deserialize)]
+    struct ExportLeases {
+        #[serde(default)]
+        entries: Vec<serde_yaml::Value>,
+        #[serde(default)]
+        epoch_pins: Vec<serde_yaml::Value>,
+    }
+    #[derive(Deserialize)]
+    struct Marker {
+        config: serde_yaml::Mapping,
+    }
+    let legacy = |mode: &str| {
+        TcpError::new(format!(
+            "unsupported legacy distributed mode {mode}: use archive/multi-design"
+        ))
+    };
+    let present = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(TcpError::from(error)),
+    };
+    let leases = root.join(LEGACY_EXPORT_LEASES);
+    if present(&leases)? {
+        let leases: ExportLeases = read_metadata(&leases).map_err(TcpError::component)?;
+        if !leases.entries.is_empty() || !leases.epoch_pins.is_empty() {
+            return Err(legacy("sealed_export"));
+        }
+    }
+    let marker = root.join(LIVE_TARGET_CONFIG);
+    if present(&marker)? {
+        let marker: Marker = read_metadata(&marker).map_err(TcpError::component)?;
+        if marker
+            .config
+            .get("spdk")
+            .is_some_and(|spdk| !spdk.is_null())
+        {
+            return Err(legacy("spdk"));
+        }
+        match marker
+            .config
+            .get("export_mode")
+            .map(serde_yaml::Value::as_str)
+        {
+            Some(Some(mode @ ("on_demand" | "per_file"))) => return Err(legacy(mode)),
+            Some(_) => return Err(legacy("pre_refactor_live_target_marker")),
+            None if marker.config.contains_key("spdk") => {
+                return Err(legacy("pre_refactor_live_target_marker"));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2268,37 +2184,112 @@ mod tests {
         assert!(inventory.read_evidence_for_benchmark(1, true).is_err());
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Write `value` as `file` in a closed owner root and check that open
+    /// fails with legacy `mode` before any mutation.
+    fn assert_legacy_open_rejected(file: &str, value: serde_yaml::Value, mode: &str) {
+        let temporary = tempdir::TempDir::new("node-legacy-state").unwrap();
+        let config = config(&temporary.path().join("node"));
+        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory.fence_to(1).unwrap();
+        drop(inventory);
+        install_metadata(&config.root, file, &encode_metadata(&value).unwrap()).unwrap();
+        let listing = || {
+            let mut names: Vec<_> = fs::read_dir(&config.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let (before, manifest) = (listing(), fs::read(config.root.join(MANIFEST)).unwrap());
+        let error = match NodeInventory::open(config.clone(), metrics()) {
+            Ok(_) => panic!("legacy owner state {mode} opened"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(&format!(
+                "unsupported legacy distributed mode {mode}: use archive/multi-design"
+            )),
+            "{error}"
+        );
+        assert_eq!(listing(), before);
+        assert_eq!(fs::read(config.root.join(MANIFEST)).unwrap(), manifest);
+    }
+
+    fn legacy_marker(spdk: serde_yaml::Value, export_mode: Option<&str>) -> serde_yaml::Value {
+        let mut config = serde_yaml::Mapping::new();
+        config.insert("address".into(), "127.0.0.1".into());
+        config.insert("spdk".into(), spdk);
+        if let Some(mode) = export_mode {
+            config.insert("export_mode".into(), mode.into());
+        }
+        let mut marker = serde_yaml::Mapping::new();
+        marker.insert("config".into(), config.into());
+        marker.insert("identity".into(), serde_yaml::Mapping::new().into());
+        marker.into()
+    }
+
     #[test]
-    fn offline_export_requires_sealed_epoch_and_retains_owner_lock() {
-        for mode in [
-            crate::distributed::storage::HistoryPersistence::OnDisk,
-            crate::distributed::storage::HistoryPersistence::WalReplay,
-        ] {
-            offline_export_requires_sealed_epoch_mode(mode);
+    fn sealed_export_admission_fails_open_before_mutation() {
+        let entry: serde_yaml::Value = serde_yaml::from_str("{owner_epoch: 1}").unwrap();
+        for (entries, pins) in [(vec![entry.clone()], vec![]), (vec![], vec![entry])] {
+            let mut registry = serde_yaml::Mapping::new();
+            registry.insert("version".into(), 1.into());
+            registry.insert("entries".into(), entries.into());
+            registry.insert("epoch_pins".into(), pins.into());
+            assert_legacy_open_rejected(LEGACY_EXPORT_LEASES, registry.into(), "sealed_export");
         }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn offline_export_requires_sealed_epoch_mode(
-        mode: crate::distributed::storage::HistoryPersistence,
-    ) {
-        let temporary = tempdir::TempDir::new("node-sealed-export").unwrap();
+    #[test]
+    fn empty_sealed_export_registry_is_ignored() {
+        let temporary = tempdir::TempDir::new("node-empty-registry").unwrap();
         let config = config(&temporary.path().join("node"));
-        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
-        inventory.set_history_persistence(mode).unwrap();
-        inventory.fence_to(1).unwrap();
-        assert!(SealedOwnerExport::open(&config, 1, metrics()).is_err());
-        drop(inventory);
-        assert!(SealedOwnerExport::open(&config, 1, metrics()).is_err());
-        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
-        inventory.fence_to(2).unwrap();
-        inventory.seal(2).unwrap();
-        drop(inventory);
-        let export = SealedOwnerExport::open(&config, 2, metrics()).unwrap();
-        assert!(NodeInventory::open(config.clone(), metrics()).is_err());
-        drop(export);
+        drop(NodeInventory::open(config.clone(), metrics()).unwrap());
+        let mut registry = serde_yaml::Mapping::new();
+        registry.insert("version".into(), 1.into());
+        registry.insert("entries".into(), serde_yaml::Sequence::new().into());
+        install_metadata(
+            &config.root,
+            LEGACY_EXPORT_LEASES,
+            &encode_metadata(&registry).unwrap(),
+        )
+        .unwrap();
         assert!(NodeInventory::open(config, metrics()).is_ok());
+    }
+
+    #[test]
+    fn spdk_live_target_marker_fails_open_before_mutation() {
+        let spdk: serde_yaml::Value =
+            serde_yaml::from_str("{rpc_socket: /run/spdk.sock, executable: /usr/bin/spdk}")
+                .unwrap();
+        assert_legacy_open_rejected(
+            LIVE_TARGET_CONFIG,
+            legacy_marker(spdk, Some("on_demand")),
+            "spdk",
+        );
+    }
+
+    #[test]
+    fn on_demand_and_per_file_live_target_markers_fail_open_before_mutation() {
+        for mode in ["on_demand", "per_file"] {
+            assert_legacy_open_rejected(
+                LIVE_TARGET_CONFIG,
+                legacy_marker(serde_yaml::Value::Null, Some(mode)),
+                mode,
+            );
+        }
+    }
+
+    #[test]
+    fn pre_refactor_per_owner_live_target_marker_fails_open_before_mutation() {
+        for export_mode in [Some("per_owner"), None] {
+            assert_legacy_open_rejected(
+                LIVE_TARGET_CONFIG,
+                legacy_marker(serde_yaml::Value::Null, export_mode),
+                "pre_refactor_live_target_marker",
+            );
+        }
     }
     #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
     #[test]

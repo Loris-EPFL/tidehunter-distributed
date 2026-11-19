@@ -443,7 +443,6 @@ fn retiring_read_grant_keeps_idle_controller_export_across_file_rollover() {
         address: binding.address.clone(),
         service: binding.service,
         transport: binding.transport,
-        spdk: binding.spdk.clone(),
         geometry: Default::default(),
     };
     let temp = tempdir::TempDir::new("rollover-controller-regression").unwrap();
@@ -599,7 +598,6 @@ impl HistoryPool {
             address: binding.address.clone(),
             service: binding.service,
             transport: binding.transport,
-            spdk: binding.spdk.clone(),
             geometry: Default::default(),
         };
         pool.acquire_pinned(

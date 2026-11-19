@@ -195,8 +195,6 @@ fn fixture(
                     state_dir: state,
                     commissioning_port_id: 43,
                     commissioning_service: 4421,
-                    spdk: None,
-                    export_mode: Default::default(),
                 },
                 configfs,
             )

@@ -554,15 +554,15 @@ impl Remote {
         &self,
         submit: impl FnOnce(
             &ConcurrentRemoteDatabase,
-        ) -> std::result::Result<T, super::local_db::LocalDbError>,
-    ) -> std::result::Result<T, super::local_db::LocalDbError> {
+        ) -> std::result::Result<T, super::storage::LocalDbError>,
+    ) -> std::result::Result<T, super::storage::LocalDbError> {
         self.read_submit.run(|| submit(&self.db))
     }
     fn admit<T>(
         &self,
         mut submit: impl FnMut(
             &ConcurrentRemoteDatabase,
-        ) -> std::result::Result<T, super::local_db::LocalDbError>,
+        ) -> std::result::Result<T, super::storage::LocalDbError>,
     ) -> Result<T> {
         let deadline = Instant::now() + self.timeout;
         loop {
@@ -599,46 +599,6 @@ impl Remote {
     }
 }
 impl Db {
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn install_nvmeof_file_fixture(
-        &self,
-        config: super::nvmeof::NvmeofReaderConfig,
-        path: &Path,
-    ) -> Result<()> {
-        match &self.backend {
-            Backend::Remote(remote) => remote
-                .db
-                .install_nvmeof_file_fixture(config, path)
-                .map_err(error),
-            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
-        }
-    }
-
-    /// Install the optional sealed-WAL reader on a remote backend.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn install_nvmeof_reader(&self, config: super::nvmeof::NvmeofReaderConfig) -> Result<()> {
-        match &self.backend {
-            Backend::Remote(remote) => remote.db.install_nvmeof_reader(config).map_err(error),
-            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn clear_nvmeof_reader(&self) -> Result<()> {
-        match &self.backend {
-            Backend::Remote(remote) => remote.db.clear_nvmeof_reader().map_err(error),
-            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn nvmeof_stats(&self) -> Vec<super::nvmeof::NvmeofStats> {
-        match &self.backend {
-            Backend::Remote(remote) => remote.db.nvmeof_stats(),
-            Backend::Native(_) => Vec::new(),
-        }
-    }
-
     /// Live payload counters and verified namespace evidence, not configuration
     /// intent. Returns `None` when this database does not use live NVMe-oF.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -737,7 +697,7 @@ impl Db {
         config: RemoteDatabaseConfig,
         configure: impl FnOnce(
             &mut RemoteDatabase,
-        ) -> std::result::Result<(), super::local_db::LocalDbError>,
+        ) -> std::result::Result<(), super::storage::LocalDbError>,
     ) -> Result<Arc<Self>> {
         let timeout = config.timeout;
         let batch_limits = config.storage.batch_limits;
@@ -1937,7 +1897,7 @@ impl Db {
         &self,
     ) -> Option<(
         super::remote_db::ReadCacheStats,
-        super::local_db::LocalDbStats,
+        super::storage::LocalDbStats,
         u64,
     )> {
         match &self.backend {
@@ -1963,7 +1923,7 @@ impl Db {
     ) -> Option<
         Option<(
             super::remote_db::ReadCacheStats,
-            super::local_db::LocalDbStats,
+            super::storage::LocalDbStats,
             u64,
         )>,
     > {

@@ -70,7 +70,7 @@ impl ReadService {
     ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
         let deadline = Instant::now() + self.timeout();
         let bytes = self
-            .plan_member(&self.routing(), reference)?
+            .plan_member(reference)?
             .charge
             .checked_add(extra_bytes)
             .and_then(|n| n.checked_add(512))

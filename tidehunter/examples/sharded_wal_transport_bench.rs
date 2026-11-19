@@ -18,9 +18,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tidehunter::distributed::codec::BatchLimits;
 use tidehunter::distributed::group::GroupLimits;
-use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
-use tidehunter::distributed::storage::{PartitionConfig, StaticInventory, WalMemberReadPolicy};
+use tidehunter::distributed::storage::{
+    LocalInventoryConfig, PartitionConfig, StaticInventory, WalMemberReadPolicy,
+};
 use tidehunter::distributed::tcp::{Client, PollingPolicy, Transport};
 use tidehunter::key_shape::{KeyShape, KeyType};
 

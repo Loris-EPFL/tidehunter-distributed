@@ -890,7 +890,6 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 leased_durability: DurabilityTier::Native,
                 inline_reads: true,
                 queue_geometry: Default::default(),
-                export_mode: Default::default(),
             }),
             durable_cut: Default::default(),
         };

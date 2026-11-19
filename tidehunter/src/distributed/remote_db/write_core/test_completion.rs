@@ -2,8 +2,7 @@
 
 use super::completion::AppendCompletion;
 use crate::distributed::codec::CompleteBatch;
-use crate::distributed::local_db::LocalDbError;
-use crate::distributed::storage::DurableBatch;
+use crate::distributed::storage::{DurableBatch, LocalDbError};
 use crate::distributed::types::BatchVersion;
 use parking_lot::Mutex;
 use std::collections::HashMap;

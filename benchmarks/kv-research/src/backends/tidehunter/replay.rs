@@ -77,12 +77,6 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
             return Err("distributed replay node DB paths must not overlap".into());
         }
         paths.push(resolved);
-        if !opts.nvmeof_readers.is_empty() {
-            return Err(
-                "checkpoint replay requires owner RPC or live NVMe-oF, not sealed-WAL readers"
-                    .into(),
-            );
-        }
         batch_limits(&opts)?.validate()?;
         result.push((node.db_id, node.options, opts));
     }

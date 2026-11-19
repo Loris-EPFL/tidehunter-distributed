@@ -189,7 +189,7 @@ fn replay_outputs(live: bool) {
                 "commissioning_service":4421+2*id,"commissioning_port_id":1001+2*id,
                 "max_inflight_requests":16,"max_inflight_bytes":8388608,"connect_timeout_ms":10000,"io_timeout_ms":30000,
                 "leased_write_window":1,"leased_sync":"per_frame_fua",
-                "export_mode":"per_owner","inline_reads":true
+                "inline_reads":true
             });
         }
         let input = root.join(format!("input-{id}.json"));

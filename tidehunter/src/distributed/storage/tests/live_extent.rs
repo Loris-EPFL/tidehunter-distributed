@@ -1062,15 +1062,10 @@ fn leased_self_adoption_stops_at_torn_frame_and_keeps_sync_checkpoint_barrier() 
 }
 
 #[test]
-fn leased_mode_excludes_reservations_and_rpc_append() {
+fn leased_mode_excludes_rpc_append() {
     let (_temp, config, log) = fixture();
     let extent = log.lease_live_extent(authority(&config)).unwrap().0;
     let (group, _) = encoded(&config, vec![batch(&config, 0)]);
-    let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
-    assert!(matches!(
-        log.reserve_live_group(authority(&config), descriptor.clone()),
-        Err(StorageError::Invalid(_))
-    ));
     assert!(matches!(
         log.append_group(authority(&config), &group),
         Err(StorageError::Invalid(_))
@@ -1078,10 +1073,8 @@ fn leased_mode_excludes_reservations_and_rpc_append() {
     skip(&extent, 0);
     log.adopt_live_extent(authority(&config), extent.token, 0, true)
         .unwrap();
-    log.reserve_live_group(authority(&config), descriptor)
-        .unwrap();
     assert!(matches!(
-        log.lease_live_extent(authority(&config)),
+        log.append_group(authority(&config), &group),
         Err(StorageError::Invalid(_))
     ));
 }

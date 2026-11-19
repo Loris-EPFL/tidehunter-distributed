@@ -764,7 +764,7 @@ fn native_ack_paused_before_hand_off_fails_after_a_concurrent_persistence_failur
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_fencing {
     use super::*;
-    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
     use crate::distributed::nvmeof::live_target::{LiveFileIdentity, LiveTargetManager};
     use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
     use std::os::unix::fs::FileExt;
@@ -792,21 +792,12 @@ mod live_fencing {
     // Exercise the actual WAL/control lifecycle with the existing journal-only
     // target fixture. This is not evidence of kernel namespace I/O drain.
     fn open_live(root: &std::path::Path, tier: DurabilityTier) -> (NodeConfig, Arc<StorageNode>) {
-        open_live_mode(root, tier, LiveExportMode::OnDemand)
-    }
-
-    fn open_live_mode(
-        root: &std::path::Path,
-        tier: DurabilityTier,
-        mode: LiveExportMode,
-    ) -> (NodeConfig, Arc<StorageNode>) {
-        open_live_with(root, tier, mode, config(&root.join("node")))
+        open_live_with(root, tier, config(&root.join("node")))
     }
 
     fn open_live_with(
         root: &std::path::Path,
         tier: DurabilityTier,
-        mode: LiveExportMode,
         mut config: NodeConfig,
     ) -> (NodeConfig, Arc<StorageNode>) {
         // A complete 4 KiB live group stays below the native fragment trigger.
@@ -832,8 +823,6 @@ mod live_fencing {
                 state_dir,
                 commissioning_port_id: 43,
                 commissioning_service: 4421,
-                spdk: None,
-                export_mode: mode,
             },
             configfs,
         )
@@ -864,12 +853,7 @@ mod live_fencing {
         let mut value = serde_yaml::to_value(config(&temp.path().join("node"))).unwrap();
         value.as_mapping_mut().unwrap().remove("wal_prewrite");
         let default = serde_yaml::from_value(value).unwrap();
-        let (config, node) = open_live_with(
-            temp.path(),
-            DurabilityTier::Synchronous,
-            LiveExportMode::OnDemand,
-            default,
-        );
+        let (config, node) = open_live_with(temp.path(), DurabilityTier::Synchronous, default);
         assert!(config.wal_prewrite);
         let (file, bytes) = leased_wal_file(&node);
         crate::wal::fiemap::assert_written_extents(&file, bytes);
@@ -881,12 +865,7 @@ mod live_fencing {
         let temp = tempdir::TempDir::new("explicit-false-owner-prewrite").unwrap();
         let mut explicit = config(&temp.path().join("node"));
         explicit.wal_prewrite = false;
-        let (_, node) = open_live_with(
-            temp.path(),
-            DurabilityTier::Synchronous,
-            LiveExportMode::OnDemand,
-            explicit,
-        );
+        let (_, node) = open_live_with(temp.path(), DurabilityTier::Synchronous, explicit);
         let (file, bytes) = leased_wal_file(&node);
         assert!(
             crate::wal::fiemap::extents(&file, bytes)
@@ -937,11 +916,7 @@ mod live_fencing {
     #[test]
     fn prepared_permanent_export_is_reused_and_identity_checked() {
         let temp = tempdir::TempDir::new("prepared-permanent").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         let Response::LiveLeased(first) =
             extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
         else {
@@ -1049,11 +1024,7 @@ mod live_fencing {
     fn prepared_never_granted_exports_are_revoked_on_fence_and_seal() {
         for seal in [false, true] {
             let temp = tempdir::TempDir::new("prepared-retirement").unwrap();
-            let (_, node) = open_live_mode(
-                temp.path(),
-                DurabilityTier::Native,
-                LiveExportMode::PerOwner,
-            );
+            let (_, node) = open_live(temp.path(), DurabilityTier::Native);
             extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 });
             let log = node.inventory.lock().active(1).unwrap();
             wait_prepared(&log, 1);
@@ -1104,11 +1075,7 @@ mod live_fencing {
     #[test]
     fn final_target_shutdown_joins_a_preparer_parked_on_the_lifecycle_gate() {
         let temp = tempdir::TempDir::new("prepared-final-shutdown").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         let log = node.inventory.lock().active(1).unwrap();
         log.lease_live_extent(RequestAuthority { epoch: 1 })
             .unwrap();
@@ -1133,11 +1100,7 @@ mod live_fencing {
     #[test]
     fn final_target_shutdown_drains_preparers_after_a_join_error() {
         let temp = tempdir::TempDir::new("prepared-shutdown-error").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         let log = node.inventory.lock().active(1).unwrap();
         log.lease_live_extent(RequestAuthority { epoch: 1 })
             .unwrap();
@@ -1247,11 +1210,7 @@ mod live_fencing {
     fn preparer_retirement_joins_while_the_lifecycle_gate_is_held() {
         for seal in [false, true] {
             let temp = tempdir::TempDir::new("prepared-try-lock").unwrap();
-            let (_, node) = open_live_mode(
-                temp.path(),
-                DurabilityTier::Native,
-                LiveExportMode::PerOwner,
-            );
+            let (_, node) = open_live(temp.path(), DurabilityTier::Native);
             let log = node.inventory.lock().active(1).unwrap();
             log.lease_live_extent(RequestAuthority { epoch: 1 })
                 .unwrap();
@@ -1275,63 +1234,36 @@ mod live_fencing {
     }
 
     #[test]
-    fn on_demand_preparer_does_not_publish_and_export_failure_poison_fences() {
-        for failure in [false, true] {
-            let temp = tempdir::TempDir::new("prepared-publication-error").unwrap();
-            let mode = if failure {
-                LiveExportMode::PerOwner
-            } else {
-                LiveExportMode::OnDemand
-            };
-            let (_, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
-            let log = node.inventory.lock().active(1).unwrap();
-            log.lease_live_extent(RequestAuthority { epoch: 1 })
-                .unwrap();
-            if failure {
-                // The registry's pending path must be a regular file.
-                fs::create_dir(temp.path().join("target/.live-target.pending")).unwrap();
-            }
-            node.control.shared.trigger_file_preparation(&log);
-            wait_prepared(&log, 0);
-            if failure {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !node.control_context.poison_pending.load(Ordering::Acquire) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "publication failure did not poison readers"
-                    );
-                    thread::yield_now();
-                }
-            }
-            node.control.shared.retire_syncer(&log).unwrap();
-            if failure {
-                assert!(node.control_context.poison_pending.load(Ordering::Acquire));
-                assert!(
-                    log.lease_live_extent(RequestAuthority { epoch: 1 })
-                        .is_err()
-                );
-            } else {
-                assert_eq!(log.live_file_preparation_stats().live_files_published, 0);
-                assert_eq!(
-                    node.with_live_target(|target| target.stats())
-                        .unwrap()
-                        .owned_namespace_count,
-                    0
-                );
-                drop(log);
-                shutdown(&node, 1);
-            }
+    fn preparer_export_failure_poison_fences() {
+        let temp = tempdir::TempDir::new("prepared-publication-error").unwrap();
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
+        let log = node.inventory.lock().active(1).unwrap();
+        log.lease_live_extent(RequestAuthority { epoch: 1 })
+            .unwrap();
+        // The registry's pending path must be a regular file.
+        fs::create_dir(temp.path().join("target/.live-target.pending")).unwrap();
+        node.control.shared.trigger_file_preparation(&log);
+        wait_prepared(&log, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !node.control_context.poison_pending.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "publication failure did not poison readers"
+            );
+            thread::yield_now();
         }
+        node.control.shared.retire_syncer(&log).unwrap();
+        assert!(node.control_context.poison_pending.load(Ordering::Acquire));
+        assert!(
+            log.lease_live_extent(RequestAuthority { epoch: 1 })
+                .is_err()
+        );
     }
 
     #[test]
     fn permanent_export_survives_read_pin_release_and_idle_reaping() {
         let temp = tempdir::TempDir::new("permanent-pin").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let batch = batch(&config, 1, 0);
         let group = CompleteGroup::new_live(
             &node.control_context.append_shape,
@@ -1416,21 +1348,17 @@ mod live_fencing {
     }
 
     #[test]
-    fn open_live_exports_default_is_empty_and_permanent_exports_are_idempotent() {
-        for mode in [
-            LiveExportMode::OnDemand,
-            LiveExportMode::PerFile,
-            LiveExportMode::PerOwner,
-        ] {
+    fn open_live_exports_are_permanent_and_idempotent() {
+        {
             let temp = tempdir::TempDir::new("open-live-exports").unwrap();
-            let (_, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
+            let (_, node) = open_live(temp.path(), DurabilityTier::Native);
             let Response::LiveLeased(leased) =
                 extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
             else {
                 panic!("expected lease")
             };
-            let permanent = mode != LiveExportMode::OnDemand;
-            let expected_namespaces = if permanent { 2 } else { 1 };
+            let permanent = true;
+            let expected_namespaces = 2;
             let pause =
                 if permanent {
                     let log = node.inventory.lock().active(1).unwrap();
@@ -1474,13 +1402,16 @@ mod live_fencing {
                 else {
                     panic!("expected exports")
                 };
-                assert_eq!(info.mode, mode);
+                assert_eq!(
+                    info.mode,
+                    crate::distributed::nvmeof::legacy_wire::LiveExportMode::PerOwner
+                );
                 assert_eq!(info.exported_files, if permanent { 2 } else { 0 });
                 assert_eq!(info.wal_file_bytes, 32768);
                 let stats = node.with_live_target(|target| target.stats()).unwrap();
                 assert_eq!(stats.namespaces_exposed, expected_namespaces);
                 assert_eq!(stats.owned_namespace_count, expected_namespaces);
-                assert_eq!(leased.binding.permanent, mode != LiveExportMode::OnDemand);
+                assert!(leased.binding.permanent);
             }
             node.with_lifecycle(|inventory, slot| {
                 NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 1)
@@ -1502,11 +1433,7 @@ mod live_fencing {
     #[test]
     fn prepared_namespace_is_not_advertised_as_a_granted_file() {
         let temp = tempdir::TempDir::new("prepared-export-info").unwrap();
-        let (_, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 });
         let log = node.inventory.lock().active(1).unwrap();
         wait_prepared(&log, 1);
@@ -1529,22 +1456,10 @@ mod live_fencing {
     }
 
     #[test]
-    fn permanent_owner_rejects_reserved_writes_and_active_record_resolution() {
+    fn permanent_owner_rejects_active_record_resolution() {
         let temp = tempdir::TempDir::new("permanent-controls").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let batch = batch(&config, 1, 0);
-        let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
-            vec![batch.clone()],
-            config.partition.batch_limits,
-            config.partition.group_limits,
-        )
-        .unwrap();
-        let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
         let reference = batch
             .record_reference(
                 PhysicalValueAddress {
@@ -1556,34 +1471,33 @@ mod live_fencing {
                 0,
             )
             .unwrap();
-        for (request, message) in [
-            (
-                Request::ReserveLiveGroup {
-                    epoch: 1,
-                    descriptor,
-                },
-                "permanent live export requires leased write mode",
-            ),
-            (
+        let error = node
+            .handle(
                 Request::ResolveLiveRecords {
                     authority_epoch: 1,
                     references: vec![reference],
                 },
-                "live record resolution is disabled for the active epoch in permanent export mode",
-            ),
-        ] {
-            let error = node.handle(request, TcpLimits::default()).err().unwrap();
-            assert_eq!(error.to_string(), message);
-        }
+                TcpLimits::default(),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "live record resolution is disabled for the active epoch in permanent export mode"
+        );
         shutdown(&node, 1);
     }
 
-    fn reserve(
+    /// Write one single-batch frame at `offset` of the open leased extent and
+    /// adopt it without closing the extent; returns the adopted receipt.
+    fn adopt_leased_frame(
         node: &StorageNode,
         config: &NodeConfig,
-        epoch: u64,
+        leased: &LiveLeased,
         sequence: u64,
-    ) -> (LiveReserved, Vec<u8>) {
+        offset: u64,
+    ) -> Receipt {
+        let epoch = leased.extent.segment.epoch;
         let group = CompleteGroup::new_live(
             &node.control_context.append_shape,
             vec![batch(config, epoch, sequence)],
@@ -1591,53 +1505,42 @@ mod live_fencing {
             config.partition.group_limits,
         )
         .unwrap();
-        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-        let (completed, completions) = mpsc::sync_channel(1);
-        assert!(
-            command(
-                node,
-                1,
-                Request::ReserveLiveGroup { epoch, descriptor },
-                4096,
-                &completed,
-            )
-            .is_ok()
-        );
-        let Response::LiveReserved(live_control::LiveReserveWire::Reserved(reserved)) =
-            receive(&completions, 1).response.unwrap()
-        else {
-            panic!("expected new live reservation")
-        };
-        (reserved, frame)
-    }
-
-    fn complete(node: &StorageNode, reserved: &LiveReserved, frame: &[u8]) -> Receipt {
-        let reservation = &reserved.reservation;
+        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
         fs::OpenOptions::new()
             .write(true)
-            .open(&reservation.segment.path)
+            .open(&leased.extent.segment.path)
             .unwrap()
-            .write_all_at(frame, reservation.frame_offset % reservation.segment.bytes)
+            .write_all_at(&frame, offset % leased.extent.segment.bytes)
             .unwrap();
-        let (completed, completions) = mpsc::sync_channel(1);
-        assert!(
-            command(
-                node,
-                1,
-                Request::CompleteLiveGroup {
-                    epoch: reservation.segment.epoch,
-                    token: reservation.token,
-                },
-                4096,
-                &completed,
-            )
-            .is_ok()
-        );
-        let Response::LiveCompleted(completion) = receive(&completions, 1).response.unwrap() else {
-            panic!("expected completed live group")
+        let Response::LiveAdopted(_) = extent_exchange(
+            node,
+            Request::AdoptLiveExtent {
+                epoch,
+                token: leased.extent.token,
+                through: offset + frame.len() as u64,
+                close: false,
+                lease_next: false,
+            },
+        ) else {
+            panic!("expected adoption")
         };
-        assert_eq!(completion.receipts.len(), 1);
-        completion.receipts[0]
+        let log = node.inventory.lock().active(epoch).unwrap();
+        let appended = log.receipt_page(log.receipt_count() - 1, 1).unwrap()[0];
+        Receipt {
+            id: appended.id(),
+            version: appended.version(),
+            digest: appended.digest(),
+            address: appended.address(),
+        }
+    }
+
+    fn lease(node: &StorageNode, epoch: u64) -> LiveLeased {
+        let Response::LiveLeased(leased) =
+            extent_exchange(node, Request::LeaseLiveExtent { epoch })
+        else {
+            panic!("expected lease")
+        };
+        leased
     }
 
     fn fence(node: &StorageNode, epoch: u64) -> Result<Response, TcpError> {
@@ -1762,14 +1665,10 @@ mod live_fencing {
     }
 
     #[test]
-    fn history_pages_reuse_readonly_exports_only_in_permanent_modes() {
-        for mode in [
-            LiveExportMode::OnDemand,
-            LiveExportMode::PerFile,
-            LiveExportMode::PerOwner,
-        ] {
+    fn history_pages_reuse_retained_readonly_exports() {
+        {
             let temp = tempdir::TempDir::new("retained-history-pages").unwrap();
-            let (config, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
+            let (config, node) = open_live(temp.path(), DurabilityTier::Native);
             let end = leased_history(&node, &config, 2);
             assert_eq!(target_stats(&node).owned_namespace_count, 0);
             let first = history_page(&node, &config, 0, end, 0);
@@ -1779,7 +1678,7 @@ mod live_fencing {
                 NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 2)
             })
             .unwrap();
-            let retained = mode != LiveExportMode::OnDemand;
+            let retained = true;
             assert_eq!(
                 target_stats(&node).owned_namespace_count,
                 u64::from(retained)
@@ -1806,11 +1705,7 @@ mod live_fencing {
     #[test]
     fn readonly_export_connection_pin_survives_record_release_and_idle_history_eviction() {
         let temp = tempdir::TempDir::new("pinned-history-export").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let count = 2 * (super::super::inventory::MAX_IDLE_HISTORY_EXPORTS + 2);
         let end = leased_history(&node, &config, count);
         let first = history_page(&node, &config, 0, end, 0);
@@ -1857,11 +1752,7 @@ mod live_fencing {
     fn retained_history_stays_readonly_and_lifecycle_revocation_allows_retirement() {
         for lifecycle in ["seal", "retire", "final"] {
             let temp = tempdir::TempDir::new("retained-history-lifecycle").unwrap();
-            let (config, node) = open_live_mode(
-                temp.path(),
-                DurabilityTier::Synchronous,
-                LiveExportMode::PerOwner,
-            );
+            let (config, node) = open_live(temp.path(), DurabilityTier::Synchronous);
             let end = leased_history(&node, &config, 1);
             let page = history_page(&node, &config, 0, end, 0);
             let segment = &page.entries[0].segment;
@@ -1947,11 +1838,7 @@ mod live_fencing {
     #[test]
     fn retained_history_cache_evicts_oldest_unpinned_export_not_an_inflight_page() {
         let temp = tempdir::TempDir::new("retained-history-bound").unwrap();
-        let (config, node) = open_live_mode(
-            temp.path(),
-            DurabilityTier::Native,
-            LiveExportMode::PerOwner,
-        );
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let bound = inventory::MAX_IDLE_HISTORY_EXPORTS;
         let end = leased_history(&node, &config, (bound + 2) * 2);
         let mut from = 0;
@@ -2036,8 +1923,8 @@ mod live_fencing {
         for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
             let temp = tempdir::TempDir::new("live-fence-syncer").unwrap();
             let (config, node) = open_live(temp.path(), tier);
-            let (reserved, frame) = reserve(&node, &config, 1, 0);
-            let first = complete(&node, &reserved, &frame);
+            let leased = lease(&node, 1);
+            let first = adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
             let log = node.inventory.lock().active(1).unwrap();
             let old = Arc::downgrade(&log);
             let frontier = log.frontier().unwrap().clone();
@@ -2054,8 +1941,7 @@ mod live_fencing {
             }
             // A later real completion proves the no-op/rejected fences did not
             // stop the old frontier. Its next control must still be able to sync.
-            let (reserved, frame) = reserve(&node, &config, 1, 1);
-            let second = complete(&node, &reserved, &frame);
+            let second = adopt_leased_frame(&node, &config, &leased, 1, leased.extent.start + 4096);
             let Response::Status(status) = fence(&node, 2).unwrap() else {
                 panic!("expected fenced status")
             };
@@ -2076,53 +1962,40 @@ mod live_fencing {
                     .is_err()
             );
             assert_recovered(&node, &config, &[first, second]);
-            let (reserved, frame) = reserve(&node, &config, 2, 0);
-            complete(&node, &reserved, &frame);
+            let leased = lease(&node, 2);
+            adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
             assert_eq!(node.control.shared.syncers.lock().len(), 1);
             shutdown(&node, 2);
         }
     }
 
     #[test]
-    fn recoverable_live_fence_releases_used_wal_after_an_abandoned_reservation() {
+    fn recoverable_live_fence_releases_used_wal_after_an_incomplete_leased_frame() {
         let temp = tempdir::TempDir::new("live-recoverable-syncer").unwrap();
         let (config, node) = open_live(temp.path(), DurabilityTier::Native);
-        let (reserved, frame) = reserve(&node, &config, 1, 0);
-        let receipt = complete(&node, &reserved, &frame);
+        let leased = lease(&node, 1);
+        let receipt = adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
         let log = node.inventory.lock().active(1).unwrap();
         let old = Arc::downgrade(&log);
         assert!(log.synced_frontier() < log.appended_frontier());
         let frontier = log.frontier().unwrap().clone();
-        // A reserve worker may pass its preliminary flush while a completion
-        // worker is still publishing the preceding group. Reserve directly at
-        // the same storage boundary to reproduce that overlap deterministically:
-        // the acknowledged group stays unsynced when the next frame is absent.
-        let group = CompleteGroup::new_live(
-            &node.control_context.append_shape,
-            vec![batch(&config, 1, 1)],
-            config.partition.batch_limits,
-            config.partition.group_limits,
-        )
-        .unwrap();
-        let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
-        let LiveReserveResult::Reserved(abandoned) = log
-            .reserve_live_group(RequestAuthority { epoch: 1 }, descriptor)
-            .unwrap()
-        else {
-            panic!("expected abandoned reservation")
-        };
         let (sync_entered, resume_sync) = log.pause_next_persist();
         drop(log);
         let incarnation = node.inventory.lock().incarnation();
         assert!(node.inventory.lock().status().unwrap().recovery_clean);
+        // Close beyond the adopted end: the next frame was never written, so the
+        // acknowledged frame stays unsynced behind an incomplete live frame.
         let (completed, completions) = mpsc::sync_channel(1);
         assert!(
             command(
                 &node,
                 1,
-                Request::CompleteLiveGroup {
+                Request::AdoptLiveExtent {
                     epoch: 1,
-                    token: abandoned.token,
+                    token: leased.extent.token,
+                    through: leased.extent.start + 2 * 4096,
+                    close: true,
+                    lease_next: false,
                 },
                 4096,
                 &completed,
@@ -2160,21 +2033,6 @@ mod live_fencing {
         // so the fence and every later status report it unclean.
         assert_eq!(status.incarnation, incarnation);
         assert!(!status.recovery_clean);
-        assert!(
-            command(
-                &node,
-                3,
-                Request::Status { protocol: PROTOCOL },
-                1,
-                &completed
-            )
-            .is_ok()
-        );
-        let Response::Status(status) = receive(&completions, 3).response.unwrap() else {
-            panic!("expected status")
-        };
-        assert_eq!(status.incarnation, incarnation);
-        assert!(!status.recovery_clean);
         assert_recovered(&node, &config, &[receipt]);
         shutdown(&node, 2);
     }
@@ -2183,8 +2041,8 @@ mod live_fencing {
     fn live_fence_keeps_the_external_handle_guard_after_joining_the_syncer() {
         let temp = tempdir::TempDir::new("live-fence-external-handle").unwrap();
         let (config, node) = open_live(temp.path(), DurabilityTier::Native);
-        let (reserved, frame) = reserve(&node, &config, 1, 0);
-        complete(&node, &reserved, &frame);
+        let leased = lease(&node, 1);
+        adopt_leased_frame(&node, &config, &leased, 0, leased.extent.start);
         let retained = node.inventory.lock().active(1).unwrap();
         let error = fence(&node, 2).err().unwrap();
         assert!(

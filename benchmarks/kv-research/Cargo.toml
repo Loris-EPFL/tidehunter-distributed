@@ -42,10 +42,5 @@ fabric = ["tidehunter/experimental-fabric"]
 test-utils = ["tidehunter/test-utils"]
 nvmeof = ["tidehunter/experimental-nvmeof"]
 
-[[bin]]
-name = "nvmeof-check"
-path = "src/bin/nvmeof-check.rs"
-required-features = ["nvmeof"]
-
 [lints.clippy]
 all = "warn"

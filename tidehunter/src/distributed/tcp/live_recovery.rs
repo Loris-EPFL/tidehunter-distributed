@@ -76,6 +76,9 @@ impl Client {
             while index < page.entries.len() {
                 let first = &page.entries[index];
                 let binding = &first.binding;
+                binding
+                    .require_kernel_target()
+                    .map_err(TcpError::component)?;
                 let target = LiveConnectTarget {
                     nqn: binding.nqn.clone(),
                     uuid: binding.uuid,
@@ -85,7 +88,6 @@ impl Client {
                     address: binding.address.clone(),
                     service: binding.service,
                     transport: binding.transport,
-                    spdk: binding.spdk.clone(),
                     geometry: config.queue_geometry,
                 };
                 let access = if binding.readonly {
@@ -142,11 +144,6 @@ impl Client {
                         service: binding.service,
                         host_nqn: config.host_nqn.clone(),
                         host_id: config.host_id,
-                        target_implementation:
-                            crate::distributed::nvmeof::live_metrics::target_implementation(
-                                &observed.spdk,
-                            ),
-                        spdk: observed.spdk.clone(),
                         writer: None,
                         namespace_identity: LiveNamespaceIdentity {
                             namespace_path: observed.namespace_path.clone(),
@@ -156,10 +153,6 @@ impl Client {
                             nsid: observed.nsid,
                             bytes: observed.bytes,
                             block_size: observed.block_size,
-                            target_implementation:
-                                crate::distributed::nvmeof::live_metrics::target_implementation(
-                                    &observed.spdk,
-                                ),
                         },
                     });
                 }

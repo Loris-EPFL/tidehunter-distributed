@@ -106,7 +106,7 @@ class CapsuleLayoutTests(unittest.TestCase):
                 prep = json.loads(Path(argv[2]).read_text())['live_nvmeof']
                 nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
                 keys = ('max_inflight_requests', 'max_inflight_bytes', 'connect_timeout_ms',
-                        'io_timeout_ms', 'inline_reads', 'queue_geometry', 'export_mode',
+                        'io_timeout_ms', 'inline_reads', 'queue_geometry',
                         'lease_ahead', 'polled_writes', 'leased_write_window')
                 live_client = {key: prep[key] for key in keys}
                 live_client.update(host_nqn=nqn, host_id=cloud.live_host_identity(nqn),
@@ -175,7 +175,7 @@ class AdmissionConfigTests(unittest.TestCase):
                         cfg['spec'].update(mode='focused', selection=selection,
                                            backends=['tidehunter_nvme_rdma'])
                         live = cloud.live_nvme_preparation(cfg, job['case_id'], 'rdma')
-                        live.update(export_mode='per_owner',
+                        live.update(
                                     inline_reads=job['live_inline_reads'],
                                     lease_ahead=job['live_lease_ahead'],
                                     polled_writes=job['live_polled_writes'],

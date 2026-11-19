@@ -34,8 +34,9 @@
 //! returns only after the record covers it.
 
 use super::super::durability::DurableCutConfig;
-use super::super::local_db::LocalDbError;
-use super::super::storage::{StorageError, encode_metadata, install_metadata, read_metadata};
+use super::super::storage::{
+    LocalDbError, StorageError, encode_metadata, install_metadata, read_metadata,
+};
 use super::super::tcp::{Client, DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport, TcpError};
 use super::super::types::BatchVersion;
 use parking_lot::Mutex;

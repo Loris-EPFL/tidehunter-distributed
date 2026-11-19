@@ -1,6 +1,6 @@
 //! Initiator configuration for the live owner-WAL NVMe-oF data plane.
 
-use super::{LiveExportMode, LiveQueueGeometry};
+use super::LiveQueueGeometry;
 use serde::{Deserialize, Serialize};
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -54,8 +54,8 @@ pub struct LiveInitiatorIdentity {
     pub host_id: [u8; 16],
 }
 
-/// Bounded initiator resources. On-demand namespace identity comes from the
-/// owner. Permanent active-epoch identity is computed from the WAL file index.
+/// Bounded initiator resources. The permanent per-owner export's namespace
+/// identity is computed from the WAL file index.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveClientConfig {
@@ -93,9 +93,6 @@ pub struct LiveClientConfig {
     pub inline_reads: bool,
     #[serde(default)]
     pub queue_geometry: LiveQueueGeometry,
-    #[serde(default)]
-    /// Permanent export requires leased writes; on-demand stays the default.
-    pub export_mode: LiveExportMode,
 }
 
 fn default_inline_reads() -> bool {
@@ -146,7 +143,6 @@ impl LiveClientConfig {
             polled_writes: self.polled_writes,
             inline_reads: self.inline_reads,
             queue_geometry: self.queue_geometry,
-            export_mode: self.export_mode,
         }))
     }
 
@@ -397,7 +393,7 @@ impl LiveWriteQueue {
             && target.address == binding.address
             && target.service == binding.service
             && target.transport == binding.transport
-            && target.spdk == binding.spdk
+            && binding.spdk.is_none()
     }
 }
 
@@ -789,12 +785,13 @@ mod tests {
             leased_durability: crate::distributed::durability::DurabilityTier::Native,
             inline_reads: true,
             queue_geometry: Default::default(),
-            export_mode: Default::default(),
         };
         assert!(config.validate().is_ok());
         let mut old = serde_json::to_value(&config).unwrap();
         old.as_object_mut().unwrap().remove("queue_geometry");
-        old.as_object_mut().unwrap().remove("export_mode");
+        let mut removed = serde_json::to_value(&config).unwrap();
+        removed["export_mode"] = serde_json::json!("per_owner");
+        assert!(serde_json::from_value::<LiveClientConfig>(removed).is_err());
         old.as_object_mut().unwrap().remove("leased_write_window");
         old.as_object_mut().unwrap().remove("leased_sync");
         old.as_object_mut()
@@ -803,7 +800,6 @@ mod tests {
         assert!(!old.as_object().unwrap().contains_key("owner_identities"));
         let restored: LiveClientConfig = serde_json::from_value(old).unwrap();
         assert_eq!(restored.queue_geometry, LiveQueueGeometry::default());
-        assert_eq!(restored.export_mode, LiveExportMode::OnDemand);
         assert_eq!(restored.leased_write_window, None);
         assert_eq!(restored.leased_sync, LeasedSync::GroupFlush);
         assert_eq!(restored.leased_flush_min_frame_bytes, 65536);
@@ -826,14 +822,6 @@ mod tests {
             );
         }
         assert!(restored.owner_identities.is_empty());
-        for mode in [
-            LiveExportMode::PerFile,
-            LiveExportMode::PerOwner,
-            LiveExportMode::OnDemand,
-        ] {
-            config.export_mode = mode;
-            assert!(config.validate().is_ok());
-        }
         config.leased_write_window = None;
         assert!(config.validate().is_ok());
         config.leased_write_window = Some(0);
@@ -1412,6 +1400,9 @@ impl super::Client {
             .live_config
             .as_ref()
             .ok_or_else(|| super::TcpError::new("live NVMe is not configured"))?;
+        binding
+            .require_kernel_target()
+            .map_err(super::TcpError::component)?;
         let target = LiveConnectTarget {
             nqn: binding.nqn.clone(),
             uuid: binding.uuid,
@@ -1421,28 +1412,17 @@ impl super::Client {
             address: binding.address.clone(),
             service: binding.service,
             transport: binding.transport,
-            spdk: binding.spdk.clone(),
             geometry: config.queue_geometry,
         };
         #[cfg(any(test, feature = "test-utils"))]
         if self.live_write_local_fixture {
             if let Some(pool) = &self.live_pool {
-                if config.export_mode == super::LiveExportMode::OnDemand {
-                    pool.cache_local_namespace(
-                        &target,
-                        &config.host_nqn,
-                        config.host_id,
-                        LiveNamespaceAccess::ReadWrite,
-                        &leased.extent.segment.path,
-                    )
-                } else {
-                    pool.cache_local_shared_namespace(
-                        &target,
-                        &config.host_nqn,
-                        config.host_id,
-                        &leased.extent.segment.path,
-                    )
-                }
+                pool.cache_local_shared_namespace(
+                    &target,
+                    &config.host_nqn,
+                    config.host_id,
+                    &leased.extent.segment.path,
+                )
                 .map_err(super::TcpError::component)?;
             }
             let namespace = bench_open_local_file(
@@ -1475,48 +1455,23 @@ impl super::Client {
             .as_ref()
             .ok_or_else(|| super::TcpError::new("live controller pool unavailable"))?;
         let deadline = Instant::now() + Duration::from_millis(config.connect_timeout_ms);
-        let shared = config.export_mode.files_per_subsystem().is_some();
-        let (lease, acquisition) = if shared {
-            pool.acquire_shared(
+        let (lease, acquisition, _) = pool
+            .acquire_shared(
                 &target,
                 &config.host_nqn,
                 config.host_id,
                 LiveNamespaceAccess::ReadWrite,
                 deadline,
             )
-            .map(|(lease, acquisition, _)| (lease, acquisition))
-        } else {
-            pool.acquire_pinned(
-                &target,
-                &config.host_nqn,
-                config.host_id,
+            .map_err(super::TcpError::component)?;
+        let (namespace, opened) = lease
+            .namespace(
+                binding.nsid,
+                binding.uuid,
                 LiveNamespaceAccess::ReadWrite,
                 deadline,
-                super::LiveExportPinRequest {
-                    recipe: &self.live_pin_recipe,
-                    epoch: leased.extent.segment.epoch,
-                    segment: &leased.extent.segment,
-                    binding,
-                },
             )
-            .map(|(lease, acquisition, _)| (lease, acquisition))
-        }
-        .map_err(super::TcpError::component)?;
-        let (namespace, opened) = if shared {
-            lease
-                .namespace(
-                    binding.nsid,
-                    binding.uuid,
-                    LiveNamespaceAccess::ReadWrite,
-                    deadline,
-                )
-                .map(|(namespace, opened)| (namespace, Some(opened)))
-        } else {
-            lease
-                .open_namespace()
-                .map(|namespace| (std::sync::Arc::new(namespace), None))
-        }
-        .map_err(super::TcpError::component)?;
+            .map_err(super::TcpError::component)?;
         let io = LiveIo::new(
             namespace,
             config.max_inflight_requests,
@@ -1535,7 +1490,7 @@ impl super::Client {
         if let Some(metrics) = &self.live_metrics {
             // A shared controller serves every member of its subsystem: name
             // the member this queue opened, not the one used to connect.
-            let observed = opened.as_ref().unwrap_or_else(|| lease.binding());
+            let observed = &opened;
             let segment = &leased.extent.segment;
             metrics.record_route(
                 crate::distributed::nvmeof::live_metrics::LiveRouteEvidence {
@@ -1544,11 +1499,6 @@ impl super::Client {
                     service: binding.service,
                     host_nqn: config.host_nqn.clone(),
                     host_id: config.host_id,
-                    target_implementation:
-                        crate::distributed::nvmeof::live_metrics::target_implementation(
-                            &observed.spdk,
-                        ),
-                    spdk: observed.spdk.clone(),
                     writer: Some(crate::distributed::nvmeof::live_metrics::LiveWriterRoute {
                         epoch: segment.epoch,
                         file_index: segment.file_index,
@@ -1571,10 +1521,6 @@ impl super::Client {
                             nsid: observed.nsid,
                             bytes: observed.bytes,
                             block_size: observed.block_size,
-                            target_implementation:
-                                crate::distributed::nvmeof::live_metrics::target_implementation(
-                                    &observed.spdk,
-                                ),
                         },
                 },
             );
@@ -2523,26 +2469,6 @@ pub(crate) mod leased_tests {
         }
 
         fn new_with_partitions(tier: DurabilityTier, fragment: u64, partitions: Vec<u32>) -> Self {
-            Self::with_export_mode(tier, fragment, partitions, Default::default())
-        }
-
-        /// Leased owner whose target exports every WAL member of the owner
-        /// under one subsystem, as the kernel CI qualification does.
-        pub(crate) fn per_owner(tier: DurabilityTier, fragment: u64) -> Self {
-            Self::with_export_mode(
-                tier,
-                fragment,
-                vec![2],
-                crate::distributed::nvmeof::LiveExportMode::PerOwner,
-            )
-        }
-
-        fn with_export_mode(
-            tier: DurabilityTier,
-            fragment: u64,
-            partitions: Vec<u32>,
-            export_mode: crate::distributed::nvmeof::LiveExportMode,
-        ) -> Self {
             let temp = tempdir::TempDir::new("leased-coordinator").unwrap();
             let mut config = tcp::tests::config(&temp.path().join("node"));
             config.partition.inventory.partitions = partitions;
@@ -2552,7 +2478,7 @@ pub(crate) mod leased_tests {
             config.partition.group_limits.max_encoded_bytes = 16376.min(fragment as usize - 8);
             config.partition.max_batches = 4096;
             config.partition.max_reference_metadata_bytes = 64 * 1024 * 1024;
-            Self::open_exported(tier, config, temp, Duration::from_secs(10), export_mode)
+            Self::open(tier, config, temp, Duration::from_secs(10))
         }
 
         pub(crate) fn native_geometry() -> Self {
@@ -2580,16 +2506,6 @@ pub(crate) mod leased_tests {
             temp: tempdir::TempDir,
             client_timeout: Duration,
         ) -> Self {
-            Self::open_exported(tier, config, temp, client_timeout, Default::default())
-        }
-
-        fn open_exported(
-            tier: DurabilityTier,
-            config: NodeConfig,
-            temp: tempdir::TempDir,
-            client_timeout: Duration,
-            export_mode: crate::distributed::nvmeof::LiveExportMode,
-        ) -> Self {
             let node = StorageNode::open(config.clone(), tcp::tests::metrics()).unwrap();
             node.set_durability(DurabilityConfig::with_tier(tier))
                 .unwrap();
@@ -2610,8 +2526,6 @@ pub(crate) mod leased_tests {
                     state_dir,
                     commissioning_port_id: 43,
                     commissioning_service: 4421,
-                    spdk: None,
-                    export_mode,
                 },
                 configfs,
             )
@@ -2705,7 +2619,6 @@ pub(crate) mod leased_tests {
                         leased_durability: tier,
                         inline_reads: true,
                         queue_geometry: Default::default(),
-                        export_mode: Default::default(),
                     },
                     crate::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY,
                 )
@@ -5399,13 +5312,11 @@ mod leased_rollover_tests {
     /// kernel qualification's member-transition proof requires.
     #[test]
     fn per_owner_rebind_route_names_the_opened_member() {
-        use crate::distributed::nvmeof::LiveExportMode;
         use crate::distributed::nvmeof::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
         use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
         use crate::distributed::nvmeof::live_pool::LiveControllerPool;
-        let fixture = leased_tests::Fixture::per_owner(DurabilityTier::Native, 16384);
+        let fixture = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
         let mut client = fixture.writer();
-        client.live_config.as_mut().unwrap().export_mode = LiveExportMode::PerOwner;
         client.leased_test_set_window(4);
         let pool_dir = tempdir::TempDir::new("per-owner-route-pool").unwrap();
         let pool = std::sync::Arc::new(
@@ -5453,7 +5364,6 @@ mod leased_rollover_tests {
                 address: binding.address.clone(),
                 service: binding.service,
                 transport: binding.transport,
-                spdk: None,
                 geometry: config.queue_geometry,
             },
             LiveNamespaceAccess::ReadWrite,

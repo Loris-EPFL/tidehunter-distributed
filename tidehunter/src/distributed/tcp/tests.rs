@@ -128,7 +128,7 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
         );
         assert_eq!(
             tag(&Response::LiveExports(live_control::LiveExportInfo {
-                mode: LiveExportMode::OnDemand,
+                mode: super::super::nvmeof::legacy_wire::LiveExportMode::PerOwner,
                 address: String::new(),
                 service: 0,
                 transport: super::super::nvmeof::NvmeofTransport::Tcp,
@@ -276,8 +276,6 @@ fn static_node_validation_opens_no_runtime_resources() {
         state_dir: temp.path().join("absent-target-state"),
         commissioning_port_id: 43,
         commissioning_service: 4421,
-        spdk: None,
-        export_mode: Default::default(),
     });
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     {
@@ -292,7 +290,7 @@ fn static_node_validation_opens_no_runtime_resources() {
 }
 
 #[test]
-fn old_owner_launch_target_defaults_to_on_demand() {
+fn owner_launch_target_rejects_removed_export_keys() {
     let temp = tempdir::TempDir::new("old-live-launch").unwrap();
     let config = config(&temp.path().join("node"));
     let mut launch = serde_json::to_value(&config).unwrap();
@@ -302,12 +300,22 @@ fn old_owner_launch_target_defaults_to_on_demand() {
         "state_dir": temp.path().join("target"), "commissioning_port_id": 43,
         "commissioning_service": 4421
     });
+    // A launch file without the removed keys keeps parsing (per-owner export).
     let serialized = serde_yaml::to_string(&launch).unwrap();
     let restored: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
-    assert_eq!(
-        restored.live_target.unwrap().export_mode,
-        LiveExportMode::OnDemand
-    );
+    assert!(restored.live_target.is_some());
+    for (key, value) in [
+        ("export_mode", serde_json::json!("on_demand")),
+        ("spdk", serde_json::Value::Null),
+    ] {
+        let mut removed = launch.clone();
+        removed["live_target"][key] = value;
+        let serialized = serde_yaml::to_string(&removed).unwrap();
+        assert!(
+            serde_yaml::from_str::<NodeConfig>(&serialized).is_err(),
+            "{key}"
+        );
+    }
 }
 
 #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
@@ -316,7 +324,6 @@ fn unsupported_live_target_is_rejected_before_node_creation() {
     let temp = tempdir::TempDir::new("unsupported-live-target").unwrap();
     let mut config = config(&temp.path().join("node"));
     config.live_target = Some(crate::distributed::nvmeof::LiveTargetConfig {
-        export_mode: Default::default(),
         address: "127.0.0.1".into(),
         service: 4420,
         transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
@@ -325,7 +332,6 @@ fn unsupported_live_target_is_rejected_before_node_creation() {
         state_dir: temp.path().join("target"),
         commissioning_port_id: 43,
         commissioning_service: 4421,
-        spdk: None,
     });
     let serialized = serde_yaml::to_string(&config).unwrap();
     let parsed: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
@@ -1443,41 +1449,6 @@ fn history_failure_fences_existing_reads_and_recovery_preserves_acknowledged_val
         .unwrap();
     reopened.inventory.lock().fence_to(2).unwrap();
     assert_eq!(read(&reopened, 2).unwrap(), batch.mutations()[0]);
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-#[test]
-fn poison_rejects_reads_before_nvme_epoch_pin_drains() {
-    let temp = tempdir::TempDir::new("poison-nvme-pin").unwrap();
-    let configfs = temp.path().join("configfs");
-    std::fs::create_dir_all(&configfs).unwrap();
-    let node = StorageNode::open(config(&temp.path().join("node")), metrics()).unwrap();
-    node.set_nvmeof_lease_fixture(&configfs).unwrap();
-    node.inventory.lock().fence_to(1).unwrap();
-    let Response::NvmeofEpochPinned(token) = node
-        .handle(
-            Request::RegisterNvmeofEpochPin { epoch: 1 },
-            TcpLimits::default(),
-        )
-        .unwrap()
-    else {
-        panic!("expected epoch pin");
-    };
-    node.poison_readers();
-    assert!(!node.terminal.load(Ordering::Acquire));
-    assert!(!node.reader_authority_valid(1, None));
-    assert!(
-        node.handle(Request::Status { protocol: PROTOCOL }, TcpLimits::default())
-            .is_err()
-    );
-    assert!(matches!(
-        node.handle(
-            Request::ReleaseNvmeofEpochPin { epoch: 1, token },
-            TcpLimits::default()
-        ),
-        Ok(Response::NvmeofEpochReleased)
-    ));
-    assert!(node.terminal.load(Ordering::Acquire));
 }
 
 #[cfg(feature = "test-utils")]

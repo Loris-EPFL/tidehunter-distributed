@@ -13,16 +13,6 @@ const MAX_PRODUCERS: usize = 1 << 20;
 const MAX_ROUTES: usize = 1024;
 const MAX_FENCES: usize = 1024;
 
-pub(crate) fn target_implementation(
-    spdk: &Option<Arc<super::SpdkTarget>>,
-) -> super::LiveTargetImplementation {
-    if spdk.is_some() {
-        super::LiveTargetImplementation::Spdk
-    } else {
-        super::LiveTargetImplementation::Kernel
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveNamespaceIdentity {
     pub namespace_path: PathBuf,
@@ -32,8 +22,6 @@ pub struct LiveNamespaceIdentity {
     pub nsid: u32,
     pub bytes: u64,
     pub block_size: u32,
-    #[serde(default)]
-    pub target_implementation: super::LiveTargetImplementation,
 }
 
 /// Native member identity from an authenticated writable reservation.
@@ -53,10 +41,6 @@ pub struct LiveRouteEvidence {
     pub service: u16,
     pub host_nqn: String,
     pub host_id: [u8; 16],
-    #[serde(default)]
-    pub target_implementation: super::LiveTargetImplementation,
-    #[serde(default)]
-    pub spdk: Option<Arc<super::SpdkTarget>>,
     pub namespace_identity: LiveNamespaceIdentity,
     #[serde(default)]
     pub writer: Option<LiveWriterRoute>,

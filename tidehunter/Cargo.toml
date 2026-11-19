@@ -57,14 +57,6 @@ test_methods = []
 test-utils = []
 
 [[example]]
-name = "sharded_wal_local"
-required-features = ["experimental-distributed"]
-
-[[example]]
-name = "sharded_wal_bench"
-required-features = ["experimental-distributed"]
-
-[[example]]
 name = "sharded_wal_recovery_bench"
 required-features = ["experimental-distributed"]
 

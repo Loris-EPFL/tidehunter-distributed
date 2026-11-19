@@ -491,11 +491,9 @@ def _kernel_live_ports(address, *, commissioning_address, control_address):
                       "service/commissioning pair after 32 attempts")
 
 
-def _admit_kernel_leased_route(remote, target, tier):
-    live = remote.get("live_nvme") or {}
-    if (live.get("export_mode") != "per_owner" or live.get("leased_durability") != tier
-            or target.get("export_mode") != "per_owner"):
-        raise TargetError("prepared kernel qualification is not per-owner at the requested durability tier")
+def _admit_kernel_durability(remote, tier):
+    if (remote.get("live_nvme") or {}).get("leased_durability") != tier:
+        raise TargetError("prepared kernel qualification durability differs from the requested tier")
 
 
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
@@ -624,7 +622,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                 "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
                     "port_id": port_id, "commissioning_service": commissioning,
                     "commissioning_port_id": port_id + 1, "max_inflight_requests": 32,
-                    "export_mode": "per_owner",
                     "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
                     "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
             if owner_wal_file_bytes is not None:
@@ -641,9 +638,9 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     or launch["node"]["partition"]["wal_file_bytes"] != owner_wal_file_bytes):
                 raise TargetError("prepared qualification WAL member size differs from request")
             target = launch["node"]["live_target"]
-            _admit_kernel_leased_route(remote, target, tier)
+            _admit_kernel_durability(remote, tier)
             if (launch["listen"] != f"{control_address}:{control}" or target["address"] != addr
-                    or target["transport"] != transport or target.get("spdk") is not None
+                    or target["transport"] != transport
                     or target["port_id"] != port_id or target["commissioning_port_id"] != port_id + 1):
                 raise TargetError("generated kernel owner identity differs from requested fixture")
             node.mkdir(mode=0o700, parents=True)
@@ -707,7 +704,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             input_path = directory / "qualification.json"
             input_path.write_text(json.dumps({"remote_config": remote, "coordinator_path": str(directory / "database"),
                 "namespace": list(uuid.uuid4().bytes), "expected_route": transport,
-                "target_implementation": "kernel", "durability_tier": tier, "value_bytes": 1024}))
+                "durability_tier": tier, "value_bytes": 1024}))
             sampler = threading.Thread(target=sample, daemon=True)
             sampler.start()
             budget = remaining(seconds) - 75
@@ -741,7 +738,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         "checkpoint_iteration", "cache_miss_hit", "flush_reopen",
                         "abrupt_tail_recovery", "fence_drain")
             if (proof.get("kind") != "live_nvmeof_qualification" or proof.get("expected_route") != transport
-                    or proof.get("target_implementation") != "kernel"
                     or proof.get("durability_tier") != receipt["durability"]["tier"]
                     or any(checks.get(k) is not True for k in required)
                     or checks.get("payload_rpc_fallback") is not False):

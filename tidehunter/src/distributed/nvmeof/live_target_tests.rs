@@ -40,8 +40,6 @@ impl Fixture {
             state_dir: state,
             commissioning_port_id: 43,
             commissioning_service: 4421,
-            spdk: None,
-            export_mode: Default::default(),
         };
         Self {
             _tmp: tmp,
@@ -136,7 +134,6 @@ fn fifteen_exclusive_owners_share_configfs_without_sharing_objects() {
         config.commissioning_port_id += 2 * index as u16;
         config.service += 2 * index as u16;
         config.commissioning_service += 2 * index as u16;
-        config.export_mode = LiveExportMode::PerOwner;
         fs::create_dir(&config.state_dir).unwrap();
         let path = f._tmp.path().join(format!("wal-{index}"));
         fs::write(&path, [0; 4096]).unwrap();
@@ -261,7 +258,6 @@ fn crash_before_namespace_configuration_cleans_disabled_object() {
         binding: binding.clone(),
         file: f.file.clone(),
         readonly: false,
-        spdk_phase: None,
     });
     manager.save().unwrap();
     let sub = PathBuf::from("subsystems").join(&binding.nqn);
@@ -434,84 +430,9 @@ fn replaced_sealed_directory_blocks_recovery() {
 }
 
 #[test]
-fn uncertain_spdk_operations_remain_durable_and_block_fencing() {
-    for phase in [
-        spdk::Phase::Creating,
-        spdk::Phase::Removing,
-        spdk::Phase::Cleaning,
-    ] {
-        let f = Fixture::new();
-        let mut manager = f.open().unwrap();
-        let id = random_id().unwrap();
-        let binding = LiveTargetBinding {
-            nqn: format!("nqn.2026-01.local.tidehunter:live-{}", uuid(id)),
-            uuid: id,
-            nsid: 1,
-            bytes: f.file.bytes,
-            block_size: f.file.block_size,
-            address: f.config.address.clone(),
-            service: f.config.service,
-            transport: f.config.transport,
-            readonly: false,
-            spdk: None,
-            permanent: false,
-        };
-        manager.state.exports.push(Export {
-            binding,
-            file: f.file.clone(),
-            readonly: false,
-            spdk_phase: Some(phase),
-        });
-        manager.save().unwrap();
-        assert!(manager.spdk_fence(None).is_err());
-        assert_eq!(manager.state.exports[0].spdk_phase, Some(phase));
-        assert!(manager.sealed_file(&f.file.path).unwrap().is_none());
-        let bytes = fs::read(f.config.state_dir.join(STATE)).unwrap();
-        let persisted: State = serde_json::from_slice(&bytes[4..]).unwrap();
-        assert_eq!(persisted.exports[0].spdk_phase, Some(phase));
-    }
-}
-
-#[test]
-fn spdk_drained_journal_seals_exact_writable_inode() {
-    let f = Fixture::new();
-    let mut manager = f.open().unwrap();
-    let id = random_id().unwrap();
-    manager.state.exports.push(Export {
-        binding: LiveTargetBinding {
-            nqn: format!("nqn.2026-01.local.tidehunter:live-{}", uuid(id)),
-            uuid: id,
-            nsid: 1,
-            bytes: f.file.bytes,
-            block_size: f.file.block_size,
-            address: f.config.address.clone(),
-            service: f.config.service,
-            transport: f.config.transport,
-            readonly: false,
-            spdk: None,
-            permanent: false,
-        },
-        file: f.file.clone(),
-        readonly: false,
-        spdk_phase: Some(spdk::Phase::Drained),
-    });
-    manager.save().unwrap();
-    manager.spdk_fence(None).unwrap();
-    assert_eq!(
-        manager.sealed_file(&f.file.path).unwrap(),
-        Some(f.file.clone())
-    );
-    assert_eq!(
-        manager.state.exports[0].spdk_phase,
-        Some(spdk::Phase::Drained)
-    );
-}
-
-#[test]
 fn permanent_namespaces_share_subsystem_and_revoke_independently() {
     use super::super::live_storage::wal_export_name;
-    let mut f = Fixture::new();
-    f.config.export_mode = LiveExportMode::PerOwner;
+    let f = Fixture::new();
     let mut manager = f.open().unwrap();
     let name = wal_export_name(1024, [1; 16], 2, 3, 0);
     let first = manager.export_permanent(&name, f.file.clone()).unwrap();
@@ -542,55 +463,6 @@ fn permanent_namespaces_share_subsystem_and_revoke_independently() {
     manager.revoke(&second).unwrap();
     assert!(!sub.exists());
     manager.shutdown().unwrap();
-}
-
-#[test]
-fn old_target_config_binding_and_state_default_to_on_demand() {
-    let f = Fixture::new();
-    let mut config = serde_json::to_value(&f.config).unwrap();
-    config.as_object_mut().unwrap().remove("export_mode");
-    assert_eq!(
-        serde_json::from_value::<LiveTargetConfig>(config)
-            .unwrap()
-            .export_mode,
-        LiveExportMode::OnDemand
-    );
-    let mut manager = f.open().unwrap();
-    let binding = manager.export_writable(f.file.clone()).unwrap();
-    let mut old = serde_json::to_value(&binding).unwrap();
-    old.as_object_mut().unwrap().remove("permanent");
-    assert!(
-        !serde_json::from_value::<LiveTargetBinding>(old)
-            .unwrap()
-            .permanent
-    );
-    let mut old_state = serde_json::to_value(&manager.state).unwrap();
-    old_state["config"]
-        .as_object_mut()
-        .unwrap()
-        .remove("export_mode");
-    old_state["exports"][0]["binding"]
-        .as_object_mut()
-        .unwrap()
-        .remove("permanent");
-    let state: State = serde_json::from_value(old_state).unwrap();
-    assert_eq!(state.config.export_mode, LiveExportMode::OnDemand);
-    assert!(!state.exports[0].binding.permanent);
-    manager.shutdown().unwrap();
-}
-
-#[test]
-fn permanent_export_rejects_spdk() {
-    let mut f = Fixture::new();
-    f.config.export_mode = LiveExportMode::PerOwner;
-    f.config.spdk = Some(super::super::LiveSpdkConfig {
-        rpc_socket: f._tmp.path().join("rpc"),
-        executable: f._tmp.path().join("spdk"),
-    });
-    assert_eq!(
-        validate_config(&f.config).unwrap_err().to_string(),
-        "permanent live export requires the kernel target"
-    );
 }
 
 fn extra_wal(f: &Fixture, name: &str) -> LiveFileIdentity {
@@ -657,8 +529,7 @@ fn stale_registry_after_batched_revoke_recovers_and_keeps_markers() {
 #[test]
 fn batched_revoke_removes_only_fully_drained_permanent_subsystems() {
     use super::super::live_storage::wal_export_name;
-    let mut f = Fixture::new();
-    f.config.export_mode = LiveExportMode::PerOwner;
+    let f = Fixture::new();
     let mut manager = f.open().unwrap();
     let names: Vec<_> = (0..4)
         .map(|file| wal_export_name(2, [1; 16], 2, 3, file))
@@ -878,26 +749,17 @@ fn assert_recovery(
     true
 }
 
-impl Fixture {
-    fn with_mode(mode: LiveExportMode) -> Self {
-        let mut f = Self::new();
-        f.config.export_mode = mode;
-        f
-    }
-}
-
 /// Files a scenario exported before the crash window; `true` = writable.
 type Prepared = Vec<(LiveFileIdentity, bool)>;
 
 /// Crash at both steps of every save of `operation`, then recover. Returns
 /// (recovered, failed closed) cut counts; every cut is one of the two.
 fn crash_cuts(
-    mode: LiveExportMode,
     prepare: fn(&Fixture, &mut LiveTargetManager) -> Prepared,
     operation: fn(&Fixture, &mut LiveTargetManager, &Prepared) -> io::Result<()>,
 ) -> (usize, usize) {
     let saves = {
-        let f = Fixture::with_mode(mode);
+        let f = Fixture::new();
         let mut manager = f.open().unwrap();
         let prepared = prepare(&f, &mut manager);
         let count = Arc::new(AtomicUsize::new(0));
@@ -909,7 +771,7 @@ fn crash_cuts(
     let mut outcomes = (0, 0);
     for save in 0..saves {
         for step in [SaveStep::Prepared, SaveStep::Published] {
-            let f = Fixture::with_mode(mode);
+            let f = Fixture::new();
             let mut manager = f.open().unwrap();
             let identity = manager.identity().unwrap();
             let prepared = prepare(&f, &mut manager);
@@ -1004,7 +866,7 @@ fn crash_at_every_journal_step_of_open_recovers_or_fails_closed() {
 
 #[test]
 fn crash_at_every_journal_step_of_writable_export_recovers_or_fails_closed() {
-    let (recovered, _) = crash_cuts(LiveExportMode::OnDemand, nothing, |f, manager, _| {
+    let (recovered, _) = crash_cuts(nothing, |f, manager, _| {
         manager.export_writable(f.file.clone()).map(drop)
     });
     assert!(recovered > 0);
@@ -1012,7 +874,7 @@ fn crash_at_every_journal_step_of_writable_export_recovers_or_fails_closed() {
 
 #[test]
 fn crash_at_every_journal_step_of_readonly_export_recovers_or_fails_closed() {
-    let (recovered, _) = crash_cuts(LiveExportMode::OnDemand, nothing, |f, manager, _| {
+    let (recovered, _) = crash_cuts(nothing, |f, manager, _| {
         manager.export_readonly(f.file.clone()).map(drop)
     });
     assert!(recovered > 0);
@@ -1020,7 +882,7 @@ fn crash_at_every_journal_step_of_readonly_export_recovers_or_fails_closed() {
 
 #[test]
 fn crash_at_every_journal_step_of_permanent_export_recovers_or_fails_closed() {
-    let (recovered, _) = crash_cuts(LiveExportMode::PerOwner, nothing, |f, manager, _| {
+    let (recovered, _) = crash_cuts(nothing, |f, manager, _| {
         export_permanent_pair(f, manager).map(drop)
     });
     assert!(recovered > 0);
@@ -1028,16 +890,13 @@ fn crash_at_every_journal_step_of_permanent_export_recovers_or_fails_closed() {
 
 #[test]
 fn crash_at_every_journal_step_of_revocation_recovers() {
-    for (mode, prepare) in [
-        (
-            LiveExportMode::OnDemand,
-            writable_and_readonly as fn(&Fixture, &mut LiveTargetManager) -> Prepared,
-        ),
-        (LiveExportMode::PerOwner, permanent_pair),
+    for prepare in [
+        writable_and_readonly as fn(&Fixture, &mut LiveTargetManager) -> Prepared,
+        permanent_pair,
     ] {
         // Revocation creates nothing, so no cut can leave an uncertain
         // creation: every crash must recover.
-        let (_, failed_closed) = crash_cuts(mode, prepare, |_, manager, prepared| {
+        let (_, failed_closed) = crash_cuts(prepare, |_, manager, prepared| {
             let bindings = bindings(manager, prepared);
             manager.revoke_all(&bindings.iter().collect::<Vec<_>>())
         });
@@ -1047,11 +906,7 @@ fn crash_at_every_journal_step_of_revocation_recovers() {
 
 #[test]
 fn crash_at_every_journal_step_of_shutdown_recovers() {
-    let (_, failed_closed) = crash_cuts(
-        LiveExportMode::OnDemand,
-        writable_and_readonly,
-        |_, manager, _| manager.shutdown(),
-    );
+    let (_, failed_closed) = crash_cuts(writable_and_readonly, |_, manager, _| manager.shutdown());
     assert_eq!(failed_closed, 0);
 }
 

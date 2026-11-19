@@ -920,7 +920,6 @@ fn live_frame_can_fill_one_fragment() {
     config.live_nvme = Some(super::super::tcp::LiveClientConfig {
         lease_ahead: true,
         polled_writes: false,
-        export_mode: Default::default(),
         host_nqn: "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
         host_id: [1; 16],
         owner_identities: Default::default(),

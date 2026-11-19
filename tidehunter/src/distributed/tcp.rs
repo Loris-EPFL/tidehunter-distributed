@@ -32,7 +32,7 @@ pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
 mod inventory;
 mod live_client;
 mod payload;
-pub use super::nvmeof::{LiveExportMode, LiveQueueGeometry};
+pub use super::nvmeof::LiveQueueGeometry;
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use live_client::leased_tests;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -96,8 +96,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use inventory::NodeInventory;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-pub use inventory::SealedOwnerExport;
 /// Wire protocol version. 22 adds leased live WAL extents and adoption proofs.
 /// 23 adds OpenLiveExports for permanent live export.
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
@@ -674,7 +672,7 @@ enum Request {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     RegisterNvmeofExport {
         epoch: u64,
-        binding: Box<super::nvmeof::lease::ExportBinding>,
+        binding: Box<super::nvmeof::legacy_wire::ExportBinding>,
         reference: ValueRecordReference,
     },
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1009,15 +1007,12 @@ pub struct ValidatedRecordLocation {
 type ReadHook = Arc<dyn Fn(&ValueRecordReference) + Send + Sync>;
 
 /// Live exports created inline by an owner request, while its caller waited,
-/// by request kind. A grant (reserve, lease) pays for one only when no
+/// by request kind. A lease pays for one only when no
 /// preparation published its file first. Each count is one export creation
 /// with its target-registry syncs (see `LIFECYCLE_TIMEOUT`). Exports of
 /// background preparation and of `OpenLiveExports` are not counted.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct LiveInlineExportStats {
-    /// `ReserveLiveGroup` (kind 27): a group reservation in a file without a
-    /// binding, the first of an epoch or after a file rollover.
-    pub reserve: u64,
     /// `LeaseLiveExtent` (kind 33): a lease without a current extent, the first
     /// after open or after a fence.
     pub lease: u64,
@@ -1068,7 +1063,7 @@ impl StorageNode {
             Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
         let inventory = NodeInventory::open(config, metrics)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let live_nvme_selected = inventory.live_export_mode.is_some();
+        let live_nvme_selected = inventory.live_target_configured;
         let lifecycle = inventory.lifecycle.clone();
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
@@ -1077,8 +1072,6 @@ impl StorageNode {
         let append_batch_limits = inventory.config.partition.batch_limits;
         let append_group_limits = inventory.config.partition.group_limits;
         let partition = inventory.config.partition.clone();
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let nvmeof_leases = inventory.nvmeof_leases.clone();
         let inventory = Arc::new(Mutex::new(inventory));
         #[cfg(test)]
         let panic_after_append = Arc::new(AtomicBool::new(false));
@@ -1101,7 +1094,7 @@ impl StorageNode {
             read_config,
             read_admission: read_admission.clone(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            nvmeof_leases,
+            live_control_gate: Mutex::new(()),
             #[cfg(test)]
             panic_after_append: panic_after_append.clone(),
         });
@@ -1228,45 +1221,9 @@ impl StorageNode {
             .read()
             .snapshot(epoch, references, &self.terminal)
     }
-    /// Real-WAL qualification helper; the result is data, never a read grant.
-    /// Production owner tooling uses `PartitionLog::export_sealed_readset`.
-    #[cfg(all(feature = "experimental-nvmeof", any(test, feature = "test-utils")))]
-    pub fn export_sealed_nvmeof_readset(
-        &self,
-        source_epoch: u64,
-        directory: &std::path::Path,
-        references: &[ValueRecordReference],
-        config: &super::nvmeof::ExportConfig,
-    ) -> Result<super::nvmeof::ExportManifest, TcpError> {
-        let log = self.inventory.lock().sealed_nvmeof_log(source_epoch)?;
-        log.export_sealed_readset(directory, references, config)
-            .map_err(TcpError::component)
-    }
     #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn bench_live_grant_profiles(&self) -> serde_json::Value {
         self.control.grant_profiles()
-    }
-    /// Replace an empty owner registry with an explicit file-backed test fixture.
-    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn set_nvmeof_lease_fixture(
-        &self,
-        configfs: &std::path::Path,
-    ) -> Result<(), TcpError> {
-        let root = self.inventory.lock().config.root.clone();
-        let mut leases = self.control_context.nvmeof_leases.lock();
-        if leases.has_live_or_quarantined() {
-            return Err(TcpError::new(
-                "cannot replace a live NVMe-oF lease registry",
-            ));
-        }
-        *leases = super::nvmeof::lease::ExportLeaseRegistry::open_fixture(
-            &root,
-            configfs,
-            1024,
-            super::nvmeof::MAX_EXPORT_MANIFEST_BYTES,
-        )
-        .map_err(TcpError::component)?;
-        Ok(())
     }
     /// Install the ordinary-file live target fixture before serving any requests.
     /// This exercises the protocol, not a kernel NVMe target.
@@ -1286,7 +1243,7 @@ impl StorageNode {
         )
     }
     /// Install a live target manager after open: the gate owns the manager and
-    /// the inventory records its immutable export mode.
+    /// the inventory records that one is installed.
     #[cfg(all(
         any(test, feature = "test-utils"),
         feature = "experimental-nvmeof",
@@ -1298,10 +1255,10 @@ impl StorageNode {
     ) -> Result<(), TcpError> {
         let mut slot = self.control_context.lifecycle.lock();
         let mut inventory = self.inventory.lock();
-        if slot.is_some() || inventory.live_export_mode.is_some() {
+        if slot.is_some() || inventory.live_target_configured {
             return Err(TcpError::new("live target fixture already installed"));
         }
-        inventory.live_export_mode = Some(target.export_mode());
+        inventory.live_target_configured = true;
         *slot = Some(target);
         Ok(())
     }
@@ -2607,97 +2564,6 @@ impl Client {
         self.read_records(epoch, std::slice::from_ref(reference))?
             .pop()
             .ok_or_else(|| TcpError::new("empty record response"))
-    }
-    /// Validate an export catalog without transferring value bytes.
-    /// This control operation must finish before installing a direct read route.
-    #[cfg(feature = "experimental-nvmeof")]
-    pub fn validate_record_references(
-        &mut self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-    ) -> Result<Vec<ValidatedRecordLocation>, TcpError> {
-        if references.is_empty() || references.len() > self.max_reads.min(256) {
-            return Err(TcpError::new(
-                "record validation count exceeds negotiated bound",
-            ));
-        }
-        match self.request(Request::ValidateRecordReferences {
-            epoch,
-            references: references.to_vec(),
-        })? {
-            Response::ValidatedRecordReferences(locations)
-                if locations.len() == references.len()
-                    && locations
-                        .iter()
-                        .zip(references)
-                        .all(|(location, reference)| {
-                            location.reference == *reference
-                                && location.wal_file_bytes == self.expected.wal_file_bytes
-                                && reference.batch_address.partition == self.expected.partition
-                        }) =>
-            {
-                Ok(locations)
-            }
-            response => self.wrong_variant("ValidateRecordReferences", &response, "ValidatedRecordReferences with matching count, references, WAL file size and partition"),
-        }
-    }
-    /// Acquire an owner-pinned namespace admission before validating its catalog.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn register_nvmeof_export(
-        &mut self,
-        epoch: u64,
-        binding: super::nvmeof::lease::ExportBinding,
-        reference: ValueRecordReference,
-    ) -> Result<[u8; 16], TcpError> {
-        match self.request(Request::RegisterNvmeofExport {
-            epoch,
-            binding: Box::new(binding),
-            reference,
-        })? {
-            Response::NvmeofExportRegistered(token) => Ok(token),
-            response => {
-                self.wrong_variant("RegisterNvmeofExport", &response, "NvmeofExportRegistered")
-            }
-        }
-    }
-
-    /// Acknowledge a closed, fully drained namespace reader.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn release_nvmeof_export(
-        &mut self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<(), TcpError> {
-        match self.request(Request::ReleaseNvmeofExport { epoch, token })? {
-            Response::NvmeofExportReleased => Ok(()),
-            response => {
-                self.wrong_variant("ReleaseNvmeofExport", &response, "NvmeofExportReleased")
-            }
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn register_nvmeof_epoch_pin(&mut self, epoch: u64) -> Result<[u8; 16], TcpError> {
-        match self.request(Request::RegisterNvmeofEpochPin { epoch })? {
-            Response::NvmeofEpochPinned(token) => Ok(token),
-            response => {
-                self.wrong_variant("RegisterNvmeofEpochPin", &response, "NvmeofEpochPinned")
-            }
-        }
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn release_nvmeof_epoch_pin(
-        &mut self,
-        epoch: u64,
-        token: [u8; 16],
-    ) -> Result<(), TcpError> {
-        match self.request(Request::ReleaseNvmeofEpochPin { epoch, token })? {
-            Response::NvmeofEpochReleased => Ok(()),
-            response => {
-                self.wrong_variant("ReleaseNvmeofEpochPin", &response, "NvmeofEpochReleased")
-            }
-        }
     }
     pub fn read_records(
         &mut self,

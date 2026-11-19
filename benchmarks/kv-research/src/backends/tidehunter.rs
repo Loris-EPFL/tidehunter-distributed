@@ -3,8 +3,6 @@
 mod live_qualification;
 #[cfg(all(feature = "nvmeof", target_os = "linux"))]
 mod live_write_profile;
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
-mod nvmeof_campaign;
 pub mod replay;
 #[allow(clippy::too_many_lines)]
 // Its TLS setup is inherited and outside timed calls; do not restyle the shared engine helper.
@@ -12,15 +10,6 @@ pub mod replay;
 #[path = "../../../../tidehunter/examples/support/tcp_cluster.rs"]
 mod tcp_cluster;
 
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
-pub fn prepare_nvmeof_dataset(input: &Path, output: &Path) -> BackendResult<()> {
-    nvmeof_campaign::prepare(input, output)
-}
-
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
-pub fn export_nvmeof_dataset(launch: &Path, prepared: &Path, output: &Path) -> BackendResult<()> {
-    nvmeof_campaign::export(launch, prepared, output)
-}
 #[cfg(all(feature = "nvmeof", target_os = "linux"))]
 pub fn qualify_live_nvmeof(input: &Path, output: &Path) -> BackendResult<()> {
     live_qualification::run(input, output)
@@ -37,9 +26,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
-use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, ReplayLimits};
-use tidehunter::distributed::storage::{NATIVE_FRAGMENT_BYTES, NATIVE_WAL_FILE_BYTES};
+use tidehunter::distributed::storage::{
+    LocalInventoryConfig, NATIVE_FRAGMENT_BYTES, NATIVE_WAL_FILE_BYTES,
+};
 use tidehunter::distributed::sui;
 use tidehunter::distributed::tcp::{FabricSecurity, PollingPolicy, Transport};
 use tidehunter::key_shape::{KeyShape, KeyType};
@@ -143,13 +133,6 @@ struct Options {
     /// partition order, copied to the coordinator host. Required there; a missing file fails open.
     #[serde(default)]
     external_owner_durability_receipts: Vec<PathBuf>,
-    /// Independently admitted sealed-WAL namespaces; control/write transport stays separate.
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    #[serde(default)]
-    nvmeof_readers: Vec<tidehunter::distributed::nvmeof::NvmeofReaderConfig>,
-    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-    #[serde(default)]
-    nvmeof_readers: Vec<serde_json::Value>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,8 +159,6 @@ struct ExternalLiveNvmeof {
     inline_reads: bool,
     #[serde(default)]
     queue_geometry: tidehunter::distributed::tcp::LiveQueueGeometry,
-    #[serde(default)]
-    export_mode: tidehunter::distributed::tcp::LiveExportMode,
     #[serde(default = "default_resident_first")]
     lease_ahead: bool,
     #[serde(default)]
@@ -522,7 +503,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         remote.live_nvme = Some(tidehunter::distributed::tcp::LiveClientConfig {
             lease_ahead: live.lease_ahead,
             polled_writes: live.polled_writes,
-            export_mode: live.export_mode,
             host_nqn: host_nqn.clone(),
             host_id: *host_id,
             owner_identities: live_identities
@@ -583,8 +563,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
                 "port_id": live.port_id + port_offset,
                 "state_dir": input.guest_root.join(format!("node-{partition}")).join("live-nvmeof"),
                 "commissioning_port_id": live.commissioning_port_id + port_offset,
-                "commissioning_service": live.commissioning_service + port_offset,
-                "export_mode": live.export_mode
+                "commissioning_service": live.commissioning_service + port_offset
             });
             launch["node"]["live_target"] = serde_yaml::to_value(config)?;
             fs::write(&launch_path, serde_yaml::to_string(&launch)?)?;
@@ -769,32 +748,6 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
     {
         return Err("live NVMe-oF requires the Linux nvmeof benchmark feature".into());
     }
-    if !options.nvmeof_readers.is_empty() {
-        if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
-            return Err("NVMe-oF requires the Linux nvmeof benchmark feature".into());
-        }
-        if options.external_remote_config.is_none() {
-            return Err("NVMe-oF readers require explicit external owner configuration and prepared sealed data".into());
-        }
-    }
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    if let Some(first) = options.nvmeof_readers.first()
-        && options
-            .nvmeof_readers
-            .iter()
-            .any(|reader| reader.binding.transport != first.binding.transport)
-    {
-        return Err("one benchmark case cannot pool different NVMe-oF transports".into());
-    }
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    if options
-        .external_remote_config
-        .as_ref()
-        .is_some_and(|config| config.live_nvme.is_some())
-        && !options.nvmeof_readers.is_empty()
-    {
-        return Err("live NVMe-oF and sealed-WAL readers are separate benchmark modes".into());
-    }
     if options.path.as_os_str().is_empty()
         || options
             .evidence
@@ -908,60 +861,6 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
 
 pub fn validate_options(value: &serde_json::Value) -> BackendResult<()> {
     parse_options(value).map(|_| ())
-}
-
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
-fn compact_nvmeof_reader(
-    reader: &tidehunter::distributed::nvmeof::NvmeofReaderConfig,
-) -> BackendResult<serde_json::Value> {
-    use blake2::{Blake2b512, Digest};
-    struct DigestWriter(Blake2b512);
-    impl std::io::Write for DigestWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let manifest = &reader.manifest;
-    let mut digest = DigestWriter(Blake2b512::new());
-    // Hash the compact serde serialization without allocating a second catalog.
-    serde_json::to_writer(&mut digest, manifest)?;
-    let hash: String = digest
-        .0
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    Ok(serde_json::json!({
-        "binding": reader.binding,
-        "manifest": {
-            "version": manifest.version,
-            "database_uuid": manifest.database_uuid,
-            "epoch": manifest.epoch,
-            "partition": manifest.partition,
-            "generation": manifest.generation,
-            "export_uuid": manifest.export_uuid,
-            "nqn": manifest.nqn,
-            "nsid": manifest.nsid,
-            "wal_file_bytes": manifest.wal_file_bytes,
-            "source_file_index": manifest.source_file_index,
-            "image_len": manifest.image_len,
-            "block_size": manifest.block_size,
-            "source_device": manifest.source_device,
-            "source_inode": manifest.source_inode,
-            "durable_frontier": manifest.durable_frontier,
-            "catalog_count": manifest.catalog.len(),
-            "manifest_hash_blake2b512": hash,
-            "hash_encoding": "compact serde_json serialization of ExportManifest"
-        },
-        "max_inflight_requests": reader.max_inflight_requests,
-        "max_inflight_members": reader.max_inflight_members,
-        "max_inflight_bytes": reader.max_inflight_bytes,
-        "max_catalog_bytes": reader.max_catalog_bytes
-    }))
 }
 
 pub async fn open(
@@ -1187,18 +1086,6 @@ async fn open_with_shape(
     let live_nvme = false;
     let selected_backend = backend_name(&transport);
     #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    let selected_backend = options
-        .nvmeof_readers
-        .first()
-        .map_or(selected_backend, |reader| match reader.binding.transport {
-            tidehunter::distributed::nvmeof::NvmeofTransport::Tcp => {
-                "tidehunter_nvme_tcp_sealed_read"
-            }
-            tidehunter::distributed::nvmeof::NvmeofTransport::Rdma => {
-                "tidehunter_nvme_rdma_sealed_read"
-            }
-        });
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     let selected_backend = if live_nvme {
         "tidehunter_live_nvmeof"
     } else {
@@ -1207,7 +1094,6 @@ async fn open_with_shape(
     let mut effective_configuration = serde_json::json!({
         "backend": selected_backend,
         "live_queue_geometry": remote_config.live_nvme.as_ref().map(|live| live.queue_geometry),
-        "live_export_mode": remote_config.live_nvme.as_ref().map(|live| live.export_mode),
         "transport": transport.label(),
         "transport_security": transport.security_label(),
         // Full serialized selector, so every transport knob (provider, domain, slots) is receipted.
@@ -1335,12 +1221,7 @@ async fn open_with_shape(
         .id();
     let db = sui::Db::open_remote(&coordinator_path, shape, remote_config).map_err(native_error)?;
     #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    for reader in &options.nvmeof_readers {
-        db.install_nvmeof_reader(reader.clone())
-            .map_err(native_error)?;
-    }
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    if !options.nvmeof_readers.is_empty() || db.live_nvmeof_stats().is_some() {
+    if db.live_nvmeof_stats().is_some() {
         db.register_nvmeof_metrics(registry).map_err(native_error)?;
     }
     #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
@@ -1375,26 +1256,10 @@ async fn open_with_shape(
                 None => serde_json::Value::Null,
             };
     }
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    {
-        effective_configuration["nvmeof_readers"] = serde_json::Value::Array(
-            options
-                .nvmeof_readers
-                .iter()
-                .map(compact_nvmeof_reader)
-                .collect::<BackendResult<Vec<_>>>()?,
-        );
-    }
-    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-    {
-        effective_configuration["nvmeof_readers"] = serde_json::json!([]);
-    }
     effective_configuration["read_backend"] = serde_json::json!(if live_nvme {
         "live_nvmeof"
-    } else if options.nvmeof_readers.is_empty() {
-        "owner_record_protocol"
     } else {
-        "linux_nvmeof_sealed_read_with_owner_record_fallback"
+        "owner_record_protocol"
     });
     effective_configuration["write_backend"] = serde_json::json!(if live_nvme {
         "live_nvmeof"
@@ -1624,18 +1489,6 @@ impl KvBackend for TidehunterBackend {
     fn read_observation(&self) -> BackendResult<serde_json::Value> {
         let db = self.db.as_ref().ok_or("backend is shutting down")?;
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-        let nvmeof = {
-            let readers = db.nvmeof_stats();
-            serde_json::json!({
-                "available": !readers.is_empty(),
-                "readers": readers,
-                "scope": "lifetime host reader counters; submit_to_cq includes kernel/network/target/device",
-            })
-        };
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        let nvmeof =
-            serde_json::json!({"available": false, "reason": "Linux NVMe-oF feature not enabled"});
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         let live_nvmeof = self.live_boundary_snapshot(db)?;
         #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
         let live_nvmeof: Option<serde_json::Value> = None;
@@ -1702,8 +1555,7 @@ impl KvBackend for TidehunterBackend {
         let Some(monitor) = db.read_evidence_monitor() else {
             return Ok(
                 serde_json::json!({"available": true, "coordinator": coordinator,
-                "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "owner_storage": owner_storage,
-                "durable_cut": durable_cut,
+                "live_nvmeof": live_nvmeof, "owner_storage": owner_storage, "durable_cut": durable_cut,
                 "owner_executor": {"available": false, "error": "read evidence monitor unavailable"}}),
             );
         };
@@ -1714,8 +1566,7 @@ impl KvBackend for TidehunterBackend {
         Ok(
             serde_json::json!({"available": true, "coordinator": coordinator,
             "owner_executor": owners,
-            "nvmeof": nvmeof, "live_nvmeof": live_nvmeof, "owner_storage": owner_storage,
-            "durable_cut": durable_cut}),
+            "live_nvmeof": live_nvmeof, "owner_storage": owner_storage, "durable_cut": durable_cut}),
         )
     }
 
@@ -2434,53 +2285,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    #[test]
-    fn compact_reader_receipt_keeps_identity_and_hash_without_catalog() {
-        use blake2::{Blake2b512, Digest};
-        use tidehunter::distributed::nvmeof::{
-            ExportManifest, NamespaceBinding, NvmeofReaderConfig, NvmeofTransport,
-        };
-        let reader = NvmeofReaderConfig {
-            binding: NamespaceBinding {
-                namespace_path: "/dev/nvme0n1".into(),
-                transport: NvmeofTransport::Tcp,
-                target: Default::default(),
-            },
-            manifest: ExportManifest {
-                version: 1,
-                database_uuid: [1; 16],
-                epoch: 2,
-                partition: 3,
-                generation: 2,
-                export_uuid: [4; 16],
-                nqn: "nqn.2026-01.local.tidehunter:test".into(),
-                wal_file_bytes: 4096,
-                source_file_index: 1,
-                nsid: 1,
-                image_len: 4096,
-                block_size: 4096,
-                source_device: 7,
-                source_inode: 8,
-                durable_frontier: 8192,
-                catalog: Vec::new(),
-            },
-            max_inflight_requests: 2,
-            max_inflight_members: 4,
-            max_inflight_bytes: 8192,
-            max_catalog_bytes: 65536,
-        };
-        let receipt = compact_nvmeof_reader(&reader).unwrap();
-        let hash: String = Blake2b512::digest(serde_json::to_vec(&reader.manifest).unwrap())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        assert_eq!(receipt["manifest"]["manifest_hash_blake2b512"], hash);
-        assert_eq!(receipt["manifest"]["catalog_count"], 0);
-        assert!(receipt["manifest"].get("catalog").is_none());
-        assert_eq!(receipt["binding"]["transport"], "tcp");
-    }
-
     #[test]
     fn largest_research_batch_fits_native_group_and_fragment() {
         use tidehunter::distributed::{
@@ -2559,10 +2363,9 @@ mod tests {
             tidehunter::distributed::tcp::LeasedSync::GroupFlush
         );
         assert_eq!(parsed.leased_flush_min_frame_bytes, 65536);
-        assert_eq!(
-            parsed.export_mode,
-            tidehunter::distributed::tcp::LiveExportMode::OnDemand
-        );
+        let mut removed = input.clone();
+        removed["export_mode"] = serde_json::json!("per_owner");
+        assert!(serde_json::from_value::<ExternalLiveNvmeof>(removed).is_err());
         assert_eq!(
             serde_json::to_value(parsed.queue_geometry).unwrap(),
             serde_json::json!({"io_queues": 4, "queue_size": 128, "poll_queues": 0})
@@ -2760,7 +2563,7 @@ mod tests {
             "live_nvmeof": {
                 "addresses": ["10.20.15.197"],
                 "commissioning_port_id": 1001, "commissioning_service": 4421,
-                "connect_timeout_ms": 30000, "export_mode": "per_owner",
+                "connect_timeout_ms": 30000,
                 "inline_reads": true, "io_timeout_ms": 30000,
                 "max_inflight_bytes": 16777216, "max_inflight_requests": 32,
                 "port_id": 1000,
@@ -2833,13 +2636,8 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         let input = root.join("input.json");
-        for (name, export, ahead, polled) in [
-            ("controller", "per_owner", true, false),
-            ("polled", "per_owner", false, true),
-            ("on-demand", "on_demand", true, false),
-        ] {
+        for (name, ahead, polled) in [("controller", true, false), ("polled", false, true)] {
             let mut value = controller_live_preparation_input();
-            value["live_nvmeof"]["export_mode"] = serde_json::json!(export);
             value["live_nvmeof"]["lease_ahead"] = serde_json::json!(ahead);
             value["live_nvmeof"]["polled_writes"] = serde_json::json!(polled);
             value["live_nvmeof"]["leased_flush_min_frame_bytes"] = serde_json::json!(8192);
@@ -2853,7 +2651,6 @@ mod tests {
             assert!(remote.get("history_persistence").is_none());
             assert_eq!(remote["live_nvme"]["lease_ahead"], ahead);
             assert_eq!(remote["live_nvme"]["polled_writes"], polled);
-            assert_eq!(remote["live_nvme"]["export_mode"], export);
             assert_eq!(remote["live_nvme"]["leased_flush_min_frame_bytes"], 8192);
             assert_eq!(
                 remote["live_nvme"]["queue_geometry"],
@@ -2863,10 +2660,7 @@ mod tests {
                 serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap())
                     .unwrap();
             assert_eq!(launch["history_persistence"].as_str(), Some("wal_replay"));
-            assert_eq!(
-                launch["node"]["live_target"]["export_mode"].as_str(),
-                Some(export)
-            );
+            assert!(launch["node"]["live_target"].get("export_mode").is_none());
             assert_eq!(
                 launch["node"]["live_target"]["host_nqn"].as_str(),
                 remote["live_nvme"]["host_nqn"].as_str()
@@ -2980,7 +2774,6 @@ mod tests {
             assert_eq!(remote["pin_read_lanes"], false);
             assert!(remote.get("read_lanes").is_none());
             assert_eq!(remote["live_nvme"]["inline_reads"], true);
-            assert_eq!(remote["live_nvme"]["export_mode"], "on_demand");
             assert_eq!(remote["live_nvme"]["lease_ahead"], true);
             assert_eq!(remote["live_nvme"]["polled_writes"], false);
             assert_eq!(remote["live_nvme"]["leased_sync"], "group_flush");
@@ -3000,7 +2793,6 @@ mod tests {
                     serde_yaml::from_value(launch["node"].clone()).unwrap();
                 assert!(node.live_target.is_some());
                 let target = &launch["node"]["live_target"];
-                assert_eq!(target["export_mode"].as_str(), Some("on_demand"));
                 assert_eq!(
                     target["address"].as_str().unwrap(),
                     format!("10.1.0.{}", partition + 1)
@@ -3015,23 +2807,6 @@ mod tests {
                 assert_eq!(
                     target["commissioning_service"].as_u64(),
                     Some(4421 + 2 * partition)
-                );
-            }
-            config["live_nvmeof"]["export_mode"] = serde_json::json!("per_owner");
-            write_input(&config);
-            let permanent = root.join("live-per-owner");
-            prepare_external_case_file(&input, &permanent).unwrap();
-            let remote: serde_json::Value =
-                serde_json::from_slice(&fs::read(permanent.join("remote.json")).unwrap()).unwrap();
-            assert_eq!(remote["live_nvme"]["export_mode"], "per_owner");
-            for partition in 0..5 {
-                let launch: serde_yaml::Value = serde_yaml::from_slice(
-                    &fs::read(permanent.join(format!("node-{partition}/launch.yaml"))).unwrap(),
-                )
-                .unwrap();
-                assert_eq!(
-                    launch["node"]["live_target"]["export_mode"].as_str(),
-                    Some("per_owner")
                 );
             }
             for count in [1, 2, 4, 16] {
@@ -3074,7 +2849,6 @@ mod tests {
             );
             config["live_nvmeof"]["addresses"] =
                 serde_json::json!(["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"]);
-            config["live_nvmeof"]["export_mode"] = serde_json::json!("on_demand");
             config["live_nvmeof"]["queue_geometry"] =
                 serde_json::json!({"io_queues": 4, "queue_size": 32, "poll_queues": 0});
             config["pin_read_lanes"] = serde_json::json!(true);

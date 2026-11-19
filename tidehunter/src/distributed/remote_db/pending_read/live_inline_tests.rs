@@ -38,7 +38,6 @@ impl Case {
                 config.live_nvme = Some(crate::distributed::tcp::LiveClientConfig {
                     lease_ahead: true,
                     polled_writes: false,
-                    export_mode: Default::default(),
                     host_nqn: "nqn.2026-01.test:inline".into(),
                     host_id: [1; 16],
                     owner_identities: Default::default(),

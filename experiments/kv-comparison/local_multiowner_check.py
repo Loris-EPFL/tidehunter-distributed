@@ -135,7 +135,6 @@ def main():
         job.pop(key, None)
     job.update(selection='local_functional', backend='tidehunter_nvme_tcp', keys=args.owners,
                warmup_operations=0, measurement_operations=args.owners, concurrency=args.owners,
-               live_export_mode='per_owner',
                owner_wal_geometry='research', owner_wal_file_bytes=8388608,
                owner_read_memory_allowance_bytes=128 * 1024**2)
     now = datetime.now(timezone.utc)

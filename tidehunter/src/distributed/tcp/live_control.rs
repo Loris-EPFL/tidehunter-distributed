@@ -181,7 +181,8 @@ impl LiveExportPin {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LiveExportInfo {
-    pub mode: LiveExportMode,
+    /// Always `PerOwner`; see `legacy_wire::LiveExportMode`.
+    pub mode: super::super::nvmeof::legacy_wire::LiveExportMode,
     pub address: String,
     pub service: u16,
     pub transport: super::super::nvmeof::NvmeofTransport,
@@ -336,14 +337,12 @@ impl Client {
         let Response::LiveExports(info) = response else {
             return self.wrong_variant("OpenLiveExports", &response, "LiveExports");
         };
-        if self
-            .live_config
-            .as_ref()
-            .is_none_or(|config| info.mode != config.export_mode)
+        if self.live_config.is_none()
+            || info.mode != super::super::nvmeof::legacy_wire::LiveExportMode::PerOwner
         {
             self.broken = true;
             return Err(TcpError::new(
-                "live export mode differs between owner and coordinator",
+                "owner live export mode is not per_owner, or live NVMe is not configured",
             ));
         }
         if info.wal_file_bytes != self.expected.wal_file_bytes {
@@ -405,23 +404,19 @@ impl Client {
         let extent = &leased.extent;
         let fragment = self.expected.fragment_bytes;
         self.valid_live_segment(&extent.segment, &leased.binding, epoch, extent.start)
-            && self
-                .live_config
-                .as_ref()
-                .and_then(|config| config.export_mode.files_per_subsystem())
-                .is_none_or(|files| {
-                    let name = super::super::nvmeof::live_storage::wal_export_name(
-                        files,
-                        extent.segment.database,
-                        extent.segment.partition,
-                        epoch,
-                        extent.segment.file_index,
-                    );
-                    leased.binding.permanent
-                        && leased.binding.nqn == name.nqn
-                        && leased.binding.nsid == name.nsid
-                        && leased.binding.uuid == name.uuid
-                })
+            && (self.live_config.is_none() || {
+                let name = super::super::nvmeof::live_storage::wal_export_name(
+                    super::super::nvmeof::live_storage::FILES_PER_SUBSYSTEM,
+                    extent.segment.database,
+                    extent.segment.partition,
+                    epoch,
+                    extent.segment.file_index,
+                );
+                leased.binding.permanent
+                    && leased.binding.nqn == name.nqn
+                    && leased.binding.nsid == name.nsid
+                    && leased.binding.uuid == name.uuid
+            })
             && extent.token != [0; 16]
             && !leased.binding.readonly
             && extent.segment.block_size == 4096

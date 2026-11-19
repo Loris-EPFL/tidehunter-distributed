@@ -621,24 +621,6 @@ class NvmeActionAdmissionTests(unittest.TestCase):
         with self.assertRaises(controller.SafetyError):
             controller.live_nvme_preparation(config, "case-1", "rdma")
 
-    def test_live_spdk_config_is_exact_and_explicit(self):
-        config = config_fixture()
-        config["spec"].update(mode="standard-with-live-nvmeof",
-                              backends=["tidehunter_nvme_rdma"], spdk_comparison=True)
-        host = "nqn.2014-08.org.nvmexpress:uuid:12345678-1234-4234-8234-123456789abc"
-        with patch.object(controller, "platform_module", return_value=None):
-            kernel = controller.live_target_for_owner(config, "case-1", 2, "rdma", host)
-            target = controller.live_target_for_owner(config, "case-1", 2, "rdma", host, "spdk")
-            self.assertNotIn("spdk", kernel)
-            self.assertEqual(set(target["spdk"]), {"rpc_socket", "executable"})
-            self.assertEqual(target["spdk"]["executable"], "/opt/test-comparison/runtime/spdk/bin/nvmf_tgt")
-            self.assertEqual(target["spdk"]["rpc_socket"],
-                             controller.live_target_for_owner(config, "case-1", 2, "rdma", host, "spdk")["spdk"]["rpc_socket"])
-            self.assertNotEqual(target["spdk"]["rpc_socket"],
-                                controller.live_target_for_owner(config, "case-1", 3, "rdma", host, "spdk")["spdk"]["rpc_socket"])
-            config["spec"]["spdk_comparison"] = False
-            with self.assertRaises(controller.SafetyError):
-                controller.live_target_for_owner(config, "case-1", 2, "rdma", host, "spdk")
 
     def test_live_spdk_boundary_retains_partial_owner_failures(self):
         runtime = object.__new__(controller.Controller)

@@ -1921,8 +1921,9 @@ def admit_prepared_live_client(live_client, prep, tier):
                 raise SafetyError("live owner UUID differs from its NQN")
         expected["owner_identities"] = identities
     expected.update(host_nqn=host_nqn, host_id=host_id, leased_durability=tier,
-                    inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"],
-                    export_mode=prep["export_mode"])
+                    inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"])
+    if "export_mode" in prep:
+        expected["export_mode"] = "per_owner"
     for key, default in (("lease_ahead", True), ("polled_writes", False), ("leased_write_window", None)):
         if key in live_client or key in prep:
             expected[key] = prep.get(key, default)
@@ -1947,15 +1948,11 @@ def live_target_for_owner(config, case, index, transport, host_nqn, target="kern
             "state_dir": str(Path(config["fleet"]["data_root"]) / "cells" / case
                              / f"node-{index}" / "live-nvmeof"),
             "commissioning_port_id": prep["commissioning_port_id"] + offset,
-            "commissioning_service": prep["commissioning_service"] + offset, "export_mode": export_mode}
-    if target == "spdk":
-        if transport != "rdma" or config["spec"].get("spdk_comparison") is not True:
-            raise SafetyError("live SPDK requires explicitly admitted RDMA comparison")
-        token = hashlib.sha256((config["prefix"] + "\0" + case + "\0" + str(index)).encode()).hexdigest()[:32]
-        result["spdk"] = {"rpc_socket": "/run/tidehunter-spdk-live/" + token + "/rpc.sock",
-                          "executable": str(Path(config["binary"]).parent.parent / "spdk/bin/nvmf_tgt")}
-    elif target != "kernel":
-        raise SafetyError("unknown live target")
+            "commissioning_service": prep["commissioning_service"] + offset}
+    if target != "kernel":
+        raise SafetyError("only the kernel live target is supported")
+    if config["spec"].get("selection") == q0_campaign.SELECTION:
+        result["export_mode"] = export_mode
     return result
 
 
@@ -3832,7 +3829,6 @@ class Controller:
             live_transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}.get(job["backend"])
             prep["live_nvmeof"] = live_nvme_preparation(self.config, case, live_transport)
             prep["live_nvmeof"].update(inline_reads=job.get("live_inline_reads", True),
-                                       export_mode="per_owner",
                                        lease_ahead=job.get("live_lease_ahead", True),
                                        polled_writes=job.get("live_polled_writes", False),
                                        leased_write_window=job.get("live_leased_write_window"),
@@ -3844,7 +3840,7 @@ class Controller:
                     prep["live_nvmeof"][key] = job["live_" + key]
             if binary_seal is not None:
                 prep["history_persistence"] = "wal_replay"
-                prep["live_nvmeof"]["write_mode"] = "leased"
+                prep["live_nvmeof"].update(write_mode="leased", export_mode="per_owner")
         if "live_pin_read_lanes" in job:
             prep["pin_read_lanes"] = job["live_pin_read_lanes"]
         if "read_lanes" in job:
@@ -5004,19 +5000,6 @@ class Controller:
                 else:
                     options = record_phase_span(focused_spans if "case_kind" in job else None,
                                                 "backend_deploy", self.prepare_tide, job, directory)
-                if backend in cloud_campaign.NVME_BACKENDS and job.get("nvmeof_route") != "live":
-                    target_started = time.monotonic_ns()
-                    target_status = "failed"
-                    try:
-                        options["nvmeof_readers"] = self.connect_nvme(job, directory)
-                        target_status = "completed"
-                    finally:
-                        if "case_kind" in job:
-                            focused_spans.append({"operation": "target_setup", "host_index": 0,
-                                "monotonic_start_ns": target_started, "monotonic_end_ns": time.monotonic_ns(),
-                                "status": target_status})
-                    receipt["nvmeof_target_evidence"] = {"path": "nvme-targets.json",
-                                                        "sha256": digest(directory / "nvme-targets.json")}
                 if job.get("nvmeof_route") == "live":
                     transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}[backend]
                     prep = live_nvme_preparation(self.config, job["case_id"], transport)

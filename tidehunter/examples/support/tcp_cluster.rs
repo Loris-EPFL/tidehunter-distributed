@@ -14,10 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
-use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, RemoteEndpoint};
 use tidehunter::distributed::storage::HistoryPersistence;
-use tidehunter::distributed::storage::{PartitionConfig, StaticInventory};
+use tidehunter::distributed::storage::{LocalInventoryConfig, PartitionConfig, StaticInventory};
 use tidehunter::distributed::tcp::{
     NodeConfig, PollingPolicy, StorageNode, TcpLimits, TlsFiles, Transport,
 };
@@ -427,16 +426,12 @@ fn confirm_owner_start(
 }
 
 fn qualified_live_target_shutdown(
-    implementation: tidehunter::distributed::nvmeof::LiveTargetImplementation,
     serve_ok: bool,
     target: Option<&tidehunter::distributed::nvmeof::LiveTargetStats>,
 ) -> bool {
     serve_ok
         && target.is_some_and(|stats| {
-            !stats.fixture_only
-                && stats.target_implementation == implementation
-                && stats.errors == 0
-                && stats.owned_namespace_count == 0
+            !stats.fixture_only && stats.errors == 0 && stats.owned_namespace_count == 0
         })
 }
 
@@ -506,20 +501,12 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     }
     let launch_bytes = fs::read(&file)?;
     let config: NodeLaunch = serde_yaml::from_slice(&launch_bytes)?;
-    let live_shutdown_owner = config.node.live_target.as_ref().map(|target| {
-        let implementation = if target.spdk.is_some() {
-            tidehunter::distributed::nvmeof::LiveTargetImplementation::Spdk
-        } else {
-            tidehunter::distributed::nvmeof::LiveTargetImplementation::Kernel
-        };
-        (
-            serde_json::json!({
-                "database": config.node.partition.inventory.database,
-                "partition": config.node.partition.partition,
-                "root": config.node.root,
-            }),
-            implementation,
-        )
+    let live_shutdown_owner = config.node.live_target.as_ref().map(|_| {
+        serde_json::json!({
+            "database": config.node.partition.inventory.database,
+            "partition": config.node.partition.partition,
+            "root": config.node.root,
+        })
     });
     println!(
         "shard_read_memory_allowance_bytes={}",
@@ -600,7 +587,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     monitor
         .join()
         .map_err(|_| io::Error::other("node stop monitor panicked"))?;
-    if let Some((owner, implementation)) = live_shutdown_owner {
+    if let Some(owner) = live_shutdown_owner {
         use blake2::{Blake2b512, Digest};
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
@@ -608,15 +595,8 @@ pub fn maybe_run_storage_node() -> Result<bool> {
         // database close does not destroy the target: it must permit reopen.
         let cleanup = node.finish_live_target_shutdown();
         let target = cleanup.as_ref().ok().and_then(Option::as_ref);
-        let complete = qualified_live_target_shutdown(implementation, result.is_ok(), target);
-        let scope = match implementation {
-            tidehunter::distributed::nvmeof::LiveTargetImplementation::Kernel => {
-                "kernel_live_target_shutdown"
-            }
-            tidehunter::distributed::nvmeof::LiveTargetImplementation::Spdk => {
-                "spdk_live_target_shutdown"
-            }
-        };
+        let complete = qualified_live_target_shutdown(result.is_ok(), target);
+        let scope = "kernel_live_target_shutdown";
         let launch_hash: String = Blake2b512::digest(&launch_bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -1308,7 +1288,7 @@ fn record_owner_threads(proof: &mut serde_json::Value, read_workers: usize) {
 #[cfg(test)]
 mod live_shutdown_tests {
     use super::qualified_live_target_shutdown;
-    use tidehunter::distributed::nvmeof::{LiveTargetImplementation, LiveTargetStats};
+    use tidehunter::distributed::nvmeof::LiveTargetStats;
 
     #[test]
     fn shutdown_receipt_records_resolved_owner_threads() {
@@ -1326,61 +1306,18 @@ mod live_shutdown_tests {
     }
 
     #[test]
-    fn shutdown_requires_actual_matching_backend_and_clean_counters() {
-        let mut stats = LiveTargetStats {
-            target_implementation: LiveTargetImplementation::Kernel,
-            ..Default::default()
-        };
-        assert!(qualified_live_target_shutdown(
-            LiveTargetImplementation::Kernel,
-            true,
-            Some(&stats)
-        ));
-        assert!(!qualified_live_target_shutdown(
-            LiveTargetImplementation::Spdk,
-            true,
-            Some(&stats)
-        ));
-        stats.target_implementation = LiveTargetImplementation::Spdk;
-        assert!(qualified_live_target_shutdown(
-            LiveTargetImplementation::Spdk,
-            true,
-            Some(&stats)
-        ));
-        assert!(!qualified_live_target_shutdown(
-            LiveTargetImplementation::Kernel,
-            true,
-            Some(&stats)
-        ));
-        assert!(!qualified_live_target_shutdown(
-            LiveTargetImplementation::Spdk,
-            false,
-            Some(&stats)
-        ));
-        assert!(!qualified_live_target_shutdown(
-            LiveTargetImplementation::Spdk,
-            true,
-            None
-        ));
+    fn shutdown_requires_clean_counters() {
+        let mut stats = LiveTargetStats::default();
+        assert!(qualified_live_target_shutdown(true, Some(&stats)));
+        assert!(!qualified_live_target_shutdown(false, Some(&stats)));
+        assert!(!qualified_live_target_shutdown(true, None));
         stats.owned_namespace_count = 1;
-        assert!(!qualified_live_target_shutdown(
-            LiveTargetImplementation::Spdk,
-            true,
-            Some(&stats)
-        ));
+        assert!(!qualified_live_target_shutdown(true, Some(&stats)));
         stats.owned_namespace_count = 0;
         stats.errors = 1;
-        assert!(!qualified_live_target_shutdown(
-            LiveTargetImplementation::Spdk,
-            true,
-            Some(&stats)
-        ));
+        assert!(!qualified_live_target_shutdown(true, Some(&stats)));
         stats.errors = 0;
         stats.fixture_only = true;
-        assert!(!qualified_live_target_shutdown(
-            LiveTargetImplementation::Spdk,
-            true,
-            Some(&stats)
-        ));
+        assert!(!qualified_live_target_shutdown(true, Some(&stats)));
     }
 }

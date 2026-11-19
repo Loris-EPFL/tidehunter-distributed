@@ -7,10 +7,10 @@
 use super::core::WriteCore;
 use super::sequencer::Resolution;
 use crate::distributed::codec::Mutation;
-use crate::distributed::local_db::LocalDbError;
 use crate::distributed::remote_db::concurrent::AdmissionCharges;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 use crate::distributed::remote_db::{IndexReadCut, RemoteDatabase};
+use crate::distributed::storage::LocalDbError;
 use crate::distributed::tcp::StorageNode;
 use crate::distributed::types::{BatchId, BatchVersion};
 use crate::key_shape::{KeyShape, KeySpace, KeyType};

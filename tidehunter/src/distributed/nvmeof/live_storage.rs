@@ -27,6 +27,10 @@ use crate::distributed::types::{BatchId, BatchVersion, PayloadDigest};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// WAL files per permanent export subsystem: one subsystem per owner covers
+/// 1024 files of an epoch, one namespace each.
+pub const FILES_PER_SUBSYSTEM: u64 = 1024;
+
 /// Deterministic active-epoch subsystem and namespace identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalExportName {
@@ -163,6 +167,8 @@ impl Drop for LiveRecordLease {
     }
 }
 
+/// Body of the removed Reserved route's `LiveReserved` reply. Kept only so the
+/// wire layout stays unchanged until the protocol bump removes it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveWriteReservation {
     pub token: [u8; 16],
@@ -170,12 +176,6 @@ pub struct LiveWriteReservation {
     /// Global native WAL offset; subtract file_index * segment.bytes for I/O.
     pub frame_offset: u64,
     pub frame_len: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum LiveReserveResult {
-    Existing(Vec<AppendedBatch>),
-    Reserved(LiveWriteReservation),
 }
 
 /// One fragment remainder granted to a single writer. Offsets are global WAL

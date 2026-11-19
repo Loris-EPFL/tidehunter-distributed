@@ -49,23 +49,6 @@ fn entry() -> BackendResult<()> {
     }
     if arguments
         .first()
-        .is_some_and(|arg| arg == "prepare-nvmeof-dataset" || arg == "export-nvmeof-dataset")
-    {
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-        {
-            return match (arguments[0].as_str(), arguments.as_slice()) {
-                ("prepare-nvmeof-dataset", [_, input, output]) =>
-                    backends::tidehunter::prepare_nvmeof_dataset(Path::new(input), Path::new(output)),
-                ("export-nvmeof-dataset", [_, launch, prepared, output]) =>
-                    backends::tidehunter::export_nvmeof_dataset(Path::new(launch), Path::new(prepared), Path::new(output)),
-                _ => Err("usage: prepare-nvmeof-dataset RUN_CONFIG.json OUTPUT.json | export-nvmeof-dataset NODE_LAUNCH.yaml PREPARED.json OUTPUT_DIR".into()),
-            };
-        }
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        return Err("NVMe-oF campaign tools require Linux and the nvmeof feature".into());
-    }
-    if arguments
-        .first()
         .is_some_and(|argument| argument == "--prepare-external-case")
     {
         if arguments.len() != 4 || arguments[2] != "--output" {

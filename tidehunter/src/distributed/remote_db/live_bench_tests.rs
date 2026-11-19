@@ -41,7 +41,6 @@ fn live_config(tier: DurabilityTier) -> LiveClientConfig {
         leased_durability: tier,
         inline_reads: true,
         queue_geometry: Default::default(),
-        export_mode: Default::default(),
     }
 }
 fn key(sequence: usize) -> Vec<u8> {
@@ -96,29 +95,6 @@ impl Fixture {
         wal_file_bytes: u64,
         replay_limits: ReplayLimits,
     ) -> Self {
-        Self::with_export_mode(
-            base,
-            case,
-            tier,
-            arm,
-            fragment_bytes,
-            wal_file_bytes,
-            replay_limits,
-            Default::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn with_export_mode(
-        base: &Path,
-        case: &str,
-        tier: DurabilityTier,
-        arm: &str,
-        fragment_bytes: u64,
-        wal_file_bytes: u64,
-        replay_limits: ReplayLimits,
-        export_mode: crate::distributed::nvmeof::LiveExportMode,
-    ) -> Self {
         let directory = tempdir::TempDir::new_in(base, case).unwrap();
         let root = directory.path();
         let shape = KeyShape::new_single(32, 1, KeyType::uniform(1));
@@ -170,9 +146,6 @@ impl Fixture {
             live_nvme: (arm != "A").then(|| live_config(tier)),
             durable_cut: Default::default(),
         };
-        if let Some(live) = &mut config.live_nvme {
-            live.export_mode = export_mode;
-        }
         let node = StorageNode::open(
             NodeConfig {
                 root: root.join("owner"),
@@ -216,8 +189,6 @@ impl Fixture {
                     state_dir,
                     commissioning_port_id: 43,
                     commissioning_service: 4421,
-                    spdk: None,
-                    export_mode,
                 },
                 configfs,
             )
@@ -1321,11 +1292,6 @@ fn leased_checkpoint_tail_workstation() {
     };
     let replay_max_batches = setting("TH_TAIL_REPLAY_MAX_BATCHES", 256);
     let replay_max_bytes = setting("TH_TAIL_REPLAY_MAX_BYTES", 16 * MIB);
-    let export_mode = match std::env::var("TH_TAIL_EXPORT_MODE").as_deref() {
-        Err(_) | Ok("on_demand") => crate::distributed::nvmeof::LiveExportMode::OnDemand,
-        Ok("per_owner") => crate::distributed::nvmeof::LiveExportMode::PerOwner,
-        Ok(other) => panic!("invalid TH_TAIL_EXPORT_MODE: {other}"),
-    };
     let default_geometry = calls == 4096
         && fragment_bytes == 8 * MIB
         && wal_file_bytes == 256 * MIB
@@ -1341,7 +1307,7 @@ fn leased_checkpoint_tail_workstation() {
     let base = tempdir::TempDir::new("leased-checkpoint-tail").unwrap();
     let value: Bytes = vec![0x5a; 65536].into();
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
-        let mut fixture = Fixture::with_export_mode(
+        let mut fixture = Fixture::with_limits(
             base.path(),
             "tail",
             tier,
@@ -1352,7 +1318,6 @@ fn leased_checkpoint_tail_workstation() {
                 max_batches: replay_max_batches,
                 max_encoded_bytes: replay_max_bytes,
             },
-            export_mode,
         );
         fixture.config.owner_append_occupancy = fixture
             .config
@@ -1475,7 +1440,6 @@ fn leased_checkpoint_tail_workstation() {
                 "max_leased_in_flight": counts.max_leased_in_flight,
                 "live_files_prepared": preparation.live_files_prepared,
                 "live_files_published": preparation.live_files_published,
-                "export_mode": export_mode,
                 "live_leased_write_window": leased_write_window,
                 "live_leased_write_window_bound": leased_write_window_bound,
                 "live_file_prepare_failures": preparation.live_file_prepare_failures,
@@ -1583,8 +1547,6 @@ fn small_put_multiowner_workstation() {
                         state_dir,
                         commissioning_port_id: 43 + owner as u16 * 2,
                         commissioning_service: 4421 + owner as u16 * 2,
-                        spdk: None,
-                        export_mode: Default::default(),
                     },
                     configfs,
                 )
@@ -1982,8 +1944,6 @@ fn overhead_case(
                         state_dir,
                         commissioning_port_id: 43 + owner as u16 * 2,
                         commissioning_service: 4421 + owner as u16 * 2,
-                        spdk: None,
-                        export_mode: Default::default(),
                     },
                     configfs,
                 )
@@ -2242,8 +2202,6 @@ fn lone_batch_with_empty_queue_is_submitted_without_waiting() {
                     state_dir: root.join("state"),
                     commissioning_port_id: 43,
                     commissioning_service: 4421,
-                    spdk: None,
-                    export_mode: Default::default(),
                 },
                 root.join("configfs"),
             )

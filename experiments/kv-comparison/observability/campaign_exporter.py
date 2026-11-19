@@ -1399,7 +1399,7 @@ def read_diagnostic_metrics(evidence, labels):
                                      local | {"partition": partition, "counter": suffix})
         if selected:
             for suffix in ("admission_retry_credit", "admission_retry_flight", "admission_retry_lane",
-                           "admission_retry_paused", "admission_retry_config", "admission_retry_mixed",
+                           "admission_retry_paused",
                            "live_lane_full", "live_lane_depth_max", "live_lane_pending_max"):
                 field = "read_profile_" + suffix
                 if field in group_counters:

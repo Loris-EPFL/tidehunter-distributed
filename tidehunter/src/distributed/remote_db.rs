@@ -13,8 +13,6 @@
 
 use super::codec::{CompleteBatch, Mutation};
 use super::durability::{DurabilityTier, DurableCutConfig};
-use super::local_db::{LocalCheckpoint, LocalDbError, LocalDbStats};
-use super::local_inventory::LocalInventoryConfig;
 use super::native_index::{IndexReadCut, NativeIndex};
 use super::native_publication::{NativePublicationRouting, PreparedNativePublication};
 use super::reference_directory::ReferenceDirectory;
@@ -22,6 +20,7 @@ use super::storage::{
     AppendedBatch, DurableBatch, HistoryPersistence, PartitionConfig, PartitionStats,
     StaticInventory, WAL_REPLAY_WINDOW_BATCHES, encode_metadata, install_metadata, read_metadata,
 };
+use super::storage::{LocalCheckpoint, LocalDbError, LocalDbStats, LocalInventoryConfig};
 use super::tcp::checkpoint::CheckpointPositionProof;
 use super::tcp::{Client, TlsFiles};
 use super::types::{BatchId, BatchVersion, MutationVersion, ValueRecordReference};
@@ -1392,36 +1391,6 @@ impl RemoteDatabase {
             .map(|metrics| metrics.snapshot())
     }
 
-    /// Install a verified sealed-WAL reader while all reads are idle.
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn install_nvmeof_reader(
-        &self,
-        config: super::nvmeof::NvmeofReaderConfig,
-    ) -> Result<(), LocalDbError> {
-        self.ensure_healthy()?;
-        self.core
-            .reads
-            .install_nvmeof_reader(config, &self.core.config, &self.core.shape)
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn clear_nvmeof_reader(&self) -> Result<(), LocalDbError> {
-        self.core.reads.clear_nvmeof_reader()
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn nvmeof_stats(&self) -> Vec<super::nvmeof::NvmeofStats> {
-        self.core.reads.nvmeof_stats()
-    }
-
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub fn register_nvmeof_metrics(
-        &self,
-        registry: &prometheus::Registry,
-    ) -> Result<(), LocalDbError> {
-        self.core.reads.register_nvmeof_metrics(registry)
-    }
-
     pub fn index_stats(&self) -> super::native_index::NativeIndexStats {
         self.core.index.stats()
     }
@@ -2547,7 +2516,7 @@ impl RemoteDatabase {
         Ok(LocalCheckpoint {
             database: self.core.config.storage.database,
             cut: latest,
-            pin: Some(
+            _pin: Some(
                 self.core
                     .index
                     .pin_cut(latest.map_or(IndexReadCut::BeforeAll, IndexReadCut::At))

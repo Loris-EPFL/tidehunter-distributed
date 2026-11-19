@@ -246,7 +246,8 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
             or not isinstance(proof, dict) or proof.get('schema_version') != 1
             or proof.get('kind') != 'live_nvmeof_qualification'
             or proof.get('expected_route') != transport or proof.get('scope') != scope
-            or proof.get('durability_tier') != tier or proof.get('target_implementation') != target):
+            or proof.get('durability_tier') != tier
+            or proof.get('target_implementation', 'kernel') != target):
         raise ValueError('live qualification receipt missing or mismatched')
     if owner_launch.get('listen') != owner_control + ':9400':
         raise ValueError('owner launch endpoint mismatch')
@@ -580,8 +581,8 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
     if transport not in ('tcp', 'rdma'):
         raise ValueError('invalid live qualification transport')
     target_kind = cfg.get('qualification_target', 'kernel')
-    if target_kind not in ('kernel', 'spdk') or target_kind == 'spdk' and transport != 'rdma':
-        raise ValueError('live SPDK qualification requires explicit RDMA')
+    if target_kind != 'kernel':
+        raise ValueError('only the kernel live target is supported')
     owner = max(own, cfg['peer_instance'])
     own_is_owner = own == owner
     peer_info = api.request('GET', f'zones/{zone}/instances/{cfg["peer_instance"]}')
@@ -637,10 +638,10 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
             'live_nvmeof': {'transport': transport, 'addresses': [owner_fabric], 'service': 4420, 'port_id': 1000,
                 'commissioning_service': 4421, 'commissioning_port_id': 1001,
                 'max_inflight_requests': 32, 'max_inflight_bytes': 16 * 1024**2,
-                'connect_timeout_ms': 30000, 'io_timeout_ms': 30000, 'export_mode': 'per_owner'}}
+                'connect_timeout_ms': 30000, 'io_timeout_ms': 30000}}
         if archive_binary:
             preparation['history_persistence'] = 'wal_replay'
-            preparation['live_nvmeof']['write_mode'] = 'leased'
+            preparation['live_nvmeof'].update(write_mode='leased', export_mode='per_owner')
         input_path = root / 'prepare.json'
         input_path.write_text(json.dumps(preparation))
         prepared = root / 'prepared'
@@ -649,11 +650,6 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         remote = json.loads((prepared / 'remote.json').read_text())
         launch = yaml.safe_load((prepared / 'node-0/launch.yaml').read_text())
         launch['launch_nonce'] = secrets.token_hex(16)
-        if target_kind == 'spdk':
-            token = uuid.uuid5(uuid.NAMESPACE_URL, cfg['run_id'] + ':' + owner + ':spdk-qualification:' + tier).hex
-            launch['node']['live_target']['spdk'] = {
-                'rpc_socket': '/run/tidehunter-spdk-live/' + token + '/rpc.sock',
-                'executable': str(package / 'runtime/spdk/bin/nvmf_tgt')}
         if launch.get('listen') != owner_control + ':9400' or launch.get('ready_file') != str(root / 'node-0/ready'):
             raise ValueError('prepared owner launch identity mismatch')
         _copy_tls(prepared, root, remote['tls'])
@@ -683,7 +679,9 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         barrier('owner-before')
         command = {'remote_config': remote, 'coordinator_path': str(root / 'database'),
                    'namespace': list(uuid.uuid4().bytes), 'expected_route': transport, 'value_bytes': 1024,
-                   'target_implementation': target_kind, 'durability_tier': tier}
+                   'durability_tier': tier}
+        if archive_binary:
+            command['target_implementation'] = target_kind
         input_file = root / 'qualification-input.json'
         input_file.write_text(json.dumps(command))
         output = root / 'result'
