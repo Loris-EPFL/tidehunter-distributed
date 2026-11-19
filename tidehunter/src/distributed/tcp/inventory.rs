@@ -13,6 +13,31 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod capacity;
+mod ready_binding;
+mod retirement;
+
+/// Owner file-maintenance counters of this process (R1 seal and retirement,
+/// and the live grant paths they must never delay). Changed only under the
+/// inventory mutex.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct FileMaintenanceStats {
+    /// Files this process sealed (durable `FileSeal` installed).
+    pub sealed_files: u64,
+    /// Files whose retirement finished unlink, directory sync and cleanup.
+    pub retired_files: u64,
+    /// Retirement requests that made no durable decision.
+    pub busy_retirements: u64,
+    /// Grants answered from an already published binding: no lifecycle gate.
+    pub ready_binding_grants: u64,
+    /// Grants that took the lifecycle gate although their binding was
+    /// published. Must stay zero: a prepared grant never waits for maintenance.
+    pub prepared_gate_waits: u64,
+    pub prepared_gate_wait_ns: u64,
+    /// Grants without a published binding that waited for the gate (the
+    /// unprepared residual, as native waits for map preparation).
+    pub unprepared_gate_waits: u64,
+    pub unprepared_gate_wait_ns: u64,
+}
 
 const MANIFEST: &str = "tcp-node-inventory-v1";
 const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
@@ -241,6 +266,8 @@ pub struct NodeInventory {
     /// Value WAL files passed to a successful retirement unlink step by this
     /// process. Read by the R0 inventory page; R0 asserts it does not move.
     value_wal_unlinks: u64,
+    /// Changed only under this mutex; see `FileMaintenanceStats`.
+    pub(super) file_maintenance: FileMaintenanceStats,
     /// Whether a live target is installed. Immutable after installation, so
     /// reading it needs no gate.
     pub(super) live_target_configured: bool,
@@ -548,6 +575,7 @@ impl NodeInventory {
             #[cfg(test)]
             trim_crash: None,
             value_wal_unlinks: 0,
+            file_maintenance: FileMaintenanceStats::default(),
             live_target_configured: live_target.is_some(),
             lifecycle: Arc::new(Mutex::new(live_target)),
             live_shutdown: false,
@@ -1418,89 +1446,6 @@ impl NodeInventory {
         self.retirement_log(authority_epoch, epoch)?
             .wal_file_page(after, limit)
             .map_err(TcpError::component)
-    }
-
-    /// The caller holds the lifecycle gate (`slot` is its content) or owns the
-    /// inventory exclusively.
-    pub(super) fn retire_wal_files<H: InventoryAccess>(
-        inventory: &mut H,
-        slot: &mut LifecycleSlot,
-        authority_epoch: u64,
-        epoch: u64,
-        files: &[u64],
-    ) -> Result<(), TcpError> {
-        Self::retire_files_inner(inventory, slot, authority_epoch, epoch, files)
-    }
-
-    fn retire_files_inner<H: InventoryAccess>(
-        inventory: &mut H,
-        slot: &mut LifecycleSlot,
-        authority_epoch: u64,
-        epoch: u64,
-        files: &[u64],
-    ) -> Result<(), TcpError> {
-        if files.len() > 256 {
-            return Err(TcpError::new("retirement file count exceeds bound"));
-        }
-        let log = inventory.retirement_log(authority_epoch, epoch)?;
-        if !inventory.live_pins.is_empty() {
-            return Err(TcpError::new(
-                "live NVMe-oF pins must drain before retirement",
-            ));
-        }
-        if inventory
-            .live_export_pins
-            .values()
-            .any(|(_, (source, file))| {
-                *source == epoch
-                    && files.contains(&(file * inventory.config.partition.wal_file_bytes))
-            })
-        {
-            return Err(TcpError::new(
-                "live connection pins must drain before retirement",
-            ));
-        }
-        let mut target = live_target(inventory, slot)?;
-        let retired_identities = if let Some(target) = target.as_deref_mut() {
-            if let Err(error) = Self::revoke_live_files(inventory, target, epoch, files) {
-                inventory.healthy = false;
-                return Err(error);
-            }
-            let root = epoch_path(&inventory.config.root, epoch);
-            let bytes = inventory.config.partition.wal_file_bytes;
-            inventory.released(|| {
-                let mut identities = Vec::new();
-                for offset in files {
-                    let path = root.join(format!("wal_{:016x}", offset / bytes));
-                    if let Some(identity) =
-                        target.sealed_file(&path).map_err(TcpError::component)?
-                    {
-                        identities.push(identity);
-                    }
-                }
-                Ok::<_, TcpError>(identities)
-            })?
-        } else {
-            Vec::new()
-        };
-        // Counted on submission, before any root install or unlink, so a
-        // partially failed retirement still shows that unlinks were attempted.
-        inventory.value_wal_unlinks = inventory
-            .value_wal_unlinks
-            .saturating_add(u64::try_from(files.len()).unwrap_or(u64::MAX));
-        inventory.released(|| {
-            log.retire_wal_files(files).map_err(TcpError::component)?;
-            // Each tombstone release syncs the WAL directory before its marker
-            // removal, so a crash cannot resurrect an untracked old file.
-            if let Some(target) = target {
-                for identity in &retired_identities {
-                    target
-                        .retire_deleted_file(identity)
-                        .map_err(TcpError::component)?;
-                }
-            }
-            Ok(())
-        })
     }
 
     pub(super) fn checkpoint_log(

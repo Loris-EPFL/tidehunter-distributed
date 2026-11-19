@@ -23,9 +23,9 @@ struct StreamSnapshot {
     open_adopted: Option<(u64, u64)>,
     processed_end: u64,
     root: Option<(u64, u64, u64)>,
-    /// Retired file offsets of the WAL root; `None` without a root, when no
-    /// file has been retired (the root is the only retirement record).
-    retired: Option<Vec<u64>>,
+    /// Retired files of the WAL root; `None` without a root, when no file has
+    /// been retired (the root is the only retirement record).
+    retired: Option<RetiredFiles>,
 }
 
 impl StreamSnapshot {
@@ -156,12 +156,22 @@ impl PartitionLog {
         }
         let after_snapshot = self.capacity_snapshot();
         let stable = before.same_classification(&after_snapshot, bytes) && !vanished;
+        // Seals are only added between snapshots, and each is durable: an
+        // exact inode match reports a valid seal even if taken later.
+        let seals = self.state.lock().wal_root.clone();
         let mut rows = Vec::with_capacity(observed.len());
         for (offset, device, inode, logical_bytes, allocated_bytes) in observed {
             let retired = after_snapshot
                 .retired
                 .as_ref()
-                .is_some_and(|retired| retired.binary_search(&offset).is_ok());
+                .is_some_and(|retired| retired.contains(offset));
+            let seal = seals.as_ref().and_then(|root| {
+                root.sealed_files
+                    .binary_search_by_key(&offset, |seal| seal.start)
+                    .ok()
+                    .map(|index| root.sealed_files[index])
+                    .filter(|seal| seal.device == device && seal.inode == inode)
+            });
             rows.push(classify(
                 &after_snapshot,
                 bytes,
@@ -179,6 +189,7 @@ impl PartitionLog {
                     read_pins: None,
                     export_pins: None,
                     target_access: TargetAccess::Unknown,
+                    seal,
                 },
             )?);
         }

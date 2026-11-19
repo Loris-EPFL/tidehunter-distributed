@@ -170,6 +170,7 @@ fn row(start: u64) -> WalFileObservation {
         read_pins: Some(0),
         export_pins: Some(0),
         target_access: TargetAccess::None,
+        seal: None,
     }
 }
 

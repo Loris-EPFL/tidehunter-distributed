@@ -53,6 +53,12 @@ use durable_progress::ProgressTail;
 mod capacity_inventory;
 mod local_types;
 pub use local_types::{LocalCheckpoint, LocalDbError, LocalDbStats, LocalInventoryConfig};
+mod retired_files;
+pub use retired_files::{FileSeal, PendingRetirement};
+use retired_files::{RetiredFiles, validate_root_sets};
+mod file_retirement;
+pub use file_retirement::{RetireProof, RetirementOutcome, RetirementWitness, WalInode};
+mod file_seal;
 
 /// Full static inventory for one database epoch, copied durably to every node.
 /// The caller must hold the unique database authority; this is not a consensus
@@ -406,7 +412,9 @@ struct State {
     // Writer drops before the directory lock. The experimental feature strictly
     // joins its native workers; shutdown can wait but cannot release a live path.
     writer: Option<WalWriter>,
-    wal_root: Option<WalRoot>,
+    // Shared immutable snapshot: lock holders clone the `Arc`, never the seal
+    // set. Writers copy it outside `state` under `persistence`, then swap it.
+    wal_root: Option<Arc<WalRoot>>,
     references: ReferenceDirectoryWriter,
     appended_end: u64,
     durable_end: u64,
@@ -907,6 +915,9 @@ pub struct PartitionLog {
     fail_wal_root: AtomicU8,
     #[cfg(test)]
     fail_wal_retire: AtomicBool,
+    // Test-only crash cut of seal/retirement (`file_retirement::CrashCut` code).
+    #[cfg(test)]
+    r1_crash: AtomicU8,
     #[cfg(test)]
     before_persist: Mutex<
         Option<(
@@ -1040,7 +1051,7 @@ impl PartitionLog {
                 live_tail: None,
                 live_root_end: 0,
                 writer: Some(writer),
-                wal_root: Some(wal_root),
+                wal_root: Some(Arc::new(wal_root)),
                 references: reference_writer,
                 appended_end: 0,
                 durable_end: 0,
@@ -1072,6 +1083,8 @@ impl PartitionLog {
             fail_wal_root: AtomicU8::new(0),
             #[cfg(test)]
             fail_wal_retire: AtomicBool::new(false),
+            #[cfg(test)]
+            r1_crash: AtomicU8::new(0),
             #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]
@@ -1592,6 +1605,17 @@ impl PartitionLog {
             .as_ref()
             .ok_or(StorageError::Sealed)?
             .position();
+        // A sealed or retired file is closed to every later grant, even if a
+        // defect moved the allocator back: its seal certified its bytes.
+        if state
+            .wal_root
+            .as_ref()
+            .is_some_and(|root| start < root.seal_cursor())
+        {
+            return Err(StorageError::Invalid(
+                "live grant inside a sealed or retired WAL file",
+            ));
+        }
         let len = config.fragment_bytes - start % config.fragment_bytes;
         if len >= 1 << 30 || !start.is_multiple_of(4096) || !len.is_multiple_of(4096) {
             return Err(StorageError::Invalid("invalid live extent geometry"));
@@ -3423,12 +3447,10 @@ impl PartitionLog {
                             .checked_add(u64::from(address.len))
                             .is_none_or(|end| end > allocated)
                             || state.wal_root.as_ref().is_some_and(|root| {
-                                root.retired
-                                    .binary_search(
-                                        &(address.offset / self.config().wal_file_bytes
-                                            * self.config().wal_file_bytes),
-                                    )
-                                    .is_ok()
+                                root.retired.contains(
+                                    address.offset / self.config().wal_file_bytes
+                                        * self.config().wal_file_bytes,
+                                )
                             })
                         {
                             return Err(StorageError::Invalid(
@@ -4359,7 +4381,7 @@ impl PartitionLog {
                 frame_count: self.references.len(),
                 physical_end: physical_end(&state),
             };
-            if let Some(root) = &mut state.wal_root {
+            if let Some(root) = state.wal_root.as_mut().map(Arc::make_mut) {
                 root.generation = root
                     .generation
                     .checked_add(1)

@@ -73,6 +73,8 @@ pub struct WalFileObservation {
     /// Owner connection (export) pins in the file; `None` when not attributable.
     pub export_pins: Option<u64>,
     pub target_access: TargetAccess,
+    /// Durable lease-logical `FileSeal` of this exact inode, if installed.
+    pub seal: Option<crate::distributed::storage::FileSeal>,
 }
 
 /// Owner reply to `FileInventoryPage`. Rows are sorted by `file_start`, all

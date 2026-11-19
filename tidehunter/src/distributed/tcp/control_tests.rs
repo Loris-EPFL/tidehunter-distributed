@@ -1,6 +1,7 @@
 use super::super::tests::{batch, config, metrics};
 use super::*;
 use crate::distributed::durability::DurabilityTier;
+use crate::distributed::storage::RetirementOutcome;
 
 // Mirror the production ownership-preserving admission API without boxing.
 #[allow(clippy::result_large_err)]
@@ -145,6 +146,11 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
         panic!("wrong retirement page response")
     };
     assert_eq!(files.len(), 1);
+    let proof = |file_start| crate::distributed::storage::RetireProof {
+        file_start,
+        inode: None,
+        seal_generation: None,
+    };
     let requests = [
         Request::RetirementFiles {
             authority_epoch: 1,
@@ -173,17 +179,20 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
         Request::RetireWalFiles {
             authority_epoch: 1,
             epoch: 1,
-            files: files.clone(),
+            files: files.iter().copied().map(proof).collect(),
+            witness: None,
         },
         Request::RetireWalFiles {
             authority_epoch: 2,
             epoch: 2,
-            files: files.clone(),
+            files: files.iter().copied().map(proof).collect(),
+            witness: None,
         },
         Request::RetireWalFiles {
             authority_epoch: 2,
             epoch: 1,
-            files: vec![files[0]; 257],
+            files: vec![proof(files[0]); 257],
+            witness: None,
         },
     ];
     for (index, request) in requests.into_iter().enumerate() {
@@ -1303,6 +1312,117 @@ mod live_fencing {
     }
 
     #[test]
+    fn trim_finishes_retired_tombstones_after_owner_restart() {
+        use crate::distributed::storage::{RetireProof, RetirementOutcome};
+        use crate::distributed::tcp::generation_control::TrimRequest;
+
+        let temp = tempdir::TempDir::new("trim-retired-tombstones").unwrap();
+        let root = temp.path();
+        let configfs = root.join("configfs");
+        let state_dir = root.join("target");
+        fs::create_dir(&configfs).unwrap();
+        fs::create_dir(&state_dir).unwrap();
+        for directory in ["hosts", "ports", "subsystems"] {
+            fs::create_dir(configfs.join(directory)).unwrap();
+        }
+        let mut config = config(&root.join("node"));
+        config.partition.fragment_bytes = 16 * 1024;
+        config.partition.wal_file_bytes = 32 * 1024;
+        config.live_target = Some(LiveTargetConfig {
+            address: "127.0.0.1".into(),
+            service: 4420,
+            transport: NvmeofTransport::Tcp,
+            host_nqn: "nqn.2026-01.local.test:trim-tombstones".into(),
+            port_id: 42,
+            state_dir: state_dir.clone(),
+            commissioning_port_id: 43,
+            commissioning_service: 4421,
+        });
+        let reopen = || {
+            StorageNode::bench_open_live_fixture(config.clone(), metrics(), configfs.clone())
+                .unwrap()
+        };
+        let node = reopen();
+        fence(&node, 1).unwrap();
+        leased_history(&node, &config, 12);
+        let log = node.source_log_for_test(2, 1);
+        let proofs: Vec<_> = log
+            .wal_file_page(None, 256)
+            .unwrap()
+            .into_iter()
+            .map(|file_start| RetireProof {
+                file_start,
+                inode: None,
+                seal_generation: None,
+            })
+            .collect();
+        // Stop after the retirement root and unlink, before target cleanup.
+        assert_eq!(
+            log.retire_sealed_stream_files(&proofs).unwrap(),
+            RetirementOutcome::Completed
+        );
+        let pending = log.pending_file_retirements();
+        let victim = pending
+            .iter()
+            .filter(|file| file.start != 0)
+            .map(|file| log.wal_file_path(file.start))
+            .find(|path| {
+                node.with_live_target(|target| target.sealed_file(path).unwrap().is_some())
+            })
+            .expect("a tombstone beyond the first WAL file");
+        assert!(
+            pending
+                .iter()
+                .all(|file| !log.wal_file_path(file.start).exists())
+        );
+        let generation_path = victim.parent().unwrap();
+        let sealed = state_dir.join("sealed");
+        let (marker, marker_bytes) = fs::read_dir(&sealed)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                let identity: LiveFileIdentity = serde_json::from_slice(&bytes[4..]).unwrap();
+                (identity.path == victim).then_some((path, bytes))
+            })
+            .unwrap();
+        drop(log);
+        drop(node);
+
+        let node = reopen();
+        fence(&node, 3).unwrap();
+        let trim = |authority_generation| {
+            Request::TrimGeneration(TrimRequest {
+                authority_generation,
+                generation: 1,
+            })
+        };
+        fs::write(&marker, b"bad").unwrap();
+        let err = node.handle(trim(3), TcpLimits::default()).err().unwrap();
+        assert!(
+            err.to_string().contains("truncated sealed WAL marker"),
+            "{err}"
+        );
+        assert!(generation_path.is_dir());
+        assert_eq!(
+            node.source_log_for_test(3, 1).pending_file_retirements(),
+            pending
+        );
+        fs::write(&marker, marker_bytes).unwrap();
+        drop(node);
+
+        let node = reopen();
+        fence(&node, 4).unwrap();
+        assert!(
+            matches!(node.handle(trim(4), TcpLimits::default()).unwrap(), Response::TrimGeneration(reply) if reply.generation == 1)
+        );
+        assert!(!generation_path.exists());
+        assert!(!marker.exists());
+        assert!(node.with_live_target(|target| target.sealed_file(&victim).unwrap().is_none()));
+        shutdown(&node, 4);
+    }
+
+    #[test]
     fn history_pages_reuse_retained_readonly_exports() {
         {
             let temp = tempdir::TempDir::new("retained-history-pages").unwrap();
@@ -1437,10 +1557,15 @@ mod live_fencing {
                             Request::RetireWalFiles {
                                 authority_epoch: 3,
                                 epoch: 1,
-                                files: vec![0],
+                                files: vec![crate::distributed::storage::RetireProof {
+                                    file_start: 0,
+                                    inode: None,
+                                    seal_generation: None,
+                                }],
+                                witness: None,
                             }
                         ),
-                        Response::Retired
+                        Response::Retired(RetirementOutcome::Completed)
                     ));
                     shutdown(&node, 3);
                 }
@@ -1451,10 +1576,15 @@ mod live_fencing {
                             Request::RetireWalFiles {
                                 authority_epoch: 2,
                                 epoch: 1,
-                                files: vec![0],
+                                files: vec![crate::distributed::storage::RetireProof {
+                                    file_start: 0,
+                                    inode: None,
+                                    seal_generation: None,
+                                }],
+                                witness: None,
                             }
                         ),
-                        Response::Retired
+                        Response::Retired(RetirementOutcome::Completed)
                     ));
                     shutdown(&node, 2);
                 }
@@ -2295,8 +2425,8 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 31);
-    preface[4..6].copy_from_slice(&30u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 32);
+    preface[4..6].copy_from_slice(&31u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }
 

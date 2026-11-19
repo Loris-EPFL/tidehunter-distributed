@@ -361,6 +361,17 @@ impl NodeInventory {
                     (TrimReadiness::EmptySealed | TrimReadiness::Retired, _) => {}
                     (_, reason) => return Err(refuse(reason)),
                 }
+                // R1 recovery can leave exact tombstones for already absent
+                // files at arbitrary offsets. Finish them before detaching the
+                // log or dropping its durable cleanup record.
+                if let Some(target) = target.as_deref_mut()
+                    && let Some(log) = inventory.logs.get(&generation).cloned()
+                {
+                    let pending = log.pending_file_retirements();
+                    inventory.released(|| {
+                        super::retirement::finish_tombstones(target, &log, &pending)
+                    })?;
+                }
                 // Detach the log: readers first, then this inventory's handle.
                 inventory.readers.write().logs.remove(&generation);
                 if let Some(log) = inventory.logs.remove(&generation) {

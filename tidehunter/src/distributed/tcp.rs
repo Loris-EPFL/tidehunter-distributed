@@ -91,7 +91,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use inventory::NodeInventory;
+pub use inventory::{FileMaintenanceStats, NodeInventory};
 /// Wire protocol version. 22 adds leased live WAL extents and adoption proofs.
 /// 23 adds OpenLiveExports for permanent live export.
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
@@ -111,7 +111,9 @@ pub use inventory::NodeInventory;
 /// `NodeStatus` with the owner high-water and inventory revision, and appends
 /// InventoryPage, CheckTrimGeneration and TrimGeneration.
 /// 31 (R0) appends FileInventoryPage (request tag 29, response tag 26).
-const PROTOCOL: u32 = 31;
+/// 32 (R1 owner) gives RetireWalFiles inode-bound proofs and an Exact witness, and `Retired`
+/// a Completed/Busy outcome (payloads change in place; tags are unchanged).
+const PROTOCOL: u32 = 32;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -452,11 +454,14 @@ enum Request {
         epoch: u64,
         through: u64,
     },
-    /// Tag 10.
+    /// Tag 10. Whole-file retirement. `epoch` older than the authority: older
+    /// sealed stream (no seals, no witness). `epoch` equal to it: durably
+    /// sealed files of the serving stream, with the adopted Exact witness.
     RetireWalFiles {
         authority_epoch: u64,
         epoch: u64,
-        files: Vec<u64>,
+        files: Vec<super::storage::RetireProof>,
+        witness: Option<super::storage::RetirementWitness>,
     },
     /// Tag 11. Owner durable progress of stream `epoch` for the coordinator's
     /// durable cut. A long-poll: see `DurableProgressReport` for the reply
@@ -641,7 +646,7 @@ enum Response {
     /// Tag 1.
     RetirementFiles(Vec<u64>),
     /// Tag 2.
-    Retired,
+    Retired(super::storage::RetirementOutcome),
     /// Tag 3.
     Status(NodeStatus),
     /// Tag 4.
@@ -819,6 +824,12 @@ impl StorageNode {
     /// wire protocol.
     pub fn live_inline_export_stats(&self) -> LiveInlineExportStats {
         self.inventory.lock().inline_exports
+    }
+
+    /// Owner-process R1 seal/retirement counters and the grant-path gate
+    /// waits they must not cause. Not part of the wire protocol.
+    pub fn file_maintenance_stats(&self) -> FileMaintenanceStats {
+        self.inventory.lock().file_maintenance
     }
 
     #[cfg(test)]

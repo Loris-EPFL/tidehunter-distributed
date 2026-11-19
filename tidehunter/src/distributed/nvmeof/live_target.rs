@@ -23,6 +23,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "live_target/retirement.rs"]
+mod retirement;
 const CONFIGFS: &str = "/sys/kernel/config/nvmet";
 const STATE: &str = "live-target.json";
 const MAX_STATE: u64 = 4 * 1024 * 1024;
@@ -775,6 +777,12 @@ impl LiveTargetManager {
             } else {
                 Err(invalid("WAL file already exported"))
             };
+        }
+        // A durable seal marker means this path was fenced or retired: never
+        // restore a writable capability. Refused without quarantining the
+        // manager, as `export` does for its writable case.
+        if self.sealed_file(&file.path)?.is_some() {
+            return Err(invalid("fenced WAL cannot be exported writable again"));
         }
         let result = self.export_permanent_inner(name, file);
         if result.is_err() {

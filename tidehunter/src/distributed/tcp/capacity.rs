@@ -38,6 +38,15 @@ impl Client {
                             && row.logical_bytes <= bytes
                             && row.file_start.checked_add(bytes).is_some_and(|end| {
                                 row.validated_through.is_none_or(|through| through <= end)
+                                    && row.seal.is_none_or(|seal| {
+                                        seal.start == row.file_start
+                                            && seal.end == end
+                                            && seal.device == row.device
+                                            && seal.inode == row.inode
+                                            && reply
+                                                .wal_synced_end
+                                                .is_some_and(|synced| end <= synced)
+                                    })
                             })
                     })
                     && reply

@@ -1,6 +1,6 @@
 //! Frozen owner-protocol wire tags. Bincode encodes an enum variant as its
 //! declaration index, so the ordered variant list below *is* the tag table of
-//! protocol 31. Changing it requires a protocol bump.
+//! protocol 32. Changing it requires a protocol bump.
 
 use super::{HARD_FRAME_LIMIT, PROTOCOL, Request, Response, wire_codec};
 use bincode::Options;
@@ -53,8 +53,8 @@ fn variants<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
 }
 
 #[test]
-fn protocol_31_request_tags_are_frozen() {
-    assert_eq!(PROTOCOL, 31);
+fn protocol_32_request_tags_are_frozen() {
+    assert_eq!(PROTOCOL, 32);
     assert_eq!(
         variants::<Request>(),
         [
@@ -93,7 +93,7 @@ fn protocol_31_request_tags_are_frozen() {
 }
 
 #[test]
-fn protocol_31_response_tags_are_frozen() {
+fn protocol_32_response_tags_are_frozen() {
     assert_eq!(
         variants::<Response>(),
         [
@@ -146,7 +146,9 @@ fn bincode_tag_is_the_declaration_index() {
         assert_eq!(encode(&request)[..4], tag.to_le_bytes());
     }
     let reply = wire_codec(HARD_FRAME_LIMIT)
-        .serialize(&Response::Retired)
+        .serialize(&Response::Retired(
+            crate::distributed::storage::RetirementOutcome::Completed,
+        ))
         .expect("encode response");
     assert_eq!(reply[..4], 2u32.to_le_bytes());
 }

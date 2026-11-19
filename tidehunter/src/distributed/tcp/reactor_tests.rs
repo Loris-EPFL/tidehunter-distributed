@@ -252,7 +252,11 @@ fn invalid_status_bounds_and_wrong_variants_name_the_failure() {
     );
     assert!(client.broken);
     let error = client
-        .wrong_variant::<()>("Seal", &Response::Retired, "Sealed")
+        .wrong_variant::<()>(
+            "Seal",
+            &Response::Retired(crate::distributed::storage::RetirementOutcome::Completed),
+            "Sealed",
+        )
         .unwrap_err();
     assert_eq!(
         error.to_string(),
