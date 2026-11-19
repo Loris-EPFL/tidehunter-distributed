@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+mod drop_cells;
 pub(crate) mod kv_capture;
 
 pub type Result<T, E = DbError> = std::result::Result<T, E>;
@@ -2198,61 +2199,9 @@ impl Db {
             db.drop_cells_in_range(ks, from, to)?;
             return self.native_barrier(false);
         }
-        let descriptor = self.shape.ks(ks);
-        let reduced_from = descriptor.reduce_key(from);
-        let reduced_to = descriptor.reduce_key(to);
-        descriptor.map_key_range_to_cell_range(&reduced_from, &reduced_to);
-        let _guard = self.write_gate();
-        let Backend::Remote(remote) = &self.backend else {
-            unreachable!()
-        };
-        let mut retained_bytes = 128usize;
-        // Write-gated and in-call: no owner charge (see `StandingViewBudget`).
-        let (cut, pin) = remote.db.call_protected_cut().map_err(error)?;
-        // The validated endpoints denote complete reduced cells. A full-key
-        // iterator bound would wrongly exclude colliding keys whose suffix sorts
-        // below `from`; include the reduced lower key and then page exclusively.
-        let mut after = Bytes::copy_from_slice(&reduced_from);
-        let mut page = Vec::new();
-        if let Some(reference) = remote
-            .db
-            .index_reference(ks, from, cut.clone())
-            .map_err(error)?
-        {
-            page.push((after.clone(), reference));
-        }
-        let mut deletes = Vec::with_capacity(256);
-        'pages: loop {
-            for (reduced, reference) in page {
-                if reduced.as_ref() > reduced_to.as_ref() {
-                    break 'pages;
-                }
-                retained_bytes =
-                    retained_bytes.saturating_add(reference.descriptor.key_len as usize + 64);
-                if deletes.len() >= remote.batch_limits.max_operations as usize
-                    || retained_bytes > remote.batch_limits.max_encoded_bytes
-                {
-                    return Err(error(
-                        "atomic cell-range deletion exceeds configured batch admission bound",
-                    ));
-                }
-                let mutation = remote.record(ks, &reduced, reference, &pin)?;
-                let (Mutation::Put { key, .. } | Mutation::Delete { key, .. }) = mutation;
-                deletes.push(Mutation::Delete { keyspace: ks, key });
-                after = reduced;
-            }
-            page = remote
-                .db
-                .index_page(ks, Some(&after), false, cut.clone())
-                .map_err(error)?;
-            if page.is_empty() {
-                break;
-            }
-        }
-        if !deletes.is_empty() {
-            self.commit_remote(deletes, None)?;
-        }
-        Ok(())
+        // One singleton DropCells batch under the shared gate; see
+        // `drop_cells::drop_remote_cells`.
+        self.drop_remote_cells(ks, from, to)
     }
 }
 

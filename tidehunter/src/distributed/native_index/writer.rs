@@ -15,12 +15,26 @@
 //! module documentation of `shards`).
 
 use super::shards::{CellKey, add, sub};
-use super::snapshot::FrozenCell;
+use super::snapshot::{FrozenCell, FrozenMasks};
 use super::*;
-use crate::distributed::native_publication::NativePendingSink;
+use crate::distributed::native_publication::{NativeDropCells, NativePendingSink};
 use parking_lot::MutexGuard;
+use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
+
+/// Ordered cell directory key: native keyspace byte, then cell. Cells of one
+/// keyspace share one `CellId` variant, so the derived order never compares
+/// an integer cell with a byte cell.
+pub(super) type DirectoryKey = (u8, CellId);
+
+fn directory_key(identity: &CellKey) -> DirectoryKey {
+    (identity.0.0, identity.1.clone())
+}
+
+fn cell_key(key: &DirectoryKey) -> CellKey {
+    (KeySpace(key.0), key.1.clone())
+}
 
 pub(super) struct ImageInstallation {
     cells: std::vec::IntoIter<FrozenCell>,
@@ -29,8 +43,16 @@ pub(super) struct ImageInstallation {
 }
 
 pub(super) struct ImageCapture {
-    cursor: usize,
-    end: usize,
+    /// Last directory key frozen; `None` before the first step.
+    after: Option<DirectoryKey>,
+    /// Cells born at or after this ID were created after `begin` and never
+    /// enter this image.
+    birth_ceiling: u64,
+    /// Cells born before `begin` not frozen yet. The capture completes on
+    /// the step that freezes the last one, as when it walked a fixed prefix
+    /// of the directory: cells leave the directory only when reaped, and
+    /// reaping never overlaps a capture, so every one of them is reached.
+    remaining: usize,
     cells: Vec<FrozenCell>,
     cut: IndexReadCut,
     lease: CaptureLease,
@@ -42,17 +64,50 @@ pub(super) struct ImageCapture {
 pub(super) struct WriterState {
     /// Cells with staged pending entries, awaiting `promote_committed`.
     pub touched: HashSet<CellKey>,
-    /// Append-only cell directory: capture and cleanup walk it in order.
-    pub cell_order: Vec<CellKey>,
+    /// Ordered cell directory, identity → runtime birth ID. Capture, cleanup,
+    /// `DropCells` preflight and reaping walk it in key order. A cell enters
+    /// on materialization (O(log cells)) and leaves only when reaped.
+    pub cells: BTreeMap<DirectoryKey, u64>,
+    /// Next birth ID. Monotone for the life of this index; never reused.
+    pub next_cell_birth: u64,
     pub generation: u64,
     pub capture: Option<ImageCapture>,
     pub sealed_count: usize,
-    pub cleanup_cursor: usize,
+    /// Last directory key restored by `cleanup_failed_capture_step`.
+    pub cleanup_cursor: Option<DirectoryKey>,
     /// Newest promoted version. Not what readers see; see `published`.
     pub latest: Option<MutationVersion>,
     pub installation: Option<ImageInstallation>,
+    /// At most one candidate per cell that installation left empty, with
+    /// the birth it had. The cell keeps its directory charge until reaped.
+    pub reap: Vec<(CellKey, u64)>,
     /// Reused by `promote_committed` so a promotion allocates nothing.
     scratch: Vec<(usize, CellKey)>,
+}
+
+impl WriterState {
+    /// Up to `max` directory entries after `after`, in key order.
+    fn directory_step(&self, after: Option<&DirectoryKey>, max: usize) -> Vec<(CellKey, u64)> {
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.cells
+            .range::<DirectoryKey, _>((lower, Bound::Unbounded))
+            .take(max)
+            .map(|(key, birth)| (cell_key(key), *birth))
+            .collect()
+    }
+
+    fn new_birth(&mut self) -> Result<u64, NativeIndexError> {
+        let birth = self.next_cell_birth;
+        self.next_cell_birth = birth.checked_add(1).ok_or(NativeIndexError::Capacity)?;
+        Ok(birth)
+    }
+
+    /// Materialize `identity` in the directory with a fresh birth ID.
+    pub(super) fn register_cell(&mut self, identity: &CellKey) -> Result<u64, NativeIndexError> {
+        let birth = self.new_birth()?;
+        self.cells.insert(directory_key(identity), birth);
+        Ok(birth)
+    }
 }
 
 /// Exclusive publication/maintenance access. Dereferences to the index so every
@@ -111,15 +166,16 @@ impl NativePendingSink for IndexWriter<'_> {
         let mut shard = index.shard_for(&identity).write();
         if !shard.contains_key(&identity) {
             index.check_capacity(cell_directory_charge(&identity.1))?;
+            let birth = state.register_cell(&identity)?;
             add(
                 &index.accounting.directory,
                 cell_directory_charge(&identity.1),
             );
-            state.cell_order.push(identity.clone());
             shard.insert(
                 identity.clone(),
                 CellIndex {
                     generation: state.generation,
+                    birth,
                     ..Default::default()
                 },
             );
@@ -127,6 +183,14 @@ impl NativePendingSink for IndexWriter<'_> {
         state.touched.insert(identity.clone());
         apply(&mut shard.entry(identity).or_default().pending);
         Ok(())
+    }
+
+    fn drop_cells(
+        &mut self,
+        drop: &NativeDropCells,
+        version: MutationVersion,
+    ) -> Result<(), Self::Error> {
+        self.stage_drop_cells(drop, version)
     }
 }
 
@@ -433,11 +497,16 @@ impl IndexWriter<'_> {
     ) -> Result<(), NativeIndexError> {
         let index = self.index;
         let state = &mut *self.state;
-        if state.sealed_count != 0 {
+        if state.sealed_count != 0 || state.installation.is_some() || !state.reap.is_empty() {
             return Err(NativeIndexError::CheckpointInProgress);
         }
         for identity in &state.touched {
-            if index.shard_for(identity).read()[identity].pending.len() != 0 {
+            if index
+                .shard_for(identity)
+                .read()
+                .get(identity)
+                .is_some_and(|cell| cell.pending.len() != 0)
+            {
                 return Err(NativeIndexError::PendingPublication);
             }
         }
@@ -452,9 +521,10 @@ impl IndexWriter<'_> {
         let lease = index.capture_lease(&cut, floor, state.latest)?;
         state.generation = generation;
         state.capture = Some(ImageCapture {
-            cursor: 0,
-            end: state.cell_order.len(),
-            cells: Vec::with_capacity(state.cell_order.len()),
+            after: None,
+            birth_ceiling: state.next_cell_birth,
+            remaining: state.cells.len(),
+            cells: Vec::with_capacity(state.cells.len()),
             cut,
             lease,
             schema,
@@ -462,29 +532,45 @@ impl IndexWriter<'_> {
         Ok(())
     }
 
-    /// Each step freezes at most `max_cells` directory entries, without copying
-    /// their reference histories. Persistence filters the immutable cut later.
-    /// Each cell is frozen under its own shard lock; no two are held together.
+    /// Each step visits at most `max_cells` directory entries in key order and
+    /// freezes those born before `begin`, without copying their reference
+    /// histories. It returns the image on the step that freezes the last cell
+    /// born before `begin`. Persistence filters the immutable cut later. Each
+    /// cell is frozen under its own shard lock; no two are held together.
     pub(crate) fn capture_step(&mut self, max_cells: usize) -> Option<PreparedIndexImage> {
         assert!(max_cells != 0, "capture step must make progress");
         let index = self.index;
         let state = &mut *self.state;
         let mut capture = state.capture.take().expect("capture is active");
-        let end = capture.cursor.saturating_add(max_cells).min(capture.end);
-        for identity in &state.cell_order[capture.cursor..end] {
-            let mut shard = index.shard_for(identity).write();
-            let cell = shard.get_mut(identity).expect("directory cell exists");
+        let step = state.directory_step(capture.after.as_ref(), max_cells);
+        // An exhausted directory also ends the capture (no cell is left).
+        let exhausted = step.len() < max_cells;
+        for (identity, birth) in step {
+            if capture.remaining == 0 {
+                break;
+            }
+            capture.after = Some(directory_key(&identity));
+            if birth >= capture.birth_ceiling {
+                continue;
+            }
+            let mut shard = index.shard_for(&identity).write();
+            // Reaping never overlaps a capture (see `begin_compacted_capture`).
+            let cell = shard.get_mut(&identity).expect("directory cell exists");
             if cell.rotate(state.generation) {
                 state.sealed_count += 1;
             }
+            let masks =
+                FrozenMasks::capture(&cell.drop_versions, &capture.cut, &capture.lease.floor);
             capture.cells.push(FrozenCell {
-                identity: identity.clone(),
+                identity,
+                birth,
                 base: cell.base.clone(),
                 overlay: Arc::clone(cell.sealed.as_ref().expect("sealed generation")),
+                masks,
             });
+            capture.remaining -= 1;
         }
-        capture.cursor = end;
-        if end != capture.end {
+        if capture.remaining != 0 && !exhausted {
             state.capture = Some(capture);
             return None;
         }
@@ -516,14 +602,11 @@ impl IndexWriter<'_> {
             return Err(NativeIndexError::CheckpointInProgress);
         }
         if state.sealed_count == 0 {
-            state.cleanup_cursor = 0;
+            state.cleanup_cursor = None;
             return Ok(true);
         }
-        let end = state
-            .cleanup_cursor
-            .saturating_add(max_cells)
-            .min(state.cell_order.len());
-        for identity in &state.cell_order[state.cleanup_cursor..end] {
+        let step = state.directory_step(state.cleanup_cursor.as_ref(), max_cells);
+        for (identity, _) in &step {
             let mut shard = index.shard_for(identity).write();
             let cell = shard.get_mut(identity).expect("directory cell exists");
             if let Some(sealed) = cell.sealed.take() {
@@ -533,9 +616,13 @@ impl IndexWriter<'_> {
                 state.sealed_count -= 1;
             }
         }
-        state.cleanup_cursor = end;
+        state.cleanup_cursor = if step.len() < max_cells {
+            None
+        } else {
+            step.last().map(|(identity, _)| directory_key(identity))
+        };
         if state.sealed_count == 0 {
-            state.cleanup_cursor = 0;
+            state.cleanup_cursor = None;
             Ok(true)
         } else {
             Ok(false)
@@ -565,7 +652,8 @@ impl IndexWriter<'_> {
     /// Install at most `max_cells` captured cells, each under its own shard
     /// lock. Until completion the lease rejects older new read cuts and
     /// preserves every existing pin. The owner must not release checkpoint
-    /// credits or authorize cleanup before `true`.
+    /// credits or authorize cleanup before `true`. Cells the installation
+    /// leaves empty become reap candidates for [`Self::reap_step`].
     pub(crate) fn install_image_step(&mut self, max_cells: usize) -> bool {
         assert!(max_cells != 0, "installation step must make progress");
         let index = self.index;
@@ -574,9 +662,12 @@ impl IndexWriter<'_> {
         let mut installation = state.installation.take().expect("installation is active");
         for captured in installation.cells.by_ref().take(max_cells) {
             let mut shard = index.shard_for(&captured.identity).write();
+            // A captured cell holds a sealed generation, so it is never empty
+            // and never reaped before its own installation.
             let cell = shard
                 .get_mut(&captured.identity)
-                .expect("captured cell exists");
+                .filter(|cell| cell.birth == captured.birth)
+                .expect("captured cell exists with its birth");
             let newer_base = cell
                 .base
                 .as_ref()
@@ -622,6 +713,22 @@ impl IndexWriter<'_> {
                 }
             }
             cell.base = captured.base;
+            // The new base omits every reference at or below the absorbed
+            // mask, the cut's references left the sealed generation and later
+            // publications are above the cut: the mask covers nothing.
+            if let Some(absorbed) = captured.masks.absorbed {
+                let before = cell.drop_versions.len();
+                cell.drop_versions.retain(|version| *version > absorbed);
+                sub(
+                    &accounting.directory,
+                    (before - cell.drop_versions.len()) * MASK_CHARGE,
+                );
+            }
+            // At most one candidate per cell: each cell is captured once per
+            // image, and no capture begins while candidates remain.
+            if cell.is_empty() && !state.touched.contains(&captured.identity) {
+                state.reap.push((captured.identity, cell.birth));
+            }
         }
         if installation.cells.len() == 0 {
             installation.lease.install();
@@ -632,10 +739,43 @@ impl IndexWriter<'_> {
         }
     }
 
+    /// Remove at most `max_cells` reap candidates, each rechecked under its
+    /// shard lock: same birth, and nothing staged, published, stored or
+    /// masked. A cell that changed since installation stays and loses its
+    /// candidate. Returns `true` once no candidate remains. Never changes a
+    /// published cut; scans and histories treat an absent cell as empty.
+    /// Runs after installation completes, as its own bounded writer step.
+    pub(crate) fn reap_step(&mut self, max_cells: usize) -> bool {
+        assert!(max_cells != 0, "reap step must make progress");
+        let index = self.index;
+        let state = &mut *self.state;
+        let start = state.reap.len().saturating_sub(max_cells);
+        for (identity, birth) in state.reap.drain(start..) {
+            if state.touched.contains(&identity) {
+                continue;
+            }
+            let mut shard = index.shard_for(&identity).write();
+            if shard
+                .get(&identity)
+                .is_some_and(|cell| cell.birth == birth && cell.is_empty())
+            {
+                shard.remove(&identity);
+                state.cells.remove(&directory_key(&identity));
+                sub(
+                    &index.accounting.directory,
+                    cell_directory_charge(&identity.1),
+                );
+            }
+        }
+        state.reap.is_empty()
+    }
+
     /// Native LargeTable's exact-reference unmerge retains later publications.
+    /// Installs the whole image, then reaps every cell it left empty.
     pub(crate) fn install_image(&mut self, persisted: PersistedIndexImage) {
         self.begin_install_image(persisted);
         self.install_image_step(usize::MAX);
+        self.reap_step(usize::MAX);
     }
 
     /// Materialize compact cell metadata in heap buffers. User values remain in
@@ -666,4 +806,134 @@ impl IndexWriter<'_> {
         add(&index.accounting.loaded, additional);
         Ok(())
     }
+
+    /// Collect at most `max` occupied cells of `[first, last]` in `keyspace`
+    /// after the cell `after`, in key order, with their birth IDs. Returns the
+    /// cursor for the next step, or `None` once the range is exhausted. Reads
+    /// only the ordered directory: no shard lock, no I/O.
+    pub(crate) fn drop_cells_targets_step(
+        &mut self,
+        keyspace: KeySpace,
+        first: &CellId,
+        last: &CellId,
+        after: Option<&CellId>,
+        max: usize,
+        targets: &mut Vec<DropCellsTarget>,
+    ) -> Option<CellId> {
+        assert!(max != 0, "DropCells preflight step must make progress");
+        let lower = after.map_or(Bound::Included((keyspace.0, first.clone())), |cell| {
+            Bound::Excluded((keyspace.0, cell.clone()))
+        });
+        let upper = Bound::Included((keyspace.0, last.clone()));
+        let mut visited = 0;
+        let mut next = None;
+        for (key, birth) in self.state.cells.range((lower, upper)).take(max) {
+            targets.push(DropCellsTarget {
+                identity: cell_key(key),
+                birth: *birth,
+            });
+            visited += 1;
+            next = Some(key.1.clone());
+        }
+        if visited < max { None } else { next }
+    }
+
+    /// Index charge of one `DropCells` member over the cells now present in
+    /// its range. Used by single-threaded replay, which has no barrier.
+    pub(crate) fn drop_cells_charge(
+        &self,
+        keyspace: KeySpace,
+        first: &CellId,
+        last: &CellId,
+    ) -> Result<usize, NativeIndexError> {
+        let cells = self
+            .state
+            .cells
+            .range((
+                Bound::Included((keyspace.0, first.clone())),
+                Bound::Included((keyspace.0, last.clone())),
+            ))
+            .count();
+        drop_mask_charge(cells)
+    }
+
+    /// Stage one `DropCells` mask at `version` on every target cell, under each
+    /// cell's own shard lock. Readers see nothing until the next publication
+    /// cut contains `version`. Every lower version is already promoted (the
+    /// publication barrier, or replay order), so no pending entry and no lower
+    /// later publication exist. A target reaped since preflight is skipped; a
+    /// present cell must keep its preflight birth. `latest` reaches `version`
+    /// even when no cell exists.
+    fn stage_drop_cells(
+        &mut self,
+        drop: &NativeDropCells,
+        version: MutationVersion,
+    ) -> Result<(), NativeIndexError> {
+        let index = self.index;
+        if self.state.latest.is_some_and(|latest| latest >= version) {
+            return Err(NativeIndexError::Invalid(
+                "DropCells below the publication frontier",
+            ));
+        }
+        let enumerated;
+        let targets = match &drop.targets {
+            Some(targets) => targets.as_slice(),
+            None => {
+                let mut collected = Vec::new();
+                self.drop_cells_targets_step(
+                    drop.keyspace,
+                    &drop.first,
+                    &drop.last,
+                    None,
+                    usize::MAX,
+                    &mut collected,
+                );
+                enumerated = collected;
+                enumerated.as_slice()
+            }
+        };
+        let mut resident = index.resident_bytes();
+        for target in targets {
+            let (keyspace, cell_id) = &target.identity;
+            if *keyspace != drop.keyspace || *cell_id < drop.first || *cell_id > drop.last {
+                return Err(NativeIndexError::Invalid(
+                    "DropCells target outside its range",
+                ));
+            }
+            let mut shard = index.shard_for(&target.identity).write();
+            let Some(cell) = shard.get_mut(&target.identity) else {
+                continue;
+            };
+            if cell.birth != target.birth {
+                return Err(NativeIndexError::Invalid(
+                    "DropCells target cell was recreated",
+                ));
+            }
+            if cell.pending.len() != 0 {
+                return Err(NativeIndexError::PendingPublication);
+            }
+            if cell
+                .drop_versions
+                .last()
+                .is_some_and(|newest| *newest >= version)
+            {
+                return Err(NativeIndexError::Invalid("DropCells masks out of order"));
+            }
+            resident = resident
+                .checked_add(MASK_CHARGE)
+                .filter(|total| *total <= index.max_metadata_bytes)
+                .ok_or(NativeIndexError::Capacity)?;
+            cell.drop_versions.push(version);
+            add(&index.accounting.directory, MASK_CHARGE);
+        }
+        self.state.latest = Some(version);
+        Ok(())
+    }
+}
+
+/// Admission and index charge of `cells` `DropCells` masks.
+pub(crate) fn drop_mask_charge(cells: usize) -> Result<usize, NativeIndexError> {
+    cells
+        .checked_mul(MASK_CHARGE)
+        .ok_or(NativeIndexError::Capacity)
 }

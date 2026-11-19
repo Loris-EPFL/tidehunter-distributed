@@ -30,8 +30,49 @@ fn cell_digest(bytes: &[u8]) -> [u8; 32] {
 
 pub(super) struct FrozenCell {
     pub identity: (KeySpace, CellId),
+    /// Runtime birth of the captured materialization; installation checks it.
+    pub birth: u64,
     pub base: Option<SortedBlock>,
     pub overlay: std::sync::Arc<Overlay<ValueRecordReference>>,
+    pub masks: FrozenMasks,
+}
+
+/// `DropCells` masks frozen at the capture boundary.
+#[derive(Clone, Debug, Default)]
+pub(super) struct FrozenMasks {
+    /// Ascending masks at or below the capture cut.
+    pub versions: Vec<MutationVersion>,
+    /// The newest mask at or below the retention floor. Every reference at
+    /// or below it is invisible to every valid cut, so the image omits them.
+    pub absorbed: Option<MutationVersion>,
+}
+
+impl FrozenMasks {
+    pub(super) fn capture(
+        drop_versions: &[MutationVersion],
+        cut: &IndexReadCut,
+        floor: &IndexReadCut,
+    ) -> Self {
+        let versions: Vec<_> = drop_versions
+            .iter()
+            .copied()
+            .filter(|version| cut.contains_mutation(*version))
+            .collect();
+        let absorbed = versions
+            .iter()
+            .rev()
+            .copied()
+            .find(|version| floor.contains_mutation(*version));
+        Self { versions, absorbed }
+    }
+
+    /// Masks the root keeps for protected cuts between the floor and the cut.
+    fn retained(&self) -> impl Iterator<Item = MutationVersion> + '_ {
+        self.versions
+            .iter()
+            .copied()
+            .filter(|version| self.absorbed.is_none_or(|absorbed| *version > absorbed))
+    }
 }
 
 pub(crate) struct PreparedIndexImage {
@@ -215,6 +256,13 @@ impl PreparedIndexImage {
             }
         }
         // Small roots bind each cell to an immutable container and exact range.
+        // Masks are kept only for cells that still store rows: an empty cell
+        // has nothing a mask could hide, and the suffix replays above the cut.
+        let masked = self
+            .cells
+            .iter()
+            .filter(|cell| cell.base.is_some() && cell.masks.retained().next().is_some())
+            .count();
         let mut payload = Vec::new();
         payload.extend_from_slice(MAGIC);
         payload.extend_from_slice(&FORMAT.to_be_bytes());
@@ -260,6 +308,8 @@ impl PreparedIndexImage {
                 return Err(NativeIndexError::Capacity);
             }
         }
+        // The mask section is always present, so one writer format exists.
+        encode_masks(&self.cells, masked, &mut payload)?;
         let frame = CrcFrame::new(&payload);
         let mut root_file = OpenOptions::new().write(true).create_new(true).open(path)?;
         root_file.write_all(frame.as_ref())?;
@@ -405,6 +455,114 @@ fn frame_payload(mapped: &Bytes) -> Result<Bytes, NativeIndexError> {
     Ok(payload)
 }
 
+/// Mask section: `be_u32 masked_cell_count`, then per cell in directory
+/// order `ks:u8, native CellId, be_u32 version_count` and ascending
+/// `(be_u64 generation, be_u64 sequence, be_u32 ordinal = 0)` versions.
+fn encode_masks(
+    cells: &[FrozenCell],
+    masked: usize,
+    payload: &mut Vec<u8>,
+) -> Result<(), NativeIndexError> {
+    payload.extend_from_slice(
+        &u32::try_from(masked)
+            .map_err(|_| NativeIndexError::Capacity)?
+            .to_be_bytes(),
+    );
+    let mut identity = BytesMut::new();
+    for cell in cells.iter().filter(|cell| cell.base.is_some()) {
+        let count = cell.masks.retained().count();
+        if count == 0 {
+            continue;
+        }
+        payload.push(cell.identity.0.0);
+        identity.clear();
+        cell.identity.1.write_into_bytes(&mut identity);
+        payload.extend_from_slice(&identity);
+        payload.extend_from_slice(
+            &u32::try_from(count)
+                .map_err(|_| NativeIndexError::Capacity)?
+                .to_be_bytes(),
+        );
+        for version in cell.masks.retained() {
+            payload.extend_from_slice(&version.batch.epoch.to_be_bytes());
+            payload.extend_from_slice(&version.batch.sequence.to_be_bytes());
+            payload.extend_from_slice(&version.operation_index.to_be_bytes());
+        }
+        if payload.len() > MAX_IMAGE_BYTES - 8 {
+            return Err(NativeIndexError::Capacity);
+        }
+    }
+    Ok(())
+}
+
+/// Bounded decoding of the mask section. Every masked cell has a stored
+/// frame, appears once in ascending directory order, and has strictly
+/// ascending ordinal-0 versions above the floor and within the cut. An empty
+/// section (count zero) is the common case.
+fn decode_masks(
+    cursor: &mut Cursor<'_>,
+    index: &mut NativeIndex,
+    cut: &IndexReadCut,
+    floor: &IndexReadCut,
+    cells: usize,
+) -> Result<(), NativeIndexError> {
+    let masked = cursor.u32()? as usize;
+    // Each entry needs at least a keyspace, a cell tag and one version.
+    if masked > cells || masked > cursor.remaining() / 22 {
+        return Err(NativeIndexError::Invalid("mask section count"));
+    }
+    let mut previous: Option<(u8, CellId)> = None;
+    for _ in 0..masked {
+        let keyspace = KeySpace(cursor.u8()?);
+        let cell_id = decode_cell(cursor)?;
+        let key = (keyspace.0, cell_id);
+        let shard = index.shard_index(keyspace, &key.1);
+        let identity = (keyspace, key.1.clone());
+        if !index.shards[shard].get_mut().contains_key(&identity) {
+            return Err(NativeIndexError::Invalid("mask names an absent cell"));
+        }
+        // The cell exists in `keyspace`, so `key` has its CellId variant and
+        // the comparison with a same-keyspace predecessor cannot panic.
+        if previous.as_ref().is_some_and(|prior| *prior >= key) {
+            return Err(NativeIndexError::Invalid("unsorted mask cells"));
+        }
+        let count = cursor.u32()? as usize;
+        if count == 0 || count > cursor.remaining() / 20 {
+            return Err(NativeIndexError::Invalid("mask version count"));
+        }
+        let charge = count
+            .checked_mul(MASK_CHARGE)
+            .ok_or(NativeIndexError::Capacity)?;
+        index.check_capacity(charge)?;
+        super::shards::add(&index.accounting.directory, charge);
+        let mut versions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let version = MutationVersion {
+                batch: BatchVersion {
+                    epoch: cursor.u64()?,
+                    sequence: cursor.u64()?,
+                },
+                operation_index: cursor.u32()?,
+            };
+            if version.operation_index != 0
+                || !cut.contains_mutation(version)
+                || floor.contains_mutation(version)
+                || versions.last().is_some_and(|prior| *prior >= version)
+            {
+                return Err(NativeIndexError::Invalid("mask version domain or order"));
+            }
+            versions.push(version);
+        }
+        let cell = index.shards[shard]
+            .get_mut()
+            .get_mut(&identity)
+            .ok_or(NativeIndexError::Invalid("mask names an absent cell"))?;
+        cell.drop_versions = versions;
+        previous = Some(key);
+    }
+    Ok(())
+}
+
 pub(super) fn open(
     path: &Path,
     shape: &KeyShape,
@@ -415,7 +573,11 @@ pub(super) fn open(
     let mapped = map_file(&File::open(path)?, Some(MAX_IMAGE_BYTES as u64))?;
     let payload = frame_payload(&mapped)?;
     let mut cursor = Cursor::new(&payload);
-    if cursor.take(8)? != MAGIC || cursor.u16()? != FORMAT || cursor.u16()? != 0 {
+    if cursor.take(8)? != MAGIC {
+        return Err(NativeIndexError::Invalid("index image format"));
+    }
+    let format = cursor.u16()?;
+    if !matches!(format, FORMAT | PREVIOUS_FORMAT) || cursor.u16()? != 0 {
         return Err(NativeIndexError::Invalid("index image format"));
     }
     if cursor.take(16)? != database || cursor.take(32)? != schema_digest(shape)? {
@@ -497,12 +659,8 @@ pub(super) fn open(
                 old.max(reference.mutation_version())
             }));
         }
-        index
-            .writer
-            .get_mut()
-            .cell_order
-            .push((keyspace, cell_id.clone()));
         let identity = (keyspace, cell_id);
+        let birth = index.writer.get_mut().register_cell(&identity)?;
         let shard = index.shard_index(identity.0, &identity.1);
         if index.shards[shard]
             .get_mut()
@@ -510,6 +668,7 @@ pub(super) fn open(
                 identity,
                 CellIndex {
                     base: Some(block),
+                    birth,
                     ..Default::default()
                 },
             )
@@ -518,12 +677,19 @@ pub(super) fn open(
             return Err(NativeIndexError::Invalid("duplicate cell"));
         }
     }
+    if format == FORMAT {
+        decode_masks(&mut cursor, &mut index, &cut, &floor, count)?;
+    }
     if cursor.remaining() != 0 {
         return Err(NativeIndexError::Invalid("trailing payload"));
     }
     index.retention.set_floor(floor);
     index.recount_retained();
-    let latest = index.writer.get_mut().latest;
+    // The root cut is published even when no stored reference has its
+    // version (a `DropCells` batch absorbed into the image).
+    let writer = index.writer.get_mut();
+    writer.latest = writer.latest.max(retention::position(&cut));
+    let latest = writer.latest;
     index.published.store(std::sync::Arc::new(
         latest.map_or(IndexReadCut::BeforeAll, IndexReadCut::At),
     ));
@@ -648,10 +814,13 @@ fn retained<'a>(
     overlay: &'a [ValueRecordReference],
     cut: &IndexReadCut,
     floor: &IndexReadCut,
+    absorbed: Option<MutationVersion>,
 ) -> Versions<'a> {
     // Preserve one anchor at/before the floor, including a tombstone, and every
     // later version. Binary-search old histories instead of scanning discarded
-    // versions once per serialization pass.
+    // versions once per serialization pass. A `DropCells` mask at or below the
+    // floor hides every version at or below it from every valid cut: those
+    // versions, the anchor included, are omitted (the mask is absorbed).
     let count = base.len() / REFERENCE_BYTES;
     let reference = |n| {
         decode_reference(&base[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
@@ -663,23 +832,28 @@ fn retained<'a>(
         .last()
         .copied();
     let anchor = newest(base_anchor, overlay_anchor).map(|value| value.mutation_version());
-    let base_start = lower_bound_by(count, |n| {
-        anchor.is_some_and(|anchor| reference(n).mutation_version() < anchor)
-    });
+    let omitted = |version: MutationVersion| {
+        anchor.is_some_and(|anchor| version < anchor)
+            || absorbed.is_some_and(|absorbed| version <= absorbed)
+    };
+    let base_start = lower_bound_by(count, |n| omitted(reference(n).mutation_version()));
     let base_end = lower_bound_by(count, |n| cut.contains(&reference(n)));
-    let overlay_start = overlay
-        .partition_point(|value| anchor.is_some_and(|anchor| value.mutation_version() < anchor));
+    let overlay_start = overlay.partition_point(|value| omitted(value.mutation_version()));
     let overlay_end = overlay.partition_point(|value| cut.contains(value));
+    // The absorbed mask is within the cut, so the starts never pass the ends.
     Versions::new(
-        &base[base_start * REFERENCE_BYTES..base_end * REFERENCE_BYTES],
-        &overlay[overlay_start..overlay_end],
+        &base[base_start.min(base_end) * REFERENCE_BYTES..base_end * REFERENCE_BYTES],
+        &overlay[overlay_start.min(overlay_end)..overlay_end],
     )
 }
 
 fn has_rows(cell: &FrozenCell, cut: &IndexReadCut, floor: &IndexReadCut) -> bool {
     *cut != IndexReadCut::BeforeAll
-        && Rows::new(cell)
-            .any(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
+        && Rows::new(cell).any(|(_, base, overlay)| {
+            retained(base, overlay, cut, floor, cell.masks.absorbed)
+                .next()
+                .is_some()
+        })
 }
 
 struct WrittenCell {
@@ -725,7 +899,7 @@ fn encode_cell_payload(
         .checked_add(count.checked_mul(4).ok_or(NativeIndexError::Capacity)?)
         .ok_or(NativeIndexError::Capacity)?;
     for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor).count();
+        let n = retained(base, overlay, cut, floor, cell.masks.absorbed).count();
         if n == 0 {
             continue;
         }
@@ -745,7 +919,7 @@ fn encode_cell_payload(
     let mut retained_bytes = 0usize;
     let mut retained_versions = 0usize;
     for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor).count();
+        let n = retained(base, overlay, cut, floor, cell.masks.absorbed).count();
         if n == 0 {
             continue;
         }
@@ -760,7 +934,7 @@ fn encode_cell_payload(
                 .map_err(|_| NativeIndexError::Capacity)?
                 .to_be_bytes(),
         )?;
-        for reference in retained(base, overlay, cut, floor) {
+        for reference in retained(base, overlay, cut, floor, cell.masks.absorbed) {
             reference_bytes.clear();
             encode_reference(&reference, reference_bytes);
             write(reference_bytes)?;
@@ -849,42 +1023,45 @@ impl CellEncoder {
         floor: &IndexReadCut,
     ) -> Result<Option<WrittenCell>, NativeIndexError> {
         self.stats.row_passes += 1;
-        let (count, bytes, digest, summary) = if let Some((rows, upper)) =
-            buffered_bound(cell, self.limit)
-        {
-            let Some((count, summary)) = self.encode_buffered(cell, rows, upper, cut, floor)?
-            else {
-                self.stats.empty_cells += 1;
-                return Ok(None);
+        let (count, bytes, digest, summary) =
+            if let Some((rows, upper)) = buffered_bound(cell, self.limit) {
+                let Some((count, summary)) = self.encode_buffered(cell, rows, upper, cut, floor)?
+                else {
+                    self.stats.empty_cells += 1;
+                    return Ok(None);
+                };
+                let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
+                let (bytes, digest) = write_frame(&self.payload, offset, writer)?;
+                self.stats.buffered_cells += 1;
+                self.stats.encode_passes += 1;
+                self.stats.buffered_bytes += bytes;
+                self.stats.references_encoded += summary.retained_versions as u64;
+                (count, bytes, digest, summary)
+            } else {
+                let count = Rows::new(cell)
+                    .filter(|(_, base, overlay)| {
+                        retained(base, overlay, cut, floor, cell.masks.absorbed)
+                            .next()
+                            .is_some()
+                    })
+                    .count();
+                if count == 0 {
+                    self.stats.empty_cells += 1;
+                    return Ok(None);
+                }
+                let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
+                let (bytes, digest, summary) =
+                    stream_cell(cell, count, cut, floor, offset, writer, &mut self.reference)?;
+                self.stats.streamed_cells += 1;
+                self.stats.encode_passes += 2;
+                self.stats.row_passes += 4;
+                self.stats.streamed_bytes += bytes;
+                self.stats.references_encoded += 2 * summary.retained_versions as u64;
+                if summary.length <= self.limit {
+                    self.stats.conservative_fallbacks += 1;
+                }
+                (count, bytes, digest, summary)
             };
-            let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
-            let (bytes, digest) = write_frame(&self.payload, offset, writer)?;
-            self.stats.buffered_cells += 1;
-            self.stats.encode_passes += 1;
-            self.stats.buffered_bytes += bytes;
-            self.stats.references_encoded += summary.retained_versions as u64;
-            (count, bytes, digest, summary)
-        } else {
-            let count = Rows::new(cell)
-                .filter(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
-                .count();
-            if count == 0 {
-                self.stats.empty_cells += 1;
-                return Ok(None);
-            }
-            let writer = writer.ok_or(NativeIndexError::Invalid("missing index container"))?;
-            let (bytes, digest, summary) =
-                stream_cell(cell, count, cut, floor, offset, writer, &mut self.reference)?;
-            self.stats.streamed_cells += 1;
-            self.stats.encode_passes += 2;
-            self.stats.row_passes += 4;
-            self.stats.streamed_bytes += bytes;
-            self.stats.references_encoded += 2 * summary.retained_versions as u64;
-            if summary.length <= self.limit {
-                self.stats.conservative_fallbacks += 1;
-            }
-            (count, bytes, digest, summary)
-        };
         Ok(Some(WrittenCell {
             file: CellFile {
                 path: path.to_owned(),
@@ -925,7 +1102,7 @@ impl CellEncoder {
         let mut retained_bytes = 0usize;
         let mut retained_versions = 0usize;
         for (key, base, overlay) in Rows::new(cell) {
-            let mut versions = retained(base, overlay, cut, floor);
+            let mut versions = retained(base, overlay, cut, floor, cell.masks.absorbed);
             let Some(first) = versions.next() else {
                 continue;
             };

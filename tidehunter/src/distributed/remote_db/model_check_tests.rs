@@ -20,6 +20,8 @@ use std::sync::Barrier;
 
 #[path = "model_check_concurrent.rs"]
 mod concurrent_model;
+#[path = "drop_cells_crash.rs"]
+mod drop_cells_crash;
 #[path = "model_check_leased.rs"]
 mod leased;
 const KEYS: usize = 64;

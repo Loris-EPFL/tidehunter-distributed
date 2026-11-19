@@ -1655,6 +1655,8 @@ impl RemoteDatabase {
         fencing_generations::mark_served(&mut manifest, epoch)?;
         // Old suffixes validated against their original durable bound. Only a
         // fully recovered, not-yet-serving epoch may activate a larger bound.
+        // Only the new format may serve and write DropCells batches.
+        manifest.format = fencing_generations::AUTHORITY_FORMAT;
         manifest.replay_limits = config.replay_limits;
         persist_manifest(&path, &manifest)?;
         #[cfg(test)]
@@ -1734,6 +1736,7 @@ impl RemoteDatabase {
                 published_next: 0,
                 upper: latest,
                 dependents: HashMap::new(),
+                range_barrier: None,
                 latest,
                 live_latest: latest,
                 snapshot_generation: 0,
@@ -2151,7 +2154,7 @@ impl RemoteDatabase {
                 key: actual,
                 ..
             } => Ok(keyspace == ks && actual.as_ref() == key),
-            Mutation::Delete { .. } => Err(LocalDbError::new(
+            Mutation::Delete { .. } | Mutation::DropCells { .. } => Err(LocalDbError::new(
                 "live index reference resolves to tombstone",
             )),
         }
@@ -2537,12 +2540,15 @@ fn replay_history(
                     ));
                 }
                 previous = Some(version);
+                // A DropCells batch masks every cell now in its range: the
+                // reconstructed base and the already promoted replayed suffix.
+                let charge = match batch.drop_cells() {
+                    Some((keyspace, first, last)) => index.drop_cells_charge(keyspace, first, last),
+                    None => index.estimated_batch_bytes(&batch),
+                }
+                .map_err(LocalDbError::component)?;
                 index
-                    .check_capacity(
-                        index
-                            .estimated_batch_bytes(&batch)
-                            .map_err(LocalDbError::component)?,
-                    )
+                    .check_capacity(charge)
                     .map_err(LocalDbError::component)?;
                 PreparedNativePublication::prepare_authenticated(
                     shape,
@@ -3400,6 +3406,8 @@ mod position_tests;
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(test)]
+mod drop_cells_tests;
 #[cfg(test)]
 mod durable_cut_tests;
 #[cfg(test)]

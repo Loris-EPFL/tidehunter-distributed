@@ -471,6 +471,10 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
             break;
         }
     }
+    // Reap the cells the installation left empty (absorbed `DropCells`
+    // masks), one bounded writer step at a time. Reaping changes no cut, so
+    // publication is not held out.
+    while !core.index.writer().reap_step(32) {}
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_install_after");
     let recent = {

@@ -79,6 +79,24 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     pub published_next: u64,
     pub upper: Option<MutationVersion>,
     pub dependents: HashMap<u64, Vec<u64>>,
+    /// The one unresolved fresh `DropCells` slot, if any. While present no
+    /// sequence above it publishes; see `RangeBarrier`.
+    pub range_barrier: Option<RangeBarrier>,
+}
+
+/// Global publication barrier of one fresh `DropCells` slot. It never stops
+/// WAL admission, owner queues or durable completion of other sequences: it
+/// only defers publication of sequences above `sequence`. Lower sequences
+/// publish normally; the range publishes once `published_next == sequence`.
+/// Each deferred durable sequence is queued here exactly once and requeued
+/// in order when the range is published or aborted before READY.
+///
+/// Bound: `deferred_ready` holds distinct admitted sequences above
+/// `sequence`, so its length is below the sequencer window. Owner: the
+/// publisher mutex. Lifetime: the admitted slot, not the caller's timeout.
+pub(in crate::distributed::remote_db) struct RangeBarrier {
+    pub sequence: u64,
+    pub deferred_ready: Vec<u64>,
 }
 
 impl PublisherState {

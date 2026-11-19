@@ -2275,10 +2275,12 @@ impl RemoteDatabase {
         }
         self.ensure_healthy()?;
         let mutation = completed.result.inspect_err(|error| self.poison(error))?;
-        if matches!(mutation, Mutation::Delete { .. })
+        if !matches!(mutation, Mutation::Put { .. })
             || mutation.keyspace() != ks
             || completed.reference.descriptor.keyspace != ks.0
-            || self.core.shape.ks(ks).reduce_key(mutation.key()).as_ref() != reduced_key
+            || mutation
+                .point_key()
+                .is_none_or(|key| self.core.shape.ks(ks).reduce_key(key).as_ref() != reduced_key)
         {
             let error = LocalDbError::new("scan member does not match its live index reference");
             self.poison(&error);
@@ -2504,6 +2506,9 @@ impl RemoteDatabase {
             Mutation::Put { .. } => Ok(None),
             Mutation::Delete { .. } => Err(LocalDbError::new(
                 "live index reference resolves to tombstone",
+            )),
+            Mutation::DropCells { .. } => Err(LocalDbError::new(
+                "DropCells does not have a value reference",
             )),
         }
     }

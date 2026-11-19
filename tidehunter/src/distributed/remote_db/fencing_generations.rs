@@ -29,10 +29,10 @@ use crate::distributed::tcp::{
     InventoryGeneration, NodeStatus, OwnerGenerationState, TrimReadiness,
 };
 
-/// Authority manifest format with generation states, `next_generation` and
-/// `trim_pending` (number assigned at merge). Format 5 is the deleted per-cell
-/// mode; formats 2 to 4 are pre-cutover Exact manifests.
-pub(super) const AUTHORITY_FORMAT: u32 = 6;
+/// Authority manifest format that allows serving DropCells WAL batches.
+pub(super) const AUTHORITY_FORMAT: u32 = 7;
+/// L1 introduced the monotone fencing ledger; its Exact roots are readable.
+const FENCING_AUTHORITY_FORMAT: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,7 +65,9 @@ pub(super) fn read_authority_manifest(path: &Path) -> Result<AuthorityManifest, 
     let probe: FormatProbe = read_metadata(path).map_err(LocalDbError::component)?;
     probe.mode.reject_legacy_mode(probe.format)?;
     match probe.format {
-        AUTHORITY_FORMAT => read_metadata(path).map_err(LocalDbError::component),
+        FENCING_AUTHORITY_FORMAT | AUTHORITY_FORMAT => {
+            read_metadata(path).map_err(LocalDbError::component)
+        }
         format => Err(LocalDbError::new(format!(
             "unsupported distributed authority manifest format {format} (expected {AUTHORITY_FORMAT})"
         ))),

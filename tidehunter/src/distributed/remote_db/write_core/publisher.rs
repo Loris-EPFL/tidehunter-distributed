@@ -262,111 +262,190 @@ impl WriteCore {
                         work.push(dependent);
                     }
                 }
+                // A DropCells slot aborted before READY has no WAL effect:
+                // release its barrier and requeue the deferred suffix.
+                if publisher
+                    .range_barrier
+                    .as_ref()
+                    .is_some_and(|barrier| barrier.sequence == sequence)
+                    && let Some(barrier) = publisher.range_barrier.take()
+                {
+                    for deferred in barrier.deferred_ready {
+                        work.push(deferred);
+                    }
+                }
             }
-            // Pops strictly increase (PublicationWork) and every popped
-            // generation is durable, unresolved and inside the admitted window
+            // Pass 1 publishes below any range barrier, pass 2 the range once
+            // its prefix is contiguous, pass 3 the suffix it deferred. Without
+            // a barrier only pass 1 runs. Within a pass, pops strictly
+            // increase (PublicationWork) and every popped generation is
+            // durable, unresolved and inside the admitted window
             // [reuse_next, next), whose length is at most the ring capacity.
             // The bound therefore covers all work; leftover work or a
             // non-increasing pop is an invariant violation and fail-stops.
-            let mut previous = None;
-            for _ in 0..self.sequencer.capacity() {
-                let Some(sequence) = work.pop() else { break };
-                if previous.is_some_and(|previous| sequence <= previous) {
-                    return Err(LocalDbError::new(
-                        "publication work did not increase in sequence order",
-                    ));
-                }
-                previous = Some(sequence);
-                if self.sequencer.resolved(sequence) {
-                    continue;
-                }
-                if self.sequencer.resolution(sequence) != Some(Resolution::Durable) {
-                    return Err(LocalDbError::new(
-                        "publication work has no durable generation",
-                    ));
-                }
-                let slot = self.sequencer.slot(sequence);
-                let mut data = slot.data.lock();
-                if let Some(predecessor) = data
-                    .predecessors
-                    .iter()
-                    .copied()
-                    .find(|predecessor| !self.sequencer.resolved(*predecessor))
-                {
-                    publisher
-                        .dependents
-                        .entry(predecessor)
-                        .or_default()
-                        .push(sequence);
-                    continue;
-                }
-                let durable = data
-                    .receipt
-                    .ok_or_else(|| LocalDbError::new("durable slot has no receipt"))?;
-                let SlotPublication {
-                    batch,
-                    routing,
-                    metadata_charge,
-                    last_mutation,
-                } = data
-                    .publication
-                    .take()
-                    .ok_or_else(|| LocalDbError::new("durable slot has no publication payload"))?;
-                if data.last_mutation != Some(last_mutation) {
-                    return Err(LocalDbError::new(
-                        "publication mutation frontier differs from its slot",
-                    ));
-                }
-                #[cfg(test)]
-                crate::failpoints::write_model::boundary("publication_before");
-                // Test-only leaf mutex: injects a native publication callback
-                // error for one generation, under writer→publisher as in production.
-                #[cfg(test)]
-                if self.test_hooks.lock().fail_publication == Some(sequence) {
-                    return Err(LocalDbError::new("injected publication callback failure"));
-                }
-                routing
-                    .publish_authenticated(&batch, durable, &mut writer)
-                    .map_err(LocalDbError::component)?;
-                #[cfg(test)]
-                crate::failpoints::write_model::boundary("publication_after");
-                self.sequencer
-                    .transition(sequence, Resolution::Durable, Resolution::Published)?;
-                publisher.upper = Some(
-                    publisher
-                        .upper
-                        .map_or(last_mutation, |upper| upper.max(last_mutation)),
-                );
-                {
-                    let state = publisher.checkpoint_state();
-                    if state.known.insert(data.id, durable.appended()).is_some() {
+            for _pass in 0..3 {
+                let mut previous = None;
+                for _ in 0..self.sequencer.capacity() {
+                    let Some(sequence) = work.pop() else { break };
+                    if previous.is_some_and(|previous| sequence <= previous) {
                         return Err(LocalDbError::new(
-                            "publication repeated a retained identity",
+                            "publication work did not increase in sequence order",
                         ));
                     }
-                    *state.live_latest = Some(
-                        state
-                            .live_latest
-                            .map_or(last_mutation, |previous| previous.max(last_mutation)),
-                    );
-                    *state.checkpoint_tail_batches += 1;
-                    *state.checkpoint_tail_bytes += batch.encoded().len();
-                }
-                published.push(Published {
-                    sequence,
-                    batch,
-                    address: durable.appended().address(),
-                    metadata_charge,
-                });
-                if let Some(dependents) = publisher.dependents.remove(&sequence) {
-                    for dependent in dependents {
-                        work.push(dependent);
+                    previous = Some(sequence);
+                    if self.sequencer.resolved(sequence) {
+                        continue;
                     }
+                    if self.sequencer.resolution(sequence) != Some(Resolution::Durable) {
+                        return Err(LocalDbError::new(
+                            "publication work has no durable generation",
+                        ));
+                    }
+                    let published_next = publisher.published_next;
+                    if let Some(barrier) = &mut publisher.range_barrier {
+                        if sequence > barrier.sequence {
+                            // Durable, unpublished: requeued when the range resolves.
+                            barrier.deferred_ready.push(sequence);
+                            continue;
+                        }
+                        if sequence == barrier.sequence && published_next != sequence {
+                            // Rearmed below once the lower prefix is contiguous.
+                            continue;
+                        }
+                    }
+                    let slot = self.sequencer.slot(sequence);
+                    let mut data = slot.data.lock();
+                    if let Some(predecessor) = data
+                        .predecessors
+                        .iter()
+                        .copied()
+                        .find(|predecessor| !self.sequencer.resolved(*predecessor))
+                    {
+                        publisher
+                            .dependents
+                            .entry(predecessor)
+                            .or_default()
+                            .push(sequence);
+                        continue;
+                    }
+                    let durable = data
+                        .receipt
+                        .ok_or_else(|| LocalDbError::new("durable slot has no receipt"))?;
+                    let SlotPublication {
+                        batch,
+                        routing,
+                        metadata_charge,
+                        last_mutation,
+                    } = data.publication.take().ok_or_else(|| {
+                        LocalDbError::new("durable slot has no publication payload")
+                    })?;
+                    if data.last_mutation != Some(last_mutation) {
+                        return Err(LocalDbError::new(
+                            "publication mutation frontier differs from its slot",
+                        ));
+                    }
+                    #[cfg(test)]
+                    crate::failpoints::write_model::boundary("publication_before");
+                    // Test-only leaf mutex: injects a native publication callback
+                    // error for one generation, under writer→publisher as in production.
+                    #[cfg(test)]
+                    if self.test_hooks.lock().fail_publication == Some(sequence) {
+                        return Err(LocalDbError::new("injected publication callback failure"));
+                    }
+                    routing
+                        .publish_authenticated(&batch, durable, &mut writer)
+                        .map_err(LocalDbError::component)?;
+                    #[cfg(test)]
+                    crate::failpoints::write_model::boundary("publication_after");
+                    self.sequencer.transition(
+                        sequence,
+                        Resolution::Durable,
+                        Resolution::Published,
+                    )?;
+                    publisher.upper = Some(
+                        publisher
+                            .upper
+                            .map_or(last_mutation, |upper| upper.max(last_mutation)),
+                    );
+                    {
+                        let state = publisher.checkpoint_state();
+                        if state.known.insert(data.id, durable.appended()).is_some() {
+                            return Err(LocalDbError::new(
+                                "publication repeated a retained identity",
+                            ));
+                        }
+                        *state.live_latest = Some(
+                            state
+                                .live_latest
+                                .map_or(last_mutation, |previous| previous.max(last_mutation)),
+                        );
+                        *state.checkpoint_tail_batches += 1;
+                        *state.checkpoint_tail_bytes += batch.encoded().len();
+                    }
+                    published.push(Published {
+                        sequence,
+                        batch,
+                        address: durable.appended().address(),
+                        metadata_charge,
+                    });
+                    if let Some(dependents) = publisher.dependents.remove(&sequence) {
+                        for dependent in dependents {
+                            work.push(dependent);
+                        }
+                    }
+                }
+                if !work.is_empty() {
+                    return Err(LocalDbError::new(
+                        "publication dependency work exceeded the admitted window",
+                    ));
+                }
+                writer
+                    .promote_committed()
+                    .map_err(LocalDbError::component)?;
+                for _ in 0..self.sequencer.capacity() {
+                    let sequence = publisher.published_next;
+                    match self.sequencer.resolution(sequence) {
+                        Some(Resolution::Published) => {
+                            let data = self.sequencer.slot(sequence).data.lock();
+                            let last = data.last_mutation.ok_or_else(|| {
+                                LocalDbError::new("published slot lost its last mutation")
+                            })?;
+                            *publisher.checkpoint_state().latest = Some(last);
+                        }
+                        Some(Resolution::Aborted) => {}
+                        _ => break,
+                    }
+                    publisher.published_next = sequence + 1;
+                }
+                match publisher
+                    .range_barrier
+                    .as_ref()
+                    .map(|barrier| barrier.sequence)
+                {
+                    // The range published: release the barrier, requeue its suffix.
+                    Some(range) if publisher.published_next > range => {
+                        if let Some(barrier) = publisher.range_barrier.take() {
+                            for deferred in barrier.deferred_ready {
+                                work.push(deferred);
+                            }
+                        }
+                    }
+                    // The lower prefix became contiguous with the range durable.
+                    Some(range)
+                        if publisher.published_next == range
+                            && self.sequencer.resolution(range) == Some(Resolution::Durable) =>
+                    {
+                        work.push(range);
+                    }
+                    _ => {}
+                }
+                if work.is_empty() {
+                    break;
                 }
             }
             if !work.is_empty() {
                 return Err(LocalDbError::new(
-                    "publication dependency work exceeded the admitted window",
+                    "publication barrier work exceeded its passes",
                 ));
             }
             writer
@@ -468,6 +547,10 @@ impl WriteCore {
             slots += self.finalize_slot(allocation.sequence);
         }
         let published_count = published.len() as u64;
+        // Counted before `finalize_published` installs any caller outcome, so
+        // an acknowledged write always observes its own publication (as the
+        // suffix counter above).
+        self.stats.lock().database.published_batches += published_count;
         for entry in published {
             let partition = *self
                 .partition_indexes
@@ -480,7 +563,6 @@ impl WriteCore {
         }
         self.admission
             .release_publication(index_bytes, slots, &partitions, aborted_replay)?;
-        self.stats.lock().database.published_batches += published_count;
         result?;
         self.request_checkpoint()
     }
@@ -493,12 +575,29 @@ impl WriteCore {
             metadata_charge: _,
         } = entry;
         if self.config.read_cache_bytes != 0 {
-            for (operation, mutation) in batch.mutations().iter().enumerate() {
-                let reference = batch
-                    .record_reference(address, operation)
-                    .map_err(LocalDbError::component)?;
-                let prepared = self.read_cache.prepare_post_publish(reference, mutation);
-                self.read_cache.insert_prepared(prepared);
+            if let Some((keyspace, first, last)) = batch.drop_cells() {
+                // No warming for DropCells. Masks already hide the covered
+                // references; evict them before the caller completes. Writer
+                // and publisher are released; one cache shard at a time.
+                let descriptor = self.shape.ks(keyspace);
+                let key_size = descriptor.index_key_size();
+                self.read_cache
+                    .evict_dropped(keyspace, batch.version(), |key: &[u8]| {
+                        let reduced = descriptor.reduce_key(key);
+                        if Some(reduced.len()) != key_size {
+                            return false;
+                        }
+                        let cell = descriptor.cell_id(&reduced);
+                        *first <= cell && cell <= *last
+                    });
+            } else {
+                for (operation, mutation) in batch.mutations().iter().enumerate() {
+                    let reference = batch
+                        .record_reference(address, operation)
+                        .map_err(LocalDbError::component)?;
+                    let prepared = self.read_cache.prepare_post_publish(reference, mutation);
+                    self.read_cache.insert_prepared(prepared);
+                }
             }
         }
         self.identities

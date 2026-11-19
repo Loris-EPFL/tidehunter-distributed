@@ -12,8 +12,9 @@
 //! transaction hides all staged entries; it cannot abort that durable batch.
 
 use super::codec::{BatchLimits, CodecError, CompleteBatch, Mutation, ValidatedMutations};
+use super::native_index::DropCellsTarget;
 use super::storage::{DurableBatch, PartitionLog, StorageError};
-use super::types::{BatchId, BatchVersion, PayloadDigest, ValueRecordReference};
+use super::types::{BatchId, BatchVersion, MutationVersion, PayloadDigest, ValueRecordReference};
 use crate::batch::PendingOp;
 use crate::cell::CellId;
 use crate::index::pending_table::{PendingTable, Transaction};
@@ -41,6 +42,50 @@ pub trait NativePendingSink {
         cell: &CellId,
         apply: impl FnOnce(&mut PendingTable<ValueRecordReference>),
     ) -> Result<(), Self::Error>;
+
+    /// Apply one ordered `DropCells` member at `version`: every point
+    /// reference of the range at or below it becomes invisible to cuts that
+    /// contain `version`. Called only after every lower version is published.
+    fn drop_cells(
+        &mut self,
+        drop: &NativeDropCells,
+        version: MutationVersion,
+    ) -> Result<(), Self::Error>;
+}
+
+/// One routed `DropCells` member. It has no pending operation and no value.
+#[derive(Debug)]
+pub struct NativeDropCells {
+    pub(crate) keyspace: KeySpace,
+    pub(crate) first: CellId,
+    pub(crate) last: CellId,
+    /// Occupied cells collected before READY under the publication barrier.
+    /// `None` on replay, where the index enumerates the range itself.
+    pub(crate) targets: Option<Vec<DropCellsTarget>>,
+}
+
+impl NativeDropCells {
+    fn from_batch(batch: &CompleteBatch) -> Option<Self> {
+        batch.drop_cells().map(|(keyspace, first, last)| Self {
+            keyspace,
+            first: first.clone(),
+            last: last.clone(),
+            targets: None,
+        })
+    }
+
+    fn matches(&self, batch: &CompleteBatch) -> bool {
+        batch.drop_cells().is_some_and(|(keyspace, first, last)| {
+            keyspace == self.keyspace && *first == self.first && *last == self.last
+        })
+    }
+}
+
+fn drop_cells_version(version: BatchVersion) -> MutationVersion {
+    MutationVersion {
+        batch: version,
+        operation_index: 0,
+    }
 }
 
 /// All authority membership and native key routing prepared before staging.
@@ -53,6 +98,7 @@ pub struct PreparedNativePublication {
     version: BatchVersion,
     digest: PayloadDigest,
     operations: Vec<(PendingOp, ValueRecordReference)>,
+    drop_cells: Option<NativeDropCells>,
 }
 
 /// Version-free routing for an immutable validated input. Borrowing the exact
@@ -61,6 +107,7 @@ pub(crate) struct UnboundNativePublicationRouting<'a> {
     shape: &'a KeyShape,
     mutations: &'a [Mutation],
     operations: Vec<PendingOp>,
+    drop_cells: bool,
 }
 
 impl<'a> UnboundNativePublicationRouting<'a> {
@@ -75,6 +122,16 @@ impl<'a> UnboundNativePublicationRouting<'a> {
         shape: &'a KeyShape,
         mutations: &'a [Mutation],
     ) -> Result<Self, NativePublicationError> {
+        // A DropCells singleton has no pending operation; codec validation
+        // already rejected it in a mixed batch.
+        if matches!(mutations, [Mutation::DropCells { .. }]) {
+            return Ok(Self {
+                shape,
+                mutations,
+                operations: Vec::new(),
+                drop_cells: true,
+            });
+        }
         let mut operations = Vec::with_capacity(mutations.len());
         for mutation in mutations {
             operations.push(route_mutation(shape, mutation)?);
@@ -83,6 +140,7 @@ impl<'a> UnboundNativePublicationRouting<'a> {
             shape,
             mutations,
             operations,
+            drop_cells: false,
         })
     }
 
@@ -122,8 +180,10 @@ impl<'a> UnboundNativePublicationRouting<'a> {
                     } => (*ks, reduced_key, None),
                 };
                 let shape = self.shape.ks(ks);
-                if !matches!(shape.key_indexing(), KeyIndexing::Hash) {
-                    *reduced_key = shape.reduced_key_bytes(mutation.key().clone());
+                if !matches!(shape.key_indexing(), KeyIndexing::Hash)
+                    && let Some(key) = mutation.point_key()
+                {
+                    *reduced_key = shape.reduced_key_bytes(key.clone());
                 }
                 if let Some(Some((key, value))) = lru_update {
                     let Mutation::Put {
@@ -139,11 +199,20 @@ impl<'a> UnboundNativePublicationRouting<'a> {
                 }
             }
         }
+        let drop_cells = if self.drop_cells {
+            Some(
+                NativeDropCells::from_batch(batch)
+                    .ok_or(NativePublicationError::ReceiptMismatch)?,
+            )
+        } else {
+            None
+        };
         Ok(NativePublicationRouting {
             id: batch.id(),
             version: batch.version(),
             digest: batch.digest(),
             operations: self.operations,
+            drop_cells,
         })
     }
 }
@@ -179,6 +248,7 @@ pub(crate) struct NativePublicationRouting {
     version: BatchVersion,
     digest: PayloadDigest,
     operations: Vec<PendingOp>,
+    drop_cells: Option<NativeDropCells>,
 }
 
 impl NativePublicationRouting {
@@ -190,6 +260,20 @@ impl NativePublicationRouting {
         batch: &CompleteBatch,
     ) -> Result<Self, NativePublicationError> {
         UnboundNativePublicationRouting::from_mutations(shape, batch.mutations())?.bind(batch)
+    }
+
+    /// Occupied target cells of a `DropCells` routing, collected under the
+    /// publication barrier before READY. Rejected for a point batch.
+    pub(crate) fn set_drop_targets(
+        &mut self,
+        targets: Vec<DropCellsTarget>,
+    ) -> Result<(), NativePublicationError> {
+        let drop = self
+            .drop_cells
+            .as_mut()
+            .ok_or(NativePublicationError::ReceiptMismatch)?;
+        drop.targets = Some(targets);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -215,9 +299,17 @@ impl NativePublicationRouting {
             || batch.id() != self.id
             || batch.version() != self.version
             || batch.digest() != self.digest
-            || self.operations.len() != batch.mutations().len()
+            || match &self.drop_cells {
+                None => self.operations.len() != batch.mutations().len(),
+                Some(drop) => !self.operations.is_empty() || !drop.matches(batch),
+            }
         {
             return Err(NativePublicationError::ReceiptMismatch);
+        }
+        if let Some(drop) = &self.drop_cells {
+            return sink
+                .drop_cells(drop, drop_cells_version(self.version))
+                .map_err(NativePublicationError::Install);
         }
         let transaction = Transaction::default();
         for (index, pending) in self.operations.into_iter().enumerate() {
@@ -256,12 +348,15 @@ fn route_mutation(
 ) -> Result<PendingOp, NativePublicationError> {
     let keyspace = mutation.keyspace();
     let descriptor = shape.ks(keyspace);
+    let Some(key) = mutation.point_key() else {
+        return Err(NativePublicationError::InvalidRouting);
+    };
     if let KeyIndexing::Reduction(_, range) = descriptor.key_indexing()
-        && (range.start > range.end || range.end > mutation.key().len())
+        && (range.start > range.end || range.end > key.len())
     {
         return Err(NativePublicationError::InvalidRouting);
     }
-    let reduced_key = descriptor.reduced_key_bytes(mutation.key().clone());
+    let reduced_key = descriptor.reduced_key_bytes(key.clone());
     if let CellId::Bytes(prefix) = descriptor.first_cell()
         && reduced_key.len() < prefix.len()
     {
@@ -282,6 +377,7 @@ fn route_mutation(
             reduced_key,
             cell_id,
         },
+        Mutation::DropCells { .. } => return Err(NativePublicationError::InvalidRouting),
     })
 }
 
@@ -340,6 +436,15 @@ impl PreparedNativePublication {
         batch
             .validate_for(shape, limits)
             .map_err(NativePublicationError::Codec)?;
+        if let Some(drop_cells) = NativeDropCells::from_batch(batch) {
+            return Ok(Self {
+                id: batch.id(),
+                version: batch.version(),
+                digest: batch.digest(),
+                operations: Vec::new(),
+                drop_cells: Some(drop_cells),
+            });
+        }
         let mut operations = Vec::with_capacity(batch.mutations().len());
         for (index, mutation) in batch.mutations().iter().enumerate() {
             let reference = member(index)?;
@@ -356,6 +461,7 @@ impl PreparedNativePublication {
             version: batch.version(),
             digest: batch.digest(),
             operations,
+            drop_cells: None,
         })
     }
 
@@ -383,6 +489,11 @@ impl PreparedNativePublication {
         self,
         sink: &mut S,
     ) -> Result<(), NativePublicationError<S::Error>> {
+        if let Some(drop) = &self.drop_cells {
+            return sink
+                .drop_cells(drop, drop_cells_version(self.version))
+                .map_err(NativePublicationError::Install);
+        }
         let transaction = Transaction::default();
         for (pending, reference) in self.operations {
             let keyspace = pending.ks();
@@ -594,6 +705,14 @@ mod tests {
             }
             Ok(())
         }
+
+        fn drop_cells(
+            &mut self,
+            _drop: &NativeDropCells,
+            _version: MutationVersion,
+        ) -> Result<(), Self::Error> {
+            Err("point-only test sink")
+        }
     }
 
     fn collect(sink: &mut Sink) -> Vec<(KeySpace, CellId, CommittedChange<ValueRecordReference>)> {
@@ -628,7 +747,7 @@ mod tests {
         for (index, (keyspace, cell, change)) in changes.iter().enumerate() {
             let mutation = &batches[0].mutations()[index];
             let descriptor = shape().ks(*keyspace).clone();
-            let reduced = descriptor.reduced_key_bytes(mutation.key().clone());
+            let reduced = descriptor.reduced_key_bytes(mutation.point_key().unwrap().clone());
             assert_eq!(change.key, reduced);
             assert_eq!(*cell, descriptor.cell_id(&reduced));
             assert_eq!(*keyspace, mutation.keyspace());
@@ -640,7 +759,7 @@ mod tests {
         assert_eq!(
             changes[2].2.lru_update,
             Some((
-                batches[0].mutations()[2].key().clone(),
+                batches[0].mutations()[2].point_key().unwrap().clone(),
                 b"cached"[..].into()
             ))
         );

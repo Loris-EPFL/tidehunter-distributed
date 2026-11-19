@@ -3,7 +3,7 @@ use super::super::{
     WriteTimelineStage, WriteWait, elapsed,
 };
 use super::Dependency;
-use super::core::WriteCore;
+use super::core::{RangeBarrier, WriteCore};
 use super::identity::{IdentityClass, IdentityEntry};
 use super::owner_queue::OwnerQueue;
 use super::publisher::AbortedAllocation;
@@ -69,6 +69,8 @@ impl Drop for QueuedWindow<'_> {
 enum AllocationResult {
     Allocated,
     Replan,
+    /// Another fresh `DropCells` slot still holds the publication barrier.
+    RangeBusy,
     Closed(LocalDbError),
 }
 
@@ -80,7 +82,7 @@ impl WriteCore {
         sample: Option<WriteTimelineSample>,
     ) -> Result<BatchVersion, LocalDbError> {
         let inputs = [(operation, mutations)];
-        let queued = self.enqueue_window(&inputs, true, sample)?;
+        let queued = self.enqueue_window(&inputs, true, sample, false)?;
         // No queued routing/value handle retains caller backing after bind.
         // Release even arbitrarily large source allocations before waiting.
         drop(inputs);
@@ -113,13 +115,46 @@ impl WriteCore {
         })
     }
 
+    /// Submit one singleton `DropCells` batch and wait for its publication.
+    /// The slot holds the global publication barrier from allocation until
+    /// it is published or aborted before READY; WAL admission and the shared
+    /// write gate stay open. Point windows can never carry this member.
+    pub(in crate::distributed::remote_db) fn write_drop_cells(
+        self: &Arc<Self>,
+        operation: [u8; 16],
+        mutation: Mutation,
+    ) -> Result<BatchVersion, LocalDbError> {
+        if !matches!(mutation, Mutation::DropCells { .. }) {
+            return Err(LocalDbError::new(
+                "write_drop_cells requires a DropCells member",
+            ));
+        }
+        let inputs = [(operation, vec![mutation])];
+        let queued = self.enqueue_window(&inputs, true, None, true)?;
+        let version = *queued
+            .versions
+            .first()
+            .ok_or_else(|| LocalDbError::new("write allocated no version"))?;
+        let deadline = Instant::now() + self.config.timeout;
+        let result = if queued.owned.contains(&version.sequence) && version.epoch == self.epoch {
+            self.sequencer.wait(version, deadline)
+        } else {
+            self.wait_retry(version, deadline)
+        };
+        result.and_then(|version| {
+            self.ensure_healthy()
+                .map(|()| version)
+                .map_err(|error| LocalDbError::unknown(version, error))
+        })
+    }
+
     pub(in crate::distributed::remote_db) fn submit(
         self: &Arc<Self>,
         operation: [u8; 16],
         mutations: Vec<Mutation>,
     ) -> Result<BatchVersion, LocalDbError> {
         let inputs = [(operation, mutations)];
-        let queued = self.enqueue_window(&inputs, false, None)?;
+        let queued = self.enqueue_window(&inputs, false, None, false)?;
         queued
             .versions
             .first()
@@ -143,7 +178,7 @@ impl WriteCore {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let mut queued = self.enqueue_window(inputs, false, None)?;
+        let mut queued = self.enqueue_window(inputs, false, None, false)?;
         Ok(std::mem::take(&mut queued.versions).into_vec())
     }
 
@@ -152,10 +187,11 @@ impl WriteCore {
         inputs: &[Input],
         block: bool,
         sample: Option<WriteTimelineSample>,
+        drop_cells: bool,
     ) -> Result<QueuedWindow<'a>, LocalDbError> {
         let first_allocated = Cell::new(None);
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.enqueue_window_inner(inputs, block, sample, &first_allocated)
+            self.enqueue_window_inner(inputs, block, sample, drop_cells, &first_allocated)
         })) {
             Ok(result) => result,
             Err(_) => {
@@ -176,11 +212,25 @@ impl WriteCore {
         inputs: &[Input],
         block: bool,
         sample: Option<WriteTimelineSample>,
+        drop_cells: bool,
         first_allocated: &Cell<Option<BatchVersion>>,
     ) -> Result<QueuedWindow<'a>, LocalDbError> {
         self.ensure_writable()?;
         if inputs.len() > self.config.max_pending_batches {
             return Err(LocalDbError::new("write exceeds admission request budget"));
+        }
+        // A DropCells member needs the publication barrier: only the
+        // dedicated entry point admits it, alone in its window.
+        if inputs.iter().any(|(_, mutations)| {
+            mutations
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::DropCells { .. }))
+        }) != drop_cells
+            || (drop_cells && inputs.len() != 1)
+        {
+            return Err(LocalDbError::new(
+                "DropCells must be the only member in a batch",
+            ));
         }
         if let Some(sample) = sample {
             self.write_timeline
@@ -331,6 +381,7 @@ impl WriteCore {
                 sample,
                 first_allocated,
                 preparation_ns.take().unwrap_or(0),
+                drop_cells,
             );
             queued = Some(match (result, prefix) {
                 (Ok(segment), _) => segment,
@@ -437,6 +488,7 @@ impl WriteCore {
         sample: Option<WriteTimelineSample>,
         first_allocated: &Cell<Option<BatchVersion>>,
         preparation_ns: u64,
+        drop_cells: bool,
     ) -> Result<QueuedWindow<'a>, LocalDbError> {
         let deadline = Instant::now() + self.config.timeout;
         // Only no-effect identity races replan. The absolute deadline also
@@ -554,11 +606,23 @@ impl WriteCore {
             }
             let allocate_started = Instant::now();
             let block_started = self.write_timeline.block_started();
+            // A DropCells allocation takes the publisher mutex outside its short
+            // allocate transaction and records the barrier before release, so
+            // no higher sequence can publish ahead of it. Order: publisher →
+            // identity shards → key shards → owner order → slot; it never
+            // takes the index writer or Admission while holding publisher.
+            let mut range_publisher = drop_cells.then(|| self.publisher.lock());
             let allocated = self.identities.with_operations(&operations, |identities| {
                 self.dependencies.with_shards(shards, |keys| {
                     OwnerQueue::with_owners(&owners, |owners| {
                         if let Err(error) = self.ensure_writable() {
                             return Ok(AllocationResult::Closed(error));
+                        }
+                        if range_publisher
+                            .as_ref()
+                            .is_some_and(|publisher| publisher.range_barrier.is_some())
+                        {
+                            return Ok(AllocationResult::RangeBusy);
                         }
                         // Freeze every identity before allocating any member.
                         // A newly inserted or changed identity must be encoded
@@ -614,11 +678,18 @@ impl WriteCore {
                                 sequence,
                                 owner_sequence,
                             });
+                            if let Some(publisher) = range_publisher.as_mut() {
+                                publisher.range_barrier = Some(RangeBarrier {
+                                    sequence,
+                                    deferred_ready: Vec::new(),
+                                });
+                            }
                         }
                         Ok(AllocationResult::Allocated)
                     })
                 })
             });
+            drop(range_publisher);
             self.write_timeline.block_finished(
                 WriteBlockStage::Allocate,
                 block_started,
@@ -628,6 +699,11 @@ impl WriteCore {
             match allocated {
                 Ok(AllocationResult::Replan) => {
                     drop(queued);
+                    continue;
+                }
+                Ok(AllocationResult::RangeBusy) => {
+                    drop(queued);
+                    self.wait_range_barrier(deadline)?;
                     continue;
                 }
                 Ok(AllocationResult::Allocated) => {
@@ -675,6 +751,33 @@ impl WriteCore {
                     panic!("injected caller allocation panic");
                 }
             }
+            // DropCells preflight: after the lower prefix resolves and before
+            // READY, collect the occupied target cells and reserve their mask
+            // charge. Any failure here is a pre-effect abort of the slot.
+            let mut drop_targets = None;
+            if drop_cells
+                && let Some(plan) = plans.first_mut()
+                && let Some(allocation) = &plan.allocation
+            {
+                let sequence = allocation.sequence;
+                match self.prepare_drop_cells(
+                    plan.validated.mutations(),
+                    sequence,
+                    plan.metadata_charge,
+                    deadline,
+                ) {
+                    Ok((targets, metadata_charge)) => {
+                        plan.metadata_charge = metadata_charge;
+                        drop_targets = Some(targets);
+                    }
+                    Err(error) => {
+                        self.write_timeline
+                            .wait_leave(WriteWait::AdmittedToAppendEnqueue, queued.owned.len());
+                        self.abort_window(plans, &error)?;
+                        return Err(error);
+                    }
+                }
+            }
             let encoding_started = Instant::now();
             let block_started = self.write_timeline.block_started();
             let encoding = (|| {
@@ -716,12 +819,17 @@ impl WriteCore {
                         None,
                         None,
                     );
-                    let routing = plan
+                    let mut routing = plan
                         .routing
                         .take()
                         .ok_or_else(|| LocalDbError::new("allocation lost its routing token"))?
                         .bind(&batch)
                         .map_err(LocalDbError::component)?;
+                    if let Some(targets) = drop_targets.take() {
+                        routing
+                            .set_drop_targets(targets)
+                            .map_err(LocalDbError::component)?;
+                    }
                     let last_mutation = batch
                         .mutation_version(batch.mutations().len() - 1)
                         .ok_or_else(|| LocalDbError::new("empty admitted batch"))?;

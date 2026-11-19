@@ -1696,8 +1696,12 @@ fn cache_micro_throughput() {
         for index in 0..2_000_000 {
             let (reference, mutation) = &hit_inputs[index % hit_inputs.len()];
             hits += usize::from(
-                black_box(cache.get_point(reference, mutation.keyspace(), mutation.key()))
-                    .is_some(),
+                black_box(cache.get_point(
+                    reference,
+                    mutation.keyspace(),
+                    mutation.point_key().unwrap(),
+                ))
+                .is_some(),
             );
         }
         let elapsed = started.elapsed();
@@ -1714,7 +1718,11 @@ fn cache_micro_throughput() {
         let started = Instant::now();
         let mut accepted = 0;
         for (reference, mutation) in &insert_inputs {
-            black_box(cache.get_point(reference, mutation.keyspace(), mutation.key()));
+            black_box(cache.get_point(
+                reference,
+                mutation.keyspace(),
+                mutation.point_key().unwrap(),
+            ));
             accepted +=
                 usize::from(cache.insert_prepared(cache.prepare_verified(*reference, mutation)));
         }

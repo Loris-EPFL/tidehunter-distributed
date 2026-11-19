@@ -1525,7 +1525,9 @@ fn sui_adapter_variable_prefix_bounds_and_bulk_order() {
 }
 
 #[test]
-fn sui_cell_pruning_rejects_oversized_atomic_range_without_partial_deletion() {
+fn sui_cell_pruning_drops_more_keys_than_one_batch_admits() {
+    // One DropCells batch replaces the bounded enumerate-and-delete batch, so
+    // five keys drop although a batch admits four operations.
     use crate::distributed::sui::Db;
     let fixture = Fixture::new();
     let db = Db::open_remote_local_fixture(
@@ -1538,13 +1540,12 @@ fn sui_cell_pruning_rejects_oversized_atomic_range_without_partial_deletion() {
     for key in 0..5u32 {
         db.insert(ks, key.to_be_bytes().to_vec(), vec![7]).unwrap();
     }
-    assert!(db.drop_cells_in_range(ks, &[0; 4], &[255; 4]).is_err());
-    for key in 0..5u32 {
-        assert!(db.exists(ks, &key.to_be_bytes()).unwrap());
-    }
-    db.remove(ks, 4u32.to_be_bytes().to_vec()).unwrap();
+    assert!(5 > fixture.config.storage.batch_limits.max_operations);
     db.drop_cells_in_range(ks, &[0; 4], &[255; 4]).unwrap();
     assert!(db.iterator(ks).next().is_none());
+    for key in 0..5u32 {
+        assert!(!db.exists(ks, &key.to_be_bytes()).unwrap());
+    }
 }
 
 fn sui_pruning_shape() -> KeyShape {

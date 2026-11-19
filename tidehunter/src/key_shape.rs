@@ -548,9 +548,16 @@ impl KeySpaceDesc {
     /// Panics if called on a key space with variable-length keys.
     ///
     /// Returns a tuple of (first_key, last_key) where both keys have the key space's configured length.
+    /// Range mapping uses the checked `cell_range_with_len`; tests use this.
+    #[cfg(test)]
     pub(crate) fn cell_range(&self, cell: &CellId) -> (Vec<u8>, Vec<u8>) {
         let key_len = self.require_index_key_size("cell_range");
+        self.cell_range_with_len(cell, key_len)
+    }
 
+    /// `cell` belongs to this key type and `key_len` is the fixed index key
+    /// size, at least the cell prefix length (checked by the callers).
+    fn cell_range_with_len(&self, cell: &CellId, key_len: usize) -> (Vec<u8>, Vec<u8>) {
         match self.key_type {
             KeyType::Uniform(_) => {
                 let range = self.index_prefix_range(cell);
@@ -602,26 +609,54 @@ impl KeySpaceDesc {
         from_inclusive: &[u8],
         to_inclusive: &[u8],
     ) -> (CellId, CellId) {
+        self.require_index_key_size("cell_range");
+        match self.try_map_key_range_to_cell_range(from_inclusive, to_inclusive) {
+            Ok(range) => range,
+            Err(CellRangeError::VariableLength) => {
+                unreachable!("fixed index key size checked above")
+            }
+            Err(CellRangeError::InvalidFrom | CellRangeError::FromNotFirst) => {
+                panic!("from_inclusive is not the first key in its cell")
+            }
+            Err(CellRangeError::InvalidTo | CellRangeError::ToNotLast) => {
+                panic!("to_inclusive is not the last key in its cell")
+            }
+        }
+    }
+
+    /// Checked form of [`Self::map_key_range_to_cell_range`] for untrusted
+    /// reduced keys: the same reduction and boundary math, without panics.
+    /// It does not order the endpoints; the caller rejects a reversed range.
+    pub(crate) fn try_map_key_range_to_cell_range(
+        &self,
+        from_inclusive: &[u8],
+        to_inclusive: &[u8],
+    ) -> Result<(CellId, CellId), CellRangeError> {
+        let key_len = self
+            .index_key_size()
+            .ok_or(CellRangeError::VariableLength)?;
+        let prefix_len = match self.key_type {
+            KeyType::Uniform(_) => CELL_PREFIX_LENGTH,
+            KeyType::PrefixedUniform(config) => config.prefix_len_bytes,
+        };
+        let valid = |key: &[u8]| key.len() == key_len && key_len >= prefix_len && prefix_len != 0;
+        if !valid(from_inclusive) {
+            return Err(CellRangeError::InvalidFrom);
+        }
         let from_cell = self.cell_id(from_inclusive);
+        let (first_key, _) = self.cell_range_with_len(&from_cell, key_len);
+        if from_inclusive != first_key.as_slice() {
+            return Err(CellRangeError::FromNotFirst);
+        }
+        if !valid(to_inclusive) {
+            return Err(CellRangeError::InvalidTo);
+        }
         let to_cell = self.cell_id(to_inclusive);
-
-        // Verify from_inclusive is the first key in from_cell
-        let (first_key, _) = self.cell_range(&from_cell);
-        assert_eq!(
-            from_inclusive,
-            first_key.as_slice(),
-            "from_inclusive is not the first key in its cell"
-        );
-
-        // Verify to_inclusive is the last key in to_cell
-        let (_, last_key) = self.cell_range(&to_cell);
-        assert_eq!(
-            to_inclusive,
-            last_key.as_slice(),
-            "to_inclusive is not the last key in its cell"
-        );
-
-        (from_cell, to_cell)
+        let (_, last_key) = self.cell_range_with_len(&to_cell, key_len);
+        if to_inclusive != last_key.as_slice() {
+            return Err(CellRangeError::ToNotLast);
+        }
+        Ok((from_cell, to_cell))
     }
 
     /// Returns whether this key space uses byte-addressed cells and needs large table cell index.
@@ -629,6 +664,19 @@ impl KeySpaceDesc {
     pub(crate) fn needs_large_table_cell_index(&self) -> bool {
         matches!(self.key_type, KeyType::PrefixedUniform(_))
     }
+}
+
+/// Rejected endpoint of [`KeySpaceDesc::try_map_key_range_to_cell_range`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CellRangeError {
+    /// The keyspace has variable-length index keys.
+    VariableLength,
+    /// `from_inclusive` has the wrong reduced length.
+    InvalidFrom,
+    /// `to_inclusive` has the wrong reduced length.
+    InvalidTo,
+    FromNotFirst,
+    ToNotLast,
 }
 
 impl KeySpaceConfig {

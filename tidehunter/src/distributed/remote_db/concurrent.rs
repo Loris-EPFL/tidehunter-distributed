@@ -374,6 +374,27 @@ impl Admission {
         Ok(())
     }
 
+    /// Nonblocking secondary index reservation for the masks of one
+    /// `DropCells` slot, taken after allocation and before any WAL byte. The
+    /// slot's metadata charge then includes it, so publication or a pre-READY
+    /// abort returns it through `release_publication`. A full budget rejects:
+    /// the caller aborts the slot instead of waiting with a barrier held.
+    pub(in crate::distributed::remote_db) fn reserve_index_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<(), LocalDbError> {
+        let mut budget = self.budget.lock();
+        if budget.closed {
+            return Err(self.closed_error());
+        }
+        budget.index_bytes = budget
+            .index_bytes
+            .checked_add(bytes)
+            .filter(|total| self.index.check_capacity(*total).is_ok())
+            .ok_or_else(|| LocalDbError::new("DropCells exceeds index metadata capacity"))?;
+        Ok(())
+    }
+
     pub(super) fn return_slots(&self, count: usize) -> Result<(), LocalDbError> {
         if count == 0 {
             return Ok(());
@@ -1235,6 +1256,30 @@ impl ConcurrentRemoteDatabase {
         sample: Option<WriteTimelineSample>,
     ) -> Result<BatchVersion, LocalDbError> {
         self.database.core.write(operation, mutations, sample)
+    }
+
+    /// Commit one singleton `DropCells` batch over the inclusive reduced-cell
+    /// range and wait for its ordered publication. One WAL batch whatever the
+    /// number of keys or cells; the caller validates the endpoints first.
+    ///
+    /// # Errors
+    /// Returns validation, capacity, storage or publication errors. After an
+    /// unknown owner completion the error carries the uncertain version.
+    pub(crate) fn drop_cells(
+        &self,
+        operation: [u8; 16],
+        keyspace: crate::key_shape::KeySpace,
+        first_cell: crate::cell::CellId,
+        last_cell: crate::cell::CellId,
+    ) -> Result<BatchVersion, LocalDbError> {
+        self.database.core.write_drop_cells(
+            operation,
+            Mutation::DropCells {
+                keyspace,
+                first_cell,
+                last_cell,
+            },
+        )
     }
 
     /// # Errors
