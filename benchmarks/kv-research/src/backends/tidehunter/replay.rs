@@ -314,12 +314,15 @@ impl ReplayBackend for TidehunterReplayBackend {
             .get(usize::from(table))
             .and_then(Option::as_ref)
             .ok_or("unknown replay table")?;
-        self.databases[&db]
+        let backend = &self.databases[&db];
+        let value = backend
             .db
             .as_ref()
             .ok_or("replay DB closed")?
             .get(ks, key)
-            .map_err(native_error)
+            .map_err(native_error)?;
+        backend.open_record.observe_get();
+        Ok(value)
     }
     fn commit(&self, db: u16, entries: &[Row]) -> BackendResult<()> {
         let database = self
@@ -416,6 +419,15 @@ impl ReplayBackend for TidehunterReplayBackend {
             )?);
         }
         Ok(sessions)
+    }
+
+    fn index_checkpoint_targets(
+        &self,
+    ) -> BackendResult<Vec<crate::index_checkpoint::IndexCheckpointTarget>> {
+        self.databases
+            .iter()
+            .map(|(id, backend)| backend.index_checkpoint_target(&format!("db{id}")))
+            .collect()
     }
 }
 

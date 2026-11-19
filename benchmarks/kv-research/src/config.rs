@@ -248,6 +248,10 @@ pub struct DiagnosticsConfig {
     /// Maximum retained Valkey owner-pipeline timing records; zero disables.
     #[serde(default)]
     pub valkey_profile_limit: usize,
+    /// Exact checkpoint attribution and device evidence (coordinator ring,
+    /// suffix debt, reopen evidence); off by default; Tidehunter only.
+    #[serde(default)]
+    pub index_checkpoint: bool,
 }
 
 fn default_write_timeline_sample_every() -> usize {
@@ -262,6 +266,7 @@ impl Default for DiagnosticsConfig {
             write_timeline_sample_every: 1,
             read_profile_limit: 0,
             valkey_profile_limit: 0,
+            index_checkpoint: false,
         }
     }
 }
@@ -419,6 +424,9 @@ impl RunConfig {
             return invalid(
                 "write timeline cannot be combined with the admission-gated write profile",
             );
+        }
+        if self.diagnostics.index_checkpoint && !self.backend.kind.starts_with("tidehunter") {
+            return invalid("diagnostics.index_checkpoint is only supported by tidehunter");
         }
         if self.diagnostics.read_profile_limit > 65_536 {
             return invalid("diagnostics.read_profile_limit must not exceed 65536");

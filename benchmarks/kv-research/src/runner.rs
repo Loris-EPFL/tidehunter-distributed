@@ -69,6 +69,16 @@ pub async fn run<B: KvBackend>(
     reporter.snapshot()?;
 
     let backend = Arc::new(backend);
+    // Opt-in A0 collector: it shares coordinator handles until it finishes,
+    // always before backend shutdown.
+    let mut index_checkpoint = if config.diagnostics.index_checkpoint {
+        Some(crate::index_checkpoint::IndexCheckpointCollector::start(
+            backend.index_checkpoint_targets()?,
+            output,
+        )?)
+    } else {
+        None
+    };
     let mut failed = false;
     let mut fatal_reason = None;
     match qualify_on_worker(
@@ -274,6 +284,9 @@ pub async fn run<B: KvBackend>(
         }
         if fatal_reason.is_none() {
             measurement_attempted = true;
+            if let Some(collector) = &index_checkpoint {
+                collector.mark("timed").await;
+            }
             backend.set_measurement_window(true);
             reporter.set_phase("measurement");
             let phase_result = if config.execution.mode == ExecutionMode::Interference {
@@ -415,6 +428,9 @@ pub async fn run<B: KvBackend>(
             |previous| format!("{previous}; {reason}"),
         ));
     }
+    if measurement_attempted && let Some(collector) = &index_checkpoint {
+        collector.mark("gate").await;
+    }
     if measurement_attempted
         && let Some(gate) = &config.measurement_completion_gate
         && let Err(error) = wait_for_measurement_gate(gate, deadline).await
@@ -426,6 +442,22 @@ pub async fn run<B: KvBackend>(
         ));
         reporter.snapshot()?;
     }
+    let mut index_details = None;
+    let index_export = match index_checkpoint.take() {
+        Some(collector) => {
+            collector.mark("drain").await;
+            match collector.finish().await {
+                Ok(export) => {
+                    index_details = Some(export.details);
+                    Some(export.summary)
+                }
+                Err(error) => {
+                    Some(serde_json::json!({"status": "failed", "error": error.to_string()}))
+                }
+            }
+        }
+        None => None,
+    };
     let mut write_wait_metrics_exported = false;
     if config.diagnostics.write_timeline_limit > 0 {
         let (timeline, mut error) = if timeline_armed {
@@ -526,6 +558,11 @@ pub async fn run<B: KvBackend>(
                 ));
             }
         }
+    }
+    // After the profile export: write-diagnostics.json exists even when the
+    // legacy write profile is off. No request-profile samples are claimed.
+    if let Some(details) = &index_details {
+        write_index_checkpoint_diagnostics(output, &info.name, details)?;
     }
     if config.diagnostics.read_profile_limit > 0 {
         let profile_deadline = deadline + Duration::from_secs(config.limits.shutdown_grace_seconds);
@@ -653,6 +690,7 @@ pub async fn run<B: KvBackend>(
             "Read oracle: a missing value is accepted only when a delete of that key completed without a later clean put, or a delete or put of that key was in flight during the read; present values are always compared byte for byte. This is not a linearizability check.".to_owned(),
             "Synchronous adapters run on fixed dedicated workers; Tokio timeouts cannot preempt blocking calls, so overruns are retained and the process supervisor supplies the hard wall-clock bound.".to_owned(),
         ],
+        index_checkpoint: index_export,
     };
     let mut manifest_extra = serde_json::json!({
         "config_hash_blake2b512": config_hash,
@@ -2056,6 +2094,32 @@ async fn export_write_diagnostics<B: KvBackend>(
     )?;
     Ok(finish_error)
 }
+/// Insert the authoritative `index_checkpoint` object into
+/// `write-diagnostics.json`, creating the file when no profile was exported.
+pub(crate) fn write_index_checkpoint_diagnostics(
+    output: &Path,
+    backend: &str,
+    details: &serde_json::Value,
+) -> BackendResult<()> {
+    let path = output.join("write-diagnostics.json");
+    let mut evidence = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({
+            "schema_version": 1,
+            "backend": backend,
+            "runtime_observation_mode": "not_armed",
+            "profile": null,
+        }),
+        Err(error) => return Err(error.into()),
+    };
+    evidence
+        .as_object_mut()
+        .ok_or("write diagnostics must be an object")?
+        .insert("index_checkpoint".to_owned(), details.clone());
+    std::fs::write(path, serde_json::to_vec_pretty(&evidence)?)?;
+    Ok(())
+}
+
 fn write_timeline_owner_error(timeline: &serde_json::Value) -> Option<String> {
     if timeline
         .get("deadline_exceeded")
@@ -5065,6 +5129,7 @@ mod tests {
                 phase_counts: serde_json::json!({}),
                 distributions: reporter.distribution_summaries(),
                 limitations: Vec::new(),
+                index_checkpoint: None,
             };
             reporter
                 .finish(&summary, false, &serde_json::json!({}))
@@ -5273,6 +5338,7 @@ mod tests {
             phase_counts: serde_json::json!({}),
             distributions: reporter.distribution_summaries(),
             limitations: Vec::new(),
+            index_checkpoint: None,
         };
         assert!(
             reporter
@@ -5360,6 +5426,7 @@ mod tests {
                 phase_counts: serde_json::json!({}),
                 distributions: reporter.distribution_summaries(),
                 limitations: Vec::new(),
+                index_checkpoint: None,
             };
             reporter
                 .finish(&summary, true, &serde_json::json!({}))

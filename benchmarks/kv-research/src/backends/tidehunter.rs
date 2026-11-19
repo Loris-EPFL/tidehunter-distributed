@@ -516,7 +516,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
 }
 // Checkpoint phase sums are charged on completion, including work begun before
 // the measurement boundary. They are not per-request latency or network clocks.
-const COORDINATOR_INTERVAL_COUNTERS: [&str; 30] = [
+const COORDINATOR_INTERVAL_COUNTERS: [&str; 26] = [
     "write_storage_wait_ns",
     "write_publication_ns",
     "write_dispatch_ns",
@@ -527,10 +527,6 @@ const COORDINATOR_INTERVAL_COUNTERS: [&str; 30] = [
     "write_authority_batches",
     "write_checkpoint_ns",
     "write_checkpoint_count",
-    "write_foreground_checkpoint_ns",
-    "write_foreground_checkpoint_count",
-    "write_concurrent_checkpoint_deferrals",
-    "write_concurrent_checkpoint_wait_ns",
     "write_background_checkpoint_ns",
     "write_background_checkpoint_suffix_batches",
     "write_durable_receipt_publication_blocked_ns",
@@ -613,6 +609,9 @@ pub struct TidehunterBackend {
     effective_configuration: serde_json::Value,
     read_evidence_written: bool,
     coordinator_interval_baseline: std::sync::Mutex<Option<BTreeMap<&'static str, u64>>>,
+    coordinator_path: PathBuf,
+    /// External open timing and engine recovery evidence of this open.
+    open_record: crate::index_checkpoint::OpenRecord,
     live_write_profile: std::sync::Mutex<Option<live_write_profile::Window>>,
 }
 
@@ -971,7 +970,20 @@ async fn open_with_shape(
         .next()
         .ok_or("empty distributed key shape")?
         .id();
+    let open_kind = if fs::read_dir(&coordinator_path)?.next().is_some() {
+        crate::index_checkpoint::OpenKind::Reopen
+    } else {
+        crate::index_checkpoint::OpenKind::Create
+    };
+    let open_start_ns = tidehunter::distributed::remote_db::diagnostics_clock_ns();
     let db = sui::Db::open_remote(&coordinator_path, shape, remote_config).map_err(native_error)?;
+    let open_record = crate::index_checkpoint::OpenRecord {
+        kind: open_kind,
+        open_start_ns,
+        open_return_ns: tidehunter::distributed::remote_db::diagnostics_clock_ns(),
+        first_get_ns: std::sync::Arc::default(),
+        recovery: db.remote_recovery_stats(),
+    };
     if db.live_nvmeof_stats().is_some() {
         db.register_nvmeof_metrics(registry).map_err(native_error)?;
     }
@@ -1018,6 +1030,8 @@ async fn open_with_shape(
     effective_configuration["durability"]["live_write"] = live_write_evidence;
     Ok(TidehunterBackend {
         db: Some(db),
+        coordinator_path,
+        open_record,
         keyspace,
         endpoints,
         owners: options.owners,
@@ -1033,6 +1047,24 @@ async fn open_with_shape(
 }
 
 impl TidehunterBackend {
+    /// This coordinator as an attribution target; the handle is shared with
+    /// the collector until it finishes, before shutdown.
+    pub(crate) fn index_checkpoint_target(
+        &self,
+        label: &str,
+    ) -> BackendResult<crate::index_checkpoint::IndexCheckpointTarget> {
+        Ok(crate::index_checkpoint::IndexCheckpointTarget {
+            label: label.to_owned(),
+            db: std::sync::Arc::clone(
+                self.db
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("backend is shutting down"))?,
+            ),
+            coordinator: self.coordinator_path.clone(),
+            open: self.open_record.clone(),
+        })
+    }
+
     fn live_boundary_snapshot(
         &self,
         db: &sui::Db,
@@ -1126,6 +1158,12 @@ impl TidehunterBackend {
 impl KvBackend for TidehunterBackend {
     fn info(&self) -> BackendInfo {
         self.info()
+    }
+
+    fn index_checkpoint_targets(
+        &self,
+    ) -> BackendResult<Vec<crate::index_checkpoint::IndexCheckpointTarget>> {
+        Ok(vec![self.index_checkpoint_target("coordinator")?])
     }
 
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -1754,7 +1792,9 @@ impl KvBackend for TidehunterBackend {
             .db
             .as_ref()
             .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
-        db.get(self.keyspace, key).map_err(native_error)
+        let value = db.get(self.keyspace, key).map_err(native_error)?;
+        self.open_record.observe_get();
+        Ok(value)
     }
     async fn traced_get(&self, key: &[u8], id: u64) -> BackendResult<Option<Bytes>> {
         let db = self

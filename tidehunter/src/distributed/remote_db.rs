@@ -48,6 +48,8 @@ use typenum::U32;
 
 mod capacity_observer;
 pub use capacity_observer::CapacityObserver;
+mod checkpoint_attribution;
+use checkpoint_attribution::CoordinatorIoCategory;
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
@@ -68,6 +70,13 @@ pub(crate) use relocation::RelocationReport;
 #[cfg(feature = "test_methods")]
 pub(crate) use relocation::{CallbackDecision, RelocationGate};
 mod durable_cut;
+pub use checkpoint_attribution::{
+    AgeQuality, AttributionTotals, CellPersistCounts, CheckpointAttribution, CheckpointIo,
+    CheckpointStage, CheckpointTriggerFlags, CoordinatorIoSnapshot, FileIo, GenerationStatus,
+    IndexCheckpointSnapshot, ReturnedCredits, SuffixPeaks, SuffixSample, TailCount,
+    coordinator_io_snapshot, diagnostics_clock_ns, set_coordinator_allocation_accounting,
+};
+pub use concurrent::{HardWaitSnapshot, WaitReasonTotals};
 pub use durable_cut::{DurableCutStats, RecoveredCut};
 mod fencing_generations;
 use fencing_generations::AuthorityGeneration;
@@ -757,6 +766,8 @@ pub struct RecoveryStats {
     pub cut_continuity_bound: Option<u64>,
     /// The bound this open decided for the previously tracked epoch.
     pub recovered_cut: Option<RecoveredCut>,
+    /// Process-unique identity of this open; joins checkpoint attribution rows.
+    pub open_id: u64,
 }
 impl RecoveryStats {
     fn add_connection(&mut self, profile: super::tcp::ClientConnectProfile) {
@@ -869,13 +880,6 @@ pub struct AuthorityWriteStats {
     pub checkpoint_count: u64,
     /// Captured checkpoint wall lifetimes, including concurrent suffix progress.
     pub background_checkpoint_ns: u64,
-    /// Actual owner blocking in admission backpressure (drain plus completed
-    /// durable cut), not the lifetime of an already running background worker.
-    pub foreground_checkpoint_ns: u64,
-    pub foreground_checkpoint_count: u64,
-    /// Actor writes deferred at a capacity boundary, and their elapsed queue wait.
-    pub concurrent_checkpoint_deferrals: u64,
-    pub concurrent_checkpoint_wait_ns: u64,
     /// New logical admissions while immutable checkpoint persistence was active.
     pub background_checkpoint_suffix_batches: u64,
     /// Receipts observed by the owner while a prior sequence is unpublished.
@@ -923,6 +927,8 @@ pub struct CheckpointDiagnostic {
     pub owner_adoption_ns: Option<u64>,
     pub obsolete_cleanup_ns: Option<u64>,
     pub outcome: Option<CheckpointProgressOutcome>,
+    /// Exact generation attribution; absent on rows from other producers.
+    pub attribution: Option<CheckpointAttribution>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -989,11 +995,16 @@ pub struct CheckpointDiagnosticSummary {
     pub after_new_capture_relief_count: u64,
     pub capacity_error_count: u64,
     pub progress_error_count: u64,
+    /// Exact generation attribution totals (checkpoint_attribution.rs).
+    pub attribution: checkpoint_attribution::AttributionTotals,
 }
 
 impl CheckpointDiagnosticSummary {
     fn record(&mut self, record: CheckpointDiagnostic) {
         self.records = self.records.saturating_add(1);
+        if let Some(attribution) = &record.attribution {
+            self.attribution.record(attribution);
+        }
         match record.trigger {
             Some(CheckpointTrigger::Tail) => {
                 self.tail_pressure_count = self.tail_pressure_count.saturating_add(1);
@@ -1398,7 +1409,7 @@ impl RemoteDatabase {
                 checkpoint_staging: None,
                 checkpoint_obsolete: None,
             };
-            persist_manifest(&path, &manifest)?;
+            persist_manifest(&path, &manifest, CoordinatorIoCategory::Open)?;
             manifest
         };
         if manifest.storage != config.storage
@@ -1442,7 +1453,10 @@ impl RemoteDatabase {
             .as_ref()
             .map(|pool| transports::LivePoolOpenGuard::new(pool.clone(), config.timeout));
         let live_metrics = Some(super::nvmeof::live_metrics::LiveNvmeMetrics::new());
-        let mut recovery_stats = RecoveryStats::default();
+        let mut recovery_stats = RecoveryStats {
+            open_id: checkpoint_attribution::next_open_id(),
+            ..RecoveryStats::default()
+        };
         let tls_started = Instant::now();
         let tls_config = config
             .tls
@@ -1482,7 +1496,7 @@ impl RemoteDatabase {
         // appends Reserved(g) and advances the never-reused counter before ANY
         // owner may activate g. A failed partial fence is aborted by the next open.
         let epoch = fencing_generations::reserve(&mut manifest, config.storage.database)?;
-        persist_manifest(&path, &manifest)?;
+        persist_manifest(&path, &manifest, CoordinatorIoCategory::Open)?;
         #[cfg(test)]
         if matches!(interruption, Some(OpenInterruption::AfterReservation)) {
             return Err(LocalDbError::new("injected interruption after reservation"));
@@ -1617,7 +1631,12 @@ impl RemoteDatabase {
         recovery_stats.tail_replay_ns = elapsed(replay_started);
         // Current checkpoint/proofs and the complete tail have now validated.
         // Resolve only durably named cleanup intents before allowing more work.
-        cleanup_checkpoint_artifacts(&path, &mut manifest, false)?;
+        cleanup_checkpoint_artifacts(
+            &path,
+            &mut manifest,
+            false,
+            (CoordinatorIoCategory::Open, CoordinatorIoCategory::Open),
+        )?;
         // One constant sparse-view quota for the serialized publisher: the
         // installed view and its replacement at max_pending_batches - 1
         // exclusions. No write reserves view quota, and no publication can then
@@ -1719,7 +1738,7 @@ impl RemoteDatabase {
         // Before serving, gate DropCells and the Exact callback-start wrapper.
         manifest.format = fencing_generations::AUTHORITY_FORMAT;
         manifest.replay_limits = config.replay_limits;
-        persist_manifest(&path, &manifest)?;
+        persist_manifest(&path, &manifest, CoordinatorIoCategory::Open)?;
         #[cfg(test)]
         if matches!(interruption, Some(OpenInterruption::AfterServed)) {
             return Err(LocalDbError::new("injected interruption after served"));
@@ -1832,6 +1851,7 @@ impl RemoteDatabase {
                 next_checkpoint_diagnostic: 0,
                 dropped_checkpoint_diagnostics: 0,
                 last_checkpoint_diagnostic: None,
+                index_suffix: None,
             },
             concurrent_failure,
             first_failure,
@@ -2904,11 +2924,14 @@ fn load_checkpoint(
     Ok(())
 }
 
+/// Returns the unlink directory sync and the cleanup manifest write, counted
+/// under `categories` (names, manifest); both are empty when nothing is staged.
 fn cleanup_checkpoint_artifacts(
     path: &Path,
     manifest: &mut AuthorityManifest,
     _interrupt_after_unlink: bool,
-) -> Result<(), LocalDbError> {
+    categories: (CoordinatorIoCategory, CoordinatorIoCategory),
+) -> Result<(FileIo, FileIo), LocalDbError> {
     let current = manifest
         .checkpoint
         .as_ref()
@@ -2923,7 +2946,7 @@ fn cleanup_checkpoint_artifacts(
             index_files: commit.index_files.clone(),
         });
     if staged.is_none() && obsolete.is_none() {
-        return Ok(());
+        return Ok((FileIo::default(), FileIo::default()));
     }
     // The CRC-protected ledger names only generations reserved by this authority.
     // Validate every intent before deleting anything, especially the live root.
@@ -2998,16 +3021,22 @@ fn cleanup_checkpoint_artifacts(
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(LocalDbError::component)?;
+    let names = checkpoint_attribution::record_unlink_sync(categories.0);
     manifest.checkpoint_staging = None;
     manifest.checkpoint_obsolete = None;
-    persist_manifest(path, manifest)
+    Ok((names, persist_manifest(path, manifest, categories.1)?))
 }
 
-fn persist_manifest(path: &Path, manifest: &AuthorityManifest) -> Result<(), LocalDbError> {
-    install_metadata(
+fn persist_manifest(
+    path: &Path,
+    manifest: &AuthorityManifest,
+    category: CoordinatorIoCategory,
+) -> Result<FileIo, LocalDbError> {
+    checkpoint_attribution::install_counted(
         path,
         MANIFEST,
         &encode_metadata(manifest).map_err(LocalDbError::component)?,
+        category,
     )
     .map_err(LocalDbError::component)
 }

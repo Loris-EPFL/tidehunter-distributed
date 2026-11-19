@@ -954,6 +954,8 @@ impl WriteCore {
         self: &Arc<Self>,
         pressure: CheckpointPressure,
     ) -> Result<(), LocalDbError> {
+        let hard =
+            super::super::checkpoint_attribution::CheckpointTriggerFlags::hard(pressure.reason);
         if self.write_timeline.enabled() {
             let generation = {
                 let publisher = self.publisher.lock();
@@ -965,7 +967,7 @@ impl WriteCore {
             self.write_timeline
                 .checkpoint_pressure(self.epoch, generation, pressure);
         }
-        self.request_checkpoint()
+        self.request_checkpoint_for(hard)
     }
 
     fn abort_window(

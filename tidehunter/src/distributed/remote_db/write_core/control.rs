@@ -129,19 +129,23 @@ impl WriteCore {
         self.progress_checkpoint(true)?;
         {
             let mut publisher = self.publisher.lock();
-            if limit == 0 {
-                publisher.checkpoint_diagnostics = None;
-            } else if let Some(records) = &mut publisher.checkpoint_diagnostics {
-                records.clear();
-            } else {
-                publisher.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
+            // Armed index checkpoint diagnostics own the ring for the whole run:
+            // a profile window must not clear unread rows or reset the counters.
+            if publisher.index_suffix.is_none() {
+                if limit == 0 {
+                    publisher.checkpoint_diagnostics = None;
+                } else if let Some(records) = &mut publisher.checkpoint_diagnostics {
+                    records.clear();
+                } else {
+                    publisher.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
+                }
+                publisher.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
+                    available: limit != 0,
+                    ..CheckpointDiagnosticSummary::default()
+                };
+                publisher.dropped_checkpoint_diagnostics = 0;
+                publisher.last_checkpoint_diagnostic = None;
             }
-            publisher.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
-                available: limit != 0,
-                ..CheckpointDiagnosticSummary::default()
-            };
-            publisher.dropped_checkpoint_diagnostics = 0;
-            publisher.last_checkpoint_diagnostic = None;
         }
         *self.write_profile.lock() = WriteProfileSnapshot {
             limit_per_connection: limit,

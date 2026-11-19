@@ -191,6 +191,14 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
                 .serve(listener, tls(), TcpLimits::default(), stop)
                 .unwrap()
         }));
+        let open_kind = if std::fs::read_dir(base.join("coordinator"))
+            .is_ok_and(|mut entries| entries.next().is_some())
+        {
+            crate::index_checkpoint::OpenKind::Reopen
+        } else {
+            crate::index_checkpoint::OpenKind::Create
+        };
+        let open_start_ns = tidehunter::distributed::remote_db::diagnostics_clock_ns();
         let db = sui::Db::open_remote_with_local_live_fixture(
             &base.join("coordinator"),
             shape,
@@ -198,6 +206,13 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             false,
         )
         .unwrap();
+        let open_record = crate::index_checkpoint::OpenRecord {
+            kind: open_kind,
+            open_start_ns,
+            open_return_ns: tidehunter::distributed::remote_db::diagnostics_clock_ns(),
+            first_get_ns: Arc::default(),
+            recovery: db.remote_recovery_stats(),
+        };
         let keyspace = db.ks(&trace
             .tables
             .iter()
@@ -210,6 +225,7 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
             effective_configuration:serde_json::json!({"fixture_route":"leased","remote":config}),
             read_evidence_written:false,owner_sample_gate:Default::default(),coordinator_interval_baseline:std::sync::Mutex::new(None),
+            coordinator_path:base.join("coordinator"),open_record,
             live_write_profile:std::sync::Mutex::new(None),
         });
     }

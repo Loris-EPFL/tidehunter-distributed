@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 mod drop_cells;
+mod index_checkpoint;
 pub(crate) mod kv_capture;
 mod relocation;
 
@@ -1011,6 +1012,7 @@ impl Db {
                     capacity_error_count,
                     progress_error_count,
                 );
+                index_checkpoint::visit_attribution(&checkpoint.attribution, &mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);
@@ -1025,22 +1027,6 @@ impl Db {
                 );
                 set("write_checkpoint_ns", authority.checkpoint_ns);
                 set("write_checkpoint_count", authority.checkpoint_count);
-                set(
-                    "write_foreground_checkpoint_ns",
-                    authority.foreground_checkpoint_ns,
-                );
-                set(
-                    "write_foreground_checkpoint_count",
-                    authority.foreground_checkpoint_count,
-                );
-                set(
-                    "write_concurrent_checkpoint_deferrals",
-                    authority.concurrent_checkpoint_deferrals,
-                );
-                set(
-                    "write_concurrent_checkpoint_wait_ns",
-                    authority.concurrent_checkpoint_wait_ns,
-                );
                 set(
                     "write_background_checkpoint_suffix_batches",
                     authority.background_checkpoint_suffix_batches,
@@ -1288,6 +1274,7 @@ impl Db {
                     capacity_error_count,
                     progress_error_count,
                 );
+                index_checkpoint::visit_attribution(&checkpoint.attribution, &mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);
@@ -1302,22 +1289,6 @@ impl Db {
                 );
                 set("write_checkpoint_ns", authority.checkpoint_ns);
                 set("write_checkpoint_count", authority.checkpoint_count);
-                set(
-                    "write_foreground_checkpoint_ns",
-                    authority.foreground_checkpoint_ns,
-                );
-                set(
-                    "write_foreground_checkpoint_count",
-                    authority.foreground_checkpoint_count,
-                );
-                set(
-                    "write_concurrent_checkpoint_deferrals",
-                    authority.concurrent_checkpoint_deferrals,
-                );
-                set(
-                    "write_concurrent_checkpoint_wait_ns",
-                    authority.concurrent_checkpoint_wait_ns,
-                );
                 set(
                     "write_background_checkpoint_suffix_batches",
                     authority.background_checkpoint_suffix_batches,

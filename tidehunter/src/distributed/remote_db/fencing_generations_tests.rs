@@ -459,7 +459,7 @@ fn retained_generation_unknown_to_the_authority_fails_closed() {
     let harness = Harness::seeded(false);
     let mut manifest = harness.manifest();
     manifest.generations.retain(|entry| entry.generation != 1);
-    persist_manifest(&harness.root, &manifest).unwrap();
+    persist_manifest(&harness.root, &manifest, CoordinatorIoCategory::Open).unwrap();
     let error = harness.open().err().unwrap();
     assert!(
         error
@@ -474,7 +474,7 @@ fn exhausted_generation_counter_mutates_nothing() {
     let harness = Harness::seeded(false);
     let mut manifest = harness.manifest();
     manifest.next_generation = u64::MAX;
-    persist_manifest(&harness.root, &manifest).unwrap();
+    persist_manifest(&harness.root, &manifest, CoordinatorIoCategory::Open).unwrap();
     let before = fs::read(harness.root.join(MANIFEST)).unwrap();
     let error = harness.open().err().unwrap();
     assert!(
@@ -497,7 +497,7 @@ fn aborted_generation_with_accepted_data_fails_closed() {
     let mut manifest = harness.manifest();
     assert!(manifest.checkpoint.is_none());
     manifest.generations[0].state = GenerationState::Aborted;
-    persist_manifest(&harness.root, &manifest).unwrap();
+    persist_manifest(&harness.root, &manifest, CoordinatorIoCategory::Open).unwrap();
     let error = harness.open().err().unwrap();
     assert_eq!(
         error.to_string(),

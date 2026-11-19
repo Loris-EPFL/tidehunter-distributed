@@ -276,6 +276,13 @@ pub trait KvBackend: Send + Sync + 'static {
         async { Err(unsupported("measurement-phase read profiling")) }
     }
 
+    /// Coordinator databases for Exact checkpoint attribution (Tidehunter).
+    fn index_checkpoint_targets(
+        &self,
+    ) -> BackendResult<Vec<crate::index_checkpoint::IndexCheckpointTarget>> {
+        Err(unsupported("index checkpoint diagnostics"))
+    }
+
     /// Arm bounded write diagnostics at the measurement boundary.
     fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {
         if limit == 0 {

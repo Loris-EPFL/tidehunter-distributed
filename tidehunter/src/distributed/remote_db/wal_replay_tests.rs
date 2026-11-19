@@ -448,7 +448,7 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         commit.metadata_bytes = encoded.len() as u64;
         commit.metadata_digest = Blake2b::<U32>::digest(&encoded).into();
         install_metadata(&path, &commit.metadata_name(), &encoded).unwrap();
-        persist_manifest(&path, &manifest).unwrap();
+        persist_manifest(&path, &manifest, CoordinatorIoCategory::Open).unwrap();
         let error = reopen_result(&fixture).err().unwrap().to_string();
         assert!(
             error.contains(if wrong_format {

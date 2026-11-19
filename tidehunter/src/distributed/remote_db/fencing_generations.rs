@@ -467,7 +467,7 @@ fn commit_trim(core: &Arc<WriteCore>, generation: u64) -> Result<(), LocalDbErro
         Ok(())
     } else {
         let manifest = core.publisher.lock().manifest.clone();
-        persist_manifest(&core.path, &manifest)
+        persist_manifest(&core.path, &manifest, CoordinatorIoCategory::Open).map(|_| ())
     }
 }
 
@@ -511,7 +511,7 @@ fn finish_trim(
         publisher.manifest.trim_pending = None;
         publisher.manifest.clone()
     };
-    persist_manifest(&core.path, &manifest)
+    persist_manifest(&core.path, &manifest, CoordinatorIoCategory::Open).map(|_| ())
 }
 
 /// A simulated power cut: every earlier step was installed with a synced

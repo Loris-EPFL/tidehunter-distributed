@@ -113,12 +113,6 @@ pub(crate) struct PersistedIndexImage {
     pub(super) cut: IndexReadCut,
     pub(super) lease: CaptureLease,
     pub(crate) metadata: IndexImageMetadata,
-    // The checkpoint diagnostic stage exports these counters; until it reads
-    // them, only tests do. The expectation fails once a reader exists.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "exported by the checkpoint metrics stage")
-    )]
     pub(crate) encode_stats: CellEncodeStats,
     pub(super) policy_root: Option<PolicyRoot>,
     pub(super) install_epoch: u64,
@@ -131,6 +125,24 @@ pub(crate) struct PersistedIndexImage {
     /// Holds the charge of the added marks until the caller ends it after
     /// live install, when the index itself charges them.
     pub(crate) mark_budget: Box<dyn MarkBudget>,
+    pub(crate) persist_stats: ImagePersistStats,
+}
+
+/// Cell reuse and file work of one image persistence, counted in the existing
+/// cell loop (no second walk). Checkpoint attribution exports them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ImagePersistStats {
+    pub captured_cells: u64,
+    /// Cells whose durable frame is reused, whether or not already mapped.
+    pub reused_cells: u64,
+    /// Old `CellFile.bytes` of reused cells; never written by this image.
+    pub reused_frame_bytes: u64,
+    /// Cells named by the root: reused plus rewritten.
+    pub root_cells: u64,
+    /// A frame container was created, written and synced.
+    pub container_created: bool,
+    /// Root frame bytes, header included.
+    pub root_bytes: u64,
 }
 
 impl PersistedIndexImage {
@@ -293,6 +305,11 @@ impl PreparedIndexImage {
             None
         };
         after_create();
+        let mut persist_stats = ImagePersistStats {
+            captured_cells: self.cells.len() as u64,
+            container_created: container.is_some(),
+            ..ImagePersistStats::default()
+        };
         let mut written = Vec::new();
         let mut reused_mappings = HashMap::new();
         // This thread's only payload scratch; it grows outside serving locks
@@ -323,25 +340,31 @@ impl PreparedIndexImage {
                         .checked_add(encoded.file.bytes)
                         .ok_or(NativeIndexError::Capacity)?;
                     written.push((number, encoded));
-                } else if let Some(base) = &mut cell.base
-                    && !base.mapped
-                {
+                } else if let Some(base) = &mut cell.base {
                     let file = base.file.as_ref().expect("reusable durable cell");
-                    let name = file
-                        .path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .ok_or(NativeIndexError::Invalid("invalid cell container name"))?;
-                    let frame =
-                        open_frame(&mut reused_mappings, parent, name, file.offset, file.bytes)?;
-                    if cell_digest(&frame) != file.digest {
-                        return Err(NativeIndexError::Invalid("cell range digest"));
+                    persist_stats.reused_cells += 1;
+                    persist_stats.reused_frame_bytes += file.bytes;
+                    if !base.mapped {
+                        let name = file
+                            .path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or(NativeIndexError::Invalid("invalid cell container name"))?;
+                        let frame = open_frame(
+                            &mut reused_mappings,
+                            parent,
+                            name,
+                            file.offset,
+                            file.bytes,
+                        )?;
+                        if cell_digest(&frame) != file.digest {
+                            return Err(NativeIndexError::Invalid("cell range digest"));
+                        }
+                        let payload = frame_payload(&frame)?;
+                        // Marks are already resident in `cell.marks`.
+                        base.bytes = payload.slice(..SortedBlock::rows_len(&payload)?);
+                        base.mapped = true;
                     }
-                    let payload = frame_payload(&frame)?;
-                    // The block holds the rows only; the trailer stores the
-                    // cell's marks, which are resident in `cell.marks`.
-                    base.bytes = payload.slice(..SortedBlock::rows_len(&payload)?);
-                    base.mapped = true;
                 }
             }
             if let Some(writer) = &mut writer {
@@ -382,6 +405,7 @@ impl PreparedIndexImage {
         encode_cut(&self.cut, &mut payload);
         encode_cut(&self.lease.floor, &mut payload);
         let count = self.cells.iter().filter(|cell| cell.base.is_some()).count();
+        persist_stats.root_cells = count as u64;
         payload.extend_from_slice(
             &u32::try_from(count)
                 .map_err(|_| NativeIndexError::Capacity)?
@@ -451,6 +475,7 @@ impl PreparedIndexImage {
             bytes: frame.len_with_header() as u64,
             digest: Blake2b::<U32>::digest(frame.as_ref()).into(),
         };
+        persist_stats.root_bytes = metadata.bytes;
         Ok(PersistedIndexImage {
             cells: self.cells,
             cut: self.cut,
@@ -462,6 +487,7 @@ impl PreparedIndexImage {
             compactor_stats,
             prune_stats,
             mark_budget: self.mark_budget,
+            persist_stats,
         })
     }
 }

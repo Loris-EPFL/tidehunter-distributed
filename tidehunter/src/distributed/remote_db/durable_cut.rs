@@ -160,7 +160,15 @@ impl CutRecord {
                 "durable cut record {}: {error}",
                 path.join(RECORD).display()
             ))
-        })
+        })?;
+        // Coordinator device attribution: not Exact output.
+        super::checkpoint_attribution::record_installed(
+            path,
+            RECORD,
+            bytes.len(),
+            super::checkpoint_attribution::CoordinatorIoCategory::DurableCut,
+        );
+        Ok(())
     }
 
     /// The tracked generation, if any.

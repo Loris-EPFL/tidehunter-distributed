@@ -1,6 +1,7 @@
 //! Shared write engine. Callers allocate/encode; owner workers publish durable
 //! batches. Checkpoint persistence owns no foreground or publication lock.
 
+use super::super::checkpoint_attribution::{CheckpointTriggerFlags, SuffixTracker, TailCount};
 use super::super::{
     AppendedBatch, AuthorityManifest, AuthorityWriteStats, BackgroundCheckpoint, BatchId,
     CheckpointDiagnostic, CheckpointDiagnosticSummary, ControlHandle, IndexReadCut, LocalDbError,
@@ -49,6 +50,7 @@ pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub next_checkpoint_diagnostic: &'a mut u64,
     pub dropped_checkpoint_diagnostics: &'a mut u64,
     pub last_checkpoint_diagnostic: &'a mut Option<CheckpointDiagnostic>,
+    pub index_suffix: &'a mut Option<SuffixTracker>,
 }
 
 pub(in crate::distributed::remote_db) struct PublisherState {
@@ -79,6 +81,9 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     pub next_checkpoint_diagnostic: u64,
     pub dropped_checkpoint_diagnostics: u64,
     pub last_checkpoint_diagnostic: Option<CheckpointDiagnostic>,
+    /// Published-suffix debt tracker; present once index checkpoint
+    /// diagnostics are armed (checkpoint_attribution.rs).
+    pub index_suffix: Option<SuffixTracker>,
     /// Exclusive contiguous publication frontier, including an empty epoch 0.
     pub published_next: u64,
     pub upper: Option<MutationVersion>,
@@ -128,6 +133,7 @@ impl PublisherState {
             next_checkpoint_diagnostic: &mut self.next_checkpoint_diagnostic,
             dropped_checkpoint_diagnostics: &mut self.dropped_checkpoint_diagnostics,
             last_checkpoint_diagnostic: &mut self.last_checkpoint_diagnostic,
+            index_suffix: &mut self.index_suffix,
         }
     }
 }
@@ -640,7 +646,17 @@ impl WriteCore {
     pub(in crate::distributed::remote_db) fn request_checkpoint(
         self: &Arc<Self>,
     ) -> Result<(), LocalDbError> {
-        super::super::checkpoint_lifecycle::core_request_checkpoint(self)
+        self.request_checkpoint_for(CheckpointTriggerFlags::default())
+    }
+
+    /// Start a due checkpoint; `extra` names a hard admission request that
+    /// accompanies the soft predicates. Policy is unchanged: only a due
+    /// checkpoint starts.
+    pub(in crate::distributed::remote_db) fn request_checkpoint_for(
+        self: &Arc<Self>,
+        extra: CheckpointTriggerFlags,
+    ) -> Result<(), LocalDbError> {
+        super::super::checkpoint_lifecycle::core_request_checkpoint(self, extra)
     }
 
     pub(in crate::distributed::remote_db) fn start_checkpoint(
@@ -661,7 +677,14 @@ impl WriteCore {
     pub(in crate::distributed::remote_db) fn commit_checkpoint(
         self: &Arc<Self>,
     ) -> Result<(), LocalDbError> {
-        let result = super::super::checkpoint_lifecycle::core_commit_checkpoint(self);
+        self.commit_checkpoint_for(CheckpointTriggerFlags::EXPLICIT)
+    }
+
+    pub(in crate::distributed::remote_db) fn commit_checkpoint_for(
+        self: &Arc<Self>,
+        trigger: CheckpointTriggerFlags,
+    ) -> Result<(), LocalDbError> {
+        let result = super::super::checkpoint_lifecycle::core_commit_checkpoint(self, trigger);
         self.checkpoint_result(result)
     }
 
@@ -695,13 +718,14 @@ impl WriteCore {
         result
     }
 
+    /// Returns the granted replay tail before and after the release.
     pub(in crate::distributed::remote_db) fn release_checkpoint_credits(
         &self,
         credits: CheckpointCredits,
-    ) -> Result<(), LocalDbError> {
-        self.admission.release_checkpoint(credits)?;
+    ) -> Result<(TailCount, TailCount), LocalDbError> {
+        let granted = self.admission.release_checkpoint(credits)?;
         self.admission.regrant();
-        Ok(())
+        Ok(granted)
     }
 
     /// Called before dropping writer→publisher on a publication failure.

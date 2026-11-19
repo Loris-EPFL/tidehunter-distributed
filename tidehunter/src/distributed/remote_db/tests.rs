@@ -209,7 +209,7 @@ fn recorded_live_identity_cannot_reopen_as_tcp() {
         "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
         [1; 16],
     ));
-    persist_manifest(&root, &manifest).unwrap();
+    persist_manifest(&root, &manifest, CoordinatorIoCategory::Open).unwrap();
 
     let error = reopen_result(&fixture).err().unwrap();
     assert!(
@@ -441,7 +441,7 @@ fn checkpoint_is_not_adopted_until_every_required_shard_is_fenced() {
     );
 }
 
-fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointImageV3)) {
+fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointImageV4)) {
     let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
     let commit = manifest.checkpoint.as_mut().unwrap();
     let name = commit.metadata_name();
@@ -451,7 +451,7 @@ fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointI
     commit.metadata_bytes = encoded.len() as u64;
     commit.metadata_digest = Blake2b::<U32>::digest(&encoded).into();
     install_metadata(root, &name, &encoded).unwrap();
-    persist_manifest(root, &manifest).unwrap();
+    persist_manifest(root, &manifest, CoordinatorIoCategory::Open).unwrap();
 }
 
 #[test]
@@ -522,18 +522,11 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
         acknowledged.push((operation, value, version));
     }
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(db.authority_write_stats().foreground_checkpoint_count, 0);
     assert_eq!(checkpoint_tail(&db).0, count);
     assert!(!db.core.path.join("receipt-history-v2").exists());
     let retained_tail = checkpoint_tail(&db).0;
     let clocks = db.authority_write_stats();
     assert!(clocks.checkpoint_count > 0);
-    assert!(clocks.foreground_checkpoint_count <= clocks.checkpoint_count);
-    if clocks.foreground_checkpoint_count == 0 {
-        assert_eq!(clocks.foreground_checkpoint_ns, 0);
-    } else {
-        assert!(clocks.foreground_checkpoint_ns > 0);
-    }
     drop(resume);
     fail_stop_without_checkpoint(db);
     let mut db = fixture.open();
@@ -1204,7 +1197,10 @@ fn sui_adapter_pages_reverse_bounds_snapshot_and_reopen() {
     assert!(timing.contains_key("write_durable_receipt_publication_blocked_batches"));
     assert!(timing.contains_key("write_durable_receipt_publication_waiting_batches"));
     assert!(timing.contains_key("write_durable_receipt_publication_waiting_peak"));
-    assert!(timing.contains_key("write_foreground_checkpoint_count"));
+    assert!(timing.contains_key("write_index_checkpoint_cleaned"));
+    assert!(timing.contains_key("coordinator_io_durable_cut_bytes"));
+    assert!(!timing.contains_key("write_foreground_checkpoint_count"));
+    assert!(!timing.contains_key("write_concurrent_checkpoint_wait_ns"));
     assert!(timing.contains_key("cache_inserts"));
     assert!(timing.contains_key("index_reader_held_view_bytes"));
     assert!(!timing.contains_key("read_cache_hits"));

@@ -122,6 +122,13 @@ pub trait ReplayBackend: Send + Sync + 'static {
     ) -> BackendResult<Vec<crate::capacity_r0::R0Session>> {
         Err("R0 capacity observation requires a distributed Tidehunter backend".into())
     }
+
+    /// Coordinator databases for Exact checkpoint attribution (Tidehunter).
+    fn index_checkpoint_targets(
+        &self,
+    ) -> BackendResult<Vec<crate::index_checkpoint::IndexCheckpointTarget>> {
+        Err(crate::backend::unsupported("index checkpoint diagnostics"))
+    }
 }
 
 pub fn verify_rows<B: ReplayBackend + ?Sized>(

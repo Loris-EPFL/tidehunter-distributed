@@ -5,6 +5,11 @@ use super::super::native_index::{
     CompactorStats, MarkBudget, PersistedIndexImage, PreparedIndexImage, PrunePlan,
     UnboundedMarkBudget,
 };
+use super::checkpoint_attribution::{
+    CheckpointAccumulator, CheckpointLaunch, CheckpointStage, CheckpointTriggerFlags,
+    CoordinatorIoCategory, GenerationStatus, ReturnedCredits, TailCount, diagnostics_clock_ns,
+    install_counted,
+};
 use super::*;
 use std::sync::atomic::AtomicBool;
 
@@ -164,39 +169,84 @@ impl Drop for BackgroundCheckpoint {
 
 use super::write_core::core::{CheckpointCredits, PublisherCheckpoint, WriteCore};
 
+#[cfg(test)]
 pub(super) fn core_checkpoint_due(core: &WriteCore) -> bool {
+    !core_checkpoint_due_flags(core).is_empty()
+}
+
+/// Every soft predicate that is due, as observed by one request.
+fn core_checkpoint_due_flags(core: &WriteCore) -> CheckpointTriggerFlags {
     // Admission's granted tail includes the published suffix. Inspect each
     // snapshot separately, never add them or take Admission under publisher.
     let pressure = core.admission.checkpoint_pressure();
     let mut publisher = core.publisher.lock();
     let state = publisher.checkpoint_state();
-    core.config
-        .replay_limits
-        .checkpoint_due(pressure.replay_batches, pressure.replay_bytes)
-        || core
-            .config
-            .replay_limits
-            .checkpoint_due(*state.checkpoint_tail_batches, *state.checkpoint_tail_bytes)
-        || pressure.identities >= (core.config.max_admitted_batches / 2).max(1)
-        || state.known.len() >= (core.config.max_admitted_batches / 2).max(1)
-        || core.index.charged_metadata_bytes() >= core.config.max_index_bytes / 2
+    let limits = core.config.replay_limits;
+    let half_identities = (core.config.max_admitted_batches / 2).max(1);
+    let mut flags = CheckpointTriggerFlags::default();
+    for (due, flag) in [
+        (
+            limits.batches_due(pressure.replay_batches),
+            CheckpointTriggerFlags::GRANTED_BATCHES_SOFT,
+        ),
+        (
+            limits.bytes_due(pressure.replay_bytes),
+            CheckpointTriggerFlags::GRANTED_BYTES_SOFT,
+        ),
+        (
+            limits.batches_due(*state.checkpoint_tail_batches),
+            CheckpointTriggerFlags::PUBLISHED_BATCHES_SOFT,
+        ),
+        (
+            limits.bytes_due(*state.checkpoint_tail_bytes),
+            CheckpointTriggerFlags::PUBLISHED_BYTES_SOFT,
+        ),
+        (
+            pressure.identities >= half_identities,
+            CheckpointTriggerFlags::GRANTED_IDENTITIES_SOFT,
+        ),
+        (
+            state.known.len() >= half_identities,
+            CheckpointTriggerFlags::KNOWN_IDENTITIES_SOFT,
+        ),
+        (
+            core.index.charged_metadata_bytes() >= core.config.max_index_bytes / 2,
+            CheckpointTriggerFlags::INDEX_SOFT,
+        ),
+    ] {
+        if due {
+            flags |= flag;
+        }
+    }
+    flags
 }
 
-pub(super) fn core_request_checkpoint(core: &Arc<WriteCore>) -> Result<(), LocalDbError> {
+/// Start a checkpoint only when a soft predicate is due; `extra` records a
+/// hard admission request served by that same launch.
+pub(super) fn core_request_checkpoint(
+    core: &Arc<WriteCore>,
+    extra: CheckpointTriggerFlags,
+) -> Result<(), LocalDbError> {
     core.ensure_healthy()?;
-    if core_checkpoint_due(core) {
-        core.start_checkpoint()?;
+    let due = core_checkpoint_due_flags(core);
+    if !due.is_empty() {
+        core_start_checkpoint_with_floor(core, None, CheckpointLaunch::new(due | extra))?;
     }
     Ok(())
 }
 
 pub(super) fn core_start_checkpoint(core: &Arc<WriteCore>) -> Result<(), LocalDbError> {
-    core_start_checkpoint_with_floor(core, None)
+    core_start_checkpoint_with_floor(
+        core,
+        None,
+        CheckpointLaunch::new(CheckpointTriggerFlags::EXPLICIT),
+    )
 }
 
 fn core_start_checkpoint_with_floor(
     core: &Arc<WriteCore>,
     floor: Option<IndexReadCut>,
+    launch: CheckpointLaunch,
 ) -> Result<(), LocalDbError> {
     core.ensure_healthy()?;
     core_progress_checkpoint(core, false)?;
@@ -211,7 +261,7 @@ fn core_start_checkpoint_with_floor(
     {
         return Ok(());
     }
-    core_launch_checkpoint(core, state, floor, None, None, false)
+    core_launch_checkpoint(core, state, floor, None, None, false, launch)
 }
 
 /// Attach one R1 relocation plan, its callback starts and its floor to the
@@ -236,7 +286,17 @@ pub(super) fn core_start_relocation_checkpoint(
         background.relocation = Some(capture);
         return Ok(());
     }
-    core_launch_checkpoint(core, state, Some(floor), Some(capture), None, false)
+    core_launch_checkpoint(
+        core,
+        state,
+        Some(floor),
+        Some(capture),
+        None,
+        false,
+        CheckpointLaunch::new(
+            CheckpointTriggerFlags::RETENTION_FLOOR | CheckpointTriggerFlags::RELOCATION,
+        ),
+    )
 }
 
 /// Commit the open-time recovery baseline: an ordinary Exact root over the
@@ -254,7 +314,15 @@ pub(super) fn core_commit_recovery_baseline(core: &Arc<WriteCore>) -> Result<(),
                 "recovery baseline found a running checkpoint",
             ));
         }
-        core_launch_checkpoint(core, state, None, None, None, true)?;
+        core_launch_checkpoint(
+            core,
+            state,
+            None,
+            None,
+            None,
+            true,
+            CheckpointLaunch::new(CheckpointTriggerFlags::RECOVERY),
+        )?;
     }
     core_progress_checkpoint(core, true)
 }
@@ -301,8 +369,18 @@ pub(super) fn core_force_rebuild_index(
             // covers `target_next`; a frozen job hands it to its successor.
             Some(background) => background.force = Some(ticket),
             // No no-tail shortcut: an unsatisfied force always evaluates.
-            None => core_launch_checkpoint(core, state, None, None, Some(ticket), false)
-                .map_err(IndexForceError::Failed)?,
+            None => core_launch_checkpoint(
+                core,
+                state,
+                None,
+                None,
+                Some(ticket),
+                false,
+                CheckpointLaunch::new(
+                    CheckpointTriggerFlags::EXPLICIT | CheckpointTriggerFlags::COMPACTOR,
+                ),
+            )
+            .map_err(IndexForceError::Failed)?,
         }
     }
     // `core_progress_checkpoint(.., true)` waits on the job, launches the one
@@ -411,6 +489,7 @@ fn core_launch_checkpoint(
     relocation: Option<super::relocation::RelocationCapture>,
     force: Option<ForceTicket>,
     recovery_baseline: bool,
+    launch: CheckpointLaunch,
 ) -> Result<(), LocalDbError> {
     if state.manifest.checkpoint_staging.is_some() || state.manifest.checkpoint_obsolete.is_some() {
         return Err(LocalDbError::new(
@@ -428,8 +507,9 @@ fn core_launch_checkpoint(
     let thread = thread::Builder::new()
         .name("value-wal-checkpoint".to_owned())
         .spawn(move || {
+            let mut accumulator = CheckpointAccumulator::launched(&worker_core, launch);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                core_run_checkpoint(&worker_core, generation)
+                core_run_checkpoint(&worker_core, generation, &mut accumulator)
             }))
             .unwrap_or_else(|_| Err(LocalDbError::new("checkpoint worker panicked")));
             if let Err(error) = &result {
@@ -445,9 +525,20 @@ fn core_launch_checkpoint(
                 // lease. Healthy progress never reaches this cancellation path.
                 worker_core.index.writer().abort_capture();
             }
+            // A failed generation keeps its last completed boundary and observed
+            // file work; it is never counted as adopted. Read CPU before the lock.
+            let failed = result.is_err().then(|| CheckpointDiagnostic {
+                epoch: worker_core.epoch,
+                generation: Some(generation),
+                attribution: Some(accumulator.finish(GenerationStatus::Failed)),
+                ..CheckpointDiagnostic::default()
+            });
             // Pair completion and notification with the waiter's predicate mutex.
             {
-                let _publisher = worker_core.publisher.lock();
+                let mut publisher = worker_core.publisher.lock();
+                if let Some(record) = failed {
+                    core_record_checkpoint_diagnostic(&mut publisher.checkpoint_state(), record);
+                }
                 let _ = sender.try_send(result);
                 worker_core.floor_changed.notify_all();
             }
@@ -512,7 +603,25 @@ fn core_progress_checkpoint_until(
             let has_successor = result.is_ok()
                 && (requested_floor.is_some() || relocation.is_some() || force.is_some());
             let successor = if has_successor {
-                core_launch_checkpoint(core, state, requested_floor, relocation, force, false)
+                let mut trigger = CheckpointTriggerFlags::default();
+                if requested_floor.is_some() {
+                    trigger |= CheckpointTriggerFlags::RETENTION_FLOOR;
+                }
+                if relocation.is_some() {
+                    trigger |= CheckpointTriggerFlags::RELOCATION;
+                }
+                if force.is_some() {
+                    trigger |= CheckpointTriggerFlags::EXPLICIT | CheckpointTriggerFlags::COMPACTOR;
+                }
+                core_launch_checkpoint(
+                    core,
+                    state,
+                    requested_floor,
+                    relocation,
+                    force,
+                    false,
+                    CheckpointLaunch::new(trigger),
+                )
             } else {
                 // A failed job drops a waiting force: its waiter observes
                 // the failure.
@@ -542,17 +651,21 @@ fn core_progress_checkpoint_until(
     }
 }
 
-pub(super) fn core_commit_checkpoint(core: &Arc<WriteCore>) -> Result<(), LocalDbError> {
+pub(super) fn core_commit_checkpoint(
+    core: &Arc<WriteCore>,
+    trigger: CheckpointTriggerFlags,
+) -> Result<(), LocalDbError> {
     core.ensure_healthy()?;
     core.wait_published_before(core.next_sequence())?;
     core_progress_checkpoint(core, true)?;
-    core_start_checkpoint(core)?;
+    core_start_checkpoint_with_floor(core, None, CheckpointLaunch::new(trigger))?;
     core_progress_checkpoint(core, true)
 }
 
 fn core_capture_checkpoint(
     core: &WriteCore,
     generation: u64,
+    accumulator: &mut CheckpointAccumulator,
 ) -> Result<
     (
         CapturingCheckpoint,
@@ -603,6 +716,13 @@ fn core_capture_checkpoint(
             .force
             .take_if(|ticket| published_next >= ticket.target_next)
     });
+    if relocation.is_some() {
+        accumulator.row.trigger_flags |= CheckpointTriggerFlags::RELOCATION;
+    }
+    if force.is_some() {
+        accumulator.row.trigger_flags |=
+            CheckpointTriggerFlags::EXPLICIT | CheckpointTriggerFlags::COMPACTOR;
+    }
     let recovery_baseline = state
         .background_checkpoint
         .as_ref()
@@ -673,6 +793,11 @@ fn core_capture_checkpoint(
     // sentinel or translation into a different on-disk version.
     let diagnostics_enabled = state.checkpoint_diagnostics.is_some();
     let prepare_started = diagnostics_enabled.then(Instant::now);
+    accumulator.captured(
+        state.index_suffix,
+        floor.as_ref(),
+        state.known.len().saturating_sub(credits.replay_batches),
+    );
     let index_cut = cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
     match floor {
         Some(floor) => writer.begin_compacted_capture(index_cut, floor),
@@ -724,7 +849,11 @@ fn core_capture_checkpoint(
     Ok((capture, persistence, credits))
 }
 
-fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), LocalDbError> {
+fn core_run_checkpoint(
+    core: &Arc<WriteCore>,
+    generation: u64,
+    accumulator: &mut CheckpointAccumulator,
+) -> Result<(), LocalDbError> {
     let started = Instant::now();
     core.stats.lock().write.checkpoint_count += 1;
     core.write_timeline
@@ -736,7 +865,9 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         None,
         Some(generation),
     );
-    let (mut capture, mut persistence, mut credits) = core_capture_checkpoint(core, generation)?;
+    accumulator.capture_started(core.index.charged_metadata_bytes());
+    let (mut capture, mut persistence, mut credits) =
+        core_capture_checkpoint(core, generation, accumulator)?;
     // The worker owns a consumed force through adoption and live install. On
     // any error it is dropped and its waiter observes the failure.
     let force = capture.force.take();
@@ -763,6 +894,8 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         *total = total.saturating_add(elapsed(started));
     }
     let capture_ns = elapsed(started);
+    accumulator.row.capture_end_at_ns = Some(diagnostics_clock_ns());
+    accumulator.reached(CheckpointStage::CaptureEnd);
     core.write_timeline.checkpoint_generation(
         "capture_end",
         None,
@@ -794,7 +927,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     let interruption = persistence.hooks.interruption;
     #[cfg(test)]
     let cleanup_pause = persistence.hooks.cleanup_pause.take();
-    let mut completed = persist_checkpoint(capture, prepared, persistence)?;
+    let mut completed = persist_checkpoint(capture, prepared, persistence, accumulator)?;
     completed.relocation = relocation;
     let work_started = Instant::now();
     core.write_timeline.checkpoint_generation(
@@ -815,6 +948,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_install_before");
+    accumulator.row.live_install_start_at_ns = Some(diagnostics_clock_ns());
     let compactor = completed
         .persisted
         .as_ref()
@@ -847,12 +981,15 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     // masks), one bounded writer step at a time. Reaping changes no cut, so
     // publication is not held out.
     while !core.index.writer().reap_step(32) {}
+    accumulator.row.live_install_end_at_ns = Some(diagnostics_clock_ns());
+    accumulator.reached(CheckpointStage::LiveInstalled);
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_install_after");
     let recent = {
         let _writer = core.index.writer();
         let mut publisher = core.publisher.lock();
         let state = publisher.checkpoint_state();
+        let before = TailCount::new(*state.checkpoint_tail_batches, *state.checkpoint_tail_bytes);
         let batches = state
             .checkpoint_tail_batches
             .checked_sub(completed.batches)
@@ -878,13 +1015,25 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         });
         *state.checkpoint_tail_batches = batches;
         *state.checkpoint_tail_bytes = bytes;
+        accumulator.tail_released(
+            state.index_suffix,
+            before,
+            TailCount::new(batches, bytes),
+            !state.known.is_empty(),
+        );
         state.recent.clone()
     };
     core.capacity.end_install(completed.cut);
     // Identity retirement can take shard locks. It and Admission must run after
     // writer/publisher, and Active→Suffix must not resurrect a Recent identity.
     credits.identities = core.retire_checkpoint_identities(completed.cut, &recent);
-    core.release_checkpoint_credits(credits)?;
+    let returned = ReturnedCredits {
+        batches: credits.replay_batches as u64,
+        bytes: credits.replay_bytes as u64,
+        identities: credits.identities as u64,
+    };
+    let granted = core.release_checkpoint_credits(credits)?;
+    accumulator.credits_returned(returned, granted, core.index.charged_metadata_bytes());
     if let Some(force) = force {
         // Capacity one and never shared: this send cannot block, and a
         // waiter that gave up only discards the report.
@@ -927,13 +1076,24 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         Some(generation),
     );
     let cleanup_started = Instant::now();
-    cleanup_checkpoint_artifacts(&core.path, &mut completed.manifest, interrupt_cleanup).map_err(
-        |error| {
-            LocalDbError::new(format!(
-                "checkpoint committed; artifact cleanup incomplete: {error}"
-            ))
-        },
-    )?;
+    let (cleanup_names, cleanup_manifest) = cleanup_checkpoint_artifacts(
+        &core.path,
+        &mut completed.manifest,
+        interrupt_cleanup,
+        (
+            CoordinatorIoCategory::CleanupNames,
+            CoordinatorIoCategory::ManifestCleanup,
+        ),
+    )
+    .map_err(|error| {
+        LocalDbError::new(format!(
+            "checkpoint committed; artifact cleanup incomplete: {error}"
+        ))
+    })?;
+    accumulator.row.io.cleanup_names = cleanup_names;
+    accumulator.row.io.manifest_cleanup = cleanup_manifest;
+    accumulator.row.cleanup_end_at_ns = Some(diagnostics_clock_ns());
+    accumulator.reached(CheckpointStage::Cleaned);
     let cleanup_ns = elapsed(cleanup_started);
     core.write_timeline.checkpoint_generation(
         "cleanup_end",
@@ -948,12 +1108,14 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
             "injected interruption after checkpoint cleanup",
         ));
     }
+    // Thread CPU is read before the lock: no file I/O under publisher.
+    let attribution = accumulator.finish(GenerationStatus::Cleaned);
     {
         let _writer = core.index.writer();
         let mut publisher = core.publisher.lock();
         let mut state = publisher.checkpoint_state();
         *state.manifest = completed.manifest.clone();
-        let diagnostic = checkpoint_diagnostic(&completed, install_ns, cleanup_ns);
+        let diagnostic = checkpoint_diagnostic(&completed, install_ns, cleanup_ns, attribution);
         let diagnostic = core_record_checkpoint_diagnostic(&mut state, diagnostic);
         *state.last_checkpoint_diagnostic = Some(diagnostic);
     }
@@ -996,6 +1158,7 @@ fn checkpoint_diagnostic(
     completed: &CompletedCheckpoint,
     install_ns: u64,
     cleanup_ns: u64,
+    attribution: super::checkpoint_attribution::CheckpointAttribution,
 ) -> CheckpointDiagnostic {
     CheckpointDiagnostic {
         epoch: completed.commit.epoch,
@@ -1011,6 +1174,7 @@ fn checkpoint_diagnostic(
         root_adoption_ns: completed.root_adoption_ns,
         owner_adoption_ns: Some(install_ns),
         obsolete_cleanup_ns: Some(cleanup_ns),
+        attribution: Some(attribution),
         ..CheckpointDiagnostic::default()
     }
 }
@@ -1050,10 +1214,14 @@ pub(super) fn core_retire_history_before(
             _ => false,
         };
         if advances {
-            core_start_checkpoint_with_floor(core, Some(floor))?;
+            core_start_checkpoint_with_floor(
+                core,
+                Some(floor),
+                CheckpointLaunch::new(CheckpointTriggerFlags::RETENTION_FLOOR),
+            )?;
             core_progress_checkpoint(core, true)?;
         }
-        core_commit_checkpoint(core)?;
+        core_commit_checkpoint(core, CheckpointTriggerFlags::RETENTION_FLOOR)?;
         // R0 shadow mode keeps logical pruning, checkpoints and the floor, and
         // suppresses only physical retirement; the observer samples this prune.
         if core.capacity.shadow_prune(core) {
@@ -1167,6 +1335,7 @@ fn persist_checkpoint(
     capture: CapturingCheckpoint,
     prepared: PreparedIndexImage,
     persistence: CheckpointPersistence,
+    accumulator: &mut CheckpointAccumulator,
 ) -> Result<CompletedCheckpoint, LocalDbError> {
     let CapturingCheckpoint {
         commit,
@@ -1231,7 +1400,12 @@ fn persist_checkpoint(
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_staging_before");
-    persist_manifest(&path, &staging_manifest)?;
+    accumulator.row.io.manifest_stage = persist_manifest(
+        &path,
+        &staging_manifest,
+        CoordinatorIoCategory::ManifestStage,
+    )?;
+    accumulator.reached(CheckpointStage::StagingManifest);
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_staging_after");
     let staging_manifest_ns = phase_started.map(elapsed);
@@ -1343,6 +1517,7 @@ fn persist_checkpoint(
         ));
     }
     let node_prefix_wait_ns = phase_started.map(elapsed);
+    accumulator.reached(CheckpointStage::Positions);
     let phase_started = diagnostics_enabled.then(Instant::now);
     timeline.checkpoint_generation(
         "index_persist_start",
@@ -1353,9 +1528,18 @@ fn persist_checkpoint(
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_image_before");
+    let index_root = path.join(commit.index_name());
     let persisted = prepared
-        .persist(&path.join(commit.index_name()))
+        .persist(&index_root)
         .map_err(LocalDbError::component)?;
+    accumulator.image_persisted(
+        &persisted.encode_stats,
+        &persisted.persist_stats,
+        &index_root,
+    );
+    if persisted.compactor_stats.evaluated() {
+        accumulator.row.trigger_flags |= CheckpointTriggerFlags::COMPACTOR;
+    }
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_image_after");
     let index_persist_ns = phase_started.map(elapsed);
@@ -1423,7 +1607,14 @@ fn persist_checkpoint(
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_metadata_before");
-    install_metadata(&path, &commit.metadata_name(), &encoded).map_err(LocalDbError::component)?;
+    accumulator.row.io.wrapper = install_counted(
+        &path,
+        &commit.metadata_name(),
+        &encoded,
+        CoordinatorIoCategory::Wrapper,
+    )
+    .map_err(LocalDbError::component)?;
+    accumulator.reached(CheckpointStage::Wrapper);
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_metadata_after");
     let metadata_install_ns = phase_started.map(elapsed);
@@ -1463,6 +1654,7 @@ fn persist_checkpoint(
         ));
     }
     let phase_started = diagnostics_enabled.then(Instant::now);
+    accumulator.row.adopt_start_at_ns = Some(diagnostics_clock_ns());
     timeline.checkpoint_generation(
         "root_persist_start",
         None,
@@ -1472,7 +1664,13 @@ fn persist_checkpoint(
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_root_before");
-    persist_manifest(&path, &staging_manifest)?;
+    accumulator.row.io.manifest_adopt = persist_manifest(
+        &path,
+        &staging_manifest,
+        CoordinatorIoCategory::ManifestAdopt,
+    )?;
+    accumulator.row.adopt_end_at_ns = Some(diagnostics_clock_ns());
+    accumulator.reached(CheckpointStage::RootAdopted);
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_root_after");
     let root_adoption_ns = phase_started.map(elapsed);
@@ -2136,7 +2334,12 @@ mod retirement_request_tests {
         core.progress_checkpoint(true).unwrap();
         core.start_checkpoint().unwrap();
         waiting.recv_timeout(core.config.timeout).unwrap();
-        core_start_checkpoint_with_floor(&core, Some(requested.clone())).unwrap();
+        core_start_checkpoint_with_floor(
+            &core,
+            Some(requested.clone()),
+            CheckpointLaunch::new(CheckpointTriggerFlags::RETENTION_FLOOR),
+        )
+        .unwrap();
         {
             let mut publisher = core.publisher.lock();
             let state = publisher.checkpoint_state();

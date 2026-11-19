@@ -4,10 +4,15 @@
 //! owner never waits for a single append before accepting another batch. Like
 //! `FoundationDB` §§2.3–2.6, read cuts and durable ordered publication remain
 //! separate from scheduling. This RF1 path still requires synced WAL receipts.
+use super::checkpoint_attribution::{TailCount, diagnostics_clock_ns};
 #[allow(clippy::wildcard_imports)]
 // Private implementation shares its parent's internal types.
 use super::*;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+mod hard_wait;
+mod index_attribution;
+pub use hard_wait::{HardWaitSnapshot, WaitReasonTotals};
 
 #[derive(Default)]
 struct CheckpointBudget {
@@ -37,6 +42,10 @@ struct WriteBudget {
     waiters: VecDeque<Arc<AdmissionWaiter>>,
     live_waiters: usize,
     checkpoint: CheckpointBudget,
+    /// Granted replay-tail high-water marks, updated at each charge.
+    peak_replay_batches: usize,
+    peak_replay_bytes: usize,
+    hard_wait: hard_wait::HardWaitTracker,
     /// Test-only lower identity bound, applied inside the grant predicate.
     #[cfg(test)]
     identity_limit: Option<usize>,
@@ -167,6 +176,8 @@ struct WaitingReservation<'a> {
     admission: &'a Admission,
     waiter: Arc<AdmissionWaiter>,
     claimed: bool,
+    /// Blocking reasons, ended under the budget mutex at claim or drop.
+    wait: hard_wait::WaiterWait,
 }
 
 impl Drop for WaitingReservation<'_> {
@@ -175,6 +186,9 @@ impl Drop for WaitingReservation<'_> {
             return;
         }
         let mut budget = self.admission.budget.lock();
+        budget
+            .hard_wait
+            .set(&mut self.wait, 0, diagnostics_clock_ns());
         if let Some(position) = budget
             .waiters
             .iter()
@@ -311,10 +325,32 @@ impl Admission {
         }
     }
 
+    /// Granted checkpoint charge and the granted replay-tail high-water mark.
+    pub(super) fn checkpoint_charge_and_peak(&self) -> (CheckpointPressureSnapshot, TailCount) {
+        let budget = self.budget.lock();
+        let current = CheckpointPressureSnapshot {
+            identities: budget.checkpoint.identities,
+            replay_batches: budget.checkpoint.replay_batches,
+            replay_bytes: budget.checkpoint.replay_bytes,
+        };
+        let peak = TailCount::new(
+            budget.peak_replay_batches.max(current.replay_batches),
+            budget.peak_replay_bytes.max(current.replay_bytes),
+        );
+        (current, peak)
+    }
+
+    pub(super) fn hard_wait_snapshot(&self) -> HardWaitSnapshot {
+        let now = diagnostics_clock_ns();
+        self.budget.lock().hard_wait.snapshot(now)
+    }
+
+    /// Returns the granted replay tail immediately before and after the release,
+    /// both observed under this mutation's own lock.
     pub(super) fn release_checkpoint(
         &self,
         released: super::write_core::core::CheckpointCredits,
-    ) -> Result<(), LocalDbError> {
+    ) -> Result<(TailCount, TailCount), LocalDbError> {
         let mut budget = self.budget.lock();
         let current = &mut budget.checkpoint;
         if released.identities > current.identities
@@ -325,10 +361,14 @@ impl Admission {
                 "checkpoint credit release exceeds admission charge",
             ));
         }
+        let before = TailCount::new(current.replay_batches, current.replay_bytes);
         current.identities -= released.identities;
         current.replay_batches -= released.replay_batches;
         current.replay_bytes -= released.replay_bytes;
-        Ok(())
+        Ok((
+            before,
+            TailCount::new(current.replay_batches, current.replay_bytes),
+        ))
     }
 
     /// Publication converts reserved index bytes into native-index charges.
@@ -485,29 +525,7 @@ impl Admission {
         grant: &WriteGrant,
     ) -> Option<CheckpointPressure> {
         let tail = &budget.checkpoint;
-        #[cfg(test)]
-        let max_identities = budget
-            .identity_limit
-            .map_or(self.max_identities, |limit| limit.min(self.max_identities));
-        #[cfg(not(test))]
-        let max_identities = self.max_identities;
-        // WAL replay has no hard tail bound, as the native engine has none:
-        // the replay charges are counted only for checkpoint_due and release.
-        let reason = if tail
-            .identities
-            .checked_add(grant.identities)
-            .is_none_or(|n| n > max_identities)
-        {
-            "identity"
-        } else if budget
-            .index_bytes
-            .checked_add(grant.index_bytes)
-            .is_none_or(|n| self.index.check_capacity(n).is_err())
-        {
-            "index"
-        } else {
-            return None;
-        };
+        let reason = self.checkpoint_block(budget, grant, false).0?;
         Some(CheckpointPressure {
             reason,
             batches: tail.replay_batches,
@@ -516,6 +534,55 @@ impl Admission {
             max_encoded_bytes: usize::MAX,
             incoming_encoded_bytes: Some(grant.replay_bytes),
         })
+    }
+
+    /// The first blocking checkpoint dimension, in priority order, and the
+    /// wait bits of the dimensions evaluated. `all` evaluates every dimension
+    /// (waiting path); otherwise evaluation stops at the first block.
+    fn checkpoint_block(
+        &self,
+        budget: &WriteBudget,
+        grant: &WriteGrant,
+        all: bool,
+    ) -> (Option<&'static str>, u8) {
+        let tail = &budget.checkpoint;
+        #[cfg(test)]
+        let max_identities = budget
+            .identity_limit
+            .map_or(self.max_identities, |limit| limit.min(self.max_identities));
+        #[cfg(not(test))]
+        let max_identities = self.max_identities;
+        // WAL replay deliberately has no hard tail bound.
+        let identity = tail
+            .identities
+            .checked_add(grant.identities)
+            .is_none_or(|n| n > max_identities);
+        if identity && !all {
+            return (Some("identity"), hard_wait::WAIT_IDENTITY);
+        }
+        let index = budget
+            .index_bytes
+            .checked_add(grant.index_bytes)
+            .is_none_or(|n| self.index.check_capacity(n).is_err());
+        let first = if identity {
+            Some("identity")
+        } else {
+            index.then_some("index")
+        };
+        let bits = (if identity {
+            hard_wait::WAIT_IDENTITY
+        } else {
+            0
+        }) | (if index { hard_wait::WAIT_INDEX } else { 0 });
+        (first, bits)
+    }
+
+    /// Wait bits of a queued grant: its checkpoint dimensions, or `other`.
+    fn wait_bits(&self, budget: &WriteBudget, grant: &WriteGrant) -> u8 {
+        match self.checkpoint_block(budget, grant, true).1 {
+            0 => hard_wait::WAIT_OTHER,
+            bits => bits,
+        }
     }
 
     /// Lower the identity (checkpoint receipt metadata) bound for a test,
@@ -540,6 +607,10 @@ impl Admission {
         }
         budget.peak_requests = budget.peak_requests.max(budget.requests);
         budget.peak_bytes = budget.peak_bytes.max(budget.bytes);
+        budget.peak_replay_batches = budget
+            .peak_replay_batches
+            .max(budget.checkpoint.replay_batches);
+        budget.peak_replay_bytes = budget.peak_replay_bytes.max(budget.checkpoint.replay_bytes);
     }
 
     fn resources_owned(budget: &WriteBudget, grant: &WriteGrant) -> bool {
@@ -638,11 +709,17 @@ impl Admission {
         budget.live_waiters += 1;
         budget.waiters.push_back(waiter.clone());
         debug_assert!(budget.waiters.len() <= budget.live_waiters);
-        WaitingReservation {
+        let mut reservation = WaitingReservation {
             admission: self,
             waiter,
             claimed: false,
-        }
+            wait: hard_wait::WaiterWait::default(),
+        };
+        let bits = self.wait_bits(budget, &reservation.waiter.grant);
+        budget
+            .hard_wait
+            .set(&mut reservation.wait, bits, diagnostics_clock_ns());
+        reservation
     }
 
     #[cfg(test)]
@@ -719,6 +796,9 @@ impl Admission {
                 WAITER_GRANTED => {
                     healthy()?;
                     let mut budget = self.budget.lock();
+                    budget
+                        .hard_wait
+                        .set(&mut waiting.wait, 0, diagnostics_clock_ns());
                     if budget.closed {
                         return Err(self.closed_error());
                     }
@@ -740,7 +820,11 @@ impl Admission {
                         return Err(LocalDbError::new("write admission deadline expired"));
                     }
                     let pressure = {
-                        let budget = self.budget.lock();
+                        let mut budget = self.budget.lock();
+                        let bits = self.wait_bits(&budget, &waiting.waiter.grant);
+                        budget
+                            .hard_wait
+                            .set(&mut waiting.wait, bits, diagnostics_clock_ns());
                         self.checkpoint_pressure_for(&budget, &waiting.waiter.grant)
                     };
                     if let Some(pressure) = pressure {

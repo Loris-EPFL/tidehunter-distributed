@@ -1866,6 +1866,15 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         config.execution.request_timeout_ms,
     )?;
     let mut m = Measurements::new(&trace, prepared.len())?;
+    // Opt-in A0 collector over every replay coordinator; finished before close.
+    let index_checkpoint = if config.diagnostics.index_checkpoint {
+        Some(crate::index_checkpoint::IndexCheckpointCollector::start(
+            backend.index_checkpoint_targets()?,
+            output,
+        )?)
+    } else {
+        None
+    };
     let preload_start = Instant::now();
     let mut preload_ns = 0;
     let mut window_start = None;
@@ -1917,6 +1926,9 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         reporter.set_phase("measurement");
         let begin = Instant::now();
         window_start = Some(begin);
+        if let Some(collector) = &index_checkpoint {
+            collector.mark("timed").await;
+        }
         Scheduler::new(
             &trace,
             &prepared,
@@ -1929,6 +1941,9 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         .await?;
         elapsed = begin.elapsed();
         physical_after = backend.physical_counts();
+        if let Some(collector) = &index_checkpoint {
+            collector.mark("gate").await;
+        }
         backend.check_background_health()?;
         if let Some(gate) = &config.measurement_completion_gate {
             crate::runner::wait_for_measurement_gate(gate, deadline).await?;
@@ -1939,6 +1954,25 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         )
     }
     .await;
+    let index_export = match index_checkpoint {
+        Some(collector) => {
+            collector.mark("drain").await;
+            match collector.finish().await {
+                Ok(export) => {
+                    crate::runner::write_index_checkpoint_diagnostics(
+                        output,
+                        &info.name,
+                        &export.details,
+                    )?;
+                    Some(export.summary)
+                }
+                Err(error) => {
+                    Some(serde_json::json!({"status": "failed", "error": error.to_string()}))
+                }
+            }
+        }
+        None => None,
+    };
     if let Some(begin) = window_start
         && elapsed.is_zero()
     {
@@ -2064,7 +2098,7 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
     let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:replay_durability(&info),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
         execution:serde_json::json!({"effective_client_shards":1}),
         phase_counts:serde_json::json!({"scope":trace.scope(),"profile":metrics,"preload_ns":preload_ns,"counts":m.counts,"error":result.as_ref().err().map(ToString::to_string),"resources":resources,"sustained_30s_qualified":result.is_ok() && unresolved_workers==0 && elapsed.as_secs_f64()>=30.0,"run_status":run_status,"unknown_outcomes":unknown_outcomes,"unresolved_workers":unresolved_workers,"shutdown_contract":"join completed callers; after deadline plus grace detach only unresolved calls, under external process supervision; no cancellation or rollback"}),
-        distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
+        distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()],index_checkpoint:index_export};
     reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":trace.scope(),"config":config,"binary":resources["binary"],"trace_manifest":trace.manifest,"profile":metrics}))?;
     result
 }

@@ -362,7 +362,7 @@ fn owner_initiator_map_is_pinned_across_authority_reopen() {
     }
     let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
     manifest.live_nvme_owner_identities.clear();
-    persist_manifest(&root, &manifest).unwrap();
+    persist_manifest(&root, &manifest, CoordinatorIoCategory::Open).unwrap();
     assert!(
         open(f.config.clone())
             .err()

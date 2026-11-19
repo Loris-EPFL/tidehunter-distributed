@@ -1,3 +1,4 @@
+use super::super::checkpoint_attribution::{TailCount, diagnostics_clock_ns};
 use super::super::{CompleteBatch, DurableBatch, IndexReadCut, LocalDbError, WriteTimelineStage};
 use super::core::WriteCore;
 use super::identity::IdentityClass;
@@ -381,6 +382,17 @@ impl WriteCore {
                         );
                         *state.checkpoint_tail_batches += 1;
                         *state.checkpoint_tail_bytes += batch.encoded().len();
+                        // Record each publication exactly where it charges the suffix.
+                        if let Some(suffix) = state.index_suffix.as_mut() {
+                            suffix.on_publish(
+                                diagnostics_clock_ns(),
+                                TailCount::new(
+                                    *state.checkpoint_tail_batches,
+                                    *state.checkpoint_tail_bytes,
+                                ),
+                                self.index.charged_metadata_bytes(),
+                            );
+                        }
                     }
                     published.push(Published {
                         sequence,

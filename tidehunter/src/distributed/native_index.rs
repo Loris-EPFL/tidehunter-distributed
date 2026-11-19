@@ -75,7 +75,9 @@ pub use shards::{
     DEFAULT_INDEX_SHARDS, IndexShardLoad, IndexShardStats, MAX_INDEX_SHARDS,
     PUBLICATION_HISTOGRAM_BUCKETS,
 };
-pub(crate) use snapshot::{PersistedIndexImage, PreparedIndexImage};
+pub(crate) use snapshot::{
+    CellEncodeStats, ImagePersistStats, PersistedIndexImage, PreparedIndexImage,
+};
 use std::sync::atomic::AtomicU64;
 pub use writer::IndexWriter;
 use writer::WriterState;
