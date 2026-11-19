@@ -249,10 +249,13 @@ For the exact `tidehunter_live_nvmeof` backend and
 counter deltas from arm through the pre-completion-gate snapshot. The requested
 limit enables the window; it does not select or cap a first-N prefix. Its
 `completed_write_ops` population counts I/O frames, not necessarily logical
-keys or API calls. Timer sums retain their own sample counts; a clock with zero
-samples is unavailable. These clocks can overlap and are neither pure wire,
-device or CPU time nor per-stage percentiles. Error, unknown-write, metadata and
-payload-RPC counters remain actual observations; missing fields are not zeros.
+keys or API calls. Lease clocks share `lease_profile_samples`; adoption clocks
+share `adopt_profile_samples`. Other clocks keep their individual sample counts.
+A clock with zero samples is unavailable. These clocks can overlap and are neither
+pure wire, device or CPU time nor per-stage percentiles. Live write byte counters
+use `kv_live_nvmeof_bytes` with the diagnostic window scope; operation and sample
+counts use `kv_case_write_diagnostic_stage_count`. Error, unknown-write, metadata
+and payload-RPC counters remain actual observations; missing fields are not zeros.
 The independently scoped coordinator snapshots are not NVMe samples. See
 `experiments/nvmeof/LIVE_WAL.md` for the live write and persistence path.
 

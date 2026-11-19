@@ -252,13 +252,16 @@ pub struct NodeInventory {
     logs: BTreeMap<u64, Arc<PartitionLog>>,
     pub(super) healthy: bool,
     pub(super) terminal: Arc<AtomicBool>,
+    /// Sticky persistence-failure latch of this incarnation (see
+    /// `ControlContext::persistence_failed`). Never cleared.
+    pub(super) persistence_failed: Arc<AtomicBool>,
     pub(super) readers: Arc<RwLock<ReaderAuthority>>,
     metrics: Arc<Metrics>,
     history_diagnostics: bool,
     history_persistence: crate::distributed::storage::HistoryPersistence,
     history_failure_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
-    // Kernel boot of this owner process, read once at open.
-    boot_id: [u8; 16],
+    // Owner incarnation, created once at open (see `durable_progress::new_incarnation`).
+    incarnation: [u8; 16],
     // Partition handles each retain this root lock as well.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
@@ -745,12 +748,13 @@ impl NodeInventory {
             logs,
             healthy: true,
             terminal: Arc::new(AtomicBool::new(false)),
+            persistence_failed: Arc::new(AtomicBool::new(false)),
             readers,
             metrics,
             history_diagnostics: false,
             history_persistence,
             history_failure_notifier: None,
-            boot_id: super::durable_progress::read_boot_id()?,
+            incarnation: super::durable_progress::new_incarnation()?,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_leases,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -887,11 +891,20 @@ impl NodeInventory {
             live_nvmeof: false,
             // The control owner holds the tier; it sets this field in its replies.
             durability_tier: super::super::durability::DurabilityTier::default(),
-            boot_id: self.boot_id,
-            // Every log this process recovered stays in `logs` (a live fence
-            // replaces the old handle with its recovery), so this covers every
-            // recovery since start.
-            recovery_clean: !self.logs.values().any(|log| log.recovery_found_hole()),
+            incarnation: self.incarnation,
+            // Every log this incarnation recovered stays in `logs` (a live fence
+            // replaces the old handle with its recovery, and fails unless the old
+            // frontier drained), so this covers every recovery since open. A failed
+            // fsync may have dropped acknowledged dirty pages without any hole, so a
+            // persistence failure or poison (latch, Acquire: pairs with the funnels'
+            // Release) or a failed frontier makes every later recovery unprovable.
+            recovery_clean: !self.persistence_failed.load(Ordering::Acquire)
+                && !self.logs.values().any(|log| {
+                    log.recovery_found_hole()
+                        || log
+                            .frontier()
+                            .is_some_and(|frontier| frontier.failure().is_some())
+                }),
         })
     }
     /// Fence an exclusively owned inventory. A live inventory needs its target
@@ -2056,9 +2069,9 @@ impl NodeInventory {
         }
     }
 
-    /// Kernel boot id read when this owner opened.
-    pub(super) fn boot_id(&self) -> [u8; 16] {
-        self.boot_id
+    /// Owner incarnation created when this owner opened.
+    pub(super) fn incarnation(&self) -> [u8; 16] {
+        self.incarnation
     }
 
     /// Log of stream `epoch` for a durable-progress poll under `authority_epoch`.

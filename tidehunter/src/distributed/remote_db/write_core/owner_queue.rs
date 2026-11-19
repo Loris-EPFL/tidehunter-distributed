@@ -6,6 +6,17 @@ const ALLOCATED: u64 = 1;
 const READY: u64 = 2;
 const ABORTED: u64 = 3;
 
+/// Owner-queue head state after a drain that rejected no batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeadStop {
+    /// The head is at or past the ordered control or snapshot bound.
+    Fence,
+    /// The head entry is not allocated yet.
+    Empty,
+    /// The head entry is allocated and not READY yet.
+    Allocated,
+}
+
 struct OwnerEntry {
     state: AtomicU64,
     batch: Mutex<Option<(u64, CompleteBatch)>>,
@@ -176,6 +187,39 @@ impl OwnerQueue {
             return batch;
         }
         None
+    }
+
+    /// Diagnostic classification of the head after a drain stopped without a
+    /// rejected batch. A concurrent READY store can race with this read; a
+    /// READY or ABORTED head here was not READY when the drain looked.
+    pub(crate) fn head_stop(&self, before_owner_seq: u64) -> HeadStop {
+        // Only this owner worker changes head; Acquire matches take_ready_before.
+        let head = self.head.load(Ordering::Acquire);
+        if head >= before_owner_seq {
+            return HeadStop::Fence;
+        }
+        let state = self.entry(head).state.load(Ordering::Acquire);
+        if state >> 2 == head {
+            HeadStop::Allocated
+        } else {
+            HeadStop::Empty
+        }
+    }
+
+    /// Consecutive READY entries at the head before `before_owner_seq`, at most
+    /// `limit`. Packing evidence only: callers may make more entries READY.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn ready_run(&self, before_owner_seq: u64, limit: usize) -> usize {
+        // Only this owner worker changes head; Acquire matches take_ready_before.
+        let head = self.head.load(Ordering::Acquire);
+        let mut run = 0;
+        for sequence in head..before_owner_seq.min(head.saturating_add(limit as u64)) {
+            if self.entry(sequence).state.load(Ordering::Acquire) != (sequence << 2) | READY {
+                break;
+            }
+            run += 1;
+        }
+        run
     }
 
     /// True means the worker may block on its existing bounded command/wake

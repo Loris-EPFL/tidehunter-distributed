@@ -42,6 +42,56 @@ COORDINATOR_INTERVAL_COUNTERS = {
     "write_checkpoint_diagnostic_obsolete_cleanup_ns", "write_checkpoint_diagnostic_obsolete_cleanup_count",
     "write_checkpoint_diagnostic_index_prepare_ns", "write_checkpoint_diagnostic_index_prepare_count"} | AUTHORITY_INTERVAL_COUNTERS
 
+# Live NVMe-oF measurement deltas (kv-research `runner.rs` LIVE_NVMEOF_DELTA_FIELDS). The
+# expected set must be present; the allowed set must equal the Rust delta list exactly, which
+# test_campaign_exporter checks against live_nvmeof_counter_fields.json (also pinned by Rust).
+LIVE_NVMEOF_FIELDS = (
+    "completed_read_ops", "completed_read_bytes", "completed_write_ops",
+    "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
+    "metadata_requests", "namespace_connects", "payload_rpc_requests",
+    "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
+LIVE_NVMEOF_STAGES = (
+    "queue", "submit", "cq", "control", "validation", "allocation",
+    "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
+    "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace")
+LIVE_NVMEOF_EXTRA_FIELDS = (
+    "lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
+    "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
+    "reserve_exchanges", "complete_exchanges", "lease_exchanges", "leased_frames",
+    "leased_bytes", "leased_skip_markers", "extents_leased", "adoption_async_exchanges",
+    "adoption_sync_exchanges", "fua_writes", "leased_failed_writes", "leased_short_writes",
+    "leased_timed_out_writes", "leased_full_writes", "failed_write_ops", "short_write_ops",
+    "short_write_bytes", "adoption_history_full_settles",
+    # Run 13: owner lease and adoption profiles, lease-ahead counts. The `_ns` totals use
+    # the existing events family (the counter label names the unit); no new metric family.
+    "lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns", "lease_profile_samples",
+    "adopt_owner_ns", "adopt_close_scan_ns", "adopt_close_scan_bytes", "adopt_profile_samples",
+    "extent_preleases", "extent_switch_waits", "leased_eventfd_unavailable",
+    "leased_worker_waits", "leased_worker_wait_timeouts",
+    "leased_flushes", "leased_flush_ns", "leased_flush_samples", "leased_flush_covered_frames",
+    "read_lane_pin_failures",
+    # Sync-overhead fix (d2c19c4): packing and owner-drain counters. All are monotonic event
+    # counts (fetch_add in live_metrics.rs), so they are measurement deltas, not gauges.
+    "leased_frame_batches", "write_submit_calls", "owner_drains", "owner_drain_batches",
+    "owner_drain_stop_empty", "owner_drain_stop_allocated", "owner_drain_stop_fence",
+    "owner_drain_stop_limit", "owner_drain_stop_credit", "leased_submit_ready_left",
+    "leased_submit_ready_left_batches", "leased_submit_ready_left_full",
+    "leased_submit_ready_left_full_batches", "leased_deferred_submits")
+LIVE_NVMEOF_EXTRA_STAGES = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
+                            "extent_switch", "adoption_async", "adoption_settle")
+# Lifetime maxima (gauge peaks): exported as boundary snapshots, never as deltas.
+LIVE_NVMEOF_PEAKS = ("lane_inflight_request_max", "lane_inflight_op_max", "max_leased_in_flight")
+
+
+def live_nvmeof_expected_counters():
+    return set(LIVE_NVMEOF_FIELDS) | {stage + suffix for stage in LIVE_NVMEOF_STAGES
+                                      for suffix in ("_ns", "_samples")}
+
+
+def live_nvmeof_allowed_counters():
+    return (live_nvmeof_expected_counters() | set(LIVE_NVMEOF_EXTRA_FIELDS)
+            | {stage + suffix for stage in LIVE_NVMEOF_EXTRA_STAGES for suffix in ("_ns", "_samples")})
+
 
 def absolute(value):
     if not isinstance(value, str) or not Path(value).is_absolute() or ".." in Path(value).parts:
@@ -455,7 +505,7 @@ def client_pool_metrics(evidence, labels):
 def live_nvmeof_peak_metrics(evidence, labels):
     if evidence is None:
         return ""
-    if not isinstance(evidence, dict) or set(evidence) - {"lane_inflight_request_max", "lane_inflight_op_max", "max_leased_in_flight"}:
+    if not isinstance(evidence, dict) or set(evidence) - set(LIVE_NVMEOF_PEAKS):
         raise ValueError("invalid live NVMe-oF peaks")
     result = ""
     for field, row in evidence.items():
@@ -521,32 +571,9 @@ def live_nvmeof_metrics(evidence, labels):
     if not evidence["available"]:
         return result
     counters = evidence.get("counters")
-    fields = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
-              "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
-              "metadata_requests", "namespace_connects", "payload_rpc_requests",
-              "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
-    stages = ("queue", "submit", "cq", "control", "validation", "allocation",
-              "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
-              "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace")
-    extra_fields = ("lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
-                    "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
-                    "reserve_exchanges", "complete_exchanges", "lease_exchanges", "leased_frames",
-                    "leased_bytes", "leased_skip_markers", "extents_leased", "adoption_async_exchanges",
-                    "adoption_sync_exchanges", "fua_writes", "leased_failed_writes", "leased_short_writes",
-                    "leased_timed_out_writes", "leased_full_writes", "failed_write_ops", "short_write_ops",
-                    "short_write_bytes", "adoption_history_full_settles",
-                    # Run 13: owner lease and adoption profiles, lease-ahead counts. The `_ns` totals use
-                    # the existing events family (the counter label names the unit); no new metric family.
-                    "lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns", "lease_profile_samples",
-                    "adopt_owner_ns", "adopt_close_scan_ns", "adopt_close_scan_bytes", "adopt_profile_samples",
-                    "extent_preleases", "extent_switch_waits", "leased_eventfd_unavailable",
-                    "leased_worker_waits", "leased_worker_wait_timeouts",
-                    "leased_flushes", "leased_flush_ns", "leased_flush_samples", "leased_flush_covered_frames",
-                    "read_lane_pin_failures")
-    extra_stages = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
-                    "extent_switch", "adoption_async", "adoption_settle")
-    expected = set(fields) | {stage + suffix for stage in stages for suffix in ("_ns", "_samples")}
-    allowed = expected | set(extra_fields) | {stage + suffix for stage in extra_stages for suffix in ("_ns", "_samples")}
+    fields, stages = LIVE_NVMEOF_FIELDS, LIVE_NVMEOF_STAGES
+    extra_fields, extra_stages = LIVE_NVMEOF_EXTRA_FIELDS, LIVE_NVMEOF_EXTRA_STAGES
+    expected, allowed = live_nvmeof_expected_counters(), live_nvmeof_allowed_counters()
     if not isinstance(counters, dict) or not expected <= counters.keys() or counters.keys() - allowed:
         raise ValueError("incomplete live NVMe-oF measurement counters")
     for field in fields + tuple(field for field in extra_fields if field in counters):
@@ -871,6 +898,16 @@ def resource_interval_metrics(evidence, labels):
     return result
 
 
+# The owner reports each phase clock with one shared count per profile.
+LIVE_NVME_WRITE_SHARED_CLOCKS = {
+    "lease_profile_samples": ("lease_reserve_ns", "lease_namespace_sync_ns", "lease_publish_ns"),
+    "adopt_profile_samples": ("adopt_owner_ns", "adopt_close_scan_ns"),
+}
+LIVE_NVME_WRITE_SHARED_SAMPLES = {
+    clock: samples for samples, clocks in LIVE_NVME_WRITE_SHARED_CLOCKS.items() for clock in clocks
+}
+
+
 LIVE_NVME_WRITE_COUNTERS = {
     "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
     "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
@@ -885,6 +922,8 @@ LIVE_NVME_WRITE_COUNTERS = {
     "leased_worker_waits", "leased_worker_wait_timeouts",
     "leased_flushes", "leased_flush_ns", "leased_flush_samples", "leased_flush_covered_frames",
     "read_lane_pin_failures",
+    "adopt_close_scan_bytes", "extent_preleases", "extent_switch_waits",
+    *LIVE_NVME_WRITE_SHARED_CLOCKS, *LIVE_NVME_WRITE_SHARED_SAMPLES,
     *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
                                    "allocation", "publication", "namespace_setup", "read_io",
                                    "owner_completion", "wal_persistence", "wal_namespace",
@@ -893,6 +932,10 @@ LIVE_NVME_WRITE_COUNTERS = {
                                    "extent_switch", "adoption_async", "adoption_settle")
       for suffix in ("_ns", "_samples")),
 }
+
+
+def live_nvmeof_write_samples_field(clock):
+    return LIVE_NVME_WRITE_SHARED_SAMPLES.get(clock, clock[:-3] + "_samples")
 
 
 def write_diagnostic_metrics(evidence, labels):
@@ -990,9 +1033,12 @@ def write_diagnostic_metrics(evidence, labels):
             count(value)
         for field in counters:
             if field.endswith("_ns"):
-                samples_field = field[:-3] + "_samples"
+                samples_field = live_nvmeof_write_samples_field(field)
                 if samples_field not in counters:
                     raise ValueError("live NVMe clock lacks its sample count")
+            elif field in LIVE_NVME_WRITE_SHARED_CLOCKS:
+                if any(clock not in counters for clock in LIVE_NVME_WRITE_SHARED_CLOCKS[field]):
+                    raise ValueError("live NVMe profile sample count lacks its clocks")
             elif field.endswith("_samples") and field != "lane_inflight_samples":
                 if field[:-8] + "_ns" not in counters:
                     raise ValueError("live NVMe sample count lacks its clock")
@@ -1068,17 +1114,23 @@ def write_diagnostic_metrics(evidence, labels):
                 continue
             else:
                 value = count(value)
-                if nvme and component == "stages.live_nvmeof" and field.endswith("_ns") and tree.get(field[:-3] + "_samples") == 0:
-                    continue
+                live_window = nvme and component == "stages.live_nvmeof"
+                if live_window and field.endswith("_ns"):
+                    samples_field = live_nvmeof_write_samples_field(field)
+                    if tree[samples_field] == 0:
+                        continue
                 if field.endswith("_ns"):
                     counters.append(("kv_case_write_diagnostic_stage_seconds", value / 1e9,
                                      {"component": component, "stage": field}))
+                elif live_window and (field.endswith("_bytes") or field == "copy_bytes_avoided"):
+                    counters.append(("kv_live_nvmeof_bytes", value,
+                                     {"component": component, "counter": field}))
                 elif (field in ("sampled_registered_files_min", "sampled_registered_files_max")
                       or field.endswith(("_calls", "_errors", "_samples", "_requests", "_retries", "_groups",
                                          "_receipts", "_publications", "_successes", "_operations", "_barriers",
                                          "_connections", "_count", "_batches", "_appends", "_admitted", "_completed",
                                          "_polls", "_would_block", "_stalls", "_completions", "_ops", "_bytes"))
-                      or (nvme and component == "stages.live_nvmeof")):
+                      or live_window):
                     counters.append(("kv_case_write_diagnostic_stage_count", value,
                                      {"component": component, "counter": field}))
 

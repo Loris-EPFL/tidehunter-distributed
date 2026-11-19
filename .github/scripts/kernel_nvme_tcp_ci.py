@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise the maintained four-owner TCP proof and verify its owned cleanup.
+"""Supervise the maintained single- and four-owner kernel TCP proofs.
 
 The proof owns setup, admission, second-open recovery and teardown. This wrapper
 adds signal-to-finally delivery and inventory receipts, not another NVMe lifecycle.
@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import signal
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -84,6 +85,43 @@ def run(args):
         dump(args.state / "result.json", {"exit_code": result, "passed": result == 0})
 
 
+def qualify(args):
+    """Run the four single-owner cells with independent cleanup checks."""
+    sys.path.insert(0, str(ROOT / "experiments/kv-comparison"))
+    from local_dry_run_targets import KERNEL_LIVE_HISTORIES, _kernel_live_worker
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    root = args.state / "single-owner"
+    root.mkdir(mode=0o700)
+    before = inventory()
+    dump(root / "before.json", before)
+    results = {}
+    for history in KERNEL_LIVE_HISTORIES:
+        output = root / history
+        output.mkdir(mode=0o700)
+        started = time.monotonic()
+        # Each history gets its own deadline. Sequential runs bound disk
+        # use and let the existing worker remove each clean fixture first.
+        seconds = 180
+        proof, evidence = _kernel_live_worker(
+            output, args.binary, "tcp", seconds, time.time() + seconds,
+            history_persistence=history, owner_wal_file_bytes=8 * 1024**2)
+        after = inventory()
+        dump(output / "after.json", after)
+        result = {"complete": proof["complete"], "fixture_removed": proof["fixture_removed"],
+                  "inventory_restored": before == after, "evidence": str(evidence.relative_to(root)),
+                  "elapsed_seconds": round(time.monotonic() - started, 3)}
+        results[history] = result
+        dump(root / "summary.json", results)
+        print(f"{history}: {json.dumps(result, sort_keys=True)}", flush=True)
+        if not result["fixture_removed"] or not result["inventory_restored"]:
+            raise RuntimeError("Single-owner kernel TCP cleanup unconfirmed; refusing another proof")
+        if signal.getsignal(signal.SIGTERM) == signal.SIG_IGN:
+            return 1
+    return 0 if all(result["complete"] for result in results.values()) else 1
+
+
 def cleanup(args):
     """Require the proof's finally cleanup and independently restored inventories."""
     before = json.loads((args.state / "before.json").read_text())
@@ -109,7 +147,7 @@ def cleanup(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("run", "cleanup"))
+    parser.add_argument("action", choices=("qualify", "run", "cleanup"))
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--binary", type=Path)
     args = parser.parse_args()
@@ -121,9 +159,9 @@ def main():
         stat = path.stat()
         if path.is_symlink() or stat.st_uid != 0 or stat.st_mode & 0o022:
             parser.error(f"untrusted root-owned state ancestor: {path}")
-    if args.action == "run" and args.binary is None:
-        parser.error("run requires --binary")
-    return run(args) if args.action == "run" else cleanup(args)
+    if args.action != "cleanup" and args.binary is None:
+        parser.error(f"{args.action} requires --binary")
+    return {"qualify": qualify, "run": run, "cleanup": cleanup}[args.action](args)
 
 
 if __name__ == "__main__":

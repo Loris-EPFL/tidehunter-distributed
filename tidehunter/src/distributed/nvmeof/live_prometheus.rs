@@ -481,6 +481,90 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
             false,
             "Member bytes delivered as slices of the I/O block instead of a copy",
         ),
+        (
+            "leased_frame_batches_total",
+            c.leased_frame_batches,
+            false,
+            "Complete batches in released leased frames",
+        ),
+        (
+            "write_submit_calls_total",
+            c.write_submit_calls,
+            false,
+            "Write-queue io_uring enter calls that consumed an SQE",
+        ),
+        (
+            "owner_drains_total",
+            c.owner_drains,
+            false,
+            "Owner-worker drains of the READY owner queue",
+        ),
+        (
+            "owner_drain_batches_total",
+            c.owner_drain_batches,
+            false,
+            "Batches taken by owner-worker drains",
+        ),
+        (
+            "owner_drain_stop_empty_total",
+            c.owner_drain_stop_empty,
+            false,
+            "Drains stopped at an unallocated owner-queue entry",
+        ),
+        (
+            "owner_drain_stop_allocated_total",
+            c.owner_drain_stop_allocated,
+            false,
+            "Drains stopped at an ALLOCATED owner-queue head",
+        ),
+        (
+            "owner_drain_stop_fence_total",
+            c.owner_drain_stop_fence,
+            false,
+            "Drains stopped at an ordered control or snapshot bound",
+        ),
+        (
+            "owner_drain_stop_limit_total",
+            c.owner_drain_stop_limit,
+            false,
+            "Drains stopped by group, reference or frame geometry",
+        ),
+        (
+            "owner_drain_stop_credit_total",
+            c.owner_drain_stop_credit,
+            false,
+            "Drains stopped by transport byte credit or append occupancy",
+        ),
+        (
+            "leased_submit_ready_left_total",
+            c.leased_submit_ready_left,
+            false,
+            "Leased frame submissions that left READY batches unsubmitted",
+        ),
+        (
+            "leased_submit_ready_left_batches_total",
+            c.leased_submit_ready_left_batches,
+            false,
+            "READY batches left unsubmitted at leased frame submissions",
+        ),
+        (
+            "leased_submit_ready_left_full_total",
+            c.leased_submit_ready_left_full,
+            false,
+            "Full leased frames submitted while READY batches remained",
+        ),
+        (
+            "leased_submit_ready_left_full_batches_total",
+            c.leased_submit_ready_left_full_batches,
+            false,
+            "READY batches left behind full leased frames",
+        ),
+        (
+            "leased_deferred_submits_total",
+            c.leased_deferred_submits,
+            false,
+            "Submissions of a leased group deferred earlier for credit",
+        ),
     ]);
     // Each evidence entry contains cumulative per-owner counters. Use only the
     // latest snapshot per partition, not the sum of overlapping snapshots.
@@ -648,7 +732,7 @@ mod tests {
         let metrics = LiveNvmeMetrics::new();
         let producer = metrics.register().unwrap();
         producer.record_timing(LiveTimingStage::Completion, 2_000_000_000, 2);
-        producer.record_leased_frame(4096);
+        producer.record_leased_frame(4096, 2);
         producer.record_leased_worker_wait(false);
         producer.record_leased_worker_wait(true);
         producer.record_leased_flush(3);
@@ -735,6 +819,10 @@ mod tests {
         }
         assert_eq!(counter("tidehunter_nvmeof_live_leased_frames_total"), 1.0);
         assert_eq!(counter("tidehunter_nvmeof_live_leased_bytes_total"), 4096.0);
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_leased_frame_batches_total"),
+            2.0
+        );
         assert_eq!(
             counter("tidehunter_nvmeof_live_leased_skip_markers_total"),
             1.0

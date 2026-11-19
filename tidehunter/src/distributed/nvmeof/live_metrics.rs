@@ -211,7 +211,33 @@ counter_fields!(
     grant_misses,
     grant_evictions,
     // Member bytes delivered as slices of the I/O block instead of a copy.
-    copy_bytes_avoided;
+    copy_bytes_avoided,
+    /// Complete batches carried by released leased frames (batches per frame).
+    leased_frame_batches,
+    /// io_uring submit system calls of the write queue (frames per submission).
+    write_submit_calls,
+    /// Owner-worker group drains that took a batch or stopped at a nonempty
+    /// head (empty polls excluded), and the batches they took.
+    owner_drains,
+    owner_drain_batches,
+    /// Why each drain stopped: queue head empty, head ALLOCATED, ordered control
+    /// or snapshot bound, group geometry limit, transport credit or occupancy.
+    owner_drain_stop_empty,
+    owner_drain_stop_allocated,
+    owner_drain_stop_fence,
+    owner_drain_stop_limit,
+    owner_drain_stop_credit,
+    /// Leased frame submissions with spare frame capacity that left READY
+    /// batches behind (owner-queue head or unmerged queued groups), and those
+    /// batches: the packing opportunity.
+    leased_submit_ready_left,
+    leased_submit_ready_left_batches,
+    /// The same for frames that were full (geometry or count limit): not a
+    /// packing opportunity.
+    leased_submit_ready_left_full,
+    leased_submit_ready_left_full_batches,
+    /// Submissions of a group that an earlier attempt deferred for credit.
+    leased_deferred_submits;
     max:
     // Peak over each producer's lifetime; aggregation keeps the largest peak.
     max_leased_in_flight,
@@ -265,6 +291,21 @@ pub(crate) enum LiveWriteFailure {
     Full,
 }
 
+/// Why one owner-worker drain of the READY owner queue stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerDrainStop {
+    /// The next owner-queue entry is not allocated yet.
+    Empty,
+    /// The next entry is allocated but its caller has not made it READY.
+    Allocated,
+    /// The next entry lies at or after an ordered control or snapshot bound.
+    Fence,
+    /// The next READY batch exceeds group, reference or frame geometry.
+    Limit,
+    /// Transport byte credit or owner append occupancy is exhausted.
+    Credit,
+}
+
 impl LiveNvmeCounters {
     pub(crate) fn record_lease_profile(&self, profile: super::super::tcp::LeaseProfile) {
         // Relaxed: owner-local timing evidence publishes no stream state.
@@ -310,10 +351,53 @@ impl LiveNvmeCounters {
         // Relaxed: evidence only, not control-slot synchronization.
         self.lease_exchanges.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn record_leased_frame(&self, bytes: u64) {
+    pub fn record_leased_frame(&self, bytes: u64, batches: u64) {
         // Relaxed: these independent evidence counters publish no stream state.
         self.leased_frames.fetch_add(1, Ordering::Relaxed);
         self.leased_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.leased_frame_batches
+            .fetch_add(batches, Ordering::Relaxed);
+    }
+    pub(crate) fn record_write_submit_calls(&self, calls: u64) {
+        // Relaxed: syscall evidence, not SQE ownership publication.
+        self.write_submit_calls.fetch_add(calls, Ordering::Relaxed);
+    }
+    pub(crate) fn record_owner_drain(&self, batches: u64, stop: OwnerDrainStop) {
+        let counter = match stop {
+            OwnerDrainStop::Empty => &self.owner_drain_stop_empty,
+            OwnerDrainStop::Allocated => &self.owner_drain_stop_allocated,
+            OwnerDrainStop::Fence => &self.owner_drain_stop_fence,
+            OwnerDrainStop::Limit => &self.owner_drain_stop_limit,
+            OwnerDrainStop::Credit => &self.owner_drain_stop_credit,
+        };
+        // Relaxed: worker-local evidence; queue order is published by its own atomics.
+        self.owner_drains.fetch_add(1, Ordering::Relaxed);
+        self.owner_drain_batches
+            .fetch_add(batches, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One frame submission that left `batches` READY batches unsubmitted.
+    pub(crate) fn record_submit_ready_left(&self, batches: u64, frame_full: bool) {
+        if batches != 0 {
+            let (frames, left) = if frame_full {
+                (
+                    &self.leased_submit_ready_left_full,
+                    &self.leased_submit_ready_left_full_batches,
+                )
+            } else {
+                (
+                    &self.leased_submit_ready_left,
+                    &self.leased_submit_ready_left_batches,
+                )
+            };
+            // Relaxed: packing evidence only.
+            frames.fetch_add(1, Ordering::Relaxed);
+            left.fetch_add(batches, Ordering::Relaxed);
+        }
+    }
+    pub(crate) fn record_deferred_submit(&self) {
+        // Relaxed: evidence only.
+        self.leased_deferred_submits.fetch_add(1, Ordering::Relaxed);
     }
     pub(crate) fn record_max_leased_in_flight(&self, count: u64) {
         // Relaxed: this peak is evidence, not publication of flight state.

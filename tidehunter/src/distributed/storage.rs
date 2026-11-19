@@ -427,6 +427,12 @@ struct State {
     last_live_complete: Option<([u8; 16], usize, usize)>,
     #[cfg(feature = "experimental-nvmeof")]
     live_tail: Option<LiveFrontierTail>,
+    /// End below which this handle owes no live-frontier root. Zero after
+    /// create, so the first barrier or fragment crossing installs a root. After
+    /// recovery it is the recovered end: recovery leaves that end described by
+    /// its own durable roots and seal, and a sealed handle has no live tail.
+    #[cfg(feature = "experimental-nvmeof")]
+    live_root_end: u64,
     // Writer drops before the directory lock. The experimental feature strictly
     // joins its native workers; shutdown can wait but cannot release a live path.
     writer: Option<WalWriter>,
@@ -450,7 +456,7 @@ struct State {
 }
 
 /// Counters for this open handle, not recovered durability or publication proof.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartitionStats {
     pub appended_groups: u64,
     /// Completed explicit per-group file persistence calls. Creation and sealing
@@ -466,6 +472,25 @@ pub struct PartitionStats {
     /// whose subsequent publication failed; creation/recovery are excluded.
     pub live_frontier_file_syncs: u64,
     pub live_frontier_namespace_syncs: u64,
+    /// WAL file data syncs (fdatasync) of completed persistence barriers; a
+    /// failed barrier does not add to it. Cold-read scoped proofs, creation and
+    /// recovery are excluded.
+    pub wal_file_syncs: u64,
+    /// Live-frontier persistence requests made by owner adoption control.
+    pub live_frontier_requests: u64,
+    /// Completed live-frontier root installs (temporary file write and sync,
+    /// rename, directory sync) and the root file bytes they wrote.
+    pub live_frontier_installs: u64,
+    pub live_frontier_bytes: u64,
+    /// Syncer barriers that synced the WAL and deferred the live root within a
+    /// fragment (bounded policy; WAL-replay history only).
+    pub live_frontier_deferred: u64,
+    /// Completed on-demand data barriers requested by owner reads beyond the
+    /// durable prefix (a barrier finding nothing pending also counts).
+    pub read_persist_requests: u64,
+    /// Scoped cold-grant fdatasyncs of a pinned WAL inode; they never advance
+    /// the durable prefix, so they can repeat until a barrier does.
+    pub cold_grant_syncs: u64,
     /// Currently charged resident/cache/read-CQ descriptor records, not disk total.
     pub registered_records: usize,
     pub reference_metadata_bytes: usize,
@@ -1098,6 +1123,8 @@ impl PartitionLog {
                 last_live_complete: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                live_root_end: 0,
                 writer: Some(writer),
                 wal_root: Some(wal_root),
                 references: reference_writer,
@@ -1650,12 +1677,14 @@ impl PartitionLog {
                 last_live_complete: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                live_root_end: physical_end,
                 writer: None,
                 wal_root: None,
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
-                progress: ProgressTail::default(),
+                progress: ProgressTail::recovered(physical_end),
                 namespace_synced_file: None,
                 poison: None,
                 sealed: true,
@@ -3985,12 +4014,11 @@ impl PartitionLog {
         self.recovery_hole
     }
 
-    /// Appended and synced tails with their byte frontiers, from one lock hold.
+    /// Appended and synced tails with their byte frontiers, from one lock hold. On a
+    /// live stream the synced tail covers only the prefix of the installed strict root.
     pub fn durable_progress(&self) -> LogDurableProgress {
         let state = self.state.lock();
-        state
-            .progress
-            .snapshot(state.appended_end, state.durable_end)
+        state.progress.snapshot(state.appended_end)
     }
 
     /// Published position-root cut, distinct from the adopted receipt frontier.
@@ -4005,6 +4033,48 @@ impl PartitionLog {
         let state = self.state.lock();
         let root = state.wal_root.as_ref().unwrap();
         (root.generation, root.scan_from, root.synced_end)
+    }
+
+    /// Count one adoption-triggered live-frontier persistence request.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn note_live_frontier_request(&self) {
+        self.state.lock().stats.live_frontier_requests += 1;
+    }
+
+    /// Explicit barrier for the live root: after a bounded syncer deferred it,
+    /// install a root covering the durable prefix. A no-op when the root is
+    /// current, the log is not live, or persistence already failed (a failed
+    /// log never writes another root; recovery scans its valid suffix).
+    /// Flush, fence/retire and shutdown call it.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn persist_live_root(&self) -> Result<(), StorageError> {
+        {
+            let state = self.state.lock();
+            if !live_root_lags(&state) || persistence_poisoned(&state, PersistScope::Appended) {
+                return Ok(());
+            }
+        }
+        self.persist_scope(PersistScope::Appended, None)
+    }
+
+    /// Durable-progress nudge on a live stream: make everything appended durable
+    /// and install the strict live root over it, so the next report covers it (see
+    /// [`Self::durable_progress`]). A no-op when the report already covers the
+    /// appended end, as on a recovered handle. Returns false when the stream is not
+    /// live: its reports follow every sync, so the syncer serves the nudge.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn persist_live_progress(&self) -> Result<bool, StorageError> {
+        {
+            let state = self.state.lock();
+            if !state.live {
+                return Ok(false);
+            }
+            if state.progress.snapshot(state.appended_end).idle() {
+                return Ok(true);
+            }
+        }
+        self.persist_scope(PersistScope::Appended, None)?;
+        Ok(true)
     }
 
     /// The durability layer's frontier, once the node attached it.
@@ -4042,10 +4112,27 @@ impl PartitionLog {
     }
 
     /// Syncer body: make everything appended durable and keep its stage timings
-    /// for the waiter that triggered it. Runs on the single syncer thread.
+    /// for the waiter that triggered it. Runs on the single syncer thread. It
+    /// uses the bounded live-root policy; explicit barriers catch the root up.
     pub fn sync_for_frontier(&self) -> io::Result<()> {
         let mut profile = StorageWriteProfile::default();
-        let result = self.persist_appended_profiled(&mut profile);
+        #[cfg(feature = "experimental-nvmeof")]
+        let adopted = self.self_adopt_live_extent();
+        #[cfg(not(feature = "experimental-nvmeof"))]
+        let adopted: Result<(), StorageError> = Ok(());
+        let result = adopted.and_then(|()| {
+            // The final drain at syncer shutdown (fence, retire, owner stop)
+            // is an explicit barrier: it leaves the root covering the prefix.
+            let stopping = self
+                .frontier
+                .get()
+                .is_some_and(|frontier| frontier.stopping());
+            self.persist_scope_with(
+                PersistScope::Appended,
+                Some(&mut profile),
+                syncer_root_policy(stopping),
+            )
+        });
         let capture = profile.persistence_capture;
         let mut accumulated = self.sync_profile.lock();
         accumulated.add(profile);
@@ -4075,7 +4162,16 @@ impl PartitionLog {
         scope: PersistScope<'_>,
         profile: Option<&mut StorageWriteProfile>,
     ) -> Result<(), StorageError> {
-        let result = self.persist_scope_inner(scope, profile);
+        self.persist_scope_with(scope, profile, RootPolicy::Barrier)
+    }
+
+    fn persist_scope_with(
+        &self,
+        scope: PersistScope<'_>,
+        profile: Option<&mut StorageWriteProfile>,
+        root: RootPolicy,
+    ) -> Result<(), StorageError> {
+        let result = self.persist_scope_inner(scope, profile, root);
         if let Err(error) = &result
             && matches!(error, StorageError::Unknown(_) | StorageError::Poisoned)
         {
@@ -4138,6 +4234,7 @@ impl PartitionLog {
         &self,
         scope: PersistScope<'_>,
         profile: Option<&mut StorageWriteProfile>,
+        root: RootPolicy,
     ) -> Result<(), StorageError> {
         let receipt_count = scope.len();
         let mut timing = WriteTiming::new(profile, false);
@@ -4153,7 +4250,7 @@ impl PartitionLog {
         timing.stage(Some(WriteStage::PersistStateLock));
         let state = self.state.lock();
         timing.stage(Some(WriteStage::PersistValidation));
-        let pending = pending_scope(&state, scope)?;
+        let pending = pending_with_root(&state, scope, root)?;
         drop(state);
         if pending.is_none() {
             timing.record(|profile| {
@@ -4171,7 +4268,7 @@ impl PartitionLog {
         let (start, end, namespace_synced_file, captured) = {
             let mut state = self.state.lock();
             timing.stage(Some(WriteStage::PersistValidation));
-            let Some(requested_end) = pending_scope(&state, scope)? else {
+            let Some(requested_end) = pending_with_root(&state, scope, root)? else {
                 timing.record(|profile| {
                     profile.persist_noops = profile.persist_noops.saturating_add(1);
                 });
@@ -4198,8 +4295,18 @@ impl PartitionLog {
                     cumulative_appended_groups: state.stats.appended_groups,
                 });
             });
+            // The live root only sets the strict recovery prefix; recovery scans
+            // every valid frame beyond it. A barrier always installs it. The
+            // syncer defers it within a fragment, and only with windowed
+            // (WAL-replay) history: on-disk history requires the root at or past
+            // the history root that this barrier may advance.
             #[cfg(feature = "experimental-nvmeof")]
-            if state.live {
+            if state.live
+                && (root == RootPolicy::Barrier
+                    || !state.references.windowed()
+                    || state.appended_end / self.config().fragment_bytes
+                        > state.live_root_end / self.config().fragment_bytes)
+            {
                 let tail = state
                     .live_tail
                     .ok_or(StorageError::Invalid("missing live frontier tail"))?;
@@ -4232,10 +4339,12 @@ impl PartitionLog {
         let previous_namespace = namespace_synced_file.map(|file| file.as_u64());
         let namespace_sync = previous_namespace.is_none_or(|file| last_file > file);
         let mut witness_persisted = 0u64;
+        let mut wal_file_syncs = 0u64;
         #[cfg(feature = "experimental-nvmeof")]
-        let mut frontier_syncs = (0u64, 0u64);
+        let mut frontier_io = LiveFrontierIo::default();
         let result = (|| -> io::Result<()> {
-            for file_id in first_file..=last_file {
+            // A root catch-up after a deferred root has no new data to sync.
+            for file_id in (first_file..=last_file).filter(|_| start < end) {
                 timing.record(|profile| {
                     profile.file_persist_calls = profile.file_persist_calls.saturating_add(1);
                 });
@@ -4246,6 +4355,7 @@ impl PartitionLog {
                 #[cfg(test)]
                 crate::failpoints::write_model::boundary("file_sync_before");
                 self.wal.persist_frame_file(WalPosition::new(offset, 1))?;
+                wal_file_syncs += 1;
                 #[cfg(test)]
                 crate::failpoints::write_model::boundary("file_sync_after");
                 timing.record(|profile| {
@@ -4261,7 +4371,7 @@ impl PartitionLog {
             )?;
             #[cfg(feature = "experimental-nvmeof")]
             if let Some(frontier) = &live_frontier {
-                self.persist_live_frontier(frontier, &mut timing, &mut frontier_syncs)?;
+                self.persist_live_frontier(frontier, &mut timing, &mut frontier_io)?;
             }
             Ok(())
         })();
@@ -4270,10 +4380,23 @@ impl PartitionLog {
         let mut state = self.state.lock();
         timing.stage(Some(WriteStage::PersistPublication));
         state.stats.inventory_witnesses += witness_persisted;
+        if result.is_ok() {
+            state.stats.wal_file_syncs += wal_file_syncs;
+        }
         #[cfg(feature = "experimental-nvmeof")]
         {
-            state.stats.live_frontier_file_syncs += frontier_syncs.0;
-            state.stats.live_frontier_namespace_syncs += frontier_syncs.1;
+            state.stats.live_frontier_file_syncs += frontier_io.file_syncs;
+            state.stats.live_frontier_namespace_syncs += frontier_io.namespace_syncs;
+            state.stats.live_frontier_installs += frontier_io.installs;
+            state.stats.live_frontier_bytes += frontier_io.bytes;
+            if result.is_ok() {
+                if live_frontier.is_some() {
+                    // Persistence serializes installs; captures only grow.
+                    state.live_root_end = end;
+                } else if state.live {
+                    state.stats.live_frontier_deferred += 1;
+                }
+            }
         }
         result.map_err(|error| {
             state.poison = Some(WriterPoison::Fatal);
@@ -4286,9 +4409,16 @@ impl PartitionLog {
         debug_assert!(end <= state.appended_end);
         state.stats.persistence_barriers += 1;
         state.stats.namespace_syncs += u64::from(namespace_sync);
-        let advanced = end > state.durable_end;
         state.durable_end = end;
-        state.progress.synced(captured, advanced);
+        // A live sync that deferred the strict root publishes no progress: recovery
+        // enforces no frame beyond the root, so a report must not cover one.
+        #[cfg(feature = "experimental-nvmeof")]
+        let reportable = live_frontier.is_some() || !state.live;
+        #[cfg(not(feature = "experimental-nvmeof"))]
+        let reportable = true;
+        if reportable {
+            state.progress.synced(captured, end);
+        }
         self.durable_frontier.store(end, Ordering::Release);
         if namespace_sync {
             state.namespace_synced_file =
@@ -4336,7 +4466,7 @@ impl PartitionLog {
             if !self.position_covers_batch(appended.address) {
                 return Err(StorageError::NeedsPersistence);
             }
-            self.persist_appended()?;
+            self.persist_for_read()?;
             if _authority.group_end() > self.readable_frontier() {
                 return Err(StorageError::NeedsPersistence);
             }
@@ -4560,7 +4690,7 @@ impl PartitionLog {
             {
                 // A completed position proof is not a receipt publication.
                 // Consume it through this read's own covering receipt barrier.
-                self.persist_appended()?;
+                self.persist_for_read()?;
                 self.validate_record_authority(reference, &registered)?;
             }
             result => result?,
@@ -4578,11 +4708,21 @@ impl PartitionLog {
         match self.load_durable_record_authority(reference) {
             #[cfg(feature = "experimental-nvmeof")]
             Err(StorageError::NeedsPersistence) if self.live_stream => {
-                self.persist_appended()?;
+                self.persist_for_read()?;
                 self.load_durable_record_authority(reference)
             }
             result => result,
         }
+    }
+
+    /// On-demand data barrier for a read beyond the durable prefix. A read is
+    /// not a lifecycle barrier: a live root keeps the syncer's bounded policy.
+    fn persist_for_read(&self) -> Result<(), StorageError> {
+        #[cfg(feature = "experimental-nvmeof")]
+        self.self_adopt_live_extent()?;
+        self.persist_scope_with(PersistScope::Appended, None, syncer_root_policy(false))?;
+        self.state.lock().stats.read_persist_requests += 1;
+        Ok(())
     }
 
     /// Read one independently verified record, never a whole value batch.
@@ -4734,9 +4874,11 @@ impl PartitionLog {
                 self.poison_writer();
                 return Err(StorageError::Unknown(WalError::Io(error)));
             }
+            let mut state = self.state.lock();
+            state.stats.cold_grant_syncs += 1;
             #[cfg(test)]
             {
-                self.state.lock().live_test_diagnostics.cold_read_syncs += 1;
+                state.live_test_diagnostics.cold_read_syncs += 1;
             }
         }
         #[cfg(test)]
@@ -4869,7 +5011,7 @@ impl PartitionLog {
             if !self.position_covers_batch(receipt.address) {
                 return Err(StorageError::NeedsPersistence);
             }
-            self.persist_appended()?;
+            self.persist_for_read()?;
             if registered.group_end() > self.readable_frontier() {
                 return Err(StorageError::NeedsPersistence);
             }
@@ -5754,11 +5896,11 @@ impl PartitionLog {
             StorageError::Unknown(WalError::Io(io::Error::other(error)))
         })?;
         // The seal synced every registered file under this lock hold, so it covers the
-        // whole appended tail.
+        // whole appended tail. Recovery rejects a scan that ends below the sealed end,
+        // so the seal bounds the report like a live root.
         let captured = state.progress.capture();
-        let advanced = end.physical_end > state.durable_end;
         state.durable_end = end.physical_end;
-        state.progress.synced(captured, advanced);
+        state.progress.synced(captured, end.physical_end);
         self.durable_frontier
             .store(end.physical_end, Ordering::Release);
         Ok(())
@@ -5887,6 +6029,67 @@ fn pending_receipts(
     Ok(pending_end)
 }
 
+/// Test-only measurement arm: restore the pre-change write path (root on
+/// every syncer barrier, no last-moment merge) in this process.
+#[cfg(test)]
+pub(crate) static BASELINE_WRITE_PATH: AtomicBool = AtomicBool::new(false);
+
+/// True when the test-only baseline arm is selected; always false otherwise.
+#[cfg(test)]
+pub(crate) fn baseline_write_path() -> bool {
+    // Relaxed: a measurement arm selected before the fixture opens.
+    BASELINE_WRITE_PATH.load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+pub(crate) fn baseline_write_path() -> bool {
+    false
+}
+
+fn syncer_root_policy(stopping: bool) -> RootPolicy {
+    if stopping || baseline_write_path() {
+        RootPolicy::Barrier
+    } else {
+        RootPolicy::Bounded
+    }
+}
+
+/// Live-frontier root policy of one persistence barrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootPolicy {
+    /// Install the root covering the captured prefix, also when only the root
+    /// lags. Every caller except the background syncer.
+    Barrier,
+    /// Background syncer: install the root only on a fragment crossing or with
+    /// on-disk history; otherwise sync the WAL and defer the root.
+    Bounded,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+fn live_root_lags(state: &State) -> bool {
+    state.live && state.live_root_end < state.durable_end
+}
+
+/// Pending WAL data, or for a barrier a lagging live root covered at the
+/// current appended end (the data below it is already durable).
+fn pending_with_root(
+    state: &State,
+    scope: PersistScope<'_>,
+    root: RootPolicy,
+) -> Result<Option<u64>, StorageError> {
+    let pending = pending_scope(state, scope)?;
+    #[cfg(feature = "experimental-nvmeof")]
+    if pending.is_none() && root == RootPolicy::Barrier && live_root_lags(state) {
+        if persistence_poisoned(state, scope) {
+            return Err(StorageError::Poisoned);
+        }
+        return Ok(Some(state.durable_end));
+    }
+    #[cfg(not(feature = "experimental-nvmeof"))]
+    let _ = root;
+    Ok(pending)
+}
+
 /// What one persistence call must make durable.
 #[derive(Clone, Copy)]
 enum PersistScope<'a> {
@@ -5940,6 +6143,16 @@ pub(crate) fn encode_metadata(value: &impl Serialize) -> Result<Vec<u8>, Storage
     Ok(CrcFrame::new(&bytes).as_ref().to_vec())
 }
 
+/// Live-frontier root I/O done by one persistence barrier.
+#[cfg(feature = "experimental-nvmeof")]
+#[derive(Default)]
+struct LiveFrontierIo {
+    file_syncs: u64,
+    namespace_syncs: u64,
+    installs: u64,
+    bytes: u64,
+}
+
 /// Commit the CRC-protected live durability frontier after the WAL file and
 /// its namespace witnesses, before returning any durable receipt.
 #[cfg(feature = "experimental-nvmeof")]
@@ -5948,7 +6161,7 @@ impl PartitionLog {
         &self,
         frontier: &LiveFrontier,
         timing: &mut WriteTiming<'_>,
-        syncs: &mut (u64, u64),
+        counts: &mut LiveFrontierIo,
     ) -> io::Result<()> {
         let frontier_sync_span = super::owner_events::OwnerEventSpan::new(
             super::owner_events::OwnerEventKind::FrontierSyncStart,
@@ -5967,6 +6180,7 @@ impl PartitionLog {
             .write(true)
             .open(&temporary)?;
         file.write_all(&bytes)?;
+        counts.bytes += bytes.len() as u64;
         timing.record(|profile| {
             profile.live_frontier_file_calls = profile.live_frontier_file_calls.saturating_add(1)
         });
@@ -5975,7 +6189,7 @@ impl PartitionLog {
             return Err(io::Error::other("injected live frontier file sync failure"));
         }
         file.sync_all()?;
-        syncs.0 += 1;
+        counts.file_syncs += 1;
         timing.record(|profile| {
             profile.live_frontier_file_successes =
                 profile.live_frontier_file_successes.saturating_add(1)
@@ -5998,7 +6212,8 @@ impl PartitionLog {
             ));
         }
         File::open(path)?.sync_all()?;
-        syncs.1 += 1;
+        counts.namespace_syncs += 1;
+        counts.installs += 1;
         timing.record(|profile| {
             profile.live_frontier_namespace_successes =
                 profile.live_frontier_namespace_successes.saturating_add(1)

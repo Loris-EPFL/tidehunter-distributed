@@ -237,7 +237,7 @@ fn fixture(
             endpoints:config.endpoints.iter().map(|e|(e.partition,e.address.clone())).collect(),owners:1,
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
             effective_configuration:serde_json::json!({"fixture_route":live.unwrap_or("owner_rpc"),"remote":config,"owner_read":owner_read}),operational_read_io:None,
-            read_evidence_written:false,coordinator_interval_baseline:std::sync::Mutex::new(None),
+            read_evidence_written:false,owner_sample_gate:Default::default(),coordinator_interval_baseline:std::sync::Mutex::new(None),
             #[cfg(all(feature="nvmeof",target_os="linux"))]
             live_write_profile:std::sync::Mutex::new(None),
         });
@@ -557,6 +557,86 @@ async fn perpetual_only_replay_uses_exact_database_population() {
         (1014, 232, 1308, 6)
     );
     assert_eq!(backend.info().topology["node_databases"], 1);
+    drop(backend);
+    drop(owners);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The replay's logical WAL bytes are the put cases' counter: the gate-boundary delta of
+/// live leased `completed_write_bytes`, divided by successful committed payload.
+#[cfg(all(feature = "nvmeof", feature = "test-utils", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_local_file_live_replay_records_logical_wal_amplification() {
+    let root = root();
+    let mut trace = trace();
+    trace.select_node_databases(&[0]).unwrap();
+    let prepared = Arc::new(prepare(&trace, 2).unwrap());
+    let (backend, owners) = fixture(&root, &trace, Some("leased"));
+    let config: crate::mainnet_replay::ReplayConfig = serde_json::from_value(serde_json::json!({
+        "schema_version":1,"backend":{"kind":"tidehunter_tcp","options":{}},
+        "workload":{"kind":"sui_mainnet_replay",
+            "manifest_path":Path::new(env!("CARGO_MANIFEST_DIR")).join("../../experiments/sui-mainnet/fixture/manifest.json"),
+            "manifest_sha256":"4264e79e0cbe4a1e36d94468df2f049f988eac57877c9bf2e7e175489dc922fa",
+            "repetitions":2,"minimum_measurement_seconds":0.0,"node_databases":[0]},
+        "execution":{"mode":"closed_loop","concurrency":4,"client_shards":1,"queue_capacity":8,
+            "request_timeout_ms":30000,"offered_ops_per_second":null},
+        "limits":{"max_keys":10000,"max_bytes":67108864,"max_operations":10000,
+            "deadline_seconds":120,"shutdown_grace_seconds":5}
+    }))
+    .unwrap();
+    let output = root.join("result");
+    let info = backend.info();
+    crate::mainnet_replay::run_prepared(
+        config,
+        &output,
+        trace,
+        prepared,
+        Arc::clone(&backend),
+        serde_json::json!({}),
+        (Instant::now(), 0.0, Some(info)),
+    )
+    .await
+    .unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("summary.json")).unwrap()).unwrap();
+    let amplification = &summary["phase_counts"]["profile"]["write_amplification"];
+    let payload = &amplification["payload"];
+    assert_eq!(
+        *payload,
+        serde_json::json!({"commits":6,"rows":1308,"value_bytes":1_000_648,"key_bytes":47_664,"key_value_bytes":1_048_312}),
+        "{amplification}"
+    );
+    let wal = &amplification["logical_wal"];
+    assert_eq!(wal["available"], true, "{amplification}");
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(output.join("measurement-read-evidence.json")).unwrap(),
+    )
+    .unwrap();
+    let counters = &evidence["live_nvmeof"]["counters"];
+    let bytes = wal["bytes"].as_u64().unwrap();
+    assert_eq!(bytes, counters["completed_write_bytes"].as_u64().unwrap());
+    assert_eq!(wal["write_ops"], counters["completed_write_ops"]);
+    assert_eq!(wal["leased_frames"], counters["leased_frames"]);
+    // One complete-batch frame per successful commit; each frame carries its keys and values.
+    assert_eq!(wal["leased_frames"], payload["commits"]);
+    assert!(bytes >= 1_048_312, "{amplification}");
+    // serde_json parses floats to within one ULP (no `float_roundtrip`), so the summary's
+    // ratios are compared to the exact quotient with a relative tolerance of a few ULPs.
+    for (name, payload_bytes) in [
+        ("bytes_per_value_byte", 1_000_648.0),
+        ("bytes_per_key_value_byte", 1_048_312.0),
+    ] {
+        let recorded = wal[name].as_f64().unwrap();
+        let exact = bytes as f64 / payload_bytes;
+        assert!(
+            (recorded - exact).abs() <= 4.0 * f64::EPSILON * exact,
+            "{name}: {recorded} != {exact}"
+        );
+    }
+    eprintln!(
+        "local-file-live-replay-amplification bytes={bytes} frames={} wal_per_value={} wal_per_key_value={}",
+        wal["leased_frames"], wal["bytes_per_value_byte"], wal["bytes_per_key_value_byte"]
+    );
     drop(backend);
     drop(owners);
     std::fs::remove_dir_all(root).unwrap();

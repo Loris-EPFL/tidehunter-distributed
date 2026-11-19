@@ -848,6 +848,13 @@ impl LocalDatabase {
             result.inventory_witnesses += stats.inventory_witnesses;
             result.live_frontier_file_syncs += stats.live_frontier_file_syncs;
             result.live_frontier_namespace_syncs += stats.live_frontier_namespace_syncs;
+            result.wal_file_syncs += stats.wal_file_syncs;
+            result.live_frontier_requests += stats.live_frontier_requests;
+            result.live_frontier_installs += stats.live_frontier_installs;
+            result.live_frontier_bytes += stats.live_frontier_bytes;
+            result.live_frontier_deferred += stats.live_frontier_deferred;
+            result.read_persist_requests += stats.read_persist_requests;
+            result.cold_grant_syncs += stats.cold_grant_syncs;
             result.registered_records += stats.registered_records;
             result.reference_metadata_bytes += stats.reference_metadata_bytes;
         }

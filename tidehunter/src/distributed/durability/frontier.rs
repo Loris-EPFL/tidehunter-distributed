@@ -637,6 +637,12 @@ impl Frontier {
         self.wake_all();
     }
 
+    /// True once [`Frontier::stop`] ran: the syncer is on its final drain.
+    #[must_use]
+    pub fn stopping(&self) -> bool {
+        self.state.lock().stopping
+    }
+
     fn wake_all(&self) {
         self.appended_cv.notify_all();
         self.synced_cv.notify_all();

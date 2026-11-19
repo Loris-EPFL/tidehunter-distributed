@@ -1185,6 +1185,80 @@ fn leased_recovery_reports_a_hole_only_below_a_later_valid_frame() {
     }
 }
 
+/// Two fragments: v0 and v1 then a skip marker at 8192 in fragment 0, v2 at the start
+/// of fragment 1. With `damaged`, unsynced bytes inside v1 stop the scan there and
+/// recovery probes fragment 1. Returns the stream path and fragment 1's start.
+fn two_fragment_stream(damaged: bool) -> (tempdir::TempDir, PartitionConfig, u64) {
+    let (temp, config, log) = fixture();
+    assert_eq!(log.history_persistence(), HistoryPersistence::WalReplay);
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    for n in 0..2 {
+        let (_, frame) = encoded(&config, vec![batch(&config, n)]);
+        write(&first, n * 4096, &frame);
+    }
+    skip(&first, 8192);
+    log.adopt_live_extent(authority(&config), first.token, 8192, true)
+        .unwrap();
+    let second = log.lease_live_extent(authority(&config)).unwrap().0;
+    assert_eq!(second.start, config.fragment_bytes);
+    let (_, frame) = encoded(&config, vec![batch(&config, 2)]);
+    write(&second, second.start, &frame);
+    if damaged {
+        write(&first, 4096 + 100, &[0x5a; 16]);
+    }
+    drop(log);
+    (temp, config, second.start)
+}
+
+fn assert_recovery_fails_with_eio(path: &Path, config: &PartitionConfig, case: &str) {
+    let error = PartitionLog::recover_live_sealed(path, config, metrics(), || Ok(()))
+        .err()
+        .unwrap_or_else(|| panic!("{case}: recovery reported a result despite EIO"));
+    assert!(
+        matches!(&error, StorageError::Io(io) if io.raw_os_error() == Some(libc::EIO)),
+        "{case}: {error}"
+    );
+}
+
+/// An I/O error while probing a later fragment leaves continuity unknown: recovery
+/// fails instead of reporting no hole. The hook replaces the result of each probe
+/// read (open, header, body) with EIO, so the production classifier decides; without
+/// the fault the same bytes recover with the hole.
+#[test]
+fn leased_recovery_probe_io_error_fails_instead_of_reading_as_clean() {
+    use crate::distributed::storage::wal_replay::{RecoveryRead, inject_read_fault};
+    for read in [
+        RecoveryRead::ProbeOpen,
+        RecoveryRead::ProbeHeader,
+        RecoveryRead::ProbeBody,
+    ] {
+        let (temp, config, probe) = two_fragment_stream(true);
+        let path = temp.path().join("stream");
+        inject_read_fault(read, probe);
+        assert_recovery_fails_with_eio(&path, &config, &format!("{read:?}"));
+        let recovered =
+            PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+        assert!(recovered.recovery_found_hole(), "{read:?}");
+        assert_eq!(recovered.receipt_count(), 1);
+    }
+}
+
+/// An I/O error on the main scan's header read at a skip marker fails recovery. It
+/// must not fall through to a decode that reads the marker as an invalid frame
+/// and reports the end of the WAL.
+#[test]
+fn leased_recovery_scan_header_io_error_at_a_skip_marker_fails() {
+    use crate::distributed::storage::wal_replay::{RecoveryRead, inject_read_fault};
+    let (temp, config, _) = two_fragment_stream(false);
+    let path = temp.path().join("stream");
+    inject_read_fault(RecoveryRead::ScanHeader, 8192);
+    assert_recovery_fails_with_eio(&path, &config, "ScanHeader at the skip marker");
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    assert!(!recovered.recovery_found_hole());
+    assert_eq!(recovered.receipt_count(), 3);
+}
+
 #[test]
 fn leased_seal_adopts_and_persists_complete_frames_after_revocation() {
     let (temp, config, log) = fixture();

@@ -74,6 +74,7 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
         }),
         20
     );
+    assert_eq!(tag(&Request::PartitionStats), 21);
     assert_eq!(
         tag(&Response::Checkpoint(checkpoint::CheckpointProof {
             database: [0; 16],
@@ -106,12 +107,13 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
             synced_end: 0,
             appended_end: 0,
             idle: true,
-            boot_id: [0; 16],
+            incarnation: [0; 16],
         })),
         19
     );
+    assert_eq!(tag(&Response::PartitionStats(Box::default())), 20);
     #[cfg(feature = "experimental-nvmeof")]
-    assert_eq!(tag(&Response::ValidatedRecordReferences(Vec::new())), 20);
+    assert_eq!(tag(&Response::ValidatedRecordReferences(Vec::new())), 21);
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     {
         assert_eq!(
@@ -122,7 +124,7 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
                 limit: 0,
                 require_end: 0,
             }),
-            37
+            38
         );
         assert_eq!(
             tag(&Response::LiveExports(live_control::LiveExportInfo {
@@ -134,7 +136,7 @@ fn production_wire_variant_tags_do_not_depend_on_features() {
                 block_size: 0,
                 exported_files: 0,
             })),
-            32
+            33
         );
     }
 }

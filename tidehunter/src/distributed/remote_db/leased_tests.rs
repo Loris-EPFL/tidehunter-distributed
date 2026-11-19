@@ -27,9 +27,33 @@ fn worker_with_failure_context(
     capacity: usize,
     first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
 ) -> (ClientWorker, Arc<AtomicBool>) {
-    let failure = Arc::new(AtomicBool::new(false));
     let max_pending = capacity.max(crate::distributed::tcp::APPEND_COMMAND_WINDOW);
     let completion = write_core::test_completion::TestCompletion::new(max_pending);
+    worker_with_completion(
+        fixture,
+        client,
+        capacity,
+        first_failure,
+        (completion.clone(), completion),
+        true,
+    )
+}
+
+/// `completion` is the test reply sink and the route the worker calls.
+fn worker_with_completion(
+    fixture: &Fixture,
+    client: Client,
+    capacity: usize,
+    first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
+    completion: (
+        Arc<write_core::test_completion::TestCompletion>,
+        Arc<dyn write_core::completion::AppendCompletion>,
+    ),
+    leased_submit_redrain: bool,
+) -> (ClientWorker, Arc<AtomicBool>) {
+    let (sink, route) = completion;
+    let failure = Arc::new(AtomicBool::new(false));
+    let max_pending = capacity.max(crate::distributed::tcp::APPEND_COMMAND_WINDOW);
     let mut worker = ClientWorker::start(
         client,
         capacity,
@@ -45,14 +69,106 @@ fn worker_with_failure_context(
                 fixture.config.partition.clone(),
                 max_pending,
                 crate::distributed::tcp::APPEND_COMMAND_WINDOW,
+                leased_submit_redrain,
             )
             .unwrap(),
         },
-        completion.clone(),
+        route,
     )
     .unwrap();
-    worker.test_completion = Some(completion);
+    worker.test_completion = Some(sink);
     (worker, failure)
+}
+
+/// Test completion route that runs one action in the worker's first durable
+/// callback. The worker releases replies after the drain at the top of its
+/// turn and before that turn's frame submission, so the action runs exactly
+/// between the two.
+struct ActOnFirstDurable {
+    sink: Arc<write_core::test_completion::TestCompletion>,
+    action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl write_core::completion::AppendCompletion for ActOnFirstDurable {
+    fn durable(&self, owner: u32, batches: Vec<(u64, DurableBatch)>) {
+        self.sink.durable(owner, batches);
+        if let Some(action) = self.action.lock().take() {
+            action();
+        }
+    }
+
+    fn failed(&self, owner: u32, sequences: &[u64], error: LocalDbError) {
+        self.sink.failed(owner, sequences, error);
+    }
+}
+
+/// A group that becomes READY after the top-of-turn drain: with the
+/// pre-submit re-drain it joins that turn's frame; without it, it waits for
+/// the next frame, as the single drain did before the re-drain existed.
+#[test]
+fn leased_submit_redrain_switch_selects_the_frame_of_a_late_ready_group() {
+    for redrain in [true, false] {
+        let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+        let mut client = fixture.writer();
+        client.leased_test_set_window(1);
+        client.leased_test_hold_completions(&[1]);
+        let capacity = 16;
+        let sink = write_core::test_completion::TestCompletion::new(
+            capacity.max(crate::distributed::tcp::APPEND_COMMAND_WINDOW),
+        );
+        let route = Arc::new(ActOnFirstDurable {
+            sink: sink.clone(),
+            action: Mutex::new(None),
+        });
+        let (worker, failure) = worker_with_completion(
+            &fixture,
+            client,
+            capacity,
+            Arc::new(std::sync::OnceLock::new()),
+            (sink.clone(), route.clone()),
+            redrain,
+        );
+        let batches: Vec<_> = (0..3).map(|n| fixture.batch(n)).collect();
+        let first = worker.enqueue(1, vec![batches[0].clone()]).unwrap();
+        // Flight 1 carries batch 0; its completion is reaped and held.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.client.lock().leased_test_reaped_writes() == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let mut guard = worker.client.lock();
+        // The next turn drains batch 1 and stops at ALLOCATED batch 2. Its
+        // release of flight 1 then makes batch 2 READY.
+        let second = worker.enqueue(1, vec![batches[1].clone()]).unwrap();
+        let third = sink.register(&batches[2..]).unwrap();
+        let late = batches[2].clone();
+        let (owner_sequence, _) = worker.queue.reserve(|| late.version().sequence);
+        let queue = Arc::clone(&worker.queue);
+        *route.action.lock() = Some(Box::new(move || {
+            queue.ready(owner_sequence, late.version().sequence, late);
+        }));
+        guard.leased_test_release_held();
+        drop(guard);
+        for (batch, reply) in batches.iter().zip([first, second, third]) {
+            let receipts = reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].appended().version(), batch.version());
+        }
+        assert!(route.action.lock().is_none());
+        assert_eq!(
+            *worker.accounting.formed_groups.lock(),
+            [[0], [1], [2]],
+            "redrain={redrain}"
+        );
+        assert_eq!(
+            fixture.metrics.snapshot().counts.leased_frames,
+            if redrain { 2 } else { 3 },
+            "redrain={redrain}"
+        );
+        drop(worker);
+        // Acquire observes any fatal outcome the worker published.
+        assert!(!failure.load(Ordering::Acquire));
+    }
 }
 
 #[test]
@@ -878,6 +994,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             },
             owner_append_occupancy: 1,
             pipelined_writes: true,
+            leased_submit_redrain: true,
             read_cache_bytes: 0,
             read_memory_allowance_bytes: 64 * 1024 * 1024,
             scan_prefetch_pages: 1,

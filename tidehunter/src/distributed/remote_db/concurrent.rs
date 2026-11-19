@@ -874,6 +874,13 @@ fn owner_timeline_error(
 }
 
 impl ConcurrentRemoteDatabase {
+    /// Owner persistence counters summed over owners, for benchmark boundaries.
+    pub fn storage_stats(
+        &self,
+    ) -> Result<crate::distributed::storage::PartitionStats, LocalDbError> {
+        self.database.storage_stats()
+    }
+
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
         self.live_metrics.as_ref().map(|metrics| metrics.snapshot())

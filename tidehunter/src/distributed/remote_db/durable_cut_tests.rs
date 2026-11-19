@@ -163,9 +163,9 @@ fn write_around_an_aborted_version(flushed: bool) -> Fixture {
     fixture
 }
 
-/// Coordinator-only crash: the owners keep their boot and recover without a
-/// hole, so the aborted version was never written. Extend skips it and keeps
-/// the acknowledged write after it, flushed or not.
+/// Coordinator-only crash: the owner processes keep running (same incarnation)
+/// and recover without a hole, so the aborted version was never written. Extend
+/// skips it and keeps the acknowledged write after it, flushed or not.
 #[test]
 fn continuous_owners_keep_acknowledged_writes_above_an_aborted_version() {
     for flushed in [false, true] {
@@ -190,16 +190,16 @@ fn continuous_owners_keep_acknowledged_writes_above_an_aborted_version() {
     }
 }
 
-/// An owner whose boot changed bounds the skip at its recorded synced end: the
-/// aborted sequence 1 is skipped only when that owner's record covers it, and
-/// a flush still keeps the acknowledged write either way.
+/// An owner whose incarnation changed bounds the skip at its recorded synced
+/// end: the aborted sequence 1 is skipped only when that owner's record covers
+/// it, and a flush still keeps the acknowledged write either way.
 #[test]
-fn rebooted_owner_bounds_the_skip_at_its_recorded_sync() {
+fn restarted_owner_bounds_the_skip_at_its_recorded_sync() {
     for (flushed, recorded, kept) in [(false, 1, false), (false, 2, true), (true, 0, true)] {
         let fixture = write_around_an_aborted_version(flushed);
         let authority = fixture.temp.path().join("authority");
         super::durable_cut::rewrite_marks_for_test(&authority, |marks| {
-            marks[1].boot_id = [0x5a; 16];
+            marks[1].incarnation = [0x5a; 16];
             marks[1].synced_next = recorded;
         });
         let mut db = fixture.open();
@@ -217,6 +217,75 @@ fn rebooted_owner_bounds_the_skip_at_its_recorded_sync() {
             "flushed={flushed} recorded={recorded}"
         );
     }
+}
+
+/// Same boot, new owner process. Owner 1 acknowledged v1 above the persisted
+/// cut and lost it: a failed fsync drops dirty pages without a reboot, and the
+/// owner stops and restarts. Owner 0 keeps v2. The restarted owner recovers
+/// without a hole, but its incarnation changed, so Extend stops at the lost v1
+/// and discards v2, and a later open keeps that truncation.
+#[test]
+fn restarted_owner_process_stops_extend_at_its_lost_version() {
+    let mut fixture = fixture(2, quiet(CutRecovery::Extend));
+    let db = fixture.open();
+    let epoch = db.epoch();
+    db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
+        .unwrap();
+    db.core.flush_durable().unwrap();
+    let lost = db
+        .write_batch(fixture.operation(1, 2), vec![put(2, 2)])
+        .unwrap();
+    let kept = db
+        .write_batch(fixture.operation(0, 3), vec![put(3, 3)])
+        .unwrap();
+    assert_eq!((lost.sequence, kept.sequence), (1, 2));
+    assert_eq!(db.durable_cut_stats().persisted_next, 1);
+    // Owner 1's syncer fsync fails: the failure is sticky, so its log never
+    // seals and the owner must restart.
+    let log = fixture.nodes[1].log_for_test(epoch);
+    log.fail_next_persist();
+    let frontier = log.frontier().unwrap().clone();
+    drop(log);
+    assert!(
+        crate::distributed::durability::frontier::flush_all(&[frontier], None)
+            .into_synced()
+            .is_err()
+    );
+    // The coordinator fails too.
+    super::tests::fail_stop_without_checkpoint(db);
+    fixture.stop_owners();
+    // v1 is owner 1's only frame of the epoch: the failed fsync dropped its
+    // dirty pages.
+    let wal = fixture
+        .temp
+        .path()
+        .join(format!("node-1/epoch_{epoch:016}/wal_0000000000000000"));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(wal)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    fixture.restart_owners().unwrap();
+    let mut db = fixture.open();
+    let stats = db.recovery_stats();
+    // Both owners restarted; owner 1's mark has nothing synced.
+    assert_eq!(stats.cut_continuity_bound, Some(0));
+    assert_eq!(stats.recovered_cut, Some(RecoveredCut { epoch, next: 1 }));
+    assert_eq!(
+        (stats.cut_discarded_batches, stats.cut_skipped_versions),
+        (1, 0)
+    );
+    assert_eq!(
+        [1, 2, 3].map(|key| value(&mut db, key)),
+        [Some(1), None, None]
+    );
+    crash(db);
+    let mut db = fixture.open();
+    assert_eq!(
+        [1, 2, 3].map(|key| value(&mut db, key)),
+        [Some(1), None, None]
+    );
 }
 
 /// Every step of open is crash safe: an interruption after the record and

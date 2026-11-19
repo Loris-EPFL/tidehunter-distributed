@@ -74,6 +74,15 @@ accepted), and `local_dry_run.py --wal-prewrite`/`--no-wal-prewrite` overrides a
 case that does not set the value. The CI kernel NVMe/TCP proof runs a gating
 `--no-wal-prewrite` pass, then a non-gating `--wal-prewrite` pass.
 
+For the NVMe-oF write-engine selections, `nvmeof_path.py` exports the scalar
+controls in `puts.csv` (`G35W`) and `reads.csv` (`G35R`). Each `replays.csv`
+row (`G35S`) is one case: `concurrency` is the number of read callers and `K`
+is the planned pipeline depth (1 when omitted by the older matrix).
+`commit_*` and `get_*` are separate measurement-window API populations, not
+the synthetic job's `put`/`read` mix. Both API rates and mean in-flight values
+use the replay's own elapsed time. `checkpoints_per_second` measures trace
+repetitions, not full-node Sui checkpoint processing.
+
 ## Linux page-cache owner branch
 
 On `experiment/linux-pagecache-nvme-rdma`, the coordinator value cache remains,

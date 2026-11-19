@@ -3885,6 +3885,7 @@ fn request_kind_code(request: &Request) -> u64 {
         Request::ReplayWal { .. } => 19,
         Request::RetireWalFiles { .. } => 20,
         Request::DurableProgress { .. } => 44,
+        Request::PartitionStats => 45,
         #[cfg(feature = "experimental-nvmeof")]
         Request::ValidateRecordReferences { .. } => 21,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

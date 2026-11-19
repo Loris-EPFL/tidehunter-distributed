@@ -154,7 +154,21 @@ class TargetsContractTests(unittest.TestCase):
 
     def test_kernel_qualification_rejects_invalid_transport(self):
         with self.assertRaises(ValueError):
-            targets.qualify_kernel_live(self.root, '/binary', transport='other')
+            targets.qualify_kernel_live(self.root, '/binary', transport='other',
+                                        history_persistence='on_disk')
+
+    def test_kernel_qualification_requires_durable_history(self):
+        with self.assertRaisesRegex(ValueError, 'history persistence'):
+            targets.qualify_kernel_live(self.root, '/binary', history_persistence='memory_only')
+
+    def test_kernel_qualification_passes_history_to_worker(self):
+        for history in ('on_disk', 'wal_replay'):
+            with self.subTest(history=history), patch.object(targets.subprocess, 'run') as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = '{"complete": true}'
+                self.assertTrue(targets.qualify_kernel_live(
+                    self.root, '/binary', transport='tcp', history_persistence=history)['complete'])
+                self.assertEqual(run.call_args.args[0][-1], history)
 
     def test_kernel_worker_rejects_untrusted_output_before_creating_artifacts(self):
         self.root.chmod(0o777)
@@ -162,7 +176,7 @@ class TargetsContractTests(unittest.TestCase):
         with patch.object(targets.os, 'geteuid', return_value=0):
             with self.assertRaisesRegex(ValueError, 'untrusted directory'):
                 targets._kernel_live_worker(self.root, self.root / 'missing-binary',
-                                            'rdma', 120, 0)
+                                            'rdma', 120, 0, history_persistence='on_disk')
         self.assertEqual(set(self.root.iterdir()), before)
 
 

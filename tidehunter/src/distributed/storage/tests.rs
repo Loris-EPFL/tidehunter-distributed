@@ -113,6 +113,448 @@ fn append_live_fixture(log: &PartitionLog, config: &PartitionConfig, n: u64) -> 
         .unwrap()[0]
 }
 
+/// Live geometry whose fragment holds several 4 KiB frames, so the syncer can
+/// defer the root within a fragment.
+#[cfg(feature = "experimental-nvmeof")]
+fn live_multi_frame_config() -> PartitionConfig {
+    let mut config = live_config();
+    config.fragment_bytes = 64 * 1024;
+    config.wal_file_bytes = 128 * 1024;
+    config
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+fn live_root_end(path: &Path) -> u64 {
+    read_metadata::<LiveFrontier>(&path.join(LIVE_FRONTIER))
+        .unwrap()
+        .end
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+fn live_log_for(
+    path: &Path,
+    config: &PartitionConfig,
+    mode: HistoryPersistence,
+    tier: crate::distributed::durability::DurabilityTier,
+) -> PartitionLog {
+    let log = PartitionLog::create_live(path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(mode).unwrap();
+    log.attach_frontier(&crate::distributed::durability::DurabilityConfig::with_tier(tier))
+        .unwrap();
+    log
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+const TIERS: [crate::distributed::durability::DurabilityTier; 2] = [
+    crate::distributed::durability::DurabilityTier::Native,
+    crate::distributed::durability::DurabilityTier::Synchronous,
+];
+
+/// The syncer syncs the WAL but defers the root inside a fragment only with
+/// WAL-replay history; on-disk history keeps the root at the durable end.
+/// Either way a crash recovers every synced frame by scanning past the root.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn syncer_defers_live_root_only_with_wal_replay_history_and_recovers_by_scan() {
+    for tier in TIERS {
+        for mode in [HistoryPersistence::WalReplay, HistoryPersistence::OnDisk] {
+            let temp = tempdir::TempDir::new("live-root-deferred").unwrap();
+            let config = live_multi_frame_config();
+            let path = temp.path().join("stream");
+            let log = live_log_for(&path, &config, mode, tier);
+            let first = append_live_fixture(&log, &config, 0);
+            log.sync_for_frontier().unwrap();
+            let second = append_live_fixture(&log, &config, 1);
+            log.sync_for_frontier().unwrap();
+            let stats = log.stats();
+            assert_eq!(stats.wal_file_syncs, 2);
+            log.validate_durable_receipt(DurableBatch(second)).unwrap();
+            if mode == HistoryPersistence::WalReplay {
+                assert_eq!(
+                    (stats.live_frontier_installs, stats.live_frontier_deferred),
+                    (0, 2)
+                );
+                assert_eq!(live_root_end(&path), 0);
+            } else {
+                assert_eq!(
+                    (stats.live_frontier_installs, stats.live_frontier_deferred),
+                    (2, 0)
+                );
+                assert_eq!(live_root_end(&path), 8192);
+            }
+            drop(log);
+            let recovered =
+                PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+            assert_eq!(recovered.lookup(first.id()).unwrap(), Some(first));
+            assert_eq!(recovered.lookup(second.id()).unwrap(), Some(second));
+        }
+    }
+}
+
+/// Crash at every step of the explicit root catch-up after a deferral: the
+/// failed barrier reports an unknown outcome, and recovery still finds every
+/// synced frame whichever root (old or new) survived.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_root_catch_up_crash_cuts_recover_every_synced_frame() {
+    for tier in TIERS {
+        for phase in 0..=3 {
+            let temp = tempdir::TempDir::new("live-root-catch-up").unwrap();
+            let config = live_multi_frame_config();
+            let path = temp.path().join("stream");
+            let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+            let first = append_live_fixture(&log, &config, 0);
+            let second = append_live_fixture(&log, &config, 1);
+            log.sync_for_frontier().unwrap();
+            assert_eq!(live_root_end(&path), 0);
+            log.fail_live_frontier.store(phase, Ordering::Release);
+            let result = log.persist_live_root();
+            if phase == 0 {
+                result.unwrap();
+                assert_eq!(live_root_end(&path), 8192);
+                assert_eq!(log.stats().live_frontier_installs, 1);
+                // The root is current: a second barrier installs nothing.
+                log.persist_live_root().unwrap();
+                assert_eq!(log.stats().live_frontier_installs, 1);
+            } else {
+                assert!(matches!(result, Err(StorageError::Unknown(_))));
+                assert_eq!(live_root_end(&path), if phase == 3 { 8192 } else { 0 });
+            }
+            drop(log);
+            let recovered =
+                PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+            assert_eq!(recovered.lookup(first.id()).unwrap(), Some(first));
+            assert_eq!(recovered.lookup(second.id()).unwrap(), Some(second));
+        }
+    }
+}
+
+/// A fragment crossing installs the root even under the bounded policy, and
+/// only that install reports durable progress.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn syncer_installs_live_root_on_fragment_crossing() {
+    let temp = tempdir::TempDir::new("live-root-crossing").unwrap();
+    let mut config = live_multi_frame_config();
+    config.fragment_bytes = 8192;
+    let path = temp.path().join("stream");
+    let log = live_log_for(
+        &path,
+        &config,
+        HistoryPersistence::WalReplay,
+        crate::distributed::durability::DurabilityTier::Synchronous,
+    );
+    append_live_fixture(&log, &config, 0);
+    log.sync_for_frontier().unwrap();
+    assert_eq!(log.stats().live_frontier_installs, 0);
+    let deferred = log.durable_progress();
+    assert_eq!((deferred.synced, deferred.synced_end), (None, 0));
+    append_live_fixture(&log, &config, 1);
+    log.sync_for_frontier().unwrap();
+    assert_eq!(log.stats().live_frontier_installs, 1);
+    assert_eq!(live_root_end(&path), 8192);
+    let rooted = log.durable_progress();
+    assert_eq!(
+        (rooted.synced, rooted.synced_end, rooted.generation),
+        (Some(version(&config, 1)), 8192, 1)
+    );
+}
+
+/// An abrupt crash after one synced live append, then the owner operations of
+/// a recovery open on the recovered sealed log: per-receipt recovery barriers
+/// (`RecoverLiveMetadata`, checkpoint proof), flush, the fence/retire root
+/// catch-up and durable-progress status. Recovery leaves no unsynced data and
+/// no root debt, so none of them may need a live tail. A second recovery
+/// proves these operations leave the stream recoverable.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn recovered_live_log_serves_recovery_barriers_after_abrupt_crash() {
+    use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        for mode in [HistoryPersistence::WalReplay, HistoryPersistence::OnDisk] {
+            let temp = tempdir::TempDir::new("live-abrupt-recovery").unwrap();
+            let mut config = live_config();
+            config.fragment_bytes = 64 * 1024;
+            config.wal_file_bytes = 128 * 1024;
+            let path = temp.path().join("stream");
+            let log =
+                PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+            log.set_history_persistence(mode).unwrap();
+            log.attach_frontier(&DurabilityConfig::with_tier(tier))
+                .unwrap();
+            let appended = append_live_fixture(&log, &config, 0);
+            log.sync_for_frontier().unwrap();
+            // Abrupt: no flush, fence or shutdown barrier runs before the drop.
+            drop(log);
+            let mut durable_state = None;
+            // Each pass drops the recovered handle without shutdown: a second
+            // abrupt crash after the post-recovery barriers.
+            for _ in 0..2 {
+                let recovered =
+                    PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(()))
+                        .unwrap();
+                // Recovery itself leaves a root covering the recovered end.
+                assert_eq!(live_root_end(&path), 4096);
+                let receipts = recovered.receipt_page(0, 16).unwrap();
+                assert_eq!(receipts, vec![appended]);
+                assert_eq!(
+                    recovered.persist_through(appended).unwrap(),
+                    DurableBatch(appended)
+                );
+                assert_eq!(
+                    recovered.persist_many(&receipts).unwrap(),
+                    vec![DurableBatch(appended)]
+                );
+                assert_eq!(recovered.persist_appended().unwrap(), 4096);
+                recovered.persist_live_root().unwrap();
+                // The recovered handle owes no root: the barriers install none.
+                assert_eq!(recovered.stats().live_frontier_installs, 0);
+                let progress = recovered.durable_progress();
+                assert_eq!((progress.appended_end, progress.synced_end), (4096, 4096));
+                assert_eq!(recovered.lookup(appended.id()).unwrap(), Some(appended));
+                assert_eq!(
+                    recovered.read_batch(appended).unwrap().encoded(),
+                    batch(&config, 0).encoded()
+                );
+                let state = (
+                    read_metadata::<LiveFrontier>(&path.join(LIVE_FRONTIER)).unwrap(),
+                    read_metadata::<SealedEnd>(&path.join(SEAL)).unwrap(),
+                );
+                assert_eq!(state.1.physical_end, 4096);
+                assert_eq!(*durable_state.get_or_insert_with(|| state.clone()), state);
+            }
+        }
+    }
+}
+
+/// With a lagging root, recovery scans forward and stops at the first invalid
+/// frame beyond it (a torn tail), keeping every valid frame before it.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn lagging_live_root_recovery_stops_at_first_invalid_frame() {
+    for tier in TIERS {
+        let temp = tempdir::TempDir::new("live-root-lagging").unwrap();
+        let config = live_multi_frame_config();
+        let path = temp.path().join("stream");
+        let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+        let first = append_live_fixture(&log, &config, 0);
+        let second = append_live_fixture(&log, &config, 1);
+        let third = append_live_fixture(&log, &config, 2);
+        log.sync_for_frontier().unwrap();
+        assert_eq!(live_root_end(&path), 0);
+        drop(log);
+        // Tear the middle frame: everything from it on is an unproven tail.
+        tear_live_frame(&path, &config, second);
+        let recovered =
+            PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+        assert_eq!(recovered.lookup(first.id()).unwrap(), Some(first));
+        assert_eq!(recovered.lookup(second.id()).unwrap(), None);
+        assert_eq!(recovered.lookup(third.id()).unwrap(), None);
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+fn version(config: &PartitionConfig, sequence: u64) -> BatchVersion {
+    BatchVersion {
+        epoch: config.inventory.epoch,
+        sequence,
+    }
+}
+
+/// Overwrite the CRC-covered start of `receipt`'s frame and sync the file. The
+/// first WAL file is the only directory entry of the full file size.
+#[cfg(feature = "experimental-nvmeof")]
+fn tear_live_frame(path: &Path, config: &PartitionConfig, receipt: AppendedBatch) {
+    let wal = fs::read_dir(path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.len() == config.wal_file_bytes)
+        })
+        .unwrap()
+        .path();
+    let file = OpenOptions::new().write(true).open(wal).unwrap();
+    file.write_all_at(&[0x5a; 16], receipt.address().offset + 8)
+        .unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A durable-progress report covers only the prefix of the installed strict
+/// live root. With the root deferred, the report names no version, so no cut
+/// built from it covers a frame that recovery drops as a torn tail. After the
+/// nudge barrier rooted and reported all three frames (a cut `next = 3`), the
+/// same corruption of the middle frame is fatal at recovery: certified batches
+/// are never dropped silently. Each run stops abruptly, without a barrier.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn durable_progress_covers_only_the_rooted_prefix_and_recovery_enforces_it() {
+    for tier in TIERS {
+        for nudge in [false, true] {
+            let temp = tempdir::TempDir::new("live-root-progress").unwrap();
+            let config = live_multi_frame_config();
+            let path = temp.path().join("stream");
+            let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+            let first = append_live_fixture(&log, &config, 0);
+            let second = append_live_fixture(&log, &config, 1);
+            let third = append_live_fixture(&log, &config, 2);
+            log.sync_for_frontier().unwrap();
+            // Every frame is synced, but the bounded syncer deferred the root.
+            let end = log.appended_frontier();
+            assert_eq!(log.synced_frontier(), end);
+            assert_eq!(live_root_end(&path), 0);
+            let deferred = log.durable_progress();
+            assert_eq!(
+                (
+                    deferred.appended,
+                    deferred.synced,
+                    deferred.synced_end,
+                    deferred.generation
+                ),
+                (Some(version(&config, 2)), None, 0, 0)
+            );
+            if nudge {
+                assert!(log.persist_live_progress().unwrap());
+                assert_eq!(live_root_end(&path), end);
+                let rooted = log.durable_progress();
+                assert_eq!(
+                    (rooted.synced, rooted.synced_end, rooted.generation),
+                    (Some(version(&config, 2)), end, 1)
+                );
+                assert!(rooted.idle());
+            }
+            // The cut the coordinator may persist from this report.
+            let cut_next = log
+                .durable_progress()
+                .synced
+                .map_or(0, |version| version.sequence + 1);
+            assert_eq!(cut_next, if nudge { 3 } else { 0 });
+            drop(log);
+            tear_live_frame(&path, &config, second);
+            let recovered = PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(()));
+            if nudge {
+                // Below the strict root a torn frame is corrupt durable state.
+                assert!(
+                    matches!(recovered, Err(StorageError::Invalid(_))),
+                    "{:?}",
+                    recovered.as_ref().err()
+                );
+            } else {
+                // Below the cut nothing is lost; the torn tail starts above it.
+                let recovered = recovered.unwrap();
+                assert_eq!(recovered.lookup(first.id()).unwrap(), Some(first));
+                assert_eq!(recovered.lookup(second.id()).unwrap(), None);
+                assert_eq!(recovered.lookup(third.id()).unwrap(), None);
+            }
+        }
+    }
+}
+
+/// The nudge barrier syncs and roots what the syncer left unreported, reports
+/// it, and installs nothing when the report is current. A recovered handle has
+/// identical byte ends and its recovery root, so its nudge needs no live tail.
+/// A stream that is not live leaves the nudge to its syncer.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn progress_nudge_roots_the_appended_prefix_once() {
+    for tier in TIERS {
+        let temp = tempdir::TempDir::new("live-progress-nudge").unwrap();
+        let config = live_multi_frame_config();
+        let path = temp.path().join("stream");
+        let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+        append_live_fixture(&log, &config, 0);
+        log.sync_for_frontier().unwrap();
+        assert!(log.persist_live_progress().unwrap());
+        let first_end = log.appended_frontier();
+        assert_eq!(live_root_end(&path), first_end);
+        assert_eq!(log.stats().live_frontier_installs, 1);
+        // Unsynced: the barrier syncs the WAL and installs the root over it.
+        let appended = append_live_fixture(&log, &config, 1);
+        let syncs = log.stats().wal_file_syncs;
+        assert!(log.persist_live_progress().unwrap());
+        let end = log.appended_frontier();
+        assert!(end > first_end);
+        let stats = log.stats();
+        assert_eq!(
+            (stats.wal_file_syncs, stats.live_frontier_installs),
+            (syncs + 1, 2)
+        );
+        assert_eq!(live_root_end(&path), end);
+        let progress = log.durable_progress();
+        assert_eq!(
+            (progress.synced, progress.synced_end, progress.generation),
+            (Some(version(&config, 1)), end, 2)
+        );
+        // Current report: no further install.
+        assert!(log.persist_live_progress().unwrap());
+        assert_eq!(log.stats().live_frontier_installs, 2);
+        drop(log);
+        let recovered =
+            PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+        assert!(recovered.persist_live_progress().unwrap());
+        assert_eq!(recovered.stats().live_frontier_installs, 0);
+        let progress = recovered.durable_progress();
+        assert_eq!(
+            (progress.synced, progress.appended_end, progress.synced_end),
+            (None, end, end)
+        );
+        assert_eq!(recovered.lookup(appended.id()).unwrap(), Some(appended));
+    }
+    let temp = tempdir::TempDir::new("progress-nudge-not-live").unwrap();
+    let config = config(vec![3], 3);
+    let log =
+        PartitionLog::create(&temp.path().join("stream"), config, &shape(), metrics()).unwrap();
+    assert!(!log.persist_live_progress().unwrap());
+}
+
+/// Adoption requests no per-frame sync. An owner read of the newest batch
+/// returns it in both tiers: Synchronous persists the WAL on demand first
+/// (one fdatasync, no root install); Native serves the page-cache copy without
+/// a sync. Either way a crash after the read recovers the batch.
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn owner_read_of_newest_batch_persists_on_demand_only_in_synchronous_tier() {
+    for tier in TIERS {
+        let temp = tempdir::TempDir::new("live-read-on-demand").unwrap();
+        let config = live_multi_frame_config();
+        let path = temp.path().join("stream");
+        let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+        let newest = append_live_fixture(&log, &config, 0);
+        let reference = log.record_reference(newest, 0).unwrap();
+        let before = log.stats();
+        // The owner serving boundary (`validate_durable_record_reference`, used
+        // by the owner read handler, read workers and record grants) obtains its
+        // own covering barrier before any byte leaves the owner.
+        log.validate_durable_record_reference(&reference).unwrap();
+        assert_eq!(
+            log.read_record(&reference).unwrap(),
+            batch(&config, 0).mutations()[0],
+            "{tier}"
+        );
+        let after = log.stats();
+        let synchronous = tier == crate::distributed::durability::DurabilityTier::Synchronous;
+        assert_eq!(
+            after.wal_file_syncs - before.wal_file_syncs,
+            u64::from(synchronous),
+            "{tier}"
+        );
+        assert_eq!(after.live_frontier_installs, before.live_frontier_installs);
+        assert_eq!(
+            after.read_persist_requests - before.read_persist_requests,
+            u64::from(synchronous),
+            "{tier}"
+        );
+        if synchronous {
+            log.validate_durable_receipt(DurableBatch(newest)).unwrap();
+        }
+        drop(log);
+        let recovered =
+            PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+        assert_eq!(recovered.lookup(newest.id()).unwrap(), Some(newest));
+    }
+}
+
 #[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn live_final_frames_persist_retry_and_recover_across_rollover() {
