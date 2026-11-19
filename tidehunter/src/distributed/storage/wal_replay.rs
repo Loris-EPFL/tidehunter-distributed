@@ -915,6 +915,23 @@ impl PartitionLog {
         if !root.cleanup_pending.is_empty() {
             File::open(&path)?.sync_all()?;
         }
+        // What the repeated unlink found, for the R1 event stream: a present
+        // dirent is the pending inode (checked above) and was just unlinked.
+        let recovered_cleanup: Vec<_> = root
+            .cleanup_pending
+            .iter()
+            .map(|entry| {
+                let present = retired_present
+                    .iter()
+                    .any(|&(offset, _, _)| offset == entry.start);
+                let outcome = if present {
+                    super::UnlinkOutcome::Unlinked
+                } else {
+                    super::UnlinkOutcome::AlreadyAbsent
+                };
+                (*entry, outcome)
+            })
+            .collect();
         let mut log = Self {
             state: Mutex::new(State {
                 open_live_extent: None,
@@ -960,6 +977,7 @@ impl PartitionLog {
             fail_wal_retire: AtomicBool::new(false),
             #[cfg(test)]
             r1_crash: AtomicU8::new(0),
+            recovered_cleanup: Mutex::new(recovered_cleanup),
             #[cfg(test)]
             before_unlink: Mutex::new(None),
             #[cfg(test)]

@@ -61,21 +61,41 @@ impl NodeInventory {
         inventory.value_wal_unlinks = inventory
             .value_wal_unlinks
             .saturating_add(u64::try_from(files.len()).unwrap_or(u64::MAX));
-        inventory.released(|| {
-            let outcome = log
-                .retire_sealed_stream_files(proofs)
-                .map_err(TcpError::component)?;
-            if outcome == RetirementOutcome::Busy {
-                return Ok(outcome);
+        let emit = inventory.r1_events.is_some();
+        let (outcome, done, tombstones, cleared) =
+            inventory.released(|| -> Result<_, TcpError> {
+                let outcome = log
+                    .retire_sealed_stream_files(proofs)
+                    .map_err(TcpError::component)?;
+                if outcome == RetirementOutcome::Busy {
+                    return Ok((outcome, Vec::new(), Vec::new(), None));
+                }
+                let done = log.pending_file_retirements();
+                let mut tombstones = Vec::new();
+                if let Some(target) = target.as_mut() {
+                    if emit {
+                        tombstones.reserve_exact(done.len());
+                    }
+                    finish_tombstones(target, &log, &done, |removed| {
+                        if emit {
+                            tombstones.push(removed);
+                        }
+                    })?;
+                }
+                let cleared = log
+                    .clear_retirement_cleanup(&done)
+                    .map_err(TcpError::component)?;
+                Ok((outcome, done, tombstones, cleared))
+            })?;
+        // Older sealed stream: only the cleanup completions are published
+        // (its decision and unlink steps are not part of the R1 contract).
+        if let Some(events) = inventory.r1_events.as_mut() {
+            emit_tombstones(events, epoch, &done, &tombstones, Some("older_sealed"));
+            if let Some(cleared) = &cleared {
+                emit_cleared(events, epoch, cleared, Some("older_sealed"));
             }
-            let done = log.pending_file_retirements();
-            if let Some(target) = target.as_mut() {
-                finish_tombstones(target, &log, &done)?;
-            }
-            log.clear_retirement_cleanup(&done)
-                .map_err(TcpError::component)?;
-            Ok(outcome)
-        })
+        }
+        Ok(outcome)
     }
 
     /// Serving stream: retire durably sealed files proved dead by `witness`.
@@ -104,6 +124,10 @@ impl NodeInventory {
             inventory.lock().file_maintenance.busy_retirements += 1;
             return Ok(RetirementOutcome::Busy);
         }
+        // Durable seals as of this request, read before any lock: the victims'
+        // seals are reported before their first retirement step (the
+        // preparer reports seals only after a whole kick).
+        let seals = log.file_retirement_state().0;
         {
             let mut slot = lifecycle.lock();
             let mut guard = inventory.lock();
@@ -117,20 +141,65 @@ impl NodeInventory {
                 guard.file_maintenance.busy_retirements += 1;
                 return Ok(RetirementOutcome::Busy);
             }
-            if let Some(target) = live_target(&guard, &mut slot)?
-                && let Err(error) =
-                    Self::revoke_live_files(&mut guard, target, authority_epoch, &files)
-            {
-                guard.healthy = false;
-                return Err(error);
+            if let Some(events) = guard.r1_events.as_mut() {
+                events.seals(authority_epoch, &seals);
+            }
+            if let Some(target) = live_target(&guard, &mut slot)? {
+                let revoked =
+                    match Self::revoke_live_files(&mut guard, target, authority_epoch, &files) {
+                        Ok(revoked) => revoked,
+                        Err(error) => {
+                            guard.healthy = false;
+                            return Err(error);
+                        }
+                    };
+                // Only files whose binding this call revoked: zero victim
+                // pins were checked above, and `enable=0` drained their
+                // target I/O and left durable tombstones. A victim with no
+                // binding (never exported, evicted, or revoked by an
+                // earlier attempt) had no target step here.
+                if let Some(events) = guard.r1_events.as_mut() {
+                    events.victims(
+                        "target_io_drained",
+                        authority_epoch,
+                        &revoked,
+                        &serde_json::json!({
+                            "record_pins": 0,
+                            "export_pins": 0,
+                            "drain": "namespace_enable_0",
+                        }),
+                    );
+                    events.victims(
+                        "target_removed",
+                        authority_epoch,
+                        &revoked,
+                        &serde_json::json!({"tombstone_durable": true}),
+                    );
+                }
             }
         }
-        let outcome = log
-            .authorize_file_retirement(proofs, witness)
+        let authorized = log
+            .authorize_file_retirement_recorded(proofs, witness)
             .map_err(TcpError::component)?;
+        let outcome = authorized.outcome;
         if outcome == RetirementOutcome::Busy {
             inventory.lock().file_maintenance.busy_retirements += 1;
             return Ok(outcome);
+        }
+        // Only entries this call recorded in a new durable root; a repeated
+        // proof of an already retired file made no root change.
+        if let Some(events) = inventory.lock().r1_events.as_mut() {
+            for entry in &authorized.recorded {
+                events.victims(
+                    "retirement_root_durable",
+                    authority_epoch,
+                    &pending_files(std::slice::from_ref(entry)),
+                    &serde_json::json!({
+                        "seal_generation": entry.seal_generation,
+                        "root_generation": authorized.root_generation,
+                    }),
+                );
+            }
         }
         Self::finish_active_retirement(inventory, lifecycle, &log)?;
         Ok(outcome)
@@ -143,20 +212,43 @@ impl NodeInventory {
         lifecycle: &Mutex<LifecycleSlot>,
         log: &Arc<PartitionLog>,
     ) -> Result<(), TcpError> {
-        let done = log.finish_file_retirement().map_err(TcpError::component)?;
-        if done.is_empty() {
+        let outcomes = log
+            .finish_file_retirement_outcomes()
+            .map_err(TcpError::component)?;
+        if outcomes.is_empty() {
             return Ok(());
         }
-        let configured = inventory.lock().live_target_configured;
+        let generation = log.config().inventory.epoch;
+        if let Some(events) = inventory.lock().r1_events.as_mut() {
+            events.unlinked(generation, &outcomes, "retirement");
+        }
+        let done: Vec<_> = outcomes.into_iter().map(|(entry, _)| entry).collect();
+        let (configured, emit) = {
+            let guard = inventory.lock();
+            (guard.live_target_configured, guard.r1_events.is_some())
+        };
         if configured {
             let mut slot = lifecycle.lock();
             let target = slot
                 .as_mut()
                 .ok_or_else(|| TcpError::new("live target disappeared"))?;
-            finish_tombstones(target, log, &done)?;
+            let mut removed = Vec::with_capacity(if emit { done.len() } else { 0 });
+            finish_tombstones(target, log, &done, |did_remove| {
+                if emit {
+                    removed.push(did_remove);
+                }
+            })?;
+            drop(slot);
+            if emit && let Some(events) = inventory.lock().r1_events.as_mut() {
+                emit_tombstones(events, generation, &done, &removed, None);
+            }
         }
-        log.clear_retirement_cleanup(&done)
+        let cleared = log
+            .clear_retirement_cleanup(&done)
             .map_err(TcpError::component)?;
+        if let (Some(cleared), Some(events)) = (&cleared, inventory.lock().r1_events.as_mut()) {
+            emit_cleared(events, generation, cleared, None);
+        }
         let mut guard = inventory.lock();
         let count = u64::try_from(done.len()).unwrap_or(u64::MAX);
         guard.value_wal_unlinks = guard.value_wal_unlinks.saturating_add(count);
@@ -194,15 +286,59 @@ impl NodeInventory {
 }
 
 /// Remove each retired inode's tombstone after its unlink and directory sync.
+/// Report per entry whether this call removed its tombstone.
 pub(super) fn finish_tombstones(
     target: &mut LiveTarget,
     log: &PartitionLog,
     done: &[crate::distributed::storage::PendingRetirement],
+    mut report: impl FnMut(bool),
 ) -> Result<(), TcpError> {
     for entry in done {
-        target
+        let removed = target
             .finish_retired_file(&log.wal_file_path(entry.start), entry.device, entry.inode)
             .map_err(TcpError::component)?;
+        report(removed);
     }
     Ok(())
+}
+
+/// `(start, device, inode)` of pending retirement entries.
+fn pending_files(done: &[crate::distributed::storage::PendingRetirement]) -> Vec<(u64, u64, u64)> {
+    done.iter()
+        .map(|entry| (entry.start, entry.device, entry.inode))
+        .collect()
+}
+
+/// One `target_tombstone_synced` per entry: the marker directory sync is
+/// durable; `tombstone_removed` says whether this call removed the marker.
+fn emit_tombstones(
+    events: &mut r1_events::OwnerR1Events,
+    generation: u64,
+    done: &[crate::distributed::storage::PendingRetirement],
+    removed: &[bool],
+    stream: Option<&str>,
+) {
+    for (entry, removed) in done.iter().zip(removed) {
+        events.victims(
+            "target_tombstone_synced",
+            generation,
+            &pending_files(std::slice::from_ref(entry)),
+            &serde_json::json!({"tombstone_removed": removed, "stream": stream}),
+        );
+    }
+}
+
+/// One `cleanup_root_durable` per entry the clear removed, with its root.
+fn emit_cleared(
+    events: &mut r1_events::OwnerR1Events,
+    generation: u64,
+    cleared: &crate::distributed::storage::Cleared,
+    stream: Option<&str>,
+) {
+    events.victims(
+        "cleanup_root_durable",
+        generation,
+        &pending_files(&cleared.removed),
+        &serde_json::json!({"root_generation": cleared.root_generation, "stream": stream}),
+    );
 }

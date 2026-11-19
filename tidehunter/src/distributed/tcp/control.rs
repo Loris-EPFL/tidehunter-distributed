@@ -1396,6 +1396,21 @@ impl ControlContext {
             })
             .ok_or_else(|| TcpError::new("live pin token allocation failed"))?;
         inventory.live_pins.insert(token, (epoch, leases));
+        if let Some(events) = inventory.r1_events.as_mut() {
+            events.pin(
+                "pin_held",
+                "record",
+                token,
+                metadata.iter().map(|(segment, _, _)| {
+                    (
+                        segment.epoch,
+                        segment.file_index,
+                        Some((segment.device, segment.inode)),
+                    )
+                }),
+                "resolve",
+            );
+        }
         let mut locations = Vec::with_capacity(metadata.len());
         for (segment, offset, len) in metadata {
             let binding = match inventory.live_segment_writable(epoch, &segment) {
@@ -1463,14 +1478,29 @@ impl ControlContext {
     /// readers follow it. An I/O error only leaves the file unsealed until a
     /// later kick. Takes the inventory only to count, never the gate.
     fn seal_ready_files(&self, log: &Arc<super::super::storage::PartitionLog>) {
-        match log.seal_ready_files() {
-            Ok(0) | Err(StorageError::Io(_)) => {}
-            Ok(sealed) => {
-                let mut inventory = self.inventory.lock();
-                let stats = &mut inventory.file_maintenance;
-                stats.sealed_files = stats.sealed_files.saturating_add(sealed as u64);
-            }
-            Err(_) => self.poison_readers(),
+        let result = log.seal_ready_files();
+        if matches!(result, Ok(0)) {
+            return;
+        }
+        if let Err(error) = &result
+            && !matches!(error, StorageError::Io(_))
+        {
+            self.poison_readers();
+            return;
+        }
+        // Read the durable seals before the inventory lock (state lock only);
+        // the events follow the root installs they name. A kick that ends in
+        // an I/O error keeps the seals it installed before it, so they are
+        // reported too.
+        let seals = log.file_retirement_state().0;
+        let generation = log.config().inventory.epoch;
+        let mut inventory = self.inventory.lock();
+        if let Ok(sealed) = result {
+            let stats = &mut inventory.file_maintenance;
+            stats.sealed_files = stats.sealed_files.saturating_add(sealed as u64);
+        }
+        if let Some(events) = inventory.r1_events.as_mut() {
+            events.seals(generation, &seals);
         }
     }
     /// The preparer never waits for the lifecycle gate: fence, seal and final
@@ -1571,6 +1601,10 @@ impl ControlContext {
         // seal, retirement revoke or tombstone removal never delays it.
         let published = {
             let mut inventory = self.inventory.lock();
+            // The grant is allocated: a first grant in a later file is a roll.
+            if let Some(events) = inventory.r1_events.as_mut() {
+                events.grant(&extent.segment);
+            }
             let ready = (|| {
                 // Acquire observes terminal authority published during unlocked I/O.
                 if self.poison_pending.load(Ordering::Acquire)

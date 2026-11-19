@@ -9,13 +9,14 @@ impl LiveTargetManager {
     /// the WAL parent, removes the matching tombstone if present, and syncs
     /// the sealed-marker directory even when the tombstone was already gone,
     /// so a crash after either sync repeats safely. A marker with another
-    /// identity is refused.
+    /// identity is refused. Returns whether this call removed the tombstone
+    /// (`false`: it was already gone).
     pub fn finish_retired_file(
         &mut self,
         wal_path: &Path,
         device: u64,
         inode: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.poisoned {
             return Err(invalid("target manager is quarantined"));
         }
@@ -49,14 +50,16 @@ impl LiveTargetManager {
             .open(parent)?
             .sync_all()?;
         let result = (|| {
+            let mut removed = false;
             if marker.is_some() {
                 match fs::remove_file(self.marker_path(wal_path)?) {
-                    Ok(()) => {}
+                    Ok(()) => removed = true,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
             }
-            self.sealed_directory.sync_all()
+            self.sealed_directory.sync_all()?;
+            Ok(removed)
         })();
         if result.is_err() {
             self.poisoned = true;

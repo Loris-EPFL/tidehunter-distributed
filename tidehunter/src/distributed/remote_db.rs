@@ -52,6 +52,7 @@ mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
 mod dead_wal_files;
+mod r1_events;
 mod relocation;
 use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use checkpoint_lifecycle::{IndexForceError, IndexForceReport};

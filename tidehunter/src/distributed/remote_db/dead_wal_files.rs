@@ -188,11 +188,18 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
             covered_next,
             persisted_cut_next,
         };
+        let file_bytes = core
+            .config
+            .partition_config(1, endpoint.partition)
+            .wal_file_bytes;
         for chunk in proofs.chunks(MAX_PROOFS_PER_REQUEST) {
             // Revalidate the walked image identity at submission.
             if core.capacity.install_seq() != seq {
                 return Ok(());
             }
+            let claim =
+                core.r1_events
+                    .claimed(core, endpoint.partition, file_bytes, chunk, &witness, seq);
             let outcome = client
                 .retire_sealed_files(core.epoch, chunk.to_vec(), witness)
                 .map_err(|error| {
@@ -201,6 +208,17 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
                         endpoint.partition
                     ))
                 })?;
+            if let Some((attempt, after)) = claim {
+                let files: Vec<u64> = chunk.iter().map(|proof| proof.file_start).collect();
+                core.r1_events.replied(
+                    endpoint.partition,
+                    core.epoch,
+                    attempt,
+                    &after,
+                    &files,
+                    outcome,
+                );
+            }
             // `Busy`: no durable decision; retry after a later root, roll or
             // unpin (the next pass), never in a loop here.
             if outcome == RetirementResult::Busy {

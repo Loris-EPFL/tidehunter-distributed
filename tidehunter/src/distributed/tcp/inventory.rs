@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod capacity;
+pub(super) mod r1_events;
 mod ready_binding;
 mod relocation;
 mod retirement;
@@ -269,6 +270,8 @@ pub struct NodeInventory {
     value_wal_unlinks: u64,
     /// Changed only under this mutex; see `FileMaintenanceStats`.
     pub(super) file_maintenance: FileMaintenanceStats,
+    /// Ordered R1 evidence stream of this owner incarnation, when enabled.
+    pub(super) r1_events: Option<r1_events::OwnerR1Events>,
     /// Whether a live target is installed. Immutable after installation, so
     /// reading it needs no gate.
     pub(super) live_target_configured: bool,
@@ -577,6 +580,7 @@ impl NodeInventory {
             trim_crash: None,
             value_wal_unlinks: 0,
             file_maintenance: FileMaintenanceStats::default(),
+            r1_events: None,
             live_target_configured: live_target.is_some(),
             lifecycle: Arc::new(Mutex::new(live_target)),
             live_shutdown: false,
@@ -737,8 +741,33 @@ impl NodeInventory {
                     .iter()
                     .map(|(token, (epoch, _))| (*token, *epoch)),
             );
+            let record_pins: Vec<_> = inventory
+                .live_pins
+                .iter()
+                .map(|(token, (_, leases))| (*token, r1_events::lease_files(leases)))
+                .collect();
+            let export_pins: Vec<_> = inventory
+                .live_export_pins
+                .iter()
+                .map(|(token, (_, key))| (*token, *key))
+                .collect();
+            // Dropping the record leases releases their inode/read pins.
             inventory.live_pins.clear();
             inventory.live_export_pins.clear();
+            if let Some(events) = inventory.r1_events.as_mut() {
+                for (token, files) in record_pins {
+                    events.pin("pin_released", "record", token, files, "fence");
+                }
+                for (token, (source, file)) in export_pins {
+                    events.pin(
+                        "pin_released",
+                        "export",
+                        token,
+                        [(source, file, None)],
+                        "fence",
+                    );
+                }
+            }
         }
         if let Some(old) = inventory
             .manifest
@@ -1035,12 +1064,16 @@ impl NodeInventory {
         }
         result
     }
+    /// Revoke the live bindings of `files` in `epoch`. Returns `(start,
+    /// device, inode)` of every binding actually revoked; a file without a
+    /// binding (never exported, evicted, or revoked by an earlier attempt) is
+    /// absent from the result.
     fn revoke_live_files<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
         epoch: u64,
         files: &[u64],
-    ) -> Result<(), TcpError> {
+    ) -> Result<Vec<(u64, u64, u64)>, TcpError> {
         let bytes = inventory.config.partition.wal_file_bytes;
         let retired = |(binding_epoch, file): &(u64, u64)| {
             *binding_epoch == epoch && files.contains(&(file * bytes))
@@ -1056,12 +1089,15 @@ impl NodeInventory {
             .filter_map(|key| inventory.live_bindings.remove_entry(key))
             .collect();
         let result = inventory.released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
-        if result.is_err() {
+        if let Err(error) = result {
             inventory.live_bindings.extend(claimed);
-            return result;
+            return Err(error);
         }
         inventory.idle_history_exports.retain(|key| !retired(key));
-        Ok(())
+        Ok(claimed
+            .iter()
+            .map(|((_, file), (segment, _, _))| (file * bytes, segment.device, segment.inode))
+            .collect())
     }
 
     pub(super) fn acquire_live_export_pin(
@@ -1094,6 +1130,15 @@ impl NodeInventory {
             })
             .ok_or_else(|| TcpError::new("live export pin token allocation failed"))?;
         self.live_export_pins.insert(token, (epoch, key));
+        if let Some(events) = self.r1_events.as_mut() {
+            events.pin(
+                "pin_held",
+                "export",
+                token,
+                [(key.0, key.1, Some((segment.device, segment.inode)))],
+                "connect",
+            );
+        }
         // A connected history export cannot be an idle-owner eviction victim.
         self.idle_history_exports.retain(|file| *file != key);
         Ok(token)
@@ -1118,8 +1163,21 @@ impl NodeInventory {
                 "export pin belongs to another authority epoch",
             ));
         }
+        let identity = inventory
+            .live_bindings
+            .get(&key)
+            .map(|(segment, _, _)| (segment.device, segment.inode));
         Self::release_live_bindings(inventory, target, [key], Some(token))?;
         inventory.live_export_pins.remove(&token);
+        if let Some(events) = inventory.r1_events.as_mut() {
+            events.pin(
+                "pin_released",
+                "export",
+                token,
+                [(key.0, key.1, identity)],
+                "release",
+            );
+        }
         Ok(())
     }
 
@@ -1148,12 +1206,23 @@ impl NodeInventory {
                 .map(|lease| (lease.segment.epoch, lease.segment.file_index)),
             None,
         );
-        if result.is_err() {
+        if let Err(error) = result {
             // A revoke can fail after a partial target change. Restore the
             // record leases, keeping their inode/read pins until a fence.
             inventory.live_pins.insert(token, (authority, leases));
+            return Err(error);
         }
-        result
+        // Only an enabled stream pays for the file list (read release path).
+        let files = inventory
+            .r1_events
+            .is_some()
+            .then(|| r1_events::lease_files(&leases));
+        // Dropping the record leases releases their inode/read pins.
+        drop(leases);
+        if let (Some(events), Some(files)) = (inventory.r1_events.as_mut(), files) {
+            events.pin("pin_released", "record", token, files, "release");
+        }
+        Ok(())
     }
 
     fn release_live_bindings<H: InventoryAccess>(

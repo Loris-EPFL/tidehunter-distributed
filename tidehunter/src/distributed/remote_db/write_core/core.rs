@@ -231,6 +231,8 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub(crate) retirement: Mutex<()>,
     /// Opt-in R0 capacity observation; inert until an observer installs a hook.
     pub capacity: super::super::capacity_observer::CapacitySlot,
+    /// Opt-in ordered R1 evidence stream; inert until enabled.
+    pub(crate) r1_events: super::super::r1_events::R1EventSlot,
     pub stats: Mutex<CoreStats>,
     pub read_resolve_ns: AtomicU64,
     pub value_read_ns: AtomicU64,
@@ -311,6 +313,7 @@ impl WriteCore {
             floor_changed: Condvar::new(),
             retirement: Mutex::new(()),
             capacity: Default::default(),
+            r1_events: Default::default(),
             stats: Mutex::new(open.stats),
             admission,
             read_resolve_ns: AtomicU64::new(0),

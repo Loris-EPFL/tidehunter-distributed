@@ -849,3 +849,5 @@ fn writes_roll_into_a_later_file_while_a_retirement_is_parked_before_unlink() {
         db.shutdown().unwrap();
     }
 }
+
+mod r1_events;

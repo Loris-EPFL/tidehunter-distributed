@@ -848,6 +848,45 @@ impl StorageNode {
         self.inventory.lock().file_maintenance
     }
 
+    /// Start this owner incarnation's ordered R1 evidence stream at
+    /// `<case_output>/capacity/r1-events/owner_O<partition>/<incarnation>.jsonl`.
+    /// Events cover live grants that roll files, durable seals, retirement
+    /// steps and record/connection pins taken from now on. Not wire-visible.
+    pub fn enable_r1_events(
+        &self,
+        config: &crate::distributed::r1_events::R1EventConfig,
+    ) -> Result<(), TcpError> {
+        NodeInventory::enable_r1_events(&self.inventory, config)
+    }
+
+    /// Write the terminal line and close this owner's stream. A process that
+    /// never calls this leaves an incomplete (`.partial`) stream.
+    pub fn finish_r1_events(&self) -> Result<(), TcpError> {
+        let events = self
+            .inventory
+            .lock()
+            .r1_events
+            .take()
+            .ok_or_else(|| TcpError::new("r1 event stream is not enabled"))?;
+        events.log().finish().map_err(TcpError::component)
+    }
+
+    /// Test-only: revoke one file's live binding (as an eviction or an
+    /// earlier retirement attempt would), emitting no event.
+    #[cfg(test)]
+    pub(crate) fn revoke_file_binding_for_test(
+        &self,
+        generation: u64,
+        start: u64,
+    ) -> Result<usize, TcpError> {
+        NodeInventory::revoke_file_binding_for_test(
+            &self.inventory,
+            &self.control_context.lifecycle,
+            generation,
+            start,
+        )
+    }
+
     /// Test-only: stop the file preparers after their current step (see
     /// `ControlOwner::stop_preparers_for_test`). No grant may follow.
     #[cfg(test)]

@@ -57,9 +57,12 @@ mod retired_files;
 pub use retired_files::{FileSeal, PendingRetirement};
 use retired_files::{RetiredFiles, validate_root_sets};
 mod file_retirement;
+pub(crate) use file_retirement::Cleared;
 #[cfg(test)]
 pub(crate) use file_retirement::CrashCut;
-pub use file_retirement::{RetireProof, RetirementOutcome, RetirementWitness, WalInode};
+pub use file_retirement::{
+    RetireProof, RetirementOutcome, RetirementWitness, UnlinkOutcome, WalInode,
+};
 mod relocation_scan;
 pub use relocation_scan::{RelocationBatch, RelocationPage, RelocationPut};
 mod file_seal;
@@ -922,6 +925,9 @@ pub struct PartitionLog {
     // Test-only crash cut of seal/retirement (`file_retirement::CrashCut` code).
     #[cfg(test)]
     r1_crash: AtomicU8,
+    // Pending cleanup entries whose unlink this process's recovery repeated,
+    // with what it found; taken once by the R1 event stream (else unused).
+    recovered_cleanup: Mutex<Vec<(PendingRetirement, UnlinkOutcome)>>,
     // Test-only pause after the retirement detach, before the unlinks (no
     // lock held): writes must proceed while a retirement is mid-flight.
     #[cfg(test)]
@@ -1098,6 +1104,7 @@ impl PartitionLog {
             fail_wal_retire: AtomicBool::new(false),
             #[cfg(test)]
             r1_crash: AtomicU8::new(0),
+            recovered_cleanup: Mutex::new(Vec::new()),
             #[cfg(test)]
             before_unlink: Mutex::new(None),
             #[cfg(test)]

@@ -369,7 +369,7 @@ impl NodeInventory {
                 {
                     let pending = log.pending_file_retirements();
                     inventory.released(|| {
-                        super::retirement::finish_tombstones(target, &log, &pending)
+                        super::retirement::finish_tombstones(target, &log, &pending, |_| {})
                     })?;
                 }
                 // Detach the log: readers first, then this inventory's handle.

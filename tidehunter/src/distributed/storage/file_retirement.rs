@@ -62,6 +62,32 @@ pub enum RetirementOutcome {
     Busy,
 }
 
+/// What the retirement unlink step found for one pending entry. Both are
+/// covered by the same durable `cleanup_pending` record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnlinkOutcome {
+    /// This call removed the exact pending inode.
+    Unlinked,
+    /// The name was already gone (a repeated step after recovery or retry).
+    AlreadyAbsent,
+}
+
+/// Result of one authorization: entries newly recorded in a durable root and
+/// that root's generation (empty/`None` when it changed nothing).
+#[derive(Debug)]
+pub(crate) struct Authorized {
+    pub(crate) outcome: RetirementOutcome,
+    pub(crate) recorded: Vec<PendingRetirement>,
+    pub(crate) root_generation: Option<u64>,
+}
+
+/// Entries one cleanup clear removed, and the root generation that did it.
+#[derive(Debug)]
+pub(crate) struct Cleared {
+    pub(crate) root_generation: u64,
+    pub(crate) removed: Vec<PendingRetirement>,
+}
+
 /// Test-only crash cuts between the persisted steps. Root install cuts reuse
 /// `fail_wal_root` phases 1-3 (before temp write, after temp sync, after
 /// rename before directory sync).
@@ -130,6 +156,12 @@ impl PartitionLog {
         root.map_or_else(Vec::new, |root| root.cleanup_pending.clone())
     }
 
+    /// Pending entries whose unlink this process's recovery repeated, with
+    /// what it found. Returned once; later calls return nothing.
+    pub(crate) fn take_recovered_cleanup(&self) -> Vec<(PendingRetirement, UnlinkOutcome)> {
+        std::mem::take(&mut *self.recovered_cleanup.lock())
+    }
+
     /// Encoded size of the installed root, for the constant-size tests.
     #[cfg(test)]
     pub(crate) fn wal_root_encoded_len(&self) -> usize {
@@ -155,7 +187,7 @@ impl PartitionLog {
             let outcome = self.retire_sealed_stream_files(proofs)?;
             // Completed: every pending entry was unlinked and its directory synced.
             let done = if outcome == RetirementOutcome::Completed {
-                self.file_retirement_state().1
+                self.pending_file_retirements()
             } else {
                 Vec::new()
             };
@@ -201,6 +233,19 @@ impl PartitionLog {
         proofs: &[RetireProof],
         witness: &RetirementWitness,
     ) -> Result<RetirementOutcome, StorageError> {
+        Ok(self
+            .authorize_file_retirement_recorded(proofs, witness)?
+            .outcome)
+    }
+
+    /// `authorize_file_retirement`, also reporting the entries this call
+    /// recorded and the generation of the root that made them durable (both
+    /// empty/`None` when every proof repeated an already retired file).
+    pub(crate) fn authorize_file_retirement_recorded(
+        &self,
+        proofs: &[RetireProof],
+        witness: &RetirementWitness,
+    ) -> Result<Authorized, StorageError> {
         let size = self.config().wal_file_bytes;
         check_proof_order(proofs, size)?;
         // Path observations are I/O: take them before any lock.
@@ -208,12 +253,22 @@ impl PartitionLog {
         let _persistence = self.persistence.lock();
         let current = self.active_retirement_root()?;
         let entries = retirement_entries(&current, proofs, &observed, witness)?;
-        if entries.is_empty() || pending_outcome(&current, &entries) == RetirementOutcome::Busy {
-            return Ok(pending_outcome(&current, &entries));
+        let outcome = pending_outcome(&current, &entries);
+        if entries.is_empty() || outcome == RetirementOutcome::Busy {
+            return Ok(Authorized {
+                outcome,
+                recorded: Vec::new(),
+                root_generation: None,
+            });
         }
         let root = retirement_root(&current, &entries, size)?;
+        let root_generation = Some(root.generation);
         self.commit_root(root, CommitStep::Retire)?;
-        Ok(RetirementOutcome::Completed)
+        Ok(Authorized {
+            outcome: RetirementOutcome::Completed,
+            recorded: entries,
+            root_generation,
+        })
     }
 
     fn observe_proofs(
@@ -241,6 +296,18 @@ impl PartitionLog {
     /// result with pending entries left means a victim is still mapped
     /// writable on this live mapper; a later call repeats the work.
     pub(crate) fn finish_file_retirement(&self) -> Result<Vec<PendingRetirement>, StorageError> {
+        Ok(self
+            .finish_file_retirement_outcomes()?
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .collect())
+    }
+
+    /// `finish_file_retirement`, also reporting what the unlink of each
+    /// entry found (for the ordered R1 evidence stream).
+    pub(crate) fn finish_file_retirement_outcomes(
+        &self,
+    ) -> Result<Vec<(PendingRetirement, UnlinkOutcome)>, StorageError> {
         let (pending, writer) = {
             let state = self.state.lock();
             let Some(root) = state.wal_root.as_ref() else {
@@ -260,12 +327,17 @@ impl PartitionLog {
         // No writer or mapper: the registry has no other publisher.
         let size = self.config().wal_file_bytes;
         let mut present = Vec::with_capacity(pending.len());
-        for entry in &pending {
-            if self.check_unlink_target(entry)? {
+        let mut outcomes = Vec::with_capacity(pending.len());
+        for entry in pending {
+            let outcome = if self.check_unlink_target(&entry)? {
                 present.push(crate::wal::position::WalFileId::from_u64(
                     entry.start / size,
                 ));
-            }
+                UnlinkOutcome::Unlinked
+            } else {
+                UnlinkOutcome::AlreadyAbsent
+            };
+            outcomes.push((entry, outcome));
         }
         #[cfg(test)]
         self.crash_at(CrashCut::BeforeUnlink)?;
@@ -275,7 +347,7 @@ impl PartitionLog {
         }
         #[cfg(test)]
         self.crash_at(CrashCut::AfterDirectorySync)?;
-        Ok(pending)
+        Ok(outcomes)
     }
 
     /// Live mapper: detach through the mapper (its sole publisher), then
@@ -284,7 +356,7 @@ impl PartitionLog {
         &self,
         pending: Vec<PendingRetirement>,
         detacher: &crate::wal::ExternalFilePreparer,
-    ) -> Result<Vec<PendingRetirement>, StorageError> {
+    ) -> Result<Vec<(PendingRetirement, UnlinkOutcome)>, StorageError> {
         let size = self.config().wal_file_bytes;
         let ids: Vec<_> = pending
             .iter()
@@ -309,14 +381,17 @@ impl PartitionLog {
                 let _ = resume.recv_timeout(std::time::Duration::from_secs(120));
             }
         }
-        for (index, entry) in pending.iter().enumerate() {
-            if self.check_unlink_target(entry)? {
+        let mut outcomes = Vec::with_capacity(pending.len());
+        for (index, entry) in pending.into_iter().enumerate() {
+            let mut outcome = UnlinkOutcome::AlreadyAbsent;
+            if self.check_unlink_target(&entry)? {
                 match fs::remove_file(self.wal_file_path(entry.start)) {
-                    Ok(()) => {}
+                    Ok(()) => outcome = UnlinkOutcome::Unlinked,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
             }
+            outcomes.push((entry, outcome));
             #[cfg(test)]
             if index == 0 {
                 self.crash_at(CrashCut::AfterFirstUnlink)?;
@@ -327,17 +402,19 @@ impl PartitionLog {
         File::open(&self.path)?.sync_all()?;
         #[cfg(test)]
         self.crash_at(CrashCut::AfterDirectorySync)?;
-        Ok(pending)
+        Ok(outcomes)
     }
 
     /// Durably remove finished entries from `cleanup_pending`. Call only after
     /// their unlink, directory sync and target tombstone cleanup are durable.
+    /// Returns the entries this call removed and the generation of the root
+    /// that removed them, or `None` when none was still pending.
     pub(crate) fn clear_retirement_cleanup(
         &self,
         done: &[PendingRetirement],
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<Cleared>, StorageError> {
         if done.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let _persistence = self.persistence.lock();
         let current = self
@@ -349,13 +426,23 @@ impl PartitionLog {
         let mut root = WalRoot::clone(&current);
         root.cleanup_pending.retain(|entry| !done.contains(entry));
         if root.cleanup_pending.len() == current.cleanup_pending.len() {
-            return Ok(());
+            return Ok(None);
         }
         root.generation = root
             .generation
             .checked_add(1)
             .ok_or(StorageError::Capacity)?;
-        self.commit_root(root, CommitStep::Clear)
+        let cleared = Cleared {
+            root_generation: root.generation,
+            removed: current
+                .cleanup_pending
+                .iter()
+                .filter(|entry| done.contains(entry))
+                .copied()
+                .collect(),
+        };
+        self.commit_root(root, CommitStep::Clear)?;
+        Ok(Some(cleared))
     }
 
     /// Older sealed stream: the original path, now with inode-bound pending
