@@ -36,6 +36,8 @@ mod plain_tests;
 #[cfg(test)]
 #[path = "reactor_session_tests.rs"]
 mod session_tests;
+#[path = "reactor_wait.rs"]
+mod wait;
 
 pub(super) const TLS_BUFFER_BYTES: usize = 256 * 1024;
 pub(super) const SESSION_REQUESTS: usize = 32;
@@ -1318,9 +1320,7 @@ impl Client {
                 // ID 0 is never a request: an owner that ends the session sends
                 // its reason (`send_close_notice`) right before closing.
                 return Err(match envelope.body {
-                    Response::Error(reason) => {
-                        TcpError::new(format!("owner closed the session: {reason}"))
-                    }
+                    Response::Error(reason) => TcpError::owner_closed(&reason),
                     _ => TcpError::new("invalid unsolicited response"),
                 });
             }
@@ -1533,15 +1533,17 @@ impl Client {
                     profile.requests += 1;
                 }
                 return match response {
-                    Response::Error(message) => Err(TcpError::new(message)),
+                    Response::Error(message) => Err(TcpError::owner_error(message)),
                     response => Ok(response),
                 };
             }
-            polling.pause(
-                self.polling,
-                self.stream.is_fabric(),
-                self.reactor.progressed,
-            );
+            if !self.park_progress(id)? {
+                polling.pause(
+                    self.polling,
+                    self.stream.is_fabric(),
+                    self.reactor.progressed,
+                );
+            }
         }
     }
 }
@@ -1667,6 +1669,7 @@ pub(super) fn serve_session(
     mut stream: Session,
     limits: TcpLimits,
     shutdown: &AtomicBool,
+    shutdown_wake: &super::WakeFd,
     client_verifier: Option<&dyn rustls::server::danger::ClientCertVerifier>,
 ) -> Result<(), TcpError> {
     let (completed, completions) = mpsc::sync_channel::<WorkCompletion>(SESSION_REQUESTS);
@@ -1687,10 +1690,12 @@ pub(super) fn serve_session(
     let mut polling = ActivePoll::default();
     let mut previous_sweep = None::<Instant>;
     let mut fabric_idle_deadline = None;
+    let mut progress = wait::OwnerProgress::new(node, shutdown_wake);
     #[cfg(feature = "experimental-fabric")]
     stream.attach_owner_transport(&node.control_context.transport);
     let result = (|| {
         while !shutdown.load(Ordering::Acquire) {
+            progress.begin_sweep()?;
             let now = Instant::now();
             let sweep_gap = if let Some(profile) = diagnostics.as_mut() {
                 profile.polling.progress_sweeps += 1;
@@ -1761,6 +1766,7 @@ pub(super) fn serve_session(
             while let Ok(completion) = completions.try_recv() {
                 progressed = true;
                 workers -= 1;
+                progress.completed(completion.id);
                 if pending
                     .get(&completion.id)
                     .is_some_and(|request| request.is_append)
@@ -2048,7 +2054,12 @@ pub(super) fn serve_session(
                         id,
                         Response::ConnectionProfile(Box::new(previous)),
                     )?;
+                } else if let Some(reason) = wait::OwnerProgress::refusal(&stream, &request) {
+                    // Correlated refusal before admission; the session stays open.
+                    queue_response(&mut pending, id, Response::Error(reason))?;
                 } else {
+                    let notify = progress.notify(&request)?;
+                    let is_progress = notify.is_some();
                     let work = control::ControlWork {
                         id,
                         request,
@@ -2058,9 +2069,13 @@ pub(super) fn serve_session(
                         submitted: pending[&id].measured.then(Instant::now),
                         charge: pending[&id].charge,
                         completed: completed.clone(),
+                        progress: notify,
                     };
                     match node.control.try_submit(work) {
                         Ok(()) => {
+                            if is_progress {
+                                progress.submitted(id);
+                            }
                             if is_append {
                                 active_appends += 1;
                             } else {
@@ -2091,7 +2106,16 @@ pub(super) fn serve_session(
             if progressed {
                 idle_since = Instant::now();
             }
-            if let Some(deadline) = stream.idle_wait_deadline(
+            let quiet = held_request.is_none() && controls.is_empty() && workers == 1;
+            if progress.park(
+                &mut stream,
+                progressed,
+                quiet,
+                &pending,
+                diagnostics.as_mut(),
+            )? {
+                // The durable-progress lane waited on readiness.
+            } else if let Some(deadline) = stream.idle_wait_deadline(
                 limits,
                 progressed,
                 !pending.is_empty() || held_request.is_some(),

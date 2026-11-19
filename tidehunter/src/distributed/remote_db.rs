@@ -1755,15 +1755,17 @@ impl RemoteDatabase {
                         // session, and Status flushes the owner's logs. The
                         // first session therefore opens in `start`, before
                         // this epoch can append; a reconnect after a failed
-                        // poll costs one extra owner sync.
-                        connect: Box::new(move || {
-                            Client::connect_shared(
+                        // poll costs one extra owner sync. The lane waits on
+                        // readiness and the poller's stop wake.
+                        connect: Box::new(move |stop| {
+                            Client::connect_progress_shared(
                                 &address,
                                 &tls,
                                 client_config.clone(),
                                 timeout,
                                 expected.clone(),
                                 &shape,
+                                stop,
                             )
                         }),
                     }

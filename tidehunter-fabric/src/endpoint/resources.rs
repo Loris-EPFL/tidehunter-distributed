@@ -983,6 +983,48 @@ impl Resources {
         !matches!(self.cq_wait_mode, CqWaitMode::Polling)
     }
 
+    pub(super) fn has_wait_fd(&self) -> bool {
+        matches!(self.cq_wait_mode, CqWaitMode::FdTryWait(_))
+    }
+
+    /// Conservative quiet state for a CQ wait: no TX in use, every receive
+    /// posted, no unread received bytes.
+    fn wait_quiescent(&self) -> bool {
+        self.peer.is_some()
+            && self.tx_pending.iter().all(|pending| !pending)
+            && self.rx_pending.iter().all(|pending| *pending)
+            && self.rx_len.iter().all(|&len| len == 0)
+            && self.rx_offset == 0
+            && self.rx_read == self.rx_post
+    }
+
+    /// Arms the provider CQ wait fd for one caller-owned `poll(2)`. `Ok(None)`:
+    /// not quiescent, or `fi_trywait` reported queued work (`-FI_EAGAIN`); the
+    /// caller progresses normally. Any other `fi_trywait` code is fatal.
+    pub(super) fn arm_wait_fd(&mut self) -> io::Result<Option<libc::c_int>> {
+        let CqWaitMode::FdTryWait(fd) = self.cq_wait_mode else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fabric completion queue has no wait fd",
+            ));
+        };
+        if !self.wait_quiescent() {
+            return Ok(None);
+        }
+        // SAFETY: `fabric` and `cq` are the live handles this Resources owns and
+        // this &mut self is the only user (FI_THREAD_DOMAIN); `fids` points to one
+        // initialized element for the call's duration.
+        let code = unsafe {
+            let mut fid = &raw mut (*self.cq).fid;
+            ffi::fi_trywait(self.fabric, &raw mut fid, 1)
+        };
+        match code {
+            0 => Ok(Some(fd)),
+            code if code < 0 && code.unsigned_abs() == ffi::FI_EAGAIN => Ok(None),
+            code => Err(error("arm completion queue wait", code.unsigned_abs())),
+        }
+    }
+
     pub(super) fn progress_stats(&self) -> ProgressStats {
         self.progress_stats
     }
@@ -1278,13 +1320,7 @@ impl Resources {
         let Some(deadline) = deadline else {
             return self.poll().map(|progress| (progress, false));
         };
-        let can_wait = self.supports_idle_wait()
-            && self.peer.is_some()
-            && self.tx_pending.iter().all(|pending| !pending)
-            && self.rx_pending.iter().all(|pending| *pending)
-            && self.rx_len.iter().all(|&len| len == 0)
-            && self.rx_offset == 0
-            && self.rx_read == self.rx_post;
+        let can_wait = self.supports_idle_wait() && self.wait_quiescent();
         if !can_wait
             || deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(1)
         {

@@ -134,6 +134,9 @@ pub(super) struct Waiter {
     pub(super) log: Weak<PartitionLog>,
     pub(super) wake: Wake,
     pub(super) deadline: Instant,
+    /// Wakes the session after `answer` published the reply: `answer` drops it
+    /// after `control::deliver`.
+    pub(super) progress: Option<super::progress_wait::CompletionNotify>,
 }
 
 impl Waiter {
@@ -161,6 +164,7 @@ impl Waiter {
     }
 
     fn answer(self, response: Result<Response, TcpError>) {
+        let progress = self.progress;
         control::deliver(
             self.id,
             self.completed,
@@ -169,6 +173,8 @@ impl Waiter {
             self.measured,
             self.began,
         );
+        // The wake follows the published reply (see `CompletionNotify`).
+        drop(progress);
     }
 
     /// Answer with the current report, for a poll the hub cannot park.
@@ -278,7 +284,13 @@ fn run(receiver: &mpsc::Receiver<Command>) {
             }
         };
         match next {
-            Some(Command::Wait(waiter)) if waiters.len() < MAX_WAITERS => waiters.push(*waiter),
+            Some(Command::Wait(waiter)) if waiters.len() < MAX_WAITERS => {
+                #[cfg(test)]
+                if let Some(progress) = &waiter.progress {
+                    progress.parked(waiter.id);
+                }
+                waiters.push(*waiter);
+            }
             Some(Command::Wait(waiter)) => waiter.answer_now(),
             Some(Command::Advanced) => {}
             Some(Command::Retire(done)) => {

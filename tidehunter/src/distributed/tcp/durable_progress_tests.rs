@@ -18,6 +18,7 @@ fn submit(
         submitted: None,
         charge: 1,
         completed: completed.clone(),
+        progress: None,
     });
     assert!(admitted.is_ok(), "control queue rejected request {id}");
 }

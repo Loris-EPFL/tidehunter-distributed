@@ -21,6 +21,7 @@ fn command(
         queued: Some(Instant::now()),
         submitted: Some(Instant::now()),
         completed: completed.clone(),
+        progress: None,
     })
 }
 fn receive(

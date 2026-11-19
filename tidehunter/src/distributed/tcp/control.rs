@@ -82,6 +82,10 @@ pub(super) struct ControlWork {
     pub(super) submitted: Option<Instant>,
     pub(super) charge: usize,
     pub(super) completed: mpsc::SyncSender<reactor::WorkCompletion>,
+    /// Durable-progress requests only: wakes the session once the reply is
+    /// published. Drops after `complete`/`deliver` on every path of `run`, or
+    /// moves into the parked hub waiter.
+    pub(super) progress: Option<super::progress_wait::CompletionNotify>,
 }
 
 struct Queue {
@@ -819,6 +823,7 @@ fn run(shared: &Shared) {
             submitted,
             charge,
             completed,
+            progress,
         } = work;
         let mut profile = ConnectionProfile::default();
         let began = measured.then(Instant::now);
@@ -985,6 +990,7 @@ fn run(shared: &Shared) {
                             log,
                             wake,
                             deadline,
+                            progress,
                         }));
                     }
                     Ok(DurablePoll::Ready(report)) => complete(

@@ -34,6 +34,10 @@ mod inventory;
 #[cfg(test)]
 pub(crate) use generation_control::OwnerTrimCrash;
 mod live_client;
+mod progress_wait;
+pub(crate) use progress_wait::WakeFd;
+#[cfg(test)]
+mod progress_wait_tests;
 pub use super::nvmeof::LiveQueueGeometry;
 #[cfg(test)]
 pub(crate) use live_client::leased_tests;
@@ -396,11 +400,14 @@ impl TcpReadProfile {
 #[derive(Debug)]
 pub struct TcpError {
     message: String,
+    /// Set by `wait_unavailable` and classified owner close notices.
+    wait_unavailable: bool,
 }
 impl TcpError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            wait_unavailable: false,
         }
     }
     fn component(error: impl fmt::Display) -> Self {
@@ -768,6 +775,9 @@ pub struct StorageNode {
     control: control::ControlOwner,
     control_context: Arc<control::ControlContext>,
     pub(super) live_nvme_selected: bool,
+    /// Test hook of every durable-progress session this node serves.
+    #[cfg(test)]
+    progress_wait_hook: Mutex<Option<Arc<progress_wait::WaitHook>>>,
 }
 impl StorageNode {
     pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>, TcpError> {
@@ -806,6 +816,8 @@ impl StorageNode {
             control,
             control_context,
             live_nvme_selected,
+            #[cfg(test)]
+            progress_wait_hook: Mutex::new(None),
         }))
     }
     pub fn status(&self) -> Result<NodeStatus, TcpError> {
@@ -1061,6 +1073,10 @@ impl StorageNode {
             }
         }
         let connections = Arc::new(AtomicUsize::new(0));
+        // Level-triggered: set once on every listener exit, before the workers
+        // join, and never drained, so a session parked on the durable-progress
+        // lane observes shutdown without a periodic check.
+        let shutdown_wake = Arc::new(WakeFd::for_progress("listener shutdown wake")?);
         let (accepted, sockets) =
             std::sync::mpsc::sync_channel::<(TcpStream, ConnectionPermit)>(limits.max_connections);
         let sockets = Arc::new(Mutex::new(sockets));
@@ -1088,6 +1104,7 @@ impl StorageNode {
                         let shutdown = shutdown.clone();
                         let sockets = sockets.clone();
                         let transport = transport.clone();
+                        let shutdown_wake = shutdown_wake.clone();
                         match thread::Builder::new()
                             .name("wal-mtls-session".into())
                             .spawn(move || {
@@ -1107,6 +1124,7 @@ impl StorageNode {
                                         server.clone(),
                                         limits,
                                         &shutdown,
+                                        &shutdown_wake,
                                         &transport,
                                     ) {
                                         eprintln!("storage control connection closed: {error}");
@@ -1142,6 +1160,10 @@ impl StorageNode {
             }
         }
         shutdown.store(true, Ordering::Release);
+        // The flag is stored first; a woken session reads it in its loop check.
+        if let Err(error) = shutdown_wake.signal() {
+            accept_error.get_or_insert(error);
+        }
         drop(accepted);
         drop(sockets);
         for handle in threads {
@@ -1161,6 +1183,7 @@ impl StorageNode {
         config: ServerTlsConfig,
         limits: TcpLimits,
         shutdown: &AtomicBool,
+        shutdown_wake: &WakeFd,
         transport: &Transport,
     ) -> Result<(), TcpError> {
         let mut io = DeadlineIo::new(socket, limits.io_timeout)?;
@@ -1172,6 +1195,7 @@ impl StorageNode {
                     reactor::Session::new_plain(io)?,
                     limits,
                     shutdown,
+                    shutdown_wake,
                     None,
                 );
             }
@@ -1184,6 +1208,7 @@ impl StorageNode {
                     reactor::Session::new_native(io)?,
                     limits,
                     shutdown,
+                    shutdown_wake,
                     None,
                 );
             }
@@ -1221,6 +1246,7 @@ impl StorageNode {
             reactor::Session::new(stream.conn.into(), stream.sock)?,
             limits,
             shutdown,
+            shutdown_wake,
             Some(verifier.as_ref()),
         )
     }
@@ -1290,6 +1316,8 @@ pub struct Client {
     live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
     live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
     live_unreleased_tokens: Vec<(u64, [u8; 16])>,
+    /// Set only on the coordinator's dedicated durable-progress lane.
+    progress_wait: Option<progress_wait::ClientProgressWait>,
 }
 impl Client {
     /// The node's authenticated policy, adopted by ordinary read/control drivers.
@@ -1321,24 +1349,49 @@ impl Client {
         expected: PartitionConfig,
         shape: &KeyShape,
     ) -> Result<Self, TcpError> {
-        Self::connect_shared_with_status(
+        Self::connect_shared_with_progress(
             endpoint,
             tls,
             client_config,
             timeout,
             expected,
             shape,
-            true,
+            None,
         )
     }
-    fn connect_shared_with_status(
+    /// The coordinator's dedicated durable-progress lane. Every exchange on it
+    /// waits on transport readiness and `stop` instead of an active loop, so the
+    /// Status handshake also exercises the provider notification path at setup.
+    /// # Errors
+    /// An OFI transport whose endpoint has no CQ wait fd fails before the Status
+    /// handshake with an error for which `TcpError::is_wait_unavailable` holds.
+    pub(crate) fn connect_progress_shared(
         endpoint: &str,
         tls: &TlsFiles,
         client_config: ClientTlsConfig,
         timeout: Duration,
         expected: PartitionConfig,
         shape: &KeyShape,
-        query_status: bool,
+        stop: Arc<WakeFd>,
+    ) -> Result<Self, TcpError> {
+        Self::connect_shared_with_progress(
+            endpoint,
+            tls,
+            client_config,
+            timeout,
+            expected,
+            shape,
+            Some(stop),
+        )
+    }
+    fn connect_shared_with_progress(
+        endpoint: &str,
+        tls: &TlsFiles,
+        client_config: ClientTlsConfig,
+        timeout: Duration,
+        expected: PartitionConfig,
+        shape: &KeyShape,
+        progress: Option<Arc<WakeFd>>,
     ) -> Result<Self, TcpError> {
         let live_pin_recipe = Arc::new(LivePinRecipe::new(
             endpoint,
@@ -1370,7 +1423,11 @@ impl Client {
             } else {
                 #[cfg(feature = "experimental-fabric")]
                 {
-                    let endpoint = fabric::bootstrap(&mut io, &tls.transport)?;
+                    let endpoint = if progress.is_some() {
+                        fabric::bootstrap_progress(&mut io, &tls.transport)?
+                    } else {
+                        fabric::bootstrap(&mut io, &tls.transport)?
+                    };
                     io.fabric = Some(endpoint);
                     let fabric_ns = Some(elapsed_ns(setup_started));
                     (reactor::Session::new_native(io)?, 0, fabric_ns)
@@ -1404,7 +1461,11 @@ impl Client {
             #[cfg(feature = "experimental-fabric")]
             let fabric_ns = if tls.transport.is_fabric() {
                 let began = Instant::now();
-                stream.sock.fabric = Some(fabric::bootstrap(&mut stream, &tls.transport)?);
+                stream.sock.fabric = Some(if progress.is_some() {
+                    fabric::bootstrap_progress(&mut stream, &tls.transport)?
+                } else {
+                    fabric::bootstrap(&mut stream, &tls.transport)?
+                });
                 Some(elapsed_ns(began))
             } else {
                 None
@@ -1452,12 +1513,11 @@ impl Client {
             live_counters: None,
             live_metrics: None,
             live_unreleased_tokens: Vec::new(),
+            progress_wait: progress.map(progress_wait::ClientProgressWait::new),
         };
-        if query_status {
-            let began = Instant::now();
-            client.connected_status = Some(client.status()?);
-            client.connect_profile.status_ns = elapsed_ns(began);
-        }
+        let began = Instant::now();
+        client.connected_status = Some(client.status()?);
+        client.connect_profile.status_ns = elapsed_ns(began);
         #[cfg(feature = "experimental-fabric")]
         {
             // Provider setup may defer bounded resources until its first CQ
