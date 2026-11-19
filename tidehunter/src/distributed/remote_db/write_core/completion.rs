@@ -26,7 +26,7 @@ impl CoreCompletion {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     fn new(core: &Arc<WriteCore>) -> Self {
         let completion = Self::unbound();
         completion.bind(core);
@@ -191,7 +191,7 @@ impl Drop for GroupCompletion {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::distributed::remote_db::pipeline_tests::Fixture;

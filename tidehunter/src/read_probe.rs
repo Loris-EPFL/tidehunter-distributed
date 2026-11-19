@@ -2,7 +2,11 @@
 //! Advisory eviction is not proof of cold I/O: callers must record residency
 //! and physical read-byte deltas for the measured interval.
 use serde::{Deserialize, Serialize};
+// Only the two evidence structs are compiled outside Linux `test-utils`: they
+// are owner-protocol payloads (`ReadEvidence`, `ProcessResources` replies).
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 use std::os::fd::AsRawFd;
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 use std::{fs, io};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -32,6 +36,7 @@ pub struct ProcessResources {
     pub accounted_process_write_bytes: Option<u64>,
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 impl ProcessResources {
     /// # Errors
     /// Rejects missing, oversized or malformed Linux process accounting.
@@ -73,6 +78,7 @@ impl ProcessResources {
         })
     }
 }
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 fn process_start_ticks() -> io::Result<u64> {
     let stat = fs::read_to_string("/proc/self/stat")?;
     let (_, tail) = stat
@@ -85,11 +91,13 @@ fn process_start_ticks() -> io::Result<u64> {
         .map_err(io::Error::other)
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 fn process_io_counter(name: &str) -> Option<u64> {
     let io = fs::read_to_string("/proc/self/io").ok()?;
     parse_process_io_counter(&io, name)
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 fn parse_process_io_counter(io: &str, name: &str) -> Option<u64> {
     io.lines()
         .find_map(|line| line.strip_prefix(name))?
@@ -97,11 +105,13 @@ fn parse_process_io_counter(io: &str, name: &str) -> Option<u64> {
         .parse()
         .ok()
 }
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 fn process_boot_id() -> Option<[u8; 16]> {
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     parse_process_boot_id(&boot_id)
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 fn parse_process_boot_id(value: &str) -> Option<[u8; 16]> {
     let mut bytes = [0; 16];
     let mut nibble = None;
@@ -127,6 +137,7 @@ fn parse_process_boot_id(value: &str) -> Option<[u8; 16]> {
     (index == bytes.len() && nibble.is_none()).then_some(bytes)
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 fn status_bytes(status: &str, name: &str) -> io::Result<u64> {
     let line = status
         .lines()
@@ -145,6 +156,7 @@ fn status_bytes(status: &str, name: &str) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("process memory counter overflow"))
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeReadProfile {
     pub index_ns: u64,
@@ -154,6 +166,7 @@ pub struct NativeReadProfile {
     pub value_cache_hit: bool,
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 impl ReadEvidence {
     /// # Errors
     /// Returns an error if Linux process identity or I/O counters cannot be read.
@@ -218,6 +231,7 @@ impl ReadEvidence {
 /// Inspect page-cache residency without touching file contents. Mapping metadata
 /// alone does not fault file pages in. Holes count as nonresident too, so this is
 /// a whole-file bound, not a per-value cache-hit measurement.
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
 pub(crate) fn file_residency(file: &fs::File, evict: bool) -> io::Result<(u64, u64)> {
     if evict {
         file.sync_all()?;
@@ -262,7 +276,7 @@ pub(crate) fn file_residency(file: &fs::File, evict: bool) -> io::Result<(u64, u
     Ok((len, resident.min(len)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", feature = "test-utils"))]
 mod tests {
     use super::*;
     #[test]

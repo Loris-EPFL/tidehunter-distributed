@@ -1,5 +1,5 @@
 //! Exactness of the owner's identity/version conflict lookup, which uses a
-//! hash index over pending entries and a never-forgetting filter over history.
+//! hash index over pending entries and the WAL-replay history window.
 use super::*;
 
 fn batch_with(config: &PartitionConfig, id_number: u64, sequence: u64, fill: u8) -> CompleteBatch {
@@ -41,8 +41,6 @@ fn pending_conflicts_are_exact_and_cost_is_independent_of_pending_length() {
         metrics(),
     )
     .unwrap();
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
     let mut receipts = Vec::new();
     for n in 0..40 {
         receipts.push(
@@ -95,7 +93,7 @@ fn pending_conflicts_are_exact_and_cost_is_independent_of_pending_length() {
         Some(receipts[3])
     );
     // A fresh identity and version are admitted, and the lookup work for it
-    // does not grow with the 40 pending entries.
+    // does not grow with the 40 published entries.
     let mut profile = StorageWriteProfile::default();
     let fresh = group_of(&config, batch_with(&config, 200, 200, 2));
     log.append_group_profiled(authority(&config), &fresh, &mut profile)
@@ -106,7 +104,11 @@ fn pending_conflicts_are_exact_and_cost_is_independent_of_pending_length() {
         "probes {} for 40 pending entries",
         profile.append_conflict_pending_probes
     );
-    assert_eq!(profile.append_conflict_history_lookups, 0);
+    // With a non-empty WAL-replay window, a fresh key costs exactly one
+    // bounded identity probe and one version probe (`lookup_conflict`;
+    // OnDisk's never-forgetting filter that skipped them was removed).
+    assert!(log.references.root().count > 0);
+    assert_eq!(profile.append_conflict_history_lookups, 2);
 }
 
 #[test]
@@ -121,8 +123,6 @@ fn conflicts_stay_exact_after_pending_entries_move_to_history() {
         metrics(),
     )
     .unwrap();
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
     let mut receipts = Vec::new();
     for n in 0..12 {
         let group = group_of(&config, batch_with(&config, n, n, n as u8));
@@ -131,7 +131,6 @@ fn conflicts_stay_exact_after_pending_entries_move_to_history() {
                 Ok(mut receipts) => break receipts.remove(0),
                 Err(StorageError::NeedsPersistence) => {
                     log.persist_through(*receipts.last().unwrap()).unwrap();
-                    log.wait_history().unwrap();
                 }
                 Err(error) => panic!("append failed: {error}"),
             }
@@ -139,9 +138,8 @@ fn conflicts_stay_exact_after_pending_entries_move_to_history() {
         log.persist_through(receipt).unwrap();
         receipts.push(receipt);
     }
-    log.wait_history().unwrap();
     assert!(log.references.root().count > 0, "history must hold entries");
-    // Entries now rooted on disk are found, retried and conflict exactly.
+    // Entries now in the WAL-replay window are found, retried and conflict exactly.
     for n in [0u64, 1, 5] {
         let found = log.lookup(id_for(&config, n)).unwrap();
         assert_eq!(found, Some(receipts[n as usize]));
@@ -167,7 +165,8 @@ fn conflicts_stay_exact_after_pending_entries_move_to_history() {
         ),
         Err(StorageError::VersionConflict)
     ));
-    // A key never published is proven absent without a rooted-index read.
+    // A key never published is proven absent with exactly two bounded window
+    // probes (identity, then version), independent of the window length.
     let mut profile = StorageWriteProfile::default();
     log.append_group_profiled(
         authority(&config),
@@ -175,8 +174,7 @@ fn conflicts_stay_exact_after_pending_entries_move_to_history() {
         &mut profile,
     )
     .unwrap();
-    assert_eq!(profile.append_conflict_history_lookups, 0);
-    assert!(profile.append_conflict_filter_skips >= 1);
+    assert_eq!(profile.append_conflict_history_lookups, 2);
 }
 
 #[test]

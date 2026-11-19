@@ -143,7 +143,6 @@ counter_fields!(
     namespace_connects,
     unknown_writes,
     errors,
-    payload_rpc_requests,
     queue_ns,
     queue_samples,
     submit_ns,
@@ -457,9 +456,6 @@ impl LiveNvmeCounters {
     }
     pub fn record_error(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_payload_rpc(&self) {
-        self.payload_rpc_requests.fetch_add(1, Ordering::Relaxed);
     }
     /// One flight submission: requests and member operations in flight right
     /// after it. Sum and sample count give the mean; the peaks are gauges.

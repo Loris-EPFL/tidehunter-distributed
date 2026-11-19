@@ -175,15 +175,9 @@ pub(super) struct Envelope<T> {
 struct Output {
     id: u64,
     bytes: Vec<u8>,
-    /// Native record replies retain owned frame segments until TX-slot copy.
-    segments: Option<Vec<minibytes::Bytes>>,
     offset: usize,
     len: usize,
     retained_bytes: usize,
-    #[cfg(feature = "experimental-fabric")]
-    segment_index: usize,
-    #[cfg(feature = "experimental-fabric")]
-    segment_offset: usize,
     fence: Option<u64>,
     /// Opt-in phase clock: offset zero = queued, no fence = submitting,
     /// fence present = awaiting local retirement. Reset never changes ownership.
@@ -191,69 +185,12 @@ struct Output {
 }
 
 impl Output {
-    #[cfg(feature = "experimental-fabric")]
-    fn advance(&mut self, mut amount: usize) {
-        self.offset += amount;
-        let Some(segments) = &self.segments else {
-            return;
-        };
-        while amount != 0 {
-            let remaining = segments[self.segment_index].len() - self.segment_offset;
-            if amount < remaining {
-                self.segment_offset += amount;
-                return;
-            }
-            amount -= remaining;
-            self.segment_index += 1;
-            self.segment_offset = 0;
-        }
-    }
-    #[cfg(feature = "experimental-fabric")]
-    fn native_slices<'a>(
-        &'a self,
-        budget: usize,
-        slices: &mut [io::IoSlice<'a>],
-    ) -> (usize, usize) {
-        let mut count = 0;
-        let mut total = 0;
-        if let Some(segments) = &self.segments {
-            let mut index = self.segment_index;
-            let mut offset = self.segment_offset;
-            while count < slices.len() && total < budget && index < segments.len() {
-                let bytes = &segments[index][offset..];
-                let len = bytes.len().min(budget - total);
-                if len != 0 {
-                    slices[count] = io::IoSlice::new(&bytes[..len]);
-                    count += 1;
-                    total += len;
-                }
-                index += 1;
-                offset = 0;
-            }
-        } else if self.offset < self.bytes.len() && !slices.is_empty() {
-            let len = (self.bytes.len() - self.offset).min(budget);
-            slices[0] = io::IoSlice::new(&self.bytes[self.offset..self.offset + len]);
-            count = 1;
-            total = len;
-        }
-        (count, total)
-    }
     #[cfg(test)]
     fn flatten(&self) -> Vec<u8> {
-        if let Some(segments) = &self.segments {
-            let mut bytes = Vec::with_capacity(self.len);
-            for segment in segments {
-                bytes.extend_from_slice(segment.as_ref());
-            }
-            bytes
-        } else {
-            self.bytes.clone()
-        }
+        self.bytes.clone()
     }
 }
 
-#[cfg(feature = "experimental-fabric")]
-const MAX_NATIVE_IOV: usize = 514;
 const OUTPUT_FRAME_BUDGET: usize = 4;
 const OUTPUT_TLS_WRITE_BUDGET: usize = 8;
 
@@ -391,187 +328,7 @@ impl Session {
         response: Response,
         limit: usize,
     ) -> Result<(), TcpError> {
-        #[cfg(feature = "experimental-fabric")]
-        if self.conn.is_none() && self.is_fabric() {
-            let began = self.time_work.then(Instant::now);
-            let result = match response {
-                Response::Records(records) => self.queue_native_records(id, records, None, limit),
-                Response::RecordsProfiled { records, profile } => {
-                    self.queue_native_records(id, records, Some(profile), limit)
-                }
-                response => return self.queue(id, &response, limit),
-            };
-            let measured = result
-                .as_ref()
-                .map(|_| self.output.back().map_or(0, |output| output.len));
-            self.stats.frame_encode.record(began, &measured);
-            return result;
-        }
         self.queue(id, &response, limit)
-    }
-
-    #[cfg(feature = "experimental-fabric")]
-    fn queue_native_records(
-        &mut self,
-        id: u64,
-        records: Vec<WireBytes>,
-        profile: Option<ServerReadProfile>,
-        limit: usize,
-    ) -> Result<(), TcpError> {
-        if self.closed {
-            return Err(TcpError::new("session is closed"));
-        }
-        // Serialize an empty response to obtain its exact envelope and enum
-        // prefix. Remove only the fixed-width empty sequence count, then insert
-        // codec-encoded lengths alongside the original owned record buffers.
-        let (mut prefix, tail) = if let Some(profile) = profile {
-            let body = Response::RecordsProfiled {
-                records: Vec::new(),
-                profile,
-            };
-            let empty = Envelope {
-                protocol: PROTOCOL,
-                id,
-                body,
-            };
-            let mut encoded = wire_codec(limit)
-                .serialize(&empty)
-                .map_err(TcpError::component)?;
-            let prefix_len = encoded
-                .len()
-                .checked_sub(SERVER_READ_PROFILE_BYTES + 8)
-                .ok_or_else(|| TcpError::new("invalid profiled response encoding"))?;
-            let tail = encoded.split_off(prefix_len + 8);
-            encoded.truncate(prefix_len);
-            (encoded, tail)
-        } else {
-            let body = Response::Records(Vec::new());
-            let empty = Envelope {
-                protocol: PROTOCOL,
-                id,
-                body,
-            };
-            let mut encoded = wire_codec(limit)
-                .serialize(&empty)
-                .map_err(TcpError::component)?;
-            let prefix_len = encoded
-                .len()
-                .checked_sub(8)
-                .ok_or_else(|| TcpError::new("invalid records response encoding"))?;
-            encoded.truncate(prefix_len);
-            (encoded, Vec::new())
-        };
-        let payload_bytes = records.iter().try_fold(0usize, |sum, record| {
-            sum.checked_add(record.as_slice().len())
-                .ok_or_else(|| TcpError::new("record response length overflow"))
-        })?;
-        let member_headers = records
-            .len()
-            .checked_mul(8)
-            .ok_or_else(|| TcpError::new("record response length overflow"))?;
-        let body_len = prefix
-            .len()
-            .checked_add(8)
-            .and_then(|size| size.checked_add(member_headers))
-            .and_then(|size| size.checked_add(payload_bytes))
-            .and_then(|size| size.checked_add(tail.len()))
-            .ok_or_else(|| TcpError::new("record response length overflow"))?;
-        if body_len == 0 || body_len > limit || body_len > u32::MAX as usize {
-            return Err(TcpError::new("frame length exceeds limit"));
-        }
-        let total_len = body_len + 4;
-        let segment_count = records
-            .len()
-            .checked_mul(2)
-            .and_then(|count| count.checked_add(1 + usize::from(!tail.is_empty())))
-            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
-        let owned_member_count = records
-            .iter()
-            .filter(|record| matches!(record, WireBytes::Owned(_)))
-            .count();
-        let owned_capacity_slack = records
-            .iter()
-            .try_fold(0usize, |sum, record| match record {
-                WireBytes::Owned(bytes) => {
-                    sum.checked_add(bytes.capacity().saturating_sub(bytes.len()))
-                }
-                WireBytes::Shared(_) => Some(sum),
-            })
-            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
-        let owner_count = owned_member_count
-            .checked_add(1)
-            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
-        let metadata_bytes = segment_count
-            .checked_mul(std::mem::size_of::<minibytes::Bytes>())
-            .and_then(|bytes| bytes.checked_add(owner_count.checked_mul(64)?))
-            .and_then(|bytes| bytes.checked_add(owned_capacity_slack))
-            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
-        let retained_bytes = total_len
-            .checked_add(metadata_bytes)
-            .ok_or_else(|| TcpError::new("record response length overflow"))?;
-        if self.output.len() == SESSION_REQUESTS || !self.output_fits(retained_bytes) {
-            return Err(TcpError::new("session output credit exceeded"));
-        }
-
-        let metadata_len = total_len
-            .checked_sub(payload_bytes)
-            .ok_or_else(|| TcpError::new("record response length overflow"))?;
-        let mut metadata = Vec::with_capacity(metadata_len);
-        metadata.extend_from_slice(&(body_len as u32).to_be_bytes());
-        metadata.append(&mut prefix);
-        wire_codec(limit)
-            .serialize_into(&mut metadata, &(records.len() as u64))
-            .map_err(TcpError::component)?;
-        let records_start = metadata.len();
-        for record in &records {
-            wire_codec(limit)
-                .serialize_into(&mut metadata, &(record.as_slice().len() as u64))
-                .map_err(TcpError::component)?;
-        }
-        let profile_start = metadata.len();
-        metadata.extend_from_slice(&tail);
-        let metadata_slack = metadata.capacity().saturating_sub(metadata.len());
-        let metadata_owner = minibytes::Bytes::from(metadata);
-        let mut segments = Vec::with_capacity(segment_count);
-        let segment_slack = segments
-            .capacity()
-            .saturating_sub(segment_count)
-            .saturating_mul(std::mem::size_of::<minibytes::Bytes>());
-        // All lengths are fixed-width u64s under wire_codec's fixint encoding.
-        let mut record_length_offset = records_start;
-        segments.push(metadata_owner.slice(0..records_start));
-        for record in records {
-            let length_end = record_length_offset + 8;
-            segments.push(metadata_owner.slice(record_length_offset..length_end));
-            record_length_offset = length_end;
-            segments.push(record.into_bytes());
-        }
-        if profile_start < metadata_owner.len() {
-            segments.push(metadata_owner.slice(profile_start..metadata_owner.len()));
-        }
-        let retained_bytes = retained_bytes
-            .checked_add(metadata_slack)
-            .and_then(|bytes| bytes.checked_add(segment_slack))
-            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
-        if !self.output_fits(retained_bytes) {
-            return Err(TcpError::new("session output credit exceeded"));
-        }
-        self.output_bytes += retained_bytes;
-        self.output.push_back(Output {
-            id,
-            bytes: Vec::new(),
-            segments: Some(segments),
-            len: total_len,
-            retained_bytes,
-            offset: 0,
-            segment_index: 0,
-            segment_offset: 0,
-            fence: None,
-            stage_started: self.time_work.then(Instant::now),
-        });
-        self.stats.peak_output_frames = self.stats.peak_output_frames.max(self.output.len() as u64);
-        self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
-        Ok(())
     }
     fn queue_size<T: Serialize>(&self, id: u64, body: &T, limit: usize) -> Result<usize, TcpError> {
         if self.closed {
@@ -638,14 +395,9 @@ impl Session {
         self.output.push_back(Output {
             id,
             bytes,
-            segments: None,
             len,
             retained_bytes: retained,
             offset: 0,
-            #[cfg(feature = "experimental-fabric")]
-            segment_index: 0,
-            #[cfg(feature = "experimental-fabric")]
-            segment_offset: 0,
             fence: None,
             stage_started: self.time_work.then(Instant::now),
         });
@@ -730,15 +482,15 @@ impl Session {
         }
         let start = output.offset;
         let cap = budget.min(PROGRESS_BYTES);
-        let mut slices = [io::IoSlice::new(&[]); MAX_NATIVE_IOV];
-        let (count, _source_bytes) = output.native_slices(cap, &mut slices);
+        let len = (output.len - start).min(cap);
+        let slices = [io::IoSlice::new(&output.bytes[start..start + len])];
         let began = self.time_work.then(Instant::now);
         let result = self
             .sock
             .fabric
             .as_mut()
             .ok_or_else(|| TcpError::new("native session lost its fabric endpoint"))?
-            .try_send_vectored_no_poll(&slices[..count]);
+            .try_send_vectored_no_poll(&slices);
         self.stats.plaintext_write.record(began, &result);
         match result {
             Ok(n) => {
@@ -758,7 +510,7 @@ impl Session {
                         self.stats.output_queue_samples.saturating_add(1);
                     output.stage_started = Some(started);
                 }
-                output.advance(n);
+                output.offset += n;
                 Ok(n)
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
@@ -1087,8 +839,7 @@ impl Session {
             }
             self.submitted -= 1;
             self.output_bytes -= output.retained_bytes;
-            if output.segments.is_none()
-                && output.bytes.capacity() <= 1024 * 1024
+            if output.bytes.capacity() <= 1024 * 1024
                 && output.bytes.capacity() > self.spare_output.capacity()
             {
                 self.spare_output = output.bytes;
@@ -1455,51 +1206,9 @@ impl Write for NonblockingIo<'_> {
     }
 }
 
-pub(crate) struct ReadCompletion {
-    pub id: u64,
-    pub result: Result<(Vec<Mutation>, TcpReadProfile), TcpError>,
-}
-pub(crate) struct AppendCompletion {
-    pub id: u64,
-    pub result: Result<Vec<super::DurableBatch>, TcpError>,
-}
-struct PendingAppend {
-    batches: Vec<CompleteBatch>,
-    deadline: Instant,
-    charge: usize,
-    exchange_began: Option<Instant>,
-    profile: Option<TcpReadProfile>,
-}
-struct QueuedAppendCompletion {
-    completion: AppendCompletion,
-    charge: usize,
-}
-
-struct PendingRead {
-    epoch: u64,
-    references: Vec<ValueRecordReference>,
-    values: Vec<Mutation>,
-    start: usize,
-    end: usize,
-    wire_id: u64,
-    deadline: Instant,
-    began: Option<Instant>,
-    profiled: bool,
-    charge: usize,
-    profile: TcpReadProfile,
-}
-
 #[derive(Default)]
 pub(super) struct ClientState {
     next_id: u64,
-    reads: HashMap<u64, PendingRead>,
-    wire_reads: HashMap<u64, u64>,
-    ready: VecDeque<(ReadCompletion, usize)>,
-    retained_bytes: usize,
-    appends: HashMap<u64, PendingAppend>,
-    wire_appends: HashMap<u64, u64>,
-    append_ready: VecDeque<QueuedAppendCompletion>,
-    retained_append_bytes: usize,
     control: Option<(u64, Instant)>,
     control_result: Option<Response>,
     control_decode_ns: u64,
@@ -1514,10 +1223,7 @@ pub(super) struct ClientState {
     position: Option<(u64, Instant)>,
     position_result: Option<Response>,
     position_target: Option<super::super::write_timeline::ControlTimelineTarget>,
-    message_read_requests: u64,
     progressed: bool,
-    #[cfg(test)]
-    append_hold: Option<AppendHold>,
 }
 impl ClientState {
     fn allocate_id(&mut self) -> Result<u64, TcpError> {
@@ -1527,71 +1233,8 @@ impl ClientState {
             .ok_or_else(|| TcpError::new("request ID space exhausted"))?;
         Ok(self.next_id)
     }
-
-    #[cfg(test)]
-    pub(super) fn pending_append_count(&self) -> usize {
-        self.appends.len()
-    }
 }
 
-/// Test-only hold on the client receive path, below the reactor's harvest.
-/// The first two harvested append completions are withheld from the caller.
-/// Once both have arrived, so both groups are appended at the owner, the
-/// lower-sequence group A is returned. Its successors are returned before A
-/// (`successor_first`), or stay withheld for the life of this client, exactly
-/// like a reply still in flight when the caller fail-stops.
-#[cfg(test)]
-struct AppendHold {
-    successor_first: bool,
-    held: Vec<AppendCompletion>,
-    released: bool,
-}
-
-#[cfg(test)]
-impl AppendHold {
-    fn filter(&mut self, completions: &mut Vec<AppendCompletion>) {
-        if self.released {
-            return;
-        }
-        self.held.append(completions);
-        if self.held.len() < 2 {
-            return;
-        }
-        self.released = true;
-        self.held.sort_by_key(|completion| {
-            completion
-                .result
-                .as_ref()
-                .ok()
-                .and_then(|receipts| receipts.first())
-                .map_or(u64::MAX, |receipt| receipt.appended().version().sequence)
-        });
-        let first = self.held.remove(0);
-        if self.successor_first {
-            completions.append(&mut self.held);
-        }
-        completions.push(first);
-    }
-}
-
-fn member_charge(reference: &ValueRecordReference) -> Result<usize, TcpError> {
-    let len = reference.descriptor.len as usize;
-    let result = len.checked_add(256).and_then(|n| n.checked_mul(3));
-    let plan = len.checked_add(4096);
-    result
-        .zip(plan)
-        .map(|(result, plan)| result.max(plan))
-        .ok_or_else(|| TcpError::new("read credit overflow"))
-}
-
-fn read_charge(references: &[ValueRecordReference]) -> Result<usize, TcpError> {
-    // Executor asserts its per-request/member metadata is <=4096. The other
-    // term covers explicit positional/mapped results and serialized copies.
-    references.iter().try_fold(4096usize, |sum, reference| {
-        sum.checked_add(member_charge(reference)?)
-            .ok_or_else(|| TcpError::new("read credit overflow"))
-    })
-}
 impl Client {
     pub(crate) fn trace_controls(
         &mut self,
@@ -1617,17 +1260,11 @@ impl Client {
             prefix: None,
         };
         match request {
-            Request::Checkpoint { epoch, prefix, .. } => {
-                target.kind = "checkpoint";
-                target.epoch = *epoch;
-                target.prefix = Some(*prefix);
-            }
             Request::CheckpointPosition { epoch, through, .. } => {
                 target.kind = "position";
                 target.epoch = *epoch;
                 target.through = Some(*through);
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::AdoptLiveExtent {
                 epoch,
                 token,
@@ -1644,13 +1281,11 @@ impl Client {
                 target.extent = Some(*token);
                 target.through = Some(*through);
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::PreleaseLiveExtent { epoch, after } => {
                 target.kind = "prelease";
                 target.epoch = *epoch;
                 target.extent = Some(*after);
             }
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::LeaseLiveExtent { epoch } => {
                 target.kind = "lease";
                 target.epoch = *epoch;
@@ -1686,120 +1321,11 @@ impl Client {
         }
     }
 
-    pub(crate) fn message_read_requests(&self) -> u64 {
-        self.reactor.message_read_requests
-    }
-
-    pub(super) fn revalidate_peer_at(
-        &self,
-        now: rustls::pki_types::UnixTime,
-    ) -> Result<(), TcpError> {
-        use rustls::client::danger::ServerCertVerifier;
-        let (Some(verifier), Some(server_name), Some(connection)) = (
-            self.reuse_verifier.as_ref(),
-            self.server_name.as_ref(),
-            self.stream.conn.as_ref(),
-        ) else {
-            if self.reuse_verifier.is_none()
-                && self.server_name.is_none()
-                && self.stream.conn.is_none()
-            {
-                return Ok(());
-            }
-            return Err(TcpError::new("incomplete TLS peer-revalidation state"));
-        };
-        let certificates = connection
-            .peer_certificates()
-            .ok_or_else(|| TcpError::new("missing authenticated peer certificate"))?;
-        let (leaf, chain) = certificates
-            .split_first()
-            .ok_or_else(|| TcpError::new("empty authenticated peer certificate chain"))?;
-        verifier
-            .verify_server_cert(leaf, chain, server_name, &[], now)
-            .map_err(TcpError::component)?;
-        Ok(())
-    }
-    /// Revalidate an exclusively held idle lane without resetting wire IDs,
-    /// rustls sequence state, or provider completion fences.
-    pub(crate) fn refresh_for_reuse(&mut self) -> Result<(), TcpError> {
-        self.ensure_connection()?;
-        if self.stream.closed
-            || !self.reactor.reads.is_empty()
-            || !self.reactor.wire_reads.is_empty()
-            || !self.reactor.ready.is_empty()
-            || self.reactor.retained_bytes != 0
-            || !self.reactor.appends.is_empty()
-            || !self.reactor.wire_appends.is_empty()
-            || !self.reactor.append_ready.is_empty()
-            || self.reactor.retained_append_bytes != 0
-            || self.reactor.control.is_some()
-            || self.reactor.control_result.is_some()
-            || self.reactor.position.is_some()
-            || self.reactor.position_result.is_some()
-            || self.stream.header_used != 0
-            || self.stream.input_used != 0
-            || self.stream.input_started.is_some()
-            || self.stream.plaintext_pending != 0
-            || self.stream.peer_closed
-        {
-            return Err(TcpError::new("connection is not quiescent for reuse"));
-        }
-        let began = Instant::now();
-        let refreshed = (|| {
-            self.revalidate_peer_at(rustls::pki_types::UnixTime::now())?;
-            self.stream.check_control_peer(true)?;
-            // A consumed read reply can precede the request's local CQE.
-            // Drain only its existing transport ownership, never new app work.
-            let deadline = began + self.timeout;
-            let mut polling = ActivePoll::default();
-            while !self.stream.output.is_empty() || self.stream.wants_tls_write() {
-                if Instant::now() >= deadline {
-                    return Err(TcpError::new("reuse transport drain deadline expired"));
-                }
-                self.progress_correlated()?;
-                polling.pause(
-                    self.polling,
-                    self.stream.is_fabric(),
-                    self.reactor.progressed,
-                );
-            }
-            if self.stream.input_started.is_some()
-                || self.stream.header_used != 0
-                || self.stream.input_used != 0
-            {
-                return Err(TcpError::new(
-                    "unexpected input during reuse transport drain",
-                ));
-            }
-            self.status()
-        })();
-        match refreshed {
-            Ok(status) => {
-                self.connected_status = Some(status);
-                self.connect_profile = ClientConnectProfile {
-                    status_ns: elapsed_ns(began),
-                    fabric_ns: self.stream.is_fabric().then_some(0),
-                    ..ClientConnectProfile::default()
-                };
-                Ok(())
-            }
-            Err(error) => {
-                self.fail_connection();
-                Err(error)
-            }
-        }
-    }
     /// Local connection transport counters; no RPC or progress is performed.
     /// Server output/reply ownership is in `ConnectionProfile::transport`.
     #[must_use]
     pub fn transport_progress_stats(&self) -> TransportProgressStats {
         self.stream.transport_stats()
-    }
-    /// Local-only bounded read sampling; preserve explicitly enabled connection
-    /// diagnostics when the sample ends. No RPC, reset, or ownership change.
-    pub(crate) fn profile_read_transport(&mut self, enabled: bool) {
-        self.stream
-            .configure_transport_stats(enabled || self.diagnostics.is_some(), false);
     }
     fn ensure_connection(&self) -> Result<(), TcpError> {
         if self.broken {
@@ -1819,14 +1345,6 @@ impl Client {
         }
         self.broken = true;
         self.stream.abort();
-        self.reactor.reads.clear();
-        self.reactor.wire_reads.clear();
-        self.reactor.ready.clear();
-        self.reactor.appends.clear();
-        self.reactor.wire_appends.clear();
-        self.reactor.append_ready.clear();
-        self.reactor.retained_append_bytes = 0;
-        self.reactor.retained_bytes = 0;
         self.reactor.control = None;
         self.reactor.control_result = None;
         self.reactor.control_profiled = false;
@@ -1835,16 +1353,10 @@ impl Client {
     }
     pub(crate) fn has_pending_io(&self) -> bool {
         !self.stream.output.is_empty()
-            || !self.reactor.reads.is_empty()
-            || !self.reactor.wire_reads.is_empty()
-            || !self.reactor.ready.is_empty()
-            || !self.reactor.appends.is_empty()
-            || !self.reactor.wire_appends.is_empty()
-            || !self.reactor.append_ready.is_empty()
             || self.reactor.control.is_some()
             || self.reactor.position.is_some()
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn checkpoint_pending(&self) -> bool {
         self.reactor.control.is_some() || self.reactor.position.is_some()
     }
@@ -1856,317 +1368,22 @@ impl Client {
     pub(crate) fn checkpoint_position_pending(&self) -> bool {
         self.reactor.position.is_some()
     }
-    fn data_request_count(&self) -> usize {
-        self.reactor.reads.len()
-            + self.reactor.ready.len()
-            + self.reactor.appends.len()
-            + self.reactor.append_ready.len()
-    }
-    fn retained_data_bytes(&self) -> usize {
-        self.reactor
-            .retained_bytes
-            .saturating_add(self.reactor.retained_append_bytes)
-            .saturating_add(self.stream.output_bytes)
-            .saturating_add(self.stream.spare_output.capacity())
-    }
-    pub(crate) fn read_admission(
-        &self,
-        references: &[ValueRecordReference],
-        profiled: bool,
-    ) -> Result<bool, TcpError> {
-        self.ensure_connection()?;
-        if references.is_empty() || references.len() > 256 {
-            return Err(TcpError::new("invalid read count"));
+    /// Progress the session's control and position exchanges (the leased
+    /// writer's adoption and lease replies). A failure fails the connection.
+    pub(crate) fn progress_session(&mut self) -> Result<(), TcpError> {
+        if let Err(error) = self.progress_correlated() {
+            self.fail_connection();
+            return Err(error);
         }
-        let overhead = 64
-            + if profiled {
-                SERVER_READ_PROFILE_BYTES
-            } else {
-                0
-            };
-        let mut total = overhead;
-        for reference in references {
-            if reference.batch_id.database != self.expected.inventory.database
-                || reference.batch_address.partition != self.expected.partition
-            {
-                return Err(TcpError::new("read belongs to another database/partition"));
-            }
-            super::super::codec::validate_reference_bounds(reference)
-                .map_err(TcpError::component)?;
-            if (reference.descriptor.len as usize + 8).max(256)
-                > self.frame_limit.saturating_sub(overhead)
-            {
-                return Err(TcpError::new(
-                    "one record exceeds negotiated response frame",
-                ));
-            }
-            if read_charge(std::slice::from_ref(reference))? > self.max_read_bytes {
-                return Err(TcpError::new(
-                    "one record exceeds negotiated retained-read budget",
-                ));
-            }
-            total = total
-                .checked_add((reference.descriptor.len as usize + 8).max(256))
-                .ok_or_else(|| TcpError::new("read result size overflow"))?;
-            if total > HARD_FRAME_LIMIT {
-                return Err(TcpError::new(
-                    "aggregate read result exceeds 64 MiB; split the call",
-                ));
-            }
-        }
-        let charge = read_charge(references)?;
-        if charge > SESSION_BYTES {
-            return Err(TcpError::new(
-                "read exceeds session byte credits; split the call",
-            ));
-        }
-        Ok(self.data_request_count() < SESSION_REQUESTS
-            && self.stream.output.len() < SESSION_REQUESTS
-            && self.reactor.control.is_none()
-            && charge <= SESSION_BYTES.saturating_sub(self.retained_data_bytes()))
-    }
-    pub(crate) fn submit_read(
-        &mut self,
-        epoch: u64,
-        references: Vec<ValueRecordReference>,
-        deadline: Instant,
-        profiled: bool,
-    ) -> Result<Option<u64>, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_config.is_some() {
-            return Err(TcpError::new(
-                "live NVMe read route unavailable; refusing payload RPC",
-            ));
-        }
-        if !self.read_admission(&references, profiled)? {
-            return Ok(None);
-        }
-        if Instant::now() >= deadline {
-            return Err(TcpError::new(
-                "remote read deadline expired before submission",
-            ));
-        }
-        let id = self.reactor.allocate_id()?;
-        let charge = read_charge(&references)?;
-        let mut pending = PendingRead {
-            epoch,
-            values: Vec::with_capacity(references.len()),
-            references,
-            start: 0,
-            end: 0,
-            wire_id: id,
-            deadline,
-            began: (profiled || self.diagnostics.is_some()).then(Instant::now),
-            profiled,
-            charge,
-            profile: TcpReadProfile::default(),
-        };
-        self.queue_read_chunk(&mut pending)?;
-        self.reactor.wire_reads.insert(id, id);
-        self.reactor.reads.insert(id, pending);
-        self.reactor.retained_bytes += charge;
-        Ok(Some(id))
-    }
-    fn queue_read_chunk(&mut self, pending: &mut PendingRead) -> Result<(), TcpError> {
-        let began = pending.began.map(|_| Instant::now());
-        let mut bytes = 64
-            + if pending.profiled {
-                SERVER_READ_PROFILE_BYTES
-            } else {
-                0
-            };
-        let mut retained = 4096usize;
-        pending.end = pending.start;
-        while pending.end < pending.references.len() && pending.end - pending.start < self.max_reads
-        {
-            let reference = pending.references[pending.end];
-            let record_len =
-                usize::try_from(reference.descriptor.len).map_err(TcpError::component)?;
-            let next = bytes
-                .checked_add(
-                    record_len
-                        .checked_add(8)
-                        .ok_or_else(|| TcpError::new("read chunk size overflow"))?
-                        .max(256),
-                )
-                .ok_or_else(|| TcpError::new("read chunk size overflow"))?;
-            let next_retained = retained
-                .checked_add(member_charge(&reference)?)
-                .ok_or_else(|| TcpError::new("read credit overflow"))?;
-            if next > self.frame_limit || next_retained > self.max_read_bytes {
-                break;
-            }
-            retained = next_retained;
-            bytes = next;
-            pending.end += 1;
-        }
-        if pending.end == pending.start {
-            return Err(TcpError::new("read cannot fit negotiated frame"));
-        }
-        let references = pending.references[pending.start..pending.end].to_vec();
-        let request = if pending.profiled {
-            Request::ReadProfiled {
-                epoch: pending.epoch,
-                references,
-            }
-        } else {
-            Request::Read {
-                epoch: pending.epoch,
-                references,
-            }
-        };
-        self.stream
-            .queue(pending.wire_id, &request, self.frame_limit)?;
-        self.reactor.message_read_requests += 1;
-        pending.profile.request_encode_ns += began.map_or(0, elapsed_ns);
-        pending.profile.request_encode_count += u64::from(began.is_some());
         Ok(())
     }
-    pub(super) fn submit_append(
-        &mut self,
-        epoch: u64,
-        batches: &[CompleteBatch],
-        charge: usize,
-    ) -> Result<Option<u64>, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_config.is_some() {
-            return Err(TcpError::new(
-                "live NVMe write route unavailable; refusing payload RPC",
-            ));
-        }
-        self.ensure_connection()?;
-        if charge > SESSION_BYTES {
-            return Err(TcpError::new("append exceeds session byte limit"));
-        }
-        if self.data_request_count() >= SESSION_REQUESTS
-            || self.stream.output.len() >= SESSION_REQUESTS
-            || charge > SESSION_BYTES.saturating_sub(self.retained_data_bytes())
-        {
-            return Ok(None);
-        }
-        let id = self.reactor.allocate_id()?;
-        let profile_started = self.diagnostics.is_some().then(Instant::now);
-        let request = Request::Append {
-            epoch,
-            batches: batches
-                .iter()
-                .map(|batch| batch.encoded().clone().into())
-                .collect(),
-        };
-        let current = self.retained_data_bytes();
-        let spare_capacity = self.stream.spare_output.capacity();
-        let retained_without_spare = current.saturating_sub(spare_capacity);
-        let output_reservation = spare_capacity.max(
-            self.stream
-                .queue_size(id, &request, self.frame_limit)?
-                .saturating_add(4),
-        );
-        if charge > SESSION_BYTES.saturating_sub(retained_without_spare)
-            || output_reservation
-                > SESSION_BYTES.saturating_sub(retained_without_spare.saturating_add(charge))
-        {
-            return Ok(None);
-        }
-        self.stream.queue(id, &request, self.frame_limit)?;
-        let request_encode_ns = profile_started.map_or(0, elapsed_ns);
-        self.reactor.wire_appends.insert(id, id);
-        self.reactor.appends.insert(
-            id,
-            PendingAppend {
-                batches: batches.to_vec(),
-                deadline: Instant::now() + self.timeout,
-                charge,
-                exchange_began: profile_started.map(|_| Instant::now()),
-                profile: profile_started.map(|_| TcpReadProfile {
-                    request_encode_ns,
-                    request_encode_count: 1,
-                    ..TcpReadProfile::default()
-                }),
-            },
-        );
-        self.reactor.retained_append_bytes += charge;
-        Ok(Some(id))
-    }
-    pub(crate) fn progress_appends(&mut self) -> Result<Vec<AppendCompletion>, TcpError> {
-        if let Err(error) = self.progress_correlated() {
-            self.fail_connection();
-            return Err(error);
-        }
-        let mut completions = Vec::with_capacity(self.reactor.append_ready.len());
-        while let Some(queued) = self.reactor.append_ready.pop_front() {
-            self.reactor.retained_append_bytes -= queued.charge;
-            completions.push(queued.completion);
-        }
-        #[cfg(test)]
-        if let Some(hold) = self.reactor.append_hold.as_mut() {
-            hold.filter(&mut completions);
-        }
-        Ok(completions)
-    }
-    /// Arms the one-shot test hold on this client's next two harvested append
-    /// completions; see `AppendHold`.
-    #[cfg(test)]
-    pub(crate) fn hold_append_completions(&mut self, successor_first: bool) {
-        self.reactor.append_hold = Some(AppendHold {
-            successor_first,
-            held: Vec::new(),
-            released: false,
-        });
-    }
-    pub(super) fn take_append_completion(
-        &mut self,
-        id: u64,
-    ) -> Result<Option<AppendCompletion>, TcpError> {
-        if let Err(error) = self.progress_correlated() {
-            self.fail_connection();
-            return Err(error);
-        }
-        let Some(index) = self
-            .reactor
-            .append_ready
-            .iter()
-            .position(|queued| queued.completion.id == id)
-        else {
-            return Ok(None);
-        };
-        let queued = self.reactor.append_ready.remove(index).unwrap();
-        self.reactor.retained_append_bytes -= queued.charge;
-        Ok(Some(queued.completion))
-    }
-    pub(super) fn pause_append_poll(&mut self, polling: &mut ActivePoll) {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn pause_session_poll(&mut self, polling: &mut ActivePoll) {
         polling.pause(
             self.polling,
             self.stream.is_fabric(),
             self.reactor.progressed,
         );
-    }
-    fn record_append_profile(&mut self, pending: &mut PendingAppend, decoded_ns: u64) {
-        let Some(mut profile) = pending.profile.take() else {
-            return;
-        };
-        profile.response_decode_ns += decoded_ns;
-        profile.response_decode_count += 1;
-        profile.requests += 1;
-        profile.exchange_ns = pending.exchange_began.map_or(0, elapsed_ns);
-        profile.exchange_count += u64::from(pending.exchange_began.is_some());
-        if let Some(diagnostics) = self.diagnostics.as_mut() {
-            diagnostics.add(profile);
-        }
-    }
-    pub(crate) fn read_progress_made(&self) -> bool {
-        self.reactor.progressed
-    }
-    pub(crate) fn progress_reads(&mut self) -> Result<Vec<ReadCompletion>, TcpError> {
-        if let Err(error) = self.progress_correlated() {
-            self.fail_connection();
-            return Err(error);
-        }
-        let mut completions = Vec::with_capacity(self.reactor.ready.len());
-        for (completion, charge) in self.reactor.ready.drain(..) {
-            self.reactor.retained_bytes -= charge;
-            completions.push(completion);
-        }
-        Ok(completions)
     }
     fn progress_correlated(&mut self) -> Result<(), TcpError> {
         self.progress_correlated_at(Instant::now())
@@ -2176,17 +1393,8 @@ impl Client {
         self.ensure_connection()?;
         if self
             .reactor
-            .appends
-            .values()
-            .any(|append| now >= append.deadline)
-        {
-            return Err(TcpError::new("remote append deadline expired"));
-        }
-        if self.reactor.reads.values().any(|read| now >= read.deadline)
-            || self
-                .reactor
-                .control
-                .is_some_and(|(_, deadline)| now >= deadline)
+            .control
+            .is_some_and(|(_, deadline)| now >= deadline)
             || self
                 .reactor
                 .position
@@ -2196,35 +1404,12 @@ impl Client {
         }
         let (progressed, _) = self.stream.progress(None)?;
         self.reactor.progressed = progressed;
-        // A peer can reply before our request's local CQE. Keep subsequent
-        // chunks in their bounded read owner until output retirement frees a
-        // frame credit; never overfill output or turn that stall into an error.
-        while self.stream.output.len() < SESSION_REQUESTS {
-            let Some(id) = self.reactor.reads.iter().find_map(|(&id, read)| {
-                (read.wire_id == 0 && read.start < read.references.len()).then_some(id)
-            }) else {
-                break;
-            };
-            let mut pending = self.reactor.reads.remove(&id).unwrap();
-            pending.wire_id = self.reactor.allocate_id()?;
-            self.queue_read_chunk(&mut pending)?;
-            self.reactor.wire_reads.insert(pending.wire_id, id);
-            self.reactor.reads.insert(id, pending);
-            self.reactor.progressed = true;
-        }
         for _ in 0..SESSION_REQUESTS {
             let Some((frame, frame_len)) = self.stream.receive(self.frame_limit)? else {
                 break;
             };
             self.reactor.progressed = true;
-            let measured = self.diagnostics.is_some()
-                || self.reactor.control_profiled
-                || self.reactor.reads.values().any(|read| read.profiled)
-                || self
-                    .reactor
-                    .appends
-                    .values()
-                    .any(|append| append.profile.is_some());
+            let measured = self.diagnostics.is_some() || self.reactor.control_profiled;
             let began = measured.then(Instant::now);
             let envelope: Envelope<Response> =
                 self.stream.decode(&frame[..frame_len], self.frame_limit)?;
@@ -2266,206 +1451,11 @@ impl Client {
                 self.reactor.control_decode_ns += decoded;
                 continue;
             }
-            if let Some(append_id) = self.reactor.wire_appends.remove(&envelope.id) {
-                let mut pending = self
-                    .reactor
-                    .appends
-                    .remove(&append_id)
-                    .ok_or_else(|| TcpError::new("missing append owner"))?;
-                let result = match envelope.body {
-                    Response::Appended(receipts) if receipts.len() == pending.batches.len() => {
-                        let verified = pending
-                            .batches
-                            .iter()
-                            .zip(receipts)
-                            .map(|(batch, receipt)| self.check_receipt(batch, receipt))
-                            .collect::<Result<Vec<_>, _>>();
-                        match verified {
-                            Ok(receipts) => Ok(receipts),
-                            Err(error) => {
-                                self.record_append_profile(&mut pending, decoded);
-                                self.fail_connection();
-                                return Err(error);
-                            }
-                        }
-                    }
-                    Response::Error(message) => Err(TcpError::new(message)),
-                    _ => {
-                        self.record_append_profile(&mut pending, decoded);
-                        return Err(TcpError::new("unexpected correlated append response"));
-                    }
-                };
-                self.record_append_profile(&mut pending, decoded);
-                self.reactor.append_ready.push_back(QueuedAppendCompletion {
-                    completion: AppendCompletion {
-                        id: append_id,
-                        result,
-                    },
-                    charge: pending.charge,
-                });
-                continue;
-            }
-            let aggregate = self
-                .reactor
-                .wire_reads
-                .remove(&envelope.id)
-                .ok_or_else(|| TcpError::new("unknown or duplicate response ID"))?;
-            let mut pending = self
-                .reactor
-                .reads
-                .remove(&aggregate)
-                .ok_or_else(|| TcpError::new("missing response owner"))?;
-            pending.profile.response_decode_ns += decoded;
-            pending.profile.response_decode_count += u64::from(began.is_some());
-            pending.profile.requests += 1;
-            let records = match envelope.body {
-                Response::Records(records) if !pending.profiled => records,
-                Response::RecordsProfiled { records, profile } if pending.profiled => {
-                    pending.profile.server_handler_available = true;
-                    pending.profile.server_handler_ns += profile.handler_ns;
-                    pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
-                    pending.profile.server_record_read_ns += profile.record_read_ns;
-                    pending.profile.server_wal.add(profile.wal);
-                    pending.profile.server_response_recheck_wait_ns +=
-                        profile.response_recheck_wait_ns;
-                    pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
-                    pending.profile.server_response_recheck_samples +=
-                        profile.response_recheck_samples;
-                    records
-                }
-                Response::ReadErrorProfiled { message, profile } if pending.profiled => {
-                    pending.profile.server_handler_available = true;
-                    pending.profile.server_handler_ns += profile.handler_ns;
-                    pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
-                    pending.profile.server_record_read_ns += profile.record_read_ns;
-                    pending.profile.server_wal.add(profile.wal);
-                    pending.profile.server_response_recheck_wait_ns +=
-                        profile.response_recheck_wait_ns;
-                    pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
-                    pending.profile.server_response_recheck_samples +=
-                        profile.response_recheck_samples;
-                    let mut error = TcpError::new(message);
-                    pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
-                    pending.profile.exchange_count += u64::from(pending.began.is_some());
-                    error.read_profile = Some(Box::new(pending.profile));
-                    self.reactor.ready.push_back((
-                        ReadCompletion {
-                            id: aggregate,
-                            result: Err(error),
-                        },
-                        pending.charge,
-                    ));
-                    continue;
-                }
-                Response::Error(message) => {
-                    self.reactor.ready.push_back((
-                        ReadCompletion {
-                            id: aggregate,
-                            result: Err(TcpError::new(message)),
-                        },
-                        pending.charge,
-                    ));
-                    continue;
-                }
-                _ => return Err(TcpError::new("unexpected correlated read response")),
-            };
-            let references = &pending.references[pending.start..pending.end];
-            if records.len() != references.len() {
-                return Err(TcpError::new("remote read count mismatch"));
-            }
-            let began = pending.began.map(|_| Instant::now());
-            if let [reference] = references {
-                // The common scalar reply already has its final result allocation.
-                // Keep every member/digest/shape check without tuple/result vectors
-                // or another shared-buffer clone.
-                pending.values.push(
-                    CompleteBatch::decode_record(
-                        &self.shape,
-                        reference,
-                        records
-                            .into_iter()
-                            .next()
-                            .expect("checked one record")
-                            .into_bytes(),
-                    )
-                    .map_err(TcpError::component)?,
-                );
-            } else {
-                let records: Vec<_> = references
-                    .iter()
-                    .copied()
-                    .zip(records.into_iter().map(WireBytes::into_bytes))
-                    .collect();
-                pending.values.extend(
-                    CompleteBatch::decode_records(&self.shape, &records)
-                        .map_err(TcpError::component)?,
-                );
-            }
-            pending.profile.record_verify_ns += began.map_or(0, elapsed_ns);
-            pending.profile.record_verify_count += u64::from(began.is_some());
-            if Instant::now() >= pending.deadline {
-                return Err(TcpError::new("remote read verification exceeded deadline"));
-            }
-            pending.start = pending.end;
-            pending.wire_id = 0;
-            if pending.start != pending.references.len() {
-                self.reactor.reads.insert(aggregate, pending);
-            } else {
-                pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
-                pending.profile.exchange_count += u64::from(pending.began.is_some());
-                if let Some(profile) = self.diagnostics.as_mut() {
-                    profile.add(pending.profile);
-                }
-                self.reactor.ready.push_back((
-                    ReadCompletion {
-                        id: aggregate,
-                        result: Ok((pending.values, pending.profile)),
-                    },
-                    pending.charge,
-                ));
-            }
+            return Err(TcpError::new("unknown or duplicate response ID"));
         }
         self.reactor.progressed |= self.stream.progress_output()?;
         self.reactor.progressed |= self.stream.finish_fabric_sweep()?;
         Ok(())
-    }
-
-    pub(super) fn read_records_correlated(
-        &mut self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-        profile: Option<&mut TcpReadProfile>,
-    ) -> Result<Vec<Mutation>, TcpError> {
-        let deadline = Instant::now() + self.timeout;
-        let id = self
-            .submit_read(epoch, references.to_vec(), deadline, profile.is_some())?
-            .ok_or_else(|| TcpError::new("session read admission is full"))?;
-        let mut polling = ActivePoll::default();
-        loop {
-            if let Err(error) = self.progress_correlated() {
-                self.fail_connection();
-                return Err(error);
-            }
-            if let Some(index) = self
-                .reactor
-                .ready
-                .iter()
-                .position(|(completion, _)| completion.id == id)
-            {
-                let (completion, charge) = self.reactor.ready.remove(index).unwrap();
-                self.reactor.retained_bytes -= charge;
-                let (records, measured) = completion.result?;
-                if let Some(profile) = profile {
-                    profile.add(measured);
-                }
-                return Ok(records);
-            }
-            polling.pause(
-                self.polling,
-                self.stream.is_fabric(),
-                self.reactor.progressed,
-            );
-        }
     }
     pub(super) fn exchange_position(&mut self, request: &Request) -> Result<Response, TcpError> {
         if self.reactor.position.is_some() {
@@ -2670,24 +1660,13 @@ struct ServerPending {
     kind: u64,
     timeout: Duration,
     charge: usize,
-    epoch: Option<u64>,
-    read_generation: Option<u64>,
-    profile: Option<Instant>,
-    record_started: Option<Instant>,
-    executor_started: Option<Instant>,
-    read_profile: ServerReadProfile,
     response_queued: bool,
     ready_response: Option<Response>,
-    response_ready_at: Option<Instant>,
     measured: bool,
     output_started: Option<Instant>,
-    _lease: Option<read_executor::ReadLease>,
-    async_started: Option<Instant>,
-    async_handler_ns: u64,
     control_queued: Option<Instant>,
     is_append: bool,
     owner_trace: bool,
-    owner_trace_shape: Option<(u64, usize, usize)>,
 }
 
 impl ServerPending {
@@ -2713,7 +1692,6 @@ pub(super) struct WorkCompletion {
     pub(super) id: u64,
     pub(super) response: Result<Response, TcpError>,
     pub(super) profile: ConnectionProfile,
-    pub(super) is_control: bool,
 }
 
 struct OwnerTimeline {
@@ -2768,73 +1746,6 @@ impl OwnerTimeline {
         }
     }
 }
-struct DeferredRead {
-    id: u64,
-    epoch: u64,
-    references: Vec<ValueRecordReference>,
-    members: Option<Vec<ReadMember>>,
-    plans: Option<Vec<read_executor::PlannedRead>>,
-}
-
-struct PlanCompletion {
-    read: DeferredRead,
-    result: Result<Vec<read_executor::PlannedRead>, TcpError>,
-}
-
-type ReadMember = (
-    Arc<super::super::storage::PartitionLog>,
-    ValueRecordReference,
-);
-
-// Keep the bounded cold handoff inline: boxing would allocate on every cold read.
-#[allow(clippy::large_enum_variant)]
-enum ReadPlanning {
-    Ready(Vec<read_executor::PlannedRead>),
-    Cold {
-        ready: Vec<read_executor::PlannedRead>,
-        first: ReadMember,
-        remaining: std::vec::IntoIter<ReadMember>,
-    },
-}
-
-fn resident_read_plans(members: Vec<ReadMember>) -> Result<ReadPlanning, TcpError> {
-    let mut remaining = members.into_iter();
-    let mut ready = Vec::with_capacity(remaining.len());
-    while let Some((log, reference)) = remaining.next() {
-        match log
-            .try_plan_record_read(&reference)
-            .map_err(TcpError::component)?
-        {
-            Some(plan) => ready.push((reference, plan)),
-            None => {
-                return Ok(ReadPlanning::Cold {
-                    ready,
-                    first: (log, reference),
-                    remaining,
-                });
-            }
-        }
-    }
-    Ok(ReadPlanning::Ready(ready))
-}
-
-fn load_read_plans(
-    mut ready: Vec<read_executor::PlannedRead>,
-    first: ReadMember,
-    remaining: std::vec::IntoIter<ReadMember>,
-) -> Result<Vec<read_executor::PlannedRead>, TcpError> {
-    // Only the bounded cold worker calls this blocking authority loader. Each
-    // returned plan already pins exact descriptor authority and native File.
-    for (log, reference) in std::iter::once(first).chain(remaining) {
-        ready.push((
-            reference,
-            log.plan_record_read(&reference)
-                .map_err(TcpError::component)?,
-        ));
-    }
-    Ok(ready)
-}
-
 fn revalidate_client_peer(
     server: Option<&rustls::Connection>,
     verifier: Option<&dyn rustls::server::danger::ClientCertVerifier>,
@@ -2865,21 +1776,8 @@ pub(super) fn serve_session(
     shutdown: &AtomicBool,
     client_verifier: Option<&dyn rustls::server::danger::ClientCertVerifier>,
 ) -> Result<(), TcpError> {
-    let mut executor = if node.wal_member_read == super::super::storage::WalMemberReadPolicy::Async
-    {
-        Some(
-            read_executor::ReadExecutor::new(node.read_config, node.read_admission.clone())
-                .map_err(TcpError::component)?,
-        )
-    } else {
-        None
-    };
     let (completed, completions) = mpsc::sync_channel::<WorkCompletion>(SESSION_REQUESTS);
-    let (plans_completed, plan_completions) =
-        mpsc::sync_channel::<PlanCompletion>(SESSION_REQUESTS);
-    let mut planners = 0usize;
     let mut pending = HashMap::<u64, ServerPending>::new();
-    let mut deferred = VecDeque::<DeferredRead>::new();
     let mut controls = VecDeque::<(u64, Request)>::new();
     // One decoded input frame may await byte credits; never drain more input
     // behind it. Its original deadline and the negotiated frame bound apply.
@@ -2889,7 +1787,6 @@ pub(super) fn serve_session(
     let mut workers = 0usize;
     let mut retained_bytes = 0usize;
     let mut initialized = false;
-    let mut diagnostic_only = false;
     let mut last_id = 0;
     let mut diagnostics = None::<ConnectionProfile>;
     let mut owner_timeline = None::<OwnerTimeline>;
@@ -2898,14 +1795,9 @@ pub(super) fn serve_session(
     let mut previous_sweep = None::<Instant>;
     let mut fabric_idle_deadline = None;
     #[cfg(feature = "experimental-fabric")]
-    stream.attach_owner_transport(&node.read_admission.transport);
-    #[cfg(feature = "test-utils")]
-    let mut ram_probe = None::<minibytes::Bytes>;
+    stream.attach_owner_transport(&node.control_context.transport);
     let result = (|| {
         while !shutdown.load(Ordering::Acquire) {
-            if let Some(executor) = executor.as_mut() {
-                executor.begin_sweep();
-            }
             let now = Instant::now();
             let sweep_gap = if let Some(profile) = diagnostics.as_mut() {
                 profile.polling.progress_sweeps += 1;
@@ -2973,23 +1865,18 @@ pub(super) fn serve_session(
                 &mut retained_bytes,
                 diagnostics.as_mut(),
             );
-            if let Some(executor) = executor.as_mut() {
-                progressed |= harvest_reads(executor, &mut pending)?;
-            }
             while let Ok(completion) = completions.try_recv() {
                 progressed = true;
                 workers -= 1;
-                if completion.is_control {
-                    if pending
-                        .get(&completion.id)
-                        .is_some_and(|request| request.is_append)
-                    {
-                        active_appends = active_appends.checked_sub(1).ok_or_else(|| {
-                            TcpError::new("append completion without active session admission")
-                        })?;
-                    } else {
-                        barrier_active = false;
-                    }
+                if pending
+                    .get(&completion.id)
+                    .is_some_and(|request| request.is_append)
+                {
+                    active_appends = active_appends.checked_sub(1).ok_or_else(|| {
+                        TcpError::new("stream completion without active session admission")
+                    })?;
+                } else {
+                    barrier_active = false;
                 }
                 if let Some(request) = pending.get(&completion.id)
                     && request.owner_trace
@@ -3021,7 +1908,7 @@ pub(super) fn serve_session(
                         .push(super::super::write_timeline::OwnerTimelineRecord {
                             owner: 0,
                             envelope_id: completion.id,
-                            epoch: request.owner_trace_shape.map(|shape| shape.0),
+                            epoch: None,
                             success: completion.response.is_ok(),
                             error,
                             error_truncated,
@@ -3061,8 +1948,8 @@ pub(super) fn serve_session(
                             file_persist_calls: storage.file_persist_calls,
                             namespace_persist_calls: storage.namespace_persist_calls,
                             appended_groups: storage.appended_groups,
-                            batch_count: request.owner_trace_shape.map(|shape| shape.1),
-                            encoded_bytes: request.owner_trace_shape.map(|shape| shape.2),
+                            batch_count: None,
+                            encoded_bytes: None,
                             persistence_capture: storage.persistence_capture,
                             ready_append_prefix: profile.ready_append_prefix,
                         });
@@ -3074,42 +1961,6 @@ pub(super) fn serve_session(
                     .response
                     .unwrap_or_else(|error| Response::Error(error.to_string()));
                 queue_response(&mut pending, completion.id, response)?;
-            }
-            while let Ok(completion) = plan_completions.try_recv() {
-                planners -= 1;
-                progressed = true;
-                let mut read = completion.read;
-                let request = pending
-                    .get(&read.id)
-                    .ok_or_else(|| TcpError::new("unknown authority planning completion ID"))?;
-                if Instant::now() >= request.deadline {
-                    return Err(request.deadline_error(
-                        read.id,
-                        "finished read planning",
-                        Instant::now(),
-                    ));
-                }
-                // The worker pinned native file ownership BEFORE this recheck.
-                // Fencing invalidates authority, never a live CQ/file owner.
-                if !node.reader_authority_valid(read.epoch, request.read_generation) {
-                    queue_response(
-                        &mut pending,
-                        read.id,
-                        Response::Error(
-                            "read authority was fenced or poisoned during planning".into(),
-                        ),
-                    )?;
-                    continue;
-                }
-                match completion.result {
-                    Ok(plans) => {
-                        read.plans = Some(plans);
-                        deferred.push_back(read);
-                    }
-                    Err(error) => {
-                        queue_response(&mut pending, read.id, Response::Error(error.to_string()))?
-                    }
-                }
             }
             for _ in 0..SESSION_REQUESTS {
                 // Peer receipt can precede local TX completion. Backpressure,
@@ -3166,18 +2017,9 @@ pub(super) fn serve_session(
                         "invalid, duplicate or nonmonotonic request ID",
                     ));
                 }
-                if !initialized {
-                    if matches!(&envelope.body, Request::OperationalReadIoStats) {
-                        diagnostic_only = true;
-                    } else if !matches!(&envelope.body, Request::Status { protocol: PROTOCOL }) {
-                        return Err(TcpError::new("status/protocol handshake required"));
-                    }
-                } else if diagnostic_only
-                    && !matches!(&envelope.body, Request::OperationalReadIoStats)
+                if !initialized && !matches!(&envelope.body, Request::Status { protocol: PROTOCOL })
                 {
-                    return Err(TcpError::new(
-                        "diagnostic session cannot serve data requests",
-                    ));
+                    return Err(TcpError::new("status/protocol handshake required"));
                 }
                 if initialized && matches!(&envelope.body, Request::Status { .. }) {
                     // Reusing a live TLS channel must not let an expired client
@@ -3189,69 +2031,11 @@ pub(super) fn serve_session(
                         rustls::pki_types::UnixTime::now(),
                     )?;
                 }
-                let (charge, epoch, profiled) = match &envelope.body {
-                    Request::Read {
-                        epoch, references, ..
-                    }
-                    | Request::ReadProfiled {
-                        epoch, references, ..
-                    } => {
-                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                        if node.live_nvme_selected {
-                            return Err(TcpError::new("live NVMe owner rejects payload read RPC"));
-                        }
-                        if references.is_empty()
-                            || references.len() > node.effective_max_reads(limits)
-                        {
-                            return Err(TcpError::new("read request count exceeds bound"));
-                        }
-                        let profiled = matches!(&envelope.body, Request::ReadProfiled { .. });
-                        let mut size = 32usize
-                            + if profiled {
-                                SERVER_READ_PROFILE_BYTES
-                            } else {
-                                0
-                            };
-                        for reference in references {
-                            let record_len = usize::try_from(reference.descriptor.len)
-                                .map_err(TcpError::component)?;
-                            size = size
-                                .checked_add(
-                                    record_len
-                                        .checked_add(8)
-                                        .ok_or_else(|| TcpError::new("read response overflow"))?,
-                                )
-                                .ok_or_else(|| TcpError::new("read response overflow"))?;
-                        }
-                        if size > limits.max_frame_bytes {
-                            return Err(TcpError::new("read response exceeds frame bound"));
-                        }
-                        let charge = read_charge(references)?;
-                        if charge > node.read_config.max_bytes {
-                            return Err(TcpError::new(
-                                "read exceeds negotiated retained-read budget",
-                            ));
-                        }
-                        (charge, Some(*epoch), profiled)
-                    }
-                    _ => (
-                        frame_bytes.max(limits.max_frame_bytes).saturating_add(512),
-                        None,
-                        false,
-                    ),
-                };
-                #[cfg(feature = "test-utils")]
-                let probe_bytes = ram_probe.as_ref().map_or(0, |bytes| bytes.len());
-                #[cfg(not(feature = "test-utils"))]
-                let probe_bytes = 0;
+                let charge = frame_bytes.max(limits.max_frame_bytes).saturating_add(512);
                 if charge > SESSION_BYTES {
                     return Err(TcpError::new("request exceeds session byte credits"));
                 }
-                if charge
-                    > SESSION_BYTES
-                        .saturating_sub(probe_bytes)
-                        .saturating_sub(retained_bytes)
-                {
+                if charge > SESSION_BYTES.saturating_sub(retained_bytes) {
                     held_request = Some((envelope, frame_bytes, deadline));
                     break;
                 }
@@ -3260,21 +2044,16 @@ pub(super) fn serve_session(
                 retained_bytes += charge;
                 let trace_control = matches!(
                     &envelope.body,
-                    Request::Checkpoint { .. } | Request::CheckpointPosition { .. }
+                    Request::CheckpointPosition { .. }
+                        | Request::AdoptLiveExtent { .. }
+                        | Request::PreleaseLiveExtent { .. }
+                        | Request::LeaseLiveExtent { .. }
                 );
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                let trace_control = trace_control
-                    || matches!(
-                        &envelope.body,
-                        Request::AdoptLiveExtent { .. }
-                            | Request::PreleaseLiveExtent { .. }
-                            | Request::LeaseLiveExtent { .. }
-                    );
-                let owner_trace =
-                    if trace_control || matches!(&envelope.body, Request::Append { .. }) {
-                        if let Some(timeline) =
-                            owner_timeline.as_mut().filter(|timeline| timeline.active)
-                        {
+                let owner_trace = trace_control
+                    && owner_timeline
+                        .as_mut()
+                        .filter(|timeline| timeline.active)
+                        .is_some_and(|timeline| {
                             if timeline.selected < timeline.limit {
                                 timeline.selected += 1;
                                 true
@@ -3282,29 +2061,7 @@ pub(super) fn serve_session(
                                 timeline.dropped += 1;
                                 false
                             }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                let owner_trace_shape = if owner_timeline
-                    .as_ref()
-                    .is_some_and(|timeline| timeline.active)
-                    || diagnostics.is_some()
-                {
-                    if let Request::Append { epoch, batches } = &envelope.body {
-                        Some((
-                            *epoch,
-                            batches.len(),
-                            batches.iter().map(|batch| batch.as_slice().len()).sum(),
-                        ))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                        });
                 let measured = (diagnostics.is_some() && !envelope.body.is_measurement_control())
                     || owner_trace;
                 if let Some(profile) = diagnostics.as_mut() {
@@ -3324,298 +2081,30 @@ pub(super) fn serve_session(
                         kind: request_kind_code(&envelope.body),
                         timeout: envelope.body.timeout(limits.io_timeout),
                         charge,
-                        epoch,
-                        read_generation: None,
-                        profile: profiled.then(Instant::now),
-                        record_started: None,
-                        executor_started: None,
-                        read_profile: ServerReadProfile {
-                            wal: WalReadProfile {
-                                executor_requests: u64::from(profiled && executor.is_some()),
-                                sync_reader_requests: u64::from(profiled && executor.is_none()),
-                                ..WalReadProfile::default()
-                            },
-                            ..ServerReadProfile::default()
-                        },
                         response_queued: false,
                         ready_response: None,
-                        response_ready_at: None,
                         measured,
                         owner_trace,
-                        owner_trace_shape,
                         is_append: control::is_stream_request(&envelope.body),
                         control_queued: measured.then(Instant::now),
                         output_started: None,
-                        _lease: None,
-                        async_started: (measured && epoch.is_some() && executor.is_some())
-                            .then(Instant::now),
-                        async_handler_ns: 0,
                     },
                 );
-                match envelope.body {
-                    #[cfg(feature = "test-utils")]
-                    Request::PrepareRamProbe { value_bytes } => {
-                        let valid = validate_ram_probe_size(value_bytes, limits.max_frame_bytes)
-                            .and_then(|()| {
-                                if value_bytes
-                                    > SESSION_BYTES
-                                        .saturating_sub(probe_bytes)
-                                        .saturating_sub(retained_bytes)
-                                {
-                                    Err(TcpError::new("RAM probe exceeds session byte credits"))
-                                } else {
-                                    Ok(())
-                                }
-                            });
-                        let response = match valid {
-                            Ok(()) => {
-                                // Replacement releases the old retained buffer. Queued replies
-                                // keep their immutable clone until encoding/completion ownership
-                                // retires; ordinary session output credits still apply.
-                                ram_probe = Some(
-                                    (0..value_bytes)
-                                        .map(|i| (i % 251) as u8)
-                                        .collect::<Vec<_>>()
-                                        .into(),
-                                );
-                                Response::RamProbePrepared
-                            }
-                            Err(error) => Response::Error(error.to_string()),
-                        };
-                        queue_response(&mut pending, envelope.id, response)?;
-                    }
-                    #[cfg(feature = "test-utils")]
-                    Request::ReadRamProbe => {
-                        let response = match &ram_probe {
-                            Some(bytes) => Response::RamProbe(bytes.clone().into()),
-                            None => Response::Error("RAM probe is not prepared".into()),
-                        };
-                        queue_response(&mut pending, envelope.id, response)?;
-                    }
-                    Request::Read {
-                        epoch, references, ..
-                    }
-                    | Request::ReadProfiled {
-                        epoch, references, ..
-                    } if executor.is_some() => {
-                        deferred.push_back(DeferredRead {
-                            id: envelope.id,
-                            epoch,
-                            references,
-                            members: None,
-                            plans: None,
-                        });
-                    }
-                    request => controls.push_back((envelope.id, request)),
-                }
+                controls.push_back((envelope.id, envelope.body));
             }
             // Dispatch newly decoded requests in this sweep, not after another
             // socket/CQ poll. Each queued request gets one bounded attempt; a
-            // full ring or busy inventory cannot block unrelated requests.
-            let deferred_count = deferred.len();
-            let mut reads_submitted = false;
-            for _ in 0..deferred_count {
-                let mut read = deferred.pop_front().unwrap();
-                if read.members.is_none() && read.plans.is_none() {
-                    let began = pending[&read.id].profile.map(|_| Instant::now());
-                    let snapshot = node.reader_snapshot(read.epoch, &read.references);
-                    if let Some(request) = pending.get_mut(&read.id) {
-                        request.read_profile.authority_lookup_ns += began.map_or(0, elapsed_ns);
-                    }
-                    match snapshot {
-                        Ok(snapshot) => {
-                            let request = pending.get_mut(&read.id).ok_or_else(|| {
-                                TcpError::new("missing pending read for authority snapshot")
-                            })?;
-                            request.read_generation = Some(snapshot.generation);
-                            read.members = Some(snapshot.members);
-                        }
-                        Err(error) => {
-                            queue_response(
-                                &mut pending,
-                                read.id,
-                                Response::Error(error.to_string()),
-                            )?;
-                            continue;
-                        }
-                    }
-                }
-                // Shared reply credits bound both queued cold authority loads
-                // and ready plans, not just requests already submitted to disk.
-                if pending[&read.id]._lease.is_none() {
-                    match node.read_admission.reserve_reply(pending[&read.id].charge) {
-                        Ok(Some(lease)) => pending.get_mut(&read.id).unwrap()._lease = Some(lease),
-                        Ok(None) => {
-                            deferred.push_back(read);
-                            continue;
-                        }
-                        Err(error) => {
-                            queue_response(
-                                &mut pending,
-                                read.id,
-                                Response::Error(error.to_string()),
-                            )?;
-                            continue;
-                        }
-                    }
-                }
-                let request = pending.get_mut(&read.id).unwrap();
-                if request.profile.is_some() {
-                    request.record_started.get_or_insert_with(Instant::now);
-                }
-                if read.plans.is_none() {
-                    match resident_read_plans(read.members.take().unwrap()) {
-                        Ok(ReadPlanning::Ready(plans)) => read.plans = Some(plans),
-                        Ok(ReadPlanning::Cold {
-                            ready,
-                            first,
-                            remaining,
-                        }) => {
-                            planners += 1;
-                            let completed = plans_completed.clone();
-                            node.read_pool.spawn(move || {
-                                let result =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        load_read_plans(ready, first, remaining)
-                                    }))
-                                    .unwrap_or_else(|_| {
-                                        Err(TcpError::new("cold read authority worker panicked"))
-                                    });
-                                let _ = completed.try_send(PlanCompletion { read, result });
-                            });
-                            progressed = true;
-                            continue;
-                        }
-                        Err(error) => {
-                            queue_response(
-                                &mut pending,
-                                read.id,
-                                Response::Error(error.to_string()),
-                            )?;
-                            continue;
-                        }
-                    }
-                }
-                let request = pending.get_mut(&read.id).unwrap();
-                if request.read_profile.wal.planning_count == 0
-                    && let Some(started) = request.record_started
-                {
-                    let ns = elapsed_ns(started);
-                    request.read_profile.wal.planning_ns = ns;
-                    request.read_profile.wal.planning_count = 1;
-                    request.read_profile.wal.planning_max_ns = ns;
-                }
-                // File/authority pins exist before this check, including on
-                // the entirely resident path and after a Full retry.
-                if !node.reader_authority_valid(read.epoch, request.read_generation) {
-                    queue_response(
-                        &mut pending,
-                        read.id,
-                        Response::Error(
-                            "read authority was fenced or poisoned before submission".into(),
-                        ),
-                    )?;
-                    continue;
-                }
-                if Instant::now() >= request.deadline {
-                    return Err(request.deadline_error(
-                        read.id,
-                        "reached read submission",
-                        Instant::now(),
-                    ));
-                }
-                if request.profile.is_some() {
-                    request.executor_started.get_or_insert_with(Instant::now);
-                }
-                let outcome = executor.as_mut().unwrap().submit_planned_profiled(
-                    read.id,
-                    read.plans.take().unwrap(),
-                    &mut request._lease,
-                    request.profile.map(|_| &mut request.read_profile.wal),
-                );
-                if matches!(
-                    &outcome,
-                    Ok(read_executor::SubmitOutcome::Ready { .. }
-                        | read_executor::SubmitOutcome::Pending)
-                ) && let Some(started) = request.executor_started.take()
-                {
-                    let ns = elapsed_ns(started);
-                    request.read_profile.wal.executor_residence_ns += ns;
-                    request.read_profile.wal.executor_residence_count += 1;
-                    request.read_profile.wal.executor_residence_max_ns =
-                        request.read_profile.wal.executor_residence_max_ns.max(ns);
-                }
-                match outcome {
-                    Ok(read_executor::SubmitOutcome::Ready { records, lease }) => {
-                        pending.get_mut(&read.id).unwrap()._lease = Some(lease);
-                        finish_read(&mut pending, read.id, Ok(records))?;
-                        progressed = true;
-                    }
-                    Ok(read_executor::SubmitOutcome::Pending) => {
-                        reads_submitted = true;
-                        progressed = true;
-                    }
-                    Ok(read_executor::SubmitOutcome::Full(plans)) => {
-                        read.plans = Some(plans);
-                        deferred.push_back(read);
-                    }
-                    Ok(read_executor::SubmitOutcome::Deferred(plans)) => {
-                        read.plans = Some(plans);
-                        deferred.push_back(read);
-                        progressed = true;
-                    }
-                    Err(error) => {
-                        queue_response(&mut pending, read.id, Response::Error(error.to_string()))?;
-                    }
-                }
-            }
-            if reads_submitted {
-                // Seastar reactor.cc:3333-3355 (19ecc0d39feb36c8a10692ba262e9924e9f7df33):
-                // reap again after submission, since resident I/O can already
-                // have completed. One bounded, nonblocking CQ harvest only.
-                progressed |= harvest_reads(executor.as_mut().unwrap(), &mut pending)?;
-            }
+            // busy control owner cannot block unrelated requests.
             let mut blocked_control = false;
             for _ in 0..controls.len() {
                 let (id, request) = controls.pop_front().unwrap();
-                if matches!(&request, Request::OperationalReadIoStats) {
-                    queue_response(
-                        &mut pending,
-                        id,
-                        Response::OperationalReadIoStats(Box::new((
-                            node.control_context.partition.clone(),
-                            node.read_admission.try_stats(),
-                        ))),
-                    )?;
-                    progressed = true;
-                    continue;
-                }
                 let is_append = control::is_stream_request(&request);
-                let is_control = !matches!(
-                    &request,
-                    Request::Read { .. } | Request::ReadProfiled { .. }
-                );
-                if is_control
-                    && (blocked_control || barrier_active || (!is_append && active_appends != 0))
-                {
+                if blocked_control || barrier_active || (!is_append && active_appends != 0) {
                     #[cfg(test)]
                     node.control.note_session_barrier_wait();
                     controls.push_back((id, request));
                     blocked_control = true;
                     continue;
-                }
-                if !is_control && pending[&id]._lease.is_none() {
-                    match node.read_admission.reserve_reply(pending[&id].charge) {
-                        Ok(Some(lease)) => pending.get_mut(&id).unwrap()._lease = Some(lease),
-                        Ok(None) => {
-                            controls.push_back((id, request));
-                            continue;
-                        }
-                        Err(error) => {
-                            queue_response(&mut pending, id, Response::Error(error.to_string()))?;
-                            continue;
-                        }
-                    }
                 }
                 if let Request::OwnerTimelineArm { limit } = request {
                     let response = if limit > 65_536 {
@@ -3666,13 +2155,12 @@ pub(super) fn serve_session(
                         id,
                         Response::ConnectionProfile(Box::new(previous)),
                     )?;
-                } else if is_control {
+                } else {
                     let work = control::ControlWork {
                         id,
                         request,
                         limits,
                         measured: pending[&id].measured,
-                        trace_shape: pending[&id].owner_trace_shape,
                         queued: pending[&id].control_queued,
                         submitted: pending[&id].measured.then(Instant::now),
                         charge: pending[&id].charge,
@@ -3688,46 +2176,17 @@ pub(super) fn serve_session(
                             workers += 1;
                         }
                         Err(work) => {
-                            // Do not let a later fence/seal/checkpoint pass a
-                            // backpressured append on this authenticated lane.
+                            // Do not let a later fence/seal pass a backpressured
+                            // stream request on this authenticated lane.
                             controls.push_back((id, work.request));
                             blocked_control = true;
                             continue;
                         }
                     }
-                } else {
-                    workers += 1;
-                    let completed = completed.clone();
-                    let worker_node = node.clone();
-                    let measured = pending[&id].measured;
-                    // Explicit blocking read diagnostics retain their pool;
-                    // append/control work never takes this shared-pool hop.
-                    node.read_pool.spawn(move || {
-                        let mut profile = ConnectionProfile::default();
-                        let began = measured.then(Instant::now);
-                        let response = worker_node.handle_caught(
-                            request,
-                            limits,
-                            measured.then_some(&mut profile),
-                        );
-                        profile.handler_ns = began.map_or(0, elapsed_ns);
-                        let _ = completed.try_send(WorkCompletion {
-                            id,
-                            response,
-                            profile,
-                            is_control,
-                        });
-                    });
                 }
                 progressed = true;
             }
-            if flush_responses(
-                node,
-                &mut stream,
-                &mut pending,
-                limits,
-                diagnostics.as_mut(),
-            )? {
+            if flush_responses(&mut stream, &mut pending, limits, diagnostics.as_mut())? {
                 // Do not defer a bounded resident reply behind the next sweep's
                 // socket/CQ read. This is output-only; cold I/O stays off-owner.
                 stream.progress_output()?;
@@ -3786,155 +2245,40 @@ pub(super) fn serve_session(
         completions.recv().map_err(TcpError::component)?;
         workers -= 1;
     }
-    while planners != 0 {
-        // Dropping an unsubmitted pinned plan is safe; no SQE owns its buffer.
-        // Keep the pending reply lease until every cold worker has retired.
-        plan_completions.recv().map_err(TcpError::component)?;
-        planners -= 1;
-    }
-    if let Some(executor) = executor.as_mut() {
-        // Cancellation suppresses delivery, never releases an SQE's pinned
-        // buffer/file/segment before its CQE or ring teardown quiescence.
-        for id in pending.keys() {
-            executor.cancel(*id);
-        }
-        let shutdown_result = executor.shutdown().map_err(TcpError::component);
-        result.and(shutdown_result)
-    } else {
-        result
-    }
+    result
 }
 
-fn harvest_reads(
-    executor: &mut read_executor::ReadExecutor,
-    pending: &mut HashMap<u64, ServerPending>,
-) -> Result<bool, TcpError> {
-    let completions = executor.poll_completed().map_err(TcpError::component)?;
-    let progressed = !completions.is_empty();
-    for completion in completions {
-        let request = pending
-            .get_mut(&completion.request_id)
-            .ok_or_else(|| TcpError::new("unknown executor completion ID"))?;
-        request._lease = completion.lease;
-        if let Some(profile) = completion.profile {
-            request.read_profile.wal.add(profile);
-        }
-        finish_read(
-            pending,
-            completion.request_id,
-            completion.result.map_err(TcpError::component),
-        )?;
-    }
-    Ok(progressed)
-}
-
-fn finish_read(
-    pending: &mut HashMap<u64, ServerPending>,
-    id: u64,
-    records: Result<Vec<minibytes::Bytes>, TcpError>,
-) -> Result<(), TcpError> {
-    let request = pending
-        .get_mut(&id)
-        .ok_or_else(|| TcpError::new("unknown read completion ID"))?;
-    let response = match records {
-        Ok(records) => {
-            let response_started = request.profile.map(|_| Instant::now());
-            let records = records.into_iter().map(WireBytes::from).collect();
-            if let Some(started) = response_started {
-                let ns = elapsed_ns(started);
-                request.read_profile.wal.response_ready_ns += ns;
-                request.read_profile.wal.response_ready_count += 1;
-                request.read_profile.wal.response_ready_max_ns =
-                    request.read_profile.wal.response_ready_max_ns.max(ns);
-            }
-            if let Some(began) = request.profile {
-                request.read_profile.handler_ns = elapsed_ns(began);
-                request.read_profile.record_read_ns = request.record_started.map_or(0, elapsed_ns);
-                Response::RecordsProfiled {
-                    records,
-                    profile: request.read_profile,
-                }
-            } else {
-                Response::Records(records)
-            }
-        }
-        Err(error) => Response::Error(error.to_string()),
-    };
-    queue_response(pending, id, response)
-}
-
-// Stable diagnostic codes, independent of bincode enum discriminants and features.
-// The table is documented in owner_events.rs.
+// Stable diagnostic codes, independent of bincode enum discriminants and
+// features; codes of removed requests are never reused. The table is
+// documented in owner_events.rs.
 fn request_kind_code(request: &Request) -> u64 {
     match request {
-        Request::Checkpoint { .. } => 1,
         Request::RetirementFiles { .. } => 2,
-        Request::RetireFiles { .. } => 3,
-        Request::ReadIoStats => 4,
         Request::Status { .. } => 5,
         Request::Fence { .. } => 6,
-        Request::Append { .. } => 7,
-        Request::Read { .. } => 8,
-        Request::Recover { .. } => 9,
         Request::Seal { .. } => 10,
         Request::Stats => 11,
-        Request::ReadProfiled { .. } => 12,
         Request::StatsDetailed => 13,
         Request::ConnectionProfile { .. } => 14,
-        Request::OperationalReadIoStats => 15,
         Request::OwnerTimelineArm { .. } => 16,
         Request::OwnerTimelineFetch { .. } => 17,
         Request::CheckpointPosition { .. } => 18,
-        Request::ReplayWal { .. } => 19,
         Request::RetireWalFiles { .. } => 20,
+        Request::ReleaseLiveEpochPin { .. } => 26,
+        Request::ResolveLiveRecords { .. } => 29,
+        Request::LiveTargetStats => 31,
+        Request::ShutdownLiveTarget { .. } => 32,
+        Request::LeaseLiveExtent { .. } => 33,
+        Request::AdoptLiveExtent { .. } => 34,
+        Request::OpenLiveExports { .. } => 35,
+        Request::PreleaseLiveExtent { .. } => 36,
+        Request::ReplayLiveWal { .. } => 37,
+        Request::ReadEvidence { .. } => 38,
+        Request::ProcessResources { .. } => 39,
+        Request::AcquireLiveExportPin { .. } => 42,
+        Request::ReleaseLiveExportPin { .. } => 43,
         Request::DurableProgress { .. } => 44,
         Request::PartitionStats => 45,
-        #[cfg(feature = "experimental-nvmeof")]
-        Request::ValidateRecordReferences { .. } => 21,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::RegisterNvmeofExport { .. } => 22,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReleaseNvmeofExport { .. } => 23,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::RegisterNvmeofEpochPin { .. } => 24,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReleaseNvmeofEpochPin { .. } => 25,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReleaseLiveEpochPin { .. } => 26,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReserveLiveGroup { .. } => 27,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::CompleteLiveGroup { .. } => 28,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ResolveLiveRecords { .. } => 29,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::RecoverLiveMetadata { .. } => 30,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::LiveTargetStats => 31,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ShutdownLiveTarget { .. } => 32,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::LeaseLiveExtent { .. } => 33,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::AdoptLiveExtent { .. } => 34,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::OpenLiveExports { .. } => 35,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::PreleaseLiveExtent { .. } => 36,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReplayLiveWal { .. } => 37,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::AcquireLiveExportPin { .. } => 42,
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReleaseLiveExportPin { .. } => 43,
-        #[cfg(all(target_os = "linux", feature = "test-utils"))]
-        Request::ReadEvidence { .. } => 38,
-        #[cfg(all(target_os = "linux", feature = "test-utils"))]
-        Request::ProcessResources { .. } => 39,
-        #[cfg(feature = "test-utils")]
-        Request::PrepareRamProbe { .. } => 40,
-        #[cfg(feature = "test-utils")]
-        Request::ReadRamProbe => 41,
     }
 }
 
@@ -3949,34 +2293,6 @@ fn queue_response(
     if request.response_queued || request.ready_response.is_some() {
         return Err(TcpError::new("duplicate server completion"));
     }
-    if let Response::RecordsProfiled { profile, .. } = &response {
-        // A synchronous worker owns its profile until completion; retain it
-        // before a later authority recheck can replace the successful reply.
-        request.read_profile = *profile;
-    }
-    if let Response::ReadErrorProfiled { profile, .. } = &response {
-        request.read_profile = **profile;
-    }
-    request.async_handler_ns = request.async_started.map_or(0, elapsed_ns);
-    request.response_ready_at = (request.epoch.is_some()
-        && (request.measured || request.profile.is_some()))
-    .then(Instant::now);
-    if matches!(&response, Response::Error(_))
-        && let (Some(started), Some(ready)) = (request.profile, request.response_ready_at)
-    {
-        // Match successful replies: handler/record service ends when the result
-        // becomes ready, before the response queue and final authority recheck.
-        request.read_profile.handler_ns = ready
-            .duration_since(started)
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
-        request.read_profile.record_read_ns = request.record_started.map_or(0, |started| {
-            ready
-                .duration_since(started)
-                .as_nanos()
-                .min(u64::MAX as u128) as u64
-        });
-    }
     request.ready_response = Some(response);
     super::super::owner_events::record(
         super::super::owner_events::OwnerEventKind::ControlReplied,
@@ -3988,7 +2304,6 @@ fn queue_response(
 }
 
 fn flush_responses(
-    node: &StorageNode,
     stream: &mut Session,
     pending: &mut HashMap<u64, ServerPending>,
     limits: TcpLimits,
@@ -3996,69 +2311,19 @@ fn flush_responses(
 ) -> Result<bool, TcpError> {
     let mut progressed = false;
     for (&id, request) in pending.iter_mut() {
-        if request.ready_response.is_none() {
+        let Some(response) = request.ready_response.take() else {
             continue;
-        }
+        };
         let now = Instant::now();
         if now >= request.deadline {
             return Err(request.deadline_error(id, "had a response ready to send", now));
         }
-        // Recheck the captured authority without waiting for append or persistence.
-        let recheck_started = request.response_ready_at.map(|_| Instant::now());
-        let mut response = request.ready_response.take().unwrap();
-        let recheck_error = request.epoch.and_then(|epoch| {
-            (!node.reader_authority_valid(epoch, request.read_generation))
-                .then(|| TcpError::new("read authority was fenced or poisoned before response"))
-        });
-        if let (Some(ready), Some(began)) = (request.response_ready_at, recheck_started) {
-            let wait_ns = began.duration_since(ready).as_nanos().min(u64::MAX as u128) as u64;
-            let recheck_ns = elapsed_ns(began);
-            if request.measured
-                && let Some(profile) = diagnostics.as_deref_mut()
-            {
-                profile.read_response_recheck_wait_ns += wait_ns;
-                profile.read_response_recheck_ns += recheck_ns;
-                profile.read_response_recheck_samples += 1;
-                profile.read_response_recheck_errors += u64::from(recheck_error.is_some());
-            }
-            if let Response::RecordsProfiled { profile, .. } = &mut response {
-                profile.response_recheck_wait_ns = wait_ns;
-                profile.response_recheck_ns = recheck_ns;
-                profile.response_recheck_samples = 1;
-            }
-            request.read_profile.response_recheck_wait_ns = wait_ns;
-            request.read_profile.response_recheck_ns = recheck_ns;
-            request.read_profile.response_recheck_samples = 1;
-            if let Response::ReadErrorProfiled { profile, .. } = &mut response {
-                **profile = request.read_profile;
-            }
-        }
-        if let Some(error) = recheck_error {
-            response = Response::Error(error.to_string());
-        }
-        if let Response::Error(message) = response {
-            response = if request.profile.is_some() {
-                Response::ReadErrorProfiled {
-                    message,
-                    profile: Box::new(request.read_profile),
-                }
-            } else {
-                Response::Error(message)
-            };
-        }
-        #[cfg(any(test, feature = "test-utils"))]
-        if matches!(response, Response::Appended(_))
-            && node.drop_append_response.swap(false, Ordering::AcqRel)
-        {
-            return Err(TcpError::new("injected lost durable append response"));
-        }
-        let began = (request.measured || request.profile.is_some()).then(Instant::now);
+        let began = request.measured.then(Instant::now);
         stream.queue_response(id, response, limits.max_frame_bytes)?;
         if request.measured
             && let Some(profile) = diagnostics.as_deref_mut()
         {
             profile.response_encode_ns += began.map_or(0, elapsed_ns);
-            profile.handler_ns += request.async_handler_ns;
         }
         request.output_started = request.measured.then(Instant::now);
         request.response_queued = true;

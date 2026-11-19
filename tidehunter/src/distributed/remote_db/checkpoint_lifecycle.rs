@@ -701,7 +701,7 @@ pub(super) fn core_retire_unreachable_sealed_files(core: &WriteCore) -> Result<(
             }
             if !retired.is_empty() {
                 let _retirement = core.control_owner(node, move |client| {
-                    client.retire_files_if_idle(authority_epoch, epoch, None, retired)
+                    client.retire_files_if_idle(authority_epoch, epoch, retired)
                 })?;
             }
         }
@@ -1054,9 +1054,10 @@ fn persist_checkpoint(
     })
 }
 
-#[cfg(test)]
+// The pipeline Fixture serves only the leased live route.
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 mod tests {
-    use super::super::pipeline_tests::Fixture;
+    use super::super::pipeline_tests::{Fixture, LIVE_HOST_NQN};
     use super::*;
 
     fn put(value: u8) -> Mutation {
@@ -1066,15 +1067,12 @@ mod tests {
             value: vec![value; 32].into(),
         }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn checkpoint_defers_busy_controller_retirement_and_retries_without_poisoning() {
         use crate::distributed::nvmeof::{
-            LiveTargetConfig, NvmeofTransport,
             live_connect::{LiveConnectTarget, LiveConnectionRegistry},
             live_namespace::LiveNamespaceAccess,
             live_pool::LiveControllerPool,
-            live_target::LiveTargetManager,
         };
         let fixture = Fixture::new_with_root(
             tempdir::TempDir::new("checkpoint-export-pin").unwrap(),
@@ -1083,13 +1081,7 @@ mod tests {
             KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
             2,
             |_| {},
-            |config| {
-                super::super::super::tcp::StorageNode::open(
-                    config,
-                    super::super::tests::recovery_metrics(),
-                )
-                .unwrap()
-            },
+            |_| {},
         );
         let first = fixture.open();
         first
@@ -1105,8 +1097,8 @@ mod tests {
         let db = fixture.open();
         db.write_batch(fixture.operation(0, 2), vec![put(2)])
             .unwrap();
-        // The RPC fixture does not materialize a full NVMe backing allocation.
-        // Write the unchanged bytes and zero tail before real export validation.
+        // Write the unchanged bytes and a zero tail up to the full file size
+        // before real export validation, whatever the writer allocated.
         let wal_bytes = fixture.config.storage.wal_file_bytes;
         let wal = fixture.startups[0]
             .0
@@ -1122,28 +1114,6 @@ mod tests {
         let file = fs::OpenOptions::new().write(true).open(&wal).unwrap();
         std::os::unix::fs::FileExt::write_all_at(&file, &contents, 0).unwrap();
         let root = fixture.temp.path();
-        let configfs = root.join("pin-configfs");
-        for name in ["hosts", "ports", "subsystems"] {
-            fs::create_dir_all(configfs.join(name)).unwrap();
-        }
-        let state_dir = root.join("pin-target");
-        fs::create_dir(&state_dir).unwrap();
-        fixture.nodes[0].bench_install_live_target(
-            LiveTargetManager::open_fixture(
-                LiveTargetConfig {
-                    address: "127.0.0.1".into(),
-                    service: 4420,
-                    transport: NvmeofTransport::Tcp,
-                    host_nqn: "nqn.2026-01.test:checkpoint-pin".into(),
-                    port_id: 42,
-                    state_dir,
-                    commissioning_port_id: 43,
-                    commissioning_service: 4421,
-                },
-                configfs,
-            )
-            .unwrap(),
-        );
         let epoch = db.epoch();
         let locations = db.core.clients[0]
             .control(move |client| client.resolve_live_records(epoch, &[reference]))
@@ -1177,7 +1147,7 @@ mod tests {
                 };
                 let (lease, _, _) = worker_pool.acquire_pinned(
                     &target,
-                    "nqn.2026-01.test:checkpoint-pin",
+                    LIVE_HOST_NQN,
                     [1; 16],
                     LiveNamespaceAccess::ReadOnly,
                     Instant::now() + Duration::from_secs(5),
@@ -1361,7 +1331,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// The pipeline Fixture serves only the leased live route.
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 mod core_tests {
     use super::super::pipeline_tests::Fixture;
     use super::*;
@@ -1675,7 +1646,8 @@ mod core_tests {
     }
 }
 
-#[cfg(test)]
+// The pipeline Fixture serves only the leased live route.
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 mod retirement_request_tests {
     use super::super::pipeline_tests::Fixture;
     use super::*;

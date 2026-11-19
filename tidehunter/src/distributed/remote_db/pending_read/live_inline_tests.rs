@@ -28,17 +28,20 @@ impl Case {
         let mut fixture = Fixture::new();
         fixture.config.read_lanes = Some(1);
         fixture.config.read_cache_bytes = 0;
-        // The core's read service is immutable: configure the read lanes for the
-        // local live route at open. Writes keep the TCP route and identity.
+        // The core's read service is immutable: configure the read service for
+        // the inline policy at open. Read lanes keep the fixture's live
+        // identity, so they can also read other owners' files.
         let mut db = RemoteDatabase::open_with_read_hook(
             &fixture.temp.path().join("authority"),
             &fixture.shape,
             fixture.config.clone(),
-            |config, clients| {
-                config.live_nvme = Some(crate::distributed::tcp::LiveClientConfig {
+            |config, _clients| {
+                config.live_nvme = crate::distributed::tcp::LiveClientConfig {
                     lease_ahead: true,
                     polled_writes: false,
-                    host_nqn: "nqn.2026-01.test:inline".into(),
+                    // The fixture targets admit only this host (and writes
+                    // already cached controllers under it).
+                    host_nqn: super::super::pipeline_tests::LIVE_HOST_NQN.into(),
                     host_id: [1; 16],
                     owner_identities: Default::default(),
                     leased_write_window: Some(4),
@@ -51,10 +54,7 @@ impl Case {
                     leased_durability: crate::distributed::durability::DurabilityTier::Native,
                     inline_reads,
                     queue_geometry: Default::default(),
-                });
-                for client in clients.iter_mut() {
-                    local::configure_local_client(client);
-                }
+                };
             },
         )
         .unwrap();
@@ -126,7 +126,6 @@ impl Case {
             self.db.epoch(),
             &self.reference,
             0,
-            None,
             Some(self.db.core.index.pin_cut(IndexReadCut::Latest).unwrap()),
         )
     }
@@ -215,7 +214,7 @@ fn live_inline_matches_worker_and_bypasses_actor() {
         0
     );
     drop(idle_lane);
-    let (worker, _) = case
+    let worker = case
         .db
         .core
         .reads
@@ -302,7 +301,7 @@ fn live_inline_grant_miss_uses_existing_admission() {
         case.db
             .core
             .reads
-            .read_inline(case.node, case.db.epoch(), &reference, 0, None, None)
+            .read_inline(case.node, case.db.epoch(), &reference, 0, None)
             .unwrap()
             .is_none()
     );
@@ -380,7 +379,7 @@ fn live_inline_blocks_retirement_and_coalesces_identical_references() {
     *case.db.core.reads.state.inline_pause.lock() = Some((entered, resume));
     let reads = case.db.core.reads.clone();
     let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
-    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, None));
+    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None));
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(case.db.core.reads.pause_live_for_retirement().is_err());
     assert!(!case.db.core.reads.failed());
@@ -394,7 +393,7 @@ fn live_inline_blocks_retirement_and_coalesces_identical_references() {
     release.send(()).unwrap();
     let producer = producer.join().unwrap().unwrap().unwrap();
     assert_ne!(*case.db.core.reads.state.retained.lock(), (0, 0));
-    assert_eq!(joined.finish().unwrap().0, producer);
+    assert_eq!(joined.finish().unwrap(), producer);
     assert_eq!(*case.db.core.reads.state.retained.lock(), (0, 0));
     assert_eq!(case.snapshot(), before);
     assert_eq!(
@@ -437,16 +436,6 @@ fn live_inline_corruption_poisons_and_releases_credit() {
             .load(Ordering::Relaxed),
         1
     );
-    assert_eq!(
-        case.db
-            .core
-            .reads
-            .state
-            .diagnostics
-            .failed_owner_profile_unavailable
-            .load(Ordering::Relaxed),
-        0
-    );
     assert_eq!(*case.db.core.reads.state.retained.lock(), (0, 0));
     assert_eq!(case.snapshot(), before);
 }
@@ -470,8 +459,7 @@ fn live_inline_deadline_releases_credit_only_after_retirement() {
     let reads = case.db.core.reads.clone();
     let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
     let pin = case.db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
-    let worker =
-        thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, Some(pin)));
+    let worker = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, Some(pin)));
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
     let admitted_credit = *case.db.core.reads.state.retained.lock();
     assert_eq!(admitted_credit.0, 1);
@@ -512,19 +500,13 @@ fn live_inline_eight_callers_share_one_lane_and_exact_flight() {
         workers.push(thread::spawn(move || {
             gate.wait();
             for _ in 0..8 {
-                let values = match reads
-                    .read_inline(node, epoch, &reference, 0, None, None)
-                    .unwrap()
-                {
+                let values = match reads.read_inline(node, epoch, &reference, 0, None).unwrap() {
                     Some(values) => values,
-                    None => {
-                        reads
-                            .submit(node, vec![reference], 0, false, None)
-                            .unwrap()
-                            .finish()
-                            .unwrap()
-                            .0
-                    }
+                    None => reads
+                        .submit(node, vec![reference], 0, false, None)
+                        .unwrap()
+                        .finish()
+                        .unwrap(),
                 };
                 assert_eq!(values, vec![super::tests::put(0, 7)]);
             }
@@ -600,7 +582,7 @@ fn live_inline_terminal_retirement_precedes_drain_reply() {
     *case.db.core.reads.state.inline_pause.lock() = Some((entered, resume));
     let reads = case.db.core.reads.clone();
     let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
-    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, None));
+    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None));
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
     drop(idle_lane);
     let (reply, responses) = mpsc::sync_channel(1);
@@ -676,7 +658,7 @@ fn live_inline_queued_lane_falls_back_and_preserves_both_reads() {
         mutex_fallbacks
     );
     release.send(()).unwrap();
-    assert_eq!(pending.finish().unwrap().0, vec![super::tests::put(1, 8)]);
+    assert_eq!(pending.finish().unwrap(), vec![super::tests::put(1, 8)]);
     let _idle_lane = case.park_idle_lane();
     assert_eq!(
         case.inline().unwrap().unwrap(),
@@ -738,8 +720,7 @@ fn live_inline_error_reaches_coalesced_joiner_and_retires_credit_once() {
     let reads = case.db.core.reads.clone();
     let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
     let pin = case.db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
-    let producer =
-        thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, Some(pin)));
+    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, Some(pin)));
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
     let joined = case
         .db
@@ -800,8 +781,7 @@ fn live_inline_joiner_after_io_completion_receives_one_value() {
     let reads = case.db.core.reads.clone();
     let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
     let pin = case.db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
-    let producer =
-        thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, Some(pin)));
+    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, Some(pin)));
     // The member has completed and decoded; publication and retirement have
     // not started. Admission can still find and join this exact flight.
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -824,7 +804,7 @@ fn live_inline_joiner_after_io_completion_receives_one_value() {
     let produced = producer.join().unwrap().unwrap().unwrap();
     assert_eq!(produced, vec![super::tests::put(0, 7)]);
     assert_eq!(case.db.core.reads.state.retained.lock().0, 1);
-    let (values, _) = joined.finish().unwrap();
+    let values = joined.finish().unwrap();
     assert_eq!(values, produced);
     assert_eq!(values.len(), 1);
     assert!(flight.upgrade().is_none());
@@ -868,4 +848,155 @@ fn live_inline_joiner_after_io_completion_receives_one_value() {
             .load(Ordering::Relaxed),
         1
     );
+}
+
+/// Ported from the owner-RPC `busy_scalar_reservation_remains_exclusive`: a
+/// paused inline scalar keeps its lane reservation, so a new request for
+/// another reference on that owner is refused rather than queued behind it.
+#[test]
+fn live_inline_busy_scalar_reservation_remains_exclusive() {
+    let case = Case::new();
+    let idle_lane = case.park_idle_lane();
+    let second = case
+        .db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        case.db.core.partition_indexes[&second.batch_address.partition],
+        case.node
+    );
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.core.reads.state.inline_pause.lock() = Some((entered, resume));
+    let reads = case.db.core.reads.clone();
+    let (node, epoch, first) = (case.node, case.db.epoch(), case.reference);
+    let scalar = thread::spawn(move || reads.read_inline(node, epoch, &first, 0, None));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let admitted = case
+        .db
+        .core
+        .reads
+        .submit(node, vec![second], 0, false, None);
+    release.send(()).unwrap();
+    assert!(admitted.is_err());
+    assert_eq!(
+        scalar.join().unwrap().unwrap(),
+        Some(vec![super::tests::put(0, 7)])
+    );
+    drop(idle_lane);
+    assert_eq!(
+        case.db
+            .core
+            .reads
+            .submit(node, vec![second], 0, false, None)
+            .unwrap()
+            .finish()
+            .unwrap(),
+        vec![super::tests::put(1, 8)]
+    );
+    assert_eq!(*case.db.core.reads.state.retained.lock(), (0, 0));
+}
+
+/// Ported from the owner-RPC `grouped_join_of_inline_flight_notifies_admission_after_readiness`:
+/// a batch that joins a paused inline flight takes no lane, and the producer's
+/// readiness (not a credit drop) advances the admission generation.
+#[test]
+fn live_inline_grouped_join_notifies_admission_after_readiness() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.core.reads.state.inline_pause.lock() = Some((entered, resume));
+    let reads = case.db.core.reads.clone();
+    let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
+    let scalar = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let mut groups = vec![Vec::new(); case.db.core.partition_indexes.len()];
+    groups[node].push((0, reference));
+    let mut batch = ReadBatch::new(&case.db.core.reads, vec![None], groups).unwrap();
+    batch.dispatch(&case.db.core.reads).unwrap();
+    assert_eq!(batch.reads.len(), 1);
+    let generation = case.db.core.reads.admission_generation();
+    release.send(()).unwrap();
+    assert!(scalar.join().unwrap().unwrap().is_some());
+    // The joiner still owns the flight and both credits, so a credit drop
+    // cannot be responsible for advancing this generation.
+    assert!(case.db.core.reads.admission_generation() > generation);
+    batch.finish_one().unwrap();
+    assert_eq!(batch.values[0], Some(super::tests::put(0, 7)));
+    assert_eq!(*case.db.core.reads.state.retained.lock(), (0, 0));
+}
+
+/// Ported from the owner-RPC `inline_reads_reserve_idle_lanes_with_unrelated_retained_credits`:
+/// a retained credit queued at another owner neither blocks an inline read of
+/// an idle lane nor is stolen by an inline read of the queued owner.
+#[test]
+fn live_inline_reserves_idle_lane_with_unrelated_retained_credit() {
+    let mut case = Case::new();
+    let other = (0..case.db.core.config.endpoints.len() as u32)
+        .find(|&partition| case.db.core.partition_indexes[&partition] != case.node)
+        .unwrap();
+    case.db
+        .write_batch(
+            case._fixture.operation(other, 2),
+            vec![super::tests::put(2, 9)],
+        )
+        .unwrap();
+    let second = case
+        .db
+        .index_reference(KeySpace(0), &2u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second_node = case.db.core.partition_indexes[&second.batch_address.partition];
+    assert_ne!(second_node, case.node);
+    let _idle_lane = case.park_idle_lane();
+
+    let lane = case.db.core.reads.lane_client(second_node, 0);
+    let held = lane.lock();
+    let pending = case
+        .db
+        .submit_get(KeySpace(0), &2u32.to_be_bytes())
+        .unwrap();
+    assert_eq!(case.db.core.reads.state.retained.lock().0, 1);
+
+    let inline = case
+        .inline()
+        .unwrap()
+        .expect("idle independent lane should make progress inline");
+    assert_eq!(inline, vec![super::tests::put(0, 7)]);
+    assert_eq!(case.db.core.reads.state.retained.lock().0, 1);
+
+    assert!(
+        case.db
+            .core
+            .reads
+            .read_inline(second_node, case.db.epoch(), &second, 0, None)
+            .unwrap()
+            .is_none(),
+        "queued actor ownership must block inline theft"
+    );
+    drop(held);
+    assert_eq!(case.db.finish_get(pending).unwrap(), super::tests::value(9));
+    assert_eq!(*case.db.core.reads.state.retained.lock(), (0, 0));
+}
+
+/// Ported from the owner-RPC `inline_transport_failure_poison_is_terminal`:
+/// after a failed inline read every later read and the shutdown fail.
+#[test]
+fn live_inline_failure_poison_is_terminal() {
+    let mut case = Case::new();
+    let idle_lane = case.park_idle_lane();
+    {
+        let lanes = case.db.core.reads.lanes.read();
+        let mut driver = lanes[case.node][0].driver.lock();
+        local::override_inline_completion(driver.live_cache.as_mut().unwrap(), -libc::EIO);
+    }
+    assert!(case.inline().is_err());
+    assert!(case.db.core.reads.failed());
+    // Shutdown joins the lane worker: release it from its pause first.
+    drop(idle_lane);
+    assert!(case.db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
+    assert!(case.db.shutdown().is_err());
 }

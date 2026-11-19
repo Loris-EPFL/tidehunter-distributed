@@ -189,9 +189,7 @@ pub(in crate::distributed::remote_db) fn take_ready_group(
         charge,
         Arc::clone(accounting),
     );
-    Ok(GroupDrain::Ready(WorkerItem::Append(
-        epoch, batches, result,
-    )))
+    Ok(GroupDrain::Ready(WorkerItem::Append(batches, result)))
 }
 
 fn record_drain(client: &Client, accounting: &WorkerAccounting, batches: usize, stop: DrainStop) {
@@ -216,7 +214,7 @@ pub(in crate::distributed::remote_db) fn ready_left(
     let queued_batches: usize = queued
         .iter()
         .map_while(|item| match item {
-            WorkerItem::Append(_, batches, _) => Some(batches.len()),
+            WorkerItem::Append(batches, _) => Some(batches.len()),
             WorkerItem::Control(_) => None,
         })
         .sum();

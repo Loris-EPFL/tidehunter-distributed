@@ -66,7 +66,6 @@ impl Client {
                 source_epoch,
                 cursor,
                 page_limit,
-                true,
             )?
         };
         let token = page.epoch_pin_token;
@@ -76,9 +75,6 @@ impl Client {
             while index < page.entries.len() {
                 let first = &page.entries[index];
                 let binding = &first.binding;
-                binding
-                    .require_kernel_target()
-                    .map_err(TcpError::component)?;
                 let target = LiveConnectTarget {
                     nqn: binding.nqn.clone(),
                     uuid: binding.uuid,
@@ -95,7 +91,7 @@ impl Client {
                 } else {
                     LiveNamespaceAccess::ReadWrite
                 };
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-utils"))]
                 if self.live_write_local_fixture {
                     // Use the real namespace I/O and CRC checks without a kernel target.
                     pool.cache_local_namespace(

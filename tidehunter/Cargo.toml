@@ -61,22 +61,6 @@ name = "sharded_wal_recovery_bench"
 required-features = ["experimental-distributed"]
 
 [[example]]
-name = "sharded_wal_cluster_check"
-required-features = ["experimental-distributed", "test-utils"]
-
-[[example]]
-name = "sharded_wal_transport_bench"
-required-features = ["experimental-distributed", "test-utils"]
-
-[[example]]
-name = "sharded_wal_adapter_bench"
-required-features = ["experimental-distributed", "test-utils"]
-
-[[example]]
-name = "sharded_wal_lifecycle_check"
-required-features = ["experimental-distributed", "test-utils"]
-
-[[example]]
 name = "sharded_wal_codec_probe"
 required-features = ["experimental-distributed"]
 

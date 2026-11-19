@@ -95,37 +95,6 @@ pub(super) fn persist(
     Ok(true)
 }
 
-pub(super) fn validate(
-    path: &Path,
-    config: &PartitionConfig,
-    file_count: u64,
-) -> Result<(), StorageError> {
-    let mut count = 0;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(file) = parse(
-            name.to_str()
-                .ok_or(StorageError::Invalid("non-UTF8 witness filename"))?,
-        )?
-        else {
-            continue;
-        };
-        count += 1;
-        if count > MAX_WITNESSES || !entry.file_type()?.is_file() {
-            return Err(StorageError::Invalid("WAL witness inventory exceeds bound"));
-        }
-        let actual: FileWitness = read_metadata(&entry.path())?;
-        if actual != FileWitness::new(config, file) {
-            return Err(StorageError::Invalid("WAL witness differs from authority"));
-        }
-        if file >= file_count && !path.join(format!("wal_{file:016x}")).is_file() {
-            return Err(StorageError::Invalid("missing witnessed suffix WAL file"));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn remove_covered(path: &Path, file_count: u64) -> Result<(), StorageError> {
     let mut removed = false;
     // At most one bounded post-root window can exist. Rescan bounded pages so

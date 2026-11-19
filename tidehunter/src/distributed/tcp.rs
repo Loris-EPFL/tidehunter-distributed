@@ -15,11 +15,9 @@
 //! against OFI with `FabricSecurity::Trusted` (both trusted-network/no-TLS).
 
 pub mod checkpoint;
-mod reactor;
-mod read_executor;
-pub use read_executor::{LockProfileStats, ReadExecutorStats};
 mod diagnostics;
 mod fabric;
+mod reactor;
 pub use fabric::{FabricBackend, FabricConfig, FabricSecurity, Transport, TransportProgressStats};
 mod owner_transport;
 pub(crate) use owner_transport::OwnerTransportCounters;
@@ -31,7 +29,6 @@ mod durable_progress;
 pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
 mod inventory;
 mod live_client;
-mod payload;
 pub use super::nvmeof::LiveQueueGeometry;
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use live_client::leased_tests;
@@ -48,15 +45,16 @@ pub(super) mod live_read;
 mod live_recovery;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-pub use live_control::{
-    AdoptProfile, LeaseProfile, LiveAdopted, LiveLeased, LiveRecordLocation, LiveRecordLocations,
-    LiveRecoveryEntry, LiveRecoveryPage, LiveReserved,
-};
+pub use live_control::{LiveRecoveryEntry, LiveRecoveryPage};
+mod live_wire;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) use live_control::{
     LiveExportPin, LiveExportPinControl, LiveExportPinRequest, LivePinRecipe,
 };
-use payload::WireBytes;
+pub use live_wire::{
+    AdoptProfile, LeaseProfile, LiveAdopted, LiveExportInfo, LiveLeased, LiveRecordLocation,
+    LiveRecordLocations,
+};
 #[cfg(test)]
 mod probe;
 #[cfg(test)]
@@ -68,9 +66,10 @@ mod transport_security_tests;
 pub(super) fn software_transport(security: FabricSecurity) -> Transport {
     Transport::ofi(FabricBackend::SoftwareTcp, security)
 }
-use super::codec::{BatchLimits, CompleteBatch, Mutation};
-use super::group::{CompleteGroup, GROUP_HEADER_LEN, GroupLimits};
-use super::storage::{AppendedBatch, DurableBatch, PartitionConfig, PartitionStats, StorageError};
+use super::codec::{CompleteBatch, Mutation};
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+use super::storage::StorageError;
+use super::storage::{DurableBatch, PartitionConfig, PartitionStats};
 use super::types::{
     BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RequestAuthority,
     ValueRecordReference,
@@ -79,7 +78,6 @@ use crate::key_shape::KeyShape;
 use crate::metrics::Metrics;
 use bincode::Options;
 use parking_lot::Mutex;
-use rayon::prelude::*;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
@@ -105,7 +103,13 @@ pub use inventory::NodeInventory;
 /// (feature-stable tags after DurableProgress in both Request and Response).
 /// 28 replaces the kernel boot id in NodeStatus and DurableProgressReport with the owner
 /// incarnation, and makes `NodeStatus::recovery_clean` false after any persistence failure.
-const PROTOCOL: u32 = 28;
+/// 29 removes the owner-RPC payload, receipt-history, sealed-export, Reserved,
+/// RAM-probe and read-executor requests, compiles every variant in every
+/// feature set, documents each tag (frozen by `wire_tag_tests`), drops
+/// `NodeStatus::{history_persistence, max_read_bytes}` and the SPDK, sealed-export
+/// and export-mode placeholders, and adds owner transport counters to
+/// `PartitionStats`.
+const PROTOCOL: u32 = 29;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -159,11 +163,8 @@ pub struct NodeConfig {
     pub partition: PartitionConfig,
     pub shape_yaml: String,
     pub max_epochs: usize,
-    /// Bounded workers for cold authority planning and explicit mapped/positional
-    /// diagnostics. Append/control persistence has its own per-log owner.
-    /// Absent resolves on the owner host when it starts, not on the preparing host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read_workers: Option<usize>,
+    /// Member read policy of owner WAL reads; with `Async`, also bounds each
+    /// live record resolution (see `read_max_device_reads`).
     #[serde(default = "default_async_read_policy")]
     pub wal_member_read: super::storage::WalMemberReadPolicy,
     /// Write and sync zeros across each external WAL file before it is usable,
@@ -171,17 +172,8 @@ pub struct NodeConfig {
     /// serialized: an absent key means on, and opting out requires `false`.
     #[serde(default = "default_wal_prewrite")]
     pub wal_prewrite: bool,
-    /// Opt-in NOWAIT prefix reads; compare with forced-async on the target host.
-    #[serde(default)]
-    pub read_resident_first: bool,
-    /// Host memory reserved for bounded inflight reads.
-    /// Excludes index, application, transport/kernel and page-cache reserves.
-    #[serde(default = "default_read_memory_allowance_bytes")]
-    pub read_memory_allowance_bytes: usize,
-    #[serde(default = "default_read_requests")]
-    pub read_max_inflight_requests: usize,
-    #[serde(default = "default_read_bytes")]
-    pub read_max_inflight_bytes: usize,
+    /// With `wal_member_read: async`, caps `NodeStatus::max_reads` and the
+    /// references of one `ResolveLiveRecords` request.
     #[serde(default = "default_device_reads")]
     pub read_max_device_reads: usize,
     /// Optional live target. Once enabled, its persisted configuration is
@@ -191,16 +183,10 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn effective_read_workers(&self) -> usize {
-        crate::parallelism::resolve_count(self.read_workers, crate::parallelism::available())
-    }
-
     /// Validate static owner settings without opening files, sockets or nvmet.
     pub fn validate(&self) -> Result<(), TcpError> {
         self.validated_shape()?;
-        self.read_config()?
-            .validate()
-            .map_err(TcpError::component)?;
+        self.validate_reads()?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(target) = &self.live_target {
             super::nvmeof::live_target::validate_config(target).map_err(TcpError::component)?;
@@ -219,31 +205,18 @@ impl NodeConfig {
         KeyShape::from_yaml(&self.shape_yaml).map_err(TcpError::component)
     }
 
-    fn read_config(&self) -> Result<read_executor::ReadExecutorConfig, TcpError> {
+    fn validate_reads(&self) -> Result<(), TcpError> {
         #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
         if self.live_target.is_some() {
             return Err(TcpError::new(
                 "live NVMe-oF target requires experimental-nvmeof on Linux",
             ));
         }
-        if self
-            .read_workers
-            .is_some_and(|workers| !(1..=1024).contains(&workers))
-        {
-            return Err(TcpError::new("read_workers must be in 1..=1024"));
+        // Same bound the removed read executor applied to max_device_reads.
+        if !(1..=4096).contains(&self.read_max_device_reads) {
+            return Err(TcpError::new("read_max_device_reads must be in 1..=4096"));
         }
-        if self.read_resident_first
-            && self.wal_member_read != super::storage::WalMemberReadPolicy::Async
-        {
-            return Err(TcpError::new("resident-first reads require async reads"));
-        }
-        Ok(read_executor::ReadExecutorConfig {
-            memory_allowance_bytes: self.read_memory_allowance_bytes,
-            max_requests: self.read_max_inflight_requests,
-            max_bytes: self.read_max_inflight_bytes,
-            max_device_reads: self.read_max_device_reads,
-            resident_first: self.read_resident_first,
-        })
+        Ok(())
     }
 }
 
@@ -253,17 +226,8 @@ fn default_wal_prewrite() -> bool {
 fn default_async_read_policy() -> super::storage::WalMemberReadPolicy {
     super::storage::WalMemberReadPolicy::Async
 }
-fn default_read_requests() -> usize {
-    32
-}
-fn default_read_bytes() -> usize {
-    64 * 1024 * 1024
-}
 fn default_device_reads() -> usize {
     128
-}
-pub(crate) fn default_read_memory_allowance_bytes() -> usize {
-    512 * 1024 * 1024
 }
 /// TLS credentials and transport selection. Trusted TCP and trusted OFI require
 /// empty credential paths; mutual-TLS modes require a dedicated CA.
@@ -366,7 +330,6 @@ pub struct NodeEpoch {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub partition: PartitionConfig,
-    pub history_persistence: super::storage::HistoryPersistence,
     pub shape_yaml: String,
     pub max_epochs: usize,
     pub epochs: Vec<NodeEpoch>,
@@ -375,9 +338,8 @@ pub struct NodeStatus {
     pub healthy: bool,
     /// Negotiated bound for each encoded request/response frame.
     pub max_frame_bytes: usize,
+    /// References per live record resolution.
     pub max_reads: usize,
-    /// Node-wide retained-read budget, used to split aggregate RPCs.
-    pub max_read_bytes: usize,
     pub recovery_page_batches: usize,
     pub polling: PollingPolicy,
     /// The owner is configured for direct live NVMe-oF WAL access.
@@ -396,14 +358,11 @@ pub struct RecoveryPage {
     pub next: Option<usize>,
 }
 
-/// Explicit diagnostic timings; ordinary requests take no extra stage clocks.
-/// WAL-read exchange spans encoding through authenticated, verified completion
-/// (including interleaved progress), not wire-only RTT. Encode/decode/verification
-/// and server intervals are nested and must not be added to exchange. Legacy
-/// send/header/body clocks are zero: partial multiplexed I/O cannot be attributed
-/// to one request. Socket clocks are collected at connection scope only.
-/// Unlike WAL reads, control/RAM exchange starts after queueing and also waits for
-/// local request-output retirement. RAM payload verification follows that exchange.
+/// Explicit diagnostic timings of control exchanges; ordinary requests take no
+/// extra stage clocks. Exchange starts after queueing and also waits for local
+/// request-output retirement; encode/decode intervals are nested inside it.
+/// Legacy send/header/body clocks are zero: partial multiplexed I/O cannot be
+/// attributed to one request. Socket clocks are collected at connection scope only.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TcpReadProfile {
     pub request_encode_ns: u64,
@@ -419,87 +378,7 @@ pub struct TcpReadProfile {
     pub response_decode_count: u64,
     pub record_verify_ns: u64,
     pub record_verify_count: u64,
-    /// RAM probe payload verification after exchange, not nested inside it.
-    pub ram_payload_verify_ns: u64,
-    pub ram_payload_verify_calls: u64,
-    /// Bytes whose full deterministic payload check succeeded.
-    pub ram_payload_verified_bytes: u64,
     pub requests: u64,
-    /// True when the response carried server handler clocks.
-    pub server_handler_available: bool,
-    /// Read-handler residence through completed records, excluding the final recheck.
-    pub server_handler_ns: u64,
-    /// Active-epoch validation and Arc log-handle pinning under the reader lock.
-    pub server_authority_lookup_ns: u64,
-    /// Exact member validation through completed range data/response construction,
-    /// outside reader authority. Async includes ring-admission and kernel I/O
-    /// residence; mapped/positional measures their diagnostic read/copy path.
-    pub server_record_read_ns: u64,
-    /// Completed response to reader-authority recheck, including scheduler delay.
-    pub server_response_recheck_wait_ns: u64,
-    /// Active-authority recheck before TLS enqueueing.
-    pub server_response_recheck_ns: u64,
-    /// Profiled owner read replies carrying the above spans, including retained errors.
-    pub server_response_recheck_samples: u64,
-    pub server_wal: WalReadProfile,
-}
-
-/// Local owner observations. Member durations overlap and are not request wall time.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct WalReadProfile {
-    pub executor_requests: u64,
-    pub sync_reader_requests: u64,
-    pub planning_ns: u64,
-    pub planning_count: u64,
-    pub planning_max_ns: u64,
-    pub executor_residence_ns: u64,
-    pub executor_residence_count: u64,
-    pub executor_residence_max_ns: u64,
-    pub nowait_ns: u64,
-    pub nowait_count: u64,
-    pub nowait_max_ns: u64,
-    pub nowait_errors: u64,
-    pub nowait_partial: u64,
-    pub nowait_deferred: u64,
-    pub async_ns: u64,
-    pub async_count: u64,
-    pub async_max_ns: u64,
-    pub async_errors: u64,
-    pub async_partial: u64,
-    pub response_ready_ns: u64,
-    pub response_ready_count: u64,
-    pub response_ready_max_ns: u64,
-}
-impl WalReadProfile {
-    fn add(&mut self, other: Self) {
-        macro_rules! sums { ($($field:ident),*) => { $(self.$field += other.$field;)* }; }
-        sums!(
-            executor_requests,
-            sync_reader_requests,
-            planning_ns,
-            planning_count,
-            executor_residence_ns,
-            executor_residence_count,
-            nowait_ns,
-            nowait_count,
-            nowait_errors,
-            nowait_partial,
-            nowait_deferred,
-            async_ns,
-            async_count,
-            async_errors,
-            async_partial,
-            response_ready_ns,
-            response_ready_count
-        );
-        self.planning_max_ns = self.planning_max_ns.max(other.planning_max_ns);
-        self.executor_residence_max_ns = self
-            .executor_residence_max_ns
-            .max(other.executor_residence_max_ns);
-        self.nowait_max_ns = self.nowait_max_ns.max(other.nowait_max_ns);
-        self.async_max_ns = self.async_max_ns.max(other.async_max_ns);
-        self.response_ready_max_ns = self.response_ready_max_ns.max(other.response_ready_max_ns);
-    }
 }
 
 impl TcpReadProfile {
@@ -516,44 +395,18 @@ impl TcpReadProfile {
         self.response_decode_count += next.response_decode_count;
         self.record_verify_ns += next.record_verify_ns;
         self.record_verify_count += next.record_verify_count;
-        self.ram_payload_verify_ns += next.ram_payload_verify_ns;
-        self.ram_payload_verify_calls += next.ram_payload_verify_calls;
-        self.ram_payload_verified_bytes += next.ram_payload_verified_bytes;
         self.requests += next.requests;
-        self.server_handler_available |= next.server_handler_available;
-        self.server_handler_ns += next.server_handler_ns;
-        self.server_authority_lookup_ns += next.server_authority_lookup_ns;
-        self.server_record_read_ns += next.server_record_read_ns;
-        self.server_response_recheck_wait_ns += next.server_response_recheck_wait_ns;
-        self.server_response_recheck_ns += next.server_response_recheck_ns;
-        self.server_response_recheck_samples += next.server_response_recheck_samples;
-        self.server_wal.add(next.server_wal);
     }
 }
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-struct ServerReadProfile {
-    handler_ns: u64,
-    authority_lookup_ns: u64,
-    record_read_ns: u64,
-    response_recheck_wait_ns: u64,
-    response_recheck_ns: u64,
-    response_recheck_samples: u64,
-    wal: WalReadProfile,
-}
-// Fixed-integer bincode: six request and twenty-two WAL u64 values.
-const SERVER_READ_PROFILE_BYTES: usize = 28 * 8;
 
 #[derive(Debug)]
 pub struct TcpError {
     message: String,
-    pub(crate) read_profile: Option<Box<TcpReadProfile>>,
 }
 impl TcpError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            read_profile: None,
         }
     }
     fn component(error: impl fmt::Display) -> Self {
@@ -572,88 +425,52 @@ impl From<io::Error> for TcpError {
     }
 }
 
-// Bincode tags follow declaration order. Keep ungated production variants first,
-// then NVMe-oF variants, then test-only variants, in both Request and Response.
+// Wire tags are the bincode variant indices, i.e. declaration order. Every
+// variant is compiled in every feature set (no `#[cfg]`), so a tag never
+// depends on features; builds without a route reject its request with a named
+// error. Each variant documents its tag, and `wire_tag_tests` freezes the
+// order: append new variants at the end, never reorder or remove without a
+// protocol bump.
 #[derive(Serialize, Deserialize)]
 enum Request {
-    Checkpoint {
-        authority_epoch: u64,
-        epoch: u64,
-        prefix: usize,
-    },
+    /// Tag 0.
     RetirementFiles {
         authority_epoch: u64,
         epoch: u64,
         after: Option<u64>,
         limit: usize,
     },
-    RetireFiles {
-        authority_epoch: u64,
-        epoch: u64,
-        prefix: usize,
-        files: Vec<u64>,
-    },
-    ReadIoStats,
-    Status {
-        protocol: u32,
-    },
-    Fence {
-        epoch: u64,
-    },
-    Append {
-        epoch: u64,
-        batches: Vec<WireBytes>,
-    },
-    Read {
-        epoch: u64,
-        references: Vec<ValueRecordReference>,
-    },
-    Recover {
-        epoch: u64,
-        cursor: usize,
-        limit: usize,
-    },
-    Seal {
-        epoch: u64,
-    },
+    /// Tag 1.
+    Status { protocol: u32 },
+    /// Tag 2.
+    Fence { epoch: u64 },
+    /// Tag 3.
+    Seal { epoch: u64 },
+    /// Tag 4.
     Stats,
-    ReadProfiled {
-        epoch: u64,
-        references: Vec<ValueRecordReference>,
-    },
+    /// Tag 5.
     StatsDetailed,
-    /// Connection-local diagnostics, explicit and disabled by default.
-    ConnectionProfile {
-        enabled: bool,
-        reset: bool,
-    },
-    /// Nonblocking operational snapshot; not a durability barrier or evidence cut.
-    OperationalReadIoStats,
-    OwnerTimelineArm {
-        limit: usize,
-    },
-    OwnerTimelineFetch {
-        offset: usize,
-    },
+    /// Tag 6. Connection-local diagnostics, explicit and disabled by default.
+    ConnectionProfile { enabled: bool, reset: bool },
+    /// Tag 7.
+    OwnerTimelineArm { limit: usize },
+    /// Tag 8.
+    OwnerTimelineFetch { offset: usize },
+    /// Tag 9.
     CheckpointPosition {
         authority_epoch: u64,
         epoch: u64,
         through: u64,
     },
-    ReplayWal {
-        authority_epoch: u64,
-        source_epoch: u64,
-        from: u64,
-        limit: usize,
-        require_end: u64,
-    },
+    /// Tag 10.
     RetireWalFiles {
         authority_epoch: u64,
         epoch: u64,
         files: Vec<u64>,
     },
-    /// Owner durable progress of stream `epoch` for the coordinator's durable cut.
-    /// A long-poll: see `DurableProgressReport` for the reply contract.
+    /// Tag 11. Owner durable progress of stream `epoch` for the coordinator's
+    /// durable cut. A long-poll: see `DurableProgressReport` for the reply
+    /// contract.
     DurableProgress {
         authority_epoch: u64,
         epoch: u64,
@@ -661,72 +478,22 @@ enum Request {
         max_wait_ms: u32,
         sync: bool,
     },
-    /// Complete owner persistence counters without changing the fixed
-    /// `StatsDetailed` encoding.
+    /// Tag 12. Complete owner persistence counters and owner transport counters.
     PartitionStats,
-    #[cfg(feature = "experimental-nvmeof")]
-    ValidateRecordReferences {
-        epoch: u64,
-        references: Vec<ValueRecordReference>,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    RegisterNvmeofExport {
-        epoch: u64,
-        binding: Box<super::nvmeof::legacy_wire::ExportBinding>,
-        reference: ValueRecordReference,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    ReleaseNvmeofExport {
-        epoch: u64,
-        token: [u8; 16],
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    RegisterNvmeofEpochPin {
-        epoch: u64,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    ReleaseNvmeofEpochPin {
-        epoch: u64,
-        token: [u8; 16],
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    ReleaseLiveEpochPin {
-        epoch: u64,
-        token: [u8; 16],
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    ReserveLiveGroup {
-        epoch: u64,
-        descriptor: super::nvmeof::live_storage::LiveGroupDescriptor,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    CompleteLiveGroup {
-        epoch: u64,
-        token: [u8; 16],
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 13.
+    ReleaseLiveEpochPin { epoch: u64, token: [u8; 16] },
+    /// Tag 14.
     ResolveLiveRecords {
         authority_epoch: u64,
         references: Vec<ValueRecordReference>,
     },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    RecoverLiveMetadata {
-        authority_epoch: u64,
-        source_epoch: u64,
-        cursor: usize,
-        limit: usize,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 15.
     LiveTargetStats,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    ShutdownLiveTarget {
-        epoch: u64,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    LeaseLiveExtent {
-        epoch: u64,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 16.
+    ShutdownLiveTarget { epoch: u64 },
+    /// Tag 17.
+    LeaseLiveExtent { epoch: u64 },
+    /// Tag 18.
     AdoptLiveExtent {
         epoch: u64,
         token: [u8; 16],
@@ -734,16 +501,11 @@ enum Request {
         close: bool,
         lease_next: bool,
     },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    OpenLiveExports {
-        authority_epoch: u64,
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    PreleaseLiveExtent {
-        epoch: u64,
-        after: [u8; 16],
-    },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 19.
+    OpenLiveExports { authority_epoch: u64 },
+    /// Tag 20.
+    PreleaseLiveExtent { epoch: u64, after: [u8; 16] },
+    /// Tag 21.
     ReplayLiveWal {
         authority_epoch: u64,
         source_epoch: u64,
@@ -751,32 +513,20 @@ enum Request {
         limit: usize,
         require_end: u64,
     },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 22.
     AcquireLiveExportPin {
         epoch: u64,
         segment: super::nvmeof::live_storage::LiveWalSegment,
-        binding: super::nvmeof::live_target::LiveTargetBinding,
+        binding: super::nvmeof::live_storage::LiveTargetBinding,
     },
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    ReleaseLiveExportPin {
-        epoch: u64,
-        token: [u8; 16],
-    },
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    ReadEvidence {
-        epoch: u64,
-        evict: bool,
-    },
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    ProcessResources {
-        epoch: u64,
-    },
-    #[cfg(feature = "test-utils")]
-    PrepareRamProbe {
-        value_bytes: usize,
-    },
-    #[cfg(feature = "test-utils")]
-    ReadRamProbe,
+    /// Tag 23.
+    ReleaseLiveExportPin { epoch: u64, token: [u8; 16] },
+    /// Tag 24. Benchmark evidence; owners built without Linux `test-utils`
+    /// reply with an error.
+    ReadEvidence { epoch: u64, evict: bool },
+    /// Tag 25. Benchmark evidence; owners built without Linux `test-utils`
+    /// reply with an error.
+    ProcessResources { epoch: u64 },
 }
 impl Request {
     /// Startup/recovery negotiation, durable epoch/retirement maintenance and
@@ -785,24 +535,15 @@ impl Request {
     /// and owner both derive their deadline from this method.
     fn timeout(&self, data_timeout: Duration) -> Duration {
         let lifecycle = match self {
-            Self::Checkpoint { .. }
-            | Self::RetirementFiles { .. }
-            | Self::RetireFiles { .. }
+            Self::RetirementFiles { .. }
             | Self::Status { .. }
             | Self::Fence { .. }
-            | Self::Recover { .. }
             | Self::Seal { .. }
-            | Self::ReplayWal { .. }
             | Self::RetireWalFiles { .. } => true,
-            Self::Append { .. }
-            | Self::Read { .. }
-            | Self::ReadProfiled { .. }
-            | Self::ReadIoStats
-            | Self::Stats
+            Self::Stats
             | Self::StatsDetailed
             | Self::PartitionStats
             | Self::ConnectionProfile { .. }
-            | Self::OperationalReadIoStats
             | Self::OwnerTimelineArm { .. }
             | Self::OwnerTimelineFetch { .. }
             | Self::CheckpointPosition { .. } => false,
@@ -810,41 +551,23 @@ impl Request {
             Self::DurableProgress { max_wait_ms, .. } => {
                 return data_timeout.saturating_add(durable_progress::capped_wait(*max_wait_ms));
             }
-            #[cfg(feature = "experimental-nvmeof")]
-            Self::ValidateRecordReferences { .. } => false,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Self::RecoverLiveMetadata { .. }
-            | Self::ShutdownLiveTarget { .. }
+            Self::ShutdownLiveTarget { .. }
             | Self::OpenLiveExports { .. }
             | Self::ReplayLiveWal { .. }
             | Self::ResolveLiveRecords { .. }
             | Self::PreleaseLiveExtent { .. }
             // Write grants that create an export inline when no preparation
             // published their file: the first lease after open or a fence (a
-            // fence revokes every export), and a group reservation in a new
-            // file. The grant itself is memory work and stays short.
-            | Self::LeaseLiveExtent { .. }
-            | Self::ReserveLiveGroup { .. } => true,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            // fence revokes every export). The grant itself is memory work and
+            // stays short.
+            | Self::LeaseLiveExtent { .. } => true,
             Self::AdoptLiveExtent { lease_next, .. } => *lease_next,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            Self::RegisterNvmeofExport { .. }
-            | Self::ReleaseNvmeofExport { .. }
-            | Self::RegisterNvmeofEpochPin { .. }
-            | Self::ReleaseNvmeofEpochPin { .. }
-            | Self::ReleaseLiveEpochPin { .. }
+            Self::ReleaseLiveEpochPin { .. }
             | Self::AcquireLiveExportPin { .. }
             | Self::ReleaseLiveExportPin { .. }
-            | Self::CompleteLiveGroup { .. }
-            | Self::LiveTargetStats => false,
-            #[cfg(all(target_os = "linux", feature = "test-utils"))]
+            | Self::LiveTargetStats
+            | Self::ProcessResources { .. } => false,
             Self::ReadEvidence { evict, .. } => *evict,
-            #[cfg(all(target_os = "linux", feature = "test-utils"))]
-            Self::ProcessResources { .. } => false,
-            #[cfg(feature = "test-utils")]
-            Self::PrepareRamProbe { .. } => true,
-            #[cfg(feature = "test-utils")]
-            Self::ReadRamProbe => false,
         };
         if lifecycle {
             data_timeout.max(LIFECYCLE_TIMEOUT)
@@ -854,21 +577,17 @@ impl Request {
     }
 
     fn is_measurement_control(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::Stats
-            | Self::StatsDetailed
-            | Self::PartitionStats
-            | Self::ReadIoStats
-            | Self::OperationalReadIoStats
-            | Self::ConnectionProfile { .. }
-            | Self::OwnerTimelineArm { .. }
-            | Self::OwnerTimelineFetch { .. } => true,
-            #[cfg(all(target_os = "linux", feature = "test-utils"))]
-            Self::ReadEvidence { .. } => true,
-            #[cfg(all(target_os = "linux", feature = "test-utils"))]
-            Self::ProcessResources { .. } => true,
-            _ => false,
-        }
+                | Self::StatsDetailed
+                | Self::PartitionStats
+                | Self::ConnectionProfile { .. }
+                | Self::OwnerTimelineArm { .. }
+                | Self::OwnerTimelineFetch { .. }
+                | Self::ReadEvidence { .. }
+                | Self::ProcessResources { .. }
+        )
     }
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -879,6 +598,7 @@ struct Receipt {
     address: PhysicalValueAddress,
 }
 impl Receipt {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn from_durable(batch: DurableBatch) -> Self {
         let batch = batch.appended();
         Self {
@@ -888,30 +608,38 @@ impl Receipt {
             address: batch.address(),
         }
     }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn durable(self) -> DurableBatch {
         DurableBatch::from_validated_parts(self.id, self.version, self.digest, self.address)
     }
 }
+/// Owner persistence counters plus owner transport counters (`PartitionStats`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PartitionStatsReply {
+    pub partition: PartitionStats,
+    /// Owner-side OFI transport counters summed over open and closed sessions;
+    /// zero without an OFI transport.
+    pub transport: OwnerTransportStats,
+}
+/// See `Request` for the wire-tag rules.
 #[derive(Serialize, Deserialize, strum::AsRefStr)]
 enum Response {
-    Checkpoint(checkpoint::CheckpointProof),
+    /// Tag 0.
     CheckpointPosition {
         database: [u8; 16],
         partition: u32,
         epoch: u64,
         durable_end: u64,
     },
+    /// Tag 1.
     RetirementFiles(Vec<u64>),
+    /// Tag 2.
     Retired,
-    ReadIoStats(ReadExecutorStats),
+    /// Tag 3.
     Status(NodeStatus),
-    Appended(Vec<Receipt>),
-    Records(Vec<WireBytes>),
-    Recovery {
-        batches: Vec<(WireBytes, Receipt)>,
-        next: Option<usize>,
-    },
+    /// Tag 4.
     Sealed,
+    /// Tag 5.
     Stats {
         groups: u64,
         barriers: u64,
@@ -919,11 +647,9 @@ enum Response {
         records: usize,
         metadata: usize,
     },
+    /// Tag 6.
     Error(String),
-    RecordsProfiled {
-        records: Vec<WireBytes>,
-        profile: ServerReadProfile,
-    },
+    /// Tag 7.
     StatsDetailed {
         groups: u64,
         barriers: u64,
@@ -934,77 +660,52 @@ enum Response {
         records: usize,
         metadata: usize,
     },
-    // Diagnostics must not enlarge every ordinary read/write response value.
+    /// Tag 8. Diagnostics must not enlarge every ordinary response value.
     ConnectionProfile(Box<ConnectionProfile>),
-    OperationalReadIoStats(Box<(PartitionConfig, Option<ReadExecutorStats>)>),
-    ReadErrorProfiled {
-        message: String,
-        profile: Box<ServerReadProfile>,
-    },
+    /// Tag 9.
     OwnerTimelineArmed,
+    /// Tag 10.
     OwnerTimelinePage {
         records: Vec<super::write_timeline::OwnerTimelineRecord>,
         dropped: u64,
         incomplete: u64,
         more: bool,
     },
+    /// Tag 11.
     DurableProgress(DurableProgressReport),
-    /// Boxed so ordinary responses do not grow.
-    PartitionStats(Box<PartitionStats>),
-    #[cfg(feature = "experimental-nvmeof")]
-    ValidatedRecordReferences(Vec<ValidatedRecordLocation>),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    NvmeofExportRegistered([u8; 16]),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    NvmeofExportReleased,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 12. Boxed so ordinary responses do not grow.
+    PartitionStats(Box<PartitionStatsReply>),
+    /// Tag 13. Live export pin token (`AcquireLiveExportPin`).
     NvmeofEpochPinned([u8; 16]),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 14. Live epoch or export pin released.
     NvmeofEpochReleased,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    LiveReserved(live_control::LiveReserveWire),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    LiveCompleted(Box<live_control::LiveCompletionWire>),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 15.
     LiveRecords(LiveRecordLocations),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    LiveRecovery(live_control::LiveRecoveryWire),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 16. `ReplayLiveWal` page.
+    LiveRecovery(live_wire::LiveRecoveryWire),
+    /// Tag 17.
     LiveTargetStats(super::nvmeof::LiveTargetStats),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 18.
     LiveLeased(LiveLeased),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    /// Tag 19.
     LiveAdopted(LiveAdopted),
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    LiveExports(live_control::LiveExportInfo),
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    /// Tag 20.
+    LiveExports(LiveExportInfo),
+    /// Tag 21.
     ReadEvidence(crate::read_probe::ReadEvidence),
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    /// Tag 22.
     ProcessResources(crate::read_probe::ProcessResources),
-    #[cfg(feature = "test-utils")]
-    RamProbePrepared,
-    #[cfg(feature = "test-utils")]
-    RamProbe(WireBytes),
 }
 
-/// Authenticated owner metadata for an exact, durable member of a sealed WAL.
-/// Admission uses this once; it is not a per-value read or a revocable DMA grant.
-#[cfg(feature = "experimental-nvmeof")]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ValidatedRecordLocation {
-    pub reference: ValueRecordReference,
-    pub wal_file_bytes: u64,
-    pub source_file_index: u64,
-    pub source_device: u64,
-    pub source_inode: u64,
-    pub source_file_len: u64,
-    pub durable_frontier: u64,
-    pub offset: u64,
-    pub len: u64,
-}
+/// Named error of a live request this owner build cannot serve.
+#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+const LIVE_ROUTE_UNAVAILABLE: &str = "live NVMe-oF requests require experimental-nvmeof on Linux";
+/// Named error of a benchmark evidence request this owner build cannot serve.
+#[cfg(not(all(target_os = "linux", feature = "test-utils")))]
+const EVIDENCE_UNAVAILABLE: &str = "benchmark evidence requests require test-utils on Linux";
 
 #[cfg(test)]
-type ReadHook = Arc<dyn Fn(&ValueRecordReference) + Send + Sync>;
+mod wire_tag_tests;
 
 /// Live exports created inline by an owner request, while its caller waited,
 /// by request kind. A lease pays for one only when no
@@ -1023,8 +724,6 @@ pub struct LiveInlineExportStats {
     /// `ResolveLiveRecords` (kind 29): the first resolution of a file without
     /// a binding.
     pub resolve: u64,
-    /// `RecoverLiveMetadata`: a recovery page over a file without a binding.
-    pub recover: u64,
     /// `ReplayLiveWal`: a history page over a file without a binding.
     pub replay: u64,
 }
@@ -1033,34 +732,16 @@ pub struct LiveInlineExportStats {
 /// read requests retain Arc log handles and perform disk I/O outside this mutex.
 pub struct StorageNode {
     inventory: Arc<Mutex<NodeInventory>>,
-    readers: Arc<parking_lot::RwLock<inventory::ReaderAuthority>>,
-    read_pool: rayon::ThreadPool,
     control: control::ControlOwner,
     control_context: Arc<control::ControlContext>,
-    wal_member_read: super::storage::WalMemberReadPolicy,
-    read_config: read_executor::ReadExecutorConfig,
-    read_admission: Arc<read_executor::ReadAdmission>,
-    terminal: Arc<AtomicBool>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) live_nvme_selected: bool,
-    #[cfg(any(test, feature = "test-utils"))]
-    drop_append_response: AtomicBool,
-    #[cfg(test)]
-    panic_after_append: Arc<AtomicBool>,
-    #[cfg(test)]
-    read_hook: Mutex<Option<ReadHook>>,
 }
 impl StorageNode {
     pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>, TcpError> {
-        let read_config = config.read_config()?;
-        let read_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.effective_read_workers())
-            .thread_name(|i| format!("wal-record-read-{i}"))
-            .build()
-            .map_err(TcpError::component)?;
+        config.validate_reads()?;
         let wal_member_read = config.wal_member_read;
-        let read_admission =
-            Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
+        let read_max_device_reads = config.read_max_device_reads;
         let inventory = NodeInventory::open(config, metrics)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let live_nvme_selected = inventory.live_target_configured;
@@ -1068,63 +749,33 @@ impl StorageNode {
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
         let persistence_failed = inventory.persistence_failed.clone();
-        let append_shape = inventory.shape.clone();
-        let append_batch_limits = inventory.config.partition.batch_limits;
-        let append_group_limits = inventory.config.partition.group_limits;
         let partition = inventory.config.partition.clone();
         let inventory = Arc::new(Mutex::new(inventory));
-        #[cfg(test)]
-        let panic_after_append = Arc::new(AtomicBool::new(false));
         let control_context = Arc::new(control::ControlContext {
             partition,
             inventory: inventory.clone(),
             lifecycle,
-            readers: readers.clone(),
-            terminal: terminal.clone(),
+            readers,
+            terminal,
             poison_pending: Arc::new(AtomicBool::new(false)),
             persistence_failed,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             recoverable_live_failure: AtomicBool::new(false),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             poison_gate: Mutex::new(()),
-            append_shape,
-            append_batch_limits,
-            append_group_limits,
             wal_member_read,
-            read_config,
-            read_admission: read_admission.clone(),
+            read_max_device_reads,
+            transport: Arc::default(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_control_gate: Mutex::new(()),
-            #[cfg(test)]
-            panic_after_append: panic_after_append.clone(),
         });
-        let history_context = Arc::downgrade(&control_context);
-        inventory
-            .lock()
-            .set_history_failure_notifier(Arc::new(move || {
-                if let Some(context) = history_context.upgrade() {
-                    context.poison_readers();
-                }
-            }));
         let control = control::ControlOwner::start(control_context.clone())?;
         Ok(Arc::new(Self {
             inventory,
-            readers,
             control,
             control_context,
-            terminal,
-            read_pool,
-            wal_member_read,
-            read_config,
-            read_admission,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_nvme_selected,
-            #[cfg(any(test, feature = "test-utils"))]
-            drop_append_response: AtomicBool::new(false),
-            #[cfg(test)]
-            panic_after_append,
-            #[cfg(test)]
-            read_hook: Mutex::new(None),
         }))
     }
     pub fn status(&self) -> Result<NodeStatus, TcpError> {
@@ -1184,43 +835,6 @@ impl StorageNode {
         }
     }
 
-    /// Enable local maintenance diagnostics for current and later epochs.
-    /// This does not change the wire protocol or enable per-write clocks.
-    pub fn set_history_maintenance_diagnostics(&self, enabled: bool) {
-        // The gate orders this against log creation, which captures the
-        // setting under the inventory and applies it to the unpublished log.
-        let _lifecycle = self.control_context.lifecycle.lock();
-        self.inventory
-            .lock()
-            .set_history_maintenance_diagnostics(enabled);
-    }
-
-    /// Select owner receipt persistence before accepting writes.
-    pub fn set_history_persistence(
-        &self,
-        mode: super::storage::HistoryPersistence,
-    ) -> Result<(), TcpError> {
-        let _lifecycle = self.control_context.lifecycle.lock();
-        NodeInventory::switch_history_persistence(&mut self.inventory.lock(), mode)
-    }
-
-    /// Cumulative local snapshots, paired with epoch, without an RPC.
-    /// The vector is bounded by the configured retained epoch limit.
-    pub fn history_maintenance_stats(&self) -> Vec<(u64, super::storage::HistoryMaintenanceStats)> {
-        self.inventory.lock().history_maintenance_stats()
-    }
-    fn reader_snapshot(
-        &self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-    ) -> Result<inventory::ReaderSnapshot, TcpError> {
-        if self.control_context.poison_pending.load(Ordering::Acquire) {
-            return Err(TcpError::new("reader authority is poison-pending"));
-        }
-        self.readers
-            .read()
-            .snapshot(epoch, references, &self.terminal)
-    }
     #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn bench_live_grant_profiles(&self) -> serde_json::Value {
         self.control.grant_profiles()
@@ -1284,30 +898,7 @@ impl StorageNode {
         let mut inventory = self.inventory.lock();
         f(&mut inventory, &mut slot)
     }
-    pub(super) fn reader_authority_valid(&self, epoch: u64, generation: Option<u64>) -> bool {
-        if self.control_context.poison_pending.load(Ordering::Acquire) {
-            return false;
-        }
-        let readers = self.readers.read();
-        if let Some(generation) = generation {
-            readers.snapshot_valid(epoch, generation, &self.terminal)
-        } else {
-            readers.active_valid(epoch, &self.terminal)
-        }
-    }
-    pub(super) fn poison_readers(&self) {
-        self.control_context.poison_readers();
-    }
-    /// Explicit correctness-harness hook, unavailable in ordinary builds.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn inject_drop_next_append_response(&self) {
-        self.drop_append_response.store(true, Ordering::Release);
-    }
-    #[cfg(test)]
-    pub fn inject_panic_after_next_append(&self) {
-        self.panic_after_append.store(true, Ordering::Release);
-    }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn pause_next_persist(
         &self,
         epoch: u64,
@@ -1325,7 +916,7 @@ impl StorageNode {
             .map_err(TcpError::component)?;
         Ok(log.pause_next_persist())
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn pause_inventory(
         &self,
     ) -> (
@@ -1342,7 +933,7 @@ impl StorageNode {
         });
         (waiting, release)
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn contains_batch(&self, epoch: u64, id: BatchId) -> Result<bool, TcpError> {
         let log = self
             .inventory
@@ -1570,130 +1161,7 @@ impl StorageNode {
 
     #[cfg(test)]
     fn handle(&self, request: Request, limits: TcpLimits) -> Result<Response, TcpError> {
-        self.handle_profiled(request, limits, None)
-    }
-    fn handle_caught(
-        &self,
-        request: Request,
-        limits: TcpLimits,
-        profile: Option<&mut ConnectionProfile>,
-    ) -> Result<Response, TcpError> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.handle_profiled(request, limits, profile)
-        }))
-        .unwrap_or_else(|_| {
-            self.poison_readers();
-            Err(TcpError::new(
-                "request worker panicked; authority must be reopened",
-            ))
-        })
-    }
-
-    fn handle_profiled(
-        &self,
-        request: Request,
-        limits: TcpLimits,
-        profile: Option<&mut ConnectionProfile>,
-    ) -> Result<Response, TcpError> {
-        match request {
-            Request::Read {
-                epoch, references, ..
-            } => self.read_response::<false>(epoch, references, limits),
-            Request::ReadProfiled {
-                epoch, references, ..
-            } => self.read_response::<true>(epoch, references, limits),
-            request => self
-                .control_context
-                .handle_profiled(request, limits, profile),
-        }
-    }
-
-    fn effective_max_reads(&self, limits: TcpLimits) -> usize {
-        self.control_context.effective_max_reads(limits)
-    }
-
-    /// Both wire variants share every authority, membership and bounds check.
-    /// Const specialization keeps ordinary reads free of diagnostic clocks.
-    fn read_response<const PROFILE: bool>(
-        &self,
-        epoch: u64,
-        references: Vec<ValueRecordReference>,
-        limits: TcpLimits,
-    ) -> Result<Response, TcpError> {
-        let started = PROFILE.then(Instant::now);
-        let mut profile = ServerReadProfile::default();
-        let mut record_started = None;
-        let result = (|| -> Result<Vec<WireBytes>, TcpError> {
-            if references.is_empty() || references.len() > limits.max_reads {
-                return Err(TcpError::new("read request count exceeds bound"));
-            }
-            let began = PROFILE.then(Instant::now);
-            let snapshot = self.reader_snapshot(epoch, &references)?;
-            let generation = snapshot.generation;
-            // This diagnostic handler runs off the network owner. Snapshot capture
-            // itself only pins epoch/log identity under the short authority lock.
-            for (log, reference) in &snapshot.members {
-                log.validate_durable_record_reference(reference)
-                    .map_err(TcpError::component)?;
-            }
-            if let Some(began) = began {
-                profile.authority_lookup_ns = elapsed_ns(began);
-            }
-            record_started = PROFILE.then(Instant::now);
-            let mut size = 16usize
-                + if PROFILE {
-                    SERVER_READ_PROFILE_BYTES
-                } else {
-                    0
-                };
-            for reference in &references {
-                size = size
-                    .checked_add(reference.descriptor.len as usize + 8)
-                    .ok_or_else(|| TcpError::new("read response overflow"))?;
-                if size > limits.max_frame_bytes {
-                    return Err(TcpError::new("read response exceeds frame bound"));
-                }
-            }
-            // Explicit mapped/positional diagnostic controls only. Session count
-            // and byte credits bound queued work; indexed collection preserves order.
-            let records = self.read_pool.install(|| {
-                snapshot
-                    .members
-                    .par_iter()
-                    .map(|(log, reference)| {
-                        #[cfg(test)]
-                        {
-                            let hook = self.read_hook.lock().clone();
-                            if let Some(hook) = hook {
-                                hook(reference);
-                            }
-                        }
-                        let result =
-                            log.read_record_encoded_with_policy(reference, self.wal_member_read);
-                        self.read_admission
-                            .record_sync_read(reference.descriptor.len as usize, result.is_ok());
-                        result.map(Into::into).map_err(TcpError::component)
-                    })
-                    .collect::<Result<Vec<WireBytes>, TcpError>>()
-            })?;
-            if !self.reader_authority_valid(epoch, Some(generation)) {
-                return Err(TcpError::new("read authority was fenced or poisoned"));
-            }
-            Ok(records)
-        })();
-        if let Some(started) = started {
-            profile.wal.sync_reader_requests = 1;
-            profile.record_read_ns = record_started.map_or(0, elapsed_ns);
-            profile.handler_ns = elapsed_ns(started);
-            return Ok(match result {
-                Ok(records) => Response::RecordsProfiled { records, profile },
-                Err(error) => Response::ReadErrorProfiled {
-                    message: error.to_string(),
-                    profile: Box::new(profile),
-                },
-            });
-        }
-        result.map(Response::Records)
+        self.control_context.handle_profiled(request, limits, None)
     }
 }
 
@@ -1716,7 +1184,8 @@ pub struct ClientConnectProfile {
 #[derive(Clone)]
 pub(crate) struct ClientTlsConfig {
     pub config: Option<Arc<ClientConfig>>,
-    pub verifier: Option<Arc<rustls::client::WebPkiServerVerifier>>,
+    /// Live-target connection key component (the credential digest).
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub identity: [u8; 32],
 }
 
@@ -1737,21 +1206,18 @@ pub struct Client {
     broken: bool,
     frame_limit: usize,
     max_reads: usize,
-    max_read_bytes: usize,
     page_limit: usize,
     diagnostics: Option<TcpReadProfile>,
     reactor: reactor::ClientState,
     connected_status: Option<NodeStatus>,
     connect_profile: ClientConnectProfile,
-    reuse_verifier: Option<Arc<rustls::client::WebPkiServerVerifier>>,
-    server_name: Option<ServerName<'static>>,
     polling: PollingPolicy,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_config: Option<LiveClientConfig>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_pin_recipe: Arc<LivePinRecipe>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    live_exports: Option<(u64, live_control::LiveExportInfo, u64)>,
+    live_exports: Option<(u64, LiveExportInfo, u64)>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1774,8 +1240,6 @@ pub struct Client {
     live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_unreleased_tokens: Vec<(u64, [u8; 16])>,
-    #[cfg(feature = "test-utils")]
-    ram_probe_bytes: Option<usize>,
 }
 impl Client {
     /// The node's authenticated policy, adopted by ordinary read/control drivers.
@@ -1783,93 +1247,11 @@ impl Client {
         self.polling
     }
 
-    /// Outstanding transport groups, distinct from worker-local queued groups.
-    #[cfg(test)]
+    /// Outstanding leased transport groups, distinct from worker-local queued
+    /// groups.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn append_flights_in_flight(&self) -> usize {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_nvme_configured() {
-            return self.leased_flights_in_flight();
-        }
-        self.reactor.pending_append_count()
-    }
-
-    /// Prime/replace one session-local deterministic diagnostic buffer. No WAL
-    /// state is read or changed. Bytes are `i % 251`, length 0..=64 KiB, also
-    /// bounded by the negotiated response frame. Not available in normal builds.
-    #[cfg(feature = "test-utils")]
-    pub fn prepare_ram_probe(&mut self, value_bytes: usize) -> Result<(), TcpError> {
-        validate_ram_probe_size(value_bytes, self.frame_limit)?;
-        match self.request(Request::PrepareRamProbe { value_bytes })? {
-            Response::RamProbePrepared => {
-                self.ram_probe_bytes = Some(value_bytes);
-                Ok(())
-            }
-            response => self.wrong_variant("PrepareRamProbe", &response, "RamProbePrepared"),
-        }
-    }
-
-    /// Read through real authenticated framing/TLS/transport progress and verify
-    /// every returned byte before transferring the owned response to the caller.
-    #[cfg(feature = "test-utils")]
-    pub fn read_ram_probe(&mut self) -> Result<minibytes::Bytes, TcpError> {
-        let response = self.request(Request::ReadRamProbe)?;
-        let began = self.diagnostics.as_ref().map(|_| Instant::now());
-        let valid = match &response {
-            Response::RamProbe(bytes) => {
-                Some(bytes.as_slice().len()) == self.ram_probe_bytes
-                    && bytes
-                        .as_slice()
-                        .iter()
-                        .enumerate()
-                        .all(|(i, &b)| b == (i % 251) as u8)
-            }
-            _ => false,
-        };
-        if let Some(profile) = &mut self.diagnostics {
-            profile.ram_payload_verify_ns += began.map_or(0, elapsed_ns);
-            profile.ram_payload_verify_calls += 1;
-        }
-        match response {
-            Response::RamProbe(bytes) if valid => {
-                if let Some(profile) = &mut self.diagnostics {
-                    profile.ram_payload_verified_bytes += bytes.as_slice().len() as u64;
-                }
-                Ok(bytes.into_bytes())
-            }
-            Response::RamProbe(_) => self.wrong_response(
-                "ReadRamProbe",
-                "payload length or byte pattern differs from the prepared probe",
-            ),
-            response => self.wrong_variant("ReadRamProbe", &response, "RamProbe"),
-        }
-    }
-
-    /// Node-wide bounded cache and actual WAL submission evidence.
-    pub fn read_io_stats(&mut self) -> Result<ReadExecutorStats, TcpError> {
-        match self.request(Request::ReadIoStats)? {
-            Response::ReadIoStats(stats) => Ok(stats),
-            response => self.wrong_variant("ReadIoStats", &response, "ReadIoStats"),
-        }
-    }
-    /// Nonblocking read-only owner counters for operational metrics.
-    pub fn operational_read_io_stats(&mut self) -> Result<Option<ReadExecutorStats>, TcpError> {
-        match self.request(Request::OperationalReadIoStats)? {
-            Response::OperationalReadIoStats(snapshot) => {
-                let (partition, stats) = *snapshot;
-                if partition != self.expected {
-                    return self.wrong_response(
-                        "OperationalReadIoStats",
-                        "partition differs from the client partition configuration",
-                    );
-                }
-                Ok(stats)
-            }
-            response => self.wrong_variant(
-                "OperationalReadIoStats",
-                &response,
-                "OperationalReadIoStats",
-            ),
-        }
+        self.leased_flights_in_flight()
     }
     pub fn connect(
         endpoint: &str,
@@ -1897,24 +1279,6 @@ impl Client {
             expected,
             shape,
             true,
-        )
-    }
-    pub(crate) fn connect_operational_shared(
-        endpoint: &str,
-        tls: &TlsFiles,
-        client_config: ClientTlsConfig,
-        timeout: Duration,
-        expected: PartitionConfig,
-        shape: &KeyShape,
-    ) -> Result<Self, TcpError> {
-        Self::connect_shared_with_status(
-            endpoint,
-            tls,
-            client_config,
-            timeout,
-            expected,
-            shape,
-            false,
         )
     }
     fn connect_shared_with_status(
@@ -1951,17 +1315,16 @@ impl Client {
         if tls.transport.is_native() {
             write_transport_mode(&mut io, &tls.transport)?;
         }
-        let (session, reuse_verifier, server_name, tls_ns, fabric_ns) = if tls.transport.is_native()
-        {
+        let (session, tls_ns, fabric_ns) = if tls.transport.is_native() {
             if !tls.transport.is_fabric() {
-                (reactor::Session::new_plain(io)?, None, None, 0, None)
+                (reactor::Session::new_plain(io)?, 0, None)
             } else {
                 #[cfg(feature = "experimental-fabric")]
                 {
                     let endpoint = fabric::bootstrap(&mut io, &tls.transport)?;
                     io.fabric = Some(endpoint);
                     let fabric_ns = Some(elapsed_ns(setup_started));
-                    (reactor::Session::new_native(io)?, None, None, 0, fabric_ns)
+                    (reactor::Session::new_native(io)?, 0, fabric_ns)
                 }
                 #[cfg(not(feature = "experimental-fabric"))]
                 {
@@ -1974,11 +1337,8 @@ impl Client {
             let client_tls_config = client_config
                 .config
                 .ok_or_else(|| TcpError::new("TLS transport has no client credentials"))?;
-            let verifier = client_config
-                .verifier
-                .ok_or_else(|| TcpError::new("TLS transport has no peer verifier"))?;
-            let mut conn = ClientConnection::new(client_tls_config, name.clone())
-                .map_err(TcpError::component)?;
+            let mut conn =
+                ClientConnection::new(client_tls_config, name).map_err(TcpError::component)?;
             conn.set_buffer_limit(Some(reactor::TLS_BUFFER_BYTES));
             while conn.is_handshaking() {
                 conn.complete_io(&mut io)?;
@@ -2004,8 +1364,6 @@ impl Client {
             let fabric_ns = None;
             (
                 reactor::Session::new(stream.conn.into(), stream.sock)?,
-                Some(verifier),
-                Some(name),
                 tls_ns,
                 fabric_ns,
             )
@@ -2019,7 +1377,6 @@ impl Client {
             broken: false,
             frame_limit: HARD_FRAME_LIMIT,
             max_reads: 256,
-            max_read_bytes: 256 * 1024 * 1024,
             page_limit: 1024,
             diagnostics: None,
             reactor: reactor::ClientState::default(),
@@ -2032,8 +1389,6 @@ impl Client {
                 #[cfg(feature = "experimental-fabric")]
                 fabric_open: None,
             },
-            reuse_verifier,
-            server_name,
             polling: PollingPolicy::Adaptive,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_config: None,
@@ -2063,8 +1418,6 @@ impl Client {
             live_metrics: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_unreleased_tokens: Vec::new(),
-            #[cfg(feature = "test-utils")]
-            ram_probe_bytes: None,
         };
         if query_status {
             let began = Instant::now();
@@ -2392,15 +1745,6 @@ impl Client {
                 format_args!("max_reads={}; expected 1..=256", status.max_reads),
             );
         }
-        if !(1..=256 * 1024 * 1024).contains(&status.max_read_bytes) {
-            return self.wrong_response(
-                request,
-                format_args!(
-                    "max_read_bytes={}; expected 1..=268435456",
-                    status.max_read_bytes
-                ),
-            );
-        }
         if !(1..=1024).contains(&status.recovery_page_batches) {
             return self.wrong_response(
                 request,
@@ -2448,7 +1792,6 @@ impl Client {
         }
         self.frame_limit = status.max_frame_bytes;
         self.max_reads = status.max_reads;
-        self.max_read_bytes = status.max_read_bytes;
         self.page_limit = status.recovery_page_batches;
         self.polling = status.polling;
         Ok(status)
@@ -2471,6 +1814,7 @@ impl Client {
             response => self.wrong_variant("Fence", &response, "Status"),
         }
     }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn check_receipt(
         &self,
         batch: &CompleteBatch,
@@ -2500,62 +1844,6 @@ impl Client {
         }
         Ok(receipt.durable())
     }
-    pub fn append_many(
-        &mut self,
-        epoch: u64,
-        batches: &[CompleteBatch],
-    ) -> Result<Vec<DurableBatch>, TcpError> {
-        let id = self
-            .submit_append_many(epoch, batches)?
-            .ok_or_else(|| TcpError::new("session append admission is full"))?;
-        let mut polling = reactor::ActivePoll::default();
-        loop {
-            if let Some(completion) = self.take_append_completion(id)? {
-                return completion.result;
-            }
-            self.pause_append_poll(&mut polling);
-        }
-    }
-    pub(crate) fn submit_append_many(
-        &mut self,
-        epoch: u64,
-        batches: &[CompleteBatch],
-    ) -> Result<Option<u64>, TcpError> {
-        if batches.is_empty() || batches.len() > self.expected.group_limits.max_batches as usize {
-            return Err(TcpError::new("invalid append group count"));
-        }
-        let mut encoded_bytes = GROUP_HEADER_LEN;
-        let mut charge = 64usize;
-        for batch in batches {
-            batch
-                .validate_for(&self.shape, self.expected.batch_limits)
-                .map_err(TcpError::component)?;
-            if batch.version().epoch != epoch
-                || batch.id().database != self.expected.inventory.database
-                || self
-                    .expected
-                    .inventory
-                    .partition_for(batch.id())
-                    .map_err(TcpError::component)?
-                    != self.expected.partition
-            {
-                return Err(TcpError::new("batch belongs to another epoch/partition"));
-            }
-            encoded_bytes = encoded_bytes
-                .checked_add(
-                    CompleteGroup::encoded_member_len(batch.encoded().len())
-                        .map_err(TcpError::component)?,
-                )
-                .ok_or_else(|| TcpError::new("append group size overflow"))?;
-            charge = charge
-                .checked_add(batch.encoded().len().saturating_add(64))
-                .ok_or_else(|| TcpError::new("append session credit overflow"))?;
-        }
-        if encoded_bytes > self.expected.group_limits.max_encoded_bytes {
-            return Err(TcpError::new("append group exceeds configured byte limit"));
-        }
-        self.submit_append(epoch, batches, charge)
-    }
     pub fn read_record(
         &mut self,
         epoch: u64,
@@ -2565,50 +1853,21 @@ impl Client {
             .pop()
             .ok_or_else(|| TcpError::new("empty record response"))
     }
+    /// Direct live reads with a fresh published-index cache. The read-service
+    /// lanes retain their own bounded, trusted-index grants across requests.
     pub fn read_records(
         &mut self,
         epoch: u64,
         references: &[ValueRecordReference],
     ) -> Result<Vec<Mutation>, TcpError> {
-        self.read_records_inner(epoch, references, None)
-    }
-    pub fn read_record_profiled(
-        &mut self,
-        epoch: u64,
-        reference: &ValueRecordReference,
-    ) -> Result<(Mutation, TcpReadProfile), TcpError> {
-        let (mut values, profile) =
-            self.read_records_profiled(epoch, std::slice::from_ref(reference))?;
-        Ok((
-            values
-                .pop()
-                .ok_or_else(|| TcpError::new("empty record response"))?,
-            profile,
-        ))
-    }
-    pub fn read_records_profiled(
-        &mut self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-    ) -> Result<(Vec<Mutation>, TcpReadProfile), TcpError> {
-        let mut profile = TcpReadProfile::default();
-        let values = self.read_records_inner(epoch, references, Some(&mut profile))?;
-        Ok((values, profile))
-    }
-    fn read_records_inner(
-        &mut self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-        profile: Option<&mut TcpReadProfile>,
-    ) -> Result<Vec<Mutation>, TcpError> {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_config.is_some() {
+        {
+            if self.live_config.is_none() {
+                return Err(TcpError::new("reads require live NVMe-oF configuration"));
+            }
             if !self.live_unreleased_tokens.is_empty() {
                 return Err(TcpError::new("live read has quarantined owner grants"));
             }
-            // A direct caller has no persistent published-index cache. Resolve
-            // its references afresh; the read-service lanes retain their own
-            // bounded, trusted-index grants across requests.
             let mut cache = live_read::LiveReadCache::default();
             let result = self.live_read_records(
                 &mut cache,
@@ -2624,9 +1883,8 @@ impl Client {
                     .into_iter()
                     .map(|token| (epoch, token)),
             );
-            // Legacy TCP/server clocks stay unavailable (sample counts zero).
             // Live I/O and validation clocks come from live_nvmeof_stats.
-            return match (result, cleanup) {
+            match (result, cleanup) {
                 (Ok(values), Ok(())) => Ok(values),
                 (Err(error), Ok(())) => Err(error),
                 (result, Err(cleanup)) => {
@@ -2636,65 +1894,12 @@ impl Client {
                         result.err(),
                     )))
                 }
-            };
-        }
-        self.read_records_correlated(epoch, references, profile)
-    }
-    pub fn recovery_page(
-        &mut self,
-        epoch: u64,
-        cursor: usize,
-        limit: usize,
-    ) -> Result<RecoveryPage, TcpError> {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_config.is_some() {
-            return Err(TcpError::new(
-                "live NVMe-oF recovery requires metadata-only control",
-            ));
-        }
-        if limit == 0 || limit > 1024 {
-            return Err(TcpError::new("invalid recovery page limit"));
-        }
-        match self.request(Request::Recover {
-            epoch,
-            cursor,
-            limit: limit.min(self.page_limit),
-        })? {
-            Response::Recovery { batches, next }
-                if batches.len() <= limit
-                    && next.is_none_or(|next| {
-                        cursor.checked_add(batches.len()) == Some(next) && !batches.is_empty()
-                    }) =>
-            {
-                self.broken = true;
-                let mut result = Vec::with_capacity(batches.len());
-                for (encoded, receipt) in batches {
-                    let batch = CompleteBatch::decode_owned(
-                        &self.shape,
-                        encoded.into_vec(),
-                        self.expected.batch_limits,
-                    )
-                    .map_err(TcpError::component)?;
-                    if batch.version().epoch != epoch {
-                        return self.wrong_response(
-                            "Recover",
-                            format_args!("batch epoch={}, expected {epoch}", batch.version().epoch),
-                        );
-                    }
-                    let durable = self.check_receipt(&batch, receipt)?;
-                    result.push((batch, durable));
-                }
-                self.broken = false;
-                Ok(RecoveryPage {
-                    batches: result,
-                    next,
-                })
             }
-            response => self.wrong_variant(
-                "Recover",
-                &response,
-                "Recovery within the page limit with a contiguous, nonempty next cursor",
-            ),
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            let _ = (epoch, references);
+            Err(TcpError::new(LIVE_ROUTE_UNAVAILABLE))
         }
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
@@ -2703,11 +1908,14 @@ impl Client {
             response => self.wrong_variant("Seal", &response, "Sealed"),
         }
     }
-    /// Complete owner persistence counters. Uses the boxed tail variant so the
-    /// fixed `StatsDetailed` encoding stays unchanged.
+    /// Complete owner persistence counters.
     pub fn stats(&mut self) -> Result<PartitionStats, TcpError> {
+        self.partition_stats().map(|reply| reply.partition)
+    }
+    /// Owner persistence counters with the owner's OFI transport counters.
+    pub fn partition_stats(&mut self) -> Result<PartitionStatsReply, TcpError> {
         match self.request(Request::PartitionStats)? {
-            Response::PartitionStats(stats) => Ok(*stats),
+            Response::PartitionStats(reply) => Ok(*reply),
             response => self.wrong_variant("PartitionStats", &response, "PartitionStats"),
         }
     }
@@ -2808,7 +2016,7 @@ impl TlsFiles {
         if self.trusted_mode()? {
             return Ok(ClientTlsConfig {
                 config: None,
-                verifier: None,
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 identity: [0; 32],
             });
         }
@@ -2823,25 +2031,18 @@ impl TlsFiles {
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(TcpError::component)?
-            .with_webpki_verifier(verifier.clone())
+            .with_webpki_verifier(verifier)
             .with_client_auth_cert(cert, key)
             .map_err(TcpError::component)?;
         config.alpn_protocols = vec![self.transport.alpn()];
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        let _ = identity;
         Ok(ClientTlsConfig {
             config: Some(Arc::new(config)),
-            verifier: Some(verifier),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             identity,
         })
     }
-}
-
-#[cfg(feature = "test-utils")]
-fn validate_ram_probe_size(value_bytes: usize, frame_limit: usize) -> Result<(), TcpError> {
-    // Envelope u32 protocol + u64 ID + u32 response tag + u64 byte length.
-    if value_bytes > 64 * 1024 || value_bytes > frame_limit.saturating_sub(24) {
-        return Err(TcpError::new("RAM probe exceeds payload/frame bound"));
-    }
-    Ok(())
 }
 
 fn wire_codec(limit: usize) -> impl Options {

@@ -17,8 +17,8 @@ use super::native_index::{IndexReadCut, NativeIndex};
 use super::native_publication::{NativePublicationRouting, PreparedNativePublication};
 use super::reference_directory::ReferenceDirectory;
 use super::storage::{
-    AppendedBatch, DurableBatch, HistoryPersistence, PartitionConfig, PartitionStats,
-    StaticInventory, WAL_REPLAY_WINDOW_BATCHES, encode_metadata, install_metadata, read_metadata,
+    AppendedBatch, DurableBatch, PartitionConfig, PartitionStats, StaticInventory,
+    WAL_REPLAY_WINDOW_BATCHES, encode_metadata, install_metadata, read_metadata,
 };
 use super::storage::{LocalCheckpoint, LocalDbError, LocalDbStats, LocalInventoryConfig};
 use super::tcp::checkpoint::CheckpointPositionProof;
@@ -88,286 +88,6 @@ pub use read_cache::{
 };
 use read_cache::{ReadCache, ReadCachePolicy};
 pub(crate) use read_pipeline::PendingScanPage;
-pub use transports::RemoteTransportPool;
-
-const OPERATIONAL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-const OPERATIONAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
-
-#[derive(Default)]
-pub struct OperationalReadIoSnapshot {
-    pub generation: u64,
-    pub last_attempt: Option<Instant>,
-    pub available: bool,
-    pub failed_samples: u64,
-    pub owners: Vec<(u32, super::tcp::ReadExecutorStats)>,
-}
-struct OperationalReadIoState {
-    snapshot: RwLock<OperationalReadIoSnapshot>,
-    stopped: std::sync::atomic::AtomicBool,
-}
-
-/// Passive operational owner counters. This handle retains only an inert snapshot.
-#[derive(Clone)]
-pub struct OperationalReadIoMonitor {
-    state: Arc<OperationalReadIoState>,
-}
-impl OperationalReadIoMonitor {
-    pub fn visit(&self, visit: impl FnOnce(&OperationalReadIoSnapshot, bool)) {
-        let snapshot = self.state.snapshot.read();
-        visit(
-            &snapshot,
-            self.state
-                .stopped
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
-    }
-    pub fn try_visit(&self, visit: impl FnOnce(&OperationalReadIoSnapshot, bool)) -> Option<()> {
-        let snapshot = self.state.snapshot.try_read()?;
-        visit(
-            &snapshot,
-            self.state
-                .stopped
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
-        Some(())
-    }
-}
-
-struct PendingOperationalReadIoSampling {
-    config: RemoteDatabaseConfig,
-    shape: KeyShape,
-    tls_config: super::tcp::ClientTlsConfig,
-}
-
-pub(super) struct OperationalReadIoLifecycle {
-    state: Arc<OperationalReadIoState>,
-    pending: Option<PendingOperationalReadIoSampling>,
-    stop: Option<mpsc::SyncSender<()>>,
-    worker: Option<JoinHandle<()>>,
-    stopped: bool,
-}
-
-struct OperationalReadIoSampler {
-    state: Arc<OperationalReadIoState>,
-    lifecycle: Arc<Mutex<OperationalReadIoLifecycle>>,
-}
-impl OperationalReadIoSampler {
-    fn dormant(
-        config: RemoteDatabaseConfig,
-        shape: KeyShape,
-        tls_config: super::tcp::ClientTlsConfig,
-    ) -> Self {
-        let state = Arc::new(OperationalReadIoState {
-            snapshot: RwLock::new(OperationalReadIoSnapshot::default()),
-            stopped: std::sync::atomic::AtomicBool::new(false),
-        });
-        Self {
-            state: state.clone(),
-            lifecycle: Arc::new(Mutex::new(OperationalReadIoLifecycle {
-                state,
-                pending: Some(PendingOperationalReadIoSampling {
-                    config,
-                    shape,
-                    tls_config,
-                }),
-                stop: None,
-                worker: None,
-                stopped: false,
-            })),
-        }
-    }
-
-    fn monitor(&self) -> OperationalReadIoMonitor {
-        OperationalReadIoMonitor {
-            state: self.state.clone(),
-        }
-    }
-
-    fn downgrade_lifecycle(&self) -> std::sync::Weak<Mutex<OperationalReadIoLifecycle>> {
-        Arc::downgrade(&self.lifecycle)
-    }
-
-    fn activate(&self) {
-        Self::activate_lifecycle(&self.lifecycle);
-    }
-
-    pub(super) fn activate_lifecycle(lifecycle: &Arc<Mutex<OperationalReadIoLifecycle>>) {
-        let mut lifecycle = lifecycle.lock();
-        if lifecycle.stopped || lifecycle.worker.is_some() {
-            return;
-        }
-        let Some(pending) = lifecycle.pending.take() else {
-            return;
-        };
-        let state = lifecycle.state.clone();
-        let thread_state = state.clone();
-        let (stop, stopped) = mpsc::sync_channel(1);
-        let spawn_result = thread::Builder::new()
-            .name("wal-operational-metrics".to_owned())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    operational_sample_loop(
-                        pending.config,
-                        pending.shape,
-                        pending.tls_config,
-                        &thread_state,
-                        stopped,
-                    )
-                }));
-                if result.is_err() {
-                    mark_operational_sample_failed(&thread_state);
-                    eprintln!("operational read-I/O sampler panicked");
-                }
-            });
-        match spawn_result {
-            Ok(worker) => {
-                lifecycle.stop = Some(stop);
-                lifecycle.worker = Some(worker);
-            }
-            Err(error) => {
-                lifecycle.stopped = true;
-                mark_operational_sample_failed(&state);
-                eprintln!("failed to start operational read-I/O sampler: {error}");
-            }
-        }
-    }
-
-    fn stop(&self) {
-        let (state, stop, worker) = {
-            let mut lifecycle = self.lifecycle.lock();
-            lifecycle.stopped = true;
-            lifecycle.pending = None;
-            lifecycle
-                .state
-                .stopped
-                .store(true, std::sync::atomic::Ordering::Release);
-            (
-                lifecycle.state.clone(),
-                lifecycle.stop.take(),
-                lifecycle.worker.take(),
-            )
-        };
-        if let Some(stop) = stop {
-            let _ = stop.try_send(());
-        }
-        if let Some(worker) = worker
-            && worker.join().is_err()
-        {
-            mark_operational_sample_failed(&state);
-            eprintln!("operational read-I/O sampler panicked during shutdown");
-        }
-        if let Some(mut snapshot) = state.snapshot.try_write() {
-            snapshot.available = false;
-            snapshot.owners.clear();
-        }
-    }
-}
-
-fn mark_operational_sample_failed(state: &OperationalReadIoState) {
-    state
-        .stopped
-        .store(true, std::sync::atomic::Ordering::Release);
-    if let Some(mut snapshot) = state.snapshot.try_write() {
-        snapshot.generation = snapshot.generation.saturating_add(1);
-        snapshot.last_attempt = Some(Instant::now());
-        snapshot.failed_samples = snapshot.failed_samples.saturating_add(1);
-        snapshot.available = false;
-        snapshot.owners.clear();
-    }
-}
-
-impl Drop for OperationalReadIoSampler {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn operational_sample_loop(
-    config: RemoteDatabaseConfig,
-    shape: KeyShape,
-    tls_config: super::tcp::ClientTlsConfig,
-    state: &OperationalReadIoState,
-    stop: mpsc::Receiver<()>,
-) {
-    let mut clients: Vec<Option<Client>> = (0..config.endpoints.len()).map(|_| None).collect();
-    loop {
-        if stop.try_recv().is_ok() {
-            break;
-        }
-        let attempt_started = Instant::now();
-        let mut owners = Vec::with_capacity(config.endpoints.len());
-        let mut available = true;
-        for (index, endpoint) in config.endpoints.iter().enumerate() {
-            if stop.try_recv().is_ok() {
-                available = false;
-                break;
-            }
-            if clients[index].is_none() {
-                let mut tls = config.tls.clone();
-                tls.server_name = endpoint.server_name.clone();
-                clients[index] = Client::connect_operational_shared(
-                    &endpoint.address,
-                    &tls,
-                    tls_config.clone(),
-                    OPERATIONAL_REQUEST_TIMEOUT,
-                    config.partition_config(1, endpoint.partition),
-                    &shape,
-                )
-                .ok();
-            }
-            match clients[index]
-                .as_mut()
-                .map(Client::operational_read_io_stats)
-            {
-                Some(Ok(Some(stats))) => owners.push((endpoint.partition, stats)),
-                Some(Ok(None)) | None => available = false,
-                Some(Err(_)) => {
-                    clients[index] = None;
-                    available = false;
-                }
-            }
-        }
-        if !state.stopped.load(std::sync::atomic::Ordering::Acquire)
-            && let Some(mut snapshot) = state.snapshot.try_write()
-        {
-            snapshot.generation = snapshot.generation.saturating_add(1);
-            snapshot.last_attempt = Some(attempt_started);
-            snapshot.available = available && owners.len() == config.endpoints.len();
-            snapshot.failed_samples = snapshot
-                .failed_samples
-                .saturating_add(u64::from(!snapshot.available));
-            snapshot.owners = if snapshot.available {
-                owners
-            } else {
-                Vec::new()
-            };
-        }
-        match stop.recv_timeout(OPERATIONAL_SAMPLE_INTERVAL) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    }
-}
-/// Explicit benchmark evidence handle for owner read I/O.
-pub struct ReadEvidenceMonitor {
-    clients: Vec<(u32, ControlHandle)>,
-    reads: Arc<ReadService>,
-}
-impl ReadEvidenceMonitor {
-    /// Sample owner read I/O counters outside the measured interval. Callers
-    /// must finish all reads and writes first; sequential owner replies do not
-    /// constitute a globally consistent cut.
-    /// Counter sampling does not close current or preleased writer extents.
-    pub fn sample_owner_read_io(
-        &self,
-    ) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
-        self.reads.ensure_idle()?;
-        self.clients
-            .iter()
-            .map(|(partition, client)| client.read_io_stats().map(|stats| (*partition, stats)))
-            .collect()
-    }
-}
 
 pub const BACKEND_ID: &str = "tidehunter-tcp-rf1";
 const MANIFEST: &str = "tcp-database-authority-v1";
@@ -441,9 +161,9 @@ pub struct RemoteDatabaseConfig {
     /// Per-append-connection bounded sample; zero keeps storage profiling disabled.
     #[serde(default = "default_write_profile_limit")]
     pub write_profile_limit: usize,
-    /// Select direct live owner-WAL NVMe-oF before opening or recovering.
-    #[serde(default)]
-    pub live_nvme: Option<super::tcp::LiveClientConfig>,
+    /// The leased live owner-WAL NVMe-oF route; required. Remote databases have
+    /// no other data path.
+    pub live_nvme: super::tcp::LiveClientConfig,
     /// The durable cut of Native-tier recovery. Absent means the default lags.
     #[serde(default, skip_serializing_if = "DurableCutConfig::is_default")]
     pub durable_cut: DurableCutConfig,
@@ -495,13 +215,10 @@ impl RemoteDatabaseConfig {
     /// One session from `transports::connect(..., 1)` is shared by append,
     /// checkpoint and lifecycle control; live pins reuse read/control sessions.
     const APPEND_CONTROL_CONNECTIONS: usize = 1;
-    /// The optional operational sampler owns one additional session per owner.
-    const OPERATIONAL_CONNECTIONS: usize = 1;
     /// The durable-cut poller owns one plain session per owner.
     const DURABLE_PROGRESS_CONNECTIONS: usize = 1;
-    pub const NON_READ_CONNECTIONS: usize = Self::APPEND_CONTROL_CONNECTIONS
-        + Self::OPERATIONAL_CONNECTIONS
-        + Self::DURABLE_PROGRESS_CONNECTIONS;
+    pub const NON_READ_CONNECTIONS: usize =
+        Self::APPEND_CONTROL_CONNECTIONS + Self::DURABLE_PROGRESS_CONNECTIONS;
     /// Budget two complete coordinator session sets so a reopen can overlap
     /// old sessions until their owner permits observe EOF. Auto configs use
     /// the cap, not the preparing host's CPU count.
@@ -533,12 +250,7 @@ impl RemoteDatabaseConfig {
     }
 
     fn validate_read_lane_pinning(&self, read_lanes: usize) -> Result<(), LocalDbError> {
-        if self.pin_read_lanes
-            && self
-                .live_nvme
-                .as_ref()
-                .is_some_and(|live| read_lanes > live.queue_geometry.io_queues as usize)
-        {
+        if self.pin_read_lanes && read_lanes > self.live_nvme.queue_geometry.io_queues as usize {
             return Err(LocalDbError::new(
                 "pin_read_lanes requires read_lanes <= live I/O queues",
             ));
@@ -547,11 +259,7 @@ impl RemoteDatabaseConfig {
     }
 
     fn effective_owner_append_occupancy(&self) -> usize {
-        if self
-            .live_nvme
-            .as_ref()
-            .is_some_and(|live| live.leased_write_window.is_none())
-        {
+        if self.live_nvme.leased_write_window.is_none() {
             Self::MAX_OWNER_APPEND_OCCUPANCY
         } else {
             self.owner_append_occupancy
@@ -609,14 +317,8 @@ impl RemoteDatabaseConfig {
             ));
         }
         self.durable_cut.validate().map_err(LocalDbError::new)?;
-        // Only the leased worker has the pre-submit re-drain. Reject `false`
-        // elsewhere, so a control arm cannot run as a silent no-op.
-        if !self.leased_submit_redrain && self.live_nvme.is_none() {
-            return Err(LocalDbError::new(
-                "leased_submit_redrain=false requires live_nvme",
-            ));
-        }
-        if let Some(live) = &self.live_nvme {
+        {
+            let live = &self.live_nvme;
             live.validate().map_err(LocalDbError::new)?;
             if let Some(read_lanes) = self.read_lanes {
                 self.validate_read_lane_pinning(read_lanes)?;
@@ -633,10 +335,6 @@ impl RemoteDatabaseConfig {
                     "live owner identities must cover every partition",
                 ));
             }
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            return Err(LocalDbError::new(
-                "live NVMe-oF requires the Linux experimental-nvmeof feature",
-            ));
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             {
                 if self.storage.fragment_bytes >= 1 << 30 {
@@ -678,10 +376,11 @@ impl RemoteDatabaseConfig {
         self.replay_limits.validate().map_err(LocalDbError::new)?;
         validate_owner_occupancy(self.owner_append_occupancy).map_err(LocalDbError::new)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if self.live_nvme.as_ref().is_some_and(|live| {
-            live.leased_write_window
-                .is_some_and(|window| window > self.owner_append_occupancy)
-        }) {
+        if self
+            .live_nvme
+            .leased_write_window
+            .is_some_and(|window| window > self.owner_append_occupancy)
+        {
             return Err(LocalDbError::new(
                 "leased write window exceeds owner append occupancy",
             ));
@@ -748,6 +447,12 @@ impl RemoteDatabaseConfig {
             ));
         }
         self.recovery_page_limit()?;
+        // Every remote database uses the leased live route.
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        return Err(LocalDbError::new(
+            "live NVMe-oF requires the Linux experimental-nvmeof feature",
+        ));
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         Ok(())
     }
 
@@ -968,14 +673,11 @@ pub struct RecoveryStats {
     pub tail_bytes: u64,
     /// Per-open credential parsing/configuration, before parallel connections.
     pub tls_config_ns: u64,
-    /// Pool identity/checkout and disposal of a mismatched idle bundle.
-    pub transport_checkout_ns: u64,
     /// Read-connection worker wall time; overlaps control setup and recovery.
     pub read_lane_setup_ns: u64,
     /// Critical-path wait for prepared read connections after recovery.
     pub read_lane_wait_ns: u64,
     pub created_connections: u64,
-    pub reused_connections: u64,
     /// Nested elapsed worker sums across both connection sets, not additive.
     pub connect_worker_ns: u64,
     pub status_worker_ns: u64,
@@ -1039,15 +741,15 @@ impl RecoveryStats {
 type DependencyKey = SmallVec<[u8; 32]>;
 
 #[derive(Clone, Copy)]
-enum OpenInterruption {
+pub(crate) enum OpenInterruption {
     #[cfg(any(test, feature = "test-utils"))]
     AfterFences(usize),
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     AfterReadSetup,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     DuringReplay,
     /// After the durable-cut record is persisted, before the epoch activates.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     AfterCutRecord,
 }
 
@@ -1352,28 +1054,17 @@ pub struct ShutdownStats {
     pub join_ns: u64,
 }
 
-/// Diagnostic clocks only. Actor/TCP stages are nested and must not be summed
-/// with dispatch/wait into a purported non-overlapping latency breakdown.
+/// Diagnostic clocks only. Stages are nested and must not be summed with
+/// dispatch/wait into a purported non-overlapping latency breakdown.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteReadProfile {
     pub index_ns: u64,
     pub dispatch_ns: u64,
     pub wait_ns: u64,
-    pub actor_queue_ns: u64,
-    pub actor_service_ns: u64,
-    pub actor_return_ns: u64,
-    /// Caller-owned scalar RPC, with no read-actor queue/return handoff.
+    /// Caller-owned scalar live read, with no read-actor queue/return handoff.
     pub inline_read_ns: u64,
-    pub tcp: super::tcp::TcpReadProfile,
     pub cache_hits: u64,
     pub cache_misses: u64,
-}
-
-struct WorkerReadProfile {
-    queue_ns: u64,
-    service_ns: u64,
-    finished: Instant,
-    tcp: super::tcp::TcpReadProfile,
 }
 
 pub struct RemoteDatabase {
@@ -1463,40 +1154,34 @@ impl RemoteDatabase {
         config: RemoteDatabaseConfig,
         _metrics: Arc<Metrics>,
     ) -> Result<Self, LocalDbError> {
-        Self::open_inner(path, shape, config, None, None)
+        Self::open_inner(path, shape, config, None)
     }
-    /// Enable the existing ordinary-file live I/O fixture before exposing the DB.
-    /// No kernel controller or physical NVMe device is qualified by this hook.
+    /// `open` over the rootless ordinary-file live I/O fixture (`buffered`
+    /// selects buffered fixture I/O). Every client created during open selects
+    /// the fixture before any live I/O, so WAL replay during open and later
+    /// reads of earlier files use it too. No kernel controller or physical NVMe
+    /// device is qualified by this route.
     #[cfg(all(
-        feature = "test-utils",
+        any(test, feature = "test-utils"),
         feature = "experimental-nvmeof",
         target_os = "linux"
     ))]
-    pub(crate) fn enable_local_live_fixture(&mut self, buffered: bool) -> Result<(), LocalDbError> {
-        if self.core.config.live_nvme.is_none() {
-            return Err(LocalDbError::new(
-                "local live fixture requires live_nvme configuration",
-            ));
-        }
-        for worker in &self.core.clients {
-            worker.client.lock().bench_local_live_fixture(buffered);
-        }
-        Ok(())
-    }
-
-    /// Open a fresh authority epoch using an optional process-owned transport
-    /// lifetime. Only clean, quiescent connections can be reused; credentials,
-    /// peer status, complete fencing and checkpoint/tail recovery are rechecked.
-    pub fn open_with_transport_pool(
+    pub(crate) fn open_with_local_live_fixture(
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
-        _metrics: Arc<Metrics>,
-        transports: Arc<RemoteTransportPool>,
+        buffered: bool,
     ) -> Result<Self, LocalDbError> {
-        Self::open_inner(path, shape, config, Some(transports), None)
+        Self::open_inner_with(
+            path,
+            shape,
+            config,
+            None,
+            #[cfg(test)]
+            None,
+            Some(buffered),
+        )
     }
-
     /// Exercise a coordinator failure after a durable Preparing epoch and a
     /// strict subset of node fences. No serving handle can escape this path.
     #[cfg(any(test, feature = "test-utils"))]
@@ -1516,7 +1201,6 @@ impl RemoteDatabase {
             path,
             shape,
             config,
-            None,
             Some(OpenInterruption::AfterFences(successful_fences)),
         )
     }
@@ -1531,43 +1215,71 @@ impl RemoteDatabase {
         config: RemoteDatabaseConfig,
         hook: impl FnOnce(&mut RemoteDatabaseConfig, &mut Vec<Client>),
     ) -> Result<Self, LocalDbError> {
-        Self::open_inner_with(path, shape, config, None, None, Some(Box::new(hook)))
+        Self::open_inner_with(path, shape, config, None, Some(Box::new(hook)), Some(false))
     }
 
     fn open_inner(
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
-        transport_pool: Option<Arc<RemoteTransportPool>>,
         interruption: Option<OpenInterruption>,
     ) -> Result<Self, LocalDbError> {
         Self::open_inner_with(
             path,
             shape,
             config,
-            transport_pool,
             interruption,
             #[cfg(test)]
             None,
+            #[cfg(all(
+                any(test, feature = "test-utils"),
+                feature = "experimental-nvmeof",
+                target_os = "linux"
+            ))]
+            None,
         )
+    }
+
+    /// `open` over the unbuffered ordinary-file live I/O fixture (see
+    /// `open_with_local_live_fixture`).
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn open_local_live_fixture(
+        path: &Path,
+        shape: &KeyShape,
+        config: RemoteDatabaseConfig,
+    ) -> Result<Self, LocalDbError> {
+        Self::open_inner_local_fixture(path, shape, config, None)
+    }
+
+    /// `open_inner` over the ordinary-file live I/O fixture (see
+    /// `open_local_live_fixture`), with an optional injected interruption.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn open_inner_local_fixture(
+        path: &Path,
+        shape: &KeyShape,
+        config: RemoteDatabaseConfig,
+        interruption: Option<OpenInterruption>,
+    ) -> Result<Self, LocalDbError> {
+        Self::open_inner_with(path, shape, config, interruption, None, Some(false))
     }
 
     fn open_inner_with(
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
-        transport_pool: Option<Arc<RemoteTransportPool>>,
         interruption: Option<OpenInterruption>,
         #[cfg(test)] read_hook: Option<ReadHook<'_>>,
+        // `Some(buffered)` selects the ordinary-file live I/O fixture on every
+        // client before any live I/O; `None` uses the real live route.
+        #[cfg(all(
+            any(test, feature = "test-utils"),
+            feature = "experimental-nvmeof",
+            target_os = "linux"
+        ))]
+        local_fixture: Option<bool>,
     ) -> Result<Self, LocalDbError> {
         config.validate()?;
         config.validate_read_lane_pinning(config.effective_read_lanes())?;
-        // Live queues and namespace grants cannot be returned to the TCP pool.
-        let transport_pool = if config.live_nvme.is_some() {
-            None
-        } else {
-            transport_pool
-        };
         let mut index = NativeIndex::with_shards(
             shape,
             config.storage.database,
@@ -1608,15 +1320,11 @@ impl RemoteDatabase {
                 endpoints: config.endpoints.clone(),
                 shape_yaml: shape_yaml.clone(),
                 replay_limits: config.replay_limits,
-                live_nvme_identity: config
-                    .live_nvme
-                    .as_ref()
-                    .map(|live| (live.host_nqn.clone(), live.host_id)),
-                live_nvme_owner_identities: config
-                    .live_nvme
-                    .as_ref()
-                    .map(|live| live.owner_identities.clone())
-                    .unwrap_or_default(),
+                live_nvme_identity: Some((
+                    config.live_nvme.host_nqn.clone(),
+                    config.live_nvme.host_id,
+                )),
+                live_nvme_owner_identities: config.live_nvme.owner_identities.clone(),
                 epochs: Vec::new(),
                 checkpoint: None,
                 checkpoint_staging: None,
@@ -1637,16 +1345,8 @@ impl RemoteDatabase {
                 .live_nvme_identity
                 .as_ref()
                 .map(|(host_nqn, host_id)| (host_nqn.as_str(), *host_id))
-                != config
-                    .live_nvme
-                    .as_ref()
-                    .map(|live| (live.host_nqn.as_str(), live.host_id))
-            || config
-                .live_nvme
-                .as_ref()
-                .map(|live| &live.owner_identities)
-                .is_some_and(|identities| identities != &manifest.live_nvme_owner_identities)
-            || (config.live_nvme.is_none() && !manifest.live_nvme_owner_identities.is_empty())
+                != Some((config.live_nvme.host_nqn.as_str(), config.live_nvme.host_id))
+            || config.live_nvme.owner_identities != manifest.live_nvme_owner_identities
             || manifest.epochs.len() >= config.storage.max_epochs
             || manifest
                 .epochs
@@ -1663,7 +1363,7 @@ impl RemoteDatabase {
             .validate()
             .map_err(LocalDbError::new)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let live_pool = if config.live_nvme.is_some() {
+        let live_pool = {
             let registry = super::nvmeof::live_connect::LiveConnectionRegistry::open(
                 &path.join("live-nvme-connections"),
             )
@@ -1680,18 +1380,13 @@ impl RemoteDatabase {
                 super::nvmeof::live_pool::LiveControllerPool::new(registry, controllers, clients)
                     .map_err(LocalDbError::component)?,
             ))
-        } else {
-            None
         };
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let mut live_open_guard = live_pool
             .as_ref()
             .map(|pool| transports::LivePoolOpenGuard::new(pool.clone(), config.timeout));
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let live_metrics = config
-            .live_nvme
-            .as_ref()
-            .map(|_| super::nvmeof::live_metrics::LiveNvmeMetrics::new());
+        let live_metrics = Some(super::nvmeof::live_metrics::LiveNvmeMetrics::new());
         let mut recovery_stats = RecoveryStats::default();
         let tls_started = Instant::now();
         let tls_config = config
@@ -1699,53 +1394,44 @@ impl RemoteDatabase {
             .client_config_with_identity()
             .map_err(LocalDbError::component)?;
         recovery_stats.tls_config_ns = elapsed(tls_started);
-        let checkout_started = Instant::now();
-        let transport_key = transport_pool
-            .as_ref()
-            .map(|_| transports::pool_key(&config, &shape_yaml, tls_config.identity))
-            .transpose()?;
-        let retained = transport_pool
-            .as_ref()
-            .zip(transport_key)
-            .and_then(|(pool, key)| pool.take(key));
-        let (retained_controls, retained_reads) = retained
-            .map(|idle| (Some(idle.controls), Some(idle.reads)))
-            .unwrap_or_default();
-        recovery_stats.transport_checkout_ns = elapsed(checkout_started);
         // Read transports prepare concurrently, but own no authority/index and
         // cannot issue reads until every node is fenced and recovery completes.
         let read_setup = transports::ReadSetup::start(
             config.clone(),
             shape.clone(),
             tls_config.clone(),
-            retained_reads,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool.clone(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics.clone(),
+            #[cfg(all(
+                any(test, feature = "test-utils"),
+                feature = "experimental-nvmeof",
+                target_os = "linux"
+            ))]
+            local_fixture,
         )?;
         let connected = transports::connect(
             &config,
             &shape,
             &tls_config,
             1,
-            retained_controls,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool.clone(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics.clone(),
+            #[cfg(all(
+                any(test, feature = "test-utils"),
+                feature = "experimental-nvmeof",
+                target_os = "linux"
+            ))]
+            local_fixture,
         )?;
         recovery_stats.connection_setup_ns = connected.elapsed_ns;
-        recovery_stats.created_connections = (connected.clients.len() - connected.reused) as u64;
-        recovery_stats.reused_connections = connected.reused as u64;
+        recovery_stats.created_connections = connected.clients.len() as u64;
         let mut clients = connected.clients;
         for client in &clients {
             let status = client.connected_status();
-            if status.history_persistence != HistoryPersistence::WalReplay {
-                return Err(LocalDbError::new(
-                    "owner history persistence is not wal_replay",
-                ));
-            }
             if status.max_epochs != config.storage.max_epochs
                 || status
                     .epochs
@@ -1882,7 +1568,7 @@ impl RemoteDatabase {
             &mut positions,
             &mut cut_plan,
             &mut recovery_stats,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
             interruption,
         )?;
         recovery_stats.cut_discarded_batches = cut_plan.discarded;
@@ -1961,9 +1647,7 @@ impl RemoteDatabase {
         let prepared_reads = read_setup.finish()?;
         recovery_stats.read_lane_wait_ns = elapsed(connection_started);
         recovery_stats.read_lane_setup_ns = prepared_reads.elapsed_ns;
-        recovery_stats.created_connections +=
-            (prepared_reads.clients.len() - prepared_reads.reused) as u64;
-        recovery_stats.reused_connections += prepared_reads.reused as u64;
+        recovery_stats.created_connections += prepared_reads.clients.len() as u64;
         #[cfg(test)]
         let mut prepared_reads = prepared_reads;
         #[cfg(test)]
@@ -1983,7 +1667,7 @@ impl RemoteDatabase {
             &mut recovery_stats,
             first_failure.clone(),
         )?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
         if matches!(interruption, Some(OpenInterruption::AfterReadSetup)) {
             return Err(LocalDbError::new("injected interruption after read setup"));
         }
@@ -1992,7 +1676,7 @@ impl RemoteDatabase {
         if let Some(record) = &cut_record {
             durable_cut::persist_open_record(&path, record)?;
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
         if matches!(interruption, Some(OpenInterruption::AfterCutRecord)) {
             return Err(LocalDbError::new("injected interruption after cut record"));
         }
@@ -2052,23 +1736,18 @@ impl RemoteDatabase {
             )?),
             None => None,
         };
-        let operational_sampler =
-            OperationalReadIoSampler::dormant(config.clone(), shape.clone(), tls_config);
         let core = write_core::core::WriteCore::new(write_core::core::OpenState {
             clients: workers,
             reads,
             read_cache: Arc::new(ReadCache::new(config.read_cache_bytes)),
             write_profile,
             write_timeline,
-            transport_pool,
-            transport_key,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_metrics,
             inventory: config.inventory(epoch),
             config,
-            operational_sampler,
             durable_cut,
             shape,
             path,
@@ -2165,24 +1844,6 @@ impl RemoteDatabase {
     }
     pub fn epoch(&self) -> u64 {
         self.core.epoch
-    }
-
-    pub fn read_evidence_monitor(&self) -> ReadEvidenceMonitor {
-        ReadEvidenceMonitor {
-            clients: self
-                .core
-                .config
-                .endpoints
-                .iter()
-                .zip(&self.core.clients)
-                .map(|(endpoint, worker)| (endpoint.partition, worker.control_handle()))
-                .collect(),
-            reads: self.core.reads.clone(),
-        }
-    }
-    pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
-        self.core.operational_sampler.activate();
-        self.core.operational_sampler.monitor()
     }
 
     pub fn validate_cached_read(&self) -> Result<(), LocalDbError> {
@@ -2628,29 +2289,6 @@ impl RemoteDatabase {
         self.core.read_cache.clear();
     }
 
-    /// Read-only node counters outside timed reads. Outstanding work makes a
-    /// phase boundary ambiguous, so callers must drain writes and finish reads.
-    /// Counter sampling does not close current or preleased writer extents.
-    pub fn read_io_stats(&self) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
-        self.ensure_healthy()?;
-        self.core.reads.ensure_idle()?;
-        if self.core.publisher.lock().published_next < self.core.next_sequence() {
-            return Err(LocalDbError::new(
-                "read I/O statistics require drained writes",
-            ));
-        }
-        self.core
-            .clients
-            .iter()
-            .zip(&self.core.config.endpoints)
-            .map(|(client, endpoint)| {
-                client
-                    .read_io_stats()
-                    .map(|stats| (endpoint.partition, stats))
-            })
-            .collect()
-    }
-
     /// Outside measured operations: drain first so all node clocks cover a
     /// complete interval. Node sums can overlap and are not elapsed wall time.
     /// # Errors
@@ -2766,12 +2404,30 @@ impl Drop for RemoteDatabase {
 struct ReplayPage {
     batches: VecDeque<(CompleteBatch, DurableBatch)>,
     next: Option<usize>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     last: Option<BatchVersion>,
     position: StreamPosition,
     replayed_end: u64,
     replay_last: Option<(u64, u32)>,
 }
 
+/// WAL replay reads frames over live NVMe-oF only; configuration validation
+/// rejects a database before open where that route is not compiled.
+#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+fn fill_replay_page(
+    _client: &mut Client,
+    _state: &mut ReplayPage,
+    _epoch: u64,
+    _authority_epoch: u64,
+    _cursor: usize,
+    _limit: usize,
+) -> Result<(), LocalDbError> {
+    Err(LocalDbError::new(
+        "WAL replay requires the Linux experimental-nvmeof feature",
+    ))
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn fill_replay_page(
     client: &mut Client,
     state: &mut ReplayPage,
@@ -2780,34 +2436,13 @@ fn fill_replay_page(
     cursor: usize,
     limit: usize,
 ) -> Result<(), LocalDbError> {
-    let position = &state.position;
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let mut page = if client.live_nvme_configured() {
-        client.replay_live_wal_page(
-            authority_epoch,
-            epoch,
-            cursor as u64,
-            limit,
-            position.durable_end,
-        )
-    } else {
-        client.replay_wal_page(
-            authority_epoch,
-            epoch,
-            cursor as u64,
-            limit,
-            position.durable_end,
-        )
-    }
-    .map_err(LocalDbError::component)?;
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
     let mut page = client
-        .replay_wal_page(
+        .replay_live_wal_page(
             authority_epoch,
             epoch,
             cursor as u64,
             limit,
-            position.durable_end,
+            state.position.durable_end,
         )
         .map_err(LocalDbError::component)?;
     if page.batches.len() > limit || page.next.is_some_and(|next| next <= cursor) {
@@ -2868,7 +2503,9 @@ fn replay_history(
     positions: &mut BTreeMap<(u32, u64), StreamPosition>,
     cut: &mut durable_cut::RecoveryPlan,
     stats: &mut RecoveryStats,
-    #[cfg(test)] interruption: Option<OpenInterruption>,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))] interruption: Option<
+        OpenInterruption,
+    >,
 ) -> Result<(), LocalDbError> {
     let mut index = index.writer();
     let page_limit = config
@@ -2880,6 +2517,7 @@ fn replay_history(
             let mut page = ReplayPage {
                 batches: VecDeque::new(),
                 next: None,
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 last: None,
                 position: positions
                     .get(&(config.endpoints[node].partition, epoch))
@@ -2952,7 +2590,7 @@ fn replay_history(
                 known.insert(batch.id(), durable.appended());
                 stats.tail_batches += 1;
                 stats.tail_bytes += batch.encoded().len() as u64;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
                 if matches!(interruption, Some(OpenInterruption::DuringReplay)) {
                     return Err(LocalDbError::new("injected interruption during WAL replay"));
                 }
@@ -3436,8 +3074,6 @@ enum Command {
     QueueReady,
     CheckpointPosition(u64, u64, u64, Reply<CheckpointPositionProof>),
     Stats(Reply<PartitionStats>),
-    // Counter observation shares the control slot but must not close a lease.
-    ReadIoStats(Reply<super::tcp::ReadExecutorStats>),
     Seal(u64, Reply<()>),
     ArmProfile(usize, Reply<()>),
     OwnerTimelineArm(usize, Reply<()>),
@@ -3447,12 +3083,13 @@ enum Command {
 
 /// Append groups exist only inside their owner worker. The control channel
 /// carries Command, which cannot carry a batch or a per-write reply channel.
+/// A group is nonempty and all its batches share one fencing generation.
 enum WorkerItem {
-    Append(u64, Vec<CompleteBatch>, GroupCompletion),
+    Append(Vec<CompleteBatch>, GroupCompletion),
     Control(Command),
 }
 fn trace_worker_dequeue(timeline: &WriteTimeline, partition: u32, command: &WorkerItem) {
-    let WorkerItem::Append(_, batches, _) = command else {
+    let WorkerItem::Append(batches, _) = command else {
         return;
     };
     timeline.wait_leave(WriteWait::OwnerEnqueueToDequeue, batches.len());
@@ -3469,7 +3106,10 @@ fn trace_worker_dequeue(timeline: &WriteTimeline, partition: u32, command: &Work
 }
 #[derive(Clone)]
 struct ControlHandle {
-    #[cfg(any(test, feature = "experimental-fabric"))]
+    #[cfg(any(
+        all(test, feature = "experimental-nvmeof", target_os = "linux"),
+        feature = "experimental-fabric"
+    ))]
     client: Arc<Mutex<Client>>,
     sender: std::sync::Weak<OwnerSender>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -3485,16 +3125,6 @@ impl ControlHandle {
         signal_worker_wake(&fd)
     }
 
-    fn read_io_stats(&self) -> Result<super::tcp::ReadExecutorStats, LocalDbError> {
-        let (reply, pending) = mpsc::sync_channel(1);
-        self.sender
-            .upgrade()
-            .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
-            .send(Command::ReadIoStats(reply))?;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        self.wake_worker()?;
-        receive(pending)
-    }
     fn owner_timeline_arm(&self, limit: usize) -> Result<(), LocalDbError> {
         let (reply, pending) = mpsc::sync_channel(1);
         self.sender
@@ -3547,10 +3177,15 @@ impl ControlHandle {
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 type LeasedMembers = Vec<(BatchVersion, usize, GroupCompletion)>;
 
+/// Releases leased receipts to their callers in frame order. Each released
+/// frame is one harvested completion: its receipts enter W3
+/// (`HarvestToDurable`) here and leave it in `WriteCore::on_durable`, which
+/// runs on this worker inside `reply.send`, so the handoff never needs a hint.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn release_leased_replies(
     released: &mut Vec<(u64, Vec<DurableBatch>)>,
     replies: &mut VecDeque<(u64, LeasedMembers)>,
+    write_timeline: &WriteTimeline,
 ) -> Result<(), super::tcp::TcpError> {
     for (id, receipts) in released.drain(..) {
         if replies.front().is_none_or(|entry| entry.0 != id) {
@@ -3559,6 +3194,8 @@ fn release_leased_replies(
         let Some((_, mut members)) = replies.pop_front() else {
             unreachable!();
         };
+        write_timeline.wait_enter(WriteWait::HarvestToDurable, receipts.len());
+        write_timeline.wait_wake(WriteWait::HarvestToDurable, true);
         if members.len() == 1 {
             if let Some((_, _, reply)) = members.pop() {
                 let _ = reply.send(Ok(receipts));
@@ -3571,6 +3208,41 @@ fn release_leased_replies(
         }
     }
     Ok(())
+}
+
+/// Settles the leased route before a worker-initiated control exchange (the
+/// write-profile arm and capture): drains the frames in flight and the pending
+/// adoption, then releases their receipts in frame order. Commands use
+/// `prepare_leased_command` for the same step.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn settle_leased_for_control(
+    client: &mut Client,
+    released: &mut Vec<(u64, Vec<DurableBatch>)>,
+    replies: &mut VecDeque<(u64, LeasedMembers)>,
+    write_timeline: &WriteTimeline,
+) -> Result<(), super::tcp::TcpError> {
+    if !client.live_nvme_configured() {
+        return Ok(());
+    }
+    client.wait_leased_control(released, Some(write_timeline))?;
+    release_leased_replies(released, replies, write_timeline)
+}
+
+/// The first unresolved leased version of one owner: the oldest frame in
+/// flight, else the frame deferred before submission. A transport failure
+/// leaves the outcome of every such frame unknown, so a failure record names
+/// this version as its uncertain version.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn first_unresolved_leased(
+    replies: &VecDeque<(u64, LeasedMembers)>,
+    deferred: Option<&LeasedMembers>,
+) -> Option<BatchVersion> {
+    replies
+        .front()
+        .map(|(_, members)| members)
+        .or(deferred)
+        .and_then(|members| members.first())
+        .map(|(version, _, _)| *version)
 }
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -3591,6 +3263,10 @@ fn signal_worker_wake(fd: &std::os::fd::OwnedFd) -> Result<(), LocalDbError> {
 }
 
 struct ClientWorker {
+    #[cfg(any(
+        feature = "experimental-fabric",
+        all(feature = "experimental-nvmeof", target_os = "linux")
+    ))]
     client: Arc<Mutex<Client>>,
     sender: Option<Arc<OwnerSender>>,
     /// The worker owns this fd. Command senders and CQEs add to its counter.
@@ -3621,7 +3297,10 @@ struct WorkerDiagnostics {
 impl ClientWorker {
     fn control_handle(&self) -> ControlHandle {
         ControlHandle {
-            #[cfg(any(test, feature = "experimental-fabric"))]
+            #[cfg(any(
+                all(test, feature = "experimental-nvmeof", target_os = "linux"),
+                feature = "experimental-fabric"
+            ))]
             client: self.client.clone(),
             sender: self.sender.as_ref().map(Arc::downgrade).unwrap_or_default(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -3634,9 +3313,6 @@ impl ClientWorker {
         operation: impl FnOnce(&mut Client) -> Result<T, super::tcp::TcpError> + Send + 'static,
     ) -> Result<T, LocalDbError> {
         self.control_handle().control(operation)
-    }
-    fn read_io_stats(&self) -> Result<super::tcp::ReadExecutorStats, LocalDbError> {
-        self.control_handle().read_io_stats()
     }
 
     fn send(&self, command: Command) -> Result<(), LocalDbError> {
@@ -3766,10 +3442,6 @@ fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {
     pending
         .recv()
         .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?
-}
-
-fn add_tcp_profile(total: &mut super::tcp::TcpReadProfile, next: super::tcp::TcpReadProfile) {
-    total.add(next);
 }
 
 #[cfg(test)]

@@ -79,7 +79,6 @@
     "owner_drain_stop_fence",
     "owner_drain_stop_limit",
     "owner_drains",
-    "payload_rpc_requests",
     "publication_ns",
     "publication_samples",
     "queue_ns",

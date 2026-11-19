@@ -1,12 +1,15 @@
 //! Seeded histories against real loopback owners, not an admission-core mock.
+//! Every case writes through the leased live route (the only write route) over
+//! the ordinary-file LiveIo fixture.
 //!
 //! Run `write_model_crash_soak --ignored --nocapture` with TH_MODEL_SEED and
 //! TH_MODEL_ITERATIONS for the long sweep. To replay one cut, also set
-//! TH_MODEL_OWNERS, TH_MODEL_HOT and TH_MODEL_BOUNDARY. Crash gates follow a
-//! seed-selected acknowledged prefix, never a count of physical writes/flushes.
-//! Every failure retains its exact history, gate and boundary trace.
-use super::pipeline_tests::Fixture;
-use super::tests::recovery_metrics;
+//! TH_MODEL_OWNERS, TH_MODEL_HOT, TH_MODEL_LEASED and TH_MODEL_BOUNDARY. Crash
+//! gates follow a seed-selected acknowledged prefix, never a count of physical
+//! writes/flushes. Every failure retains its exact history, gate and boundary
+//! trace.
+#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+use super::pipeline_tests::{Fixture, open_live_node};
 use super::*;
 use crate::failpoints::write_model;
 use crate::key_shape::KeyType;
@@ -18,32 +21,11 @@ use std::sync::Barrier;
 
 #[path = "model_check_concurrent.rs"]
 mod concurrent_model;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[path = "model_check_leased.rs"]
 mod leased;
 const KEYS: usize = 64;
 const WAVES: usize = 4;
 const CHILD: &str = "distributed::remote_db::model_check_tests::write_model_child";
-const BOUNDARIES: &[&str] = &[
-    "append_before",
-    "append_after",
-    "file_sync_before",
-    "file_sync_after",
-    "namespace_sync_before",
-    "namespace_sync_after",
-    "publication_before",
-    "publication_after",
-    "checkpoint_staging_before",
-    "checkpoint_staging_after",
-    "checkpoint_image_before",
-    "checkpoint_image_after",
-    "checkpoint_metadata_before",
-    "checkpoint_metadata_after",
-    "checkpoint_root_before",
-    "checkpoint_root_after",
-    "checkpoint_install_before",
-    "checkpoint_install_after",
-];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Case {
@@ -52,11 +34,9 @@ struct Case {
     hot: bool,
     boundary: String,
     gate_waves: usize,
-    leased: Option<LeasedCase>,
+    leased: LeasedCase,
     #[serde(default)]
     concurrent: bool,
-    #[serde(default)]
-    native: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -67,25 +47,22 @@ struct LeasedCase {
 }
 
 impl Case {
-    fn rpc(seed: u64, owners: usize, hot: bool) -> Self {
+    fn new(seed: u64, owners: usize, hot: bool, leased: LeasedCase) -> Self {
         Self {
             seed,
             owners,
             hot,
             boundary: String::new(),
             gate_waves: 2 + (seed as usize & 1),
-            leased: None,
+            leased,
             concurrent: false,
-            native: false,
         }
     }
     fn value_bytes(&self) -> usize {
-        if self.leased.is_some() { 4096 } else { 8 }
+        4096
     }
     fn flush_probe(&self) -> bool {
-        self.leased.is_some_and(|profile| {
-            profile.synchronous && !profile.per_frame_fua && !profile.window_one
-        })
+        self.leased.synchronous && !self.leased.per_frame_fua && !self.leased.window_one
     }
     fn flush_cut(&self) -> bool {
         matches!(
@@ -173,10 +150,9 @@ struct Restart {
     operations: Vec<[u8; 16]>,
 }
 
-/// The owner tier of a case is Synchronous unless it is a native case or a
-/// leased Native case (as `write_child` configures it).
+/// The owner tier of a case is the tier of its leased profile.
 fn synchronous(case: &Case) -> bool {
-    !case.native && case.leased.is_none_or(|profile| profile.synchronous)
+    case.leased.synchronous
 }
 
 /// Version B tracks Native owners with WAL replay under the default config.
@@ -265,62 +241,9 @@ fn workload(case: &Case) -> Vec<Vec<Edit>> {
         .collect()
 }
 
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-type PassiveReadProbe = (Arc<super::super::tcp::StorageNode>, Arc<Mutex<Client>>);
-
-/// Product reads always use the captured cut. Separate owner-RPC readers exist
-/// only for explicit read-route comparison or passive failure diagnosis.
-struct Readers {
-    clients: Option<BTreeMap<u32, Mutex<Client>>>,
-    epoch: u64,
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    probes: Option<Vec<PassiveReadProbe>>,
-}
-
-impl Readers {
-    fn new(config: &RemoteDatabaseConfig, shape: &KeyShape, epoch: u64) -> Self {
-        let clients = config
-            .live_nvme
-            .as_ref()
-            .filter(|_| {
-                std::env::var_os("TH_MODEL_COMPARE_READS").is_some()
-                    || std::env::var_os("TH_MODEL_PASSIVE_READS").is_some()
-            })
-            .map(|_| {
-                config
-                    .endpoints
-                    .iter()
-                    .map(|endpoint| {
-                        let mut tls = config.tls.clone();
-                        tls.server_name = endpoint.server_name.clone();
-                        (
-                            endpoint.partition,
-                            Mutex::new(
-                                Client::connect(
-                                    &endpoint.address,
-                                    &tls,
-                                    config.timeout,
-                                    config.partition_config(1, endpoint.partition),
-                                    shape,
-                                )
-                                .unwrap(),
-                            ),
-                        )
-                    })
-                    .collect()
-            });
-        Self {
-            clients,
-            epoch,
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            probes: None,
-        }
-    }
-}
-
 /// Capture one protected cut, then compare all point reads AND the entire index
 /// page to it. Independent scalar latest reads cannot prove batch atomicity.
-fn snapshot(db: &ConcurrentRemoteDatabase, readers: &Readers) -> Vec<Option<u64>> {
+fn snapshot(db: &ConcurrentRemoteDatabase) -> Vec<Option<u64>> {
     let (cut, _pin) = db.protected_published_cut().unwrap();
     let page = db
         .index_page(KeySpace(0), None, false, cut.clone())
@@ -331,65 +254,7 @@ fn snapshot(db: &ConcurrentRemoteDatabase, readers: &Readers) -> Vec<Option<u64>
         let reference = db
             .index_reference(KeySpace(0), &bytes, cut.clone())
             .unwrap();
-        let value = if let Some(clients) = &readers.clients {
-            reference.map(|reference| {
-                let product = std::env::var_os("TH_MODEL_COMPARE_READS").map(|_| {
-                    db.submit_get_cut(KeySpace(0), &bytes, cut.clone())
-                        .and_then(|pending| db.finish_ready_get(pending.wait()))
-                });
-                let rpc = clients
-                    .get(&reference.batch_address.partition)
-                    .unwrap()
-                    .lock()
-                    .read_record(readers.epoch, &reference);
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                if rpc.is_err()
-                    && let Some(probes) = &readers.probes
-                {
-                    let (node, writer) = &probes[reference.batch_address.partition as usize];
-                    let log = node.log_for_test(reference.batch_version.epoch);
-                    let appended = log.appended_frontier();
-                    let synced = log.synced_frontier();
-                    let root = log.position_root_for_test();
-                    let end = reference.batch_address.offset + u64::from(reference.batch_address.len);
-                    let writer = writer.lock();
-                    eprintln!(
-                        "passive_read key={key} cut={cut:?} reference={reference:?} appended={appended} synced={synced} root={root:?} beyond_appended={} beyond_synced={} beyond_root={} completed_released_durable={:?} current_written_pending={:?} closing_next={:?} flights={} rpc={rpc:?}",
-                        end > appended,
-                        end > synced,
-                        end > root.2,
-                        writer.leased_test_completion_prefixes(),
-                        writer.leased_test_frontier(),
-                        writer.leased_test_ahead_state(),
-                        writer.leased_flights_in_flight(),
-                    );
-                }
-                if let Some(product) = product {
-                    eprintln!(
-                        "compare_read key={key} cut={cut:?} reference={reference:?} product={:?} rpc={:?}",
-                        product
-                            .as_ref()
-                            .map(|value| value.as_ref().map(|value| (&value[..8], value.len()))),
-                        rpc.as_ref().map(|mutation| match mutation {
-                            Mutation::Put { value, .. } => Some((&value[..8], value.len())),
-                            Mutation::Delete { .. } => None,
-                        }),
-                    );
-                }
-                match rpc.unwrap() {
-                    Mutation::Put {
-                        keyspace,
-                        key,
-                        value,
-                    } => {
-                        assert_eq!(keyspace, KeySpace(0));
-                        assert_eq!(key.as_ref(), bytes);
-                        value
-                    }
-                    Mutation::Delete { .. } => panic!("visible reference points to delete"),
-                }
-            })
-        } else {
+        let value = {
             let pending = db.submit_get_cut(KeySpace(0), &bytes, cut.clone()).unwrap();
             db.finish_ready_get(pending.wait()).unwrap()
         };
@@ -416,9 +281,9 @@ fn snapshot(db: &ConcurrentRemoteDatabase, readers: &Readers) -> Vec<Option<u64>
     values
 }
 
-fn observe(db: &ConcurrentRemoteDatabase, readers: &Readers, recorder: &Recorder) {
+fn observe(db: &ConcurrentRemoteDatabase, recorder: &Recorder) {
     let call = recorder.begin(Action::Snapshot);
-    recorder.values(call, snapshot(db, readers));
+    recorder.values(call, snapshot(db));
 }
 
 fn write_call(
@@ -449,25 +314,11 @@ fn write_child(directory: &Path, case: &Case) {
         2,
         |config| {
             config.storage.batch_limits.max_operations = 57;
-            // Small RPC files force a namespace boundary after the gate.
-            config.storage.batch_limits.max_encoded_bytes = 1900;
-            config.storage.group_limits.max_encoded_bytes = 2040;
-            config.storage.fragment_bytes = 2048;
-            config.storage.wal_file_bytes = 2048;
             config.max_index_bytes = 16 * 1024 * 1024;
             config.read_cache_bytes = 0;
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            if let Some(profile) = case.leased {
-                leased::configure(config, profile);
-            }
+            leased::configure(config, case.leased);
         },
-        |config| {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            if case.leased.is_some() {
-                return leased::open_node(config);
-            }
-            super::super::tcp::StorageNode::open(config, recovery_metrics()).unwrap()
-        },
+        |_| {},
     );
     let fixture = if synchronous(case) {
         fixture.synchronous()
@@ -520,37 +371,12 @@ fn write_child(directory: &Path, case: &Case) {
     )
     .unwrap();
     let original = fixture.open();
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let original = {
-        let mut original = original;
-        if case.leased.is_some() {
-            leased::prepare_database(&mut original);
-        }
-        original
-    };
-    let readers = Readers::new(&fixture.config, &fixture.shape, original.epoch());
     let clients: Vec<_> = original
         .core
         .clients
         .iter()
         .map(|worker| worker.client.clone())
         .collect();
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let readers = {
-        let mut readers = readers;
-        if std::env::var_os("TH_MODEL_PASSIVE_READS").is_some() && case.leased.is_some() {
-            readers.probes = Some(
-                fixture
-                    .nodes
-                    .iter()
-                    .cloned()
-                    .zip(clients.iter().cloned())
-                    .collect(),
-            );
-        }
-        readers
-    };
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     let live_metrics = original.core.live_metrics.clone();
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let recorder = Recorder::open(&directory.join("history.jsonl"));
@@ -563,7 +389,7 @@ fn write_child(directory: &Path, case: &Case) {
     );
     for wave in 0..case.gate_waves {
         if case.concurrent {
-            concurrent_model::wave(&db, &readers, &recorder, case, &operations, &plan, wave);
+            concurrent_model::wave(&db, &recorder, case, &operations, &plan, wave);
         } else {
             let mut rng = StdRng::seed_from_u64(case.seed ^ wave as u64);
             let retry = if wave == 0 {
@@ -593,10 +419,10 @@ fn write_child(directory: &Path, case: &Case) {
                     });
                 }
                 barrier.wait();
-                observe(&db, &readers, &recorder);
+                observe(&db, &recorder);
             });
         }
-        observe(&db, &readers, &recorder);
+        observe(&db, &recorder);
         // Deliberately NO checkpoint here: the gate must have acknowledged large
         // batches recoverable only from the WAL tail behind the baseline image.
     }
@@ -610,17 +436,13 @@ fn write_child(directory: &Path, case: &Case) {
         }
         db.flush_durable().unwrap();
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    if case.leased.is_some() {
-        leased::quiesce(&clients);
-    }
+    leased::quiesce(&clients);
     write_model::open_gate();
     if !case.flush_cut() {
         for id in WAVES * 2..WAVES * 2 + 2 {
             write_call(&db, &recorder, case, &operations, &plan, id);
         }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     if case.flush_probe() {
         leased::flush_probe(
             &db,
@@ -638,13 +460,8 @@ fn write_child(directory: &Path, case: &Case) {
     }
     db.flush_durable().unwrap();
     db.flush_index().unwrap();
-    observe(&db, &readers, &recorder);
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    if let Some(profile) = case.leased {
-        leased::verify_counts(profile, &live_metrics.unwrap(), directory);
-    }
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-    let _ = clients;
+    observe(&db, &recorder);
+    leased::verify_counts(case.leased, &live_metrics.unwrap(), directory);
     std::process::exit(0);
 }
 
@@ -657,15 +474,7 @@ fn recover_child(directory: &Path) {
     let mut servers = Vec::new();
     let mut nodes = Vec::new();
     for ((config, tls), endpoint) in restart.nodes.iter().zip(&restart.config.endpoints) {
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let node = if case.leased.is_some() {
-            leased::open_node(config.clone())
-        } else {
-            super::super::tcp::StorageNode::open(config.clone(), recovery_metrics()).unwrap()
-        };
-        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-        let node =
-            super::super::tcp::StorageNode::open(config.clone(), recovery_metrics()).unwrap();
+        let node = open_live_node(config.clone(), &restart.config.live_nvme.host_nqn).unwrap();
         node.set_durability(super::super::durability::DurabilityConfig::with_tier(
             if synchronous(&case) {
                 super::super::durability::DurabilityTier::Synchronous
@@ -683,11 +492,12 @@ fn recover_child(directory: &Path) {
         }));
         nodes.push(node);
     }
-    let db = RemoteDatabase::open(
+    // Recovery and every later read of the recovered files go through the
+    // ordinary-file live fixture.
+    let db = RemoteDatabase::open_local_live_fixture(
         &restart.root.join("authority"),
         &restart.shape,
         restart.config.clone(),
-        recovery_metrics(),
     )
     .unwrap();
     // Durable-prefix recovery must run exactly for Native owners with WAL
@@ -723,20 +533,8 @@ fn recover_child(directory: &Path) {
         serde_json::to_vec(&discard).unwrap(),
     )
     .unwrap();
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let (db, recovery_pins) = {
-        let mut db = db;
-        let pins = if case.leased.is_some() {
-            leased::prepare_database(&mut db);
-            leased::prepare_recovery_reads(&db)
-        } else {
-            Vec::new()
-        };
-        (db, pins)
-    };
-    let readers = Readers::new(&restart.config, &restart.shape, db.epoch());
     let db = ConcurrentRemoteDatabase::new(db).unwrap();
-    let values = snapshot(&db, &readers);
+    let values = snapshot(&db);
     // Retry every externally acknowledged identity after a real owner restart.
     // Such retries must return their original receipt without overwriting newer
     // values. Pending identities are deliberately not retried before the oracle.
@@ -765,7 +563,7 @@ fn recover_child(directory: &Path) {
         }
     }
     assert_eq!(
-        snapshot(&db, &readers),
+        snapshot(&db),
         values,
         "recovered retry changed visible state"
     );
@@ -774,13 +572,6 @@ fn recover_child(directory: &Path) {
         serde_json::to_vec(&values).unwrap(),
     )
     .unwrap();
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    for (client, token) in recovery_pins {
-        client
-            .lock()
-            .release_live_epoch_pin(readers.epoch, token)
-            .unwrap();
-    }
     db.shutdown().unwrap();
     shutdown.store(true, std::sync::atomic::Ordering::Release);
     for server in servers {
@@ -1154,23 +945,6 @@ fn run_case(case: &Case) {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn write_model_seeded_crashes() {
-    // Six topology/distribution controls, then every named boundary after a
-    // seed-selected acknowledged WAL tail containing 22- and 57-key batches.
-    for owners in [1, 2, 4] {
-        for hot in [false, true] {
-            run_case(&Case::rpc(0x5a17 + owners as u64, owners, hot));
-        }
-    }
-    for (index, boundary) in BOUNDARIES.iter().enumerate() {
-        run_case(&Case {
-            boundary: (*boundary).into(),
-            ..Case::rpc(0x5a17 + index as u64, [1, 2, 4][index % 3], index % 2 == 0)
-        });
-    }
-}
-
 fn env_number(name: &str, default: u64) -> u64 {
     std::env::var(name).map_or(default, |value| value.parse().unwrap())
 }
@@ -1182,31 +956,24 @@ fn write_model_crash_soak() {
     let iterations = env_number("TH_MODEL_ITERATIONS", 32);
     assert!((1..=10_000).contains(&iterations));
     for iteration in 0..iterations {
-        let mut case = Case::rpc(
+        // Unfiltered, iterations rotate through all eight leased profiles.
+        let profile = env_number("TH_MODEL_LEASED", iteration % 8);
+        assert!(profile < 8, "TH_MODEL_LEASED must be 0..8");
+        let mut case = Case::new(
             seed.wrapping_add(iteration),
             env_number("TH_MODEL_OWNERS", [1, 2, 4][iteration as usize % 3]) as usize,
             env_number("TH_MODEL_HOT", iteration % 2) != 0,
+            leased::profile(profile as usize),
         );
         case.gate_waves = env_number("TH_MODEL_GATE_WAVES", case.gate_waves as u64) as usize;
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Ok(index) = std::env::var("TH_MODEL_LEASED") {
-            case.leased = Some(leased::profile(index.parse().unwrap()));
-        }
         assert!([2, 3].contains(&case.gate_waves));
         assert!([1, 2, 4].contains(&case.owners));
+        let boundaries = leased::boundaries(&case);
         if let Ok(boundary) = std::env::var("TH_MODEL_BOUNDARY") {
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            let allowed = leased::boundaries(&case);
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            let allowed = BOUNDARIES;
-            assert!(allowed.contains(&boundary.as_str()));
+            assert!(boundaries.contains(&boundary.as_str()));
             run_case(&Case { boundary, ..case });
         } else {
             run_case(&case);
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            let boundaries = leased::boundaries(&case);
-            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-            let boundaries = BOUNDARIES;
             for boundary in boundaries.iter().copied() {
                 run_case(&Case {
                     boundary: boundary.into(),

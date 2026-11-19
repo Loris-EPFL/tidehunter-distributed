@@ -63,7 +63,7 @@ def live_write_diagnostics():
         "scope": "measurement_nvme_io_cumulative_delta", "requested_limit": 2, "selected_operations": 3,
         "stages": {"live_nvmeof": {
             "completed_write_ops": 3, "completed_write_bytes": 12288,
-            "completed_read_ops": 0, "metadata_requests": 4, "payload_rpc_requests": 0,
+            "completed_read_ops": 0, "metadata_requests": 4,
             "unknown_writes": 0, "errors": 0, "queue_ns": 3000000000, "queue_samples": 3,
             "cq_ns": 0, "cq_samples": 0}},
         "finalization_error": None}
@@ -320,7 +320,7 @@ class CaseIdentityTests(unittest.TestCase):
     def test_live_measurement_deltas_are_scoped_and_missing_is_not_zero(self):
         fields = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
                   "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
-                  "metadata_requests", "namespace_connects", "payload_rpc_requests",
+                  "metadata_requests", "namespace_connects",
                   "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
         counters = {field: index for index, field in enumerate(fields)}
         for stage in ("queue", "submit", "cq", "control", "validation",
@@ -351,7 +351,7 @@ class CaseIdentityTests(unittest.TestCase):
         counters = {field: 0 for field in (
             "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
             "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
-            "payload_rpc_requests", "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")}
+            "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")}
         for stage in ("queue", "submit", "cq", "control", "validation", "publication",
                       "namespace_setup", "read_io"):
             counters.update({stage + "_ns": 0, stage + "_samples": 0})

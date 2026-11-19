@@ -1,3 +1,5 @@
+//! Every Fixture case opens the leased live fixture, so the module needs nvmeof.
+#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::pipeline_tests::Fixture;
 use super::*;
 
@@ -22,12 +24,7 @@ pub(super) fn fail_stop_without_checkpoint(db: RemoteDatabase) {
 }
 
 pub(super) fn reopen_result(fixture: &Fixture) -> Result<RemoteDatabase, LocalDbError> {
-    RemoteDatabase::open(
-        &fixture.temp.path().join("authority"),
-        &fixture.shape,
-        fixture.config.clone(),
-        recovery_metrics(),
-    )
+    fixture.try_open_with(fixture.config.clone())
 }
 
 fn manifest(db: &RemoteDatabase) -> AuthorityManifest {
@@ -102,7 +99,7 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
     struct LegacyManifest {
         format: u32,
         storage: LocalInventoryConfig,
-        history_persistence: HistoryPersistence,
+        history_persistence: String,
         endpoints: Vec<RemoteEndpoint>,
         shape_yaml: String,
         replay_limits: ReplayLimits,
@@ -118,7 +115,7 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
     let legacy = LegacyManifest {
         format: manifest.format,
         storage: manifest.storage.clone(),
-        history_persistence: HistoryPersistence::WalReplay,
+        history_persistence: "wal_replay".into(),
         endpoints: manifest.endpoints.clone(),
         shape_yaml: manifest.shape_yaml.clone(),
         replay_limits: manifest.replay_limits,
@@ -136,61 +133,6 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
         serde_yaml::from_str(&serde_yaml::to_string(&legacy).unwrap()).unwrap();
     assert!(old.live_nvme_owner_identities.is_empty());
     drop(db);
-}
-
-#[test]
-fn sui_read_evidence_samples_configured_owners_at_boundaries() {
-    use crate::distributed::sui::Db;
-
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    let db = Db::open_remote(
-        &fixture.temp.path().join("authority"),
-        fixture.shape.clone(),
-        fixture.config.clone(),
-    )
-    .unwrap();
-    let ks = db.ks("root");
-    let key = 11u32.to_be_bytes();
-    db.insert(ks, key.to_vec(), vec![42; 32]).unwrap();
-    let monitor = db.read_evidence_monitor().unwrap();
-    let before = monitor.sample_owner_read_io().unwrap();
-    assert_eq!(
-        before
-            .iter()
-            .map(|(partition, _)| *partition)
-            .collect::<Vec<_>>(),
-        fixture
-            .config
-            .endpoints
-            .iter()
-            .map(|endpoint| endpoint.partition)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(db.get(ks, &key).unwrap().unwrap().as_ref(), &[42; 32]);
-    let after = monitor.sample_owner_read_io().unwrap();
-    assert_eq!(
-        after
-            .iter()
-            .map(|(partition, _)| *partition)
-            .collect::<Vec<_>>(),
-        before
-            .iter()
-            .map(|(partition, _)| *partition)
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        after
-            .iter()
-            .map(|(_, stats)| stats.completed_reads)
-            .sum::<u64>()
-            > before
-                .iter()
-                .map(|(_, stats)| stats.completed_reads)
-                .sum::<u64>()
-    );
-    drop(monitor);
-    db.wait_for_background_threads_to_finish().unwrap();
 }
 
 #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -514,14 +456,17 @@ fn checkpoint_does_not_turn_damaged_referenced_value_into_absence() {
     )
     .unwrap();
     file.sync_all().unwrap();
-    // The live node's receipt directory still authenticates metadata. Unlike
-    // full replay, checkpoint adoption does not scrub old value bytes eagerly.
-    let mut db = fixture.open();
-    assert!(db.recovery_stats().checkpoint_loaded);
-    assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
+    // History is WAL replay only: reopen re-reads the retained frame window
+    // (retry identities) and rejects the damaged frame instead of serving.
+    // The removed on-disk receipt history let the checkpoint load and failed
+    // the read later; either way the value never becomes absence.
+    let error = fixture
+        .try_open_with(fixture.config.clone())
+        .err()
+        .expect("a damaged retained frame must not reopen as absence");
     assert!(
-        db.get(KeySpace(0), &9u32.to_be_bytes()).is_err(),
-        "failed authority must not report absence"
+        error.to_string().contains("frame"),
+        "unexpected reopen error: {error}"
     );
 }
 
@@ -831,11 +776,10 @@ fn failed_setup_joins_owned_workers_and_next_open_reserves_a_new_epoch() {
     let fixture = Fixture::new();
     let root = fixture.temp.path().join("authority");
     assert!(
-        RemoteDatabase::open_inner(
+        RemoteDatabase::open_inner_local_fixture(
             &root,
             &fixture.shape,
             fixture.config.clone(),
-            None,
             Some(OpenInterruption::AfterReadSetup)
         )
         .is_err()
@@ -917,7 +861,7 @@ fn live_frame_can_fill_one_fragment() {
     config.storage.fragment_bytes = 4096;
     config.storage.wal_file_bytes = 8192;
     config.storage.group_limits.max_encoded_bytes = 4088;
-    config.live_nvme = Some(super::super::tcp::LiveClientConfig {
+    config.live_nvme = super::super::tcp::LiveClientConfig {
         lease_ahead: true,
         polled_writes: false,
         host_nqn: "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
@@ -933,19 +877,19 @@ fn live_frame_can_fill_one_fragment() {
         leased_durability: super::super::durability::DurabilityTier::Native,
         inline_reads: true,
         queue_geometry: Default::default(),
-    });
+    };
     assert!(config.validate().is_ok());
     assert_eq!(
         config.effective_owner_append_occupancy(),
         config.owner_append_occupancy
     );
     config.owner_append_occupancy = 8;
-    let live = config.live_nvme.as_mut().unwrap();
+    let live = &mut config.live_nvme;
     live.max_inflight_requests = 32;
     live.leased_write_window = None;
     assert!(config.validate().is_ok());
     assert_eq!(config.effective_owner_append_occupancy(), 31);
-    config.live_nvme.as_mut().unwrap().leased_write_window = Some(9);
+    config.live_nvme.leased_write_window = Some(9);
     assert!(
         config
             .validate()
@@ -953,7 +897,7 @@ fn live_frame_can_fill_one_fragment() {
             .to_string()
             .contains("leased write window exceeds owner append occupancy")
     );
-    config.live_nvme.as_mut().unwrap().leased_write_window = Some(8);
+    config.live_nvme.leased_write_window = Some(8);
     assert!(config.validate().is_ok());
     assert_eq!(config.effective_owner_append_occupancy(), 8);
 }
@@ -1056,7 +1000,8 @@ fn sui_adapter_pages_reverse_bounds_snapshot_and_reopen() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
     let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     let ks = db.ks("root");
     for first in (0..260u32).step_by(4) {
         let mut batch = db.write_batch();
@@ -1127,7 +1072,8 @@ fn sui_adapter_pages_reverse_bounds_snapshot_and_reopen() {
     db.flush().unwrap();
 
     drop(db);
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     assert!(db.get(ks, &255u32.to_be_bytes()).unwrap().is_none());
     assert_eq!(
         db.get(ks, &256u32.to_be_bytes()).unwrap().unwrap().as_ref(),
@@ -1140,7 +1086,7 @@ fn sui_iterator_rechecks_authority_health_before_yielding_prefetched_rows() {
     use crate::distributed::sui::Db;
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1171,7 +1117,7 @@ fn sui_scan_filters_reduced_boundary_candidates_by_verified_full_key() {
     );
     let mut fixture = Fixture::new_with_shape(128, shape);
     fixture.config.read_cache_bytes = 0;
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1199,7 +1145,7 @@ fn sui_grouped_scan_keeps_order_while_one_storage_lane_is_stalled() {
     use crate::distributed::sui::Db;
     let mut fixture = Fixture::new();
     fixture.config.read_lanes = Some(1);
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1241,7 +1187,7 @@ fn sui_grouped_scan_keeps_order_while_one_storage_lane_is_stalled() {
     }
     db.flush().unwrap();
     db.wait_for_background_threads_to_finish().unwrap();
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1308,7 +1254,7 @@ fn sui_adapter_concurrent_reads_with_one_credit_and_atomic_batch_failure() {
     let mut fixture = Fixture::new();
     fixture.config.max_pending_reads = 1;
     fixture.config.read_cache_bytes = 0;
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1358,7 +1304,7 @@ fn sui_adapter_hash_enumeration_and_reduced_key_collisions() {
             Default::default(),
         );
         let fixture = Fixture::new_with_shape(128, shape);
-        let db = Db::open_remote(
+        let db = Db::open_remote_local_fixture(
             &fixture.temp.path().join("authority"),
             fixture.shape.clone(),
             fixture.config.clone(),
@@ -1398,7 +1344,7 @@ fn sui_adapter_variable_prefix_bounds_and_bulk_order() {
     let mut fixture = Fixture::new_with_shape(128, shape);
     fixture.config.max_pending_reads = 1;
     fixture.config.read_cache_bytes = 0;
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1439,7 +1385,7 @@ fn sui_adapter_variable_prefix_bounds_and_bulk_order() {
 fn sui_cell_pruning_rejects_oversized_atomic_range_without_partial_deletion() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new();
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1518,7 +1464,7 @@ fn sui_relocation_respects_operation_and_encoded_byte_limits() {
                 .find(|ks| ks.name() == "transactions")
                 .unwrap()
                 .id();
-            let db = Db::open_remote(
+            let db = Db::open_remote_local_fixture(
                 &fixture.temp.path().join("authority"),
                 fixture.shape.clone(),
                 fixture.config.clone(),
@@ -1543,7 +1489,7 @@ fn sui_relocation_respects_operation_and_encoded_byte_limits() {
 fn sui_relocation_protects_unconditional_remove_after_other_keyspace_stop() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1561,7 +1507,7 @@ fn sui_relocation_protects_unconditional_remove_after_other_keyspace_stop() {
 fn sui_relocation_protects_entire_atomic_batch_at_stop() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1581,7 +1527,8 @@ fn sui_relocation_deletes_eligible_rows_but_keeps_rows_across_keyspaces() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
     let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     let tx = db.ks("transactions");
     let effects = db.ks("effects");
     db.insert(tx, vec![0; 4], vec![0]).unwrap();
@@ -1596,7 +1543,8 @@ fn sui_relocation_deletes_eligible_rows_but_keeps_rows_across_keyspaces() {
     assert!(db.exists(effects, &[2; 4]).unwrap());
     assert!(db.exists(tx, &[1; 4]).unwrap());
     drop(db);
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     assert!(!db.exists(tx, &[0; 4]).unwrap());
     assert!(!db.exists(effects, &[0; 4]).unwrap());
     assert!(db.exists(tx, &[1; 4]).unwrap());
@@ -1608,7 +1556,9 @@ fn sui_relocation_consults_overwritten_and_deleted_stop_history_after_reopen() {
     for delete in [false, true] {
         let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
         let path = fixture.temp.path().join("authority");
-        let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+        let db =
+            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+                .unwrap();
         let tx = db.ks("transactions");
         let effects = db.ks("effects");
         db.insert(tx, vec![0; 4], vec![0]).unwrap();
@@ -1621,7 +1571,9 @@ fn sui_relocation_consults_overwritten_and_deleted_stop_history_after_reopen() {
         }
         db.flush().unwrap();
         drop(db);
-        let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+        let db =
+            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+                .unwrap();
         db.start_relocation().unwrap();
         assert!(!db.exists(tx, &[0; 4]).unwrap());
         assert!(
@@ -1644,14 +1596,16 @@ fn sui_cell_pruning_uses_reduced_full_cell_range_and_survives_reopen() {
     );
     let fixture = Fixture::new_with_shape(128, shape);
     let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     let ks = db.ks("root");
     db.insert(ks, vec![0; 8], vec![7]).unwrap();
     db.drop_cells_in_range(ks, &[0, 0, 0, 0, 255, 255, 255, 255], &[255; 8])
         .unwrap();
     assert!(!db.exists(ks, &[0; 8]).unwrap());
     drop(db);
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     assert!(!db.exists(ks, &[0; 8]).unwrap());
 }
 
@@ -1671,7 +1625,6 @@ fn sui_native_cell_pruning_propagates_durability_barrier_failure() {
         recovery_metrics(),
     )
     .unwrap();
-    assert!(db.read_evidence_monitor().is_none());
     db.set_native_durable(true);
     let ks = db.ks("root");
     db.insert(ks, vec![0; 4], vec![7]).unwrap();
@@ -1711,7 +1664,7 @@ fn sui_relocation_compactor_keeps_cell_semantics_and_historical_stop() {
         KeySpaceConfig::new().with_relocation_filter(|_, _| crate::Decision::Remove),
     );
     let fixture = Fixture::new_with_shape(128, builder.build());
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1774,7 +1727,9 @@ fn sui_relocation_retains_stop_overwritten_within_atomic_batch() {
     for checkpoint in [false, true] {
         let fixture = Fixture::new_with_shape(128, sui_pruning_shape());
         let path = fixture.temp.path().join("authority");
-        let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+        let db =
+            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+                .unwrap();
         let tx = db.ks("transactions");
         let effects = db.ks("effects");
         let mut batch = db.write_batch();
@@ -1785,7 +1740,8 @@ fn sui_relocation_retains_stop_overwritten_within_atomic_batch() {
         let db = if checkpoint {
             db.flush().unwrap();
             drop(db);
-            Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap()
+            Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+                .unwrap()
         } else {
             db
         };
@@ -1890,10 +1846,21 @@ fn native_checkpoint_commits_no_image_while_an_owner_sync_is_stalled() {
     let fixture = Fixture::new();
     let db = fixture.open();
     let epoch = db.epoch();
-    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
+    let version = db
+        .write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
         .unwrap();
     let log = fixture.nodes[0].log_for_test(epoch);
-    let acknowledged_end = log.appended_frontier();
+    // A leased owner learns frame positions at adoption, not at write; the
+    // acknowledged prefix ends at the acknowledged frame.
+    let acknowledged_end = {
+        let address = db
+            .core
+            .durable_receipt(version.sequence)
+            .unwrap()
+            .appended()
+            .address();
+        address.offset + u64::from(address.len)
+    };
     assert!(acknowledged_end > 0);
     let (entered, release) = fixture.nodes[0].pause_next_persist(epoch).unwrap();
     let authority = fixture.temp.path().join("authority");

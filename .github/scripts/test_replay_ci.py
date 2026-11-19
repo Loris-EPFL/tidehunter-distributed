@@ -61,20 +61,21 @@ class ReplayCITests(unittest.TestCase):
                 campaign.qualify_mainnet_resp(Path("/actual/binary"), state, Path(temporary) / "replay")
             freshness.assert_not_called()
 
-    def test_distributed_selection_fails_closed_and_allows_new_module_tests(self):
-        success = lambda n: f"test result: ok. {n} passed; 0 failed; 0 ignored; 100 filtered out;"
-        for output, passes in (([success(6), success(1)], True),
-                               ([success(7), success(1)], True),
-                               ([success(0)], False),
-                               ([success(6), success(0)], False),
-                               ([success(6), success(2)], False)):
-            with self.subTest(output=output), \
-                    patch.object(distributed, "cargo", side_effect=output):
-                if passes:
-                    self.assertEqual(distributed.main(), 0)
-                else:
-                    with self.assertRaises(RuntimeError):
-                        distributed.main()
+    def test_distributed_selection_gates_only_the_leased_replay_module(self):
+        for passed in (6, 7):
+            with self.subTest(passed=passed), patch.object(distributed, "cargo", return_value=(
+                    f"test result: ok. {passed} passed; 0 failed; 0 ignored; 100 filtered out;")) as cargo:
+                self.assertEqual(distributed.main(), 0)
+                cargo.assert_called_once()
+                self.assertEqual(cargo.call_args.args[6:],
+                                 ("--lib", "backends::tidehunter::replay", "--", "--nocapture"))
+
+    def test_distributed_selection_fails_closed_on_empty_or_failed_output(self):
+        for output in ("", "test result: ok. 0 passed; 0 failed; 0 ignored;",
+                       "test result: FAILED. 6 passed; 1 failed; 0 ignored;"):
+            with self.subTest(output=output), patch.object(distributed, "cargo", return_value=output):
+                with self.assertRaisesRegex(RuntimeError, "nonempty passing suite"):
+                    distributed.main()
 
     def test_kernel_termination_enters_maintained_cleanup(self):
         with patch.object(kernel.signal, "signal") as handler:

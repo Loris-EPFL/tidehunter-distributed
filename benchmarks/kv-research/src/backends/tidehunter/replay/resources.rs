@@ -19,7 +19,6 @@ pub(super) fn reservation(
 ) -> BackendResult<serde_json::Value> {
     let mut databases = Vec::new();
     let mut total = 0;
-    let mut local_owner_wal = 0;
     for (db, _, opts) in options(value)? {
         let shape = shape(&trace.tables, db);
         let index = NativeIndex::with_shards(&shape, [0; 16], 512 * 1024 * 1024, 1)?;
@@ -57,7 +56,7 @@ pub(super) fn reservation(
                     key: row.key.clone(),
                     value: row.value.clone(),
                 }],
-                batch_limits(&opts)?,
+                batch_limits(&opts),
             )?;
             let reduced = if table.key_shape == "digest_reduction_0_16" {
                 16
@@ -136,7 +135,7 @@ pub(super) fn reservation(
                     sequence: 0,
                 },
                 mutations,
-                batch_limits(&opts)?,
+                batch_limits(&opts),
             )?;
             let bytes = batch.encoded().len() as u64;
             // Fresh-cell charges overbound this batch's transient charge, including unpublished routing.
@@ -148,16 +147,13 @@ pub(super) fn reservation(
         }
         batches = mul(batches, repetitions)?;
         encoded = mul(encoded, repetitions)?;
-        let remote = opts.external_remote_config.as_ref();
-        let replay_limits = opts
-            .replay_limits
-            .or(remote.map(|config| config.replay_limits))
-            .unwrap_or_default();
-        let max_index = remote.map_or(128 * 1024 * 1024, |config| config.max_index_bytes) as u64;
-        let max_identities = remote.map_or(4096, |config| config.max_admitted_batches) as u64;
+        let remote = &opts.external_remote_config;
+        let replay_limits = opts.replay_limits.unwrap_or(remote.replay_limits);
+        let max_index = remote.max_index_bytes as u64;
+        let max_identities = remote.max_admitted_batches as u64;
         // Sparse publication can return callers while an older hole still blocks
         // capture. Bound the entire suffix by max_pending_batches, not caller count.
-        let pending = remote.map_or(128, |config| config.max_pending_batches) as u64;
+        let pending = remote.max_pending_batches as u64;
         // checkpoint_due triggers at replay limits /4, identities /2, or resident index /2.
         // Installing an image unloads captured overlays; only the directory remains resident.
         // Capture can exclude the whole bounded pending suffix. Subtract its maximum
@@ -200,36 +196,24 @@ pub(super) fn reservation(
         // in the checkpoint metadata cap.
         let image = add(114, add(encoded_rows, mul(cells, 167)?)?)?;
         let metadata = 2 * (128 * 1024 * 1024 + 1024 * 1024);
-        let metadata_reserve = add(mul(add(checkpoints, 2)?, image)?, metadata)?;
-        // The loopback harness nests owners under the same root. Only external
-        // topologies may exclude their six-whole-file WAL allocation allowance.
-        let local_wal = if remote.is_none() {
-            mul(
-                mul(opts.owner_wal_geometry.wal_file_bytes(), opts.owners as u64)?,
-                6,
-            )?
-        } else {
-            0
-        };
-        local_owner_wal = add(local_owner_wal, local_wal)?;
-        let reserve = add(metadata_reserve, local_wal)?;
+        let reserve = add(mul(add(checkpoints, 2)?, image)?, metadata)?;
         total = add(total, reserve)?;
         databases.push(serde_json::json!({"db_id":db,"reservation_bytes":reserve,
             "maximum_checkpoints":checkpoints,"full_index_image_bytes":image,
             "checkpoint_and_manifest_bytes":metadata,
-            "coordinator_metadata_reservation_bytes":metadata_reserve,
-            "local_owner_wal_reservation_bytes":local_wal,
             "batches":batches,"encoded_batch_bytes":encoded,"persistent_directory_bytes":directory,
             "resident_overlay_bytes":overlay,"maximum_batch_charge_bytes":maximum_batch_charge,
             "checkpoint_progress_windows":{"batches":batch_window,"encoded_bytes":byte_window,
                 "identities":identity_window,"index_bytes":index_window}}));
     }
-    Ok(serde_json::json!({"reservation_bytes":total,
-        "local_owner_wal_reservation_bytes":local_owner_wal,"databases":databases,
-        "model":"coordinator metadata: (maximum checkpoints + 2) * full encoded index image + two capped checkpoint metadata/authority manifests; six whole owner WAL files additionally charged only for the colocated loopback harness, external owner WAL allocation enforced on each owner"}))
+    Ok(
+        serde_json::json!({"reservation_bytes":total,"databases":databases,
+        "model":"coordinator metadata: (maximum checkpoints + 2) * full encoded index image + two capped checkpoint metadata/authority manifests; owner WAL allocation is enforced on each external owner"}),
+    )
 }
 
-#[cfg(test)]
+// The reservation input comes from a prepared leased configuration.
+#[cfg(all(test, feature = "nvmeof", target_os = "linux"))]
 mod tests {
     use super::*;
 
@@ -247,9 +231,8 @@ mod tests {
             "owner_wal_geometry":"native_default","replay_node_db_id":0,
             "batch_limits":{"max_operations":519,"max_encoded_bytes":500000},
             "max_batches_per_partition":32768,"max_admitted_batches":1000000,"max_index_bytes":512*1024*1024,
-            "coordinator_cache_bytes":0,"owner_wal_member_read":"async",
-            "owner_read_memory_allowance_bytes":128*1024*1024,"polling":"adaptive",
-            "owner_read_resident_first":false
+            "coordinator_cache_bytes":0,"owner_wal_member_read":"async","polling":"adaptive",
+            "live_nvmeof":crate::backends::tidehunter::test_live_nvmeof(2)
         });
         let input_path = root.join("input.json");
         std::fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
@@ -257,14 +240,9 @@ mod tests {
         crate::backends::tidehunter::prepare_external_case_file(&input_path, &prepared).unwrap();
         let remote: serde_json::Value =
             serde_json::from_slice(&std::fs::read(prepared.join("remote.json")).unwrap()).unwrap();
-        let owner_read: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(prepared.join("external_owner_read_config.json")).unwrap(),
-        )
-        .unwrap();
         let value = serde_json::json!({"databases":[{"db_id":0,"options":{
             "transport":{"kind":"tcp-trusted"},"path":root.join("db"),"owners":2,
             "external_remote_config":remote,
-            "external_owner_read_config":owner_read,"owner_read_resident_first":false,
             "batch_limits":{"max_operations":519,"max_encoded_bytes":500000}
         }}]});
         let mut trace = Trace::load(
@@ -276,7 +254,6 @@ mod tests {
         trace.select_node_databases(&[0]).unwrap();
         let bound = reservation(&value, &trace, 4096).unwrap();
         let database = &bound["databases"][0];
-        assert_eq!(bound["local_owner_wal_reservation_bytes"], 0);
         assert_eq!(database["batches"], 20480);
         assert_eq!(database["full_index_image_bytes"], 797_710_617_u64);
         assert_eq!(database["maximum_checkpoints"], 219);
@@ -284,25 +261,6 @@ mod tests {
         // z4m-highmem-16: one 14,000 GiB local SSD; keep the owner's 50% guard.
         assert!(bound["reservation_bytes"].as_u64().unwrap() < 14000 * 1024_u64.pow(3) / 2);
         eprintln!("cloud-replay-coordinator-bound={bound}");
-
-        let local = serde_json::json!({"databases":[{"db_id":0,"options":{
-            "transport":{"kind":"tcp-trusted"},"path":root.join("local-db"),"database":vec![7;16],
-            "owners":2,"owner_wal_geometry":"research",
-            "batch_limits":{"max_operations":519,"max_encoded_bytes":500000}
-        }}]});
-        let local = reservation(&local, &trace, 2).unwrap();
-        assert_eq!(
-            local["local_owner_wal_reservation_bytes"],
-            12 * 1024_u64.pow(3)
-        );
-        let database = &local["databases"][0];
-        assert_eq!(
-            database["reservation_bytes"].as_u64().unwrap(),
-            database["coordinator_metadata_reservation_bytes"]
-                .as_u64()
-                .unwrap()
-                + 12 * 1024_u64.pow(3)
-        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

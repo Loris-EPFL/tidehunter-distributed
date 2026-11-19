@@ -1,10 +1,7 @@
 //! Authenticated, metadata-only control for direct live WAL access.
 
 use super::*;
-use crate::distributed::nvmeof::live_storage::{
-    LiveAdoption, LiveWalSegment, LiveWriteExtent, LiveWriteReservation,
-};
-use crate::distributed::nvmeof::live_target::LiveTargetBinding;
+use crate::distributed::nvmeof::live_storage::{LiveTargetBinding, LiveWalSegment};
 
 /// Immutable authenticated connection recipe shared by cold pool operations.
 pub(crate) struct LivePinRecipe {
@@ -179,86 +176,6 @@ impl LiveExportPin {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveExportInfo {
-    /// Always `PerOwner`; see `legacy_wire::LiveExportMode`.
-    pub mode: super::super::nvmeof::legacy_wire::LiveExportMode,
-    pub address: String,
-    pub service: u16,
-    pub transport: super::super::nvmeof::NvmeofTransport,
-    pub wal_file_bytes: u64,
-    pub block_size: u32,
-    pub exported_files: u64,
-}
-
-/// Writable binding for one fragment remainder; never a durability proof.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveLeased {
-    pub extent: LiveWriteExtent,
-    pub binding: LiveTargetBinding,
-    /// Authoritative, immutable policy of the stream whose frontier is started.
-    pub tier: crate::distributed::durability::DurabilityTier,
-    pub profile: LeaseProfile,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveAdopted {
-    pub adoption: LiveAdoption,
-    pub next: Option<LiveLeased>,
-    pub profile: AdoptProfile,
-}
-
-/// Owner-local intervals; they must not be subtracted from coordinator clocks.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct LeaseProfile {
-    pub reserve_ns: u64,
-    pub namespace_sync_ns: u64,
-    pub publish_ns: u64,
-}
-
-/// Adoption time includes close scanning. Frames counts only newly adopted frames.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct AdoptProfile {
-    pub frames: u64,
-    pub adopt_ns: u64,
-    pub close_scan_ns: u64,
-    pub close_scan_bytes: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveReserved {
-    pub reservation: LiveWriteReservation,
-    pub binding: LiveTargetBinding,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) enum LiveReserveWire {
-    Existing(Vec<Receipt>),
-    Reserved(LiveReserved),
-}
-#[derive(Serialize, Deserialize)]
-pub(super) struct LiveCompletionWire {
-    pub(super) receipts: Vec<Receipt>,
-    pub(super) validation_ns: u64,
-    pub(super) validation_samples: u64,
-    pub(super) persistence: crate::distributed::storage::StorageWriteProfile,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveRecordLocation {
-    pub reference: ValueRecordReference,
-    pub segment: LiveWalSegment,
-    pub binding: LiveTargetBinding,
-    pub offset: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveRecordLocations {
-    pub entries: Vec<LiveRecordLocation>,
-    pub epoch_pin_token: [u8; 16],
-}
-
 pub struct LiveRecoveryEntry {
     pub receipt: DurableBatch,
     pub segment: LiveWalSegment,
@@ -271,22 +188,6 @@ pub struct LiveRecoveryPage {
     pub entries: Vec<LiveRecoveryEntry>,
     pub next: Option<usize>,
     pub epoch_pin_token: [u8; 16],
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct LiveRecoveryEntryWire {
-    pub(super) receipt: Receipt,
-    pub(super) segment: LiveWalSegment,
-    pub(super) binding: LiveTargetBinding,
-    pub(super) offset: u64,
-    pub(super) len: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct LiveRecoveryWire {
-    pub(super) entries: Vec<LiveRecoveryEntryWire>,
-    pub(super) next: Option<usize>,
-    pub(super) epoch_pin_token: [u8; 16],
 }
 
 impl Client {
@@ -337,13 +238,9 @@ impl Client {
         let Response::LiveExports(info) = response else {
             return self.wrong_variant("OpenLiveExports", &response, "LiveExports");
         };
-        if self.live_config.is_none()
-            || info.mode != super::super::nvmeof::legacy_wire::LiveExportMode::PerOwner
-        {
+        if self.live_config.is_none() {
             self.broken = true;
-            return Err(TcpError::new(
-                "owner live export mode is not per_owner, or live NVMe is not configured",
-            ));
+            return Err(TcpError::new("live NVMe is not configured"));
         }
         if info.wal_file_bytes != self.expected.wal_file_bytes {
             self.broken = true;
@@ -663,58 +560,24 @@ impl Client {
         }
     }
 
-    pub fn recover_live_metadata(
-        &mut self,
-        authority_epoch: u64,
-        source_epoch: u64,
-        cursor: usize,
-        limit: usize,
-    ) -> Result<LiveRecoveryPage, TcpError> {
-        if limit == 0 || limit > self.page_limit {
-            return Err(TcpError::new("invalid live recovery page limit"));
-        }
-        let response = self.request(Request::RecoverLiveMetadata {
-            authority_epoch,
-            source_epoch,
-            cursor,
-            limit: limit.min(256),
-        })?;
-        self.validate_live_recovery_page(
-            response,
-            authority_epoch,
-            source_epoch,
-            cursor,
-            limit,
-            false,
-        )
-    }
-
+    /// Validate one `ReplayLiveWal` page: `next` is a WAL byte offset beyond
+    /// `from`, and a page may exceed `limit` by at most one whole group.
     pub(super) fn validate_live_recovery_page(
         &mut self,
         response: Response,
         authority_epoch: u64,
         source_epoch: u64,
-        cursor: usize,
+        from: usize,
         limit: usize,
-        replay: bool,
     ) -> Result<LiveRecoveryPage, TcpError> {
         match response {
             Response::LiveRecovery(page) => {
                 if page.epoch_pin_token == [0; 16]
                     || page.entries.len()
-                        > if replay {
-                            limit.max(self.expected.group_limits.max_batches as usize)
-                        } else {
-                            limit.min(256)
-                        }
-                    || !page.next.is_none_or(|next| {
-                        !page.entries.is_empty()
-                            && if replay {
-                                next > cursor
-                            } else {
-                                cursor.checked_add(page.entries.len()) == Some(next)
-                            }
-                    })
+                        > limit.max(self.expected.group_limits.max_batches as usize)
+                    || !page
+                        .next
+                        .is_none_or(|next| !page.entries.is_empty() && next > from)
                 {
                     return self.invalid_live_metadata(authority_epoch, Some(page.epoch_pin_token));
                 }

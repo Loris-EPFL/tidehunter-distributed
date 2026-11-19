@@ -542,7 +542,6 @@ struct Session {
     export: WriteTimelineExport,
     operations: HashMap<[u8; 16], usize>,
     versions: HashMap<BatchVersion, usize>,
-    envelopes: HashMap<(u32, u64), Vec<usize>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_memberships: usize,
 }
@@ -672,7 +671,6 @@ impl WriteTimeline {
                 },
                 operations: HashMap::new(),
                 versions: HashMap::new(),
-                envelopes: HashMap::new(),
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 live_memberships: 0,
             });
@@ -1128,31 +1126,6 @@ impl WriteTimeline {
             && let Some(&index) = s.versions.get(&version)
         {
             Self::push(s, index, stage, owner, envelope);
-            if let (Some(owner), Some(envelope)) = (owner, envelope) {
-                s.envelopes
-                    .entry((owner, envelope))
-                    .or_default()
-                    .push(index);
-            }
-        }
-    }
-    pub fn response(&self, owner: u32, envelope: u64) {
-        if !self.enabled() {
-            return;
-        }
-        let mut guard = self.session.lock();
-        if let Some(s) = guard.as_mut()
-            && let Some(indexes) = s.envelopes.remove(&(owner, envelope))
-        {
-            for index in indexes {
-                Self::push(
-                    s,
-                    index,
-                    WriteTimelineStage::CompletionHarvested,
-                    Some(owner),
-                    Some(envelope),
-                );
-            }
         }
     }
     pub fn complete(&self, sample: WriteTimelineSample, error: Option<String>) {

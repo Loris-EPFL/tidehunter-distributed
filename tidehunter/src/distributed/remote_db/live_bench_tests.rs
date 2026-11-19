@@ -71,12 +71,11 @@ struct Fixture {
     root: tempdir::TempDir,
 }
 impl Fixture {
-    fn new(base: &Path, case: &str, tier: DurabilityTier, arm: &str) -> Self {
+    fn new(base: &Path, case: &str, tier: DurabilityTier) -> Self {
         Self::with_limits(
             base,
             case,
             tier,
-            arm,
             128 * MIB as u64,
             256 * MIB as u64,
             ReplayLimits {
@@ -90,7 +89,6 @@ impl Fixture {
         base: &Path,
         case: &str,
         tier: DurabilityTier,
-        arm: &str,
         fragment_bytes: u64,
         wal_file_bytes: u64,
         replay_limits: ReplayLimits,
@@ -143,7 +141,7 @@ impl Fixture {
             max_pending_reads: 64,
             max_pending_read_bytes: 16 * MIB,
             write_profile_limit: 0,
-            live_nvme: (arm != "A").then(|| live_config(tier)),
+            live_nvme: live_config(tier),
             durable_cut: Default::default(),
         };
         let node = StorageNode::open(
@@ -152,13 +150,8 @@ impl Fixture {
                 partition: config.partition_config(1, 0),
                 shape_yaml: shape.to_yaml().unwrap(),
                 max_epochs: 8,
-                read_workers: Some(1),
                 wal_member_read: Default::default(),
                 wal_prewrite: false,
-                read_resident_first: false,
-                read_memory_allowance_bytes: 128 * MIB,
-                read_max_inflight_requests: 64,
-                read_max_inflight_bytes: 16 * MIB,
                 read_max_device_reads: 64,
                 live_target: None,
             },
@@ -169,32 +162,30 @@ impl Fixture {
             .unwrap();
         let target_root = std::env::var_os("TH_TAIL_TARGET_DIR")
             .map(|path| tempdir::TempDir::new_in(path, "tail-target").unwrap());
-        if arm != "A" {
-            let target_path = target_root
-                .as_ref()
-                .map_or(root, |directory| directory.path());
-            let state_dir = target_path.join("target");
-            let configfs = target_path.join("configfs");
-            fs::create_dir(&state_dir).unwrap();
-            for name in ["hosts", "ports", "subsystems"] {
-                fs::create_dir_all(configfs.join(name)).unwrap();
-            }
-            let target = LiveTargetManager::open_fixture(
-                LiveTargetConfig {
-                    address: "127.0.0.1".into(),
-                    service: 4420,
-                    transport: NvmeofTransport::Tcp,
-                    host_nqn: "nqn.2026-01.test:p11-bench".into(),
-                    port_id: 42,
-                    state_dir,
-                    commissioning_port_id: 43,
-                    commissioning_service: 4421,
-                },
-                configfs,
-            )
-            .unwrap();
-            node.bench_install_live_target(target);
+        let target_path = target_root
+            .as_ref()
+            .map_or(root, |directory| directory.path());
+        let state_dir = target_path.join("target");
+        let configfs = target_path.join("configfs");
+        fs::create_dir(&state_dir).unwrap();
+        for name in ["hosts", "ports", "subsystems"] {
+            fs::create_dir_all(configfs.join(name)).unwrap();
         }
+        let target = LiveTargetManager::open_fixture(
+            LiveTargetConfig {
+                address: "127.0.0.1".into(),
+                service: 4420,
+                transport: NvmeofTransport::Tcp,
+                host_nqn: "nqn.2026-01.test:p11-bench".into(),
+                port_id: 42,
+                state_dir,
+                commissioning_port_id: 43,
+                commissioning_service: 4421,
+            },
+            configfs,
+        )
+        .unwrap();
+        node.bench_install_live_target(target);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         config.endpoints.push(RemoteEndpoint {
             partition: 0,
@@ -228,26 +219,22 @@ impl Fixture {
             target_root,
         }
     }
+    /// `arm` `C-buf` selects the buffered regular-file namespace, `C` (and the
+    /// read arms) the O_DIRECT one.
     fn open(&self, arm: &str) -> RemoteDatabase {
-        let db = RemoteDatabase::open(
+        let db = RemoteDatabase::open_with_local_live_fixture(
             &self.root.path().join("authority"),
             &self.shape,
             self.config.clone(),
-            metrics(),
+            arm == "C-buf",
         )
         .unwrap();
-        if arm != "A" {
-            for worker in &db.core.clients {
-                let mut client = worker.client.lock();
-                client
-                    .configure_live_nvme(
-                        self.config.live_nvme.as_ref().unwrap(),
-                        self.config.effective_owner_append_occupancy(),
-                    )
-                    .unwrap();
-                client.bench_local_live_fixture(arm == "C-buf");
-                client.set_live_metrics(self.live.clone()).unwrap();
-            }
+        for worker in &db.core.clients {
+            worker
+                .client
+                .lock()
+                .set_live_metrics(self.live.clone())
+                .unwrap();
         }
         db
     }
@@ -274,12 +261,12 @@ impl Drop for Fixture {
 #[test]
 fn pin_read_lanes_defaults_off_and_validates_queue_count() {
     let base = tempdir::TempDir::new("pin-read-lanes").unwrap();
-    let mut fixture = Fixture::new(base.path(), "config", DurabilityTier::Synchronous, "A");
+    let mut fixture = Fixture::new(base.path(), "config", DurabilityTier::Synchronous);
     let mut serialized = serde_json::to_value(&fixture.config).unwrap();
     serialized.as_object_mut().unwrap().remove("pin_read_lanes");
     let legacy: RemoteDatabaseConfig = serde_json::from_value(serialized).unwrap();
     assert!(!legacy.pin_read_lanes);
-    fixture.config.live_nvme = Some(live_config(DurabilityTier::Synchronous));
+    fixture.config.live_nvme = live_config(DurabilityTier::Synchronous);
     fixture.config.pin_read_lanes = true;
     fixture.config.read_lanes = Some(4);
     fixture.config.validate().unwrap();
@@ -306,13 +293,7 @@ fn pin_read_lanes_defaults_off_and_validates_queue_count() {
     fixture.config.pin_read_lanes = false;
     fixture.config.validate().unwrap();
     fixture.config.pin_read_lanes = true;
-    fixture
-        .config
-        .live_nvme
-        .as_mut()
-        .unwrap()
-        .queue_geometry
-        .io_queues = 1;
+    fixture.config.live_nvme.queue_geometry.io_queues = 1;
     fixture.config.read_lanes = Some(1);
     fixture.config.validate().unwrap();
     fixture.config.read_lanes = Some(2);
@@ -320,9 +301,9 @@ fn pin_read_lanes_defaults_off_and_validates_queue_count() {
 }
 
 #[test]
-fn leased_submit_redrain_defaults_on_and_is_valid_off_only_for_leased_writes() {
+fn leased_submit_redrain_defaults_on_and_round_trips_off() {
     let base = tempdir::TempDir::new("leased-submit-redrain").unwrap();
-    let mut fixture = Fixture::new(base.path(), "config", DurabilityTier::Synchronous, "A");
+    let mut fixture = Fixture::new(base.path(), "config", DurabilityTier::Synchronous);
     // Absent means on, and on is not serialized: documents are unchanged.
     let serialized = serde_json::to_value(&fixture.config).unwrap();
     assert!(serialized.get("leased_submit_redrain").is_none());
@@ -337,16 +318,6 @@ fn leased_submit_redrain_defaults_on_and_is_valid_off_only_for_leased_writes() {
         false
     );
     fixture.config.leased_submit_redrain = false;
-    fixture.config.live_nvme = None;
-    assert!(
-        fixture
-            .config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("leased_submit_redrain=false requires live_nvme")
-    );
-    fixture.config.live_nvme = Some(live_config(DurabilityTier::Synchronous));
     fixture.config.validate().unwrap();
     fixture.config.leased_submit_redrain = true;
     fixture.config.validate().unwrap();
@@ -356,26 +327,24 @@ fn leased_submit_redrain_defaults_on_and_is_valid_off_only_for_leased_writes() {
 fn owner_initiator_map_is_pinned_across_authority_reopen() {
     use crate::distributed::tcp::LiveInitiatorIdentity;
     let base = tempdir::TempDir::new("live-owner-identities").unwrap();
-    let mut f = Fixture::new(base.path(), "owner-map", DurabilityTier::Native, "C");
+    let mut f = Fixture::new(base.path(), "owner-map", DurabilityTier::Native);
     let identity = LiveInitiatorIdentity {
-        host_nqn: f.config.live_nvme.as_ref().unwrap().host_nqn.clone(),
+        host_nqn: f.config.live_nvme.host_nqn.clone(),
         host_id: [2; 16],
     };
     f.config
         .live_nvme
-        .as_mut()
-        .unwrap()
         .owner_identities
         .insert(0, identity.clone());
     let root = f.root.path().join("authority");
-    let open = |config| RemoteDatabase::open(&root, &f.shape, config, metrics());
+    let open = |config| RemoteDatabase::open_local_live_fixture(&root, &f.shape, config);
     let first = open(f.config.clone()).unwrap();
     super::tests::fail_stop_without_checkpoint(first);
     let same = open(f.config.clone()).unwrap();
     super::tests::fail_stop_without_checkpoint(same);
     for change in 0..4 {
         let mut config = f.config.clone();
-        let live = config.live_nvme.as_mut().unwrap();
+        let live = &mut config.live_nvme;
         match change {
             0 => live.owner_identities.get_mut(&0).unwrap().host_id = [3; 16],
             1 => live
@@ -401,12 +370,7 @@ fn owner_initiator_map_is_pinned_across_authority_reopen() {
             .to_string()
             .contains("authority configuration/history differs")
     );
-    f.config
-        .live_nvme
-        .as_mut()
-        .unwrap()
-        .owner_identities
-        .clear();
+    f.config.live_nvme.owner_identities.clear();
     let legacy = open(f.config.clone()).unwrap();
     super::tests::fail_stop_without_checkpoint(legacy);
 }
@@ -485,7 +449,6 @@ fn row(
 }
 fn cache_contract(arm: &str) -> &'static str {
     match arm {
-        "A" => "owner buffered/mapped WAL; no coordinator value cache; media hits unmeasured",
         "C-buf" => "buffered regular-file namespace; owner page cache; no coordinator value cache",
         _ => {
             "O_DIRECT regular-file namespace; no coordinator value cache; device/cache hits unmeasured"
@@ -511,23 +474,13 @@ fn delta(after: LiveNvmeCounts, before: LiveNvmeCounts) -> Value {
 }
 fn write_counters(
     f: &Fixture,
-    arm: &str,
     before: LiveNvmeCounts,
     owner: PartitionStats,
     syncer_before: Option<u64>,
 ) -> Value {
     let now = f.owner_stats();
     let mut counts = delta(f.live.snapshot().counts, before);
-    counts["append_rpc_exchanges"] = if arm == "A" {
-        json!(now.appended_groups - owner.appended_groups)
-    } else {
-        json!(0)
-    };
-    counts["frames"] = if arm == "A" {
-        Value::Null
-    } else {
-        counts["leased_frames"].clone()
-    };
+    counts["frames"] = counts["leased_frames"].clone();
     counts["owner_explicit_persistence_barriers"] =
         json!(now.persistence_barriers - owner.persistence_barriers);
     counts["owner_total_fdatasync"] = Value::Null;
@@ -600,7 +553,7 @@ fn run_write(
     let case = format!("{arm}-{tier}-{size}-w{writers}-r{rep}");
     println!("live_bench {case}");
     let before_case = process_snapshot();
-    let fixture = Fixture::new(base, &case, tier, arm);
+    let fixture = Fixture::new(base, &case, tier);
     let db = ConcurrentRemoteDatabase::new(fixture.open(arm)).unwrap();
     let value: Bytes = vec![0x5a; size].into();
     let (_, warm_elapsed) = write_phase(&db, writers, 0, 512, &value);
@@ -612,7 +565,7 @@ fn run_write(
         && warm_elapsed.as_secs_f64() * full_count as f64 / 512.0 > 60.0;
     let count = if reduce { full_count / 4 } else { full_count };
     let (samples, elapsed) = write_phase(&db, writers, 512, count, &value);
-    let counters = write_counters(&fixture, arm, before, owner, syncer_before);
+    let counters = write_counters(&fixture, before, owner, syncer_before);
     let mut result = row(
         case,
         arm,
@@ -628,7 +581,6 @@ fn run_write(
     // Capture before teardown, which closes the extent and may write a skip marker.
     result.lifetime_counters = write_counters(
         &fixture,
-        arm,
         LiveNvmeCounts::default(),
         PartitionStats::default(),
         Some(0),
@@ -712,10 +664,10 @@ fn configure_reads(
         .bench_install_owner_local(&fixture.node, reference);
 }
 #[test]
-fn leased_settled_dataset_matches_inline_lane_and_owner_rpc_in_both_tiers() {
+fn leased_settled_dataset_matches_inline_and_worker_lanes_in_both_tiers() {
     let root = tempdir::TempDir::new("leased-read-routes").unwrap();
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
-        let fixture = Fixture::new(root.path(), tier.as_str(), tier, "C");
+        let fixture = Fixture::new(root.path(), tier.as_str(), tier);
         let mut db = fixture.open("C");
         let value: Bytes = vec![0x5a; 1024].into();
         for sequence in 0..8 {
@@ -774,33 +726,12 @@ fn leased_settled_dataset_matches_inline_lane_and_owner_rpc_in_both_tiers() {
             );
             drop(parked);
         }
-        let mut owner = Client::connect(
-            &fixture.config.endpoints[0].address,
-            &fixture.config.tls,
-            fixture.config.timeout,
-            fixture.config.partition_config(db.epoch(), 0),
-            &fixture.shape,
-        )
-        .unwrap();
-        for sequence in 0..8 {
-            let reference = db
-                .index_reference(KeySpace(0), &key(sequence), IndexReadCut::Latest)
-                .unwrap()
-                .unwrap();
-            let (records, profile) = owner
-                .read_records_profiled(db.epoch(), &[reference])
-                .unwrap();
-            assert_eq!(records, vec![put(sequence, &value)]);
-            assert_eq!(profile.requests, 1);
-            assert!(profile.server_handler_available);
-            assert_eq!(profile.server_response_recheck_samples, 1);
-        }
         db.shutdown().unwrap();
     }
 }
 
 fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize]) -> Vec<Row> {
-    let fixture = Fixture::new(base, "reads", DurabilityTier::Native, "C");
+    let fixture = Fixture::new(base, "reads", DurabilityTier::Native);
     let mut db = fixture.open("C");
     let value: Bytes = vec![0x5a; 1024].into();
     for sequence in 0..4096 {
@@ -1025,7 +956,7 @@ fn environment(base: &Path) -> Value {
 }
 fn markdown(rows: &[Row], environment: &Value) -> String {
     let mut text = String::from(
-        "# P11 workstation regular-file fixture latency\n\nReal coordinator/authority actor, publication and index (`ConcurrentRemoteDatabase::write_batch`), real owner control service over trusted loopback TCP; reads use public `RemoteDatabase::get/get_many`. This measures software, control exchanges, copies, thread hops and local file synchronization. No fabric, nvmet or hardware FUA mapping is exercised. Differences are NOT hardware results. No coordinator value cache. A uses the owner's buffered/mapped WAL; B and C use an O_DIRECT regular-file namespace; C-buf uses a buffered regular-file namespace. Read fixtures use O_DIRECT, even after a warming pass; media/cache-hit fractions are unmeasured. O_DIRECT rows must not be described as owner-page-cache-served I/O.\n\nNative buffered writes acknowledge host-page-cache bytes without a power-loss guarantee; native O_DIRECT completion is only the regular-file fixture's completion contract, not the nvmet buffered target contract. Synchronous A/B waits for owner persistence; synchronous C/C-buf waits for RWF_DSYNC completion, not a current owner frontier root. FUA counters count Data/RWF_DSYNC requests, NOT observed hardware FUA. Async adoption is submitted after append replies, but synchronous adoption exchanges are reported rather than assumed absent. Quantiles are exact nearest rank per row, without pooling or outlier removal.\n\n",
+        "# P11 workstation regular-file fixture latency\n\nReal coordinator/authority actor, publication and index (`ConcurrentRemoteDatabase::write_batch`), real owner control service over trusted loopback TCP; reads use public `RemoteDatabase::get/get_many`. This measures software, control exchanges, copies, thread hops and local file synchronization. No fabric, nvmet or hardware FUA mapping is exercised. Differences are NOT hardware results. No coordinator value cache. C uses an O_DIRECT regular-file namespace; C-buf uses a buffered regular-file namespace. Read fixtures use O_DIRECT, even after a warming pass; media/cache-hit fractions are unmeasured. O_DIRECT rows must not be described as owner-page-cache-served I/O.\n\nNative buffered writes acknowledge host-page-cache bytes without a power-loss guarantee; native O_DIRECT completion is only the regular-file fixture's completion contract, not the nvmet buffered target contract. Synchronous C/C-buf waits for RWF_DSYNC completion, not a current owner frontier root. FUA counters count Data/RWF_DSYNC requests, NOT observed hardware FUA. Async adoption is submitted after append replies, but synchronous adoption exchanges are reported rather than assumed absent. Quantiles are exact nearest rank per row, without pooling or outlier removal.\n\n",
     );
     text.push_str(&format!("Environment: `{environment}`\n\n"));
     for (title, writes) in [("Write API latency", true), ("Read API latency", false)] {
@@ -1048,12 +979,11 @@ fn markdown(rows: &[Row], environment: &Value) -> String {
             ));
         }
     }
-    text.push_str("\n## Route counters (measured phase)\n\nLive writes are namespace io_uring SQEs, not all owner WAL writes. RPC append exchanges are derived from fresh owner appended-group counts (no retries). `n/a` means no counter or not applicable. Syncer fsync calls include background AND demanded calls and can overlap explicit barriers; DO NOT add them. No background-only or total fdatasync counter exists. F/P is frames/put, SQE/C is read SQEs/API call.\n\n| Case | Cache contract | RPC append | Lease | Adopt async | Adopt sync | Live block writes | Data/FUA requests | Skip | Extents | Frames | F/P or SQE/C | Owner explicit barriers | Syncer fsync calls | Background-only calls | Inline | Fallbacks |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n");
+    text.push_str("\n## Route counters (measured phase)\n\nLive writes are namespace io_uring SQEs, not all owner WAL writes. `n/a` means no counter or not applicable. Syncer fsync calls include background AND demanded calls and can overlap explicit barriers; DO NOT add them. No background-only or total fdatasync counter exists. F/P is frames/put, SQE/C is read SQEs/API call.\n\n| Case | Cache contract | Lease | Adopt async | Adopt sync | Live block writes | Data/FUA requests | Skip | Extents | Frames | F/P or SQE/C | Owner explicit barriers | Syncer fsync calls | Background-only calls | Inline | Fallbacks |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n");
     for r in rows {
         let c = &r.counters;
         let mut cells = vec![r.case.clone(), r.cache.clone()];
         for name in [
-            "append_rpc_exchanges",
             "lease_exchanges",
             "adoption_async_exchanges",
             "adoption_sync_exchanges",
@@ -1148,7 +1078,7 @@ fn markdown(rows: &[Row], environment: &Value) -> String {
         .map(|r| &r.case)
         .collect();
     text.push_str(&format!("\nSynchronous 4x reductions (warm-up projected >60 s): {reduced:?}. Intentional R2 disable does not increment a fallback counter. Interference is yes for load1m >2, any foreign build/test process, or foreign process >30% of one core. Own process and ancestors (including its cargo runner) are excluded. ps %CPU is lifetime-average, not an instantaneous trace; every case records its pre-arm snapshot.\n\n"));
-    text.push_str("## Selection controls\n\nComma-separated env lists; omitted variables select the full matrix: `P11_BENCH_ARMS=A,C,C-buf,R1,R2,R3`, `P11_BENCH_TIERS=native,synchronous`, `P11_BENCH_VALUE_BYTES=1024,65536`, `P11_BENCH_WRITERS=1,16`, `P11_BENCH_REPETITIONS=1,2`. Read rows are native 1KiB/one-reader and selected only when native, 1024 and one writer are included. Odd repetitions use A/C/C-buf order; even ones reverse it; scalar read pairs also reverse.\n\nFull: `RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n\nShort subset: `P11_BENCH_ARMS=C,C-buf P11_BENCH_TIERS=native P11_BENCH_VALUE_BYTES=1024 P11_BENCH_WRITERS=1 P11_BENCH_REPETITIONS=1 RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n");
+    text.push_str("## Selection controls\n\nComma-separated env lists; omitted variables select the full matrix: `P11_BENCH_ARMS=C,C-buf,R1,R2,R3`, `P11_BENCH_TIERS=native,synchronous`, `P11_BENCH_VALUE_BYTES=1024,65536`, `P11_BENCH_WRITERS=1,16`, `P11_BENCH_REPETITIONS=1,2`. Read rows are native 1KiB/one-reader and selected only when native, 1024 and one writer are included. Odd repetitions use C/C-buf order; even ones reverse it; scalar read pairs also reverse.\n\nFull: `RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n\nShort subset: `P11_BENCH_ARMS=C,C-buf P11_BENCH_TIERS=native P11_BENCH_VALUE_BYTES=1024 P11_BENCH_WRITERS=1 P11_BENCH_REPETITIONS=1 RUST_TEST_THREADS=1 cargo test --release --locked --offline -p tidehunter --features experimental-nvmeof,test-utils --lib live_bench -- --ignored --nocapture`\n");
     text
 }
 fn counter(c: &Value, name: &str) -> String {
@@ -1187,8 +1117,8 @@ fn live_bench_closed_loop() {
     );
     let arms = selection(
         "P11_BENCH_ARMS",
-        "A,C,C-buf,R1,R2,R3",
-        &["A", "C", "C-buf", "R1", "R2", "R3"],
+        "C,C-buf,R1,R2,R3",
+        &["C", "C-buf", "R1", "R2", "R3"],
     );
     let tiers = selection(
         "P11_BENCH_TIERS",
@@ -1229,9 +1159,9 @@ fn live_bench_closed_loop() {
             {
                 for &rep in &repetitions {
                     for arm in if rep % 2 == 1 {
-                        ["A", "C", "C-buf"]
+                        ["C", "C-buf"]
                     } else {
-                        ["C-buf", "C", "A"]
+                        ["C-buf", "C"]
                     } {
                         if !arms.iter().any(|selected| selected == arm) {
                             continue;
@@ -1311,7 +1241,6 @@ fn leased_checkpoint_tail_workstation() {
             base.path(),
             "tail",
             tier,
-            "C-buf",
             fragment_bytes as u64,
             wal_file_bytes as u64,
             ReplayLimits {
@@ -1323,17 +1252,10 @@ fn leased_checkpoint_tail_workstation() {
             .config
             .owner_append_occupancy
             .max(leased_write_window.unwrap_or(1));
-        fixture
-            .config
-            .live_nvme
-            .as_mut()
-            .unwrap()
-            .leased_write_window = leased_write_window;
+        fixture.config.live_nvme.leased_write_window = leased_write_window;
         let leased_write_window_bound = fixture
             .config
             .live_nvme
-            .as_ref()
-            .unwrap()
             .max_inflight_requests
             .min(fixture.config.effective_owner_append_occupancy());
         let db = ConcurrentRemoteDatabase::new(fixture.open("C-buf")).unwrap();
@@ -1523,36 +1445,11 @@ fn small_put_multiowner_workstation() {
                 live.leased_write_window = None;
                 live.leased_sync = LeasedSync::GroupFlush;
                 live.leased_flush_min_frame_bytes = 65536;
-                config.live_nvme = Some(live);
+                config.live_nvme = live;
             },
-            |config| StorageNode::open(config, metrics()).unwrap(),
+            |_| {},
         )
         .synchronous();
-        for (owner, node) in fixture.nodes.iter().enumerate() {
-            let root = fixture.temp.path().join(format!("target-{owner}"));
-            let state_dir = root.join("state");
-            let configfs = root.join("configfs");
-            fs::create_dir_all(&state_dir).unwrap();
-            for name in ["hosts", "ports", "subsystems"] {
-                fs::create_dir_all(configfs.join(name)).unwrap();
-            }
-            node.bench_install_live_target(
-                LiveTargetManager::open_fixture(
-                    LiveTargetConfig {
-                        address: "127.0.0.1".into(),
-                        service: 4420 + owner as u16 * 2,
-                        transport: NvmeofTransport::Tcp,
-                        host_nqn: "nqn.2026-01.test:p11-bench".into(),
-                        port_id: 42 + owner as u16 * 2,
-                        state_dir,
-                        commissioning_port_id: 43 + owner as u16 * 2,
-                        commissioning_service: 4421 + owner as u16 * 2,
-                    },
-                    configfs,
-                )
-                .unwrap(),
-            );
-        }
         let original = fixture.open();
         let live = LiveNvmeMetrics::new();
         for worker in &original.core.clients {
@@ -1866,7 +1763,7 @@ fn pipeline_delta(after: PipelineStats, before: PipelineStats) -> Value {
 }
 
 /// One attribution case: two owners like the G35 fleet shape, leased writes to
-/// buffered local WAL files (`C-buf`) or the owner RPC route (`rpc`).
+/// buffered local WAL files (`C-buf`).
 #[allow(clippy::too_many_lines)]
 fn overhead_case(
     probe: &DiskProbe,
@@ -1882,7 +1779,6 @@ fn overhead_case(
     let base = arm.ends_with("-base");
     let arm_kind = arm.trim_end_matches("-base");
     crate::distributed::storage::BASELINE_WRITE_PATH.store(base, Ordering::Relaxed);
-    let leased = arm_kind.starts_with("C-buf");
     let prewrite = arm_kind == "C-buf-pre";
     let mut fixture = super::pipeline_tests::Fixture::new_with_root(
         tempdir::TempDir::new_in(CACHE, "write-overhead").unwrap(),
@@ -1907,58 +1803,24 @@ fn overhead_case(
                 max_batches: 4096,
                 max_encoded_bytes: 256 * MIB,
             };
-            if leased {
-                let mut live = live_config(tier);
-                live.leased_write_window = None;
-                live.leased_sync = LeasedSync::GroupFlush;
-                live.leased_flush_min_frame_bytes = 65536;
-                live.max_inflight_bytes = 16 * MIB;
-                config.live_nvme = Some(live);
-            }
+            let mut live = live_config(tier);
+            live.leased_write_window = None;
+            live.leased_sync = LeasedSync::GroupFlush;
+            live.leased_flush_min_frame_bytes = 65536;
+            live.max_inflight_bytes = 16 * MIB;
+            config.live_nvme = live;
         },
-        |mut config| {
-            config.wal_prewrite = prewrite;
-            StorageNode::open(config, metrics()).unwrap()
-        },
+        |config| config.wal_prewrite = prewrite,
     );
     if tier == DurabilityTier::Synchronous {
         fixture = fixture.synchronous();
     }
-    if leased {
-        for (owner, node) in fixture.nodes.iter().enumerate() {
-            let root = fixture.temp.path().join(format!("target-{owner}"));
-            let state_dir = root.join("state");
-            let configfs = root.join("configfs");
-            fs::create_dir_all(&state_dir).unwrap();
-            for name in ["hosts", "ports", "subsystems"] {
-                fs::create_dir_all(configfs.join(name)).unwrap();
-            }
-            node.bench_install_live_target(
-                LiveTargetManager::open_fixture(
-                    LiveTargetConfig {
-                        address: "127.0.0.1".into(),
-                        service: 4420 + owner as u16 * 2,
-                        transport: NvmeofTransport::Tcp,
-                        host_nqn: "nqn.2026-01.test:p11-bench".into(),
-                        port_id: 42 + owner as u16 * 2,
-                        state_dir,
-                        commissioning_port_id: 43 + owner as u16 * 2,
-                        commissioning_service: 4421 + owner as u16 * 2,
-                    },
-                    configfs,
-                )
-                .unwrap(),
-            );
-        }
-    }
     let original = fixture.open();
     let live = LiveNvmeMetrics::new();
-    if leased {
-        for worker in &original.core.clients {
-            let mut client = worker.client.lock();
-            client.bench_local_live_fixture(true);
-            client.set_live_metrics(live.clone()).unwrap();
-        }
+    for worker in &original.core.clients {
+        let mut client = worker.client.lock();
+        client.bench_local_live_fixture(true);
+        client.set_live_metrics(live.clone()).unwrap();
     }
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let value: Bytes = vec![0x5a; 512].into();
@@ -2088,7 +1950,7 @@ fn write_overhead_attribution() {
     let arms = selection(
         "TH_OVERHEAD_ARMS",
         "C-buf-base,C-buf,C-buf-pre-base,C-buf-pre",
-        &["C-buf", "C-buf-pre", "C-buf-base", "C-buf-pre-base", "rpc"],
+        &["C-buf", "C-buf-pre", "C-buf-base", "C-buf-pre-base"],
     );
     let setting = |name: &str, default: usize| {
         std::env::var(name)
@@ -2176,37 +2038,16 @@ fn lone_batch_with_empty_queue_is_submitted_without_waiting() {
                 live.leased_sync = LeasedSync::GroupFlush;
                 live.leased_flush_min_frame_bytes = 65536;
                 live.max_inflight_bytes = 16 * MIB;
-                config.live_nvme = Some(live);
+                config.live_nvme = live;
                 config.max_pending_bytes = 64 * MIB;
                 // Reads must reach the owner path, not a coordinator cache.
                 config.read_cache_bytes = 0;
             },
-            |config| StorageNode::open(config, metrics()).unwrap(),
+            |_| {},
         );
         if tier == DurabilityTier::Synchronous {
             fixture = fixture.synchronous();
         }
-        let root = fixture.temp.path().join("target");
-        fs::create_dir_all(root.join("state")).unwrap();
-        for name in ["hosts", "ports", "subsystems"] {
-            fs::create_dir_all(root.join("configfs").join(name)).unwrap();
-        }
-        fixture.nodes[0].bench_install_live_target(
-            LiveTargetManager::open_fixture(
-                LiveTargetConfig {
-                    address: "127.0.0.1".into(),
-                    service: 4420,
-                    transport: NvmeofTransport::Tcp,
-                    host_nqn: "nqn.2026-01.test:p11-bench".into(),
-                    port_id: 42,
-                    state_dir: root.join("state"),
-                    commissioning_port_id: 43,
-                    commissioning_service: 4421,
-                },
-                root.join("configfs"),
-            )
-            .unwrap(),
-        );
         let original = fixture.open();
         let live = LiveNvmeMetrics::new();
         for worker in &original.core.clients {

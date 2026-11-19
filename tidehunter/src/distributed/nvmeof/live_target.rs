@@ -9,6 +9,7 @@
 //! write protection can be changed by an authorized controller.
 use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
 use super::live_namespace::LiveNamespaceAccess;
+use super::live_storage::LiveTargetBinding;
 use super::{LiveTargetConfig, LiveTargetStats, NvmeofTransport};
 use crate::lock::DbLock;
 use rand::RngCore;
@@ -44,37 +45,6 @@ pub struct LiveFileIdentity {
     pub inode: u64,
     pub bytes: u64,
     pub block_size: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LiveTargetBinding {
-    pub nqn: String,
-    pub uuid: [u8; 16],
-    pub nsid: u32,
-    pub bytes: u64,
-    pub block_size: u32,
-    pub address: String,
-    pub service: u16,
-    pub transport: NvmeofTransport,
-    pub readonly: bool,
-    /// Wire placeholder, always `None` (see `super::SpdkTarget`).
-    #[serde(default)]
-    pub spdk: Option<std::sync::Arc<super::SpdkTarget>>,
-    #[serde(default)]
-    pub permanent: bool,
-}
-
-impl LiveTargetBinding {
-    /// Reject a binding that carries the removed SPDK target proof.
-    pub fn require_kernel_target(&self) -> io::Result<()> {
-        if self.spdk.is_some() {
-            return Err(invalid(
-                "unsupported legacy distributed mode spdk: use archive/multi-design",
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,6 +114,30 @@ pub struct LiveTargetManager {
 
 fn invalid(s: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, s)
+}
+/// A registry written before the refactor carries the removed `spdk` key in
+/// every export binding (`null` when unused), which the current binding
+/// rejects. Name that mode instead of reporting a corrupt registry.
+fn unparsable_state_error(payload: &[u8]) -> io::Error {
+    let mode = serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|state| {
+            state.get("exports")?.as_array()?.iter().find_map(|export| {
+                let spdk = export.get("binding")?.get("spdk")?;
+                Some(if spdk.is_null() {
+                    "pre_refactor_live_target_registry"
+                } else {
+                    "spdk"
+                })
+            })
+        });
+    match mode {
+        Some(mode) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported legacy distributed mode {mode}: use archive/multi-design"),
+        ),
+        None => invalid("invalid target state"),
+    }
 }
 fn path_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
@@ -388,7 +382,7 @@ impl LiveTargetManager {
                     return Err(invalid("target state checksum mismatch"));
                 }
                 let s: State =
-                    serde_json::from_slice(payload).map_err(|_| invalid("invalid target state"))?;
+                    serde_json::from_slice(payload).map_err(|_| unparsable_state_error(payload))?;
                 if s.version != 1
                     || s.config != config
                     || !nqn_valid(&s.private_host)
@@ -823,7 +817,6 @@ impl LiveTargetManager {
             service: self.state.config.service,
             transport: self.state.config.transport,
             readonly: false,
-            spdk: None,
             permanent: true,
         };
         self.state.exports.push(Export {
@@ -931,7 +924,6 @@ impl LiveTargetManager {
             service: self.state.config.service,
             transport: self.state.config.transport,
             readonly,
-            spdk: None,
             permanent: false,
         };
         self.state.exports.push(Export {
@@ -1464,3 +1456,7 @@ impl LiveTargetManager {
 #[cfg(test)]
 #[path = "live_target_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "live_target_legacy_tests.rs"]
+mod legacy_tests;

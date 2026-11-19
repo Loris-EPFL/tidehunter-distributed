@@ -1,5 +1,6 @@
 //! Real five-node mTLS/Value-WAL regressions. Holding the existing authenticated
 //! control stream mutex pauses append actors, not a mock storage implementation.
+#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::super::pipeline_tests::Fixture;
 use super::*;
 
@@ -268,6 +269,8 @@ fn checkpoint_pressure_defers_fifo_head_without_blocking_durable_replies() {
     Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
     let charges = admission.charges();
     assert_eq!((charges.requests, charges.bytes), (0, 0));
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(connection);
     let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     assert_eq!(get(&reopened, 5), Some(vec![5; 32]));
     assert_eq!(get(&reopened, 6), Some(vec![6; 32]));
@@ -455,6 +458,8 @@ fn blocked_appends_allow_committed_reads_and_overlap_distinct_nodes() {
     }
     db.flush_index().unwrap();
     Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(connections);
     let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     assert_eq!(get(&reopened, 0), Some(vec![9; 32]));
     for node in 0..2 {
@@ -484,7 +489,12 @@ fn unknown_append_fences_cached_absent_and_detached_reads_until_reopen() {
         .unwrap()
         .wait();
     let cache_inserts_before_unknown = db.read_cache_stats().inserts;
-    fixture.nodes[1].inject_drop_next_append_response();
+    // The owner-1 frame reaches its WAL file but its completion reports EIO:
+    // the outcome is unknown to the authority, as for a lost reply.
+    db.database.core.clients[1]
+        .client
+        .lock()
+        .leased_test_fail_write(-libc::EIO);
     let operation = fixture.operation(1, 21);
     let error = db
         .write_batch(operation, vec![put(1, 8), put(2, 8)])
@@ -590,16 +600,30 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
     fixture.config.max_pending_reads = 1;
+    fixture.config.read_lanes = Some(1);
     let original = fixture.open();
     original
         .write_batch(fixture.operation(0, 30), vec![put(0, 5), put(1, 6)])
         .unwrap();
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     assert!(!db.stats().read_resolve_ns_available);
+    // A live inline read needs an idle lane with a cached grant: park owner
+    // 0's lane worker and install the owner-local grant of key 0's file.
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.batch_address.partition, 0);
+    let parked = db.reads.bench_park_live_lane(0);
+    db.reads
+        .bench_install_owner_local(&fixture.nodes[0], reference);
+    let rpcs = db.read_rpc_count();
     db.set_read_profile_limit(2);
     let monitor = db.read_profile_monitor();
     assert_eq!(get(&db, 0), Some(vec![5; 32]));
     assert!(db.stats().read_resolve_ns_available);
+    // The actor read below needs the lane worker.
+    drop(parked);
     let pending = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
     let generation = db.read_admission_generation();
     assert!(RemoteDatabase::read_backpressured(
@@ -626,15 +650,13 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
     assert_eq!(counters["read_profile_completed"], 2);
     assert_eq!(counters["read_profile_inline_completed"], 1);
     assert_eq!(counters["read_profile_actor_completed"], 1);
-    assert_eq!(counters["read_profile_returned"], 1);
     assert!(counters["read_profile_inline_ns"] > 0);
-    assert_eq!(counters["read_profile_server_response_recheck_samples"], 2);
     let resolution = monitor.coordinator_resolution_snapshot();
     assert_eq!(resolution.remote_misses, 2);
     assert_eq!(resolution.route_preparation.count, 2);
     assert_eq!(resolution.pin_preparation.count, 2);
     assert_eq!(resolution.batch_preparation.count, 0);
-    assert_eq!(db.read_rpc_count(), 2);
+    assert_eq!(db.read_rpc_count() - rpcs, 2);
     db.shutdown().unwrap();
 }
 
@@ -648,11 +670,7 @@ fn cancelled_late_read_failure_poison_is_shared_with_writer_and_cache() {
         .unwrap();
     let lane = original.core.reads.lane_client(0, 0);
     let held = lane.lock();
-    original.core.clients[0]
-        .client
-        .lock()
-        .fence_to(original.epoch() + 1)
-        .unwrap();
+    fixture.fence_owner(0, original.epoch() + 1);
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     drop(pending); // cancellation cannot detach a late transport failure
@@ -673,7 +691,8 @@ fn sui_shared_gate_publishes_disjoint_later_batch_and_freezes_sparse_view() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new();
     let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     let ks = db.ks("root");
     let partition = |sequence: u64| {
         let mut operation = [0; 16];
@@ -806,7 +825,11 @@ fn sui_shared_gate_publishes_disjoint_later_batch_and_freezes_sparse_view() {
         );
     }
     db.wait_for_background_threads_to_finish().unwrap();
-    let reopened = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    // The io client clone keeps the live connection registry (and its lock) alive.
+    drop(connection);
+    let reopened =
+        Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+            .unwrap();
     assert_eq!(
         reopened
             .iterator(ks)
@@ -897,6 +920,8 @@ fn writer_panic_resolves_all_admitted_acknowledgements_and_fences_reads() {
     assert!(second.unwrap().unwrap_err().uncertain_version.is_some());
     assert!(db.validate_cached_read().is_err());
     assert!(Arc::try_unwrap(db).ok().unwrap().shutdown().is_err());
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop(connections);
     let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     // Recovery owns any completely appended unknown work; no caller got success.
     reopened.validate_cached_read().unwrap();
@@ -919,7 +944,7 @@ fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
         .unwrap();
     original.shutdown().unwrap();
     drop(original);
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1225,6 +1250,15 @@ fn write_profile_is_sampled_only_on_owning_append_connections() {
     let mut before = None;
     db.visit_write_metrics(|metrics| before = Some(metrics));
     let before = before.unwrap();
+    let leased_frames = || {
+        db.live_metrics
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .counts
+            .leased_frames
+    };
+    let frames_before = leased_frames();
     db.write_batch(fixture.operation(1, 94), vec![put(10, 5)])
         .unwrap();
     let mut after = None;
@@ -1238,6 +1272,8 @@ fn write_profile_is_sampled_only_on_owning_append_connections() {
         after.pipeline.concurrent_admitted - before.pipeline.concurrent_admitted,
         1
     );
+    // The sampled write is one coordinator-written leased frame.
+    assert_eq!(leased_frames() - frames_before, 1);
     db.finish_write_profile().unwrap();
     let mut snapshot = None;
     db.visit_write_metrics(|metrics| snapshot = Some(metrics));
@@ -1248,103 +1284,8 @@ fn write_profile_is_sampled_only_on_owning_append_connections() {
     assert_eq!(profile.captured_connections, profile.expected_connections);
     assert_eq!(profile.profile_activation_errors, 0);
     assert_eq!(profile.profile_capture_errors, 0);
-    assert_eq!(profile.profile.storage_write.append_calls, 1);
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn timeline_links_real_tls_wal_receipt_and_keeps_running_after_cap() {
-    use crate::distributed::write_timeline::WriteTimelineStage as Stage;
-    // It asserts the flusher's queue timing, which exists only for the synchronous tier.
-    let fixture = Fixture::new().synchronous();
-    let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    let trace = &db.write_timeline;
-    db.arm_write_timeline(1, 1).unwrap();
-    let operation = fixture.operation(1, 901);
-    let sample = trace.begin(17).unwrap();
-    trace.operation(sample, operation);
-    let version = db
-        .write_batch_traced(operation, vec![put(901, 1)], Some(sample))
-        .unwrap();
-    trace.complete(sample, None);
-    assert!(trace.begin(18).is_none());
-    db.write_batch(fixture.operation(1, 902), vec![put(902, 2)])
-        .unwrap();
-    let export = db
-        .finish_write_timeline_until(Instant::now() + Duration::from_secs(5))
-        .unwrap();
-    assert_eq!(export.dropped_calls, 1);
-    assert_eq!(export.incomplete_calls, 0);
-    assert!(export.write_wait_metrics.enabled);
-    assert!(export.write_wait_metrics.complete);
-    assert!(!export.write_wait_metrics.saturated);
-    for (index, window) in export.write_wait_metrics.windows.iter().enumerate() {
-        assert_eq!(window.observations, 2);
-        assert_eq!(window.depth_sum, 2);
-        assert_eq!(window.depth_max, 1);
-        assert_eq!(window.wake_attempts, if index == 1 { 0 } else { 2 });
-        assert!(window.wake_coalesced <= window.wake_attempts);
-    }
-    let record = &export.records[0];
-    assert_eq!(record.caller_sample_id, 17);
-    assert_eq!(record.operation, Some(operation));
-    assert_eq!(record.batch, Some(version));
-    let position = |stage| {
-        record
-            .events
-            .iter()
-            .position(|event| event.stage == stage)
-            .unwrap()
-    };
-    assert!(position(Stage::OwnerEnqueueStarted) < position(Stage::OwnerDequeued));
-    assert!(position(Stage::Prepared) < position(Stage::AppendEnqueueStarted));
-    assert!(position(Stage::AppendEnqueueStarted) < position(Stage::WorkerDequeued));
-    assert!(position(Stage::WorkerDequeued) < position(Stage::TxQueued));
-    assert!(position(Stage::TxQueued) < position(Stage::CompletionHarvested));
-    assert!(position(Stage::CompletionHarvested) < position(Stage::DurableObserved));
-    assert!(position(Stage::DurableObserved) < position(Stage::Published));
-    for (start, end) in [
-        (Stage::OwnerEnqueueStarted, Stage::OwnerDequeued),
-        (Stage::Admitted, Stage::AppendEnqueueStarted),
-        (Stage::CompletionHarvested, Stage::DurableObserved),
-    ] {
-        assert!(
-            record.events[position(start)].elapsed_ns <= record.events[position(end)].elapsed_ns
-        );
-    }
-    let submitted = &record.events[position(Stage::TxQueued)];
-    let decoded = &record.events[position(Stage::CompletionHarvested)];
-    assert_eq!(submitted.owner, decoded.owner);
-    assert_eq!(submitted.envelope_id, decoded.envelope_id);
-    assert!(submitted.envelope_id.is_some());
-    assert!(export.owner_storage_durations_available);
-    assert_eq!(export.owner_incomplete_records, 0);
-    assert_eq!(export.owner_dropped_records, 1);
-    let owner = export
-        .owner_records
-        .iter()
-        .find(|owner| {
-            Some(owner.owner) == submitted.owner && Some(owner.envelope_id) == submitted.envelope_id
-        })
-        .unwrap();
-    assert!(owner.success);
-    assert!(owner.appender_queue_ns.is_some());
-    assert!(owner.flusher_queue_ns.is_some());
-    assert!(owner.append_persist_ns.is_some());
-    assert!(owner.append_validation_ns.is_some());
-    assert_eq!(
-        owner.append_validation_ns.unwrap(),
-        owner.append_basic_validation_ns.unwrap()
-            + owner.append_conflict_lookup_ns.unwrap()
-            + owner.append_geometry_capacity_ns.unwrap()
-            + owner.append_metadata_reservation_ns.unwrap()
-            + owner.append_descriptor_preparation_ns.unwrap()
-    );
-    assert!(owner.response_ready_ns.is_some());
-    assert_eq!(owner.epoch, Some(version.epoch));
-    let capture = owner.persistence_capture.unwrap();
-    assert!(capture.captured_appended_end > capture.durable_end);
-    assert!(owner.ready_append_prefix.is_some());
+    // Owners only adopt leased frames: their append path records no call.
+    assert_eq!(profile.profile.storage_write.append_calls, 0);
     db.shutdown().unwrap();
 }
 
@@ -1416,47 +1357,10 @@ fn timeline_preserves_validation_error_without_inventing_batch() {
 }
 
 #[test]
-fn sui_traced_write_exports_correlated_owner_record() {
-    use crate::distributed::sui::Db;
-    use crate::distributed::write_timeline::WriteTimelineStage as Stage;
-    let fixture = Fixture::new();
-    let db = Db::open_remote(
-        &fixture.temp.path().join("authority"),
-        fixture.shape.clone(),
-        fixture.config.clone(),
-    )
-    .unwrap();
-    db.arm_write_timeline(1, 1).unwrap();
-    let mut batch = db.write_batch();
-    batch.write(db.ks("root"), 911u32.to_be_bytes().to_vec(), vec![3u8; 32]);
-    batch.commit_traced(42).unwrap();
-    let export = db
-        .finish_write_timeline_until(Instant::now() + Duration::from_secs(5))
-        .unwrap();
-    assert_eq!(export.records.len(), 1);
-    assert_eq!(export.records[0].caller_sample_id, 42);
-    let event = export.records[0]
-        .events
-        .iter()
-        .find(|event| event.stage == Stage::TxQueued)
-        .unwrap();
-    assert!(
-        export
-            .owner_records
-            .iter()
-            .any(|record| Some(record.owner) == event.owner
-                && Some(record.envelope_id) == event.envelope_id)
-    );
-    assert_eq!(export.owner_expected_connections, 5);
-    assert_eq!(export.owner_captured_connections, 5);
-    db.wait_for_background_threads_to_finish().unwrap();
-}
-
-#[test]
 fn sui_timeline_finish_deadline_does_not_wait_for_shared_gate() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new();
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -1502,7 +1406,7 @@ fn large_put(key: u32) -> Mutation {
 fn sui_timing_visitors_export_authority_split_counters() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new();
-    let db = Db::open_remote(
+    let db = Db::open_remote_local_fixture(
         &fixture.temp.path().join("authority"),
         fixture.shape.clone(),
         fixture.config.clone(),
@@ -2205,7 +2109,8 @@ fn sui_multi_window_get_succeeds_with_view_budget_exhausted() {
     // No cache: every window fetches its misses under the shared floor pin.
     fixture.config.read_cache_bytes = 0;
     let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
+    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
+        .unwrap();
     let ks = db.ks("root");
     let partition = |sequence: u64| {
         let mut operation = [0; 16];

@@ -290,19 +290,21 @@ class OwnerCountTests(unittest.TestCase):
             runtime.request = Mock(return_value={"receipt": "proof"})
             job = {"case_id": "case", "backend": "tidehunter_nvme_tcp", "owner_count": count,
                    "nvmeof_route": "live", "keys": 16, "warmup_operations": 1, "measurement_operations": 2,
-                   "coordinator_cache_bytes": 0}
+                   "coordinator_cache_bytes": 0, "owner_history_diagnostics": True}
             with tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 def prepare(argv, **kwargs):
                     prep = json.loads((directory / "prepare-input.json").read_text())
                     self.assertEqual(prep["owner_wal_geometry"], "research")
+                    self.assertNotIn("owner_read_resident_first", prep)
+                    self.assertNotIn("owner_read_memory_allowance_bytes", prep)
+                    self.assertNotIn("owner_read_workers", prep)
                     self.assertEqual(prep["addresses"], [
                         host["address"] + ":9400" for host in config["fleet"]["nodes"][:count]])
                     prepared = directory / "prepared"
                     prepared.mkdir()
                     (prepared / "remote.json").write_text(json.dumps({"tls": {}, "live_nvme": {},
                         "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}))
-                    (prepared / "external_owner_read_config.json").write_text("[]")
                     for index in range(count):
                         node = prepared / f"node-{index}"
                         node.mkdir()
@@ -319,14 +321,16 @@ class OwnerCountTests(unittest.TestCase):
                 self.assertEqual(options, {
                     "path": str(directory / "database"), "evidence": str(directory / "read-evidence"),
                     "owners": count, "key_count": 1048576, "max_batches_per_partition": 16384,
-                    "coordinator_read_cache_bytes": 0, "owner_read_resident_first": False,
+                    "coordinator_read_cache_bytes": 0,
                     "external_remote_config": {"tls": {}, "live_nvme": {},
                         "storage": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}, "durability_tier": "native",
                     "external_owner_durability_receipts": [
                         str((directory / "owner-durability" / f"node-{i}.durability.json").absolute())
-                        for i in range(count)], "external_owner_read_config": []})
+                        for i in range(count)]})
                 self.assertEqual(len(options["external_owner_durability_receipts"]), count)
                 self.assertEqual(sorted(call.args[0] for call in runtime.request.call_args_list), list(range(count)))
+                self.assertTrue(all(not call.args[1]["owner_history_diagnostics"]
+                                    for call in runtime.request.call_args_list))
                 self.assertEqual(sorted(path.name for path in (directory / "owner-durability").iterdir()),
                                  [f"node-{i}.durability.json" for i in range(count)])
 
@@ -343,6 +347,28 @@ class OwnerCountTests(unittest.TestCase):
             self.assertEqual(runtime.owner_batch("nvme_owner_stop", "case"), [{"complete": True}])
             runtime.stop_tide()
         self.assertEqual([call.args[0] for call in runtime.request.call_args_list], [0, 0])
+
+    def test_only_sealed_archive_case_collects_owner_history_on_stop(self):
+        config = config_fixture()
+        runtime = controller.Controller(config, clients_fixture(config))
+        runtime.cleanup_deadline = Mock(return_value=300)
+        runtime.cleanup_timeout = Mock(return_value=30)
+        archive = controller.cloud_campaign.Q0_SELECTION
+        record = {"schema_version": 1, "epoch_stats": [[1, {"waits": 0}]]}
+        for selection in ("nvmeof_m3_t2_2", archive):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as tmp:
+                runtime.root = Path(tmp)
+                directory = runtime.root / "case"
+                job = {"case_id": "case", "selection": selection, "owner_history_diagnostics": True}
+                runtime.active_tide = (job, directory, [0])
+                result = {"history_maintenance": record} if selection == archive else {}
+                runtime.request = Mock(return_value=result)
+                runtime.stop_tide()
+                self.assertIs(runtime.request.call_args.args[1]["owner_history_diagnostics"], selection == archive)
+                path = directory / "owner-durability/node-0.history-maintenance.json"
+                self.assertIs(path.exists(), selection == archive)
+                if selection == archive:
+                    self.assertEqual(json.loads(path.read_text()), record)
 
     def test_active_owner_failure_still_cleans_only_that_owner(self):
         config = config_fixture()
@@ -946,6 +972,15 @@ class OwnershipTests(unittest.TestCase):
 
 
 class CounterAdmissionTests(unittest.TestCase):
+    def test_current_live_evidence_needs_no_retired_owner_read_configuration(self):
+        job = {"backend": "tidehunter_nvme_rdma", "nvmeof_route": "live", "coordinator_cache_bytes": 0,
+               "owner_read_resident_first": True}
+        evidence = {"schema_version": 1, "backend": "tidehunter_live_nvmeof",
+                    "coordinator": {"read_rpc_count": 0, "cache": {"budget_bytes": 0}}}
+        controller.verify_counter_evidence(job, evidence)
+        with self.assertRaisesRegex(controller.SafetyError, "actual owner configurations"):
+            controller.verify_counter_evidence(job | {"selection": controller.cloud_campaign.Q0_SELECTION}, evidence)
+
     def test_zero_hits_is_observation_not_fabricated_cache_success(self):
         job = {"backend": "tidehunter_tcp", "coordinator_cache_bytes": 128 * 1024**2}
         evidence = {"schema_version": 1, "backend": "tidehunter_tcp",

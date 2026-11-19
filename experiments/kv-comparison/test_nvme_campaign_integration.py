@@ -301,13 +301,10 @@ class CampaignModeTests(unittest.TestCase):
                                'counters': {'read_profile_live_inline': 0}}},
                     'live_nvmeof': {'available': True, 'counters': dict(end)}}
         if selection in cloud_campaign.M3_SELECTIONS:
-            owner_count = cloud_campaign.active_owner_count(job)
-            for boundary in ('start', 'end', 'deltas'):
-                evidence[boundary]['owner_executor'] = {'available': True, 'partitions': {
-                    str(i): {'available': True, 'counters': {}} for i in range(owner_count)}}
             incomplete = copy.deepcopy(evidence)
-            incomplete['deltas']['owner_executor']['partitions'].pop(str(owner_count - 1))
-            self.assertIn('per-owner measurement counter population unavailable',
+            incomplete['end']['live_nvmeof']['fence_evidence_dropped'] = 1
+            incomplete['live_nvmeof']['counters']['fence_evidence_dropped'] = 1
+            self.assertIn('live NVMe route or fence evidence was dropped',
                 cloud_campaign.qualify_live_nvme_measurement(incomplete, job, self.exported(job))['reasons'])
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(evidence, job, self.exported(job))['qualified'])
         mixed = dict(job, mix={'read': 50, 'put': 50})
@@ -333,7 +330,7 @@ class CampaignModeTests(unittest.TestCase):
         self.assertTrue(cloud_campaign.qualify_live_nvme_measurement(current, mixed, self.exported(mixed))['qualified'])
         for name, value, reason in (
                 ('metadata_requests', 554 + mixed['read_lanes'] + 2, 'permanent export sent owner requests for reads'),
-                ('payload_rpc_requests', 1, 'payload RPC observed on live NVMe route')):
+                ('unknown_writes', 1, 'live NVMe errors or unknown writes observed')):
             bad = copy.deepcopy(current)
             bad['end']['live_nvmeof'][name] = bad['start']['live_nvmeof'][name] + value
             bad['live_nvmeof']['counters'][name] = value

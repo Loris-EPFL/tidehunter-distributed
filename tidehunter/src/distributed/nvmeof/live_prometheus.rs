@@ -232,12 +232,6 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
             "Writes with unknown outcome",
         ),
         ("errors_total", c.errors, false, "Live data plane errors"),
-        (
-            "payload_rpc_requests_total",
-            c.payload_rpc_requests,
-            false,
-            "Live payload RPC requests",
-        ),
     ];
     macro_rules! stage {
         ($name:literal, $ns:ident, $samples:ident, $help:literal $(,)?) => {

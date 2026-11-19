@@ -8,7 +8,6 @@ use rand::seq::SliceRandom;
 
 pub(super) fn wave(
     db: &ConcurrentRemoteDatabase,
-    readers: &Readers,
     recorder: &Recorder,
     case: &Case,
     operations: &[[u8; 16]],
@@ -36,31 +35,33 @@ pub(super) fn wave(
             });
         }
         barrier.wait();
-        observe(db, readers, recorder);
+        observe(db, recorder);
     });
 }
 
-fn case(seed: u64, owners: usize, hot: bool, native: bool) -> Case {
+/// `profile` selects the leased write policy and owner tier (`leased::profile`).
+fn case(seed: u64, owners: usize, hot: bool, profile: usize) -> Case {
     Case {
         concurrent: true,
-        native,
         gate_waves: 1 + (seed as usize & 1),
-        ..Case::rpc(seed, owners, hot)
+        ..Case::new(seed, owners, hot, leased::profile(profile))
     }
 }
 
+/// Bounded default controls: profile 0 is the Native tier, profile 4 the
+/// Synchronous tier with its default GroupFlush policy.
 #[test]
 fn write_model_concurrent_bounded() {
     let started = Instant::now();
-    for (owners, hot, native, boundary) in [
-        (1, false, false, ""),
-        (16, true, true, ""),
-        (2, true, false, "publication_before"),
-        (4, false, true, "checkpoint_root_after"),
+    for (owners, hot, profile, boundary) in [
+        (1, false, 4, ""),
+        (16, true, 0, ""),
+        (2, true, 4, "publication_before"),
+        (4, false, 0, "checkpoint_root_after"),
     ] {
         run_case(&Case {
             boundary: boundary.into(),
-            ..case(0xc011 + owners as u64, owners, hot, native)
+            ..case(0xc011 + owners as u64, owners, hot, profile)
         });
     }
     assert!(started.elapsed() < Duration::from_secs(60));
@@ -81,44 +82,6 @@ fn selection(name: &str, all: u64) -> u64 {
     value
 }
 
-#[test]
-#[ignore = "1000 seeded schedules per owner count/distribution/tier; real subprocess crashes"]
-fn write_model_concurrent_thousand_schedules() {
-    // Unfiltered, each configuration gets exactly 1000 generated schedules.
-    // Rotate all exposed cuts plus a no-cut control; never sample away a cut.
-    let owner_filter = env_number("TH_MODEL_OWNERS", 0);
-    assert!(owner_filter <= 16, "TH_MODEL_OWNERS must be 0..=16");
-    let hot_filter = selection("TH_MODEL_HOT", 2);
-    let native_filter = selection("TH_MODEL_NATIVE", 2);
-    let seed = env_number("TH_MODEL_SEED", 0xc011);
-    let schedules = schedule_range();
-    for owners in 1..=16 {
-        if owner_filter != 0 && owner_filter != owners as u64 {
-            continue;
-        }
-        for hot in [false, true] {
-            if hot_filter != 2 && hot_filter != u64::from(hot) {
-                continue;
-            }
-            for native in [false, true] {
-                if native_filter != 2 && native_filter != u64::from(native) {
-                    continue;
-                }
-                for schedule in schedules.clone() {
-                    let boundary = schedule as usize % (BOUNDARIES.len() + 1);
-                    run_case(&Case {
-                        boundary: boundary
-                            .checked_sub(1)
-                            .map_or_else(String::new, |index| BOUNDARIES[index].into()),
-                        ..case(seed.wrapping_add(schedule), owners, hot, native)
-                    });
-                }
-            }
-        }
-    }
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 #[ignore = "1000 seeded schedules per leased owner count/distribution/durability policy"]
 fn write_model_concurrent_leased_thousand_schedules() {
@@ -149,10 +112,7 @@ fn write_model_concurrent_leased_thousand_schedules() {
                     continue;
                 }
                 for schedule in schedules.clone() {
-                    let case = Case {
-                        leased: Some(leased::profile(profile)),
-                        ..case(seed.wrapping_add(schedule), owners, hot, false)
-                    };
+                    let case = case(seed.wrapping_add(schedule), owners, hot, profile);
                     let boundaries = leased::boundaries(&case);
                     let boundary = schedule as usize % (boundaries.len() + 1);
                     run_case(&Case {
@@ -168,32 +128,10 @@ fn write_model_concurrent_leased_thousand_schedules() {
 }
 
 #[test]
-#[ignore = "exhaustive RPC crash cuts in both tiers; bounded controls run by default"]
-fn write_model_concurrent_every_rpc_boundary() {
-    for native in [false, true] {
-        for (index, boundary) in BOUNDARIES.iter().enumerate() {
-            run_case(&Case {
-                boundary: (*boundary).into(),
-                ..case(
-                    0xc011 + index as u64,
-                    1 + index % 16,
-                    index % 2 == 0,
-                    native,
-                )
-            });
-        }
-    }
-}
-
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-#[test]
 #[ignore = "exhaustive leased crash cuts in Native, GroupFlush and FUA"]
 fn write_model_concurrent_every_leased_boundary() {
     for profile in [0, 4, 6] {
-        let case = Case {
-            leased: Some(leased::profile(profile)),
-            ..case(0xc011 + profile as u64, 2, profile == 0, false)
-        };
+        let case = case(0xc011 + profile as u64, 2, profile == 0, profile);
         for boundary in leased::boundaries(&case) {
             run_case(&Case {
                 boundary: boundary.into(),
@@ -214,18 +152,31 @@ fn fixture() -> Fixture {
             config.storage.batch_limits.max_operations = 32;
             config.max_index_bytes = 16 * 1024 * 1024;
         },
-        |config| super::super::super::tcp::StorageNode::open(config, recovery_metrics()).unwrap(),
+        |_| {},
     )
     .synchronous()
+}
+
+/// Wait until the writer submitted the frame whose completion it holds.
+fn wait_held_flight(client: &Arc<Mutex<Client>>) -> Result<(), &'static str> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.lock().leased_flights_in_flight() == 0 {
+        if Instant::now() >= deadline {
+            return Err("held leased write was never submitted");
+        }
+        thread::yield_now();
+    }
+    Ok(())
 }
 
 #[test]
 fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
     let fixture = fixture();
     let original = fixture.open();
-    let (entered, release) = fixture.nodes[0]
-        .pause_next_persist(original.epoch())
-        .unwrap();
+    // Hold the completion of owner 0's next leased frame: the original write
+    // stays in flight until the test releases it.
+    let writer = original.core.clients[0].client.clone();
+    writer.lock().leased_test_hold_next_completion();
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let operation = fixture.operation(0, 42);
     let edits = vec![
@@ -239,7 +190,7 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
         },
     ];
     // Two writers share a capacity-two result channel; the flusher has one
-    // result slot. All senders are joined after releasing the persistence gate.
+    // result slot. All senders are joined after releasing the held completion.
     let (written, writes) = mpsc::sync_channel(2);
     let (flushed, flush) = mpsc::sync_channel(1);
     let (invoked, invocations) = mpsc::sync_channel(2);
@@ -253,7 +204,7 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
                 .send(db.write_batch(operation, mutations(edits, 8)))
                 .unwrap()
         });
-        let paused = entered.recv_timeout(Duration::from_secs(5));
+        let paused = wait_held_flight(&writer);
         scope.spawn(move || {
             invoked_retry.send(()).unwrap();
             written
@@ -261,7 +212,7 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
                 .unwrap();
         });
         scope.spawn(move || {
-            // Invocation is recorded while the original write is held at sync.
+            // Invocation is recorded while the original write is held in flight.
             invoked.send(()).unwrap();
             flushed.send(db.flush_durable()).unwrap();
         });
@@ -283,7 +234,7 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
         let before_release = writes.try_recv();
         let flush_before_release = flush.try_recv();
         // Release before asserting so a failed assertion cannot strand a join.
-        release.send(()).unwrap();
+        writer.lock().leased_test_release_held();
         paused.unwrap();
         retry_invoked.unwrap();
         flush_invoked.unwrap();
@@ -345,6 +296,8 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
     );
     db.flush_index().unwrap();
     db.shutdown().unwrap();
+    // A client clone keeps the live connection registry (and its lock) alive.
+    drop(writer);
     let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     assert_eq!(
         reopened
@@ -366,7 +319,14 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
 #[test]
 fn write_model_uncertain_append_fail_stops_and_recovers_identity() {
     let fixture = fixture();
-    let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
+    let original = fixture.open();
+    // Owner 0's next frame reaches its WAL file but completes with EIO: the
+    // outcome is unknown to the authority, as for a lost reply.
+    original.core.clients[0]
+        .client
+        .lock()
+        .leased_test_fail_write(-libc::EIO);
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let operation = fixture.operation(0, 99);
     let edits = vec![
         Edit {
@@ -378,11 +338,10 @@ fn write_model_uncertain_append_fail_stops_and_recovers_identity() {
             value: Some(7),
         },
     ];
-    fixture.nodes[0].inject_drop_next_append_response();
     let error = db.write_batch(operation, mutations(&edits, 8)).unwrap_err();
     let uncertain = error
         .uncertain_version
-        .expect("lost append reply must be unknown, not aborted");
+        .expect("unknown write outcome must be unknown, not aborted");
     assert!(
         db.write_batch(fixture.operation(1, 100), mutations(&edits, 8))
             .is_err()
@@ -416,7 +375,6 @@ fn write_model_uncertain_append_fail_stops_and_recovers_identity() {
 /// A fresh lane has no file grant to bypass owner reference admission. This
 /// keeps close paused after the coordinator has synced and acknowledged bytes
 /// in its pre-leased successor, so the cold-grant check is not a timing race.
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
     use crate::distributed::storage::LivePausePoint;
@@ -431,12 +389,13 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
             config.max_index_bytes = 16 * 1024 * 1024;
             config.timeout = Duration::from_secs(5);
             leased::configure(config, leased::profile(4));
+            // One read lane, warmed below.
+            config.read_lanes = Some(1);
         },
-        leased::open_node,
+        |_| {},
     )
     .synchronous();
-    let mut original = fixture.open();
-    leased::prepare_database(&mut original);
+    let original = fixture.open();
     let writer = original.core.clients[0].client.clone();
     let log = fixture.nodes[0].log_for_test(original.epoch());
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
@@ -448,6 +407,19 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
         .collect();
     db.write_batch(fixture.operation(0, 500), mutations(&first, 4096))
         .unwrap();
+    // A lane's first read sends OpenLiveExports, an exclusive owner control
+    // that waits behind in-flight stream adoptions, so a first read on a
+    // fresh lane would wait for the paused close below until its deadline.
+    // Warm the only lane with a key the second batch does not write.
+    {
+        let (cut, _pin) = db.protected_published_cut().unwrap();
+        let warm = db
+            .submit_get_cut(KeySpace(0), &key_bytes(0), cut)
+            .and_then(|pending| db.finish_ready_get(pending.wait()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm.as_ref(), 1u64.to_le_bytes().repeat(512));
+    }
     let (entered, release) = log.pause_live(LivePausePoint::CloseSuffix);
     let second: Vec<_> = (32..54)
         .map(|key| Edit {
@@ -478,10 +450,17 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
                 log.synced_frontier(),
                 writer.lock().leased_test_completion_prefixes(),
             );
-            Some(
-                db.submit_get_cut(KeySpace(0), &key_bytes(32), cut)
-                    .and_then(|pending| db.finish_ready_get(pending.wait())),
-            )
+            // Checked after the release below: the value is acknowledged but
+            // its frame is not adopted (the close that would adopt it is
+            // paused before its scan), and the read takes the cold path.
+            let unadopted = reference.batch_address.offset + u64::from(reference.batch_address.len)
+                > log.appended_frontier();
+            let before = db.read_cache_stats();
+            let value = db
+                .submit_get_cut(KeySpace(0), &key_bytes(32), cut)
+                .and_then(|pending| db.finish_ready_get(pending.wait()));
+            let after = db.read_cache_stats();
+            Some((value, unadopted, before, after))
         } else {
             None
         };
@@ -492,7 +471,14 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
         read.unwrap()
     });
     let shutdown = db.shutdown();
-    let value = read.expect("a cold live read must return the synchronously acknowledged value");
+    let (value, unadopted, before, after) = read;
+    assert!(unadopted, "the read must target an unadopted frame");
+    assert_eq!(
+        after.hits, before.hits,
+        "the read must not be served from the coordinator cache"
+    );
+    assert!(after.misses > before.misses);
+    let value = value.expect("a cold live read must return the synchronously acknowledged value");
     assert_eq!(value.unwrap().as_ref(), 2u64.to_le_bytes().repeat(512));
     shutdown.unwrap();
 }

@@ -354,7 +354,7 @@ pub enum WalMemberReadPolicy {
 /// Validated member range retaining its exact file, never a pathname reopened
 /// after submission. Distributed readers additionally retain their PartitionLog
 /// authority/segment lifetime until the completion is retired.
-#[cfg(feature = "experimental-distributed")]
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone)]
 pub(crate) struct WalMemberReadPlan {
     pub(crate) file: Arc<File>,
@@ -599,7 +599,7 @@ impl Wal {
         Ok(CrcFrame::CRC_HEADER_LENGTH + range.start..CrcFrame::CRC_HEADER_LENGTH + range.end)
     }
 
-    #[cfg(feature = "experimental-distributed")]
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn plan_record_payload_range(
         &self,
         parent: WalPosition,
@@ -1922,7 +1922,7 @@ mod tests {
         // assert_eq!(2048, fs::metadata(file).unwrap().len());
     }
 
-    #[cfg(feature = "experimental-distributed")]
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn retained_file_unlink_preserves_inflight_read_owners_and_empty_reopen() {
         let dir = tempdir::TempDir::new("retained-wal-pins").unwrap();

@@ -219,7 +219,9 @@ fn leased_worker_group_flush_replies_and_checkpoint_cover_the_durable_prefix() {
             .durable_end
             >= written
     );
-    assert!(fixture.node.log_for_test(1).synced_frontier() >= written);
+    // A position proof persists the WAL position root, not adopted-receipt
+    // bookkeeping (the removed receipt-prefix proof did that).
+    assert!(fixture.node.log_for_test(1).position_frontier_for_test() >= written);
     drop(worker);
     assert!(!failure.load(Ordering::Acquire));
 }
@@ -529,7 +531,8 @@ fn leased_measurement_gate_observations_keep_warm_extent() {
         if timeline {
             worker.control_handle().owner_timeline_arm(64).unwrap();
         }
-        worker.read_io_stats().unwrap();
+        // A typed observation command; generic `Control` would close the extent.
+        receive(worker.stats().unwrap()).unwrap();
         let gate = fixture.metrics.snapshot().counts;
         let open = worker.client.lock().leased_test_frontier().1;
         let measured = receive(worker.enqueue(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
@@ -874,7 +877,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             max_pending_reads: 4,
             max_pending_read_bytes: 128 * 1024,
             write_profile_limit: 0,
-            live_nvme: Some(LiveClientConfig {
+            live_nvme: LiveClientConfig {
                 lease_ahead: true,
                 polled_writes: false,
                 host_nqn: "nqn.2026-01.test:leased".into(),
@@ -890,19 +893,13 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 leased_durability: DurabilityTier::Native,
                 inline_reads: true,
                 queue_geometry: Default::default(),
-            }),
+            },
             durable_cut: Default::default(),
         };
         let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
-        let database = RemoteDatabase::open(
-            root.path(),
-            &shape,
-            config,
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-        )
-        .unwrap();
+        let database =
+            RemoteDatabase::open_local_live_fixture(root.path(), &shape, config).unwrap();
         let client = database.core.clients[0].client.clone();
-        client.lock().bench_local_live_fixture(false);
         let batch = fixture.batch(0);
         database
             .write_batch(batch.id().operation, batch.mutations().to_vec())

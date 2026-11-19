@@ -148,10 +148,7 @@ pub(in crate::distributed::remote_db) struct OpenState {
     pub write_profile: Arc<Mutex<WriteProfileSnapshot>>,
     pub write_timeline: Arc<WriteTimeline>,
     pub clients: Vec<super::super::ClientWorker>,
-    pub operational_sampler: super::super::OperationalReadIoSampler,
     pub durable_cut: Option<super::super::durable_cut::DurableCut>,
-    pub transport_pool: Option<Arc<super::super::RemoteTransportPool>>,
-    pub transport_key: Option<[u8; 32]>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -213,11 +210,8 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub stopped: AtomicBool,
     pub closing: AtomicBool,
     pub clients: Vec<super::super::ClientWorker>,
-    pub operational_sampler: super::super::OperationalReadIoSampler,
     /// Present when this epoch is tracked under durable-prefix recovery.
     pub durable_cut: Option<super::super::durable_cut::DurableCut>,
-    pub transport_pool: Option<Arc<super::super::RemoteTransportPool>>,
-    pub transport_key: Option<[u8; 32]>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -293,10 +287,7 @@ impl WriteCore {
             closing: AtomicBool::new(false),
             owner_controls,
             clients: open.clients,
-            operational_sampler: open.operational_sampler,
             durable_cut: open.durable_cut,
-            transport_pool: open.transport_pool,
-            transport_key: open.transport_key,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool: open.live_pool,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -398,6 +389,50 @@ impl WriteCore {
         publisher + self.identities.resident_bytes() + self.dependencies.resident_bytes()
     }
 
+    /// Retained operation identities of every class (Active, Suffix, Recent).
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(in crate::distributed::remote_db) fn resident_identities(&self) -> usize {
+        [
+            IdentityClass::Active,
+            IdentityClass::Suffix,
+            IdentityClass::Recent,
+        ]
+        .into_iter()
+        .map(|class| self.identities.count(class))
+        .sum()
+    }
+
+    /// Static upper bound of [`Self::metadata_history_bytes`] under the fixed
+    /// WAL-replay retry window (`WAL_REPLAY_WINDOW_BATCHES` receipts), from
+    /// configuration and entry sizes only. Live entries: `known` ≤
+    /// `max_admitted_batches`; `recent` ≤ the window; identities ≤ the window
+    /// (Recent) plus one admission credit each for Active/Suffix (≤
+    /// `max_admitted_batches`); dependency keys belong to admitted batches. A
+    /// std `HashMap` holding at most `n` live entries never keeps more than
+    /// `4 * (n + 1) + 8` slots (it grows only when over half full, and both
+    /// registries shrink a shard above four slots per entry), so the shard sums
+    /// add at most 12 slots per shard. A `VecDeque` at most doubles past its
+    /// peak length or its initial window capacity.
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(in crate::distributed::remote_db) fn metadata_history_bound(&self) -> usize {
+        let window = super::super::WAL_REPLAY_WINDOW_BATCHES;
+        let admitted = self.config.max_admitted_batches;
+        let map = |live: usize| 4 * (live + 1) + 8;
+        let known =
+            map(admitted) * (std::mem::size_of::<BatchId>() + std::mem::size_of::<AppendedBatch>());
+        let recent = 2 * window * std::mem::size_of::<RecentReceipt>();
+        let identities = (4 * (window + admitted) + 12 * self.identities.shard_count())
+            * IdentityTable::entry_bytes();
+        // Spilled key storage of one batch is below its encoded size; a
+        // spilled buffer at most doubles past its length.
+        let dependencies =
+            (4 * admitted * self.config.storage.batch_limits.max_operations as usize
+                + 12 * self.dependencies.shard_count())
+                * DependencyRegistry::entry_bytes()
+                + 2 * admitted * self.config.storage.batch_limits.max_encoded_bytes;
+        known + recent + identities + dependencies
+    }
+
     /// Metrics variant: contention on the publisher or on any identity or key
     /// shard makes the value unavailable; sampling never blocks a writer.
     pub(in crate::distributed::remote_db) fn try_metadata_history_bytes(&self) -> Option<usize> {
@@ -432,15 +467,21 @@ impl WriteCore {
         &self,
         next: u64,
     ) -> Result<(), LocalDbError> {
-        self.wait_published_inner(next).map_err(|mut error| {
-            if error.uncertain_version.is_none() {
-                error.uncertain_version = self
-                    .first_failure
-                    .get()
-                    .and_then(super::super::FirstFailure::version);
-            }
-            error
-        })
+        self.wait_published_inner(next)
+            .map_err(|error| self.with_first_failure_version(error))
+    }
+
+    /// Names the first causal failure's uncertain version on `error` unless
+    /// it already names one. Every fail-stop error a waiter can observe
+    /// (early health check or wait) must carry it.
+    pub(super) fn with_first_failure_version(&self, mut error: LocalDbError) -> LocalDbError {
+        if error.uncertain_version.is_none() {
+            error.uncertain_version = self
+                .first_failure
+                .get()
+                .and_then(super::super::FirstFailure::version);
+        }
+        error
     }
 
     /// The old authority filled the post-publish read cache and installed the
@@ -687,7 +728,7 @@ impl WriteCore {
 
 /// Exact test observations of the shared write state. Each helper takes at
 /// most one lock at a time and never holds it across another call.
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 impl WriteCore {
     /// True when this epoch's version is published in its live slot, or has
     /// left the ring below the published floor (aborts are not distinguished
@@ -815,7 +856,7 @@ impl WriteCore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::distributed::remote_db::pipeline_tests::Fixture;

@@ -49,7 +49,7 @@ Q0_OVERHEAD_FIELDS = ("live_frontier_installs", "durable_cut_nudges")
 LIVE_NVMEOF_FIELDS = (
     "completed_read_ops", "completed_read_bytes", "completed_write_ops",
     "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
-    "metadata_requests", "namespace_connects", "payload_rpc_requests",
+    "metadata_requests", "namespace_connects",
     "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
 LIVE_NVMEOF_STAGES = (
     "queue", "submit", "cq", "control", "validation", "publication", "namespace_setup", "read_io")
@@ -88,7 +88,7 @@ def live_nvmeof_expected_counters():
 
 
 # Sealed Q0 binaries and earlier reports can still carry these counters.
-ARCHIVE_LIVE_NVME_FIELDS = ("reserve_exchanges", "complete_exchanges")
+ARCHIVE_LIVE_NVME_FIELDS = ("reserve_exchanges", "complete_exchanges", "payload_rpc_requests")
 ARCHIVE_LIVE_NVME_STAGES = ("owner_completion", "allocation", "persistence",
                             "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace")
 ARCHIVE_LIVE_NVME_COUNTERS = set(ARCHIVE_LIVE_NVME_FIELDS) | {
@@ -932,7 +932,7 @@ LIVE_NVME_WRITE_SHARED_SAMPLES = {
 LIVE_NVME_WRITE_COUNTERS = {
     "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
     "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
-    "unknown_writes", "errors", "payload_rpc_requests",
+    "unknown_writes", "errors",
     "lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
     "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
     "lease_exchanges", "leased_frames", "leased_bytes",

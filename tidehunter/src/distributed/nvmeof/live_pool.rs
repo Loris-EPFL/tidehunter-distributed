@@ -285,7 +285,7 @@ impl LiveControllerPool {
     }
 
     /// Local-file fixture for a nonshared recovery controller identity.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn cache_local_namespace(
         &self,
         target: &LiveConnectTarget,
@@ -466,11 +466,12 @@ impl LiveControllerPool {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn register_local_target(&self, nqn: &str, path: std::path::PathBuf) {
+        // A poisoned map holds only fixture paths; recover it rather than panic.
         self.local_targets
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(nqn.to_owned(), path);
     }
 
@@ -497,7 +498,7 @@ impl LiveControllerPool {
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if let Some(path) = self
             .local_targets
             .lock()

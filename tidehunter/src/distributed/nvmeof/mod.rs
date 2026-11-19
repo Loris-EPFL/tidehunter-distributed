@@ -13,7 +13,8 @@ pub mod live_namespace;
 pub mod live_pool;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) mod live_prometheus;
-#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+/// Live WAL metadata types. Compiled in every feature set: owner-protocol
+/// payloads carry them (see `tcp::live_wire`).
 pub mod live_storage;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod live_target;
@@ -25,9 +26,6 @@ pub enum NvmeofTransport {
     Tcp,
     Rdma,
 }
-
-pub mod legacy_wire;
-pub use legacy_wire::SpdkTarget;
 
 /// Bounded live controller queues; defaults use four 128-entry I/O queues.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,9 +75,6 @@ pub struct LiveTargetConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LiveTargetStats {
     pub fixture_only: bool,
-    /// Wire placeholder, always `Kernel` (see `legacy_wire`).
-    #[serde(default)]
-    pub target_implementation: legacy_wire::LiveTargetImplementation,
     pub namespaces_exposed: u64,
     pub disable_drain_successes: u64,
     pub readonly_commission_successes: u64,

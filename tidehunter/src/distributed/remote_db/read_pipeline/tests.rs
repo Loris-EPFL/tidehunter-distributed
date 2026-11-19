@@ -1,3 +1,5 @@
+//! Scans over the leased live fixture, so the module needs nvmeof.
+#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::*;
 use crate::distributed::native_index::IndexReadCut;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
@@ -239,6 +241,8 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
     assert_eq!(as_rows(db.scan(KeySpace(0)).unwrap()), expected_rows);
     db.shutdown().unwrap();
     drop(db);
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop(owners);
     let mut reopened = fixture.open();
     assert_eq!(as_rows(reopened.scan(KeySpace(0)).unwrap()), expected_rows);
     reopened.shutdown().unwrap();
@@ -273,7 +277,7 @@ fn later_page_node_completes_while_first_node_is_explicitly_stalled() {
         .dispatch_scan_page(bounded_page(vec![rows[1].clone()]).unwrap(), pin)
         .unwrap();
     let (slots, receiver) = second.batch.reads.pop_back().unwrap();
-    let (value, _) = receiver.finish().unwrap();
+    let value = receiver.finish().unwrap();
     assert_eq!(value, vec![put(1, 8)]);
     assert!(first.batch.reads[0].1.try_result().unwrap().is_none());
     for (slot, value) in slots.into_iter().zip(value) {

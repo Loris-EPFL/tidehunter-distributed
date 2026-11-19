@@ -251,7 +251,6 @@ fn crash_before_namespace_configuration_cleans_disabled_object() {
         service: f.config.service,
         transport: f.config.transport,
         readonly: false,
-        spdk: None,
         permanent: false,
     };
     manager.state.exports.push(Export {

@@ -2,11 +2,11 @@
 //! is a fixture. Record resolution, grant retirement and owner export reap are real.
 use super::*;
 use crate::distributed::durability::DurabilityTier;
+use crate::distributed::group::CompleteGroup;
 use crate::distributed::nvmeof::{
     live_connect::{LiveConnectTarget, LiveConnectionRegistry},
     live_pool::LiveControllerPool,
     live_storage::LiveGroupDescriptor,
-    live_target::LiveFileIdentity,
 };
 use std::os::unix::fs::FileExt;
 
@@ -134,7 +134,7 @@ fn hold_export_past_data_deadline(
     );
     let bound = Instant::now() + LIFECYCLE_TIMEOUT;
     while entered.try_recv().is_err() {
-        client.progress_reads().unwrap();
+        client.progress_session().unwrap();
         assert!(
             Instant::now() < bound,
             "export did not reach its first save"
@@ -147,13 +147,13 @@ fn hold_export_past_data_deadline(
     // the response, so the data class always closed the session here.
     let held = Instant::now();
     while held.elapsed() <= HELD_DATA_TIMEOUT {
-        client.progress_reads().unwrap();
+        client.progress_session().unwrap();
         assert!(client.take_control().is_none());
         std::thread::yield_now();
     }
     release.send(()).unwrap();
     let response = loop {
-        client.progress_reads().unwrap();
+        client.progress_session().unwrap();
         if let Some(response) = client.take_control() {
             break response.unwrap();
         }
@@ -167,9 +167,8 @@ fn hold_export_past_data_deadline(
 }
 
 /// Every request that can create a live export inline uses the lifecycle
-/// deadline class; an adoption without `lease_next` and a group completion stay
-/// data requests.
-fn assert_export_deadline_classes(descriptor: LiveGroupDescriptor) {
+/// deadline class; an adoption without `lease_next` stays a data request.
+fn assert_export_deadline_classes() {
     let token = [1; 16];
     let adopt = |lease_next| Request::AdoptLiveExtent {
         epoch: 1,
@@ -197,20 +196,7 @@ fn assert_export_deadline_classes(descriptor: LiveGroupDescriptor) {
         ),
         ("adopt and lease next", adopt(true), true),
         ("lease", Request::LeaseLiveExtent { epoch: 1 }, true),
-        (
-            "reserve",
-            Request::ReserveLiveGroup {
-                epoch: 1,
-                descriptor,
-            },
-            true,
-        ),
         ("adopt", adopt(false), false),
-        (
-            "complete",
-            Request::CompleteLiveGroup { epoch: 1, token },
-            false,
-        ),
     ] {
         let expected = if lifecycle {
             LIFECYCLE_TIMEOUT
@@ -227,10 +213,6 @@ fn assert_export_deadline_classes(descriptor: LiveGroupDescriptor) {
 #[test]
 fn export_creation_held_past_the_data_deadline_keeps_the_session() {
     let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
-    owner
-        .node
-        .set_history_persistence(crate::distributed::storage::HistoryPersistence::WalReplay)
-        .unwrap();
     let mut writer = owner.writer();
     let first = writer.lease_live_extent(1).unwrap();
     let batch = owner.batch(0);
@@ -241,8 +223,8 @@ fn export_creation_held_past_the_data_deadline_keeps_the_session() {
         owner.config.partition.group_limits,
     )
     .unwrap();
-    let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-    assert_export_deadline_classes(descriptor);
+    let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+    assert_export_deadline_classes();
     let next = close_next(&mut writer, &first, &frame);
     close_next(&mut writer, &next, &[]);
     let receipt = owner
@@ -312,191 +294,6 @@ fn first_lease_after_a_fence_held_past_the_data_deadline_keeps_the_session() {
     );
 }
 
-/// Each request kind counts exactly the exports it created inline, and a grant
-/// into a file that already has a binding counts nothing. Geometry: two
-/// 16 KiB extents per 32 KiB WAL file, so every second extent opens a file.
-#[test]
-fn inline_export_counts_follow_the_request_that_created_the_export() {
-    let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
-    owner
-        .node
-        .set_history_persistence(crate::distributed::storage::HistoryPersistence::WalReplay)
-        .unwrap();
-    let mut writer = owner.writer();
-    let exposed = || namespaces(&owner).0;
-    let exposed_before = exposed();
-    assert_eq!(
-        owner.node.live_inline_export_stats(),
-        LiveInlineExportStats::default()
-    );
-    let file = |lease: &LiveLeased| lease.extent.segment.file_index;
-
-    // Kind 33: the first lease of the epoch exports file 0.
-    let e0 = writer.lease_live_extent(1).unwrap();
-    let batch = owner.batch(0);
-    let group = CompleteGroup::new_live(
-        &writer.shape,
-        vec![batch.clone()],
-        owner.config.partition.batch_limits,
-        owner.config.partition.group_limits,
-    )
-    .unwrap();
-    let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-    // Kind 34 into the bound file 0: no export.
-    let e1 = close_extent(&mut writer, &e0, &frame, true).unwrap();
-    assert_eq!(file(&e1), file(&e0));
-    // Kind 36 opens file 1.
-    let Response::LiveLeased(e2) = writer
-        .request(Request::PreleaseLiveExtent {
-            epoch: 1,
-            after: e1.extent.token,
-        })
-        .unwrap()
-    else {
-        panic!("expected preleased extent")
-    };
-    assert_eq!(file(&e2), file(&e1) + 1);
-    close_extent(&mut writer, &e1, &[], false);
-    // Kind 34 into the bound file 1: no export; the next one opens file 2.
-    let e3 = close_next(&mut writer, &e2, &[]);
-    assert_eq!(file(&e3), file(&e2));
-    let e4 = close_next(&mut writer, &e3, &[]);
-    assert_eq!(file(&e4), file(&e3) + 1);
-    assert_eq!(
-        owner.node.live_inline_export_stats(),
-        LiveInlineExportStats {
-            lease: 1,
-            rollover: 1,
-            prelease: 1,
-            ..LiveInlineExportStats::default()
-        }
-    );
-
-    // Kind 29 after a fence (which revokes every export) re-exports file 0.
-    let receipt = owner
-        .node
-        .inventory
-        .lock()
-        .active(1)
-        .unwrap()
-        .receipt_page(0, 1)
-        .unwrap()[0];
-    let reference = batch.record_reference(receipt.address(), 0).unwrap();
-    writer.fence_to(2).unwrap();
-    let Response::LiveRecords(locations) = writer
-        .request(Request::ResolveLiveRecords {
-            authority_epoch: 2,
-            references: vec![reference],
-        })
-        .unwrap()
-    else {
-        panic!("expected live record locations")
-    };
-    assert_eq!(locations.entries.len(), 1);
-
-    let stats = owner.node.live_inline_export_stats();
-    assert_eq!(
-        stats,
-        LiveInlineExportStats {
-            lease: 1,
-            rollover: 1,
-            prelease: 1,
-            resolve: 1,
-            ..LiveInlineExportStats::default()
-        }
-    );
-    // Every export in this sequence was created inline by a request.
-    assert_eq!(exposed() - exposed_before, 4);
-}
-
-#[test]
-fn retiring_read_grant_keeps_idle_controller_export_across_file_rollover() {
-    let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
-    let mut client = owner.writer();
-    let first = client.lease_live_extent(1).unwrap();
-    let batch = owner.batch(0);
-    let group = CompleteGroup::new_live(
-        &client.shape,
-        vec![batch.clone()],
-        owner.config.partition.batch_limits,
-        owner.config.partition.group_limits,
-    )
-    .unwrap();
-    let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-    let next = close_next(&mut client, &first, &frame);
-    let receipt = owner
-        .node
-        .inventory
-        .lock()
-        .active(1)
-        .unwrap()
-        .receipt_page(0, 1)
-        .unwrap()[0];
-    let reference = batch.record_reference(receipt.address(), 0).unwrap();
-    let binding = &first.binding;
-    let target = LiveConnectTarget {
-        nqn: binding.nqn.clone(),
-        uuid: binding.uuid,
-        nsid: binding.nsid,
-        bytes: binding.bytes,
-        block_size: binding.block_size,
-        address: binding.address.clone(),
-        service: binding.service,
-        transport: binding.transport,
-        geometry: Default::default(),
-    };
-    let temp = tempdir::TempDir::new("rollover-controller-regression").unwrap();
-    let registry = LiveConnectionRegistry::open(&temp.path().join("registry")).unwrap();
-    let pool = Arc::new(LiveControllerPool::new(registry, 1, 1).unwrap());
-    pool.register_local_target(&target.nqn, first.extent.segment.path.clone());
-    client.live_pool = Some(pool.clone());
-    let mut cache = live_read::LiveReadCache::default();
-    let values = client
-        .live_read_records(
-            &mut cache,
-            1,
-            &[reference],
-            Instant::now() + Duration::from_secs(5),
-            None,
-        )
-        .unwrap();
-    assert_eq!(values, batch.mutations());
-    cache.close(&mut client, 1).unwrap();
-    assert!(owner.node.inventory.lock().live_pins.is_empty());
-    let next_file = close_next(&mut client, &next, &[]);
-    assert_eq!(next_file.extent.segment.file_index, 1);
-    owner
-        .node
-        .with_lifecycle(|inventory, slot| {
-            crate::distributed::tcp::NodeInventory::reap_idle_live_segments(
-                inventory,
-                slot.as_mut().unwrap(),
-                1,
-            )
-        })
-        .unwrap();
-    let segment = &first.extent.segment;
-    let file = LiveFileIdentity {
-        path: segment.path.clone(),
-        device: segment.device,
-        inode: segment.inode,
-        bytes: segment.bytes,
-        block_size: segment.block_size,
-    };
-    let exported = || {
-        owner
-            .node
-            .with_live_target(|target| target.binding_for_file(&file).is_some())
-    };
-    assert!(
-        exported(),
-        "idle connected controller lost its export at rollover"
-    );
-    pool.shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
-    assert!(!exported());
-}
-
 pub(crate) struct HistoryPool {
     pub(crate) owner: leased_tests::Fixture,
     pub(crate) client: Client,
@@ -508,10 +305,6 @@ pub(crate) struct HistoryPool {
 impl HistoryPool {
     pub(crate) fn new() -> Self {
         let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
-        owner
-            .node
-            .set_history_persistence(crate::distributed::storage::HistoryPersistence::WalReplay)
-            .unwrap();
         let mut client = owner.writer();
         let first = client.lease_live_extent(1).unwrap();
         let batch = owner.batch(0);
@@ -565,7 +358,7 @@ impl HistoryPool {
     }
 
     pub(crate) fn poison_owner(&self) -> bool {
-        self.owner.node.poison_readers();
+        self.owner.node.control_context.poison_readers();
         self.owner
             .node
             .inventory
@@ -585,7 +378,7 @@ impl HistoryPool {
     fn acquire_in(
         &self,
         pool: &LiveControllerPool,
-        proof: &crate::distributed::nvmeof::live_target::LiveTargetBinding,
+        proof: &crate::distributed::nvmeof::live_storage::LiveTargetBinding,
     ) -> io::Result<Arc<crate::distributed::nvmeof::live_pool::LiveControllerLease>> {
         let binding = &self.location.binding;
         let config = self.client.live_config.as_ref().unwrap();
@@ -611,6 +404,115 @@ impl HistoryPool {
         )
         .map(|(lease, _, _)| lease)
     }
+}
+
+/// Ported from the per-file active-epoch fixture (on-demand/per-file export
+/// modes were removed; active-epoch exports are permanent and never pinned):
+/// two fenced history files and a capacity-one controller pool. Pinning the
+/// second file evicts only the disconnected idle entry of the first (its pin
+/// is released, the second's is held), and dropping the pool releases the
+/// last pin.
+#[test]
+fn capacity_eviction_releases_only_disconnected_entry_and_drop_releases_last() {
+    let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
+    let mut client = owner.writer();
+    let frame_of = |sequence| {
+        let group = CompleteGroup::new_live(
+            &client.shape,
+            vec![owner.batch(sequence)],
+            owner.config.partition.batch_limits,
+            owner.config.partition.group_limits,
+        )
+        .unwrap();
+        LiveGroupDescriptor::from_group(&group).unwrap().1
+    };
+    let (first_frame, second_frame) = (frame_of(0), frame_of(1));
+    let first = client.lease_live_extent(1).unwrap();
+    let next = close_next(&mut client, &first, &first_frame);
+    let second = close_next(&mut client, &next, &[]);
+    assert_eq!(
+        second.extent.segment.file_index,
+        first.extent.segment.file_index + 1
+    );
+    close_extent(&mut client, &second, &second_frame, false);
+    let receipts = owner
+        .node
+        .inventory
+        .lock()
+        .active(1)
+        .unwrap()
+        .receipt_page(0, 2)
+        .unwrap();
+    let references: Vec<_> = receipts
+        .iter()
+        .zip([owner.batch(0), owner.batch(1)])
+        .map(|(receipt, batch)| batch.record_reference(receipt.address(), 0).unwrap())
+        .collect();
+    client.fence_to(2).unwrap();
+    let locations = client.resolve_live_records(2, &references).unwrap();
+    assert_eq!(locations.entries.len(), 2);
+    let (old, new) = (&locations.entries[0], &locations.entries[1]);
+    assert_ne!(old.segment.file_index, new.segment.file_index);
+    let temp = tempdir::TempDir::new("history-capacity-eviction").unwrap();
+    let pool = Arc::new(
+        LiveControllerPool::new(
+            LiveConnectionRegistry::open(&temp.path().join("registry")).unwrap(),
+            1,
+            1,
+        )
+        .unwrap(),
+    );
+    for location in [old, new] {
+        pool.register_local_target(&location.binding.nqn, location.segment.path.clone());
+    }
+    client.live_pool = Some(pool.clone());
+    let config = client.live_config.clone().unwrap();
+    let acquire = |location: &LiveRecordLocation| {
+        let binding = &location.binding;
+        let target = LiveConnectTarget {
+            nqn: binding.nqn.clone(),
+            uuid: binding.uuid,
+            nsid: binding.nsid,
+            bytes: binding.bytes,
+            block_size: binding.block_size,
+            address: binding.address.clone(),
+            service: binding.service,
+            transport: binding.transport,
+            geometry: Default::default(),
+        };
+        pool.acquire_pinned(
+            &target,
+            &config.host_nqn,
+            config.host_id,
+            crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess::ReadOnly,
+            Instant::now() + Duration::from_secs(5),
+            client.export_pin_request(2, &location.segment, binding),
+        )
+        .unwrap()
+    };
+    let pinned_files = || {
+        let inventory = owner.node.inventory.lock();
+        let mut files: Vec<_> = inventory
+            .live_export_pins
+            .values()
+            .map(|(_, (_, file))| *file)
+            .collect();
+        files.sort_unstable();
+        files
+    };
+    // The first file's controller stays connected and idle in the pool.
+    drop(acquire(old).0);
+    assert_eq!(pinned_files(), vec![old.segment.file_index]);
+    let (lease, _, timings) = acquire(new);
+    assert!(timings.disconnect.is_some());
+    assert_eq!(pinned_files(), vec![new.segment.file_index]);
+    drop(lease);
+    client
+        .release_live_epoch_pin(2, locations.epoch_pin_token)
+        .unwrap();
+    client.live_pool.take();
+    drop(pool);
+    assert!(pinned_files().is_empty());
 }
 
 #[test]
@@ -659,10 +561,7 @@ fn busy_retirement_is_typed_and_direct_refusal_keeps_controller_until_released()
     let lease = fixture.acquire();
     assert!(fixture.client.retire_wal_files(2, 1, vec![0]).is_err());
     assert_eq!(
-        fixture
-            .client
-            .retire_files_if_idle(2, 1, None, vec![0])
-            .unwrap(),
+        fixture.client.retire_files_if_idle(2, 1, vec![0]).unwrap(),
         RetirementResult::Busy,
     );
     assert!(fixture.location.segment.path.exists());
@@ -672,10 +571,7 @@ fn busy_retirement_is_typed_and_direct_refusal_keeps_controller_until_released()
     );
     drop(lease);
     assert_eq!(
-        fixture
-            .client
-            .retire_files_if_idle(2, 1, None, vec![0])
-            .unwrap(),
+        fixture.client.retire_files_if_idle(2, 1, vec![0]).unwrap(),
         RetirementResult::Completed,
     );
     assert!(!fixture.location.segment.path.exists());
@@ -816,7 +712,7 @@ fn lost_pin_acquire_reply_quarantines_capacity_until_fence() {
 #[test]
 fn idle_connection_pins_do_not_delay_poison_publication_and_drain_after_disconnect() {
     let mut fixture = HistoryPool::new();
-    fixture.owner.node.poison_readers();
+    fixture.owner.node.control_context.poison_readers();
     assert!(
         fixture
             .owner

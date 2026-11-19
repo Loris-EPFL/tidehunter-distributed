@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+// Only the Linux live-route boundary snapshot waits with a timeout.
+#[cfg(all(feature = "nvmeof", target_os = "linux"))]
+use std::time::Duration;
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, ReplayLimits};
 use tidehunter::distributed::storage::{
@@ -80,20 +82,6 @@ pub fn maybe_run_storage_node() -> BackendResult<bool> {
     tcp_cluster::maybe_run_storage_node().map_err(|error| error.to_string().into())
 }
 
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct ExternalOwnerReadConfig {
-    partition: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    read_workers: Option<usize>,
-    wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
-    read_resident_first: bool,
-    read_memory_allowance_bytes: usize,
-    read_max_inflight_requests: usize,
-    read_max_inflight_bytes: usize,
-    read_max_device_reads: usize,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Options {
@@ -113,19 +101,14 @@ struct Options {
     #[serde(default)]
     database: Option<[u8; 16]>,
     #[serde(default)]
-    owner_wal_geometry: OwnerWalGeometry,
-    #[serde(default)]
     coordinator_read_cache_bytes: Option<usize>,
     #[serde(default)]
     replay_limits: Option<ReplayLimits>,
     #[serde(default)]
     owner_append_occupancy: Option<usize>,
-    #[serde(default)]
-    external_remote_config: Option<tidehunter::distributed::remote_db::RemoteDatabaseConfig>,
-    #[serde(default)]
-    external_owner_read_config: Option<Vec<ExternalOwnerReadConfig>>,
-    #[serde(default = "default_resident_first")]
-    owner_read_resident_first: bool,
+    /// Required: leased live NVMe-oF is the only distributed route and the
+    /// local owner-RPC cluster was removed; `parse_options` names its absence.
+    external_remote_config: RemoteDatabaseConfig,
     /// Owner acknowledgement tier. Applied inside each owner process and confirmed back by it.
     #[serde(default)]
     durability_tier: DurabilityTier,
@@ -181,8 +164,8 @@ struct ExternalPreparationInput {
     replay_node_db_id: Option<u16>,
     #[serde(default)]
     owner_transports: Option<Vec<Transport>>,
-    #[serde(default)]
-    live_nvmeof: Option<ExternalLiveNvmeof>,
+    /// Required: leased live NVMe-oF is the only distributed route.
+    live_nvmeof: ExternalLiveNvmeof,
     max_batches_per_partition: usize,
     #[serde(default)]
     owner_wal_geometry: OwnerWalGeometry,
@@ -199,12 +182,7 @@ struct ExternalPreparationInput {
     read_lanes: Option<usize>,
     #[serde(default)]
     pin_read_lanes: bool,
-    #[serde(default)]
-    owner_read_workers: Option<usize>,
     owner_wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
-    owner_read_memory_allowance_bytes: usize,
-    #[serde(default = "default_resident_first")]
-    owner_read_resident_first: bool,
     /// Tier written into every owner launch file; absent means the native tier.
     #[serde(default)]
     durability_tier: DurabilityTier,
@@ -341,17 +319,9 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             .read_lanes
             .is_some_and(|lanes| !(1..=1024).contains(&lanes))
         || input
-            .owner_read_workers
-            .is_some_and(|workers| !(1..=1024).contains(&workers))
-        || input.owner_read_memory_allowance_bytes == 0
-        || input.owner_read_memory_allowance_bytes < 64 * 1024 * 1024
-        || input
             .coordinator_cache_bytes
             .checked_add(64 * 1024 * 1024)
             .is_none_or(|bytes| bytes > input.coordinator_read_memory_allowance_bytes)
-        || (input.owner_read_resident_first
-            && input.owner_wal_member_read
-                != tidehunter::distributed::storage::WalMemberReadPolicy::Async)
     {
         return Err("external case requires one, two, four, five or sixteen owners, absolute guest_root, supported positive limits, and budgets including the 64MiB in-flight allowance".into());
     }
@@ -363,46 +333,45 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     }) {
         return Err("invalid owner WAL file size override".into());
     }
-    if let Some(live) = &input.live_nvmeof {
-        if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
-            return Err(format!(
-                "live NVMe-oF preparation (inline_reads={}, lease_ahead={}, polled_writes={}) requires Linux and the nvmeof feature",
-                live.inline_reads, live.lease_ahead, live.polled_writes
-            ).into());
-        }
-        live.queue_geometry.validate()?;
-        if live.queue_geometry.poll_queues > 0 && !live.inline_reads {
-            return Err("polled live reads require inline reads".into());
-        }
-        if live.addresses.len() != input.addresses.len()
-            || live
-                .addresses
-                .iter()
-                .any(|ip| ip.is_unspecified() || ip.is_multicast())
-            || !matches!(live.transport.as_str(), "tcp" | "rdma")
-            || live.service == 0
-            || live.port_id == 0
-            || live.commissioning_service == 0
-            || live.commissioning_port_id == 0
-            || live
-                .commissioning_service
-                .checked_add(2 * (input.addresses.len() as u16 - 1))
-                .is_none()
-            || live.commissioning_service != live.service.checked_add(1).unwrap_or(0)
-            || live
-                .commissioning_port_id
-                .checked_add(2 * (input.addresses.len() as u16 - 1))
-                .is_none()
-            || live.commissioning_port_id != live.port_id.checked_add(1).unwrap_or(0)
-            || live.max_inflight_requests == 0
-            || live.max_inflight_bytes == 0
-            || live.connect_timeout_ms == 0
-            || live.io_timeout_ms == 0
-        {
-            return Err(
-                "invalid live NVMe-oF addresses, target identity, ports or client limits".into(),
-            );
-        }
+    let live = &input.live_nvmeof;
+    if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
+        return Err(format!(
+            "live NVMe-oF preparation (inline_reads={}, lease_ahead={}, polled_writes={}) requires Linux and the nvmeof feature",
+            live.inline_reads, live.lease_ahead, live.polled_writes
+        ).into());
+    }
+    live.queue_geometry.validate()?;
+    if live.queue_geometry.poll_queues > 0 && !live.inline_reads {
+        return Err("polled live reads require inline reads".into());
+    }
+    if live.addresses.len() != input.addresses.len()
+        || live
+            .addresses
+            .iter()
+            .any(|ip| ip.is_unspecified() || ip.is_multicast())
+        || !matches!(live.transport.as_str(), "tcp" | "rdma")
+        || live.service == 0
+        || live.port_id == 0
+        || live.commissioning_service == 0
+        || live.commissioning_port_id == 0
+        || live
+            .commissioning_service
+            .checked_add(2 * (input.addresses.len() as u16 - 1))
+            .is_none()
+        || live.commissioning_service != live.service.checked_add(1).unwrap_or(0)
+        || live
+            .commissioning_port_id
+            .checked_add(2 * (input.addresses.len() as u16 - 1))
+            .is_none()
+        || live.commissioning_port_id != live.port_id.checked_add(1).unwrap_or(0)
+        || live.max_inflight_requests == 0
+        || live.max_inflight_bytes == 0
+        || live.connect_timeout_ms == 0
+        || live.io_timeout_ms == 0
+    {
+        return Err(
+            "invalid live NVMe-oF addresses, target identity, ports or client limits".into(),
+        );
     }
     let addresses = input
         .addresses
@@ -460,26 +429,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         || KeyShape::new_single(32, 16, KeyType::uniform(64)),
         |db| replay::shape(&crate::mainnet_trace::tables(), db),
     );
-    tcp_cluster::prepare_external_case_with_durability(
-        &prepared,
-        &input.guest_root,
-        &addresses,
-        &shape,
-        storage,
-        input.max_admitted_batches,
-        input.max_index_bytes,
-        input.transport.clone(),
-        &owner_transports,
-        input.owner_read_workers,
-        input.read_lanes,
-        input.owner_wal_member_read,
-        input.owner_read_memory_allowance_bytes,
-        input.polling,
-        input.owner_read_resident_first,
-        DurabilityConfig::with_tier(input.durability_tier),
-    )
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let live_identities: Vec<_> = (0..if input.live_nvmeof.is_some() { input.addresses.len() } else { 0 }).map(|_| {
+    let live_identities: Vec<_> = (0..input.addresses.len()).map(|_| {
         let mut id: [u8; 16] = rand::random();
         id[6] = (id[6] & 0x0f) | 0x40;
         id[8] = (id[8] & 0x3f) | 0x80;
@@ -490,6 +440,53 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         );
         (id, nqn)
     }).collect();
+    let (host_id, host_nqn) = &live_identities[0];
+    let live_client = tidehunter::distributed::tcp::LiveClientConfig {
+        lease_ahead: live.lease_ahead,
+        polled_writes: live.polled_writes,
+        host_nqn: host_nqn.clone(),
+        host_id: *host_id,
+        owner_identities: live_identities
+            .iter()
+            .enumerate()
+            .map(|(partition, (id, nqn))| {
+                (
+                    partition as u32,
+                    tidehunter::distributed::tcp::LiveInitiatorIdentity {
+                        host_id: *id,
+                        host_nqn: nqn.clone(),
+                    },
+                )
+            })
+            .collect(),
+        max_inflight_requests: live.max_inflight_requests,
+        leased_write_window: live.leased_write_window,
+        leased_sync: live.leased_sync,
+        leased_flush_min_frame_bytes: live.leased_flush_min_frame_bytes,
+        max_inflight_bytes: live.max_inflight_bytes,
+        connect_timeout_ms: live.connect_timeout_ms,
+        io_timeout_ms: live.io_timeout_ms,
+        leased_durability: input.durability_tier,
+        inline_reads: live.inline_reads,
+        queue_geometry: live.queue_geometry,
+    };
+    tcp_cluster::prepare_external_case(
+        &prepared,
+        &input.guest_root,
+        &addresses,
+        &shape,
+        storage,
+        input.max_admitted_batches,
+        input.max_index_bytes,
+        input.transport.clone(),
+        &owner_transports,
+        input.read_lanes,
+        input.owner_wal_member_read,
+        input.polling,
+        DurabilityConfig::with_tier(input.durability_tier),
+        live_client,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
 
     let remote_path = prepared.join("remote.yaml");
     let mut remote: tidehunter::distributed::remote_db::RemoteDatabaseConfig =
@@ -498,38 +495,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     remote.read_lanes = input.read_lanes;
     remote.read_cache_bytes = input.coordinator_cache_bytes;
     remote.read_memory_allowance_bytes = input.coordinator_read_memory_allowance_bytes;
-    if let Some(live) = &input.live_nvmeof {
-        let (host_id, host_nqn) = &live_identities[0];
-        remote.live_nvme = Some(tidehunter::distributed::tcp::LiveClientConfig {
-            lease_ahead: live.lease_ahead,
-            polled_writes: live.polled_writes,
-            host_nqn: host_nqn.clone(),
-            host_id: *host_id,
-            owner_identities: live_identities
-                .iter()
-                .enumerate()
-                .map(|(partition, (id, nqn))| {
-                    (
-                        partition as u32,
-                        tidehunter::distributed::tcp::LiveInitiatorIdentity {
-                            host_id: *id,
-                            host_nqn: nqn.clone(),
-                        },
-                    )
-                })
-                .collect(),
-            max_inflight_requests: live.max_inflight_requests,
-            leased_write_window: live.leased_write_window,
-            leased_sync: live.leased_sync,
-            leased_flush_min_frame_bytes: live.leased_flush_min_frame_bytes,
-            max_inflight_bytes: live.max_inflight_bytes,
-            connect_timeout_ms: live.connect_timeout_ms,
-            io_timeout_ms: live.io_timeout_ms,
-            leased_durability: input.durability_tier,
-            inline_reads: live.inline_reads,
-            queue_geometry: live.queue_geometry,
-        });
-    }
     if remote
         .read_cache_bytes
         .checked_add(remote.max_pending_read_bytes)
@@ -546,60 +511,26 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         serde_json::to_vec_pretty(&remote)?,
     )?;
 
-    let mut owner_configs = Vec::with_capacity(addresses.len());
     for partition in 0..u32::try_from(addresses.len())? {
         let launch_path = prepared
             .join(format!("node-{partition}"))
             .join("launch.yaml");
         let mut launch: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&launch_path)?)?;
-        if let Some(live) = &input.live_nvmeof {
-            let (_, host_nqn) = &live_identities[partition as usize];
-            let port_offset = 2 * partition as u16;
-            let config = serde_json::json!({
-                "address": live.addresses[partition as usize].to_string(),
-                "service": live.service + port_offset,
-                "transport": live.transport,
-                "host_nqn": host_nqn,
-                "port_id": live.port_id + port_offset,
-                "state_dir": input.guest_root.join(format!("node-{partition}")).join("live-nvmeof"),
-                "commissioning_port_id": live.commissioning_port_id + port_offset,
-                "commissioning_service": live.commissioning_service + port_offset
-            });
-            launch["node"]["live_target"] = serde_yaml::to_value(config)?;
-            fs::write(&launch_path, serde_yaml::to_string(&launch)?)?;
-        }
-        let node = launch
-            .get("node")
-            .ok_or("generated launch.yaml is missing node")?;
-        let field = |name| {
-            node.get(name)
-                .cloned()
-                .ok_or_else(|| format!("generated NodeConfig is missing {name}"))
-        };
-        let owner = ExternalOwnerReadConfig {
-            partition,
-            read_workers: serde_yaml::from_value(
-                node.get("read_workers")
-                    .cloned()
-                    .unwrap_or(serde_yaml::Value::Null),
-            )?,
-            wal_member_read: serde_yaml::from_value(field("wal_member_read")?)?,
-            read_resident_first: serde_yaml::from_value(field("read_resident_first")?)?,
-            read_memory_allowance_bytes: serde_yaml::from_value(field(
-                "read_memory_allowance_bytes",
-            )?)?,
-            read_max_inflight_requests: serde_yaml::from_value(field(
-                "read_max_inflight_requests",
-            )?)?,
-            read_max_inflight_bytes: serde_yaml::from_value(field("read_max_inflight_bytes")?)?,
-            read_max_device_reads: serde_yaml::from_value(field("read_max_device_reads")?)?,
-        };
-        owner_configs.push(owner);
+        let (_, host_nqn) = &live_identities[partition as usize];
+        let port_offset = 2 * partition as u16;
+        let config = serde_json::json!({
+            "address": live.addresses[partition as usize].to_string(),
+            "service": live.service + port_offset,
+            "transport": live.transport,
+            "host_nqn": host_nqn,
+            "port_id": live.port_id + port_offset,
+            "state_dir": input.guest_root.join(format!("node-{partition}")).join("live-nvmeof"),
+            "commissioning_port_id": live.commissioning_port_id + port_offset,
+            "commissioning_service": live.commissioning_service + port_offset
+        });
+        launch["node"]["live_target"] = serde_yaml::to_value(config)?;
+        fs::write(&launch_path, serde_yaml::to_string(&launch)?)?;
     }
-    fs::write(
-        prepared.join("external_owner_read_config.json"),
-        serde_json::to_vec_pretty(&owner_configs)?,
-    )?;
     fs::rename(&prepared, output)?;
     println!(
         "{}",
@@ -609,7 +540,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             "remote_config_yaml": output.join("remote.yaml"),
             "remote_config_json": output.join("remote.json"),
             "coordinator_read_memory_allowance_bytes": remote.read_memory_allowance_bytes,
-            "owner_read_configuration": output.join("external_owner_read_config.json"),
             "owner_launch_files": (0..addresses.len()).map(|partition| output.join(format!("node-{partition}/launch.yaml"))).collect::<Vec<_>>()
         }))?
     );
@@ -706,14 +636,12 @@ pub struct TidehunterBackend {
     owner_sample_gate: OwnerSampleGate,
     db: Option<std::sync::Arc<sui::Db>>,
     keyspace: tidehunter::key_shape::KeySpace,
-    cluster: std::sync::Mutex<Option<tcp_cluster::LoopbackCluster>>,
     endpoints: Vec<(u32, String)>,
     owners: usize,
     backend_name: &'static str,
     durability_tier: DurabilityTier,
     evidence_path: PathBuf,
     effective_configuration: serde_json::Value,
-    operational_read_io: Option<tidehunter::distributed::remote_db::OperationalReadIoMonitor>,
     read_evidence_written: bool,
     coordinator_interval_baseline: std::sync::Mutex<Option<BTreeMap<&'static str, u64>>>,
     #[cfg(all(feature = "nvmeof", target_os = "linux"))]
@@ -723,6 +651,14 @@ pub struct TidehunterBackend {
 // External transport, owner identity and payload bounds form one admission boundary.
 #[allow(clippy::too_many_lines)]
 fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
+    // Named before serde reports a bare missing field: the local owner-RPC
+    // cluster (LoopbackCluster) was removed with the owner-RPC data path.
+    if value
+        .get("external_remote_config")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        return Err("tidehunter backends require external_remote_config with live_nvme (leased live NVMe-oF); the local owner-RPC cluster was removed".into());
+    }
     let options = Options::deserialize(value)?;
     let name = backend_name(&options.transport);
     if let Some(limits) = options.batch_limits {
@@ -740,12 +676,7 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
             format!("{name} owner append occupancy exceeds the reserved-control window").into(),
         );
     }
-    if options
-        .external_remote_config
-        .as_ref()
-        .is_some_and(|config| config.live_nvme.is_some())
-        && !cfg!(all(feature = "nvmeof", target_os = "linux"))
-    {
+    if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
         return Err("live NVMe-oF requires the Linux nvmeof benchmark feature".into());
     }
     if options.path.as_os_str().is_empty()
@@ -767,94 +698,62 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
         .transport
         .validate()
         .map_err(|error| format!("{name} transport unavailable: {error}"))?;
-    if let Some(config) = &options.external_remote_config {
-        if !options.transport.same_protocol(&config.tls.transport) {
-            return Err(format!(
-                "{name} requires external_remote_config.tls.transport={}",
-                options.transport.label()
-            )
-            .into());
-        }
-        let owner_configs = options
-            .external_owner_read_config
-            .as_ref()
-            .ok_or("external_owner_read_config is required with external_remote_config")?;
-        if config.storage.partitions.len() != options.owners
-            || config.endpoints.len() != options.owners
-            || owner_configs.len() != options.owners
-        {
-            return Err("external remote configuration must contain exactly one partition, endpoint, and owner read configuration per owner".into());
-        }
-        let partitions: HashSet<u32> = config.storage.partitions.iter().copied().collect();
-        let endpoints: HashSet<u32> = config
+    let config = &options.external_remote_config;
+    if !options.transport.same_protocol(&config.tls.transport) {
+        return Err(format!(
+            "{name} requires external_remote_config.tls.transport={}",
+            options.transport.label()
+        )
+        .into());
+    }
+    if config.storage.partitions.len() != options.owners || config.endpoints.len() != options.owners
+    {
+        return Err(
+            "external remote configuration must contain exactly one partition and endpoint per owner"
+                .into(),
+        );
+    }
+    let partitions: HashSet<u32> = config.storage.partitions.iter().copied().collect();
+    let endpoints: HashSet<u32> = config
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.partition)
+        .collect();
+    let coordinator_cache_bytes = options
+        .coordinator_read_cache_bytes
+        .unwrap_or(config.read_cache_bytes);
+    if coordinator_cache_bytes
+        .checked_add(config.max_pending_read_bytes)
+        .is_none_or(|bytes| bytes > config.read_memory_allowance_bytes)
+    {
+        return Err(
+            "coordinator read cache plus pending reads exceeds read_memory_allowance_bytes".into(),
+        );
+    }
+    let group_limit_with_header = config.storage.group_limits.max_encoded_bytes.checked_add(8);
+    if partitions.len() != options.owners
+        || endpoints.len() != options.owners
+        || endpoints != partitions
+        || config
             .endpoints
             .iter()
-            .map(|endpoint| endpoint.partition)
-            .collect();
-        let owner_partitions: HashSet<u32> =
-            owner_configs.iter().map(|owner| owner.partition).collect();
-        let coordinator_cache_bytes = options
-            .coordinator_read_cache_bytes
-            .unwrap_or(config.read_cache_bytes);
-        if coordinator_cache_bytes
-            .checked_add(config.max_pending_read_bytes)
-            .is_none_or(|bytes| bytes > config.read_memory_allowance_bytes)
-        {
-            return Err(
-                "coordinator read cache plus pending reads exceeds read_memory_allowance_bytes"
-                    .into(),
-            );
-        }
-        let group_limit_with_header = config.storage.group_limits.max_encoded_bytes.checked_add(8);
-        if partitions.len() != options.owners
-            || endpoints.len() != options.owners
-            || endpoints != partitions
-            || owner_partitions.len() != options.owners
-            || owner_partitions != partitions
-            || config
-                .endpoints
-                .iter()
-                .any(|endpoint| endpoint.address.is_empty())
-            || config.timeout.is_zero()
-            || group_limit_with_header
-                .is_none_or(|minimum| config.storage.fragment_bytes < minimum as u64)
-            || config.storage.fragment_bytes == 0
-            || !config.storage.fragment_bytes.is_multiple_of(8)
-            || config.storage.wal_file_bytes == 0
-            || !config
-                .storage
-                .wal_file_bytes
-                .is_multiple_of(config.storage.fragment_bytes)
-            || config.storage.max_batches_per_partition == 0
-            || config.storage.max_batches_per_partition > 1_000_000
-            || config.storage.max_epochs == 0
-            || config.storage.max_epochs > 1024
-        {
-            return Err("invalid external remote owner configuration".into());
-        }
-        for owner in owner_configs {
-            if owner
-                .read_workers
-                .is_some_and(|workers| !(1..=1024).contains(&workers))
-                || owner.read_memory_allowance_bytes == 0
-                || owner.read_max_inflight_requests == 0
-                || owner.read_max_inflight_bytes == 0
-                || owner.read_max_device_reads == 0
-                || owner.read_resident_first != options.owner_read_resident_first
-                || (owner.read_resident_first
-                    && owner.wal_member_read
-                        != tidehunter::distributed::storage::WalMemberReadPolicy::Async)
-                || owner.read_max_inflight_bytes > owner.read_memory_allowance_bytes
-            {
-                return Err(format!(
-                    "invalid external owner read configuration for partition {}",
-                    owner.partition
-                )
-                .into());
-            }
-        }
-    } else if options.external_owner_read_config.is_some() {
-        return Err("external_owner_read_config requires external_remote_config".into());
+            .any(|endpoint| endpoint.address.is_empty())
+        || config.timeout.is_zero()
+        || group_limit_with_header
+            .is_none_or(|minimum| config.storage.fragment_bytes < minimum as u64)
+        || config.storage.fragment_bytes == 0
+        || !config.storage.fragment_bytes.is_multiple_of(8)
+        || config.storage.wal_file_bytes == 0
+        || !config
+            .storage
+            .wal_file_bytes
+            .is_multiple_of(config.storage.fragment_bytes)
+        || config.storage.max_batches_per_partition == 0
+        || config.storage.max_batches_per_partition > 1_000_000
+        || config.storage.max_epochs == 0
+        || config.storage.max_epochs > 1024
+    {
+        return Err("invalid external remote owner configuration".into());
     }
     Ok(options)
 }
@@ -942,72 +841,7 @@ async fn open_with_shape(
         .unwrap_or_else(|| options.path.join("evidence"));
     fs::create_dir_all(&options.path)?;
     fs::create_dir_all(&evidence_path)?;
-    let owner_read_configuration;
-    let (cluster, mut remote_config) =
-        if let Some(config) = options.external_remote_config {
-            owner_read_configuration =
-                serde_json::to_value(options.external_owner_read_config.as_ref().ok_or(
-                    "external_owner_read_config is required with external_remote_config",
-                )?)?;
-            (None, config)
-        } else {
-            fs::create_dir_all(options.path.join("owners"))?;
-            let partitions: Vec<u32> = (0..u32::try_from(options.owners)?).collect();
-            let storage = LocalInventoryConfig {
-                database: options.database.unwrap_or([0x4b; 16]),
-                partitions,
-                batch_limits: options.batch_limits.unwrap_or(
-                    tidehunter::distributed::codec::BatchLimits {
-                        max_operations: 32,
-                        max_encoded_bytes: RESEARCH_BATCH_BYTES,
-                    },
-                ),
-                group_limits: tidehunter::distributed::group::GroupLimits {
-                    max_batches: 32,
-                    max_encoded_bytes: RESEARCH_FRAGMENT_BYTES - 8,
-                },
-                fragment_bytes: options.owner_wal_geometry.fragment_bytes(),
-                wal_file_bytes: options.owner_wal_geometry.wal_file_bytes(),
-                max_batches_per_partition: options.max_batches_per_partition,
-                max_reference_metadata_bytes: 64 * 1024 * 1024,
-                max_epochs: 4,
-            };
-            owner_read_configuration = serde_json::json!(
-                (0..options.owners)
-                    .map(|partition| {
-                        serde_json::json!({
-                            "partition": partition,
-                            "read_workers": tidehunter::parallelism::available(),
-                            "wal_member_read": "async",
-                            "read_resident_first": options.owner_read_resident_first,
-                            "read_memory_allowance_bytes": 512 * 1024 * 1024,
-                            "read_max_inflight_requests": 32,
-                            "read_max_inflight_bytes": 64 * 1024 * 1024,
-                            "read_max_device_reads": 128
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            );
-            let cluster = tcp_cluster::LoopbackCluster::start_with_durability(
-                &options.path.join("owners"),
-                &evidence_path,
-                &shape,
-                storage,
-                4096,
-                128 * 1024 * 1024,
-                None,
-                transport.clone(),
-                tidehunter::parallelism::available(),
-                tidehunter::distributed::storage::WalMemberReadPolicy::Async,
-                512 * 1024 * 1024,
-                PollingPolicy::Adaptive,
-                options.owner_read_resident_first,
-                DurabilityConfig::with_tier(options.durability_tier),
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let config = cluster.config.clone();
-            (Some(cluster), config)
-        };
+    let mut remote_config = options.external_remote_config;
     if !remote_config.tls.transport.same_protocol(&transport) {
         return Err(format!(
             "{} requires transport {}",
@@ -1019,14 +853,11 @@ async fn open_with_shape(
     // Report only what every owner process confirmed. Each publishes a receipt naming its
     // partition, database, bound address and process before its ready file; a missing, incomplete
     // or foreign one fails the open.
-    let owner_receipts: Vec<tcp_cluster::OwnerReceipt> = match &cluster {
-        Some(cluster) => cluster.owner_receipts().to_vec(),
-        None => options
-            .external_owner_durability_receipts
-            .iter()
-            .map(|path| tcp_cluster::read_owner_receipt(path).map_err(|error| error.to_string()))
-            .collect::<Result<_, _>>()?,
-    };
+    let owner_receipts: Vec<tcp_cluster::OwnerReceipt> = options
+        .external_owner_durability_receipts
+        .iter()
+        .map(|path| tcp_cluster::read_owner_receipt(path).map_err(|error| error.to_string()))
+        .collect::<Result<_, _>>()?;
     let receipt_endpoints: Vec<(u32, String)> = remote_config
         .endpoints
         .iter()
@@ -1074,26 +905,10 @@ async fn open_with_shape(
         );
     }
     let coordinator_path = options.path.join("coordinator");
-    let locally_owned = cluster.is_some();
-    let placement = if locally_owned {
-        "local harness; all owners share the host storage"
-    } else {
-        "external topology; placement and physical-device independence are not observed here"
-    };
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    let live_nvme = remote_config.live_nvme.is_some();
-    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-    let live_nvme = false;
-    let selected_backend = backend_name(&transport);
-    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-    let selected_backend = if live_nvme {
-        "tidehunter_live_nvmeof"
-    } else {
-        selected_backend
-    };
+    let selected_backend = "tidehunter_live_nvmeof";
     let mut effective_configuration = serde_json::json!({
         "backend": selected_backend,
-        "live_queue_geometry": remote_config.live_nvme.as_ref().map(|live| live.queue_geometry),
+        "live_queue_geometry": remote_config.live_nvme.queue_geometry,
         "transport": transport.label(),
         "transport_security": transport.security_label(),
         // Full serialized selector, so every transport knob (provider, domain, slots) is receipted.
@@ -1109,7 +924,7 @@ async fn open_with_shape(
         "keyshape_cells_per_mutex": 64,
         "keyshape_total_cells": 1024,
         "owner_storage": "native Tidehunter PartitionLog Value-WAL; not independent Db indexes",
-        "placement": placement,
+        "placement": "external topology; placement and physical-device independence are not observed here",
         "owner_limits": {
             "batch_max_operations": remote_config.storage.batch_limits.max_operations,
             "batch_max_encoded_bytes": remote_config.storage.batch_limits.max_encoded_bytes,
@@ -1136,7 +951,6 @@ async fn open_with_shape(
                 "observation": "not controlled or verified by this adapter; application cache disablement does not disable Linux page cache or prove physical NVMe"
             }
         },
-        "owner_read_configuration": owner_read_configuration,
         "coordinator": {
             "read_cache_bytes": remote_config.read_cache_bytes,
             "read_memory_allowance_bytes": remote_config.read_memory_allowance_bytes
@@ -1168,51 +982,27 @@ async fn open_with_shape(
             .max(tidehunter::distributed::tcp::LIFECYCLE_TIMEOUT)
             .as_millis()
     );
-    effective_configuration["live_leased_write_window"] = serde_json::json!(
-        remote_config
-            .live_nvme
-            .as_ref()
-            .map(|live| live.leased_write_window)
-    );
-    effective_configuration["live_leased_sync"] = serde_json::json!(
-        remote_config
-            .live_nvme
-            .as_ref()
-            .map(|live| live.leased_sync)
-    );
-    effective_configuration["live_leased_flush_min_frame_bytes"] = serde_json::json!(
-        remote_config
-            .live_nvme
-            .as_ref()
-            .map(|live| live.leased_flush_min_frame_bytes)
-    );
+    let live = &remote_config.live_nvme;
+    effective_configuration["live_leased_write_window"] =
+        serde_json::json!(live.leased_write_window);
+    effective_configuration["live_leased_sync"] = serde_json::json!(live.leased_sync);
+    effective_configuration["live_leased_flush_min_frame_bytes"] =
+        serde_json::json!(live.leased_flush_min_frame_bytes);
+    let occupancy = if live.leased_write_window.is_none() {
+        RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY
+    } else {
+        remote_config.owner_append_occupancy
+    };
     effective_configuration["live_leased_write_window_bound"] =
-        serde_json::json!(remote_config.live_nvme.as_ref().map(|live| {
-            let occupancy = if live.leased_write_window.is_none() {
-                tidehunter::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY
-            } else {
-                remote_config.owner_append_occupancy
-            };
-            live.max_inflight_requests.min(occupancy)
-        }));
-    effective_configuration["live_lease_ahead"] = serde_json::json!(
-        remote_config
-            .live_nvme
-            .as_ref()
-            .map(|live| live.lease_ahead)
-    );
-    effective_configuration["live_polled_writes"] = serde_json::json!(
-        remote_config
-            .live_nvme
-            .as_ref()
-            .map(|live| live.polled_writes)
-    );
-    let live_write_evidence = remote_config.live_nvme.as_ref().map(|live| serde_json::json!({
+        serde_json::json!(live.max_inflight_requests.min(occupancy));
+    effective_configuration["live_lease_ahead"] = serde_json::json!(live.lease_ahead);
+    effective_configuration["live_polled_writes"] = serde_json::json!(live.polled_writes);
+    let live_write_evidence = serde_json::json!({
         "leased_durability": live.leased_durability,
         "inline_reads": live.inline_reads,
         "acknowledgement_contract": tidehunter::distributed::tcp::LiveClientConfig::acknowledgement(options.durability_tier),
         "recovery_outcome": "an operation with a lost acknowledgement can be present after recovery: unknown outcome, not exactly-once",
-    }));
+    });
     fs::create_dir_all(&coordinator_path)?;
     let keyspace = shape
         .iter_ks()
@@ -1256,16 +1046,8 @@ async fn open_with_shape(
                 None => serde_json::Value::Null,
             };
     }
-    effective_configuration["read_backend"] = serde_json::json!(if live_nvme {
-        "live_nvmeof"
-    } else {
-        "owner_record_protocol"
-    });
-    effective_configuration["write_backend"] = serde_json::json!(if live_nvme {
-        "live_nvmeof"
-    } else {
-        "owner_record_protocol"
-    });
+    effective_configuration["read_backend"] = serde_json::json!("live_nvmeof");
+    effective_configuration["write_backend"] = serde_json::json!("live_nvmeof");
     effective_configuration["data_route_evidence"] = serde_json::json!({
         "scope": "configured routes only; actual payload transport requires independent live I/O counters",
         "live_route_verified": false
@@ -1273,22 +1055,17 @@ async fn open_with_shape(
     effective_configuration["durability_tier"] =
         serde_json::json!(options.durability_tier.as_str());
     effective_configuration["durability"] = durability_receipt;
-    if let Some(evidence) = live_write_evidence {
-        effective_configuration["live_write"] = evidence.clone();
-        effective_configuration["durability"]["live_write"] = evidence;
-    }
-    let operational_read_io = db.operational_read_io_monitor();
+    effective_configuration["live_write"] = live_write_evidence.clone();
+    effective_configuration["durability"]["live_write"] = live_write_evidence;
     Ok(TidehunterBackend {
         db: Some(db),
         keyspace,
-        cluster: std::sync::Mutex::new(cluster),
         endpoints,
         owners: options.owners,
         backend_name: selected_backend,
         durability_tier: options.durability_tier,
         evidence_path,
         effective_configuration,
-        operational_read_io,
         read_evidence_written: false,
         owner_sample_gate: OwnerSampleGate::default(),
         coordinator_interval_baseline: std::sync::Mutex::new(None),
@@ -1339,42 +1116,6 @@ impl TidehunterBackend {
                 })
             })
         });
-        let mut owner_io = serde_json::Value::Null;
-        if let Some(monitor) = &self.operational_read_io {
-            // Fast workloads can finish before the one-second passive sampler.
-            // Wait only after timing, before drain; never add probes to API calls.
-            let cut = Instant::now();
-            let deadline = cut + Duration::from_secs(3);
-            loop {
-                let mut finished = false;
-                monitor.visit(|snapshot, stopped| {
-                    finished = stopped
-                        || (snapshot.last_attempt.is_some_and(|attempt| attempt >= cut)
-                            && snapshot.available);
-                });
-                if finished || Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            monitor.visit(|snapshot, stopped| {
-                owner_io = serde_json::json!({
-                    "available": snapshot.available,
-                    "generation": snapshot.generation,
-                    "failed_samples": snapshot.failed_samples,
-                    "stopped": stopped,
-                    "post_workload_sample": snapshot.last_attempt.is_some_and(|attempt| attempt >= cut),
-                    "last_sample_age_ms": snapshot.last_attempt.map(|time| time.elapsed().as_millis()),
-                    "owner_read_executor_stats": snapshot.owners.iter().map(|(partition, stats)| {
-                        serde_json::json!({"partition": partition, "stats": stats})
-                    }).collect::<Vec<_>>(),
-                    "counter_semantics": {
-                        "wal_reads": "logical owner Value-WAL member reads, not device IOPS",
-                        "async_read_submissions": "io_uring submissions, not confirmed physical-device reads"
-                    }
-                });
-            });
-        }
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         let live_nvmeof = self.db.as_ref().and_then(|db| db.live_nvmeof_stats());
         #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
@@ -1382,11 +1123,9 @@ impl TidehunterBackend {
         let evidence = serde_json::json!({
             "schema_version": 1,
             "backend": self.backend_name,
-            "counter_scope": "cumulative from adapter open through post-workload qualification; owner IO fields come from the latest passive sample",
+            "counter_scope": "cumulative from adapter open through post-workload qualification",
             "coordinator": coordinator,
-            "owner_io": owner_io,
             "live_nvmeof": live_nvmeof,
-            "owner_read_configuration": self.effective_configuration["owner_read_configuration"],
             "effective_configuration": self.effective_configuration
         });
         fs::write(
@@ -1398,26 +1137,14 @@ impl TidehunterBackend {
         Ok(())
     }
     fn info(&self) -> BackendInfo {
-        let locally_owned = self.cluster.lock().is_ok_and(|cluster| cluster.is_some());
-        let evidence_file = self.evidence_path.join("processes.yaml");
-        let owner_processes = locally_owned
-            .then(|| {
-                fs::read(&evidence_file)
-                    .ok()
-                    .and_then(|bytes| serde_yaml::from_slice::<serde_json::Value>(&bytes).ok())
-            })
-            .flatten();
         let endpoints = self.endpoints.iter()
             .map(|(partition, address)| serde_json::json!({"partition": partition, "address": address}))
             .collect::<Vec<_>>();
         let topology = serde_json::json!({
-            "processes": if locally_owned { Some(self.owners + 1) } else { None::<usize> },
             "locally_observed_processes": 1,
             "owners": self.owners,
             "coordinator_process_id": std::process::id(),
             "endpoints": endpoints,
-            "owner_processes": owner_processes,
-            "owner_process_evidence": if locally_owned { Some(evidence_file) } else { None::<PathBuf> }
         });
         BackendInfo {
             name: self.backend_name.to_owned(),
@@ -1440,30 +1167,6 @@ impl TidehunterBackend {
             configuration: self.effective_configuration.clone(),
         }
     }
-}
-
-fn partition_snapshot<T: serde::Serialize>(
-    rows: Vec<(u32, T)>,
-    endpoints: &[(u32, String)],
-) -> serde_json::Value {
-    let mut partitions = BTreeMap::new();
-    for (partition, stats) in rows {
-        if partitions.insert(partition.to_string(), stats).is_some() {
-            return serde_json::json!({"available": false, "error": format!("duplicate partition {partition}")});
-        }
-    }
-    let expected: HashSet<String> = endpoints
-        .iter()
-        .map(|(partition, _)| partition.to_string())
-        .collect();
-    if partitions.len() != expected.len()
-        || partitions
-            .keys()
-            .any(|partition| !expected.contains(partition))
-    {
-        return serde_json::json!({"available": false, "error": "sampled partitions differ from configured owners", "partitions": partitions});
-    }
-    serde_json::json!({"available": true, "partitions": partitions})
 }
 
 impl KvBackend for TidehunterBackend {
@@ -1552,20 +1255,8 @@ impl KvBackend for TidehunterBackend {
         let durable_cut = db.durable_cut_stats().map(|stats| {
             serde_json::json!({"enabled": stats.enabled, "epoch": stats.epoch, "nudges": stats.nudges})
         });
-        let Some(monitor) = db.read_evidence_monitor() else {
-            return Ok(
-                serde_json::json!({"available": true, "coordinator": coordinator,
-                "live_nvmeof": live_nvmeof, "owner_storage": owner_storage, "durable_cut": durable_cut,
-                "owner_executor": {"available": false, "error": "read evidence monitor unavailable"}}),
-            );
-        };
-        let owners = match monitor.sample_owner_read_io() {
-            Ok(rows) => partition_snapshot(rows, &self.endpoints),
-            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
-        };
         Ok(
             serde_json::json!({"available": true, "coordinator": coordinator,
-            "owner_executor": owners,
             "live_nvmeof": live_nvmeof, "owner_storage": owner_storage, "durable_cut": durable_cut}),
         )
     }
@@ -2192,18 +1883,6 @@ impl KvBackend for TidehunterBackend {
         {
             errors.push(format!("coordinator drain failed: {error:?}"));
         }
-        let cluster = match self.cluster.get_mut() {
-            Ok(cluster) => cluster,
-            Err(poisoned) => {
-                errors.push("owner cluster lock was poisoned during shutdown".to_owned());
-                poisoned.into_inner()
-            }
-        };
-        if let Some(mut cluster) = cluster.take()
-            && let Err(error) = cluster.shutdown()
-        {
-            errors.push(format!("owner drain failed: {error}"));
-        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2223,15 +1902,6 @@ impl Drop for TidehunterBackend {
         {
             errors.push(format!("coordinator drain failed: {error:?}"));
         }
-        let cluster = match self.cluster.get_mut() {
-            Ok(cluster) => cluster,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(cluster) = cluster.as_mut()
-            && let Err(error) = cluster.shutdown()
-        {
-            errors.push(format!("owner drain failed: {error}"));
-        }
         if !errors.is_empty() {
             let _ = fs::write(
                 self.evidence_path.join("lifecycle-errors.txt"),
@@ -2240,6 +1910,23 @@ impl Drop for TidehunterBackend {
         }
     }
 }
+
+/// Valid `live_nvmeof` preparation input for `owners` owners (distinct target
+/// addresses, commissioning ports one above the service/port ids).
+#[cfg(test)]
+pub(crate) fn test_live_nvmeof(owners: usize) -> serde_json::Value {
+    serde_json::json!({
+        "addresses": (1..=owners).map(|owner| format!("10.1.0.{owner}")).collect::<Vec<_>>(),
+        "transport": "rdma", "service": 4420, "port_id": 4420,
+        "commissioning_service": 4421, "commissioning_port_id": 4421,
+        "max_inflight_requests": 8, "max_inflight_bytes": 8388608,
+        "connect_timeout_ms": 10000, "io_timeout_ms": 10000
+    })
+}
+
+#[cfg(test)]
+#[path = "tidehunter/replay_preparation_tests.rs"]
+mod replay_preparation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2257,32 +1944,6 @@ mod tests {
         assert!(!called);
         gate.set_measuring(false);
         assert_eq!(gate.sample(|| 2), Ok(2));
-    }
-
-    #[test]
-    fn owner_read_configuration_rejects_retired_value_cache_and_grants() {
-        let base = serde_json::json!({
-            "partition": 0, "read_workers": 2, "wal_member_read": "async", "read_resident_first": true,
-            "read_memory_allowance_bytes": 536870912,
-            "read_max_inflight_requests": 32, "read_max_inflight_bytes": 67108864,
-            "read_max_device_reads": 128
-        });
-        assert!(serde_json::from_value::<ExternalOwnerReadConfig>(base.clone()).is_ok());
-        for (field, retired) in [
-            ("read_cache_bytes", serde_json::json!(0)),
-            (
-                "resident_reads",
-                serde_json::json!({
-                    "source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
-                    "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0,
-                    "require_device_read": false
-                }),
-            ),
-        ] {
-            let mut value = base.clone();
-            value[field] = retired;
-            assert!(serde_json::from_value::<ExternalOwnerReadConfig>(value).is_err());
-        }
     }
 
     #[test]
@@ -2326,26 +1987,6 @@ mod tests {
         assert!(batch.encoded().len() > 2 * 1024 * 1024);
         CompleteGroup::new(&shape, vec![batch], batch_limits, group_limits).unwrap();
         assert_eq!((1024 * 1024 * 1024) % RESEARCH_FRAGMENT_BYTES, 0);
-    }
-
-    #[test]
-    fn partition_samples_reject_duplicates_and_missing_owners() {
-        let endpoints = vec![(3, "a".to_owned()), (8, "b".to_owned())];
-        assert_eq!(
-            partition_snapshot(vec![(3, 1), (3, 2)], &endpoints)["available"],
-            false
-        );
-        assert_eq!(
-            partition_snapshot(vec![(3, 1)], &endpoints)["available"],
-            false
-        );
-        assert_eq!(
-            partition_snapshot(vec![(3, 1), (9, 2)], &endpoints)["available"],
-            false
-        );
-        let sample = partition_snapshot(vec![(8, 4), (3, 2)], &endpoints);
-        assert_eq!(sample["partitions"]["3"], 2);
-        assert_eq!(sample["partitions"]["8"], 4);
     }
 
     #[test]
@@ -2415,8 +2056,9 @@ mod tests {
         assert_eq!(OwnerWalGeometry::from_layout(4096, 8192), None);
     }
 
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
-    fn external_preparation_launches_wal_replay_owners_and_rejects_history_key() {
+    fn external_preparation_launches_leased_owners_and_rejects_removed_keys() {
         let root = std::env::temp_dir().join(format!(
             "kv-history-{}-{}",
             std::process::id(),
@@ -2424,33 +2066,92 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         let input = root.join("input.json");
-        let mut config = serde_json::json!({
+        let config = serde_json::json!({
             "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
             "transport": {"kind": "tcp"}, "max_batches_per_partition": 16384,
             "max_admitted_batches": 16384, "max_index_bytes": 536870912,
             "coordinator_cache_bytes": 0,
-            "owner_wal_member_read": "async", "owner_read_memory_allowance_bytes": 268435456,
-            "polling": "adaptive"
+            "owner_wal_member_read": "async", "polling": "adaptive",
+            "live_nvmeof": test_live_nvmeof(1)
         });
         fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
         let output = root.join("default");
         prepare_external_case_file(&input, &output).unwrap();
         let launch: serde_yaml::Value =
             serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
-        assert_eq!(launch["node"].get("read_workers"), None);
-        assert_eq!(launch["history_persistence"].as_str(), Some("wal_replay"));
+        assert!(launch.get("history_persistence").is_none());
+        assert!(launch.get("drop_first_append_response").is_none());
+        assert!(launch["node"]["live_target"].is_mapping());
+        assert!(!output.join("external_owner_read_config.json").exists());
         let remote: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
-        assert!(remote.get("history_persistence").is_none());
-        // WAL replay is the only history: the removed input key is rejected.
-        config["history_persistence"] = serde_json::json!("wal_replay");
-        fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
-        let rejected = root.join("rejected");
+        assert!(remote["live_nvme"].is_object());
+        // Removed inputs (history, owner-RPC reads) are rejected; live_nvmeof is required.
+        for (index, key) in [
+            "history_persistence",
+            "owner_read_workers",
+            "owner_read_resident_first",
+            "owner_read_memory_allowance_bytes",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut removed = config.clone();
+            removed[key] = serde_json::json!(1);
+            fs::write(&input, serde_json::to_vec(&removed).unwrap()).unwrap();
+            let rejected = root.join(format!("rejected-{index}"));
+            assert!(prepare_external_case_file(&input, &rejected).is_err());
+            assert!(!rejected.exists());
+        }
+        let mut no_live = config;
+        no_live.as_object_mut().unwrap().remove("live_nvmeof");
+        fs::write(&input, serde_json::to_vec(&no_live).unwrap()).unwrap();
+        let rejected = root.join("rejected-no-live");
         assert!(prepare_external_case_file(&input, &rejected).is_err());
         assert!(!rejected.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
+    #[test]
+    fn external_preparation_requires_the_nvmeof_feature() {
+        let root = std::env::temp_dir().join(format!(
+            "kv-external-no-nvmeof-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&root).unwrap();
+        let input = root.join("input.json");
+        let config = serde_json::json!({
+            "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
+            "transport": {"kind": "tcp"}, "max_batches_per_partition": 16384,
+            "max_admitted_batches": 16384, "max_index_bytes": 536870912,
+            "coordinator_cache_bytes": 0,
+            "owner_wal_member_read": "async", "polling": "adaptive",
+            "live_nvmeof": test_live_nvmeof(1)
+        });
+        fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
+        let output = root.join("unavailable");
+        let error = prepare_external_case_file(&input, &output).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires Linux and the nvmeof feature")
+        );
+        assert!(!output.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backends_require_external_remote_config() {
+        let error = validate_options(&serde_json::json!({
+            "transport": {"kind": "tcp"}, "path": "/unused"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("require external_remote_config"));
+    }
+
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn external_preparation_selects_owner_wal_geometry() {
         let root = std::env::temp_dir().join(format!(
@@ -2467,9 +2168,9 @@ mod tests {
             "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
             "max_index_bytes": 512 * 1024 * 1024,
             "coordinator_cache_bytes": 0,
-            "owner_read_workers": 4, "owner_wal_member_read": "async",
-            "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
-            "polling": "adaptive"
+            "owner_wal_member_read": "async",
+            "polling": "adaptive",
+            "live_nvmeof": test_live_nvmeof(2)
         });
         for (geometry, override_bytes, fragment_bytes, wal_file_bytes) in [
             (None, None, 134217728_u64, 10737418240_u64),
@@ -2537,14 +2238,15 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn external_preparation_rejects_invalid_owner_file_sizes() {
         let root = std::env::temp_dir().join(format!("kv-invalid-wal-{}", rand::random::<u64>()));
         fs::create_dir(&root).unwrap();
         let input = root.join("input.json");
         let mut config = controller_live_preparation_input();
-        config.as_object_mut().unwrap().remove("live_nvmeof");
         config["transport"] = serde_json::json!({"kind": "tcp"});
+        config.as_object_mut().unwrap().remove("owner_transports");
         for bytes in [0, 134217728, 268435457, 10871635968_u64] {
             config["owner_wal_file_bytes"] = serde_json::json!(bytes);
             fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -2573,8 +2275,6 @@ mod tests {
             },
             "max_admitted_batches": 1000000, "max_batches_per_partition": 16384,
             "max_index_bytes": 536870912,
-            "owner_read_memory_allowance_bytes": 536870912,
-            "owner_read_resident_first": false, "owner_read_workers": 4,
             "owner_transports": [{
                 "fabric": {"backend": "verbs", "source_address": "10.20.15.197"},
                 "kind": "ofi", "security": "trusted"
@@ -2597,7 +2297,7 @@ mod tests {
         value["live_nvmeof"]["leased_sync"] = serde_json::json!("per_frame_fua");
         value["live_nvmeof"]["leased_flush_min_frame_bytes"] = serde_json::json!(8192);
         let input: ExternalPreparationInput = serde_json::from_value(value).unwrap();
-        let live = input.live_nvmeof.unwrap();
+        let live = input.live_nvmeof;
         assert!(!live.lease_ahead);
         assert!(live.polled_writes);
         assert_eq!(live.leased_write_window, Some(8));
@@ -2615,7 +2315,7 @@ mod tests {
         live.remove("lease_ahead");
         live.remove("polled_writes");
         let input: ExternalPreparationInput = serde_json::from_value(value).unwrap();
-        let live = input.live_nvmeof.unwrap();
+        let live = input.live_nvmeof;
         assert!(live.lease_ahead);
         assert!(!live.polled_writes);
         assert_eq!(live.leased_write_window, None);
@@ -2659,7 +2359,7 @@ mod tests {
             let launch: serde_yaml::Value =
                 serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap())
                     .unwrap();
-            assert_eq!(launch["history_persistence"].as_str(), Some("wal_replay"));
+            assert!(launch.get("history_persistence").is_none());
             assert!(launch["node"]["live_target"].get("export_mode").is_none());
             assert_eq!(
                 launch["node"]["live_target"]["host_nqn"].as_str(),
@@ -2673,6 +2373,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
     #[test]
     fn external_coordinator_cache_requires_explicit_adequate_allowance() {
         let root = std::env::temp_dir().join(format!(
@@ -2690,9 +2391,9 @@ mod tests {
             "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
             "max_index_bytes": 512 * 1024 * 1024,
             "coordinator_cache_bytes": 1024_u64 * 1024 * 1024,
-            "owner_read_workers": 4, "owner_wal_member_read": "async",
-            "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
-            "polling": "adaptive"
+            "owner_wal_member_read": "async",
+            "polling": "adaptive",
+            "live_nvmeof": test_live_nvmeof(5)
         });
         let write_input = |value: &serde_json::Value| {
             fs::write(&input, serde_json::to_vec(value).unwrap()).unwrap();
@@ -2723,40 +2424,6 @@ mod tests {
             serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
         assert_eq!(remote["read_cache_bytes"], 1024_u64 * 1024 * 1024);
         assert_eq!(remote["read_memory_allowance_bytes"], allowance);
-        let owners: Vec<ExternalOwnerReadConfig> = serde_json::from_slice(
-            &fs::read(output.join("external_owner_read_config.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(owners.iter().all(|owner| owner.read_resident_first));
-        config["owner_read_resident_first"] = serde_json::json!(false);
-        write_input(&config);
-        let cold_output = root.join("cold");
-        prepare_external_case_file(&input, &cold_output).unwrap();
-        let cold_owners: Vec<ExternalOwnerReadConfig> = serde_json::from_slice(
-            &fs::read(cold_output.join("external_owner_read_config.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(cold_owners.iter().all(|owner| !owner.read_resident_first));
-        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
-        {
-            config["live_nvmeof"] = serde_json::json!({
-                "addresses": ["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"],
-                "transport": "rdma", "service": 4420, "port_id": 4420,
-                "commissioning_service": 4421, "commissioning_port_id": 4421,
-                "max_inflight_requests": 8, "max_inflight_bytes": 8388608,
-                "connect_timeout_ms": 10000, "io_timeout_ms": 10000
-            });
-            write_input(&config);
-            let output = root.join("unavailable");
-            let error = prepare_external_case_file(&input, &output).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("requires Linux and the nvmeof feature")
-            );
-            assert!(!output.exists());
-        }
-        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         {
             config["live_nvmeof"] = serde_json::json!({
                 "addresses": ["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"],
@@ -2933,10 +2600,9 @@ mod tests {
             "max_admitted_batches": 1_048_576,
             "max_index_bytes": 512 * 1024 * 1024,
             "coordinator_cache_bytes": 0,
-            "owner_read_workers": 4,
             "owner_wal_member_read": "async",
-            "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
-            "polling": "adaptive"
+            "polling": "adaptive",
+            "live_nvmeof": test_live_nvmeof(5)
         });
         fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
         let result = prepare_external_case_file(&input, &output);
@@ -2955,7 +2621,6 @@ mod tests {
             pid: 1,
             boot_id: "b".to_owned(),
             started_unix_ns: 1,
-            history_persistence: tidehunter::distributed::storage::HistoryPersistence::OnDisk,
             durability: tcp_cluster::ReceiptDurability {
                 tier,
                 max_unsynced_age_ms: None,
@@ -3098,7 +2763,3 @@ mod tests {
         assert!(validate_options(&options).is_err());
     }
 }
-
-#[cfg(test)]
-#[path = "tidehunter/replay_preparation_tests.rs"]
-mod replay_preparation_tests;

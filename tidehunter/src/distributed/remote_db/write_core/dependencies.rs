@@ -98,17 +98,29 @@ impl DependencyRegistry {
                 .sum::<usize>()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn len(&self) -> usize {
         self.shards.iter().map(|shard| shard.lock().len()).sum()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn capacity(&self) -> usize {
         self.shards
             .iter()
             .map(|shard| shard.lock().capacity())
             .sum()
+    }
+
+    /// Bytes per resident slot, as charged by `resident_bytes` (spilled key
+    /// storage is charged separately).
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) const fn entry_bytes() -> usize {
+        std::mem::size_of::<(Dependency, u64)>()
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 }
 

@@ -1,6 +1,5 @@
 use super::*;
 use crate::distributed::codec::Mutation;
-use crate::distributed::sequence::LogicalClock;
 use crate::key_shape::{KeySpace, KeyType};
 use std::os::unix::fs::FileExt;
 
@@ -188,11 +187,9 @@ fn live_root_end(path: &Path) -> u64 {
 fn live_log_for(
     path: &Path,
     config: &PartitionConfig,
-    mode: HistoryPersistence,
     tier: crate::distributed::durability::DurabilityTier,
 ) -> PartitionLog {
     let log = PartitionLog::create_live(path, config.clone(), &shape(), metrics()).unwrap();
-    log.set_history_persistence(mode).unwrap();
     log.attach_frontier(&crate::distributed::durability::DurabilityConfig::with_tier(tier))
         .unwrap();
     log
@@ -204,44 +201,34 @@ const TIERS: [crate::distributed::durability::DurabilityTier; 2] = [
     crate::distributed::durability::DurabilityTier::Synchronous,
 ];
 
-/// The syncer syncs the WAL but defers the root inside a fragment only with
-/// WAL-replay history; on-disk history keeps the root at the durable end.
-/// Either way a crash recovers every synced frame by scanning past the root.
+/// The syncer syncs the WAL but defers the root inside a fragment (WAL-replay
+/// history, the only history). A crash recovers every synced frame by
+/// scanning past the root.
 #[cfg(feature = "experimental-nvmeof")]
 #[test]
-fn syncer_defers_live_root_only_with_wal_replay_history_and_recovers_by_scan() {
+fn syncer_defers_live_root_and_recovers_by_scan() {
     for tier in TIERS {
-        for mode in [HistoryPersistence::WalReplay, HistoryPersistence::OnDisk] {
-            let temp = tempdir::TempDir::new("live-root-deferred").unwrap();
-            let config = live_multi_frame_config();
-            let path = temp.path().join("stream");
-            let log = live_log_for(&path, &config, mode, tier);
-            let first = append_live_fixture(&log, &config, 0);
-            log.sync_for_frontier().unwrap();
-            let second = append_live_fixture(&log, &config, 1);
-            log.sync_for_frontier().unwrap();
-            let stats = log.stats();
-            assert_eq!(stats.wal_file_syncs, 2);
-            log.validate_durable_receipt(DurableBatch(second)).unwrap();
-            if mode == HistoryPersistence::WalReplay {
-                assert_eq!(
-                    (stats.live_frontier_installs, stats.live_frontier_deferred),
-                    (0, 2)
-                );
-                assert_eq!(live_root_end(&path), 0);
-            } else {
-                assert_eq!(
-                    (stats.live_frontier_installs, stats.live_frontier_deferred),
-                    (2, 0)
-                );
-                assert_eq!(live_root_end(&path), 8192);
-            }
-            drop(log);
-            let recovered =
-                PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
-            assert_eq!(recovered.lookup(first.id()).unwrap(), Some(first));
-            assert_eq!(recovered.lookup(second.id()).unwrap(), Some(second));
-        }
+        let temp = tempdir::TempDir::new("live-root-deferred").unwrap();
+        let config = live_multi_frame_config();
+        let path = temp.path().join("stream");
+        let log = live_log_for(&path, &config, tier);
+        let first = append_live_fixture(&log, &config, 0);
+        log.sync_for_frontier().unwrap();
+        let second = append_live_fixture(&log, &config, 1);
+        log.sync_for_frontier().unwrap();
+        let stats = log.stats();
+        assert_eq!(stats.wal_file_syncs, 2);
+        log.validate_durable_receipt(DurableBatch(second)).unwrap();
+        assert_eq!(
+            (stats.live_frontier_installs, stats.live_frontier_deferred),
+            (0, 2)
+        );
+        assert_eq!(live_root_end(&path), 0);
+        drop(log);
+        let recovered =
+            PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+        assert_eq!(recovered.lookup(first.id()).unwrap(), Some(first));
+        assert_eq!(recovered.lookup(second.id()).unwrap(), Some(second));
     }
 }
 
@@ -256,7 +243,7 @@ fn live_root_catch_up_crash_cuts_recover_every_synced_frame() {
             let temp = tempdir::TempDir::new("live-root-catch-up").unwrap();
             let config = live_multi_frame_config();
             let path = temp.path().join("stream");
-            let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+            let log = live_log_for(&path, &config, tier);
             let first = append_live_fixture(&log, &config, 0);
             let second = append_live_fixture(&log, &config, 1);
             log.sync_for_frontier().unwrap();
@@ -295,7 +282,6 @@ fn syncer_installs_live_root_on_fragment_crossing() {
     let log = live_log_for(
         &path,
         &config,
-        HistoryPersistence::WalReplay,
         crate::distributed::durability::DurabilityTier::Synchronous,
     );
     append_live_fixture(&log, &config, 0);
@@ -315,17 +301,17 @@ fn syncer_installs_live_root_on_fragment_crossing() {
 }
 
 /// An abrupt crash after one synced live append, then the owner operations of
-/// a recovery open on the recovered sealed log: per-receipt recovery barriers
-/// (`RecoverLiveMetadata`, checkpoint proof), flush, the fence/retire root
-/// catch-up and durable-progress status. Recovery leaves no unsynced data and
-/// no root debt, so none of them may need a live tail. A second recovery
-/// proves these operations leave the stream recoverable.
+/// a recovery open on the recovered sealed log: per-receipt persistence
+/// barriers, flush, the fence/retire root catch-up and durable-progress status.
+/// Recovery leaves no unsynced data and no root debt, so none of them may need
+/// a live tail. A second recovery proves these operations leave the stream
+/// recoverable.
 #[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn recovered_live_log_serves_recovery_barriers_after_abrupt_crash() {
     use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
-        for mode in [HistoryPersistence::WalReplay, HistoryPersistence::OnDisk] {
+        {
             let temp = tempdir::TempDir::new("live-abrupt-recovery").unwrap();
             let mut config = live_config();
             config.fragment_bytes = 64 * 1024;
@@ -333,7 +319,6 @@ fn recovered_live_log_serves_recovery_barriers_after_abrupt_crash() {
             let path = temp.path().join("stream");
             let log =
                 PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
-            log.set_history_persistence(mode).unwrap();
             log.attach_frontier(&DurabilityConfig::with_tier(tier))
                 .unwrap();
             let appended = append_live_fixture(&log, &config, 0);
@@ -390,7 +375,7 @@ fn lagging_live_root_recovery_stops_at_first_invalid_frame() {
         let temp = tempdir::TempDir::new("live-root-lagging").unwrap();
         let config = live_multi_frame_config();
         let path = temp.path().join("stream");
-        let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+        let log = live_log_for(&path, &config, tier);
         let first = append_live_fixture(&log, &config, 0);
         let second = append_live_fixture(&log, &config, 1);
         let third = append_live_fixture(&log, &config, 2);
@@ -449,7 +434,7 @@ fn durable_progress_covers_only_the_rooted_prefix_and_recovery_enforces_it() {
             let temp = tempdir::TempDir::new("live-root-progress").unwrap();
             let config = live_multi_frame_config();
             let path = temp.path().join("stream");
-            let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+            let log = live_log_for(&path, &config, tier);
             let first = append_live_fixture(&log, &config, 0);
             let second = append_live_fixture(&log, &config, 1);
             let third = append_live_fixture(&log, &config, 2);
@@ -516,7 +501,7 @@ fn progress_nudge_roots_the_appended_prefix_once() {
         let temp = tempdir::TempDir::new("live-progress-nudge").unwrap();
         let config = live_multi_frame_config();
         let path = temp.path().join("stream");
-        let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+        let log = live_log_for(&path, &config, tier);
         append_live_fixture(&log, &config, 0);
         log.sync_for_frontier().unwrap();
         assert!(log.persist_live_progress().unwrap());
@@ -573,7 +558,7 @@ fn owner_read_of_newest_batch_persists_on_demand_only_in_synchronous_tier() {
         let temp = tempdir::TempDir::new("live-read-on-demand").unwrap();
         let config = live_multi_frame_config();
         let path = temp.path().join("stream");
-        let log = live_log_for(&path, &config, HistoryPersistence::WalReplay, tier);
+        let log = live_log_for(&path, &config, tier);
         let newest = append_live_fixture(&log, &config, 0);
         let reference = log.record_reference(newest, 0).unwrap();
         let before = log.stats();
@@ -618,6 +603,22 @@ fn live_recovery_fails_on_acknowledged_corruption_even_skip_header() {
         let path = temp.path().join("stream");
         let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
         let receipt = append_live_fixture(&log, &config, 0);
+        // This first frame of a fresh log sits at file offset 0 (the corruption
+        // offsets below rely on it); its receipt names the only member, at
+        // frame offset + 8-byte outer frame header + member offset.
+        let group = CompleteGroup::new_live(
+            &shape(),
+            vec![batch(&config, 0)],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let frame_offset = 0;
+        let member_offset = group.batch_offsets()[0];
+        assert_eq!(
+            receipt.address().offset,
+            frame_offset + 8 + u64::from(member_offset)
+        );
         log.persist_many(&[receipt]).unwrap();
         let file = OpenOptions::new()
             .write(true)
@@ -1381,6 +1382,8 @@ fn registered_value_reads_do_not_acquire_the_partition_metadata_mutex() {
     assert_eq!(whole.unwrap().mutations(), batch.mutations());
 }
 
+// Owned read plans (`plan_record_read`) exist only with the live route.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn reference_metadata_budget_rejects_before_any_authority_bytes() {
     let temp = tempdir::TempDir::new("native-reference-budget").unwrap();
@@ -1506,8 +1509,6 @@ fn retries_are_idempotent_and_conflicts_reject_before_authority() {
         metrics(),
     )
     .unwrap();
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
     let first = batch(&config, 0);
     let receipt = log
         .append_complete_batch(authority(&config), &first)
@@ -1545,14 +1546,16 @@ fn retries_are_idempotent_and_conflicts_reject_before_authority() {
         Err(StorageError::VersionConflict)
     ));
     assert!(matches!(
-        log.append_complete_batch(authority(&config), &batch(&config, 1)),
-        Err(StorageError::NeedsPersistence)
-    ));
-    assert!(matches!(
         log.append_complete_batch(RequestAuthority { epoch: 4 }, &first),
         Err(StorageError::Fenced)
     ));
     assert_eq!(log.receipt_page(0, 256).unwrap(), vec![receipt]);
+    // WAL-replay history: the next batch is admitted without a persistence
+    // barrier (the OnDisk `max_batches` → `NeedsPersistence` bound is gone).
+    let second = log
+        .append_complete_batch(authority(&config), &batch(&config, 1))
+        .unwrap();
+    assert_eq!(log.receipt_page(0, 256).unwrap(), vec![receipt, second]);
 }
 
 #[test]
@@ -1610,39 +1613,6 @@ fn complete_unacknowledged_batch_recovers_but_torn_batch_is_never_partial() {
 }
 
 #[test]
-fn recovery_requires_every_partition_and_does_not_confuse_global_versions_with_offsets() {
-    let temp = tempdir::TempDir::new("native-inventory").unwrap();
-    let c0 = config(vec![0, 1], 0);
-    let c1 = config(vec![0, 1], 1);
-    let p0 = temp.path().join("zero");
-    let p1 = temp.path().join("one");
-    let clock = LogicalClock::new_fenced_epoch(5);
-    let a = PartitionLog::create(&p0, c0.clone(), &shape(), metrics()).unwrap();
-    a.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let b = PartitionLog::create(&p1, c1.clone(), &shape(), metrics()).unwrap();
-    b.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    let v0 = clock.allocate().unwrap();
-    let v1 = clock.allocate().unwrap();
-    let first = a
-        .append_complete_batch(authority(&c0), &batch(&c0, v0.sequence))
-        .unwrap();
-    let later = b
-        .append_complete_batch(authority(&c1), &batch(&c1, v1.sequence))
-        .unwrap();
-    assert_eq!(first.address.offset, later.address.offset); // independent physical streams
-    assert!(first.version < later.version); // shared logical order
-    b.persist_through(later).unwrap();
-    drop(a);
-    drop(b);
-    assert!(recover_inventory(&c0.inventory, &[(p1.clone(), c1.clone())], metrics()).is_err());
-    let logs = recover_inventory(&c0.inventory.clone(), &[(p0, c0), (p1, c1)], metrics()).unwrap();
-    assert_eq!(logs[0].lookup(first.id()).unwrap(), Some(first));
-    assert_eq!(logs[1].lookup(later.id()).unwrap(), Some(later));
-}
-
-#[test]
 fn foreign_schema_identity_and_address_do_not_cross_partition_boundaries() {
     let temp = tempdir::TempDir::new("native-validation").unwrap();
     let c0 = config(vec![0, 1], 0);
@@ -1680,37 +1650,22 @@ fn foreign_schema_identity_and_address_do_not_cross_partition_boundaries() {
     assert_eq!(a.receipt_count(), 1);
 }
 
+/// WAL-replay history only (the on-disk authenticated receipt root and its
+/// corruption case were removed with OnDisk history): a competing open and a
+/// recovery of an unsealed stream fail, and a sealed stream with a missing
+/// WAL file fails closed.
 #[test]
-fn sealed_history_corruption_missing_files_and_competing_open_fail_closed() {
+fn sealed_history_missing_files_and_competing_open_fail_closed() {
     let temp = tempdir::TempDir::new("native-fail-closed").unwrap();
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
     assert!(PartitionLog::create(&path, config.clone(), &shape(), metrics()).is_err());
     assert!(PartitionLog::recover_sealed(&path, &config, metrics()).is_err());
-    let receipt = log
-        .append_complete_batch(authority(&config), &batch(&config, 0))
+    log.append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
     log.seal_epoch(authority(&config)).unwrap();
     drop(log);
-    let file = OpenOptions::new()
-        .write(true)
-        .open(path.join("wal_0000000000000000"))
-        .unwrap();
-    file.write_all_at(
-        &[0xff],
-        receipt.address.offset + u64::from(receipt.address.len) - 1,
-    )
-    .unwrap();
-    file.sync_all().unwrap();
-    // The authenticated root avoids replaying the lifetime WAL prefix. Payload
-    // integrity is checked at the consuming read boundary, before returning data.
-    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
-    assert_eq!(recovered.lookup(receipt.id()).unwrap(), Some(receipt));
-    assert!(recovered.read_batch(receipt).is_err());
-    drop(recovered);
     fs::remove_file(path.join("wal_0000000000000000")).unwrap();
     assert!(PartitionLog::recover_sealed(&path, &config, metrics()).is_err());
 }
@@ -1758,7 +1713,6 @@ fn assert_profile_stage_bounds(profile: StorageWriteProfile) {
     assert!(
         profile.append_state_lock_wait_ns
             + profile.append_validation_ns
-            + profile.append_history_ns
             + profile.append_wal_ns
             + profile.append_publication_ns
             <= profile.append_total_ns
@@ -2137,7 +2091,6 @@ fn missing_live_registration_cannot_downgrade_frontier_recovery() {
 }
 
 mod conflict_index;
-mod history;
 #[cfg(feature = "experimental-nvmeof")]
 mod live_extent;
 #[cfg(feature = "experimental-nvmeof")]

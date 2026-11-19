@@ -1,10 +1,10 @@
 //! Durable-prefix recovery against real loopback owners. A coordinator crash is
 //! a shutdown without its checkpoint: owners keep every appended batch, and the
 //! reopen fence syncs them, so only the cut decides what recovery keeps.
+#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::durable_cut::RECORD;
 use super::pipeline_tests::Fixture;
-use super::tests::recovery_metrics;
 use super::*;
 use crate::key_shape::KeyType;
 
@@ -20,7 +20,28 @@ fn fixture(owners: usize, durable_cut: DurableCutConfig) -> Fixture {
         KeyShape::new_single(4, 1, KeyType::uniform(1)),
         2,
         |config| config.durable_cut = durable_cut,
-        |config| crate::distributed::tcp::StorageNode::open(config, recovery_metrics()).unwrap(),
+        |_| {},
+    )
+}
+
+/// `fixture` with 64 KiB fragments in 1 MiB WAL files. A leased frame is at
+/// least one 4 KiB block, so with the default 4 KiB fragments every write
+/// fills its extent and the extent close requests a sync. Here a frame stays
+/// far below a fragment: no close, no new WAL file, so after the first lease
+/// only a nudge or an explicit flush syncs the owner.
+fn wide_fixture(owners: usize, durable_cut: DurableCutConfig) -> Fixture {
+    Fixture::new_with_root(
+        tempdir::TempDir::new("durable-cut").unwrap(),
+        owners,
+        128,
+        KeyShape::new_single(4, 1, KeyType::uniform(1)),
+        2,
+        |config| {
+            config.durable_cut = durable_cut;
+            config.storage.fragment_bytes = 64 * 1024;
+            config.storage.wal_file_bytes = 1024 * 1024;
+        },
+        |_| {},
     )
 }
 
@@ -198,7 +219,8 @@ fn restarted_owner_bounds_the_skip_at_its_recorded_sync() {
 /// and discards v2, and a later open keeps that truncation.
 #[test]
 fn restarted_owner_process_stops_extend_at_its_lost_version() {
-    let mut fixture = fixture(2, quiet());
+    // Wide fragments: v1 must stay acknowledged but unsynced (no extent close).
+    let mut fixture = wide_fixture(2, quiet());
     let db = fixture.open();
     let epoch = db.epoch();
     db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
@@ -213,8 +235,11 @@ fn restarted_owner_process_stops_extend_at_its_lost_version() {
     assert_eq!((lost.sequence, kept.sequence), (1, 2));
     assert_eq!(db.durable_cut_stats().persisted_next, 1);
     // Owner 1's syncer fsync fails: the failure is sticky, so its log never
-    // seals and the owner must restart.
+    // seals and the owner must restart. As the owner's own flush and nudge
+    // paths do, adopt the leased frame first, so the frontier covers v1.
     let log = fixture.nodes[1].log_for_test(epoch);
+    log.self_adopt_live_extent().unwrap();
+    assert!(log.frontier().unwrap().synced() < log.frontier().unwrap().appended());
     log.fail_next_persist();
     let frontier = log.frontier().unwrap().clone();
     drop(log);
@@ -227,17 +252,17 @@ fn restarted_owner_process_stops_extend_at_its_lost_version() {
     super::tests::fail_stop_without_checkpoint(db);
     fixture.stop_owners();
     // v1 is owner 1's only frame of the epoch: the failed fsync dropped its
-    // dirty pages.
+    // dirty pages. The leased WAL file is preallocated and bound to the live
+    // target by inode, size and allocation, so the dropped pages read back as
+    // the zeros of its never-synced blocks: zero the contents, keep the file.
     let wal = fixture
         .temp
         .path()
         .join(format!("node-1/epoch_{epoch:016}/wal_0000000000000000"));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(wal)
-        .unwrap()
-        .set_len(0)
-        .unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(wal).unwrap();
+    let len = file.metadata().unwrap().len();
+    std::os::unix::fs::FileExt::write_all_at(&file, &vec![0; len as usize], 0).unwrap();
+    drop(file);
     fixture.restart_owners().unwrap();
     let mut db = fixture.open();
     let stats = db.recovery_stats();
@@ -273,11 +298,10 @@ fn truncation_survives_every_later_crash() {
         marks[1].incarnation = [0x5a; 16];
         marks[1].synced_next = 1;
     });
-    let error = RemoteDatabase::open_inner(
+    let error = RemoteDatabase::open_inner_local_fixture(
         &root,
         &fixture.shape,
         fixture.config.clone(),
-        None,
         Some(OpenInterruption::AfterCutRecord),
     )
     .err()
@@ -331,12 +355,18 @@ fn synchronous_recovery_is_unchanged() {
 }
 
 /// Owner 1 never receives a batch and stays idle; owner 0 lags until the actor
-/// nudges it. The nudge is the only sync trigger here (Native, far below a
-/// fragment), so the paused sync proves it, and the cut moves past the idle
-/// owner once the sync completes.
+/// nudges it. The nudge is the only sync trigger here (Native, frames far
+/// below a fragment), so the paused sync proves it, and the cut moves past the
+/// idle owner once the sync completes.
+///
+/// Leased route: the first write of the epoch takes owner 0's first lease,
+/// whose WAL file and directory-entry durability step is the same owner
+/// persist hook. A warm-up write therefore takes that lease and is itself
+/// carried by a nudge before the hook is armed; the measured write then uses
+/// the open extent, so the hook can only catch the nudge's sync.
 #[test]
 fn lagging_owner_is_nudged_and_idle_owner_does_not_pin_the_cut() {
-    let fixture = fixture(
+    let fixture = wide_fixture(
         2,
         DurableCutConfig {
             lag_ms: 20,
@@ -346,18 +376,24 @@ fn lagging_owner_is_nudged_and_idle_owner_does_not_pin_the_cut() {
     let db = fixture.open();
     let cut = db.core.durable_cut.as_ref().unwrap();
     let persisted = cut.persisted_events();
+    db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
+        .unwrap();
+    assert_eq!(persisted.recv_timeout(WAIT).unwrap(), 1);
+    let warm = db.durable_cut_stats();
+    assert_eq!(warm.persisted_next, 1);
+    assert!(warm.nudges >= 1);
     let (entered, resume) = fixture.nodes[0]
         .log_for_test(db.epoch())
         .pause_next_persist();
-    db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
+    db.write_batch(fixture.operation(0, 2), vec![put(2, 2)])
         .unwrap();
     entered.recv_timeout(WAIT).unwrap();
     assert!(persisted.try_recv().is_err(), "cut moved before the sync");
-    assert!(db.durable_cut_stats().nudges >= 1);
+    assert!(db.durable_cut_stats().nudges > warm.nudges);
     resume.send(()).unwrap();
-    assert_eq!(persisted.recv_timeout(WAIT).unwrap(), 1);
+    assert_eq!(persisted.recv_timeout(WAIT).unwrap(), 2);
     let stats = db.durable_cut_stats();
-    assert_eq!(stats.persisted_next, 1);
-    assert!(stats.reports >= 1);
+    assert_eq!(stats.persisted_next, 2);
+    assert!(stats.reports > warm.reports);
     db.shutdown().unwrap();
 }

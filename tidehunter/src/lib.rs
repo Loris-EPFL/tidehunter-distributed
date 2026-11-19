@@ -31,7 +31,11 @@ mod math;
 pub mod metrics;
 pub mod parallelism;
 mod primitives;
-#[cfg(all(target_os = "linux", feature = "test-utils"))]
+// The distributed owner protocol carries the evidence structs in every build.
+#[cfg(any(
+    feature = "experimental-distributed",
+    all(target_os = "linux", feature = "test-utils")
+))]
 pub mod read_probe;
 mod relocation;
 mod replay_buffer;

@@ -105,12 +105,7 @@ impl LaneInbox<'_> {
                 self.state.poison();
                 continue;
             };
-            request.complete_nvme(
-                finished
-                    .result
-                    .map(|values| (values, None))
-                    .map_err(LocalDbError::component),
-            );
+            request.complete_nvme(finished.result.map_err(LocalDbError::component));
         }
         delivered
     }
@@ -390,7 +385,7 @@ mod tests {
     #[test]
     fn poisoned_live_actor_releases_idle_pool_after_terminal_publication() {
         use crate::distributed::remote_db::pipeline_tests::Fixture;
-        use crate::distributed::tcp::{StorageNode, export_pin_tests::HistoryPool};
+        use crate::distributed::tcp::export_pin_tests::HistoryPool;
         let mut history = HistoryPool::new();
         let base = Fixture::new_with_root(
             tempdir::TempDir::new("poison-idle-pool").unwrap(),
@@ -399,13 +394,7 @@ mod tests {
             KeyShape::from_yaml(&history.owner.config.shape_yaml).unwrap(),
             2,
             |_| {},
-            |config| {
-                StorageNode::open(
-                    config,
-                    crate::distributed::remote_db::tests::recovery_metrics(),
-                )
-                .unwrap()
-            },
+            |_| {},
         );
         let client = std::mem::replace(&mut history.client, history.owner.client());
         let mut config = base.config.clone();
@@ -423,7 +412,7 @@ mod tests {
         config.endpoints[0].server_name = history.owner.tls.server_name.clone();
         config.tls = history.owner.tls.clone();
         config.read_lanes = Some(1);
-        config.live_nvme = client.live_config_for_test();
+        config.live_nvme = client.live_config_for_test().unwrap();
         let readers = ReadService::from_clients(
             &config,
             2,
@@ -440,7 +429,7 @@ mod tests {
         readers.poison();
         // Joining the existing actor is a deterministic cleanup barrier, not a
         // timeout/sleep assertion about background scheduling.
-        drop(readers.stop_with_clients());
+        readers.stop();
         assert_eq!(history.pin_count(), 0);
         history
             .pool

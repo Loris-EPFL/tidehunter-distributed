@@ -56,7 +56,7 @@ pub(in crate::distributed::remote_db) struct WriteGrant {
 }
 
 impl WriteGrant {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     fn request(bytes: usize) -> Self {
         Self {
             requests: 1,
@@ -87,7 +87,7 @@ impl WriteGrant {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::distributed::remote_db) struct AdmissionCharges {
     pub requests: usize,
@@ -253,18 +253,18 @@ impl Admission {
         (budget.peak_requests, budget.peak_bytes)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(in crate::distributed::remote_db) fn queued_waiters(&self) -> usize {
         self.budget.lock().waiters.len()
     }
 
     /// Every charged dimension, copied under the budget mutex.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(in crate::distributed::remote_db) fn charges(&self) -> AdmissionCharges {
         Self::charges_of(&self.budget.lock())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     fn charges_of(budget: &WriteBudget) -> AdmissionCharges {
         AdmissionCharges {
             requests: budget.requests,
@@ -282,7 +282,7 @@ impl Admission {
     /// Waits on the existing drained condvar until `done` holds. Every release
     /// path notifies it through grant_waiters once no request credit remains,
     /// so callers must not hold an unreleased request credit while waiting.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(in crate::distributed::remote_db) fn wait_charges(
         &self,
         deadline: Instant,
@@ -482,7 +482,7 @@ impl Admission {
 
     /// Lower the identity (checkpoint receipt metadata) bound for a test,
     /// under the budget mutex so every later grant predicate observes it.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(in crate::distributed::remote_db) fn limit_identities_for_test(&self, limit: usize) {
         self.budget.lock().identity_limit = Some(limit);
     }
@@ -554,7 +554,7 @@ impl Admission {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     fn charge(budget: &mut WriteBudget, bytes: usize) {
         Self::charge_grant(budget, &WriteGrant::request(bytes));
     }
@@ -607,12 +607,12 @@ impl Admission {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     fn enqueue<'a>(&'a self, budget: &mut WriteBudget, bytes: usize) -> WaitingReservation<'a> {
         self.enqueue_grant(budget, WriteGrant::request(bytes))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(in crate::distributed::remote_db) fn reserve(
         self: &Arc<Self>,
         bytes: usize,
@@ -818,8 +818,6 @@ pub struct ConcurrentRemoteDatabase {
     pub(super) read_resolve_ns: AtomicU64,
     pub(super) value_read_ns: AtomicU64,
     io_clients: Vec<(u32, ControlHandle)>,
-    operational_monitor: OperationalReadIoMonitor,
-    operational_lifecycle: std::sync::Weak<Mutex<OperationalReadIoLifecycle>>,
 }
 
 fn owner_timeline_error(
@@ -1045,9 +1043,13 @@ impl ConcurrentRemoteDatabase {
             partition_indexes: core.partition_indexes.clone(),
             read_resolve_ns: AtomicU64::new(0),
             value_read_ns: AtomicU64::new(0),
-            io_clients: db.read_evidence_monitor().clients,
-            operational_monitor: core.operational_sampler.monitor(),
-            operational_lifecycle: core.operational_sampler.downgrade_lifecycle(),
+            io_clients: core
+                .config
+                .endpoints
+                .iter()
+                .zip(&core.clients)
+                .map(|(endpoint, worker)| (endpoint.partition, worker.control_handle()))
+                .collect(),
             database: Arc::new(db),
         })
     }
@@ -1372,12 +1374,6 @@ impl ConcurrentRemoteDatabase {
     ) -> Option<[PerKeyspaceReadCacheStats; KEYSPACE_COUNTER_COUNT]> {
         Some(self.cache.per_keyspace_stats())
     }
-    pub fn read_evidence_monitor(&self) -> ReadEvidenceMonitor {
-        ReadEvidenceMonitor {
-            clients: self.io_clients.clone(),
-            reads: self.reads.clone(),
-        }
-    }
     /// Explicit flush: snapshot the next sequence, wait until every earlier
     /// allocation is published (or fail-stop), then run each owner's control
     /// barrier, which flushes every log's frontier before replying. Owners run
@@ -1433,14 +1429,6 @@ impl ConcurrentRemoteDatabase {
             .collect::<Result<Vec<_>, _>>()?;
         self.ensure_healthy()?;
         Ok(result)
-    }
-
-    /// Passive snapshots do not keep the write owner or its connections alive.
-    pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
-        if let Some(lifecycle) = self.operational_lifecycle.upgrade() {
-            OperationalReadIoSampler::activate_lifecycle(&lifecycle);
-        }
-        self.operational_monitor.clone()
     }
     pub fn read_admission_generation(&self) -> u64 {
         self.reads.admission_generation()

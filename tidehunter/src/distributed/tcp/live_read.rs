@@ -23,7 +23,7 @@
 //! credit of its grant is admitted in waves as credit returns. Verified member
 //! values are slices of the aligned I/O blocks (no copy); a retained value keeps
 //! its whole block alive, so a long-lived cache should copy before retaining.
-use super::live_control::LiveRecordLocation;
+use super::LiveRecordLocation;
 use super::{Client, CompleteBatch, Mutation, TcpError, ValueRecordReference};
 use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
 use crate::distributed::nvmeof::live_io::{
@@ -1391,9 +1391,6 @@ impl LiveReadCache {
             )));
         };
         let binding = &location.binding;
-        binding
-            .require_kernel_target()
-            .map_err(|error| ConnectError::Failed(TcpError::component(error)))?;
         let target = LiveConnectTarget {
             nqn: binding.nqn.clone(),
             uuid: binding.uuid,
@@ -1440,6 +1437,14 @@ impl LiveReadCache {
         let (Some(config), Some(pool)) = (&client.live_config, &client.live_pool) else {
             return Err(failed("live controller pool unavailable"));
         };
+        // The ordinary-file fixture has no kernel target: name the file behind
+        // a file grant, so reopened authorities read earlier WAL files too.
+        #[cfg(any(test, feature = "test-utils"))]
+        if client.live_write_local_fixture
+            && let GrantScope::File(location) = &scope
+        {
+            pool.register_local_target(&target.nqn, location.segment.path.clone());
+        }
         let setup = LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
         let acquisition = if shared {
             pool.acquire_shared(
@@ -1912,287 +1917,78 @@ pub(crate) mod tests {
     use crate::distributed::types::PhysicalValueAddress;
     use std::io::{Seek, SeekFrom, Write};
 
-    struct ExportPoolFixture {
-        owner: super::super::leased_tests::Fixture,
-        client: Client,
-        pool: Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>,
-        leased: super::super::LiveLeased,
-        target: LiveConnectTarget,
-        _dir: tempdir::TempDir,
-    }
-
-    impl ExportPoolFixture {
-        fn new() -> Self {
-            use crate::distributed::durability::DurabilityTier;
-            use crate::distributed::nvmeof::{
-                live_connect::LiveConnectionRegistry, live_pool::LiveControllerPool,
-            };
-            let owner = super::super::leased_tests::Fixture::single_partition(
-                DurabilityTier::Native,
-                16384,
-            );
-            let mut client = owner.writer();
-            let leased = client.lease_live_extent(1).unwrap();
-            let binding = &leased.binding;
-            let target = LiveConnectTarget {
-                nqn: binding.nqn.clone(),
-                uuid: binding.uuid,
-                nsid: binding.nsid,
-                bytes: binding.bytes,
-                block_size: binding.block_size,
-                address: binding.address.clone(),
-                service: binding.service,
-                transport: binding.transport,
-                geometry: Default::default(),
-            };
-            let dir = tempdir::TempDir::new("export-pool-regression").unwrap();
-            let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
-            let pool = Arc::new(LiveControllerPool::new(registry, 1, 1).unwrap());
-            pool.register_local_target(&target.nqn, leased.extent.segment.path.clone());
-            client.live_pool = Some(pool.clone());
-            Self {
-                owner,
-                client,
-                pool,
-                leased,
-                target,
-                _dir: dir,
-            }
-        }
-
-        fn acquire(&self) -> Arc<LiveControllerLease> {
-            let config = self.client.live_config.as_ref().unwrap();
-            self.pool
-                .acquire_pinned(
-                    &self.target,
-                    &config.host_nqn,
-                    config.host_id,
-                    LiveNamespaceAccess::ReadWrite,
-                    Instant::now() + Duration::from_secs(5),
-                    super::super::LiveExportPinRequest {
-                        recipe: &self.client.live_pin_recipe,
-                        epoch: 1,
-                        segment: &self.leased.extent.segment,
-                        binding: &self.leased.binding,
-                    },
-                )
-                .unwrap()
-                .0
-        }
-
-        fn pin_count(&self) -> usize {
-            self.owner.node.inventory.lock().live_export_pins.len()
-        }
-
-        fn has_export(&self) -> bool {
-            let segment = &self.leased.extent.segment;
-            let file = crate::distributed::nvmeof::live_target::LiveFileIdentity {
-                path: segment.path.clone(),
-                device: segment.device,
-                inode: segment.inode,
-                bytes: segment.bytes,
-                block_size: segment.block_size,
-            };
-            self.owner
-                .node
-                .with_live_target(|target| target.binding_for_file(&file).is_some())
-        }
-
-        fn close_extent(
-            &mut self,
-            lease: &super::super::LiveLeased,
-            frame: &[u8],
-        ) -> super::super::LiveLeased {
-            use std::os::unix::fs::FileExt;
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&lease.extent.segment.path)
-                .unwrap();
-            let offset = lease.extent.start % lease.extent.segment.bytes;
-            if !frame.is_empty() {
-                file.write_all_at(frame, offset).unwrap();
-            }
-            let mut skip = [0; 4096];
-            skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
-            file.write_all_at(&skip, offset + frame.len() as u64)
-                .unwrap();
-            self.client
-                .adopt_live_extent(
-                    1,
-                    lease.extent.token,
-                    lease.extent.start + frame.len() as u64,
-                    true,
-                    true,
-                )
-                .unwrap()
-                .next
-                .unwrap()
-        }
-
-        fn rollover(&mut self) -> super::super::LiveLeased {
-            let first = self.leased.clone();
-            let next = self.close_extent(&first, &[]);
-            let next = self.close_extent(&next, &[]);
-            assert_eq!(next.extent.segment.file_index, 1);
-            self.owner
-                .node
-                .with_lifecycle(|inventory, slot| {
-                    crate::distributed::tcp::NodeInventory::reap_idle_live_segments(
-                        inventory,
-                        slot.as_mut().unwrap(),
-                        1,
-                    )
-                })
-                .unwrap();
-            next
-        }
+    /// Ported from the per-file active-epoch export fixture: on-demand and
+    /// per-file export modes were removed (R2), active-epoch exports are now
+    /// permanent and never pinned, so pinned exports exist only for history
+    /// (fenced) files. `HistoryPool` leaves one idle connected controller
+    /// holding a pin on a history export.
+    fn history_export_exists(fixture: &super::super::export_pin_tests::HistoryPool) -> bool {
+        let segment = &fixture.location.segment;
+        let file = crate::distributed::nvmeof::live_target::LiveFileIdentity {
+            path: segment.path.clone(),
+            device: segment.device,
+            inode: segment.inode,
+            bytes: segment.bytes,
+            block_size: segment.block_size,
+        };
+        fixture
+            .owner
+            .node
+            .with_live_target(|target| target.binding_for_file(&file).is_some())
     }
 
     #[test]
-    fn idle_pooled_controller_keeps_export_across_rollover_until_disconnect() {
-        let mut fixture = ExportPoolFixture::new();
-        let started = Instant::now();
-        drop(fixture.acquire());
-        let cold_acquire = started.elapsed();
-        fixture.rollover();
+    fn idle_pooled_controller_keeps_history_export_pin_across_idle_reap_until_disconnect() {
+        let fixture = super::super::export_pin_tests::HistoryPool::new();
+        fixture
+            .owner
+            .node
+            .with_lifecycle(|inventory, slot| {
+                crate::distributed::tcp::NodeInventory::reap_idle_live_segments(
+                    inventory,
+                    slot.as_mut().unwrap(),
+                    2,
+                )
+            })
+            .unwrap();
         assert_eq!(fixture.pin_count(), 1);
-        assert!(fixture.has_export());
-        let started = Instant::now();
+        assert!(history_export_exists(&fixture));
         fixture
             .pool
             .shutdown(Instant::now() + Duration::from_secs(5))
             .unwrap();
-        eprintln!(
-            "export_pin_local cold_acquire_with_handshake_us={} disconnect_and_release_us={}",
-            cold_acquire.as_micros(),
-            started.elapsed().as_micros()
-        );
         assert_eq!(fixture.pin_count(), 0);
-        assert!(!fixture.has_export());
-    }
-
-    #[test]
-    fn capacity_eviction_releases_only_disconnected_entry_and_drop_releases_last() {
-        let mut fixture = ExportPoolFixture::new();
-        drop(fixture.acquire());
-        let next = fixture.rollover();
-        let mut target = fixture.target.clone();
-        target.nqn = next.binding.nqn.clone();
-        target.uuid = next.binding.uuid;
-        target.nsid = next.binding.nsid;
-        fixture
-            .pool
-            .register_local_target(&target.nqn, next.extent.segment.path.clone());
-        let config = fixture.client.live_config.as_ref().unwrap();
-        let (lease, _, timings) = fixture
-            .pool
-            .acquire_pinned(
-                &target,
-                &config.host_nqn,
-                config.host_id,
-                LiveNamespaceAccess::ReadWrite,
-                Instant::now() + Duration::from_secs(5),
-                super::super::LiveExportPinRequest {
-                    recipe: &fixture.client.live_pin_recipe,
-                    epoch: 1,
-                    segment: &next.extent.segment,
-                    binding: &next.binding,
-                },
-            )
-            .unwrap();
-        assert!(timings.disconnect.is_some());
-        assert_eq!(fixture.pin_count(), 1);
-        assert!(!fixture.has_export());
-        drop(lease);
-        fixture.client.live_pool.take();
-        drop(fixture.pool);
-        assert!(
-            fixture
-                .owner
-                .node
-                .inventory
-                .lock()
-                .live_export_pins
-                .is_empty()
-        );
+        // Unlike the removed per-file writer exports, an unpinned history
+        // export stays retained for reuse (`history_pages_reuse_retained_readonly_exports`).
+        assert!(history_export_exists(&fixture));
     }
 
     #[test]
     fn export_pin_eviction_disconnects_before_release_and_failed_delete_keeps_pin() {
-        let mut fixture = ExportPoolFixture::new();
-        drop(fixture.acquire());
-        fixture.rollover();
-        let result = fixture.pool.evict_for_test(&fixture.target.nqn, || {
+        let fixture = super::super::export_pin_tests::HistoryPool::new();
+        let nqn = fixture.location.binding.nqn.clone();
+        assert_eq!(fixture.pin_count(), 1);
+        assert!(history_export_exists(&fixture));
+        let result = fixture.pool.evict_for_test(&nqn, || {
             assert_eq!(fixture.pin_count(), 1);
-            assert!(fixture.has_export());
+            assert!(history_export_exists(&fixture));
             Err(std::io::Error::other("injected delete failure"))
         });
         assert!(result.is_err());
         assert_eq!(fixture.pin_count(), 1);
-        assert!(fixture.has_export());
+        assert!(history_export_exists(&fixture));
         fixture
             .pool
-            .evict_for_test(&fixture.target.nqn, || {
+            .evict_for_test(&nqn, || {
                 assert_eq!(fixture.pin_count(), 1);
-                assert!(fixture.has_export());
+                assert!(history_export_exists(&fixture));
                 Ok(())
             })
             .unwrap();
         assert_eq!(fixture.pin_count(), 0);
-        assert!(!fixture.has_export());
-    }
-
-    #[test]
-    fn writer_and_reader_share_one_connection_pin_released_once() {
-        use crate::distributed::group::CompleteGroup;
-        use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
-        let mut fixture = ExportPoolFixture::new();
-        let writer = fixture.acquire();
-        let batch = fixture.owner.batch(0);
-        let group = CompleteGroup::new_live(
-            &fixture.client.shape,
-            vec![batch.clone()],
-            fixture.owner.config.partition.batch_limits,
-            fixture.owner.config.partition.group_limits,
-        )
-        .unwrap();
-        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
-        let leased = fixture.leased.clone();
-        let _next = fixture.close_extent(&leased, &frame);
-        let log = fixture.owner.node.inventory.lock().active(1).unwrap();
-        let receipt = log.receipt_page(0, 1).unwrap()[0];
-        let reference = batch.record_reference(receipt.address(), 0).unwrap();
-        let locations = fixture
-            .client
-            .resolve_live_records(1, &[reference])
-            .unwrap();
-        let grant = LiveReadCache::connect_grant(
-            &fixture.client,
-            1,
-            locations.entries[0].clone(),
-            locations.epoch_pin_token,
-            1,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .map_err(|_| "reader setup failed")
-        .unwrap();
-        assert!(Arc::ptr_eq(&writer, grant.lease.as_ref().unwrap()));
-        assert_eq!(fixture.pin_count(), 1);
-        let mut cache = LiveReadCache::default();
-        cache.grants.push(grant);
-        cache.close(&mut fixture.client, 1).unwrap();
-        assert!(fixture.owner.node.inventory.lock().live_pins.is_empty());
-        assert_eq!(fixture.pin_count(), 1);
-        drop(writer);
-        fixture
-            .pool
-            .shutdown(Instant::now() + Duration::from_secs(5))
-            .unwrap();
-        assert_eq!(fixture.pin_count(), 0);
-        fixture
-            .pool
-            .shutdown(Instant::now() + Duration::from_secs(5))
-            .unwrap();
+        // The pin is released after the disconnect; the unpinned history
+        // export stays retained for reuse (see above).
+        assert!(history_export_exists(&fixture));
     }
 
     pub(crate) fn pause_inline_submitted(
@@ -2286,7 +2082,7 @@ pub(crate) mod tests {
         node: &super::super::StorageNode,
         reference: ValueRecordReference,
     ) -> std::path::PathBuf {
-        use crate::distributed::nvmeof::live_target::LiveTargetBinding;
+        use crate::distributed::nvmeof::live_storage::LiveTargetBinding;
         let mut inventory = node.inventory.lock();
         let lease = inventory
             .active(reference.batch_version.epoch)
@@ -2309,7 +2105,6 @@ pub(crate) mod tests {
                 service: 4420,
                 transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
                 readonly: true,
-                spdk: None,
                 permanent: false,
             },
             segment,
@@ -2635,7 +2430,7 @@ pub(crate) mod tests {
     fn lane(slots: usize) -> Lane {
         use crate::distributed::nvmeof::NvmeofTransport;
         use crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics;
-        use crate::distributed::nvmeof::live_target::LiveTargetBinding;
+        use crate::distributed::nvmeof::live_storage::LiveTargetBinding;
         use crate::distributed::storage::WalMemberReadPolicy;
         let running = super::super::tests::multiplexed::Running::new(
             super::super::Transport::Tcp,
@@ -2693,7 +2488,6 @@ pub(crate) mod tests {
                 service: 4420,
                 transport: NvmeofTransport::Tcp,
                 readonly: true,
-                spdk: None,
                 permanent: false,
             };
             let segment = LiveWalSegment {
@@ -3051,8 +2845,7 @@ pub(crate) mod tests {
         lane.client.live_pool = Some(pool.clone());
         lane.client.live_exports = Some((
             1,
-            super::super::live_control::LiveExportInfo {
-                mode: crate::distributed::nvmeof::legacy_wire::LiveExportMode::PerOwner,
+            super::super::LiveExportInfo {
                 address: target.address.clone(),
                 service: target.service,
                 transport: target.transport,
@@ -3331,20 +3124,16 @@ pub(crate) mod tests {
         let node = StorageNode::open(config.clone(), super::super::tests::metrics()).unwrap();
         node.inventory.lock().fence_to(1).unwrap();
         let batch = super::super::tests::batch(&config, 1, 0);
-        let response = node
-            .handle(
-                Request::Append {
-                    epoch: 1,
-                    batches: vec![batch.encoded().clone().into()],
-                },
-                TcpLimits::default(),
+        let log = node.inventory.lock().active(1).unwrap();
+        let appended = log
+            .append_complete_batch(
+                crate::distributed::types::RequestAuthority { epoch: 1 },
+                &batch,
             )
             .unwrap();
-        let Response::Appended(receipts) = response else {
-            panic!("expected receipt")
-        };
-        let reference = batch.record_reference(receipts[0].address, 0).unwrap();
-        let log = node.inventory.lock().active(1).unwrap();
+        let reference = batch.record_reference(appended.address(), 0).unwrap();
+        // The removed owner-RPC append returned a durable receipt.
+        log.persist_through(appended).unwrap();
         let lease = log.resolve_live_record(&reference).unwrap();
         let token = [42; 16];
         node.inventory
@@ -3379,11 +3168,21 @@ pub(crate) mod tests {
         let mut client = running.client();
         client.fence_to(1).unwrap();
         let batch = super::super::tests::batch(&running.config, 1, 0);
-        let receipts = client.append_many(1, std::slice::from_ref(&batch)).unwrap();
-        let reference = batch
-            .record_reference(receipts[0].appended().address(), 0)
+        let appended = running
+            .node
+            .inventory
+            .lock()
+            .active(1)
+            .unwrap()
+            .append_complete_batch(
+                crate::distributed::types::RequestAuthority { epoch: 1 },
+                &batch,
+            )
             .unwrap();
+        let reference = batch.record_reference(appended.address(), 0).unwrap();
         let log = running.node.inventory.lock().active(1).unwrap();
+        // The removed owner-RPC append returned a durable receipt.
+        log.persist_through(appended).unwrap();
         // The native WAL mapper extends the file to its final size on its own
         // thread, and a live lease requires the final size. Wait for that
         // condition instead of assuming the mapper already ran.

@@ -294,8 +294,8 @@ class MultiOwnerTests(unittest.TestCase):
         identities = {str(i): {'host_nqn': 'owner-' + str(i), 'host_id': [i + 1] * 16} for i in range(16)}
         options = {'owners': 16, 'external_remote_config': {'storage': {'partitions': list(range(16))},
             'endpoints': [{'partition': i, 'address': '10.0.0.1:' + str(9400 + i)} for i in range(16)],
-            'live_nvme': {'owner_identities': identities}}, 'external_owner_read_config': [
-                {'partition': i} for i in range(16)], 'external_owner_durability_receipts': ['receipt-' + str(i) for i in range(16)]}
+            'live_nvme': {'owner_identities': identities}},
+            'external_owner_durability_receipts': ['receipt-' + str(i) for i in range(16)]}
         instance = SimpleNamespace(config={'binary': '/binary', 'source_revision': 'a' * 40,
             'repository_root': '/repo', 'fleet': {'nodes': [{'index': 0}]}},
             remaining=lambda: 3600, clock=time.monotonic)
@@ -313,7 +313,7 @@ class MultiOwnerTests(unittest.TestCase):
                 'read_lanes': 1, 'pin_read_lanes': False})
             self.assertEqual(selected['external_owner_durability_receipts'],
                              options['external_owner_durability_receipts'])
-            self.assertEqual(selected['external_owner_read_config'], options['external_owner_read_config'])
+            self.assertNotIn('external_owner_read_config', selected)
             Path(selected['path']).mkdir()
             output = Path(argv[-1])
             output.mkdir()
@@ -327,7 +327,7 @@ class MultiOwnerTests(unittest.TestCase):
                       for writer in (None, {'epoch': 1, 'file_index': 0})]
             (output / 'measurement-read-evidence.json').write_text(json.dumps({'end': {'live_nvmeof': {
                 'completed_read_ops': 256, 'completed_write_ops': completed_writes, 'errors': 0,
-                'payload_rpc_requests': 0, 'routes': routes}}}))
+                'routes': routes}}}))
         helper = SimpleNamespace(controller_snapshot=lambda: {}, controller_matches=lambda *args: True)
         spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
         with tempfile.TemporaryDirectory() as tmp, patch.object(controller, 'command', side_effect=run), patch.object(

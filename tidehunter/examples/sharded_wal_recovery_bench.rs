@@ -426,11 +426,8 @@ fn evidence(args: &Args, db: &RemoteDatabase, record: &Evidence) -> Result<()> {
         }
         write!(
             json,
-            ",\"read_lane_wait_ns\":{},\"created_connections\":{},\"reused_connections\":{},\"transport_checkout_ns\":{}",
-            stats.read_lane_wait_ns,
-            stats.created_connections,
-            stats.reused_connections,
-            stats.transport_checkout_ns,
+            ",\"read_lane_wait_ns\":{},\"created_connections\":{}",
+            stats.read_lane_wait_ns, stats.created_connections,
         )?;
         #[cfg(feature = "experimental-fabric")]
         if let Some(profile) = stats.fabric_open_worker {

@@ -64,7 +64,6 @@
   "namespace_connects",
   "namespace_setup_ns",
   "namespace_setup_samples",
-  "payload_rpc_requests",
   "publication_ns",
   "publication_samples",
   "queue_ns",

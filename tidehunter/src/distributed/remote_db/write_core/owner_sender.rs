@@ -365,6 +365,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn control_handles_preserve_closed_and_deadline_admission_errors() {
         use crate::distributed::remote_db::pipeline_tests::Fixture;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -389,10 +390,6 @@ mod tests {
             "owner control deadline expired before admission"
         );
         sender.close();
-        assert_eq!(
-            handle.read_io_stats().unwrap_err().message(),
-            "TCP worker stopped"
-        );
         assert_eq!(
             handle.owner_timeline_arm(1).unwrap_err().message(),
             "TCP worker stopped"

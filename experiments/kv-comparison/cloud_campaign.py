@@ -1998,17 +1998,12 @@ def admit_measurement_read_evidence(directory):
 
 LIVE_NVME_COUNTERS = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
                       "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
-                      "metadata_requests", "namespace_connects", "payload_rpc_requests",
+                      "metadata_requests", "namespace_connects",
                       "unknown_writes", "errors", "queue_ns", "queue_samples",
                       "submit_ns", "submit_samples", "cq_ns", "cq_samples",
                       "control_ns", "control_samples", "validation_ns", "validation_samples",
-                      "allocation_ns", "allocation_samples", "publication_ns", "publication_samples",
+                      "publication_ns", "publication_samples",
                       "namespace_setup_ns", "namespace_setup_samples", "read_io_ns", "read_io_samples",
-                      "persistence_ns", "persistence_samples",
-                      "wal_persistence_ns", "wal_persistence_samples",
-                      "wal_namespace_ns", "wal_namespace_samples",
-                      "frontier_file_ns", "frontier_file_samples",
-                      "frontier_namespace_ns", "frontier_namespace_samples",
                       "route_evidence_dropped", "fence_evidence_dropped")
 
 def requested_leased_sync(job):
@@ -2057,19 +2052,6 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
             ["F8 default arm did not run the engine default"] if f8_default else [])}
     start = data.get("start") or {}
     end = data.get("end") or {}
-    if job.get("selection") in M3_SELECTIONS:
-        partitions = {str(i) for i in range(active_owner_count(job))}
-        for boundary in (data.get("start"), data.get("end"), data.get("deltas")):
-            owner = (boundary or {}).get("owner_executor") or {}
-            rows = owner.get("partitions") or {}
-            if owner.get("available") is not True or set(rows) != partitions:
-                reasons.append("per-owner measurement counter population unavailable")
-                break
-        delta_owners = ((data.get("deltas") or {}).get("owner_executor") or {}).get("partitions") or {}
-        if any(row.get("available") is not True or not isinstance(row.get("counters"), dict)
-               or any(type(value) is not int or value < 0 for value in row["counters"].values())
-               for row in delta_owners.values()):
-            reasons.append("per-owner measurement counters reset or unavailable")
     start = start.get("live_nvmeof") if isinstance(start, dict) else None
     end = end.get("live_nvmeof") if isinstance(end, dict) else None
     delta = data.get("live_nvmeof")
@@ -2078,11 +2060,15 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
             or not isinstance(delta, dict) or delta.get("available") is not True
             or not isinstance(start, dict) or not isinstance(end, dict) or not isinstance(counters, dict)):
         return {"qualified": False, "reasons": ["live NVMe boundary counters unavailable"]}
-    for name in LIVE_NVME_COUNTERS:
+    archive = job.get("selection") == Q0_SELECTION
+    names = LIVE_NVME_COUNTERS + (("payload_rpc_requests",) if archive else ())
+    for name in names:
         a, b, value = start.get(name), end.get(name), counters.get(name)
         if (type(a) is not int or type(b) is not int or type(value) is not int
                 or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
             reasons.append(f"invalid live NVMe counter {name}")
+    if archive and counters.get("payload_rpc_requests"):
+        reasons.append("payload RPC observed on archived live NVMe route")
     if reasons:
         return {"qualified": False, "reasons": reasons}
     if job.get("selection") in ("valkey_rdma_reads", *NVMEOF_PATH_SELECTIONS):
@@ -2147,8 +2133,6 @@ def qualify_live_nvme_measurement(evidence, job, backend_info=None):
                     or (not job["live_inline_reads"] and value != 0)
                     or (job["live_inline_reads"] and job["concurrency"] == 1 and value <= 0)):
                 reasons.append("live inline admission evidence differs")
-    if counters["payload_rpc_requests"]:
-        reasons.append("payload RPC observed on live NVMe route")
     if counters["errors"] or counters["unknown_writes"]:
         reasons.append("live NVMe errors or unknown writes observed")
     if counters["route_evidence_dropped"] or counters["fence_evidence_dropped"]:

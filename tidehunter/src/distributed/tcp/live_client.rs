@@ -305,7 +305,7 @@ enum PendingTarget {
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct ExtentState {
-    lease: super::live_control::LiveLeased,
+    lease: super::LiveLeased,
     cursor: u64,
     written_end: u64,
     acknowledged: LeasedPrefix,
@@ -343,7 +343,7 @@ pub(crate) enum LeasedSubmit {
 pub(super) struct LeasedWriter {
     current: Option<ExtentState>,
     closing: Option<ExtentState>,
-    next: Option<super::live_control::LiveLeased>,
+    next: Option<super::LiveLeased>,
     receipt_config: Option<super::PartitionConfig>,
     pending: Option<PendingAdoption>,
     pending_started: Option<Instant>,
@@ -374,14 +374,14 @@ pub(super) struct LeasedWriter {
     #[cfg(test)]
     flight_adoption_waits: u64,
     #[cfg(test)]
-    largest_close_profile: super::live_control::AdoptProfile,
+    largest_close_profile: super::AdoptProfile,
 }
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LiveWriteQueue {
     fn matches(
         &self,
-        binding: &crate::distributed::nvmeof::live_target::LiveTargetBinding,
+        binding: &crate::distributed::nvmeof::live_storage::LiveTargetBinding,
     ) -> bool {
         let target = &self.target;
         !binding.readonly
@@ -393,7 +393,6 @@ impl LiveWriteQueue {
             && target.address == binding.address
             && target.service == binding.service
             && target.transport == binding.transport
-            && binding.spdk.is_none()
     }
 }
 
@@ -885,11 +884,7 @@ mod tests {
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl LeasedWriter {
-    fn install(
-        &mut self,
-        leased: super::live_control::LiveLeased,
-        expected: &super::PartitionConfig,
-    ) {
+    fn install(&mut self, leased: super::LiveLeased, expected: &super::PartitionConfig) {
         // Client.expected is the immutable handshake identity. Retain one config
         // for shared receipt arithmetic, updating only the granted epoch/generation.
         let receipt_config = self.receipt_config.get_or_insert_with(|| expected.clone());
@@ -938,7 +933,7 @@ impl ExtentState {
     fn validate_adoption(
         &mut self,
         pending: PendingAdoption,
-        reply: &super::live_control::LiveAdopted,
+        reply: &super::LiveAdopted,
     ) -> Result<(), super::TcpError> {
         let current = &self.lease;
         let adoption = &reply.adoption;
@@ -990,10 +985,7 @@ impl ExtentState {
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl super::Client {
-    fn install_leased_extent(
-        &mut self,
-        leased: super::live_control::LiveLeased,
-    ) -> Result<(), super::TcpError> {
+    fn install_leased_extent(&mut self, leased: super::LiveLeased) -> Result<(), super::TcpError> {
         if !self.valid_live_extent(&leased, leased.extent.segment.epoch) {
             self.live_write_failed = true;
             return Err(super::TcpError::new(
@@ -1024,7 +1016,7 @@ impl super::Client {
     fn check_leased_adoption(
         &mut self,
         pending: PendingAdoption,
-        reply: &super::live_control::LiveAdopted,
+        reply: &super::LiveAdopted,
     ) -> Result<(), super::TcpError> {
         let extent = match pending.target {
             PendingTarget::Current => self.live_leased.current.as_mut(),
@@ -1233,10 +1225,10 @@ impl super::Client {
         let mut polling = super::reactor::ActivePoll::default();
         // The existing control slot has a deadline; progress enforces it.
         while self.live_leased.pending.is_some() {
-            self.progress_appends()?;
+            self.progress_session()?;
             self.harvest_leased_adoption()?;
             if self.live_leased.pending.is_some() {
-                self.pause_append_poll(&mut polling);
+                self.pause_session_poll(&mut polling);
             }
         }
         Ok(())
@@ -1248,12 +1240,12 @@ impl super::Client {
             || (require_next && self.live_leased.next.is_none())
         {
             self.submit_leased_adoption()?;
-            self.progress_appends()?;
+            self.progress_session()?;
             self.harvest_leased_adoption()?;
             if self.live_leased.closing.is_some()
                 || (require_next && self.live_leased.next.is_none())
             {
-                self.pause_append_poll(&mut polling);
+                self.pause_session_poll(&mut polling);
             }
         }
         Ok(())
@@ -1400,9 +1392,6 @@ impl super::Client {
             .live_config
             .as_ref()
             .ok_or_else(|| super::TcpError::new("live NVMe is not configured"))?;
-        binding
-            .require_kernel_target()
-            .map_err(super::TcpError::component)?;
         let target = LiveConnectTarget {
             nqn: binding.nqn.clone(),
             uuid: binding.uuid,
@@ -2648,6 +2637,19 @@ pub(crate) mod leased_tests {
         }
     }
 
+    /// Owner-side read of `reference` at the owner's serving boundary (covering
+    /// barrier, then the record), the oracle that replaced the removed
+    /// owner-RPC `Client::read_records` (now a live NVMe-oF read). The removed
+    /// owner read handler applied the same two steps.
+    pub(crate) fn owner_read(
+        fixture: &Fixture,
+        reference: &crate::distributed::types::ValueRecordReference,
+    ) -> Vec<crate::distributed::codec::Mutation> {
+        let log = fixture.node.log_for_test(1);
+        log.validate_durable_record_reference(reference).unwrap();
+        vec![log.read_record(reference).unwrap()]
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             // Release wakes the server's shutdown checks; no stream state travels
@@ -2841,17 +2843,15 @@ pub(crate) mod leased_tests {
                     counts.adoption_async_exchanges + counts.adoption_sync_exchanges,
                     previous_adoptions
                 );
-                assert_eq!(
-                    owner_reader.read_records(1, &[reference]).unwrap(),
-                    batch.mutations()
-                );
-                let locations = owner_reader.resolve_live_records(1, &[reference]).unwrap();
+                assert_eq!(owner_read(&fixture, &reference), batch.mutations());
+                // Active-epoch `ResolveLiveRecords` is refused in per-owner
+                // export mode; pin the owner's real WAL inode directly instead
+                // (the same grant the resolution used to return).
                 let mut cache = crate::distributed::tcp::live_read::LiveReadCache::default();
-                let location = locations.entries.into_iter().next().unwrap();
-                crate::distributed::tcp::live_read::tests::install_existing_local(
+                crate::distributed::tcp::live_read::tests::install_owner_local(
                     &mut cache,
-                    location,
-                    locations.epoch_pin_token,
+                    &fixture.node,
+                    reference,
                 );
                 assert_eq!(
                     client
@@ -3002,8 +3002,7 @@ pub(crate) mod leased_tests {
                 0,
             )
             .unwrap();
-        let mut reader = fixture.client();
-        reader.read_records(1, &[reference]).unwrap();
+        owner_read(&fixture, &reference);
         let reply = client
             .adopt_live_extent(epoch, token, 4096, false, false)
             .unwrap();
@@ -3080,15 +3079,11 @@ pub(crate) mod leased_tests {
             ),
             (1, 1, 4)
         );
-        let mut reader = fixture.client();
         for (batch, receipt) in [&first, &second, &third].into_iter().zip(receipts) {
             let reference = batch
                 .record_reference(receipt.appended().address(), 0)
                 .unwrap();
-            assert_eq!(
-                reader.read_records(1, &[reference]).unwrap(),
-                batch.mutations()
-            );
+            assert_eq!(owner_read(&fixture, &reference), batch.mutations());
         }
         client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
@@ -3110,7 +3105,7 @@ pub(crate) mod leased_tests {
         assert_eq!(counts.adoption_async_exchanges, 0);
         assert_eq!(counts.adoption_async_samples, 0);
         loop {
-            client.progress_appends().unwrap();
+            client.progress_session().unwrap();
             if let Some(reply) = client.take_control() {
                 reply.unwrap();
                 break;
@@ -3270,26 +3265,6 @@ pub(crate) mod leased_tests {
         assert!(completed.adoption_async_ns > 0);
         client.close_leased_extent(&mut Vec::new(), None).unwrap();
         assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 0);
-    }
-
-    #[cfg(feature = "test-utils")]
-    #[test]
-    fn memory_only_leased_frames_adopt_without_history_waits() {
-        let fixture = Fixture::new(DurabilityTier::Native, 16 * 1024 * 1024);
-        fixture
-            .node
-            .set_history_persistence(crate::distributed::storage::HistoryPersistence::MemoryOnly)
-            .unwrap();
-        fixture.node.set_history_maintenance_diagnostics(true);
-        let mut client = fixture.writer();
-        for sequence in 0..3 * 1024 {
-            write(&mut client, &fixture.batch(sequence));
-        }
-        client.close_leased_extent(&mut Vec::new(), None).unwrap();
-        let log = fixture.node.inventory.lock().active(1).unwrap();
-        assert_eq!(log.receipt_count(), 3 * 1024);
-        assert_eq!(log.history_maintenance_stats().waits, 0);
-        assert_eq!(client.checkpoint(1, 1, 3 * 1024).unwrap().prefix, 3 * 1024);
     }
 
     #[test]
@@ -3918,15 +3893,11 @@ pub(crate) mod leased_tests {
         assert_eq!(&suffix[..8], &[255; 8]);
         assert!(suffix[8..].iter().all(|byte| *byte == 0));
         assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 1);
-        let mut reader = fixture.client();
         for (batch, receipt) in group.iter().zip(receipts) {
             let reference = batch
                 .record_reference(receipt.appended().address(), 0)
                 .unwrap();
-            assert_eq!(
-                reader.read_records(1, &[reference]).unwrap(),
-                batch.mutations()
-            );
+            assert_eq!(owner_read(&fixture, &reference), batch.mutations());
         }
         client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
@@ -4016,16 +3987,12 @@ pub(crate) mod leased_tests {
             0
         );
         client.close_leased_extent(&mut Vec::new(), None).unwrap();
-        let mut reader = fixture.client();
         for (sequence, receipt) in (1..=3).zip(receipts) {
             let batch = fixture.big_batch(sequence);
             let reference = batch
                 .record_reference(receipt.appended().address(), 0)
                 .unwrap();
-            assert_eq!(
-                reader.read_records(1, &[reference]).unwrap(),
-                batch.mutations()
-            );
+            assert_eq!(owner_read(&fixture, &reference), batch.mutations());
         }
     }
 
@@ -4195,7 +4162,7 @@ pub(crate) mod leased_tests {
         client.submit_leased_adoption().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            client.progress_appends().unwrap();
+            client.progress_session().unwrap();
             if entered.try_recv().is_ok() {
                 break;
             }
@@ -4474,16 +4441,12 @@ pub(crate) mod leased_tests {
                 .unwrap();
             let owner = fixture.node.log_for_test(1);
             assert_eq!(owner.receipt_count(), 4);
-            let mut reader = fixture.client();
             for (sequence, (_, receipts)) in released.iter().enumerate() {
                 let batch = fixture.batch(sequence as u64);
                 let reference = batch
                     .record_reference(receipts[0].appended().address(), 0)
                     .unwrap();
-                assert_eq!(
-                    reader.read_records(1, &[reference]).unwrap(),
-                    batch.mutations()
-                );
+                assert_eq!(owner_read(&fixture, &reference), batch.mutations());
             }
             for call in calls {
                 timeline.complete(call, None);
@@ -4608,6 +4571,101 @@ pub(crate) mod leased_tests {
         assert_eq!(counts.fua_writes, 1);
         assert_eq!(counts.leased_flushes, 0);
         assert_eq!(counts.leased_frames, 1);
+    }
+
+    /// Synchronous leased writes: the acknowledgement of a per-frame FUA write
+    /// is released only after that write's completion, and never after a
+    /// failed one. The covering-flush form of the same property is
+    /// `group_flush_threshold_selects_fua_or_covering_flush_with_queued_work`
+    /// and `group_flush_failure_and_timeout_poison_all_unreleased_flights`.
+    /// (This replaced the owner-sync check of the removed Reserved route in
+    /// `higher_live_fence_joins_only_the_old_syncer_and_keeps_noop_fences_safe`.)
+    #[test]
+    fn synchronous_leased_ack_follows_its_fua_completion_and_never_a_failed_one() {
+        for failed in [false, true] {
+            let fixture = Fixture::new(DurabilityTier::Synchronous, 32768);
+            let mut client = fixture.writer_without_ahead();
+            assert_eq!(
+                client.live_config.as_ref().unwrap().leased_sync,
+                LeasedSync::PerFrameFua
+            );
+            let timeline = WriteTimeline::default();
+            client.leased_test_hold_completions(&[1]);
+            if failed {
+                client
+                    .live_writer
+                    .as_mut()
+                    .unwrap()
+                    .io
+                    .override_completion_result(1, -libc::EIO);
+            }
+            assert!(matches!(
+                client
+                    .submit_leased_group(1, vec![fixture.batch(0)], &timeline, 2, false)
+                    .unwrap(),
+                LeasedSubmit::Submitted(1)
+            ));
+            assert!(client.live_leased.flights[0].durable_at_completion);
+            // The write SQE itself carried the data-sync (FUA) flag; the
+            // `fua_writes` metric only records the chosen policy.
+            assert_eq!(
+                client
+                    .live_writer
+                    .as_ref()
+                    .unwrap()
+                    .io
+                    .stats()
+                    .data_sync_writes,
+                1,
+                "the Synchronous leased write was not submitted with FUA"
+            );
+            let mut released = Vec::new();
+            // Bounded: the FUA write's CQE is reaped but held, and no
+            // acknowledgement may be released while it is held.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while client.live_writer.as_ref().unwrap().io.outstanding() != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "held FUA write CQE was not reaped within 5 s"
+                );
+                client.wait_leased_flights(false).unwrap();
+                client
+                    .progress_leased_flights(&mut released, Some(&timeline))
+                    .unwrap();
+            }
+            assert!(
+                released.is_empty(),
+                "a Synchronous acknowledgement was released while its FUA completion was held"
+            );
+            assert!(!client.live_leased.flights[0].completed);
+            client.leased_test_release_held();
+            if failed {
+                assert!(client.drain_leased_flights(&mut released, None).is_err());
+                assert!(
+                    released.is_empty(),
+                    "an acknowledgement was released for a failed FUA write"
+                );
+                assert!(client.live_write_failed);
+            } else {
+                // Bounded: once the FUA completion is delivered, the
+                // acknowledgement must follow without a covering flush.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while released.is_empty() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no acknowledgement within 5 s of the delivered FUA completion"
+                    );
+                    client.wait_leased_flights(false).unwrap();
+                    client
+                        .progress_leased_flights(&mut released, Some(&timeline))
+                        .unwrap();
+                }
+                assert_eq!(released.len(), 1);
+                let counts = fixture.metrics.snapshot().counts;
+                assert_eq!(counts.fua_writes, 1);
+                assert_eq!(counts.leased_flushes, 0);
+            }
+        }
     }
 
     #[test]
@@ -4961,7 +5019,6 @@ pub(crate) mod leased_tests {
             assert_eq!(released.len(), 10);
             let log = fixture.node.log_for_test(1);
             assert_eq!(log.receipt_count(), 10);
-            let mut reader = fixture.client();
             assert!(fixture.metrics.snapshot().counts.leased_skip_markers > 0);
             for (sequence, (_, receipts)) in released.into_iter().enumerate() {
                 let batch = if sequence < 5 {
@@ -4972,10 +5029,7 @@ pub(crate) mod leased_tests {
                 let reference = batch
                     .record_reference(receipts[0].appended().address(), 0)
                     .unwrap();
-                assert_eq!(
-                    reader.read_records(1, &[reference]).unwrap(),
-                    batch.mutations()
-                );
+                assert_eq!(owner_read(&fixture, &reference), batch.mutations());
             }
         }
     }
@@ -5016,7 +5070,7 @@ pub(crate) mod leased_tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             let proof = loop {
                 assert!(Instant::now() < deadline);
-                client.progress_appends().unwrap();
+                client.progress_session().unwrap();
                 if let Some(proof) = client.take_checkpoint_position(1, written_end) {
                     break proof.unwrap();
                 }
@@ -5100,7 +5154,7 @@ impl super::Client {
     pub(crate) fn leased_test_enable_ahead(&mut self) {
         self.live_config.as_mut().unwrap().lease_ahead = true;
     }
-    pub(crate) fn leased_test_largest_close_profile(&self) -> super::live_control::AdoptProfile {
+    pub(crate) fn leased_test_largest_close_profile(&self) -> super::AdoptProfile {
         self.live_leased.largest_close_profile
     }
     pub(crate) fn leased_test_group_flush(&mut self) {
@@ -5287,14 +5341,13 @@ mod leased_rollover_tests {
                 adopted.len()
             );
             assert_eq!(adopted[..], appended[..adopted.len()], "{tier:?}");
-            let mut reader = fixture.client();
             for (sequence, receipt) in receipts.into_iter().enumerate() {
                 let batch = fixture.batch(sequence as u64);
                 let reference = batch
                     .record_reference(receipt.appended().address(), 0)
                     .unwrap();
                 assert_eq!(
-                    reader.read_records(1, &[reference]).unwrap(),
+                    leased_tests::owner_read(&fixture, &reference),
                     batch.mutations()
                 );
             }
@@ -5414,14 +5467,13 @@ mod leased_rollover_tests {
         );
         assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
         assert_eq!(fixture.metrics.snapshot().counts.adoption_sync_exchanges, 2);
-        let mut reader = fixture.client();
         for (sequence, receipt) in receipts.into_iter().enumerate() {
             let batch = fixture.batch(sequence as u64);
             let reference = batch
                 .record_reference(receipt.appended().address(), 0)
                 .unwrap();
             assert_eq!(
-                reader.read_records(1, &[reference]).unwrap(),
+                leased_tests::owner_read(&fixture, &reference),
                 batch.mutations()
             );
         }

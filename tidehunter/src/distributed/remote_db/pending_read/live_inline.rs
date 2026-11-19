@@ -212,7 +212,6 @@ impl ReadService {
             node,
             references: vec![*reference],
             slot,
-            grouped_inline: AtomicBool::new(false),
             completion: FlightCompletion::new(),
             _pin: pin,
             _credit: credit,
@@ -224,7 +223,9 @@ impl ReadService {
             trace.lane(lane.index, slot);
             trace.event("live_inline_admitted");
         }
-        // Relaxed: these counters only describe the chosen route.
+        // Relaxed: these counters only describe the chosen route. `read_rpcs`
+        // counts this inline live read as one remote value request.
+        self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
         self.state
             .diagnostics
             .live_inline
@@ -260,7 +261,7 @@ impl ReadService {
                 &self.state.diagnostics,
                 &self.state.owner_diagnostics[node].1,
             ] {
-                diagnostics.inline_complete(ns, None, false);
+                diagnostics.inline_complete(ns);
                 // Relaxed: live timing annotations are statistics, not handoff.
                 diagnostics.nvme_completed.fetch_add(1, Ordering::Relaxed);
                 diagnostics.nvme_flight_ns.fetch_add(ns, Ordering::Relaxed);
@@ -300,7 +301,7 @@ impl ReadService {
                 .inline_result_copies
                 .fetch_add(1, Ordering::Relaxed);
             *flight.completion.result.lock() = Some(match &result {
-                Ok(values) => Ok((values.clone(), None)),
+                Ok(values) => Ok(values.clone()),
                 Err(error) => Err(copied_read_error(error)),
             });
         }

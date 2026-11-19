@@ -21,9 +21,11 @@ import local
 import analyze
 import ack_contract as contracts
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from portable_transport import (CASE_TRANSPORTS, runtime_backend, transport_for_case,
-                                validate_transport, select_backends, protocol_key, is_software)
-from resident_config import software_fabric_environment
+from portable_transport import select_backends
+
+
+BACKENDS = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb",
+            "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"}
 
 
 def digest(path, algorithm="sha256"):
@@ -187,7 +189,7 @@ def matrix(spec):
     bounded_int(spec.get("client_memory_mib", 2048), 256, 65536, "client_memory_mib")
     if spec.get("layout") not in ("qualification", "distributed"):
         raise ValueError("layout must explicitly name qualification or distributed")
-    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"} | set(CASE_TRANSPORTS)
+    supported = BACKENDS
     backends, profiles, rates = spec.get("backends", []), spec.get("profiles", []), spec.get("rates", [])
     if (not isinstance(backends, list) or not backends or any(not isinstance(x, str) for x in backends)
             or set(backends) - supported or len(backends) != len(set(backends))):
@@ -245,7 +247,7 @@ def source_snapshot(output):
                                         "snapshot_sha256": digest(output / "source.zip")})
 
 
-def backend_options(kind, state, output, transport=None, ack_contract="synced"):
+def backend_options(kind, state, output, ack_contract="synced"):
     contract = contracts.selected(kind, ack_contract)
     if state and state.get("ack_contract", "synced") != contract:
         raise ValueError("local backend acknowledgement contract differs")
@@ -278,29 +280,17 @@ def backend_options(kind, state, output, transport=None, ack_contract="synced"):
         if contract != "synced":
             options["ack_contract"] = contract
         return options
-    options = {"path": str(output / "database")}
-    if kind in CASE_TRANSPORTS:
-        transport = transport_for_case(kind) if transport is None else validate_transport(transport)
-        label = kind.removeprefix("tidehunter_")
-        options.update({"evidence": str(output / f"{label}-evidence"), "owners": 5,
-                        "transport": transport})
-    return options
+    return {"path": str(output / "database")}
 
 
-def build_config(base, job, state, output, seed, qualification, transport=None):
+def build_config(base, job, state, output, seed, qualification):
     config = copy.deepcopy(base)
     kind = job["backend"]
     contract = contracts.selected(kind, job.get("ack_contract", "synced"))
     kwargs = {"ack_contract": contract} if contract != "synced" else {}
-    selected_transport = transport_for_case(kind) if kind in CASE_TRANSPORTS else None
-    if transport is not None:
-        if selected_transport is None:
-            raise ValueError("explicit transport requires a Tidehunter research case")
-        selected_transport = validate_transport(transport)
-        if protocol_key(selected_transport) != protocol_key(transport_for_case(kind)):
-            raise ValueError("explicit transport provider/security differs from the selected research case")
-    config["backend"] = {"kind": runtime_backend(kind),
-                         "options": backend_options(kind, state, output, selected_transport, **kwargs)}
+    if kind not in BACKENDS:
+        raise ValueError("unsupported local campaign backend; use local_dry_run.py for leased Tidehunter")
+    config["backend"] = {"kind": kind, "options": backend_options(kind, state, output, **kwargs)}
     if kind == "native":
         config["backend"]["options"].update(
             durability="page_cache",
@@ -317,12 +307,6 @@ def build_config(base, job, state, output, seed, qualification, transport=None):
         config["execution"]["request_timeout_ms"] = 5000
         config["limits"]["deadline_seconds"] = 90
         config["limits"]["shutdown_grace_seconds"] = 10
-    if kind in CASE_TRANSPORTS:
-        retained = (config["dataset"]["keys"] if config["phases"]["preload"] else 0)
-        retained += sum(config["phases"][name] for name in ("warmup_operations", "aging_operations", "measurement_operations")) + 1024
-        if retained > 1_000_000:
-            raise ValueError("finite retained-history requirement exceeds supported 1,000,000 batches per partition; reduce the declared workload explicitly")
-        config["backend"]["options"]["max_batches_per_partition"] = retained
     return config
 
 def group_resources(group):
@@ -483,27 +467,17 @@ def run_one(args, spec, base, job, index):
             if (job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"]
                     and prospective.get("paired_valkey") is not True):
                 raise ValueError("paired Valkey comparison cannot reuse the ordinary TCP deployment")
-        config = build_config(base, job, prospective, run_dir, spec["seed"], args.qualification,
-                              args.transport_config if job["backend"] in CASE_TRANSPORTS else None)
+        config = build_config(base, job, prospective, run_dir, spec["seed"], args.qualification)
         config["source_revision"] = local.command(["git", "rev-parse", "HEAD"]).strip()
         local.dump(run_dir / "config.json", config)
         # Reject unsupported binary features/invalid budgets before pulling or starting DBs.
         fdb_identity = args.fdb_client_identity if job["backend"] == "foundationdb" else None
         child_environment = admitted_fdb_environment(fdb_identity) if fdb_identity else None
-        if job["backend"] in CASE_TRANSPORTS and is_software(config["backend"]["options"]["transport"]):
-            child_environment = software_fabric_environment(
-                os.environ if child_environment is None else child_environment, software=True)
-            receipt["software_fabric_environment"] = {
-                "FI_OFI_RXM_MSG_RX_SIZE": child_environment["FI_OFI_RXM_MSG_RX_SIZE"]}
         config = admit_config(args.binary, run_dir / "config.json", run_dir, child_environment)
         receipt["config_sha256"] = digest(run_dir / "config.json")
         receipt["normalized_config_sha256"] = digest(run_dir / "normalized-config.json")
         receipt["binary_sha256"] = digest(args.binary)
         receipt["binary_blake2b512"] = digest(args.binary, "blake2b")
-        if job["backend"] in CASE_TRANSPORTS:
-            receipt["retention_admission"] = {"max_batches_per_partition": config["backend"]["options"]["max_batches_per_partition"],
-                                               "derivation": "preload keys + all phase calls + 1024 qualification allowance; worst-case one-owner concentration",
-                                               "physical_wal_gc": False}
         if fdb_identity:
             receipt["admitted_native_library"] = fdb_identity
             receipt["native_loader_policy"] = "exact admitted LD_LIBRARY_PATH; LD_PRELOAD and LD_AUDIT removed"
@@ -595,8 +569,6 @@ def main():
     p.add_argument("--binary", type=Path, default=local.ROOT / "target/release/kv-research")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--backends", help="comma-separated nonempty subset of backend IDs in the tracked manifest")
-    p.add_argument("--transport-config", type=Path,
-                   help="explicit canonical Transport JSON for the local Tidehunter case only; does not alter the declared matrix")
     p.add_argument("--reuse-state", type=Path, help="reuse exact-owned ready deployment; implies explicitly labeled nonfresh storage and leaves it running")
     p.add_argument("--qualification", action="store_true", help="real API qualification, not performance")
     p.add_argument("--observe", action="store_true", help="explicitly configure/start monitoring per cell before timing")
@@ -608,19 +580,8 @@ def main():
     if args.output.exists():
         raise ValueError("output must be fresh; refusing to overwrite provenance")
     spec = json.loads(args.manifest.read_text())
-    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"} | set(CASE_TRANSPORTS)
-    spec["backends"] = select_backends(args.backends, spec.get("backends"), supported)
+    spec["backends"] = select_backends(args.backends, spec.get("backends"), BACKENDS)
     jobs = matrix(spec)
-    if args.transport_config:
-        args.transport_config = validate_transport(json.loads(args.transport_config.read_text()))
-        tidehunter_cases = [backend for backend in spec["backends"] if backend in CASE_TRANSPORTS]
-        if len(tidehunter_cases) != 1:
-            raise ValueError("--transport-config requires exactly one Tidehunter research case")
-        expected = transport_for_case(tidehunter_cases[0])
-        if protocol_key(args.transport_config) != protocol_key(expected):
-            raise ValueError("transport config provider/security differs from selected research case")
-        if args.reuse_state:
-            raise ValueError("--transport-config cannot reuse a deployment selected under an implicit transport")
     if args.reuse_state:
         if len(spec["backends"]) != 1:
             raise ValueError("--reuse-state requires exactly one selected backend")

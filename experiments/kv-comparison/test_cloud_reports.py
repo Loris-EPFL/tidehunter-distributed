@@ -368,8 +368,23 @@ class CloudMatrixTests(unittest.TestCase):
         evidence["live_nvmeof"]["counters"]["completed_write_ops"] = 0
         self.assertFalse(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
         evidence["live_nvmeof"]["counters"]["completed_write_ops"] = 1
-        evidence["end"]["live_nvmeof"]["payload_rpc_requests"] = 1
-        evidence["live_nvmeof"]["counters"]["payload_rpc_requests"] = 1
+        evidence["end"]["live_nvmeof"]["unknown_writes"] = 1
+        evidence["live_nvmeof"]["counters"]["unknown_writes"] = 1
+        self.assertFalse(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
+
+    def test_m3_live_measurement_does_not_require_retired_owner_executor_counters(self):
+        zero = dict.fromkeys((*cloud.LIVE_NVME_COUNTERS, "grant_misses",
+                              "controller_connect_ns", "controller_connect_samples",
+                              "leased_frames", "leased_skip_markers", "fua_writes"), 0)
+        end = zero | {"completed_write_ops": 1, "completed_write_bytes": 4096, "leased_frames": 1}
+        evidence = {"measurement_attempted": True, "measurement_drained": True,
+                    "start": {"live_nvmeof": zero}, "end": {"live_nvmeof": end},
+                    "live_nvmeof": {"available": True, "counters": end.copy()}}
+        job = {"selection": "nvmeof_m3_t2_2", "group": "G33W", "owner_count": 2,
+               "backend": "tidehunter_nvme_rdma", "mix": cloud.mix(put=100)}
+        self.assertTrue(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
+        evidence["end"]["live_nvmeof"]["fence_evidence_dropped"] = 1
+        evidence["live_nvmeof"]["counters"]["fence_evidence_dropped"] = 1
         self.assertFalse(cloud.qualify_live_nvme_measurement(evidence, job)["qualified"])
 
     def test_live_cache_hit_cohort_can_avoid_measurement_io_with_accounting(self):

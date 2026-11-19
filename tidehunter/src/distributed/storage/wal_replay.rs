@@ -3,10 +3,7 @@ use super::*;
 use bincode::Options;
 
 mod recovered_suffix;
-pub(super) use recovered_suffix::SuffixRewrite;
-// Used by the on-disk owned frame reader and the live-stream guard test.
-#[cfg(test)]
-pub(super) use recovered_suffix::hook as suffix_rewrite_hook;
+use recovered_suffix::SuffixRewrite;
 
 /// Recovery scans read beyond the durable frontier, where a frame can be absent or
 /// torn. Only these outcomes mean "no valid frame here": a missing file, a short
@@ -172,12 +169,12 @@ fn position_lifecycle(state: &State) -> (bool, bool, bool) {
 
 impl PartitionLog {
     pub(super) fn is_retired(&self, offset: u64) -> Result<bool, StorageError> {
-        let state = self.state.lock();
-        if let Some(root) = &state.wal_root {
-            return Ok(root.retired.binary_search(&offset).is_ok());
-        }
-        drop(state);
-        self.references.is_retired(offset)
+        Ok(self
+            .state
+            .lock()
+            .wal_root
+            .as_ref()
+            .is_some_and(|root| root.retired.binary_search(&offset).is_ok()))
     }
 
     /// Sync the fixed acknowledged cut without blocking leases on the file barrier.
@@ -375,11 +372,7 @@ impl PartitionLog {
     pub fn retire_wal_files(&self, files: &[u64]) -> Result<(), StorageError> {
         let _persistence = self.persistence.lock();
         let mut state = self.state.lock();
-        if !state.sealed
-            || state.writer.is_some()
-            || state.poison.is_some()
-            || state.references.background_failed()
-        {
+        if !state.sealed || state.writer.is_some() || state.poison.is_some() {
             return Err(StorageError::Invalid(
                 "retirement requires healthy sealed storage",
             ));
@@ -716,10 +709,10 @@ impl PartitionLog {
         let mut groups = Vec::new();
         while cursor < end {
             let file_start = cursor / self.config().wal_file_bytes * self.config().wal_file_bytes;
-            if match &retired {
-                Some(retired) => retired.binary_search(&file_start).is_ok(),
-                None => self.references.is_retired(file_start)?,
-            } {
+            if retired
+                .as_ref()
+                .is_some_and(|retired| retired.binary_search(&file_start).is_ok())
+            {
                 cursor = (file_start + self.config().wal_file_bytes).min(end);
                 continue;
             }
@@ -876,8 +869,7 @@ impl PartitionLog {
                 physical_end = sealed.physical_end;
             }
         }
-        let (references, reference_writer) =
-            ReferenceDirectory::open(&path, expected, false, HistoryPersistence::WalReplay)?;
+        let (references, reference_writer) = ReferenceDirectory::open(expected)?;
         let wal = Wal::open_retained(&path, expected.layout(), metrics)?;
         let retired = root
             .retired
@@ -935,8 +927,6 @@ impl PartitionLog {
             // Set after the scan below.
             recovery_hole: false,
             #[cfg(test)]
-            before_authority_load: Mutex::new(None),
-            #[cfg(test)]
             fail_inventory_witness: AtomicU8::new(0),
             #[cfg(test)]
             fail_wal_root: AtomicU8::new(0),
@@ -957,7 +947,6 @@ impl PartitionLog {
             wal,
             registration,
             shape,
-            device: fs::metadata(&path)?.dev(),
             path,
             _lock: lock,
             _local_authority: None,
@@ -986,9 +975,7 @@ impl PartitionLog {
         // Restart durability guard (see `recovered_suffix`): every frame and skip
         // marker accepted above the persisted root is written back from the bytes
         // this scan validated. A sealed stream was synced whole before its seal.
-        let mut rewrite = recorded
-            .is_none()
-            .then(|| SuffixRewrite::new(&log.path, expected));
+        let mut rewrite = recorded.is_none().then(SuffixRewrite::default);
         // Live streams stop globally at an invalid tail. Ordinary owner-RPC
         // streams scan fragments independently, including after a lost skip.
         // In both cases only present WAL files bound the uncheckpointed suffix.
@@ -1034,7 +1021,7 @@ impl PartitionLog {
                 } else if cursor >= strict_end
                     && let Some(rewrite) = rewrite.as_mut()
                 {
-                    rewrite.skip_marker(cursor, fragment_end)?;
+                    log.rewrite_skip_marker(rewrite, cursor, fragment_end)?;
                 }
                 cursor = fragment_end;
                 continue;
@@ -1142,7 +1129,7 @@ impl PartitionLog {
             if cursor >= strict_end
                 && let Some(rewrite) = rewrite.as_mut()
             {
-                rewrite.frame(cursor, decoded.group.encoded())?;
+                log.rewrite_validated_frame(rewrite, cursor, decoded.group.encoded())?;
             }
             physical_end = physical_end.max(decoded.frame_end);
             cursor = decoded
@@ -1173,7 +1160,7 @@ impl PartitionLog {
         // The rewritten suffix reaches the device before the barrier below may
         // certify it and before any root or seal is installed.
         if let Some(rewrite) = rewrite {
-            rewrite.finish()?;
+            log.finish_suffix_rewrite(rewrite)?;
         }
         log.wal.persist_registered_files()?;
         if live

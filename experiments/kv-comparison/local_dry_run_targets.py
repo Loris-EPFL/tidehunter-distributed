@@ -616,9 +616,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                 "owner_wal_geometry": "research",
                 "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
                 "max_index_bytes": 128 * 1024**2, "max_epochs": 4,
-                "coordinator_cache_bytes": 4 * 1024**2, "owner_read_workers": 2,
-                "owner_wal_member_read": "async", "owner_read_resident_first": False,
-                "owner_read_memory_allowance_bytes": 512 * 1024**2, "polling": "adaptive",
+                "coordinator_cache_bytes": 4 * 1024**2,
+                "owner_wal_member_read": "async", "polling": "adaptive",
                 "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
                     "port_id": port_id, "commissioning_service": commissioning,
                     "commissioning_port_id": port_id + 1, "max_inflight_requests": 32,
@@ -739,8 +738,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         "abrupt_tail_recovery", "fence_drain")
             if (proof.get("kind") != "live_nvmeof_qualification" or proof.get("expected_route") != transport
                     or proof.get("durability_tier") != receipt["durability"]["tier"]
-                    or any(checks.get(k) is not True for k in required)
-                    or checks.get("payload_rpc_fallback") is not False):
+                    or any(checks.get(k) is not True for k in required)):
                 raise TargetError("kernel qualification proof incomplete")
             routes = proof.get("member_transition", {}).get("writer_routes", [])
             identities = {(f"nvme{r['namespace_identity']['controller_instance']}",

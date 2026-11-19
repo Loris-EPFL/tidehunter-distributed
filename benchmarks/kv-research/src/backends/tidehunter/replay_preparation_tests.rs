@@ -1,3 +1,6 @@
+// Preparation always emits leased live NVMe-oF configurations, which need the feature.
+#![cfg(all(feature = "nvmeof", target_os = "linux"))]
+
 use super::*;
 use blake2::{Blake2b512, Digest};
 use std::collections::BTreeMap;
@@ -16,61 +19,104 @@ fn synthetic_input() -> serde_json::Value {
         "guest_root":"/mnt/tidehunter-preparation-golden", "addresses":["127.0.0.1:9400"],
         "transport":{"kind":"tcp-trusted"}, "owner_wal_geometry":"research",
         "max_batches_per_partition":16384,"max_admitted_batches":16384,"max_index_bytes":536870912,
-        "coordinator_cache_bytes":0,"owner_read_workers":2,"owner_wal_member_read":"async",
-        "read_lanes":2,
-        "owner_read_memory_allowance_bytes":268435456,"polling":"adaptive"
+        "coordinator_cache_bytes":0,"owner_wal_member_read":"async",
+        "read_lanes":2,"polling":"adaptive",
+        "live_nvmeof":test_live_nvmeof(1)
     })
 }
+fn digest(bytes: &[u8]) -> String {
+    Blake2b512::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+/// Digest of every output file. Each preparation draws fresh random initiator
+/// identities, so those fields are removed from `remote.json`, `remote.yaml`
+/// and every `launch.yaml` before hashing; nothing else is normalized.
 fn collect_hashes(root: &Path, directory: &Path, files: &mut BTreeMap<String, String>) {
     for entry in fs::read_dir(directory).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
         if entry.file_type().unwrap().is_dir() {
             collect_hashes(root, &path, files);
-        } else {
-            let digest: String = Blake2b512::digest(fs::read(&path).unwrap())
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            files.insert(
-                path.strip_prefix(root)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned(),
-                digest,
-            );
+            continue;
         }
+        let name = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = fs::read(&path).unwrap();
+        let bytes = if name.ends_with("launch.yaml") {
+            let mut launch: serde_yaml::Value = serde_yaml::from_slice(&bytes).unwrap();
+            launch["node"]["live_target"]
+                .as_mapping_mut()
+                .unwrap()
+                .remove("host_nqn")
+                .unwrap();
+            serde_yaml::to_string(&launch).unwrap().into_bytes()
+        } else if name == "remote.json" || name == "remote.yaml" {
+            let mut remote: serde_json::Value = if name == "remote.json" {
+                serde_json::from_slice(&bytes).unwrap()
+            } else {
+                serde_yaml::from_slice(&bytes).unwrap()
+            };
+            let live = remote["live_nvme"].as_object_mut().unwrap();
+            for field in ["host_nqn", "host_id", "owner_identities"] {
+                live.remove(field).unwrap();
+            }
+            serde_json::to_vec(&remote).unwrap()
+        } else {
+            bytes
+        };
+        files.insert(name, digest(&bytes));
     }
 }
 #[test]
-fn absent_replay_preparation_inputs_preserve_every_synthetic_output_byte() {
+fn preparation_outputs_are_deterministic_apart_from_initiator_identities() {
     let root = temp();
     let input = root.join("input.json");
     fs::write(&input, serde_json::to_vec(&synthetic_input()).unwrap()).unwrap();
-    let output = root.join("output");
-    prepare_external_case_file(&input, &output).unwrap();
-    // Captured from the pre-extension 3bbd706 CLI using this exact trusted-TCP
-    // input. No paths, identities, fields or bytes are normalized by this check.
-    // The launch hash is re-pinned for the uniform overlap budget (explicit
-    // 2 lanes plus 3 non-read sessions per owner, namely append control, the
-    // operational sampler and the durable-cut poller, doubled: 10 connections)
-    // and for the explicit legacy line `wal_prewrite: false` (the owner default
-    // is now on), which is its only other change.
-    // The remote hashes are re-pinned for the removed coordinator preparation
-    // pool: the only difference is the deleted `preparation_workers: 8` field.
-    let expected = [
-        ("durability.json", "389117a6498def40a97d89ca4fa7ed4a116597a762532440e391ebddc3d1dd2b155fd923f57db426aa1de4becd585f59767614b7d7bddb4ee58376453035487a"),
-        ("external_owner_read_config.json", "1cdb078424efc8a57b42df8f41b193f87d8f5e4efc4fbdc15819bac2bfa919bbb956b58f220a0a60741625016003b163b7d4fda5cd7ea9755069516292da6571"),
-        ("node-0/launch.yaml", "c2ab26c74b15917cdd562f0d3411acd0698717c30051e0324decb34dfc2bb1c5cd9ccfed64b56e744960138defa468983651849c2cc0a4000f4d372be9fc8ce2"),
-        ("owner_transports.json", "5c3f7f89d4ec1232155e1e5899765fb285a47198b950f7c9b174c8151bb6d1403c17c839ac9a2ab7b943d62f28c2f8423dd1ca792ebe6c087916156ee3ca54f7"),
-        ("remote.json", "4852ecb72a28976ff3aa70c5095dd793eacb24842fcf8daab92e8706b6bd52bbe6b7e4e54ad769a70b84d629905ef68ff92d1e1c88dade300cae55da8b289516"),
-        ("remote.yaml", "a0cbd90461ccac4fbf9ebe40dc88a8fc83ad87d55ce2a489e0ad8bd6edd524ec6234c6478abc6e1a8c1860cf66fc0bdd00ff99842d3943791be9fa41161a15f8"),
-        ("shape.yaml", "6efb7cce3608d1efd70139999b0ed9bccf26dcd7ce4000ecdbe4726cdfe5f3fa97a2adf46b163fa55078a9e450b9d857e7eba5c3588656c41d90e14999e10f78"),
-    ].into_iter().map(|(name, hash)| (name.to_owned(), hash.to_owned())).collect::<BTreeMap<_,_>>();
-    let mut actual = BTreeMap::new();
-    collect_hashes(&output, &output, &mut actual);
-    assert_eq!(actual, expected);
+    let mut previous = None;
+    for name in ["first", "second"] {
+        let output = root.join(name);
+        prepare_external_case_file(&input, &output).unwrap();
+        let mut hashes = BTreeMap::new();
+        collect_hashes(&output, &output, &mut hashes);
+        assert_eq!(
+            hashes.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "durability.json",
+                "node-0/launch.yaml",
+                "owner_transports.json",
+                "remote.json",
+                "remote.yaml",
+                "shape.yaml"
+            ]
+        );
+        // Captured from the pre-extension 3bbd706 CLI; these generators are unchanged.
+        for (file, hash) in [
+            (
+                "durability.json",
+                "389117a6498def40a97d89ca4fa7ed4a116597a762532440e391ebddc3d1dd2b155fd923f57db426aa1de4becd585f59767614b7d7bddb4ee58376453035487a",
+            ),
+            (
+                "owner_transports.json",
+                "5c3f7f89d4ec1232155e1e5899765fb285a47198b950f7c9b174c8151bb6d1403c17c839ac9a2ab7b943d62f28c2f8423dd1ca792ebe6c087916156ee3ca54f7",
+            ),
+            (
+                "shape.yaml",
+                "6efb7cce3608d1efd70139999b0ed9bccf26dcd7ce4000ecdbe4726cdfe5f3fa97a2adf46b163fa55078a9e450b9d857e7eba5c3588656c41d90e14999e10f78",
+            ),
+        ] {
+            assert_eq!(hashes[file], hash, "{file}");
+        }
+        if let Some(previous) = &previous {
+            assert_eq!(&hashes, previous);
+        }
+        previous = Some(hashes);
+    }
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -79,7 +125,6 @@ fn automatic_preparation_keeps_runtime_counts_out_of_generated_configs() {
     let input = root.join("input.json");
     let mut config = synthetic_input();
     config.as_object_mut().unwrap().remove("read_lanes");
-    config.as_object_mut().unwrap().remove("owner_read_workers");
     fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
     let mut previous = None;
     for name in ["first", "second"] {
@@ -91,11 +136,6 @@ fn automatic_preparation_keeps_runtime_counts_out_of_generated_configs() {
         let launch: serde_yaml::Value =
             serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
         assert!(launch["node"].get("read_workers").is_none());
-        let owners: serde_json::Value = serde_json::from_slice(
-            &fs::read(output.join("external_owner_read_config.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(owners[0].get("read_workers").is_none());
         let mut hashes = BTreeMap::new();
         collect_hashes(&output, &output, &mut hashes);
         if let Some(previous) = &previous {
@@ -112,7 +152,7 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
     let root = temp();
     let input = root.join("input.json");
     let mut config = synthetic_input();
-    for (name, lanes, expected) in [("auto", None, 134), ("explicit", Some(100), 206)] {
+    for (name, lanes, expected) in [("auto", None, 132), ("explicit", Some(100), 204)] {
         if let Some(lanes) = lanes {
             config["read_lanes"] = serde_json::json!(lanes);
         } else {
@@ -137,7 +177,7 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
         .unwrap_err()
         .to_string();
     assert!(error.contains("read_lanes=127"));
-    assert!(error.contains("require 260 connections"));
+    assert!(error.contains("require 258 connections"));
     assert!(error.contains("ceiling 256"));
     assert!(!rejected.exists());
     fs::remove_dir_all(root).unwrap();
@@ -163,7 +203,8 @@ fn replay_preparation_rejects_implicit_identity_limits_and_unknown_node_db() {
     }
     fs::remove_dir_all(root).unwrap();
 }
-fn replay_outputs(live: bool) {
+#[test]
+fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_output() {
     use crate::mainnet_trace::Trace;
     use tidehunter::distributed::codec::{CompleteBatch, Mutation};
     use tidehunter::distributed::types::{BatchId, BatchVersion};
@@ -183,15 +224,13 @@ fn replay_outputs(live: bool) {
         value["database"] = serde_json::json!(vec![id as u8 + 71; 16]);
         value["batch_limits"] =
             serde_json::json!({"max_operations":519,"max_encoded_bytes":500000});
-        if live {
-            value["live_nvmeof"] = serde_json::json!({
-                "addresses":["127.0.0.1"],"transport":"tcp","service":4420+2*id,"port_id":1000+2*id,
-                "commissioning_service":4421+2*id,"commissioning_port_id":1001+2*id,
-                "max_inflight_requests":16,"max_inflight_bytes":8388608,"connect_timeout_ms":10000,"io_timeout_ms":30000,
-                "leased_write_window":1,"leased_sync":"per_frame_fua",
-                "inline_reads":true
-            });
-        }
+        value["live_nvmeof"] = serde_json::json!({
+            "addresses":["127.0.0.1"],"transport":"tcp","service":4420+2*id,"port_id":1000+2*id,
+            "commissioning_service":4421+2*id,"commissioning_port_id":1001+2*id,
+            "max_inflight_requests":16,"max_inflight_bytes":8388608,"connect_timeout_ms":10000,"io_timeout_ms":30000,
+            "leased_write_window":1,"leased_sync":"per_frame_fua",
+            "inline_reads":true
+        });
         let input = root.join(format!("input-{id}.json"));
         fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
         let output = root.join(format!("output-{id}"));
@@ -255,24 +294,15 @@ fn replay_outputs(live: bool) {
             members = members.max(batch.entries.len());
         }
         assert_eq!(members, [519, 3, 45][usize::from(id)]);
-        if live {
-            let live = remote.live_nvme.as_ref().unwrap();
-            assert_eq!(live.leased_durability, DurabilityTier::Native);
-            assert!(initiators.insert(live.host_id));
-            let target = node.live_target.as_ref().unwrap();
-            assert_eq!(target.host_nqn, live.host_nqn);
-            assert_eq!(target.service, 4420 + 2 * id);
-        } else {
-            assert!(remote.live_nvme.is_none());
-            assert!(node.live_target.is_none());
-        }
-        let read_config: serde_json::Value = serde_json::from_slice(
-            &fs::read(output.join("external_owner_read_config.json")).unwrap(),
-        )
-        .unwrap();
+        let live = &remote.live_nvme;
+        assert_eq!(live.leased_durability, DurabilityTier::Native);
+        assert!(initiators.insert(live.host_id));
+        let target = node.live_target.as_ref().unwrap();
+        assert_eq!(target.host_nqn, live.host_nqn);
+        assert_eq!(target.service, 4420 + 2 * id);
         databases.push(serde_json::json!({"db_id":id,"options":{
             "transport":{"kind":"tcp-trusted"},"path":root.join(format!("coordinator-{id}")),"owners":1,
-            "external_remote_config":remote,"external_owner_read_config":read_config
+            "external_remote_config":remote
         }}));
     }
     let good = serde_json::json!({"databases":databases});
@@ -282,13 +312,4 @@ fn replay_outputs(live: bool) {
         ["max_operations"] = serde_json::json!(518);
     assert!(replay::TidehunterReplayBackend::validate(&insufficient, &trace).is_err());
     fs::remove_dir_all(root).unwrap();
-}
-#[test]
-fn external_tcp_replay_preparation_preserves_three_table_domains_and_atomic_output() {
-    replay_outputs(false);
-}
-#[cfg(all(feature = "nvmeof", target_os = "linux"))]
-#[test]
-fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_output() {
-    replay_outputs(true);
 }

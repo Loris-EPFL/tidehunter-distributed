@@ -113,7 +113,6 @@ class CapsuleLayoutTests(unittest.TestCase):
                                    leased_durability=campaign.durability_tier(job))
                 (prepared / 'remote.json').write_text(json.dumps(
                     {'tls': {}, 'storage': geometry, 'live_nvme': live_client}))
-                (prepared / 'external_owner_read_config.json').write_text('[]')
                 for index in range(2):
                     node = root / 'cells' / job['case_id'] / f'node-{index}'
                     launch = {'ready_file': str(node / 'ready'), 'stop_file': str(node / 'stop'),
@@ -192,9 +191,7 @@ class AdmissionConfigTests(unittest.TestCase):
                             'max_admitted_batches': 1000000, 'max_index_bytes': 512 * 1024**2,
                             'coordinator_cache_bytes': job['coordinator_cache_bytes'],
                             'owner_wal_member_read': 'async',
-                            'owner_read_memory_allowance_bytes': 128 * 1024**2,
                             'polling': job.get('owner_polling', 'adaptive'),
-                            'owner_read_resident_first': job.get('owner_read_resident_first', False),
                             'live_nvmeof': live}
                         (directory / 'prepare.json').write_text(json.dumps(prep))
                         result = subprocess.run([str(binary), '--prepare-external-case',
@@ -207,10 +204,8 @@ class AdmissionConfigTests(unittest.TestCase):
                             'key_count': max(1048576, job['keys']),
                             'max_batches_per_partition': prep['max_batches_per_partition'],
                             'coordinator_read_cache_bytes': job['coordinator_cache_bytes'],
-                            'owner_read_resident_first': False, 'external_remote_config': remote,
+                            'external_remote_config': remote,
                             'durability_tier': prep['durability_tier'],
-                            'external_owner_read_config': json.loads(
-                                (prepared / 'external_owner_read_config.json').read_text()),
                             'external_owner_durability_receipts': [
                                 str(prepared / f'node-{i}/ready.durability.json') for i in range(count)]}
                         def validate(argv, **kwargs):

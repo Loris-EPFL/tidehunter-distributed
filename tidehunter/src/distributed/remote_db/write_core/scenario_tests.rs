@@ -3,6 +3,7 @@
 //! one-shot test hooks and condition predicates, never from elapsed time; the
 //! only deadline-driven case is the caller timeout, whose resolution is held
 //! by a hook until the caller has returned.
+#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 
 use super::core::WriteCore;
 use super::sequencer::Resolution;
@@ -11,10 +12,8 @@ use crate::distributed::remote_db::concurrent::AdmissionCharges;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 use crate::distributed::remote_db::{IndexReadCut, RemoteDatabase};
 use crate::distributed::storage::LocalDbError;
-use crate::distributed::tcp::StorageNode;
 use crate::distributed::types::{BatchId, BatchVersion};
 use crate::key_shape::{KeyShape, KeySpace, KeyType};
-use crate::metrics::Metrics;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Barrier, mpsc};
@@ -379,13 +378,7 @@ fn caller_timeout_then_late_resolution_reuses_only_after_both() {
             config.max_pending_batches = CAPACITY as usize;
             config.timeout = Duration::from_secs(2);
         },
-        |config| {
-            StorageNode::open(
-                config,
-                Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-            )
-            .unwrap()
-        },
+        |_| {},
     );
     let mut db = fixture.open();
     let core = Arc::clone(&db.core);
@@ -781,7 +774,11 @@ fn uncertain_append_fail_stops_with_unknown_everywhere() {
     let held = spawn_write(&core, held_operation, vec![put(2, 2)]);
     publishing.recv_timeout(WAIT).unwrap();
     // Sequence 2 on owner 0 loses its append reply: an uncertain append.
-    fixture.nodes[0].inject_drop_next_append_response();
+    // The frame reaches the owner WAL file but its completion reports EIO.
+    core.clients[0]
+        .client
+        .lock()
+        .leased_test_fail_write(-libc::EIO);
     let uncertain_operation = fixture.operation(0, 3);
     let uncertain = version(&core, 2);
     let error = core
@@ -844,15 +841,22 @@ fn uncertain_append_fail_stops_with_unknown_everywhere() {
 }
 
 /// Owner 0's worker fail-stops on group A's publication while its successor
-/// group B is appended at the owner. The client holds A's harvested reply
-/// until B's reply has also arrived, so B is in the owner WAL before A can
-/// publish. B's reply is then either processed first (durable, parked behind
-/// A) or withheld, so the worker stops with B's flight outstanding and tears
-/// its completion down after the fail-stop. Recovery replays B exactly once.
+/// group B is appended at the owner. The leased queue holds the CQEs of both
+/// frames (A = flight 1, B = flight 2: owner 0 has written nothing before)
+/// until both writes are reaped, so B is in the owner WAL before A can
+/// publish. B's completion is then either delivered first (its receipt still
+/// waits behind A: leased receipts release in frame order) or withheld, so
+/// the worker stops with B's flight outstanding and tears its completion down
+/// after the fail-stop. Recovery replays B exactly once.
 #[test]
 fn publication_failure_with_appended_successor_group_recovers_it_once() {
     for successor_first in [false, true] {
-        let fixture = Fixture::new();
+        // Two frames must share one leased extent to be in flight together:
+        // the default 4 KiB fragment holds a single frame.
+        let fixture = Fixture::new_with_config(128, shape(), 2, |config| {
+            config.storage.fragment_bytes = 64 * 1024;
+            config.storage.wal_file_bytes = 128 * 1024;
+        });
         let db = fixture.open();
         let core = Arc::clone(&db.core);
         let id = |operation| BatchId {
@@ -870,7 +874,8 @@ fn publication_failure_with_appended_successor_group_recovers_it_once() {
         // the two-batch group limit form A = [1, 2] and B = [3, 4].
         let connection = Arc::clone(&core.clients[0].client);
         let mut held = connection.lock();
-        held.hold_append_completions(successor_first);
+        held.leased_test_hold_completions(&[1, 2]);
+        let reaped = held.leased_test_reaped_writes();
         let mut callers = Vec::new();
         for value in 1..=4u8 {
             let operation = fixture.operation(0, u64::from(value));
@@ -893,6 +898,23 @@ fn publication_failure_with_appended_successor_group_recovers_it_once() {
         );
         core.test_hooks.lock().fail_publication = Some(1);
         drop(held);
+        // Both frames are in the owner WAL file: their writes completed (CQEs
+        // reaped, held or not). The owner indexes a leased frame only at
+        // adoption, so its lookup cannot show an unadopted B; recovery below
+        // proves B is replayed exactly once.
+        wait_for("both group frames reaped", || {
+            connection.lock().leased_test_reaped_writes() >= reaped + 2
+        });
+        if successor_first {
+            // Deliver B's completion while A stays held. Leased receipts
+            // release in frame order, so B is not accepted before A.
+            connection.lock().leased_test_hold_completions(&[1]);
+            assert!(core.durable_receipt(4).is_none());
+            connection.lock().leased_test_release_held();
+        } else {
+            // Deliver A; B stays held through the fail-stop.
+            connection.lock().leased_test_hold_completions(&[2]);
+        }
 
         // Fail-stop: every caller gets an unknown outcome, never an abort.
         for (_, value, caller) in &callers {
@@ -913,18 +935,21 @@ fn publication_failure_with_appended_successor_group_recovers_it_once() {
                 Some(Resolution::Unknown)
             );
         }
-        // A's receipts were accepted before its publication failed. B's
-        // reply was processed only when it was released before A.
+        // A's receipts were accepted before its publication failed. Leased
+        // receipts release in frame order, so B's receipt never precedes A's
+        // publication, whichever completion arrived first.
         let receipts: Vec<_> = (1..=4)
             .map(|sequence| core.durable_receipt(sequence))
             .collect();
         assert!(receipts[..2].iter().all(Option::is_some));
-        assert!(
-            receipts[2..]
-                .iter()
-                .all(|receipt| receipt.is_some() == successor_first)
-        );
-        // B is in the owner WAL whether or not its reply was processed.
+        assert!(receipts[2..].iter().all(Option::is_none));
+        // B is in the owner WAL whether or not its receipt was released. A
+        // leased owner learns frames at adoption, so adopt the extent first,
+        // as the owner's flush and nudge paths do.
+        fixture.nodes[0]
+            .log_for_test(core.epoch)
+            .self_adopt_live_extent()
+            .unwrap();
         for (operation, _, _) in &callers {
             assert!(
                 fixture.nodes[0]
@@ -948,6 +973,8 @@ fn publication_failure_with_appended_successor_group_recovers_it_once() {
         let original = |sequence| BatchVersion { epoch, sequence };
         drop(core);
         drop(db);
+        // A client clone keeps the live connection registry (and its lock) alive.
+        drop(connection);
 
         let mut reopened = fixture.open();
         // The acknowledged batch and both owner-0 groups, each exactly once:

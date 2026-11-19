@@ -166,6 +166,11 @@ def case_owner_job(config, case):
     return {}
 
 
+def requests_archived_owner_history(job):
+    """Only the sealed Q0 binaries can still produce history-maintenance evidence."""
+    return job.get("selection") == cloud_campaign.Q0_SELECTION and job.get("owner_history_diagnostics", False)
+
+
 def owner_process_budget(config, job, index):
     shares = sum(owner_host_index(config, job, owner) == owner_host_index(config, job, index)
                  for owner in range(job["owner_count"])) if job.get("owner_topology") else 1
@@ -3792,12 +3797,6 @@ class Controller:
         if (job.get("nvmeof_route") != "live" or job.get("nvmeof_target", "kernel") != "kernel"
                 or job.get("target_io", "buffered") != "buffered"):
             raise SafetyError("Tidehunter owner cases require leased NVMe-oF with a buffered kernel target")
-        owner_memory = (owner_process_budget(self.config, job, 0)[1] if job.get("owner_topology")
-                        else self.config["fleet"]["server_memory_mib"])
-        allowance = job.get("owner_read_memory_allowance_bytes",
-            min(512 * 1024**2, int(owner_memory * 1024**2 // 4)))
-        if allowance + 64 * 1024**2 > owner_memory * 1024**2:
-            raise SafetyError("owner read allowance exceeds its co-located process share")
         owner_count = job.get("owner_count", len(self.config["fleet"]["nodes"]))
         polling = job.get("owner_polling", "adaptive")
         if polling not in ("adaptive", "busy"):
@@ -3812,8 +3811,6 @@ class Controller:
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"],
                 "owner_wal_member_read": "async",
-                "owner_read_resident_first": job.get("owner_read_resident_first", False),
-                "owner_read_memory_allowance_bytes": allowance,
                 "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research")}
         if "owner_wal_file_bytes" in job:
             prep["owner_wal_file_bytes"] = job["owner_wal_file_bytes"]
@@ -3839,6 +3836,14 @@ class Controller:
                 if "live_" + key in job:
                     prep["live_nvmeof"][key] = job["live_" + key]
             if binary_seal is not None:
+                owner_memory = (owner_process_budget(self.config, job, 0)[1] if job.get("owner_topology")
+                                else self.config["fleet"]["server_memory_mib"])
+                allowance = job.get("owner_read_memory_allowance_bytes",
+                    min(512 * 1024**2, int(owner_memory * 1024**2 // 4)))
+                if allowance + 64 * 1024**2 > owner_memory * 1024**2:
+                    raise SafetyError("owner read allowance exceeds its co-located process share")
+                prep.update(owner_read_resident_first=job.get("owner_read_resident_first", False),
+                            owner_read_memory_allowance_bytes=allowance)
                 prep["history_persistence"] = "wal_replay"
                 prep["live_nvmeof"].update(write_mode="leased", export_mode="per_owner")
         if "live_pin_read_lanes" in job:
@@ -3932,7 +3937,7 @@ class Controller:
             service_seconds = tide_owner_service_seconds(self.config["spec"], job, owner_count, self.remaining())
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
                 "sha256": digest(archive), "files": list(files), "timeout": service_seconds,
-                "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
+                "owner_history_diagnostics": requests_archived_owner_history(job),
                 **({"case_binary": binary_seal} if binary_seal is not None else {}),
                 "owner_trace": job.get("owner_trace", False)}, case=case, timeout=120)
             dump(directory / "server-proofs" / f"start-{index}.json", proof)
@@ -3951,11 +3956,13 @@ class Controller:
         options = {"path": str(directory / "database"), "evidence": str(directory / "read-evidence"), "owners": owner_count,
                 "key_count": max(1048576, job["keys"]), "max_batches_per_partition": prep["max_batches_per_partition"],
                 "coordinator_read_cache_bytes": job["coordinator_cache_bytes"],
-                "owner_read_resident_first": prep["owner_read_resident_first"],
                 "external_remote_config": remote,
                 "durability_tier": tier,
-                "external_owner_durability_receipts": receipt_paths,
-                "external_owner_read_config": json.loads((prepared / "external_owner_read_config.json").read_text())}
+                "external_owner_durability_receipts": receipt_paths}
+        if binary_seal is not None:
+            options.update(owner_read_resident_first=prep["owner_read_resident_first"],
+                           external_owner_read_config=json.loads(
+                               (prepared / "external_owner_read_config.json").read_text()))
         if job.get("selection") in cloud_campaign.M3_SELECTIONS and job.get("case_kind") != "mainnet_replay":
             self.admit_logical_owners(job, directory, options)
         return options
@@ -3984,7 +3991,7 @@ class Controller:
         keys = 16 * job["owner_count"]
         dump(cell / "config.json", config)
         began = self.clock()
-        executable, _ = resolve_case_binary(self.config, job)
+        executable, binary_seal = resolve_case_binary(self.config, job)
         command([str(executable), "--config", cell / "config.json", "--output", cell / "result"],
                 timeout=min(cloud_campaign.M3_OWNER_ADMISSION_TIMEOUT_SECONDS, self.remaining()), env=environment(self.config))
         elapsed = self.clock() - began
@@ -4008,7 +4015,8 @@ class Controller:
                 or any(sample.get("operation") != "read" for sample in reads)
                 or any(sample.get("outcome") not in ("ok", "success") for sample in samples)
                 or live.get("completed_read_ops", 0) < keys or live.get("completed_write_ops", 0) <= 0
-                or live.get("errors") != 0 or live.get("payload_rpc_requests") != 0
+                or live.get("errors") != 0
+                or (binary_seal is not None and live.get("payload_rpc_requests") != 0)
                 or live.get("route_evidence_dropped", 0) != 0
                 or read_nqns != expected_nqns or write_nqns != expected_nqns):
             raise SafetyError("full-inventory logical owner write/read admission failed")
@@ -4048,6 +4056,7 @@ class Controller:
         if not self.active_tide:
             return
         job, directory, indices = self.active_tide
+        history_diagnostics = requests_archived_owner_history(job)
         if self.shared_tide is not None and self.shared_tide.get("ready") is not None:
             cleanup = self.owner_batch("nvme_owner_cleanup_export", job["case_id"], timeout=120,
                                        export=True, no_targets_published=not self.shared_tide.get("target_attempted", False))
@@ -4058,13 +4067,13 @@ class Controller:
         def stop(index):
             result = self.request(index, {"action": "tide_stop", "case_id": job["case_id"],
                                           "initiator_drained": True,
-                                          "owner_history_diagnostics": job.get("owner_history_diagnostics", False),
+                                          "owner_history_diagnostics": history_diagnostics,
                                           "owner_trace": job.get("owner_trace", False)},
                                   case=job["case_id"], timeout=self.cleanup_timeout(deadline), export=True)
             dump(directory / "server-proofs" / f"stop-{index}.json", result)
             if job.get("owner_trace"):
                 dump(directory / "owner-events" / f"node-{index}.json", result["owner_events"])
-            if job.get("owner_history_diagnostics"):
+            if history_diagnostics:
                 dump(directory / "owner-durability" / f"node-{index}.history-maintenance.json", result["history_maintenance"])
 
         with ThreadPoolExecutor(max_workers=5) as pool:
@@ -5445,9 +5454,10 @@ class Controller:
                         verify_counter_evidence(job, observed, owner_count)
                         receipt["counter_evidence"] = {"path": str(evidence.relative_to(directory)), "sha256": digest(evidence),
                                                        "coordinator_scope": "cumulative_adapter_lifetime_not_measurement_interval",
-                                                       "owner_io_scope": "latest_passive_sample_may_be_stale_not_measurement_interval",
+                                                       **({"owner_io_scope": "latest_passive_sample_may_be_stale_not_measurement_interval"}
+                                                          if "owner_io" in observed else {}),
                                                        "observed": observed}
-                        if "read_tier" in job:
+                        if "read_tier" in job and "owner_read_configuration" in observed:
                             receipt["read_tier_effective"] = {
                                 "coordinator_cache_bytes": observed["coordinator"]["cache"]["budget_bytes"],
                                 "coordinator_read_memory_allowance_bytes": observed.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes"),
@@ -5693,8 +5703,7 @@ class Controller:
                     receipt["database_files_retained"] = database.exists()
             except Exception as exc:
                 record_cleanup_error("owner_storage", exc)
-            if (job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS
-                    and job.get("owner_history_diagnostics")):
+            if requests_archived_owner_history(job):
                 try:
                     require_zero_owner_history_waits(directory, owner_count)
                 except RuntimeError as exc:
@@ -5982,7 +5991,6 @@ def validate_physical_proofs(proofs, *, provider="aws", expected_instance_ids=No
 
 def verify_counter_evidence(job, evidence, owner_count=None):
     coordinator = evidence.get("coordinator")
-    owners = evidence.get("owner_read_configuration")
     expected_backend = cloud_campaign.diagnostic_backend(job)
     if evidence.get("schema_version") != 1 or evidence.get("backend") != expected_backend or not isinstance(coordinator, dict):
         raise SafetyError("actual coordinator counter evidence has wrong backend/schema")
@@ -5991,20 +5999,25 @@ def verify_counter_evidence(job, evidence, owner_count=None):
         raise SafetyError("actual RPC/cache counters are missing")
     if coordinator["cache"].get("budget_bytes") != job["coordinator_cache_bytes"]:
         raise SafetyError("actual coordinator cache budget differs from declared cohort")
-    owner_count = job.get("owner_count", 5) if owner_count is None else owner_count
-    if (not isinstance(owners, list) or len(owners) != owner_count or
-            {owner.get("partition") for owner in owners} != set(range(owner_count))):
-        raise SafetyError("actual owner configurations differ from declared partitions")
     if "coordinator_read_memory_allowance_bytes" in job:
         actual = evidence.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes")
         if actual != job["coordinator_read_memory_allowance_bytes"]:
             raise SafetyError("actual coordinator read allowance differs from declared cohort")
-    if "owner_read_memory_allowance_bytes" in job:
-        if any(owner.get("read_memory_allowance_bytes") != job["owner_read_memory_allowance_bytes"] for owner in owners):
+    # Frozen job metadata may still describe the retired owner read settings.
+    # Only archived evidence carries that population.
+    if "owner_read_configuration" in evidence or job.get("selection") == cloud_campaign.Q0_SELECTION:
+        owners = evidence.get("owner_read_configuration")
+        owner_count = job.get("owner_count", 5) if owner_count is None else owner_count
+        if (not isinstance(owners, list) or len(owners) != owner_count
+                or {owner.get("partition") for owner in owners} != set(range(owner_count))):
+            raise SafetyError("actual owner configurations differ from declared partitions")
+        if "owner_read_memory_allowance_bytes" in job and any(
+                owner.get("read_memory_allowance_bytes") != job["owner_read_memory_allowance_bytes"]
+                for owner in owners):
             raise SafetyError("actual owner read allowance differs from declared cohort")
-    if "owner_read_resident_first" in job and any(
-            owner.get("read_resident_first") != job["owner_read_resident_first"] for owner in owners):
-        raise SafetyError("actual owner NOWAIT policy differs from declared cohort")
+        if "owner_read_resident_first" in job and any(
+                owner.get("read_resident_first") != job["owner_read_resident_first"] for owner in owners):
+            raise SafetyError("actual owner NOWAIT policy differs from declared cohort")
     # Hit counts and passive sample availability are observations, not admission
     # requirements. Configuring a cache must never manufacture a hit population.
     return evidence

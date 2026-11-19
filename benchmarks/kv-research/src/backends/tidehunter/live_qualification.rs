@@ -3,6 +3,7 @@ use super::*;
 use crate::workload::{key_bytes, value_bytes};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -480,7 +481,7 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
         .remote_config
         .ok_or("child requires remote configuration")?;
     check(
-        matches!(input.expected_route.as_str(), "tcp" | "rdma") && remote.live_nvme.is_some(),
+        matches!(input.expected_route.as_str(), "tcp" | "rdma"),
         "child requires a live Linux initiator route",
     )?;
     let mut progress = QualificationProgress {
@@ -496,10 +497,8 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
     let ks = db.ks("root");
     let start = stats(&db)?;
     check(
-        count(&start, "payload_rpc_requests")? == 0
-            && count(&start, "errors")? == 0
-            && count(&start, "unknown_writes")? == 0,
-        "abrupt child opened with payload RPC or live I/O errors",
+        count(&start, "errors")? == 0 && count(&start, "unknown_writes")? == 0,
+        "abrupt child opened with live I/O errors or unknown writes",
     )?;
     progress.mark("child_mixed_write", Some(&db));
     let mut batch = db.write_batch();
@@ -518,10 +517,8 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
         "abrupt child did not complete a live payload write",
     )?;
     check(
-        delta(&start, &end, "payload_rpc_requests")? == 0
-            && delta(&start, &end, "errors")? == 0
-            && delta(&start, &end, "unknown_writes")? == 0,
-        "abrupt child used payload RPC or encountered an unknown write",
+        delta(&start, &end, "errors")? == 0 && delta(&start, &end, "unknown_writes")? == 0,
+        "abrupt child encountered live I/O errors or unknown writes",
     )?;
     verify_routes(&end, &input.expected_route)?;
     progress.mark("child_ready_write", Some(&db));
@@ -708,14 +705,9 @@ fn qualify_member_transition(
     )?;
     let transition_checked = stats(db)?;
     check(
-        delta(
-            &transition_start,
-            &transition_checked,
-            "payload_rpc_requests",
-        )? == 0
-            && delta(&transition_start, &transition_checked, "errors")? == 0
+        delta(&transition_start, &transition_checked, "errors")? == 0
             && delta(&transition_start, &transition_checked, "unknown_writes")? == 0,
-        "member transition used payload RPC or encountered an unknown write",
+        "member transition encountered live I/O errors or unknown writes",
     )?;
     let member_transition = serde_json::json!({
         "wal_file_bytes": remote.storage.wal_file_bytes,
@@ -785,12 +777,7 @@ fn qualify_abrupt_child(
                 &child_evidence["start"],
                 &child_evidence["end"],
                 "completed_write_bytes",
-            )? > 0
-            && delta(
-                &child_evidence["start"],
-                &child_evidence["end"],
-                "payload_rpc_requests",
-            )? == 0,
+            )? > 0,
         "abrupt child evidence did not prove live payload write",
     )?;
     verify_routes(&child_evidence["end"], &input.expected_route)?;
@@ -824,10 +811,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         .remote_config
         .as_ref()
         .ok_or("remote_config required for live qualification")?;
-    let live = remote
-        .live_nvme
-        .as_ref()
-        .ok_or("live_nvme configuration required")?;
+    let live = &remote.live_nvme;
     check(
         (1..=60_000).contains(&live.connect_timeout_ms)
             && (1..=60_000).contains(&live.io_timeout_ms)
@@ -871,10 +855,8 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         .collect();
     let start = stats(&db)?;
     check(
-        count(&start, "payload_rpc_requests")? == 0
-            && count(&start, "errors")? == 0
-            && count(&start, "unknown_writes")? == 0,
-        "initial open used payload RPC or encountered live I/O errors",
+        count(&start, "errors")? == 0 && count(&start, "unknown_writes")? == 0,
+        "initial open encountered live I/O errors or unknown writes",
     )?;
     progress.mark("scalar_write_read", Some(&db));
     db.insert(ks, keys[0].clone(), values[0].clone())
@@ -978,10 +960,6 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         "no completed live payload writes",
     )?;
     check(
-        delta(&start, &before_close, "payload_rpc_requests")? == 0,
-        "payload RPC used in live qualification",
-    )?;
-    check(
         delta(&start, &before_close, "errors")? == 0
             && delta(&start, &before_close, "unknown_writes")? == 0,
         "live I/O errors or unknown writes",
@@ -997,10 +975,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let recovery = stats(&reopened)?;
     progress.mark("graceful_reopen_complete", Some(&reopened));
     verify_fences(&recovery, partitions)?;
-    check(
-        count(&recovery, "payload_rpc_requests")? == 0 && count(&recovery, "errors")? == 0,
-        "recovery used RPC payload or failed",
-    )?;
+    check(count(&recovery, "errors")? == 0, "recovery failed")?;
     progress.mark("cache_miss_read", Some(&reopened));
     let cache_before = reopened
         .remote_counters()
@@ -1038,9 +1013,8 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let after_reopen_reads = stats(&reopened)?;
     verify_routes(&after_reopen_reads, &input.expected_route)?;
     check(
-        delta(&recovery, &after_reopen_reads, "payload_rpc_requests")? == 0
-            && delta(&recovery, &after_reopen_reads, "errors")? == 0,
-        "reopened live path used RPC payload or failed",
+        delta(&recovery, &after_reopen_reads, "errors")? == 0,
+        "reopened live reads failed",
     )?;
     progress.mark("cache_checks_complete", Some(&reopened));
     progress.mark("before_second_graceful_close", Some(&reopened));
@@ -1059,7 +1033,6 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     check(
         count(&crash_recovery, "recovery_read_ops")? > 0
             && count(&crash_recovery, "recovery_read_bytes")? > 0
-            && count(&crash_recovery, "payload_rpc_requests")? == 0
             && count(&crash_recovery, "errors")? == 0,
         "abrupt reopen did not prove live payload recovery",
     )?;
@@ -1075,9 +1048,8 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let after_crash_reads = stats(&crash_reopened)?;
     verify_routes(&after_crash_reads, &input.expected_route)?;
     check(
-        count(&after_crash_reads, "payload_rpc_requests")? == 0
-            && count(&after_crash_reads, "errors")? == 0,
-        "crash-reopened reads used RPC payload or failed",
+        count(&after_crash_reads, "errors")? == 0,
+        "crash-reopened live reads failed",
     )?;
     progress.mark("abrupt_recovery_checks_complete", Some(&crash_reopened));
     progress.mark("before_final_close", Some(&crash_reopened));
@@ -1088,7 +1060,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let target_shutdown = shutdown_targets(remote, &shape)?;
     progress.mark("target_shutdown_complete", None);
     let scope = "verified_kernel_namespace_not_physical_media_performance";
-    let proof = serde_json::json!({"schema_version": 1, "kind": "live_nvmeof_qualification", "expected_route": input.expected_route, "durability_tier": input.durability_tier, "scope": scope, "start": start, "before_close": before_close, "member_transition": member_transition, "recovery": recovery, "after_miss": after_miss, "after_hit": after_hit, "after_reopen_reads": after_reopen_reads, "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery, "after_crash_reads": after_crash_reads, "target_shutdown": target_shutdown, "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_drain":true,"cache_miss_hit":true,"payload_rpc_fallback":false}});
+    let proof = serde_json::json!({"schema_version": 1, "kind": "live_nvmeof_qualification", "expected_route": input.expected_route, "durability_tier": input.durability_tier, "scope": scope, "start": start, "before_close": before_close, "member_transition": member_transition, "recovery": recovery, "after_miss": after_miss, "after_hit": after_hit, "after_reopen_reads": after_reopen_reads, "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery, "after_crash_reads": after_crash_reads, "target_shutdown": target_shutdown, "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_drain":true,"cache_miss_hit":true}});
     fs::write(
         output.join("qualification.json"),
         serde_json::to_vec_pretty(&proof)?,

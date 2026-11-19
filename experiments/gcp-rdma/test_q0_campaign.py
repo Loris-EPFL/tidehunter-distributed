@@ -200,6 +200,62 @@ class DispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(controller.SafetyError, 'role differs'):
             controller.resolve_case_binary(self.config, changed)
 
+    def test_archive_preparation_keeps_the_sealed_binary_config(self):
+        runtime = controller.Controller.__new__(controller.Controller)
+        runtime.config = self.config
+        runtime.remaining = lambda: 60
+        self.config['fleet'].update(server_cpus=8, server_memory_mib=8192)
+        for index, node in enumerate(self.config['fleet']['nodes']):
+            node['address'] = '10.0.0.' + str(index + 2)
+        directory = self.stage / 'prepare'
+        directory.mkdir()
+        job = self.jobs[q0.F1]
+        with patch.object(controller, 'command', side_effect=RuntimeError('prepare captured')) as prepare, \
+             patch.object(controller, 'environment', return_value={}):
+            with self.assertRaisesRegex(RuntimeError, 'prepare captured'):
+                runtime.prepare_tide(job, directory)
+        self.assertEqual(Path(prepare.call_args.args[0][0]), self.paths[q0.F1])
+        config = json.loads((directory / 'prepare-input.json').read_text())
+        self.assertEqual(config['history_persistence'], 'wal_replay')
+        live = config['live_nvmeof']
+        self.assertEqual(live['write_mode'], 'leased')
+        nqn = 'nqn.2014-08.org.nvmexpress:uuid:01234567-89ab-4def-8123-456789abcdef'
+        keys = ('max_inflight_requests', 'max_inflight_bytes', 'connect_timeout_ms',
+                'io_timeout_ms', 'inline_reads', 'queue_geometry', 'export_mode',
+                'lease_ahead', 'polled_writes', 'leased_write_window', 'write_mode',
+                'leased_sync', 'leased_flush_min_frame_bytes')
+        prepared = {key: live[key] for key in keys if key in live}
+        prepared.update(host_nqn=nqn, host_id=controller.live_host_identity(nqn),
+                        leased_durability=job['durability_tier'])
+        self.assertEqual(controller.admit_prepared_live_client(
+            prepared, live, job['durability_tier']), nqn)
+        with self.assertRaises(controller.SafetyError):
+            controller.admit_prepared_live_client(
+                prepared | {'write_mode': 'reserved'}, live, job['durability_tier'])
+
+    def test_archive_counter_schema_remains_admissible(self):
+        job = self.jobs[q0.F1]
+        counters = dict.fromkeys(cloud_campaign.LIVE_NVME_COUNTERS, 0) | {
+            'payload_rpc_requests': 0, 'reserve_exchanges': 0, 'complete_exchanges': 0,
+            'owner_completion_ns': 0, 'owner_completion_samples': 0,
+        }
+        owners = {'available': True, 'partitions': {
+            str(i): {'available': True, 'counters': {}} for i in range(job['owner_count'])}}
+        frame = {'live_nvmeof': counters, 'owner_executor': owners}
+        evidence = {'schema_version': 1, 'scope': 'measurement_boundary',
+                    'measurement_attempted': True, 'measurement_drained': True,
+                    'deltas': {'available': False, 'owner_executor': owners},
+                    'start': frame, 'end': copy.deepcopy(frame),
+                    'live_nvmeof': {'available': True, 'counters': counters.copy()}}
+        result = self.stage / 'result'
+        result.mkdir()
+        (result / 'measurement-read-evidence.json').write_text(json.dumps(evidence))
+        self.assertEqual(cloud_campaign.admit_measurement_read_evidence(self.stage)['observed'], evidence)
+        evidence['end']['live_nvmeof']['payload_rpc_requests'] = 1
+        evidence['live_nvmeof']['counters']['payload_rpc_requests'] = 1
+        self.assertIn('payload RPC observed on archived live NVMe route',
+                      cloud_campaign.qualify_live_nvme_measurement(evidence, job)['reasons'])
+
     def test_no_fallback_when_bytes_or_manifest_do_not_match(self):
         path = self.paths[q0.F1]
         path.write_bytes(b'wrong bytes')

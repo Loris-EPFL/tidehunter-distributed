@@ -12,7 +12,6 @@ const COUNTERS: &[&str] = &[
     "namespace_connects",
     "unknown_writes",
     "errors",
-    "payload_rpc_requests",
     "queue_ns",
     "queue_samples",
     "submit_ns",

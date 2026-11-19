@@ -398,7 +398,7 @@ jobs:
       - name: Run default adapter suite
         if: matrix.profile == 'native'
         run: cargo +1.90 test --locked --offline -p kv-research --no-default-features
-      - name: Gate distributed mainnet replay and public CLI
+      - name: Gate leased distributed mainnet replay on local files
         if: matrix.profile == 'distributed'
         timeout-minutes: 10
         run: |

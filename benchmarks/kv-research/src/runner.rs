@@ -786,38 +786,6 @@ fn counter_delta(
     serde_json::json!({"available": true, "counters": delta})
 }
 
-fn partition_deltas(
-    start: &serde_json::Value,
-    end: &serde_json::Value,
-    fields: &[&str],
-) -> serde_json::Value {
-    if start["available"] != true || end["available"] != true {
-        return serde_json::json!({"available": false, "error": "partition sample unavailable at a boundary"});
-    }
-    let (Some(a), Some(b)) = (
-        start
-            .get("partitions")
-            .and_then(serde_json::Value::as_object),
-        end.get("partitions").and_then(serde_json::Value::as_object),
-    ) else {
-        return serde_json::json!({"available": false, "error": "partition snapshot unavailable"});
-    };
-    let mut partitions = serde_json::Map::new();
-    for key in a.keys().chain(b.keys()) {
-        if partitions.contains_key(key) {
-            continue;
-        }
-        let value = match (a.get(key), b.get(key)) {
-            (Some(first), Some(last)) => counter_delta(first, last, fields),
-            _ => {
-                serde_json::json!({"available": false, "error": "partition missing at one boundary"})
-            }
-        };
-        partitions.insert(key.clone(), value);
-    }
-    serde_json::json!({"available": true, "partitions": partitions})
-}
-
 fn nvmeof_counter_delta(
     start: &serde_json::Value,
     end: &serde_json::Value,
@@ -846,7 +814,6 @@ const LIVE_NVMEOF_DELTA_FIELDS: &[&str] = &[
     "recovery_read_bytes",
     "metadata_requests",
     "namespace_connects",
-    "payload_rpc_requests",
     "unknown_writes",
     "errors",
     "queue_ns",
@@ -975,42 +942,9 @@ pub(crate) fn measurement_read_evidence(
         "read_profile_live_inline_fallback_paused",
         "read_profile_live_inline_fallback_coalesced",
     ];
-    const OWNER: &[&str] = &[
-        "wal_reads",
-        "wal_read_bytes",
-        "resident_read_attempts",
-        "resident_read_successes",
-        "resident_read_fallbacks",
-        "resident_read_unsupported",
-        "resident_read_partial",
-        "resident_read_deferred",
-        "async_read_submissions",
-        "completed_reads",
-        "errors",
-        "cancellations",
-        "buffer_reuses",
-        "buffer_allocations",
-        "idle_buffer_evictions",
-        "device_credit_lock.acquisitions",
-        "device_credit_lock.contended",
-        "device_credit_lock.wait_ns",
-        "device_credit_lock.hold_ns",
-        "pool_registry_lock.acquisitions",
-        "pool_registry_lock.contended",
-        "pool_registry_lock.wait_ns",
-        "pool_registry_lock.hold_ns",
-        "transport.send_size_le_4k",
-        "transport.send_size_le_16k",
-        "transport.send_size_le_64k",
-        "transport.send_size_gt_64k",
-        "transport.send_post_eagain",
-        "transport.send_post_retries",
-        "transport.cq_idle_waits",
-    ];
     let deltas = if attempted && drained && start["available"] == true && end["available"] == true {
         serde_json::json!({
-            "coordinator": counter_delta(&start["coordinator"], &end["coordinator"], COORDINATOR),
-            "owner_executor": partition_deltas(&start["owner_executor"], &end["owner_executor"], OWNER)
+            "coordinator": counter_delta(&start["coordinator"], &end["coordinator"], COORDINATOR)
         })
     } else {
         serde_json::json!({"available": false, "error": if !attempted { "measurement not attempted" }
@@ -4206,13 +4140,7 @@ mod tests {
     }
 
     #[test]
-    fn deltas_reject_resets_and_keep_partition_identity() {
-        let start = serde_json::json!({"available": true, "partitions": {"3": {"reads": 10}, "8": {"reads": 2}}});
-        let end = serde_json::json!({"available": true, "partitions": {"3": {"reads": 12}, "9": {"reads": 4}}});
-        let delta = partition_deltas(&start, &end, &["reads"]);
-        assert_eq!(delta["partitions"]["3"]["counters"]["reads"], 2);
-        assert_eq!(delta["partitions"]["8"]["available"], false);
-        assert_eq!(delta["partitions"]["9"]["available"], false);
+    fn deltas_reject_resets() {
         assert_eq!(
             counter_delta(
                 &serde_json::json!({"reads": 4}),
@@ -4256,7 +4184,6 @@ mod tests {
             assert_eq!(evidence["end"]["coordinator"][name], 0);
             assert_eq!(evidence["deltas"]["coordinator"]["counters"][name], 0);
         }
-        assert_eq!(evidence["deltas"]["owner_executor"]["available"], false);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4604,7 +4531,6 @@ mod tests {
                 "read_profile_live_inline_fallback_credit": 0,
                 "read_profile_live_inline_fallback_paused": 0,
                 "read_profile_live_inline_fallback_coalesced": 0},
-                "owner_executor": {"available": false, "error": "test unavailable"},
                 "client_resident": {"available": false, "error": "test unavailable"}}))
         }
         fn arm_write_profile(&self, _limit: usize) -> BackendResult<()> {
@@ -6847,7 +6773,7 @@ mod tests {
             "completed_write_ops": 3, "completed_write_bytes": 8192,
             "recovery_read_ops": 1, "recovery_read_bytes": 4096,
             "metadata_requests": 4, "namespace_connects": 1,
-            "payload_rpc_requests": 0, "unknown_writes": 0, "errors": 0,
+            "unknown_writes": 0, "errors": 0,
             "queue_ns": 0, "queue_samples": 0, "submit_ns": 0, "submit_samples": 0,
             "cq_ns": 0, "cq_samples": 0, "control_ns": 0, "control_samples": 0,
             "validation_ns": 0, "validation_samples": 0, "publication_ns": 0,
@@ -6994,15 +6920,15 @@ mod tests {
                 false
             );
         }
-        end["live_nvmeof"]
+        let mut incomplete = end.clone();
+        incomplete["live_nvmeof"]
             .as_object_mut()
             .unwrap()
-            .remove("payload_rpc_requests");
+            .remove("metadata_requests");
         assert_eq!(
-            measurement_read_evidence(&start, &end, true, true)["live_nvmeof"]["available"],
+            measurement_read_evidence(&start, &incomplete, true, true)["live_nvmeof"]["available"],
             false
         );
-        end["live_nvmeof"]["payload_rpc_requests"] = serde_json::json!(0);
         end["live_nvmeof"]["completed_read_ops"] = serde_json::json!(1);
         assert_eq!(
             measurement_read_evidence(&start, &end, true, true)["live_nvmeof"]["available"],
@@ -7010,7 +6936,7 @@ mod tests {
         );
     }
 
-    fn read_boundary(owner_executor: &serde_json::Value) -> serde_json::Value {
+    fn read_boundary() -> serde_json::Value {
         let coordinator: serde_json::Map<String, serde_json::Value> = [
             "read_rpc_count",
             "hits",
@@ -7039,15 +6965,12 @@ mod tests {
         .into_iter()
         .map(|name| (name.to_owned(), serde_json::json!(0)))
         .collect();
-        serde_json::json!({
-            "available": true, "coordinator": coordinator,
-            "owner_executor": owner_executor
-        })
+        serde_json::json!({"available": true, "coordinator": coordinator})
     }
 
     #[test]
     fn live_inline_boundaries_require_complete_monotone_route_counts() {
-        let start = read_boundary(&serde_json::Value::Null);
+        let start = read_boundary();
         let mut end = start.clone();
         end["coordinator"]["read_profile_live_inline"] = serde_json::json!(7);
         let measured = measurement_read_evidence(&start, &end, true, true);
@@ -7073,7 +6996,7 @@ mod tests {
             "write_authority_windows",
             "write_authority_batches",
         ] {
-            let mut start = read_boundary(&serde_json::Value::Null);
+            let mut start = read_boundary();
             start["coordinator"][name] = serde_json::json!(10);
             let mut end = start.clone();
             end["coordinator"][name] = serde_json::json!(17);
@@ -7098,43 +7021,6 @@ mod tests {
             let missing = measurement_read_evidence(&start, &end, true, true);
             assert_eq!(missing["deltas"]["coordinator"]["available"], false);
         }
-    }
-
-    #[test]
-    fn evidence_carries_owner_wide_transport_send_counters() {
-        let owner = |sizes: [u64; 4], eagain: u64, retries: u64, waits: u64| {
-            let mut stats =
-                serde_json::to_value(tidehunter::distributed::tcp::ReadExecutorStats::default())
-                    .unwrap();
-            stats["transport"] = serde_json::json!({
-                "send_size_le_4k": sizes[0], "send_size_le_16k": sizes[1],
-                "send_size_le_64k": sizes[2], "send_size_gt_64k": sizes[3],
-                "send_post_eagain": eagain, "send_post_retries": retries,
-                "cq_idle_waits": waits,
-            });
-            serde_json::json!({"available": true, "partitions": {"0": stats}})
-        };
-        let start = read_boundary(&owner([100, 20, 3, 0], 5, 4, 9));
-        let end = read_boundary(&owner([160, 70, 9, 1], 8, 6, 19));
-        let evidence = measurement_read_evidence(&start, &end, true, true);
-        let counters = &evidence["deltas"]["owner_executor"]["partitions"]["0"]["counters"];
-        for (name, expected) in [
-            ("transport.send_size_le_4k", 60),
-            ("transport.send_size_le_16k", 50),
-            ("transport.send_size_le_64k", 6),
-            ("transport.send_size_gt_64k", 1),
-            ("transport.send_post_eagain", 3),
-            ("transport.send_post_retries", 2),
-            ("transport.cq_idle_waits", 10),
-        ] {
-            assert_eq!(counters[name], expected, "{name}");
-        }
-        // A reset owner counter must make the sample unavailable, never wrap.
-        let reset = measurement_read_evidence(&end, &start, true, true);
-        assert_eq!(
-            reset["deltas"]["owner_executor"]["partitions"]["0"]["available"],
-            false
-        );
     }
 
     /// The exported live delta and peak sets and the observer exporter's admitted

@@ -1,4 +1,5 @@
 //! WAL-position checkpoint and retry-window regressions over real owner files.
+#![cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 use super::pipeline_tests::Fixture;
 use super::tests::{checkpoint_put, fail_stop_without_checkpoint, reopen_result};
 use super::*;
@@ -73,7 +74,19 @@ fn wal_replay_retry_older_than_window_is_written_again_and_newest_wins() {
 
 #[test]
 fn wal_replay_checkpointed_dataset_owner_restart_reads_all_keys() {
-    let mut fixture = Fixture::new_with_capacity(8192).synchronous();
+    // Leased extents hold many frames only with room: at the default 4 KiB
+    // fragment and 8 KiB file every write would lease a fresh extent and every
+    // second write would roll a WAL file.
+    let mut fixture = Fixture::new_with_config(
+        8192,
+        KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
+        2,
+        |config| {
+            config.storage.fragment_bytes = 64 * 1024;
+            config.storage.wal_file_bytes = 1024 * 1024;
+        },
+    )
+    .synchronous();
     fixture.config.max_index_bytes = 64 * 1024 * 1024;
     fixture.config.read_cache_bytes = 0;
     let db = fixture.open();
@@ -110,21 +123,6 @@ fn wal_replay_checkpointed_dataset_owner_restart_reads_all_keys() {
 }
 
 #[test]
-fn owner_history_other_than_wal_replay_fails_open() {
-    let fixture = Fixture::new();
-    fixture.nodes[0]
-        .set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    assert!(
-        reopen_result(&fixture)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("owner history persistence is not wal_replay")
-    );
-}
-
-#[test]
 fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
     let mut fixture = Fixture::new();
     let db = fixture.open();
@@ -145,9 +143,52 @@ fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
         .unwrap()
         .set_len(0)
         .unwrap();
-    // The owner scan must fail below synced_end. There is no serving coordinator.
+    // The owner must fail before serving: the leased target binding detects
+    // the truncated backing file before the WAL scan reaches its end.
     let error = fixture.restart_owners().err().unwrap();
-    assert!(error.to_string().contains("UnexpectedEof"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("WAL backing file identity, size or allocation changed"),
+        "{error}"
+    );
+}
+
+/// The scan half of the test above: the WAL file keeps its identity, size
+/// and allocation (so the leased target binding accepts it), but its frames
+/// below the persisted position root are gone, as after dropped pages on a
+/// preallocated file. The owner scan finds no frame where the root says one
+/// ends and fails before it serves; there is no serving coordinator.
+#[test]
+fn wal_replay_reopen_fails_when_owner_wal_content_ends_below_checkpoint_position() {
+    let mut fixture = Fixture::new();
+    let db = fixture.open();
+    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
+        .unwrap();
+    db.flush_index().unwrap();
+    let position = db.core.publisher.lock().positions[&(0, 1)].clone();
+    assert!(position.durable_end > 0);
+    fail_stop_without_checkpoint(db);
+    fixture.stop_owners();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(
+            fixture
+                .temp
+                .path()
+                .join("node-0/epoch_0000000000000001/wal_0000000000000000"),
+        )
+        .unwrap();
+    let len = file.metadata().unwrap().len();
+    std::os::unix::fs::FileExt::write_all_at(&file, &vec![0; len as usize], 0).unwrap();
+    drop(file);
+    let error = fixture.restart_owners().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("replay position is not a frame boundary"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -310,11 +351,10 @@ fn wal_replay_second_crash_repeats_suffix_before_committing_completion() {
             .unwrap();
     }
     fail_stop_without_checkpoint(db);
-    let error = RemoteDatabase::open_inner(
+    let error = RemoteDatabase::open_inner_local_fixture(
         &fixture.temp.path().join("authority"),
         &fixture.shape,
         fixture.config.clone(),
-        None,
         Some(OpenInterruption::DuringReplay),
     )
     .err()

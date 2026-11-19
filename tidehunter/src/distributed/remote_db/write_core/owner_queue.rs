@@ -244,7 +244,7 @@ impl OwnerQueue {
     }
 
     /// Stable test observation while the worker's client mutex prevents drain.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn snapshot(&self) -> (u64, u64, Vec<(u64, u64, usize)>) {
         let order = self.order.lock();
         let next = *order;

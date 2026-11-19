@@ -152,8 +152,28 @@ pub struct LiveWalSegment {
     pub block_size: u32,
 }
 
+/// One live namespace exposing one owner WAL file. Returned by the owner for
+/// leases, record resolution and replay; also persisted in the live target
+/// registry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveTargetBinding {
+    pub nqn: String,
+    pub uuid: [u8; 16],
+    pub nsid: u32,
+    pub bytes: u64,
+    pub block_size: u32,
+    pub address: String,
+    pub service: u16,
+    pub transport: super::NvmeofTransport,
+    pub readonly: bool,
+    #[serde(default)]
+    pub permanent: bool,
+}
+
 /// Owner-local authority and inode pin. Keep it until namespace and read
 /// completions retire; it is not a transport message.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub struct LiveRecordLease {
     pub segment: LiveWalSegment,
     pub offset: u64,
@@ -161,21 +181,11 @@ pub struct LiveRecordLease {
     pub(crate) _plan: crate::distributed::storage::RecordReadPlan,
 }
 
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl Drop for LiveRecordLease {
     fn drop(&mut self) {
         self._plan._log.release_live_read_pin();
     }
-}
-
-/// Body of the removed Reserved route's `LiveReserved` reply. Kept only so the
-/// wire layout stays unchanged until the protocol bump removes it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LiveWriteReservation {
-    pub token: [u8; 16],
-    pub segment: LiveWalSegment,
-    /// Global native WAL offset; subtract file_index * segment.bytes for I/O.
-    pub frame_offset: u64,
-    pub frame_len: u32,
 }
 
 /// One fragment remainder granted to a single writer. Offsets are global WAL

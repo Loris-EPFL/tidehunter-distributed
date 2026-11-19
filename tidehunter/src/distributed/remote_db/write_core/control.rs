@@ -1,6 +1,6 @@
 use super::super::{
     AuthorityWriteStats, CheckpointDiagnosticSummary, LocalDbError, LocalDbStats, PipelineStats,
-    WriteProfileSnapshot, elapsed, failure_context, receive, transports,
+    WriteProfileSnapshot, elapsed, failure_context, receive,
 };
 use super::completion::DrainStop;
 use super::core::WriteCore;
@@ -10,7 +10,8 @@ use std::time::Instant;
 
 impl WriteCore {
     pub(in crate::distributed::remote_db) fn drain(&self) -> Result<(), LocalDbError> {
-        self.ensure_healthy()?;
+        self.ensure_healthy()
+            .map_err(|error| self.with_first_failure_version(error))?;
         let next = self.sequencer.next();
         #[cfg(test)]
         if self.publisher.lock().published_next < next {
@@ -179,7 +180,7 @@ impl WriteCore {
     pub(in crate::distributed::remote_db) fn shutdown_live_target_final(
         self: &Arc<Self>,
     ) -> Result<Vec<(u32, crate::distributed::nvmeof::LiveTargetStats)>, LocalDbError> {
-        if self.config.live_nvme.is_none() || self.stopped.load(Ordering::Acquire) {
+        if self.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new(
                 "final live shutdown requires an open live database",
             ));
@@ -235,7 +236,6 @@ impl WriteCore {
             )?;
             return self.shutdown_result();
         };
-        self.operational_sampler.stop();
         let started = Instant::now();
         let mut result = self.admission.wait_until(
             Instant::now() + self.config.timeout,
@@ -258,12 +258,7 @@ impl WriteCore {
             cut.stop();
         }
         let started = Instant::now();
-        let read_clients = if result.is_ok() && self.transport_pool.is_some() {
-            self.reads.stop_with_clients()
-        } else {
-            self.reads.stop();
-            Vec::new()
-        };
+        self.reads.stop();
         self.stats.lock().shutdown.join_ns = elapsed(started);
         if self.reads.failed() && result.is_ok() {
             result = Err(LocalDbError::new(
@@ -346,14 +341,6 @@ impl WriteCore {
         if let Err(error) = &result {
             self.fail(LocalDbError::new(error.message()));
         }
-        let control_clients = if result.is_ok() && self.transport_pool.is_some() {
-            self.clients
-                .iter()
-                .map(|worker| Arc::clone(&worker.client))
-                .collect()
-        } else {
-            Vec::new()
-        };
         let started = Instant::now();
         // A checkpoint may own worker senders: take its handle under publisher,
         // then join outside that mutex while controls can still be serviced.
@@ -365,15 +352,6 @@ impl WriteCore {
             }
         }
         self.stats.lock().shutdown.join_ns += elapsed(started);
-        if result.is_ok()
-            && let Some((pool, key)) = self.transport_pool.as_ref().zip(self.transport_key)
-        {
-            pool.retain(transports::IdleTransports {
-                key,
-                controls: control_clients,
-                reads: read_clients,
-            });
-        }
         // Release publishes completed joins before another shutdown returns.
         self.stopped.store(true, Ordering::Release);
         self.admission.notify_lifecycle();

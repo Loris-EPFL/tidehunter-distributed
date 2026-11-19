@@ -24,7 +24,6 @@ fn wal_replay_window_evicts_oldest_and_keeps_recent_retries() {
     let config = window_config();
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
-    assert_eq!(log.history_persistence(), HistoryPersistence::WalReplay);
     for n in 0..=4096 {
         append(&log, &config, n);
     }
@@ -53,12 +52,6 @@ fn wal_replay_window_evicts_oldest_and_keeps_recent_retries() {
     assert_eq!(log.receipt_count(), 4097);
     assert!(matches!(
         log.receipt_page(0, 1),
-        Err(StorageError::Invalid(
-            "receipt ordinal outside the replay window"
-        ))
-    ));
-    assert!(matches!(
-        log.checkpoint_prefix(1),
         Err(StorageError::Invalid(
             "receipt ordinal outside the replay window"
         ))
@@ -454,12 +447,6 @@ fn retire_wal_files_records_root_before_unlink_and_survives_restart() {
             append(&log, &config, n);
         }
         log.seal_epoch(authority(&config)).unwrap();
-        assert!(matches!(
-            log.retire_files(log.receipt_count(), &[0]),
-            Err(StorageError::Invalid(
-                "retirement by receipt prefix requires on-disk history"
-            ))
-        ));
         log.fail_wal_retire.store(cut, Ordering::Release);
         assert_eq!(log.retire_wal_files(&[0]).is_err(), cut);
         assert_eq!(path.join("wal_0000000000000000").exists(), cut);
@@ -469,36 +456,6 @@ fn retire_wal_files_records_root_before_unlink_and_survives_restart() {
         assert!(recovered.is_retired(0).unwrap());
         recovered.retire_wal_files(&[0]).unwrap();
         no_history(&path);
-    }
-}
-
-#[test]
-fn history_mode_of_stored_partition_wins_over_request() {
-    assert_eq!(HistoryPersistence::default(), HistoryPersistence::WalReplay);
-    assert_eq!(HistoryPersistence::legacy(), HistoryPersistence::OnDisk);
-    for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
-        let temp = tempdir::TempDir::new("wal-stored-mode").unwrap();
-        let config = config(vec![3], 3);
-        let path = temp.path().join("stream");
-        let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
-        log.set_history_persistence(mode).unwrap();
-        append(&log, &config, 0);
-        log.persist_appended().unwrap();
-        drop(log);
-        let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
-        assert_eq!(recovered.history_persistence(), mode);
-        recovered.set_history_persistence(mode).unwrap();
-        let other = if mode == HistoryPersistence::OnDisk {
-            HistoryPersistence::WalReplay
-        } else {
-            HistoryPersistence::OnDisk
-        };
-        assert!(matches!(
-            recovered.set_history_persistence(other),
-            Err(StorageError::Invalid(
-                "history persistence differs from the stored partition"
-            ))
-        ));
     }
 }
 
@@ -596,20 +553,6 @@ fn wal_replay_persists_synced_end_without_advancing_scan_fragment() {
     );
 }
 
-#[test]
-fn inventory_recovery_rejects_wal_replay_history() {
-    let temp = tempdir::TempDir::new("wal-ordinal-inventory").unwrap();
-    let config = config(vec![3], 3);
-    let path = temp.path().join("stream");
-    drop(PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap());
-    assert!(matches!(
-        recover_inventory(&config.inventory, &[(path, config.clone())], metrics()),
-        Err(StorageError::Invalid(
-            "inventory recovery requires on-disk history"
-        ))
-    ));
-}
-
 #[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn wal_replay_live_scan_stops_before_a_later_valid_fragment() {
@@ -630,7 +573,6 @@ fn wal_replay_live_scan_stops_before_a_later_valid_fragment() {
     drop(log);
     for _ in 0..2 {
         let log = PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
-        assert_eq!(log.history_persistence(), HistoryPersistence::WalReplay);
         assert_eq!(log.state.lock().appended_end, 4096);
         let page = log.replay_page(0, 3, usize::MAX, 0).unwrap();
         assert_eq!(
@@ -642,26 +584,6 @@ fn wal_replay_live_scan_stops_before_a_later_valid_fragment() {
         );
         assert!(page.next.is_none());
     }
-}
-
-#[test]
-fn wal_replay_empty_mode_cutover_keeps_a_recoverable_root() {
-    let temp = tempdir::TempDir::new("wal-empty-mode-cutover").unwrap();
-    let config = config(vec![3], 3);
-    let path = temp.path().join("stream");
-    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
-    log.set_history_persistence(HistoryPersistence::OnDisk)
-        .unwrap();
-    assert!(!path.join("partition-wal-root-v1").exists());
-    // Crash after replay authority is durable, before the old history is removed.
-    WalRoot::new(&config).install(&path).unwrap();
-    drop(log);
-    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
-    assert_eq!(
-        recovered.history_persistence(),
-        HistoryPersistence::WalReplay
-    );
-    assert_eq!(recovered.receipt_count(), 0);
 }
 
 #[cfg(feature = "experimental-nvmeof")]
@@ -753,40 +675,4 @@ fn position_recheck_rejects_a_direct_lifecycle_change_during_data_sync() {
             "position proof lifecycle changed during sync"
         ))
     ));
-}
-
-#[test]
-fn proof_covered_inline_read_defers_without_waiting_for_position_state() {
-    use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
-    let temp = tempdir::TempDir::new("position-inline-no-state-wait").unwrap();
-    let config = window_config();
-    let log = Arc::new(
-        PartitionLog::create(
-            &temp.path().join("stream"),
-            config.clone(),
-            &shape(),
-            metrics(),
-        )
-        .unwrap(),
-    );
-    let receipt = append(&log, &config, 0);
-    let reference = log.record_reference(receipt, 0).unwrap();
-    log.attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Synchronous))
-        .unwrap();
-    let cut = log.appended_frontier();
-    log.persist_wal_through(cut).unwrap();
-    assert!(log.synced_frontier() < cut);
-    let state = log.state.lock();
-    let reader = log.clone();
-    let (ready, result) = std::sync::mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
-        ready.send(reader.try_plan_record_read(&reference)).unwrap();
-    });
-    let completed = result.recv_timeout(std::time::Duration::from_secs(5));
-    drop(state);
-    worker.join().unwrap();
-    assert!(
-        matches!(completed, Ok(Ok(None))),
-        "the reactor must not wait for state"
-    );
 }
