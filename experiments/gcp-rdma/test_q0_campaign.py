@@ -58,6 +58,37 @@ class SelectionTests(unittest.TestCase):
                          (11340, 14400, 4834))
         self.assertEqual(quote['guard_slack_seconds'], 2460)
 
+    def test_bound_q0_builds_focused_rdma_fleet_and_pair_startup(self):
+        case_binaries = seals()
+        case_binaries[q0.BISECT_REVISIONS[-2]]['sha256'] = case_binaries[q0.BASELINE]['sha256']
+        spec = manual.q0_spec(case_binaries)
+        self.assertEqual(spec['job_count'], 57)
+        qualify = manual.qualify
+        members = [{'name': f'bench-q0-{i}', 'id': str(i + 1), 'rdma_ip': f'10.1.0.{i + 1}'}
+                   for i in range(spec['owner_hosts'] + 1)]
+        args = ('test-bucket', 'bench-0123456789abcdef', 'a' * 64,
+                '2030-01-01T04:00:00Z', 'b' * 64, 'c' * 64)
+        options = {'members': members, 'rdma_device': 'irdma0', 'machine_type': spec['machine_type'],
+                   'live_transports': ['rdma'], 'live_spdk': bool(spec.get('spdk_comparison')),
+                   'qualification_profile': spec['mode'], 'selection': spec['selection']}
+        self.assertTrue(manual.gcp_runtime.live_mode(spec))
+        script = qualify.fleet_startup_script(*args, **options)
+        payload = script.split("<<'TIDEHUNTER_BOOTSTRAP'\n", 1)[1].removesuffix('TIDEHUNTER_BOOTSTRAP\n')
+        compile(payload, '<Q0 fleet startup>', 'exec')
+        for invalid in ({'members': members[:2]}, {'live_transports': ['tcp']},
+                        {'live_transports': ['rdma', 'tcp']}, {'live_spdk': True},
+                        {'selection': 'nvmeof_f7_highmem32'}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'focused|write-engine'):
+                qualify.fleet_startup_script(*args, **(options | invalid))
+
+        # The host already quotes/waits 480 s; the generated guest subprocess
+        # must enforce that same window, with its separate exit allowance.
+        with patch.object(qualify.time, 'time', return_value=10), patch.object(qualify, '_call') as call:
+            qualify._fleet_pair(Path('/mnt/package'), {'selection': spec['selection']}, 3600)
+        argv, _, timeout = call.call_args.args
+        self.assertEqual(json.loads(argv[3])['phase_deadline'], 490)
+        self.assertEqual(timeout, 480 + qualify.PAIR_EXIT_SECONDS)
+
     def test_rejects_incomplete_or_wrong_bindings(self):
         value = seals()
         with self.assertRaisesRegex(ValueError, 'every selected'):
