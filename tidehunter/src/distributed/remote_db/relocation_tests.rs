@@ -224,6 +224,7 @@ impl Fixture {
             durable_cut: Default::default(),
             // Sui's native value (`typed-store/src/tidehunter_util.rs`).
             relocation_max_reclaim_pct: 100,
+            compactor_cadence: Default::default(),
         };
         let mut node_roots = Vec::new();
         let mut started = Vec::new();

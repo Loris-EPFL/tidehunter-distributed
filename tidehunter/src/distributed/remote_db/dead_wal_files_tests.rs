@@ -250,6 +250,7 @@ impl Fixture {
             },
             durable_cut: Default::default(),
             relocation_max_reclaim_pct: 100,
+            compactor_cadence: Default::default(),
         };
         let node_config = NodeConfig {
             root: root.path().join("owner"),

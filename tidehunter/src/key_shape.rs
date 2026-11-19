@@ -497,6 +497,13 @@ impl KeySpaceDesc {
         self.config.compactor.as_ref().map(Arc::as_ref)
     }
 
+    /// Shared handle of the runtime compactor, for owners that keep it past
+    /// the borrowed descriptor (the distributed Exact checkpoint worker).
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn compactor_handle(&self) -> Option<Arc<Compactor>> {
+        self.config.compactor.clone()
+    }
+
     pub(crate) fn relocation_filter(&self) -> Option<&dyn RelocationFilter> {
         self.config
             .relocation_filter

@@ -145,6 +145,7 @@ fn base(history: &History) -> Option<SortedBlock> {
         masks: FrozenMasks::default(),
         marks: None,
         marks_changed: false,
+        policy: None,
         fold: Vec::new(),
     };
     let mut frame = Vec::new();
@@ -178,6 +179,7 @@ fn cell(base_history: &History, overlay_history: &History) -> FrozenCell {
         masks: FrozenMasks::default(),
         marks: None,
         marks_changed: false,
+        policy: None,
         fold: Vec::new(),
     }
 }
@@ -655,6 +657,7 @@ fn limits_are_clamped_and_overflowing_bounds_stream() {
         masks: FrozenMasks::default(),
         marks: None,
         marks_changed: false,
+        policy: None,
         fold: Vec::new(),
     };
     // The candidate row count overflows: streaming is chosen before encoding.
@@ -757,6 +760,7 @@ fn persisted_images_are_identical_for_buffered_and_streamed_cells() {
                 masks: FrozenMasks::default(),
                 marks: None,
                 marks_changed: false,
+                policy: None,
                 fold: Vec::new(),
             })
             .collect()
@@ -816,6 +820,7 @@ fn persisted_images_are_identical_for_buffered_and_streamed_cells() {
                     masks: FrozenMasks::default(),
                     marks: None,
                     marks_changed: false,
+                    policy: None,
                     fold: Vec::new(),
                 }
             })

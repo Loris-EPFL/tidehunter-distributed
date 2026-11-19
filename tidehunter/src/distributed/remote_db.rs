@@ -54,6 +54,7 @@ mod coordinator_profile;
 mod dead_wal_files;
 mod relocation;
 use checkpoint_lifecycle::BackgroundCheckpoint;
+pub use checkpoint_lifecycle::{IndexForceError, IndexForceReport};
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
 pub use concurrent::FabricProviderEvidence;
@@ -182,6 +183,11 @@ pub struct RemoteDatabaseConfig {
     /// one-file minimum. Absent means native's default.
     #[serde(default = "default_relocation_max_reclaim_pct")]
     pub relocation_max_reclaim_pct: u8,
+    /// Native cadence of callback-enabled (compactor) keyspaces at Exact
+    /// captures, built from the native `Config` the caller would use for a
+    /// native database. Runtime only: never serialized, never sent to owners.
+    #[serde(skip)]
+    pub compactor_cadence: super::native_index::CompactorCadence,
 }
 
 fn default_relocation_max_reclaim_pct() -> u8 {
@@ -1336,6 +1342,8 @@ impl RemoteDatabase {
             config.index_shards,
         )
         .map_err(LocalDbError::component)?;
+        let compactor =
+            super::native_index::CompactorPolicy::from_shape(shape, config.compactor_cadence);
         let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
         // Keep the caller's shape: relocation filters and compactors are
         // closures, which the YAML form (manifest and owner check) drops.
@@ -1775,7 +1783,16 @@ impl RemoteDatabase {
             shape,
             path,
             epoch,
-            index: Arc::new(index),
+            index: {
+                // The caller's shape carries the runtime compactor closures;
+                // the persisted shape YAML does not.
+                if let Some(policy) = compactor {
+                    index
+                        .set_compactor_policy(policy)
+                        .map_err(LocalDbError::component)?;
+                }
+                Arc::new(index)
+            },
             partition_indexes,
             publisher: write_core::core::PublisherState {
                 view_budget,
@@ -1824,9 +1841,10 @@ impl RemoteDatabase {
         let database = Self { core, _lock: lock };
         // A successful recovery establishes a new baseline before admitting
         // another bounded tail, including after repeated crash/reopen cycles.
+        // It never runs a compactor callback (COMPACTOR-PARITY.md §2.7).
         if database.core.publisher.lock().checkpoint_tail_batches != 0 {
             let started = Instant::now();
-            database.core.commit_checkpoint()?;
+            database.core.commit_recovery_baseline()?;
             database.core.stats.lock().recovery.checkpoint_commit_ns = elapsed(started);
         }
         // Offline fencing-generation maintenance (L1): no handle escaped, no
@@ -3498,6 +3516,8 @@ mod relocation_tests;
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(test)]
+mod compactor_tests;
 #[cfg(test)]
 mod drop_cells_tests;
 #[cfg(test)]

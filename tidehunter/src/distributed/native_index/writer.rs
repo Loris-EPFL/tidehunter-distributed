@@ -41,6 +41,7 @@ pub(super) struct ImageInstallation {
     cells: std::vec::IntoIter<FrozenCell>,
     cut: IndexReadCut,
     lease: CaptureLease,
+    policy_root: Option<PolicyRoot>,
     /// Published after the last cell, so new marks appear together.
     install_epoch: u64,
 }
@@ -60,6 +61,9 @@ pub(super) struct ImageCapture {
     cut: IndexReadCut,
     lease: CaptureLease,
     schema: [u8; 32],
+    /// Compactor inputs, set by [`IndexWriter::begin_capture_policy`].
+    policy: Option<PolicyCapture>,
+    policy_root: Option<PolicyRoot>,
     install_epoch: u64,
 }
 
@@ -85,6 +89,10 @@ pub(super) struct WriterState {
     /// At most one candidate per cell that installation left empty, with
     /// the birth it had. The cell keeps its directory charge until reaped.
     pub reap: Vec<(CellKey, u64)>,
+    /// Root policy block of the adopted image; `None` without callbacks.
+    pub policy_root: Option<PolicyRoot>,
+    /// Cut of the adopted image: the baseline of a newly enabled callback.
+    pub policy_cut: Option<MutationVersion>,
     /// Reused by `promote_committed` so a promotion allocates nothing.
     scratch: Vec<(usize, CellKey)>,
 }
@@ -532,6 +540,10 @@ impl IndexWriter<'_> {
             cut,
             lease,
             schema,
+            // Without `begin_capture_policy` the image carries the adopted
+            // policy progress unchanged and evaluates nothing.
+            policy: None,
+            policy_root: state.policy_root.clone(),
             // Only the writer stores the epoch, so this load cannot race.
             install_epoch: index
                 .prune_epoch
@@ -539,6 +551,50 @@ impl IndexWriter<'_> {
                 .checked_add(1)
                 .ok_or(NativeIndexError::Capacity)?,
         });
+        Ok(())
+    }
+
+    /// Freeze the compactor inputs of the capture `begin_compacted_capture`
+    /// just started, under the same writer hold. `covered_delta` is the sum of
+    /// the canonical frame lengths of the receipts this capture newly covers.
+    /// Without callback keyspaces the image drops any adopted progress (the
+    /// callbacks were disabled); adopted marks stay.
+    pub(crate) fn begin_capture_policy(
+        &mut self,
+        covered_delta: u64,
+        force: bool,
+        recovery_baseline: bool,
+    ) -> Result<(), NativeIndexError> {
+        let index = self.index;
+        let state = &mut *self.state;
+        let capture = state
+            .capture
+            .as_mut()
+            .ok_or(NativeIndexError::Invalid("no active capture"))?;
+        let Some(policy) = index.compactor_policy() else {
+            capture.policy_root = None;
+            return Ok(());
+        };
+        let adopted = state.policy_root.as_ref();
+        let covered_bytes = adopted
+            .map_or(0, |root| root.covered_bytes)
+            .checked_add(covered_delta)
+            .ok_or(NativeIndexError::Capacity)?;
+        // The recovery baseline is not a periodic evaluation either.
+        let periodic = !recovery_baseline
+            && policy.observe_periodic(
+                covered_bytes,
+                adopted.map_or(0, |root| root.last_periodic_bytes),
+            );
+        let inputs = PolicyCapture {
+            policy: Arc::clone(policy),
+            covered_bytes,
+            periodic,
+            force,
+            recovery_baseline,
+        };
+        capture.policy_root = Some(PolicyRoot::next(adopted, state.policy_cut, &inputs));
+        capture.policy = Some(inputs);
         Ok(())
     }
 
@@ -571,7 +627,20 @@ impl IndexWriter<'_> {
             }
             let masks =
                 FrozenMasks::capture(&cell.drop_versions, &capture.cut, &capture.lease.floor);
-            // Handles only: the marks are shared, not copied.
+            // Scalars and handles only: the marks are shared, not copied.
+            let policy = capture
+                .policy_root
+                .as_ref()
+                .and_then(|root| root.baseline(identity.0))
+                .map(|baseline| {
+                    let jitter = match &capture.policy {
+                        Some(inputs) if inputs.policy.enabled(identity.0) => *cell
+                            .jitter
+                            .get_or_insert_with(|| inputs.policy.sample_jitter()),
+                        _ => cell.jitter.unwrap_or(0),
+                    };
+                    (cell.policy.unwrap_or(baseline), jitter)
+                });
             capture.cells.push(FrozenCell {
                 identity,
                 birth,
@@ -580,6 +649,7 @@ impl IndexWriter<'_> {
                 masks,
                 marks: cell.prune_marks.clone(),
                 marks_changed: false,
+                policy,
                 fold: Vec::new(),
             });
             capture.remaining -= 1;
@@ -602,7 +672,8 @@ impl IndexWriter<'_> {
                 capture.lease,
                 scratch_limit,
             )
-            .with_install_epoch(capture.install_epoch),
+            .with_install_epoch(capture.install_epoch)
+            .with_policy(capture.policy, capture.policy_root),
         )
     }
 
@@ -663,6 +734,7 @@ impl IndexWriter<'_> {
             cells: persisted.cells.into_iter(),
             cut: persisted.cut,
             lease: persisted.lease,
+            policy_root: persisted.policy_root,
             install_epoch: persisted.install_epoch,
         });
     }
@@ -731,8 +803,8 @@ impl IndexWriter<'_> {
                 }
             }
             cell.base = captured.base;
-            // Marks of the adopted image. New marks carry the pending epoch
-            // and stay hidden until the last cell installs.
+            // Marks and progress of the adopted image. New marks carry the
+            // pending epoch and stay hidden until the last cell installs.
             sub(
                 &accounting.directory,
                 prune_marks::marks_charge(cell.prune_marks.as_ref()),
@@ -742,6 +814,7 @@ impl IndexWriter<'_> {
                 prune_marks::marks_charge(captured.marks.as_ref()),
             );
             cell.prune_marks = captured.marks;
+            cell.policy = captured.policy.map(|(progress, _)| progress);
             // The new base omits every reference at or below the absorbed
             // mask, the cut's references left the sealed generation and later
             // publications are above the cut: the mask covers nothing.
@@ -766,6 +839,8 @@ impl IndexWriter<'_> {
             index
                 .prune_epoch
                 .store(installation.install_epoch, AtomicOrdering::Release);
+            state.policy_root = installation.policy_root.take();
+            state.policy_cut = position(&installation.cut);
             installation.lease.install();
             true
         } else {

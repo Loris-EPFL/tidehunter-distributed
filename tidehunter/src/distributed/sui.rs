@@ -1792,10 +1792,25 @@ impl Db {
             Backend::Remote(remote) => remote.db.flush_index().map_err(error),
         }
     }
+    /// Native: rebuild the control region. Remote: one named Exact generation
+    /// covering every earlier write, which runs the compactor of every dirty
+    /// callback cell (native's index-flush compactor). No write gate is taken.
     pub fn force_rebuild_control_region(&self) -> Result<()> {
         match &self.backend {
             Backend::Native(db) => db.force_rebuild_control_region().map(|_| ()),
-            Backend::Remote(_) => self.flush(),
+            Backend::Remote(remote) => remote.db.force_rebuild_index().map(|_| ()).map_err(error),
+        }
+    }
+    /// Test fixtures: the same force, returning the remote named completion
+    /// (adopted Exact generation, cut and compactor counters). `None` on the
+    /// native backend.
+    #[cfg(feature = "test-utils")]
+    pub fn force_rebuild_control_region_observed(
+        &self,
+    ) -> Result<Option<super::remote_db::IndexForceReport>> {
+        match &self.backend {
+            Backend::Native(db) => db.force_rebuild_control_region().map(|_| None),
+            Backend::Remote(remote) => remote.db.force_rebuild_index().map(Some).map_err(error),
         }
     }
     pub fn wait_for_background_threads_to_finish(self: Arc<Self>) -> Result<()> {

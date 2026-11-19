@@ -2,9 +2,11 @@
 //! manifest adopts an image; all acknowledged suffix batches remain WAL-backed.
 
 use super::super::native_index::{
-    MarkBudget, PersistedIndexImage, PreparedIndexImage, PrunePlan, UnboundedMarkBudget,
+    CompactorStats, MarkBudget, PersistedIndexImage, PreparedIndexImage, PrunePlan,
+    UnboundedMarkBudget,
 };
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 /// Admission-backed reservation of the resident charge of the prune marks
 /// one image adds. Owned by the checkpoint worker; never touched under the
@@ -72,6 +74,8 @@ struct CapturingCheckpoint {
     prepare_work_ns: Option<u64>,
     callback_starts: BTreeMap<(u32, u64), u64>,
     relocation: Option<(PrunePlan, super::relocation::RelocationReply)>,
+    /// The named force this capture consumed at its freeze.
+    force: Option<ForceTicket>,
 }
 
 pub(super) struct BackgroundCheckpoint {
@@ -83,6 +87,70 @@ pub(super) struct BackgroundCheckpoint {
     // Same ownership and successor transfer as `requested_floor`. At most one:
     // the database's single relocation worker waits for each adoption.
     relocation: Option<super::relocation::RelocationCapture>,
+    /// Same ownership as `requested_floor`: consumed at the freeze, or handed
+    /// to the one successor when it arrives after the freeze.
+    force: Option<ForceTicket>,
+    /// The open-time recovery baseline: count policy dirt, never call back.
+    recovery_baseline: bool,
+}
+
+/// Named completion of one `force_rebuild_control_region`: the Exact
+/// generation that covered the target, adopted and live-installed.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexForceReport {
+    pub checkpoint_generation: u64,
+    pub cut: Option<MutationVersion>,
+    pub compactor: CompactorStats,
+}
+
+#[derive(Debug)]
+pub enum IndexForceError {
+    /// Another named force of this database is in flight.
+    Busy,
+    /// The caller's deadline expired. A force no capture had taken is
+    /// withdrawn; one a capture already took stays with its checkpoint and
+    /// may still take effect. Either way the slot frees without a caller.
+    DeadlineExpired,
+    Failed(LocalDbError),
+}
+
+impl std::fmt::Display for IndexForceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("index force rebuild busy: another named force is in flight"),
+            Self::DeadlineExpired => f.write_str(
+                "index force rebuild deadline expired; the named checkpoint may still complete",
+            ),
+            Self::Failed(error) => write!(f, "index force rebuild failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for IndexForceError {}
+
+/// The one in-flight named force of a database. Owned by the publisher until
+/// a capture consumes it, then by the checkpoint worker through adoption and
+/// live install. Dropping it (success, failure, withdrawal or shutdown) frees
+/// the slot; the capacity-one reply never blocks the worker on a dropped
+/// waiter.
+pub(super) struct ForceTicket {
+    target_next: u64,
+    reply: mpsc::SyncSender<Result<IndexForceReport, LocalDbError>>,
+    /// Identity of the waiter that queued this ticket. A slot freed by a
+    /// worker can be claimed by a newer force before an older waiter reaches
+    /// its deadline; the older waiter withdraws only a ticket it owns.
+    owner: Arc<()>,
+    _slot: ForceSlot,
+}
+
+struct ForceSlot(Arc<AtomicBool>);
+
+impl Drop for ForceSlot {
+    fn drop(&mut self) {
+        // Release pairs with the Acquire compare-exchange that claims the
+        // slot: a new force sees this force's effects as finished.
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl Drop for BackgroundCheckpoint {
@@ -139,16 +207,11 @@ fn core_start_checkpoint_with_floor(
             merge_checkpoint_floor(background.requested_floor.take(), floor)?;
         return Ok(());
     }
-    // A prepared generation trim (L1) must adopt a replacement root even when
-    // no tail is pending; it is an open-time root like the recovery baseline.
-    if floor.is_none()
-        && *state.checkpoint_tail_batches == 0
-        && state.manifest.checkpoint.is_some()
-        && state.manifest.adopt_trim.is_none()
+    if floor.is_none() && *state.checkpoint_tail_batches == 0 && state.manifest.checkpoint.is_some()
     {
         return Ok(());
     }
-    core_launch_checkpoint(core, state, floor, None)
+    core_launch_checkpoint(core, state, floor, None, None, false)
 }
 
 /// Attach one R1 relocation plan, its callback starts and its floor to the
@@ -173,7 +236,151 @@ pub(super) fn core_start_relocation_checkpoint(
         background.relocation = Some(capture);
         return Ok(());
     }
-    core_launch_checkpoint(core, state, Some(floor), Some(capture))
+    core_launch_checkpoint(core, state, Some(floor), Some(capture), None, false)
+}
+
+/// Commit the open-time recovery baseline: an ordinary Exact root over the
+/// validated replay suffix, with every compactor callback and periodic
+/// evaluation suppressed. Dirt and covered bytes are still counted.
+pub(super) fn core_commit_recovery_baseline(core: &Arc<WriteCore>) -> Result<(), LocalDbError> {
+    core.ensure_healthy()?;
+    core.wait_published_before(core.next_sequence())?;
+    core_progress_checkpoint(core, true)?;
+    {
+        let mut publisher = core.publisher.lock();
+        let state = publisher.checkpoint_state();
+        if state.background_checkpoint.is_some() {
+            return Err(LocalDbError::new(
+                "recovery baseline found a running checkpoint",
+            ));
+        }
+        core_launch_checkpoint(core, state, None, None, None, true)?;
+    }
+    core_progress_checkpoint(core, true)
+}
+
+/// Named `force_rebuild_control_region`: one Exact generation whose frozen
+/// cut covers every write allocated before the call evaluates every dirty
+/// callback cell, is adopted and live-installed, then completes this call.
+/// Never takes the Sui write gate and never drains writes allocated later.
+pub(super) fn core_force_rebuild_index(
+    core: &Arc<WriteCore>,
+) -> Result<IndexForceReport, IndexForceError> {
+    core.ensure_healthy().map_err(IndexForceError::Failed)?;
+    // Acquire pairs with the Release in `ForceSlot::drop`.
+    if core
+        .force_in_flight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return Err(IndexForceError::Busy);
+    }
+    let slot = ForceSlot(Arc::clone(&core.force_in_flight));
+    let target_next = core.next_sequence();
+    core.wait_published_before(target_next)
+        .map_err(IndexForceError::Failed)?;
+    core_progress_checkpoint(core, false).map_err(IndexForceError::Failed)?;
+    let (sender, completion) = mpsc::sync_channel(1);
+    let owner = Arc::new(());
+    let ticket = ForceTicket {
+        target_next,
+        reply: sender,
+        owner: Arc::clone(&owner),
+        _slot: slot,
+    };
+    {
+        let mut publisher = core.publisher.lock();
+        let state = publisher.checkpoint_state();
+        match state.background_checkpoint.as_mut() {
+            // A job that has not frozen takes the force at its freeze, which
+            // covers `target_next`; a frozen job hands it to its successor.
+            Some(background) => background.force = Some(ticket),
+            // No no-tail shortcut: an unsatisfied force always evaluates.
+            None => core_launch_checkpoint(core, state, None, None, Some(ticket), false)
+                .map_err(IndexForceError::Failed)?,
+        }
+    }
+    // `core_progress_checkpoint(.., true)` waits on the job, launches the one
+    // successor that holds a post-freeze force and waits on it too. The
+    // worker sends the named reply before its job result, so once no job
+    // remains the reply is ready or the ticket was dropped by a failure.
+    #[cfg(test)]
+    let timeout = core
+        .test_hooks
+        .lock()
+        .force_timeout
+        .unwrap_or(core.config.timeout);
+    #[cfg(not(test))]
+    let timeout = core.config.timeout;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Err(error) = core_progress_checkpoint_until(core, Some(deadline)) {
+            return Err(match core.ensure_healthy() {
+                Ok(()) if Instant::now() >= deadline => force_deadline_expired(core, &owner),
+                _ => IndexForceError::Failed(error),
+            });
+        }
+        match completion.try_recv() {
+            Ok(result) => return result.map_err(IndexForceError::Failed),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(IndexForceError::Failed(
+                    core.ensure_healthy().err().unwrap_or_else(|| {
+                        LocalDbError::new("named force checkpoint ended without completion")
+                    }),
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) if Instant::now() >= deadline => {
+                return Err(force_deadline_expired(core, &owner));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// An expired waiter withdraws its own ticket while no capture has taken it.
+/// Such a ticket waits in `BackgroundCheckpoint.force` for a freeze or for
+/// the successor that only a `core_progress_checkpoint` caller launches, so
+/// leaving it there could hold the slot `Busy` on an idle database. A ticket
+/// a capture took stays with its checkpoint worker, which completes or fails
+/// it and frees the slot without a waiter (COMPACTOR-PARITY.md §7.4).
+fn force_deadline_expired(core: &WriteCore, owner: &Arc<()>) -> IndexForceError {
+    withdraw_parked_force(core, owner);
+    IndexForceError::DeadlineExpired
+}
+
+/// Take the parked ticket iff `owner` queued it. Captures and successor
+/// launches move tickets only under Publisher, so this check and take are
+/// atomic with them. The ticket, and with it the slot, drops outside the
+/// lock. Returns whether a ticket was withdrawn.
+pub(super) fn withdraw_parked_force(core: &WriteCore, owner: &Arc<()>) -> bool {
+    let withdrawn = core
+        .publisher
+        .lock()
+        .checkpoint_state()
+        .background_checkpoint
+        .as_mut()
+        .and_then(|background| {
+            background
+                .force
+                .take_if(|ticket| Arc::ptr_eq(&ticket.owner, owner))
+        });
+    withdrawn.is_some()
+}
+
+/// Whether a named force is parked with the current job (not yet captured).
+#[cfg(test)]
+pub(super) fn force_parked(core: &WriteCore) -> bool {
+    core.publisher
+        .lock()
+        .checkpoint_state()
+        .background_checkpoint
+        .as_ref()
+        .is_some_and(|background| background.force.is_some())
 }
 
 fn merge_checkpoint_floor(
@@ -202,6 +409,8 @@ fn core_launch_checkpoint(
     state: PublisherCheckpoint<'_>,
     floor: Option<IndexReadCut>,
     relocation: Option<super::relocation::RelocationCapture>,
+    force: Option<ForceTicket>,
+    recovery_baseline: bool,
 ) -> Result<(), LocalDbError> {
     if state.manifest.checkpoint_staging.is_some() || state.manifest.checkpoint_obsolete.is_some() {
         return Err(LocalDbError::new(
@@ -253,6 +462,8 @@ fn core_launch_checkpoint(
         thread: Some(thread),
         requested_floor: floor,
         relocation,
+        force,
+        recovery_baseline,
     });
     Ok(())
 }
@@ -261,7 +472,15 @@ pub(super) fn core_progress_checkpoint(
     core: &Arc<WriteCore>,
     wait: bool,
 ) -> Result<(), LocalDbError> {
-    let deadline = Instant::now() + core.config.timeout;
+    core_progress_checkpoint_until(core, wait.then(|| Instant::now() + core.config.timeout))
+}
+
+/// Reap a finished job and launch its one successor. With a deadline, also
+/// wait for the running job and each successor until that instant.
+fn core_progress_checkpoint_until(
+    core: &Arc<WriteCore>,
+    deadline: Option<Instant>,
+) -> Result<(), LocalDbError> {
     let mut publisher = core.publisher.lock();
     loop {
         let state = publisher.checkpoint_state();
@@ -284,13 +503,20 @@ pub(super) fn core_progress_checkpoint(
                         background.relocation.take(),
                     )
                 });
-            // A failed job drops a waiting relocation: its requester observes
-            // the closed reply and the poisoned authority.
-            let has_successor =
-                result.is_ok() && (requested_floor.is_some() || relocation.is_some());
+            let force = background
+                .as_mut()
+                .and_then(|background| background.force.take());
+            // A failed job drops a waiting relocation and a waiting force:
+            // their requesters observe the closed reply and the poisoned
+            // authority.
+            let has_successor = result.is_ok()
+                && (requested_floor.is_some() || relocation.is_some() || force.is_some());
             let successor = if has_successor {
-                core_launch_checkpoint(core, state, requested_floor, relocation)
+                core_launch_checkpoint(core, state, requested_floor, relocation, force, false)
             } else {
+                // A failed job drops a waiting force: its waiter observes
+                // the failure.
+                drop(force);
                 Ok(())
             };
             drop(publisher);
@@ -298,15 +524,15 @@ pub(super) fn core_progress_checkpoint(
             drop(background);
             successor?;
             result?;
-            if !has_successor || !wait {
+            if !has_successor || deadline.is_none() {
                 return Ok(());
             }
             publisher = core.publisher.lock();
             continue;
         }
-        if !wait {
+        let Some(deadline) = deadline else {
             return Ok(());
-        }
+        };
         if Instant::now() >= deadline {
             return Err(LocalDbError::new("checkpoint completion deadline expired"));
         }
@@ -370,6 +596,17 @@ fn core_capture_checkpoint(
             (starts, Some((capture.plan, capture.reply)))
         }
     };
+    // A named force needs a freeze that covers its target; publication below
+    // the target finished before the force was queued, so this always holds.
+    let force = state.background_checkpoint.as_mut().and_then(|background| {
+        background
+            .force
+            .take_if(|ticket| published_next >= ticket.target_next)
+    });
+    let recovery_baseline = state
+        .background_checkpoint
+        .as_ref()
+        .is_some_and(|background| background.recovery_baseline);
     let cut = *state.latest;
     if cut.is_some_and(|cut| cut.batch.epoch == core.epoch && cut.batch.sequence >= published_next)
     {
@@ -442,6 +679,15 @@ fn core_capture_checkpoint(
         None => writer.begin_capture(index_cut),
     }
     .map_err(LocalDbError::component)?;
+    // Policy age clock: canonical frame lengths, header included, of the
+    // receipts this capture newly covers (each batch once).
+    let covered_delta = (credits.replay_batches as u64)
+        .checked_mul(8)
+        .and_then(|headers| headers.checked_add(credits.replay_bytes as u64))
+        .ok_or_else(|| LocalDbError::new("checkpoint covered byte count overflow"))?;
+    writer
+        .begin_capture_policy(covered_delta, force.is_some(), recovery_baseline)
+        .map_err(LocalDbError::component)?;
     let commit = CheckpointCommit {
         epoch: core.epoch,
         generation,
@@ -462,6 +708,7 @@ fn core_capture_checkpoint(
         prepare_work_ns: prepare_started.map(elapsed),
         callback_starts,
         relocation,
+        force,
     };
     let persistence = CheckpointPersistence {
         path: core.path.clone(),
@@ -490,6 +737,9 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         Some(generation),
     );
     let (mut capture, mut persistence, mut credits) = core_capture_checkpoint(core, generation)?;
+    // The worker owns a consumed force through adoption and live install. On
+    // any error it is dropped and its waiter observes the failure.
+    let force = capture.force.take();
     let prepare_started = persistence.diagnostics_enabled.then(Instant::now);
     let prepared = loop {
         // Each step releases the writer so concurrent publication can progress.
@@ -498,7 +748,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
         }
     };
     // New prune marks reserve their resident charge in admission's index
-    // budget before they are created; the reservation ends after live install.
+    // budget before each callback; the reservation ends after live install.
     let prepared = prepared.with_mark_budget(Box::new(AdmissionMarkBudget {
         admission: Arc::clone(&core.admission),
         held: 0,
@@ -565,6 +815,11 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     );
     #[cfg(test)]
     crate::failpoints::write_model::boundary("checkpoint_install_before");
+    let compactor = completed
+        .persisted
+        .as_ref()
+        .map(|image| image.compactor_stats)
+        .unwrap_or_default();
     // R0 observers walk the installed image only between installs (seqlock).
     core.capacity.begin_install();
     // Hold the mark reservation until installation has charged the marks.
@@ -630,6 +885,15 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
     // writer/publisher, and Active→Suffix must not resurrect a Recent identity.
     credits.identities = core.retire_checkpoint_identities(completed.cut, &recent);
     core.release_checkpoint_credits(credits)?;
+    if let Some(force) = force {
+        // Capacity one and never shared: this send cannot block, and a
+        // waiter that gave up only discards the report.
+        let _ = force.reply.try_send(Ok(IndexForceReport {
+            checkpoint_generation: generation,
+            cut: completed.cut,
+            compactor,
+        }));
+    }
     let install_ns = elapsed(work_started);
     core.write_timeline.checkpoint_generation(
         "live_install_end",

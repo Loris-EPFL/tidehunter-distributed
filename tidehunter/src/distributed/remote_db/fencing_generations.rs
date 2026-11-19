@@ -455,7 +455,7 @@ fn commit_trim(core: &Arc<WriteCore>, generation: u64) -> Result<(), LocalDbErro
     };
     if names_generation {
         // Obsolete-root cleanup completes inside the commit, before any Trim.
-        let result = core.commit_checkpoint();
+        let result = core.commit_recovery_baseline();
         let mut publisher = core.publisher.lock();
         publisher.manifest.adopt_trim = None;
         result?;

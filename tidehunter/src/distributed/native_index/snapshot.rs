@@ -42,6 +42,9 @@ pub(super) struct FrozenCell {
     /// True when persistence added marks to this cell, so its stored frame
     /// is stale and the cell is rewritten.
     pub marks_changed: bool,
+    /// Policy progress and per-birth jitter of a callback-enabled cell;
+    /// persistence replaces it with the next image's progress.
+    pub policy: Option<(CellPolicy, u32)>,
     /// Sorted `(key, fold_through)`: versions this image omits with the
     /// marks it folds. Empty unless the floor reached a mark.
     pub fold: Vec<(Bytes, MutationVersion)>,
@@ -93,6 +96,10 @@ pub(crate) struct PreparedIndexImage {
     lease: CaptureLease,
     /// Payload scratch limit of the one encoder that persists this image.
     scratch_limit: usize,
+    /// Compactor inputs of this capture; `None` without callback keyspaces.
+    policy: Option<PolicyCapture>,
+    /// Root policy block of this image.
+    policy_root: Option<PolicyRoot>,
     /// Install epoch of the marks this image adds.
     install_epoch: u64,
     /// Reservation of the resident charge of the marks this image adds.
@@ -113,7 +120,9 @@ pub(crate) struct PersistedIndexImage {
         expect(dead_code, reason = "exported by the checkpoint metrics stage")
     )]
     pub(crate) encode_stats: CellEncodeStats,
+    pub(super) policy_root: Option<PolicyRoot>,
     pub(super) install_epoch: u64,
+    pub(crate) compactor_stats: CompactorStats,
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "reported by R1 logical pruning")
@@ -151,6 +160,8 @@ impl PreparedIndexImage {
             cut,
             lease,
             scratch_limit,
+            policy: None,
+            policy_root: None,
             install_epoch: 0,
             mark_budget: Box::new(UnboundedMarkBudget),
             prune_plan: PrunePlan::default(),
@@ -161,6 +172,17 @@ impl PreparedIndexImage {
     /// is installed.
     pub(super) fn with_install_epoch(mut self, install_epoch: u64) -> Self {
         self.install_epoch = install_epoch;
+        self
+    }
+
+    /// Attach the compactor inputs frozen with the capture.
+    pub(super) fn with_policy(
+        mut self,
+        policy: Option<PolicyCapture>,
+        policy_root: Option<PolicyRoot>,
+    ) -> Self {
+        self.policy = policy;
+        self.policy_root = policy_root;
         self
     }
 
@@ -211,10 +233,11 @@ impl PreparedIndexImage {
                 .then_with(|| a.identity.1.cmp(&b.identity.1))
         });
         let (parent, root_name) = output_parts(path)?;
-        // Fold, then apply the prune plan to every cell once, off-lock,
-        // before any encoding. The container decision below then sees the
-        // final rows and marks.
+        // Fold, apply the prune plan, then evaluate and select every cell once,
+        // off-lock, before any encoding. The container decision below then
+        // sees the final rows and marks.
         let mut prune_stats = PruneStats::default();
+        let mut compactor_stats = CompactorStats::default();
         let candidates = std::mem::take(&mut self.prune_plan.candidates);
         let mut planned = candidates.as_slice();
         for cell in &mut self.cells {
@@ -235,6 +258,15 @@ impl PreparedIndexImage {
                 &mut prune_stats,
             )?;
             planned = &planned[run..];
+            super::compactor::prepare_cell(
+                cell,
+                self.policy.as_ref(),
+                self.install_epoch,
+                &self.cut,
+                self.scratch_limit,
+                self.mark_budget.as_mut(),
+                &mut compactor_stats,
+            )?;
         }
         prune_stats.plan_stale += planned.len() as u64;
         match std::fs::symlink_metadata(path) {
@@ -388,11 +420,24 @@ impl PreparedIndexImage {
         }
         // The mask section is always present, so one writer format exists.
         encode_masks(&self.cells, masked, &mut payload)?;
-        // A cell without stored rows keeps no mark: nothing at or below the
-        // cut remains for a mark to hide. Marks of stored cells are in their
-        // frames, so the root ends at the mask section.
+        // A cell without stored rows keeps neither marks nor progress: nothing
+        // at or below the cut remains for a mark to hide. Marks of stored
+        // cells are in their frames.
         for cell in self.cells.iter_mut().filter(|cell| cell.base.is_none()) {
             cell.marks = None;
+            if let Some((_, jitter)) = cell.policy {
+                cell.policy = self
+                    .policy_root
+                    .as_ref()
+                    .and_then(|root| root.baseline(cell.identity.0))
+                    .map(|baseline| (baseline, jitter));
+            }
+        }
+        // The policy block follows only when a callback keyspace is enabled:
+        // a root without one ends at the mask section.
+        super::compactor::encode_policy(self.policy_root.as_ref(), &self.cells, &mut payload)?;
+        if payload.len() > MAX_IMAGE_BYTES - 8 {
+            return Err(NativeIndexError::Capacity);
         }
         let frame = CrcFrame::new(&payload);
         let mut root_file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -412,7 +457,9 @@ impl PreparedIndexImage {
             lease: self.lease,
             metadata,
             encode_stats: encoder.stats,
+            policy_root: self.policy_root,
             install_epoch: self.install_epoch,
+            compactor_stats,
             prune_stats,
             mark_budget: self.mark_budget,
         })
@@ -422,7 +469,8 @@ impl PreparedIndexImage {
 fn reusable(cell: &FrozenCell, parent: &Path, cut: &IndexReadCut, floor: &IndexReadCut) -> bool {
     // Captures retain the complete sealed generation. A cell is still clean
     // for this prefix when all its overlay references are newer than the cut
-    // and its marks are unchanged: no mark folds and none was added.
+    // and its marks are unchanged: no mark folds and none was added. A
+    // keep-all evaluation changes only the root policy progress.
     cell.fold.is_empty()
         && !cell.marks_changed
         && cell.overlay.values().all(|values| {
@@ -781,8 +829,17 @@ pub(super) fn open(
             return Err(NativeIndexError::Invalid("duplicate cell"));
         }
     }
+    let mut policy_root = None;
     if format == FORMAT {
         decode_masks(&mut cursor, &mut index, &cut, &floor, count)?;
+        // Optional: present only when a callback keyspace was enabled.
+        if cursor.remaining() != 0 {
+            policy_root = Some(super::compactor::decode_policy(
+                &mut cursor,
+                &mut index,
+                &cut,
+            )?);
+        }
     }
     if cursor.remaining() != 0 {
         return Err(NativeIndexError::Invalid("trailing payload"));
@@ -793,6 +850,10 @@ pub(super) fn open(
     // version (a `DropCells` batch absorbed into the image).
     let writer = index.writer.get_mut();
     writer.latest = writer.latest.max(retention::position(&cut));
+    // Policy progress is restored, never re-evaluated: no callback runs at
+    // open, validation or suffix replay.
+    writer.policy_root = policy_root;
+    writer.policy_cut = retention::position(&cut);
     let latest = writer.latest;
     index.published.store(std::sync::Arc::new(
         latest.map_or(IndexReadCut::BeforeAll, IndexReadCut::At),

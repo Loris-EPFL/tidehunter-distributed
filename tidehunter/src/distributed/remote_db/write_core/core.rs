@@ -206,6 +206,8 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub before_publish: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub before_release: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub fail_publication: Option<u64>,
+    /// Named-force waiter deadline instead of `config.timeout`.
+    pub force_timeout: Option<std::time::Duration>,
 }
 
 /// Lock order for the final engine: identity → ascending key shards → owner
@@ -237,6 +239,9 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub first_failure: Arc<OnceLock<super::super::FirstFailure>>,
     pub stopped: AtomicBool,
     pub closing: AtomicBool,
+    /// The one named index force in flight (`force_rebuild_index`); claimed
+    /// by compare-exchange, released when its ticket drops.
+    pub force_in_flight: Arc<AtomicBool>,
     pub clients: Vec<super::super::ClientWorker>,
     /// Set when this epoch is tracked under durable-prefix recovery. Open
     /// attaches it after offline fencing-generation maintenance, before the
@@ -316,6 +321,7 @@ impl WriteCore {
             closing: AtomicBool::new(false),
             owner_controls,
             clients: open.clients,
+            force_in_flight: Arc::new(AtomicBool::new(false)),
             durable_cut: OnceLock::new(),
             live_pool: open.live_pool,
             live_metrics: open.live_metrics,
@@ -654,6 +660,22 @@ impl WriteCore {
     ) -> Result<(), LocalDbError> {
         let result = super::super::checkpoint_lifecycle::core_commit_checkpoint(self);
         self.checkpoint_result(result)
+    }
+
+    pub(in crate::distributed::remote_db) fn commit_recovery_baseline(
+        self: &Arc<Self>,
+    ) -> Result<(), LocalDbError> {
+        let result = super::super::checkpoint_lifecycle::core_commit_recovery_baseline(self);
+        self.checkpoint_result(result)
+    }
+
+    /// Named Exact force (`force_rebuild_control_region`). A failure of the
+    /// named checkpoint already failed the core; `Busy` and an expired
+    /// deadline do not.
+    pub(in crate::distributed::remote_db) fn force_rebuild_index(
+        self: &Arc<Self>,
+    ) -> Result<super::super::IndexForceReport, super::super::IndexForceError> {
+        super::super::checkpoint_lifecycle::core_force_rebuild_index(self)
     }
 
     pub(in crate::distributed::remote_db) fn retire_history_before(

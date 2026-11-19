@@ -143,6 +143,7 @@ impl Fixture {
             live_nvme: live_config(tier),
             durable_cut: Default::default(),
             relocation_max_reclaim_pct: 100,
+            compactor_cadence: Default::default(),
         };
         let node = StorageNode::open(
             NodeConfig {

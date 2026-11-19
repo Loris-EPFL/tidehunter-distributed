@@ -1279,6 +1279,20 @@ impl ConcurrentRemoteDatabase {
         self.database.core.flush_index()
     }
 
+    /// Named index rebuild: the leased equivalent of native
+    /// `force_rebuild_control_region`. Returns after one Exact generation that
+    /// covers every write allocated before the call has evaluated every dirty
+    /// compactor cell and is durably adopted and live-installed. Takes no
+    /// write gate; later writes proceed.
+    ///
+    /// # Errors
+    /// `Busy` while another named force runs; `DeadlineExpired` withdraws the
+    /// force if no capture has taken it, otherwise drops only the waiter;
+    /// `Failed` carries the checkpoint or authority error.
+    pub fn force_rebuild_index(&self) -> Result<super::IndexForceReport, super::IndexForceError> {
+        self.database.core.force_rebuild_index()
+    }
+
     #[cfg(test)]
     /// Persist a Stop-aware floor and reclaim wholly unreachable sealed files.
     /// Live retirement can return a non-fatal busy error while a read is held;

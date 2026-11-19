@@ -101,6 +101,7 @@ pub(super) fn coordinator_config(
         live_nvme: live_config(DurabilityTier::Native),
         durable_cut: Default::default(),
         relocation_max_reclaim_pct: 100,
+        compactor_cadence: Default::default(),
     }
 }
 

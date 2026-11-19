@@ -43,12 +43,16 @@ use std::ops::Bound;
 use std::path::Path;
 use typenum::U32;
 
+mod compactor;
 mod prune_marks;
 mod relocation;
 mod retention;
 mod shards;
 mod snapshot;
 mod writer;
+pub(crate) use compactor::CompactorPolicy;
+use compactor::{CellPolicy, PolicyCapture, PolicyRoot};
+pub use compactor::{CompactorCadence, CompactorStats};
 use prune_marks::PruneMark;
 pub use prune_marks::PruneStats;
 pub(crate) use prune_marks::{MarkBudget, PruneCandidate, PrunePlan, UnboundedMarkBudget};
@@ -281,6 +285,12 @@ struct CellIndex {
     /// Adopted index-only suppression marks, sorted by key then cut. Replaced
     /// only by installation (one writer); `None` means none.
     prune_marks: Option<std::sync::Arc<[PruneMark]>>,
+    /// Compactor progress of the adopted image; `None` is the keyspace
+    /// baseline. Replaced only by installation.
+    policy: Option<CellPolicy>,
+    /// Native per-birth dirty-key jitter, sampled at the first capture of a
+    /// callback-enabled cell. Never persisted.
+    jitter: Option<u32>,
 }
 
 /// One database's native-routed cells with typed logical versions and locations.
@@ -307,6 +317,8 @@ pub struct NativeIndex {
     /// Install epoch reached by the last completed installation. Marks with
     /// a larger epoch belong to an installation in progress and stay hidden.
     prune_epoch: AtomicU64,
+    /// Runtime compactor policy, set once at open from the caller's shape.
+    compactor: std::sync::OnceLock<std::sync::Arc<CompactorPolicy>>,
 }
 
 /// Digest of the exact durable CRC-framed image, usable by its manifest owner.
@@ -579,6 +591,7 @@ impl NativeIndex {
             publication_shards: PublicationHistogram::default(),
             retention: RetentionState::new(),
             prune_epoch: AtomicU64::new(0),
+            compactor: std::sync::OnceLock::new(),
         })
     }
 
@@ -757,6 +770,21 @@ impl NativeIndex {
                     )
             })
         }))
+    }
+
+    /// Install the runtime compactor policy of the caller's shape. Once, at
+    /// open, before the index serves; later calls are refused.
+    pub(crate) fn set_compactor_policy(
+        &self,
+        policy: std::sync::Arc<CompactorPolicy>,
+    ) -> Result<(), NativeIndexError> {
+        self.compactor
+            .set(policy)
+            .map_err(|_| NativeIndexError::Invalid("compactor policy already installed"))
+    }
+
+    pub(crate) fn compactor_policy(&self) -> Option<&std::sync::Arc<CompactorPolicy>> {
+        self.compactor.get()
     }
 
     /// Ordered index references; cursors and ordering are reduced native index
@@ -1752,6 +1780,7 @@ mod tests {
     use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig};
     use crate::metrics::Metrics;
 
+    mod compactor_policy;
     mod containers;
     mod cursors;
     mod drop_cells;
