@@ -33,7 +33,7 @@
 
 use super::super::durability::{CutRecovery, DurableCutConfig, NativeRecovery};
 use super::super::local_db::LocalDbError;
-use super::super::storage::{encode_metadata, install_metadata, read_metadata};
+use super::super::storage::{StorageError, encode_metadata, install_metadata, read_metadata};
 use super::super::tcp::{Client, DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport, TcpError};
 use super::super::types::BatchVersion;
 use parking_lot::Mutex;
@@ -102,19 +102,27 @@ pub(super) struct CutRecord {
 }
 
 impl CutRecord {
-    /// Read and validate the record; `None` when the file does not exist.
+    /// Read and validate the record; `None` only when the file does not exist.
+    /// Any other error (permission, I/O, a directory in its place) fails the open:
+    /// an unreadable record must never read as "no truncations".
     pub(super) fn load(
         path: &Path,
         database: [u8; 16],
         current_epoch: u64,
     ) -> Result<Option<Self>, LocalDbError> {
         let file = path.join(RECORD);
-        if !file.exists() {
-            return Ok(None);
-        }
-        let record: Self = read_metadata(&file).map_err(|error| {
-            LocalDbError::new(format!("durable cut record {}: {error}", file.display()))
-        })?;
+        let record: Self = match read_metadata(&file) {
+            Ok(record) => record,
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(LocalDbError::new(format!(
+                    "durable cut record {}: {error}",
+                    file.display()
+                )));
+            }
+        };
         let ascending = record
             .truncations
             .windows(2)

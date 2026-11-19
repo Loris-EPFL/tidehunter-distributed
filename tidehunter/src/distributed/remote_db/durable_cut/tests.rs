@@ -31,6 +31,20 @@ fn replay(plan: &mut RecoveryPlan) -> Vec<u64> {
         .collect()
 }
 
+/// Only a missing record means "no record". A directory in its place (EISDIR on
+/// read) or a file in place of the authority directory (ENOTDIR) fails the load.
+#[test]
+fn unreadable_record_fails_instead_of_reading_as_absent() {
+    let directory = tempdir::TempDir::new("durable-cut-record-errors").unwrap();
+    assert_eq!(CutRecord::load(directory.path(), DB, 5).unwrap(), None);
+    std::fs::create_dir(directory.path().join(RECORD)).unwrap();
+    let error = CutRecord::load(directory.path(), DB, 5).unwrap_err();
+    assert!(error.message().contains(RECORD), "{error}");
+    let not_directory = directory.path().join("authority-file");
+    std::fs::write(&not_directory, b"x").unwrap();
+    assert!(CutRecord::load(&not_directory, DB, 5).is_err());
+}
+
 #[test]
 fn record_round_trips_and_rejects_foreign_or_future_state() {
     let directory = tempdir::TempDir::new("durable-cut-record").unwrap();
