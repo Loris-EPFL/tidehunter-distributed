@@ -18,3 +18,4 @@ pub(crate) fn duration_ns(duration: std::time::Duration) -> u64 {
 pub mod index_checkpoint;
 pub mod mainnet_replay;
 pub mod mainnet_trace;
+pub mod op_replay;
