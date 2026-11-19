@@ -658,6 +658,14 @@ impl Db {
         }
     }
 
+    /// Boundary snapshot of the remote coordinator's durable-cut diagnostics.
+    pub fn durable_cut_stats(&self) -> Option<super::remote_db::DurableCutStats> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote.db.durable_cut_stats()),
+            Backend::Native(_) => None,
+        }
+    }
+
     /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
     /// live target's exported namespaces and is not a reopen operation.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
