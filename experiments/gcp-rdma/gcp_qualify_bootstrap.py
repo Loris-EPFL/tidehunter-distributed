@@ -27,7 +27,8 @@ import gcp_runtime
 M3_PAIR_SECONDS = 480
 # The child alarm must fire before its parent subprocess timeout.
 PAIR_EXIT_SECONDS = 30
-WRITE_ENGINE_FLEETS = ('nvmeof_p9_write_engine', 'nvmeof_p13_write_engine', 'nvmeof_p16_redrain_ab')
+WRITE_ENGINE_FLEETS = ('nvmeof_p9_write_engine', 'nvmeof_p13_write_engine', 'nvmeof_p16_redrain_ab',
+                       'nvmeof_q0')
 M3_FLEETS = ('nvmeof_m3_t1', 'nvmeof_m3_t2_2', 'nvmeof_m3_t2_5',
              'nvmeof_p9_small_put', *WRITE_ENGINE_FLEETS)
 
