@@ -1184,6 +1184,13 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     read_expected_live(&crash_reopened, crash_ks, &after_key, &after_value)?;
     read_expected(&crash_reopened, crash_ks, &delete_key, None)?;
     read_expected(&crash_reopened, crash_ks, &keys[0], Some(&values[0]))?;
+    // Reads never open a leased writer queue, so one live write after the
+    // abrupt reopen installs the writer route that the drop check compares.
+    let recovered_key = key_bytes(&input.namespace, 23, 2);
+    let recovered_value = value_bytes(&input.namespace, 31, 2, 65536, 1.0);
+    crash_reopened
+        .insert(crash_ks, recovered_key, recovered_value)
+        .map_err(native_error)?;
     let after_crash_reads = stats(&crash_reopened)?;
     verify_routes(&after_crash_reads, &input.expected_route)?;
     check(
