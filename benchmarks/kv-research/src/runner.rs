@@ -636,6 +636,28 @@ pub async fn run<B: KvBackend>(
             |previous| format!("{previous}; {reason}"),
         ));
     }
+    // A1 index fixture: after post-workload qualification (its writes precede
+    // the stop record) and before shutdown (close or crash-style stop).
+    if backend.index_fixture().is_some() {
+        let finish = crate::index_a1::FixtureFinish {
+            namespace,
+            case_id: config.case_id.clone(),
+            output: output.to_path_buf(),
+            measurement_ok: measurement_drained && fatal_reason.is_none(),
+        };
+        if let Err(error) = boundary_on_worker(&backend, move |backend| {
+            backend.finish_index_fixture(&finish)
+        })
+        .await
+        {
+            failed = true;
+            let reason = format!("index fixture stage end failed: {error}");
+            fatal_reason = Some(fatal_reason.map_or_else(
+                || reason.clone(),
+                |previous| format!("{previous}; {reason}"),
+            ));
+        }
+    }
     if let Err(error) = shutdown_on_worker(
         backend,
         deadline,
@@ -2446,9 +2468,14 @@ fn client_generators(config: &RunConfig) -> Vec<WorkloadGenerator> {
     // Reserve new-key IDs across every client and phase. This atomic allocates IDs
     // only; oracle tracking is separate. K=1 retains the original seed and stream.
     let next_put_index = Arc::new(AtomicU64::new(0));
+    // Validated with the configuration: the A1 build writes IDs 0..N once.
+    let build_ids = matches!(
+        config.index_fixture_stage(),
+        Ok(Some(crate::index_a1::IndexFixtureStage::Build))
+    );
     (0..config.execution.effective_client_shards())
         .map(|shard| {
-            WorkloadGenerator::new(
+            let generator = WorkloadGenerator::new(
                 (config.seed ^ 0x6b76_7265_7365_6172)
                     .wrapping_add((shard as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
                 config.dataset.keys,
@@ -2457,7 +2484,12 @@ fn client_generators(config: &RunConfig) -> Vec<WorkloadGenerator> {
                 config.workload.distribution.clone(),
                 config.workload.put_key_policy,
                 Arc::clone(&next_put_index),
-            )
+            );
+            if build_ids {
+                generator.with_build_ids()
+            } else {
+                generator
+            }
         })
         .collect()
 }
@@ -2943,6 +2975,25 @@ async fn execute_item<B: KvBackend>(
         .iter()
         .map(|id| key_bytes(namespace, config.seed, *id))
         .collect::<Vec<_>>();
+    // Index fixture: measured puts write the run's value domain.
+    let fixture = backend.index_fixture().filter(|_| phase == "measurement");
+    let domain = fixture.map(crate::index_a1::FixtureRun::value_domain);
+    let make_value = |id: u64| match domain {
+        Some(domain) => domain.value(
+            namespace,
+            config.seed,
+            id,
+            config.dataset.value_size,
+            config.dataset.entropy,
+        ),
+        None => value_bytes(
+            namespace,
+            config.seed,
+            id,
+            config.dataset.value_size,
+            config.dataset.entropy,
+        ),
+    };
     let entries = if matches!(
         operation,
         OperationKind::Read | OperationKind::Put | OperationKind::GetMany | OperationKind::PutBatch
@@ -2950,18 +3001,7 @@ async fn execute_item<B: KvBackend>(
         work.keys
             .iter()
             .zip(&key_bytes_vec)
-            .map(|(id, key)| {
-                (
-                    key.clone(),
-                    value_bytes(
-                        namespace,
-                        config.seed,
-                        *id,
-                        config.dataset.value_size,
-                        config.dataset.entropy,
-                    ),
-                )
-            })
+            .map(|(id, key)| (key.clone(), make_value(*id)))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -3234,6 +3274,23 @@ async fn execute_item<B: KvBackend>(
             Cow::Borrowed("request_deadline_timeout"),
         ),
     };
+    // Inside the worker-release clock, outside the API timer. A dispatched
+    // put without success may still have been applied: it is uncertain.
+    if let Some(fixture) = fixture
+        && operation == OperationKind::Put
+        && (sample.outcome == "success" || sample.dispatch_observed)
+        && let Some(id) = work.keys.first()
+    {
+        let recorded = if sample.outcome == "success" {
+            fixture.record_put(*id)
+        } else {
+            fixture.record_uncertain(*id)
+        };
+        if let Err(error) = recorded {
+            sample.outcome = "error";
+            sample.error_kind = Cow::Owned(format!("index fixture touched bitmap: {error}"));
+        }
+    }
     sample.released_ns = duration_ns(origin.elapsed()).max(sample.completed_ns);
     sample
 }

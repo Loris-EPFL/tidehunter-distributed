@@ -1,13 +1,14 @@
 //! Replay of one database stream into both arms, with every recorded result
 //! checked on each arm at its recorded point.
 
-use super::arm::{self, Arm, FilterEvidence, KeyspaceDigest, Kind, LeasedOwner};
+use super::arm::{self, Arm, FilterEvidence, KeyspaceDigest, Kind};
 use super::trace::{
     DATABASE, FilterDecision, Frame, Member, Op, OpenSpec, Outcome, Reader, RelocationEvidence,
 };
 use super::{RowHasher, row_hash};
 use crate::backend::BackendResult;
 use crate::backends::replay::ReplayBackend;
+use crate::leased_fixture::LeasedOwner;
 use crate::mainnet_trace::Row;
 use serde::Serialize;
 use std::collections::BTreeMap;

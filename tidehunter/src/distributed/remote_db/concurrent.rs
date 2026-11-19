@@ -974,6 +974,21 @@ impl ConcurrentRemoteDatabase {
         self.database.database_id()
     }
 
+    /// Owner persistence counters of each owner, in endpoint order.
+    pub fn storage_stats_by_partition(
+        &self,
+    ) -> Result<Vec<(u32, crate::distributed::storage::PartitionStats)>, LocalDbError> {
+        self.database.storage_stats_by_partition()
+    }
+
+    /// Upper mutation version of the published cut (the logical frontier);
+    /// `None` before the first publication. Benchmark observation only.
+    pub fn published_frontier(
+        &self,
+    ) -> Result<Option<crate::distributed::types::MutationVersion>, LocalDbError> {
+        Ok(self.published_cut()?.upper())
+    }
+
     pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
         self.live_metrics.as_ref().map(|metrics| metrics.snapshot())
     }

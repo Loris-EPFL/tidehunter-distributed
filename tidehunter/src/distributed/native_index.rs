@@ -169,6 +169,16 @@ impl SparseIndexView {
 }
 
 impl IndexReadCut {
+    /// Highest mutation version the cut includes; `None` for the empty cut
+    /// and for an unresolved `Latest`.
+    pub fn upper(&self) -> Option<MutationVersion> {
+        match self {
+            Self::Latest | Self::BeforeAll => None,
+            Self::At(version) => Some(*version),
+            Self::Sparse(view) => Some(view.upper),
+        }
+    }
+
     fn within_upper(&self, reference: &ValueRecordReference) -> bool {
         match self {
             Self::Latest => true,

@@ -723,7 +723,7 @@ fn boundary_json(boundary: &Boundary) -> Value {
     })
 }
 
-fn recovery_json(stats: &RecoveryStats) -> Value {
+pub(crate) fn recovery_json(stats: &RecoveryStats) -> Value {
     json!({
         "open_id": stats.open_id,
         "checkpoint_loaded": stats.checkpoint_loaded,

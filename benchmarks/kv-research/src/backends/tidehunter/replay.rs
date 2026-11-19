@@ -37,7 +37,7 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
     let mut result = Vec::with_capacity(3);
     for node in parsed {
         let opts = parse_options(&node.options)?;
-        let remote = &opts.external_remote_config;
+        let remote = external_config(&opts)?;
         remote.validate()?;
         if opts
             .batch_limits
@@ -63,7 +63,7 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
             return Err("distributed replay node DB paths must not overlap".into());
         }
         paths.push(resolved);
-        batch_limits(&opts).validate()?;
+        remote.storage.batch_limits.validate()?;
         result.push((node.db_id, node.options, opts));
     }
     let first = &result[0].2;
@@ -93,8 +93,14 @@ fn resolve_path(path: &std::path::Path) -> BackendResult<std::path::PathBuf> {
     }
     Ok(resolved)
 }
-fn batch_limits(opts: &Options) -> BatchLimits {
-    opts.external_remote_config.storage.batch_limits
+fn external_config(opts: &Options) -> BackendResult<&super::RemoteDatabaseConfig> {
+    opts.external_remote_config
+        .as_ref()
+        .ok_or_else(|| "distributed mainnet replay requires external_remote_config".into())
+}
+
+fn batch_limits(opts: &Options) -> BackendResult<BatchLimits> {
+    Ok(external_config(opts)?.storage.batch_limits)
 }
 pub(super) fn shape(tables: &[Table], db: u16) -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
@@ -138,7 +144,7 @@ impl TidehunterReplayBackend {
         }
         for (id, _, opts) in &parsed {
             let shape = shape(&trace.tables, *id);
-            let limits = batch_limits(opts);
+            let limits = batch_limits(opts)?;
             // Use the actual codec on the immutable source rows before opening owners.
             // Expanded keys have identical lengths. Never split the 519-member output batch.
             for entries in trace
@@ -189,7 +195,7 @@ impl TidehunterReplayBackend {
         let opts = options(value)?;
         let mut wal = 0;
         for (_, _, node) in &opts {
-            let bytes = node.external_remote_config.storage.wal_file_bytes;
+            let bytes = external_config(node)?.storage.wal_file_bytes;
             wal = wal.max(
                 bytes
                     .checked_mul(node.owners as u64)

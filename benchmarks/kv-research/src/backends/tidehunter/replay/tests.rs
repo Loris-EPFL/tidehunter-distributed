@@ -214,6 +214,10 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             read_evidence_written:false,owner_sample_gate:Default::default(),coordinator_interval_baseline:std::sync::Mutex::new(None),
             coordinator_path:base.join("coordinator"),open_record,
             live_write_profile:std::sync::Mutex::new(None),
+            #[cfg(all(feature = "test-utils", target_os = "linux"))]
+            index_fixture:None,
+            #[cfg(all(feature = "test-utils", target_os = "linux"))]
+            local_owners: Vec::new(),
         });
     }
     let tables = trace

@@ -605,6 +605,31 @@ impl Db {
         }
     }
 
+    /// Owner persistence counters of each owner as `(partition, counters)`,
+    /// in endpoint order. `None` for the native backend.
+    pub fn owner_storage_stats_by_partition(
+        &self,
+    ) -> Result<Option<Vec<(u32, super::storage::PartitionStats)>>> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .db
+                .storage_stats_by_partition()
+                .map(Some)
+                .map_err(error),
+            Backend::Native(_) => Ok(None),
+        }
+    }
+
+    /// Upper mutation version of the remote published cut (the logical
+    /// frontier); `None` before the first publication and for the native
+    /// backend. Benchmark observation only.
+    pub fn published_frontier(&self) -> Result<Option<super::types::MutationVersion>> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.published_frontier().map_err(error),
+            Backend::Native(_) => Ok(None),
+        }
+    }
+
     /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
     /// live target's exported namespaces and is not a reopen operation.
     pub fn shutdown_live_target_final(

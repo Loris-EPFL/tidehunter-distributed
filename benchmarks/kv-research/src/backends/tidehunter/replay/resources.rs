@@ -20,6 +20,8 @@ pub(super) fn reservation(
     let mut databases = Vec::new();
     let mut total = 0;
     for (db, _, opts) in options(value)? {
+        let remote = external_config(&opts)?;
+        let batch_limits = remote.storage.batch_limits;
         let shape = shape(&trace.tables, db);
         let index = NativeIndex::with_shards(&shape, [0; 16], 512 * 1024 * 1024, 1)?;
         let rows: Vec<_> = trace
@@ -56,7 +58,7 @@ pub(super) fn reservation(
                     key: row.key.clone(),
                     value: row.value.clone(),
                 }],
-                batch_limits(&opts),
+                batch_limits,
             )?;
             let reduced = if table.key_shape == "digest_reduction_0_16" {
                 16
@@ -135,7 +137,7 @@ pub(super) fn reservation(
                     sequence: 0,
                 },
                 mutations,
-                batch_limits(&opts),
+                batch_limits,
             )?;
             let bytes = batch.encoded().len() as u64;
             // Fresh-cell charges overbound this batch's transient charge, including unpublished routing.
@@ -147,7 +149,6 @@ pub(super) fn reservation(
         }
         batches = mul(batches, repetitions)?;
         encoded = mul(encoded, repetitions)?;
-        let remote = &opts.external_remote_config;
         let replay_limits = opts.replay_limits.unwrap_or(remote.replay_limits);
         let max_index = remote.max_index_bytes as u64;
         let max_identities = remote.max_admitted_batches as u64;

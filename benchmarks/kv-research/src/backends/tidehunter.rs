@@ -1,4 +1,6 @@
 // Reuse the engine's existing harness unchanged, including its explicit startup sequences.
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+mod index_fixture;
 mod live_qualification;
 mod live_write_profile;
 pub mod replay;
@@ -13,6 +15,36 @@ pub fn qualify_live_nvmeof(input: &Path, output: &Path) -> BackendResult<()> {
 }
 pub fn qualify_live_nvmeof_child(input: &Path, ready: &Path) -> BackendResult<()> {
     live_qualification::run_abrupt_child(input, ready)
+}
+
+/// A1 index-fixture adapter for one `build` or `overwrite` stage; the whole
+/// run configuration binds the build receipt.
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+pub fn open_index_fixture(config: &crate::config::RunConfig) -> BackendResult<TidehunterBackend> {
+    index_fixture::open(config)
+}
+
+/// A1 cold reopen of a case after its overwrite stage, in a fresh process.
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+pub fn index_a1_cold_reopen(config: &Path, output: &Path) -> BackendResult<()> {
+    index_fixture::cold::cold_reopen(config, output)
+}
+
+/// One phase of the Q1 staged two-OwnerHost index runner.
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+pub fn q1_index_stage(
+    stage: &Path,
+    phase: &str,
+    partition: Option<u32>,
+    output: &Path,
+) -> BackendResult<()> {
+    index_fixture::q1::run(stage, phase, partition, output)
+}
+
+/// Supervised leased-fixture owner child; must run before CLI parsing.
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+pub fn maybe_run_leased_fixture_owner() -> BackendResult<bool> {
+    crate::leased_fixture::maybe_run_owner_child()
 }
 
 use crate::backend::{BackendInfo, BackendResult, BatchAtomicity, KvBackend, native_error};
@@ -100,9 +132,8 @@ struct Options {
     replay_limits: Option<ReplayLimits>,
     #[serde(default)]
     owner_append_occupancy: Option<usize>,
-    /// Required: leased live NVMe-oF is the only distributed route and the
-    /// local owner-RPC cluster was removed; `parse_options` names its absence.
-    external_remote_config: RemoteDatabaseConfig,
+    /// Kernel route when present; only Linux test-utils admits a local fixture.
+    external_remote_config: Option<RemoteDatabaseConfig>,
     /// Owner acknowledgement tier. Applied inside each owner process and confirmed back by it.
     #[serde(default)]
     durability_tier: DurabilityTier,
@@ -110,6 +141,11 @@ struct Options {
     /// partition order, copied to the coordinator host. Required there; a missing file fails open.
     #[serde(default)]
     external_owner_durability_receipts: Vec<PathBuf>,
+    /// A1 index fixture (benchmark-only; Linux test-utils). Opened
+    /// only through `open_index_fixture`, never by the stock adapter.
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    #[serde(default)]
+    index_fixture: Option<index_fixture::IndexFixtureOptions>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -620,19 +656,16 @@ pub struct TidehunterBackend {
     /// External open timing and engine recovery evidence of this open.
     open_record: crate::index_checkpoint::OpenRecord,
     live_write_profile: std::sync::Mutex<Option<live_write_profile::Window>>,
+    /// A1 index fixture of this stage; `None` on the stock route.
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    index_fixture: Option<index_fixture::FixtureState>,
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    local_owners: Vec<crate::leased_fixture::OwnerChild>,
 }
 
 // External transport, owner identity and payload bounds form one admission boundary.
 #[allow(clippy::too_many_lines)]
 fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
-    // Named before serde reports a bare missing field: the local owner-RPC
-    // cluster (LoopbackCluster) was removed with the owner-RPC data path.
-    if value
-        .get("external_remote_config")
-        .is_none_or(serde_json::Value::is_null)
-    {
-        return Err("tidehunter backends require external_remote_config with live_nvme (leased live NVMe-oF); the local owner-RPC cluster was removed".into());
-    }
     let options = Options::deserialize(value)?;
     let name = backend_name(&options.transport);
     if let Some(limits) = options.batch_limits {
@@ -642,6 +675,10 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
         limits
             .validate()
             .map_err(|error| format!("{name} replay limits: {error}"))?;
+    }
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    if let Some(fixture) = &options.index_fixture {
+        fixture.validate()?;
     }
     if options.owner_append_occupancy.is_some_and(|limit| {
         !(1..=RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY).contains(&limit)
@@ -669,7 +706,18 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
         .transport
         .validate()
         .map_err(|error| format!("{name} transport unavailable: {error}"))?;
-    let config = &options.external_remote_config;
+    let Some(config) = options.external_remote_config.as_ref() else {
+        if cfg!(all(feature = "test-utils", target_os = "linux"))
+            && options.transport == Transport::TcpTrusted
+            && options.external_owner_durability_receipts.is_empty()
+        {
+            return Ok(options);
+        }
+        return Err(format!(
+            "{name} backends require external_remote_config with live_nvme (leased live NVMe-oF); only the Linux test-utils trusted TCP fixture may omit it"
+        )
+        .into());
+    };
     if !options.transport.same_protocol(&config.tls.transport) {
         return Err(format!(
             "{name} requires external_remote_config.tls.transport={}",
@@ -801,13 +849,43 @@ async fn open_with_shape(
     shape: KeyShape,
 ) -> BackendResult<TidehunterBackend> {
     let options = parse_options(value)?;
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    if options.index_fixture.is_some() {
+        return Err("index_fixture opens only through the A1 run configuration path".into());
+    }
     let transport = options.transport;
     let evidence_path = options
         .evidence
         .unwrap_or_else(|| options.path.join("evidence"));
     fs::create_dir_all(&options.path)?;
     fs::create_dir_all(&evidence_path)?;
-    let mut remote_config = options.external_remote_config;
+    let local = options.external_remote_config.is_none();
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    let mut local_owners = Vec::new();
+    let mut remote_config = match options.external_remote_config {
+        Some(config) => config,
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        None => {
+            let (config, children) = open_local_fixture(
+                &options.path,
+                &evidence_path,
+                options.owners,
+                options.durability_tier,
+                options.max_batches_per_partition,
+                options.batch_limits,
+                options.replay_limits,
+            )?;
+            local_owners = children;
+            config
+        }
+        #[cfg(not(all(feature = "test-utils", target_os = "linux")))]
+        None => {
+            return Err(
+                "tidehunter backends require external_remote_config with live_nvme (leased live NVMe-oF)"
+                    .into(),
+            )
+        }
+    };
     if !remote_config.tls.transport.same_protocol(&transport) {
         return Err(format!(
             "{} requires transport {}",
@@ -828,17 +906,23 @@ async fn open_with_shape(
         .iter()
         .map(|endpoint| (endpoint.partition, endpoint.address.clone()))
         .collect();
-    confirm_owner_receipts(
-        &owner_receipts,
-        &remote_config.storage.partitions,
-        &receipt_endpoints,
-        options.durability_tier,
-    )?;
+    if !local {
+        confirm_owner_receipts(
+            &owner_receipts,
+            &remote_config.storage.partitions,
+            &receipt_endpoints,
+            options.durability_tier,
+        )?;
+    }
     let durability_receipt = serde_json::json!({
         "requested_tier": options.durability_tier.as_str(),
         "receipt_durability": options.durability_tier.receipt_durability().as_str(),
         "comparison_cohort": options.durability_tier.comparison_cohort(),
-        "source": "each owner process published a receipt naming its partition, address, process and launch before its ready file",
+        "source": if local {
+            "ordinary-file fixture; provisioned tier verified by the engine"
+        } else {
+            "each owner process published a receipt naming its partition, address, process and launch before its ready file"
+        },
         "owners": owner_receipts,
     });
     if let Some(cache_bytes) = options.coordinator_read_cache_bytes {
@@ -888,7 +972,11 @@ async fn open_with_shape(
         "keyshape_cells_per_mutex": 64,
         "keyshape_total_cells": 1024,
         "owner_storage": "native Tidehunter PartitionLog Value-WAL; not independent Db indexes",
-        "placement": "external topology; placement and physical-device independence are not observed here",
+        "placement": if local {
+            "supervised loopback owner processes on the same host; no NVMe-oF controller or independent device"
+        } else {
+            "external topology; placement and physical-device independence are not observed here"
+        },
         "owner_limits": {
             "batch_max_operations": remote_config.storage.batch_limits.max_operations,
             "batch_max_encoded_bytes": remote_config.storage.batch_limits.max_encoded_bytes,
@@ -978,7 +1066,16 @@ async fn open_with_shape(
         crate::index_checkpoint::OpenKind::Create
     };
     let open_start_ns = tidehunter::distributed::remote_db::diagnostics_clock_ns();
-    let db = sui::Db::open_remote(&coordinator_path, shape, remote_config).map_err(native_error)?;
+    let db = if local {
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        {
+            crate::leased_fixture::open_coordinator(&coordinator_path, shape, remote_config)?
+        }
+        #[cfg(not(all(feature = "test-utils", target_os = "linux")))]
+        return Err("ordinary-file leased fixture is not compiled".into());
+    } else {
+        sui::Db::open_remote(&coordinator_path, shape, remote_config).map_err(native_error)?
+    };
     let open_record = crate::index_checkpoint::OpenRecord {
         kind: open_kind,
         open_start_ns,
@@ -1025,8 +1122,13 @@ async fn open_with_shape(
     effective_configuration["database"] = serde_json::json!(
         tidehunter::distributed::tcp::host::identity::database_hex(&database)
     );
-    effective_configuration["read_backend"] = serde_json::json!("live_nvmeof");
-    effective_configuration["write_backend"] = serde_json::json!("live_nvmeof");
+    let data_backend = if local {
+        "leased_ordinary_file_fixture"
+    } else {
+        "live_nvmeof"
+    };
+    effective_configuration["read_backend"] = serde_json::json!(data_backend);
+    effective_configuration["write_backend"] = serde_json::json!(data_backend);
     effective_configuration["data_route_evidence"] = serde_json::json!({
         "scope": "configured routes only; actual payload transport requires independent live I/O counters",
         "live_route_verified": false
@@ -1051,7 +1153,74 @@ async fn open_with_shape(
         owner_sample_gate: OwnerSampleGate::default(),
         coordinator_interval_baseline: std::sync::Mutex::new(None),
         live_write_profile: std::sync::Mutex::new(None),
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        index_fixture: None,
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        local_owners,
     })
+}
+
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+fn open_local_fixture(
+    path: &Path,
+    evidence: &Path,
+    owner_count: usize,
+    tier: DurabilityTier,
+    max_batches: usize,
+    batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
+    replay_limits: Option<ReplayLimits>,
+) -> BackendResult<(RemoteDatabaseConfig, Vec<crate::leased_fixture::OwnerChild>)> {
+    use crate::leased_fixture::{BenchmarkGeometry, FixtureSpec, OwnerChild, fresh_owners};
+
+    let root = path.join("fixture");
+    let saved = if root.try_exists()? {
+        Some(FixtureSpec::read(&root)?)
+    } else {
+        if path.join("coordinator").try_exists()? {
+            return Err(
+                "cannot reopen a local coordinator without its saved leased fixture".into(),
+            );
+        }
+        None
+    };
+    let addresses = match &saved {
+        Some(saved) if saved.owners.len() == owner_count => saved.owners.clone(),
+        Some(_) => return Err("local leased fixture owner count changed on reopen".into()),
+        None => fresh_owners(u32::try_from(owner_count)?)?,
+    };
+    let mut spec = BenchmarkGeometry {
+        fragment_bytes: NATIVE_FRAGMENT_BYTES,
+        wal_file_bytes: NATIVE_WAL_FILE_BYTES,
+        max_admitted_batches: max_batches,
+        max_index_bytes: 256 * 1024 * 1024,
+        replay_limits,
+    }
+    .spec(root, tier, addresses);
+    if let Some(limits) = batch_limits {
+        spec.batch_limits = limits;
+    }
+    if let Some(saved) = saved.as_ref() {
+        spec.host_id = saved.host_id;
+        if spec != *saved {
+            return Err("local leased fixture configuration changed on reopen".into());
+        }
+    }
+    let config = spec.remote_config()?;
+    if saved.is_none() {
+        spec.create()?;
+    }
+    let evidence = evidence.join(format!("local-owners-{:016x}", rand::random::<u64>()));
+    fs::create_dir(&evidence)?;
+    let mut children = Vec::with_capacity(owner_count);
+    for owner in &spec.owners {
+        children.push(OwnerChild::spawn(
+            &spec,
+            owner.partition,
+            &evidence,
+            &format!("owner-{}", owner.partition),
+        )?);
+    }
+    Ok((config, children))
 }
 
 impl TidehunterBackend {
@@ -1174,6 +1343,24 @@ impl KvBackend for TidehunterBackend {
         Ok(vec![self.index_checkpoint_target("coordinator")?])
     }
 
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    fn index_fixture(&self) -> Option<&crate::index_a1::FixtureRun> {
+        self.index_fixture.as_ref().map(|fixture| &fixture.run)
+    }
+
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    fn finish_index_fixture(
+        &self,
+        finish: &crate::index_a1::FixtureFinish,
+    ) -> BackendResult<serde_json::Value> {
+        let fixture = self
+            .index_fixture
+            .as_ref()
+            .ok_or("not an index-fixture backend")?;
+        let db = self.db.as_ref().ok_or("backend is shutting down")?;
+        fixture.finish(db, self.keyspace, finish)
+    }
+
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     fn evict_mapped_wal_before_measurement(&self) -> BackendResult<serde_json::Value> {
         let db = self.db.as_ref().ok_or("backend is shutting down")?;
@@ -1187,6 +1374,10 @@ impl KvBackend for TidehunterBackend {
 
     fn set_measurement_window(&self, open: bool) {
         self.owner_sample_gate.set_measuring(open);
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        if let (Some(fixture), Some(db)) = (&self.index_fixture, &self.db) {
+            fixture.record_boundary(db, open);
+        }
     }
 
     fn read_observation(&self) -> BackendResult<serde_json::Value> {
@@ -1868,14 +2059,47 @@ impl KvBackend for TidehunterBackend {
     }
 
     async fn shutdown(mut self) -> BackendResult<()> {
+        self.close()
+    }
+}
+
+impl TidehunterBackend {
+    fn close(&mut self) -> BackendResult<()> {
         let mut errors = Vec::new();
         if let Err(error) = self.write_read_evidence() {
             errors.push(format!("read evidence export failed: {error}"));
         }
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        if self
+            .index_fixture
+            .as_ref()
+            .is_some_and(index_fixture::FixtureState::crash_stop)
+            && let Some(db) = self.db.take()
+        {
+            // A1 crash-style coordinator stop: no close and no shutdown root;
+            // the handle stays abandoned until this process exits.
+            std::mem::forget(db);
+        }
+        let mut coordinator_clean = true;
         if let Some(db) = self.db.take()
             && let Err(error) = db.wait_for_background_threads_to_finish()
         {
+            coordinator_clean = false;
             errors.push(format!("coordinator drain failed: {error:?}"));
+        }
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        if let Some(fixture) = self.index_fixture.take()
+            && let Err(error) = fixture.close(coordinator_clean)
+        {
+            errors.push(format!("index fixture close failed: {error}"));
+        }
+        #[cfg(not(all(feature = "test-utils", target_os = "linux")))]
+        let _ = coordinator_clean;
+        #[cfg(all(feature = "test-utils", target_os = "linux"))]
+        for owner in self.local_owners.drain(..) {
+            if let Err(error) = owner.stop() {
+                errors.push(format!("leased fixture owner drain failed: {error}"));
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -1887,19 +2111,10 @@ impl KvBackend for TidehunterBackend {
 
 impl Drop for TidehunterBackend {
     fn drop(&mut self) {
-        let mut errors = Vec::new();
-        if let Err(error) = self.write_read_evidence() {
-            errors.push(format!("read evidence export failed: {error}"));
-        }
-        if let Some(db) = self.db.take()
-            && let Err(error) = db.wait_for_background_threads_to_finish()
-        {
-            errors.push(format!("coordinator drain failed: {error:?}"));
-        }
-        if !errors.is_empty() {
+        if let Err(error) = self.close() {
             let _ = fs::write(
                 self.evidence_path.join("lifecycle-errors.txt"),
-                errors.join("\n"),
+                error.to_string(),
             );
         }
     }

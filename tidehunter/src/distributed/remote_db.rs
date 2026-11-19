@@ -2455,8 +2455,8 @@ impl RemoteDatabase {
     }
     pub fn storage_stats(&self) -> Result<PartitionStats, LocalDbError> {
         let mut total = PartitionStats::default();
-        for client in &self.core.clients {
-            let stats = receive(client.stats()?)?;
+        for owner in self.owner_storage_stats() {
+            let (_, stats) = owner?;
             total.appended_groups += stats.appended_groups;
             total.persistence_barriers += stats.persistence_barriers;
             total.namespace_syncs += stats.namespace_syncs;
@@ -2474,6 +2474,22 @@ impl RemoteDatabase {
             total.reference_metadata_bytes += stats.reference_metadata_bytes;
         }
         Ok(total)
+    }
+
+    /// Owner persistence counters of each owner, in endpoint order.
+    pub fn storage_stats_by_partition(&self) -> Result<Vec<(u32, PartitionStats)>, LocalDbError> {
+        self.owner_storage_stats().collect()
+    }
+
+    fn owner_storage_stats(
+        &self,
+    ) -> impl Iterator<Item = Result<(u32, PartitionStats), LocalDbError>> + '_ {
+        self.core
+            .config
+            .endpoints
+            .iter()
+            .zip(&self.core.clients)
+            .map(|(endpoint, client)| Ok((endpoint.partition, receive(client.stats()?)?)))
     }
     pub fn shutdown(&self) -> Result<(), LocalDbError> {
         self.core.shutdown()

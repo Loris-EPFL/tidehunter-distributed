@@ -254,7 +254,11 @@ establish a hardware data path. Software OFI correctness does not qualify
 hardware or performance. Exercised local checks and explicit hardware limits
 are recorded in the [27 October fabric qualification](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026).
 
-Every distributed adapter requires `external_remote_config` with `live_nvme`.
+Distributed adapters require `external_remote_config` with `live_nvme`, except
+on Linux builds with `test-utils`: `tidehunter_tcp_trusted` can omit it to
+launch supervised loopback OwnerHosts on ordinary files. Reopening reuses
+the saved fixture endpoints and rejects changed fixture settings. This route
+does not qualify kernel NVMe-oF or a fleet run.
 The owner launch describes an `OwnerHost` and has no database ID, shape or WAL
 geometry. The coordinator supplies those on first open. Subsequent opens of
 the same authority recover its provisioned identity; dropping it removes
@@ -464,22 +468,17 @@ barrier. It syncs the same registered Value-WAL files and directory. A failed sy
 all waiters and later calls; there is no retry. This is an adapter change, not an engine
 change. See `NATIVE.md` for group-size metrics and the limits of this comparison.
 
-The tier is applied inside each owner process: the launch file carries `durability` (omitted
-means `native`; fields `tier`, optional `max_unsynced_age_ms`) and a fresh `launch_nonce`. The
-process calls `StorageNode::set_durability` before it listens, then writes a receipt to
-`<ready_file>.durability.json` (temporary file, fsync, rename, directory fsync) before the ready
-file. The receipt names the owner (`partition`, `database`, bound `address`), the process (`pid`,
-`boot_id`, `started_unix_ns`), the launch (`launch_nonce`) and its `durability` with an explicit
-`tier` and `max_unsynced_age_ms` (`null` allowed, absent rejected); an incomplete receipt is never
-read as native. A local cluster checks each receipt against its launch and request after every
-start and restart. An external topology (`external_remote_config`) lists one receipt file per
-owner in `external_owner_durability_receipts`; the adapter pairs a receipt with a partition by the
-partition it names, and accepts it only if its database, endpoint address, nonce (non-empty) and
-tier match, so one receipt cannot confirm several partitions. After an owner restart the
-orchestrator replaces each copy with the restarted process's own later receipt. A missing list,
-file or mismatch fails the open. `prepare` input accepts `durability_tier`. The adapter receipt
-`configuration.durability` lists every owner receipt, the receipt label (`appended` for `native`,
-`synced` for `synchronous`) and the comparison cohort.
+For external topology, the OwnerHost launch carries the tier and a fresh `launch_nonce`.
+The owner publishes `<ready_file>.durability.json` before readiness. It names the
+partition, bound address, process (`pid`, `boot_id`, `started_unix_ns`), launch
+nonce and durability policy. It does not name a database: the coordinator
+provisions the database and verifies its tier on open.
+`external_owner_durability_receipts` must provide one startup receipt per
+partition with the matching endpoint and tier. Replace the receipt whenever an
+owner process restarts. A missing list, unreadable file or mismatch fails open.
+The adapter records the tier and comparison cohort in `configuration.durability`.
+The ordinary-file route instead keeps its fixture startup and shutdown records
+under the case evidence directory; those records are not kernel qualification.
 
 ## Measurement gate for external cold-state capture
 

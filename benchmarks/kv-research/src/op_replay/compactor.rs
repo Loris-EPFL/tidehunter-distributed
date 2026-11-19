@@ -32,9 +32,10 @@
 //! `disable_unload` or a value cache would need the compactor-invariant view
 //! on the native arm instead.
 
-use super::arm::{self, Arm, Kind, LeasedOwner};
+use super::arm::{self, Arm, Kind};
 use super::trace::OpenSpec;
 use crate::backend::BackendResult;
+use crate::leased_fixture::LeasedOwner;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;

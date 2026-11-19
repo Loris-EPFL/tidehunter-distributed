@@ -1,27 +1,26 @@
 //! The two replay arms behind one adapter: native `sui::Db::open_native`, and
-//! leased `sui::Db::open_remote_with_local_live_fixture` with one in-process
-//! owner (rootless ordinary-file live I/O). Both arms receive the recorded key
-//! shape with replay relocation filters attached.
+//! leased on the shared leased fixture route (`crate::leased_fixture`) with
+//! one in-process owner (rootless ordinary-file live I/O). Both arms receive
+//! the recorded key shape with replay relocation filters attached.
 
 use super::trace::{FilterDecision, OpenSpec};
 use super::{RowHasher, sha256};
 use crate::backend::BackendResult;
 use crate::backends::replay::ReplayBackend;
+use crate::leased_fixture::{
+    CoordinatorSpec, FixtureSpec, LeasedOwner, LiveSpec, fresh_host_id, fresh_owners,
+};
 use crate::mainnet_trace::Row;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::JoinHandle;
 use tidehunter::config::Config;
+use tidehunter::distributed::codec::BatchLimits;
 use tidehunter::distributed::durability::DurabilityTier;
-use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
+use tidehunter::distributed::group::GroupLimits;
+use tidehunter::distributed::native_index::CompactorCadence;
 use tidehunter::distributed::sui;
-use tidehunter::distributed::tcp::{
-    LiveTargetPool, OwnerHost, OwnerHostConfig, TcpError, TcpLimits, TlsFiles, Transport,
-};
 use tidehunter::key_shape::{
     Compactor, KeyIndexing, KeyShape, KeyShapeBuilder, KeySpace, KeySpaceConfig, KeyType,
 };
@@ -250,141 +249,60 @@ const PAGE: usize = 4096;
 const MAX_BATCH_OPERATIONS: u32 = 16_384;
 const MAX_PENDING_BYTES: usize = 64 * MIB;
 
-/// One in-process owner host serving leased databases over trusted loopback TCP.
-pub(super) struct LeasedOwner {
-    stop: Arc<AtomicBool>,
-    server: Option<JoinHandle<Result<(), TcpError>>>,
-    config: RemoteDatabaseConfig,
-    pub tier: DurabilityTier,
-}
-
-impl LeasedOwner {
-    /// One owner with the recorded native WAL geometry: owner fragment and file
-    /// sizes equal the native `frag_size` and `wal_file_size`.
-    pub(super) fn start(dir: &Path, native: &Config, tier: DurabilityTier) -> BackendResult<Self> {
-        let fragment = usize::try_from(native.frag_size)?;
-        if !fragment.is_multiple_of(PAGE) || !native.wal_file_size.is_multiple_of(native.frag_size)
-        {
-            return Err(format!(
-                "leased owner cannot use native geometry frag_size={} wal_file_size={}: fragments must be 4 KiB multiples and divide the file",
-                native.frag_size, native.wal_file_size
-            )
-            .into());
-        }
-        // One live write frame (group + 8, page aligned) must fit one fragment;
-        // a batch member (batch + 8, 8-byte aligned) must fit the group.
-        let frame = fragment.min(16 * MIB - PAGE);
-        let group = frame - 8;
-        let batch = frame - 40;
-        let tls = TlsFiles {
-            transport: Transport::TcpTrusted,
-            ca: PathBuf::new(),
-            cert: PathBuf::new(),
-            key: PathBuf::new(),
-            server_name: "op-replay".into(),
-        };
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let host_id: [u8; 16] = rand::random();
-        let tier_name = match tier {
-            DurabilityTier::Native => "native",
-            DurabilityTier::Synchronous => "synchronous",
-        };
-        let mut config: RemoteDatabaseConfig = serde_json::from_value(serde_json::json!({
-            "storage": {"partitions": [0],
-                "batch_limits": {"max_operations": MAX_BATCH_OPERATIONS, "max_encoded_bytes": batch},
-                "group_limits": {"max_batches": 32, "max_encoded_bytes": group},
-                "fragment_bytes": native.frag_size, "wal_file_bytes": native.wal_file_size,
-                "max_batches_per_partition": 8192, "max_reference_metadata_bytes": 64 * MIB},
-            "endpoints": [{"partition": 0, "address": listener.local_addr()?.to_string(),
-                "server_name": "op-replay"}],
-            "tls": tls, "timeout": {"secs": 60, "nanos": 0},
-            "max_admitted_batches": 8192, "max_index_bytes": 256 * MIB,
-            "max_pending_batches": 64, "max_pending_bytes": MAX_PENDING_BYTES,
-            "owner_append_occupancy": 16, "read_cache_bytes": 0,
-            "read_memory_allowance_bytes": 256 * MIB, "read_lanes": 2,
-            "max_pending_reads": 64, "max_pending_read_bytes": 16 * MIB,
-            "live_nvme": {"host_nqn": "nqn.2026-11.test:op-replay", "host_id": host_id,
-                "max_inflight_requests": 16, "max_inflight_bytes": 2 * frame + 4 * PAGE,
-                "connect_timeout_ms": 10_000, "io_timeout_ms": 60_000,
-                "leased_durability": tier_name},
-        }))?;
-        // Compactor cadence of callback keyspaces from the same native
-        // configuration (COMPACTOR-PARITY.md §2.1).
-        config.compactor_cadence =
-            tidehunter::distributed::native_index::CompactorCadence::from_native(native);
-        let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
-        let configfs = dir.join("configfs");
-        for name in ["hosts", "ports", "subsystems"] {
-            std::fs::create_dir_all(configfs.join(name))?;
-        }
-        let host = OwnerHost::open_with_live_fixture(
-            OwnerHostConfig {
-                root: dir.join("owner"),
-                max_databases: 1,
-                trusted_coordinator_id: Some([1; 32]),
-                live_target_pool: LiveTargetPool {
-                    address: "127.0.0.1".into(),
-                    transport: tidehunter::distributed::nvmeof::NvmeofTransport::Tcp,
-                    public_port_base: 42,
-                    public_service_base: 4420,
-                    commissioning_port_base: 43,
-                    commissioning_service_base: 4421,
-                },
-                wal_member_read: Default::default(),
-                wal_prewrite: false,
-                read_max_device_reads: 64,
-                durability: Default::default(),
-            },
-            metrics,
-            configfs,
-        )?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let serving = host;
-        let stopping = Arc::clone(&stop);
-        let server = std::thread::Builder::new()
-            .name("op-replay-owner".into())
-            .spawn(move || serving.serve(listener, tls, TcpLimits::default(), stopping))?;
-        Ok(Self {
-            stop,
-            server: Some(server),
-            config,
-            tier,
-        })
+/// One in-process owner host on the shared leased fixture route with the
+/// recorded native WAL geometry: owner fragment and file sizes equal the
+/// native `frag_size` and `wal_file_size`.
+pub(super) fn leased_owner(
+    dir: &Path,
+    native: &Config,
+    tier: DurabilityTier,
+) -> BackendResult<LeasedOwner> {
+    let fragment = usize::try_from(native.frag_size)?;
+    if !fragment.is_multiple_of(PAGE) || !native.wal_file_size.is_multiple_of(native.frag_size) {
+        return Err(format!(
+            "leased owner cannot use native geometry frag_size={} wal_file_size={}: fragments must be 4 KiB multiples and divide the file",
+            native.frag_size, native.wal_file_size
+        )
+        .into());
     }
-
-    fn open(&self, path: &Path, shape: KeyShape) -> BackendResult<Arc<sui::Db>> {
-        // Buffered ordinary-file backing, as the kernel target's file backing.
-        engine(sui::Db::open_remote_with_local_live_fixture(
-            path,
-            shape,
-            self.config.clone(),
-            true,
-        ))
-    }
-
-    /// Stop serving and return the server's exit status.
-    pub(super) fn stop(mut self) -> BackendResult<()> {
-        self.halt()
-    }
-
-    fn halt(&mut self) -> BackendResult<()> {
-        // Release pairs with the owner service's shutdown check.
-        self.stop.store(true, Ordering::Release);
-        let Some(server) = self.server.take() else {
-            return Ok(());
-        };
-        match server.join() {
-            Ok(result) => result.map_err(Into::into),
-            Err(_) => Err("owner server thread panicked".into()),
-        }
-    }
-}
-
-impl Drop for LeasedOwner {
-    fn drop(&mut self) {
-        // Join before the caller removes the owner's directory; `stop` reports errors.
-        let _ = self.halt();
-    }
+    // One live write frame (group + 8, page aligned) must fit one fragment;
+    // a batch member (batch + 8, 8-byte aligned) must fit the group.
+    let frame = fragment.min(16 * MIB - PAGE);
+    let spec = FixtureSpec {
+        root: dir.to_path_buf(),
+        host_id: fresh_host_id(),
+        owners: fresh_owners(1)?,
+        tier,
+        host_nqn: "nqn.2026-11.test:op-replay".into(),
+        fragment_bytes: native.frag_size,
+        wal_file_bytes: native.wal_file_size,
+        batch_limits: BatchLimits {
+            max_operations: MAX_BATCH_OPERATIONS,
+            max_encoded_bytes: frame - 40,
+        },
+        group_limits: GroupLimits {
+            max_batches: 32,
+            max_encoded_bytes: frame - 8,
+        },
+        max_batches_per_partition: 8192,
+        max_reference_metadata_bytes: 64 * MIB,
+        coordinator: CoordinatorSpec {
+            timeout_secs: 60,
+            max_admitted_batches: 8192,
+            max_index_bytes: 256 * MIB,
+            max_pending_batches: 64,
+            max_pending_bytes: MAX_PENDING_BYTES,
+            read_memory_allowance_bytes: 256 * MIB,
+            index_shards: None,
+            replay_limits: None,
+        },
+        live: LiveSpec {
+            write_window: None,
+            per_frame_fua: false,
+        },
+    };
+    // Callback keyspaces use the same compactor cadence as the recorded native arm.
+    LeasedOwner::start(&spec, CompactorCadence::from_native(native))
 }
 
 /// One arm's open database and its filter decisions.
@@ -470,7 +388,7 @@ impl Arm {
                         .path
                         .parent()
                         .ok_or("leased coordinator path has no parent")?;
-                    *owner = Some(LeasedOwner::start(dir, &config, tier)?);
+                    *owner = Some(leased_owner(dir, &config, tier)?);
                 }
                 let owner = owner.as_ref().ok_or("leased owner missing")?;
                 if owner.tier != tier {
@@ -499,6 +417,7 @@ impl Arm {
     /// Native: the recorder's driver, the blocking native `WalBased` worker; the
     /// pass ran only if it published a new nonnegative terminal position.
     /// Leased: wait for one named pass before taking its callback evidence.
+    /// This is a logical comparison, not a comparison of physical offsets.
     pub(super) fn relocate(&self, records: &[FilterDecision]) -> BackendResult<FilterEvidence> {
         let db = self.db()?;
         self.decisions
@@ -620,7 +539,7 @@ pub(super) fn key_set(db: &Arc<sui::Db>) -> BackendResult<KeySet> {
             let key = engine(row)?.0.to_vec();
             if let Some((_, key)) = keys.replace((id, key)) {
                 return Err(
-                    format!("keyspace {id}: iterator returned key {} twice", hex(&key)).into(),
+                    format!("keyspace {} key {} returned twice", desc.name(), hex(&key)).into(),
                 );
             }
         }
