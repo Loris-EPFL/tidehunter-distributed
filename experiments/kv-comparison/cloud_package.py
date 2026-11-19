@@ -727,6 +727,7 @@ def _stage_case_binaries(output, packages, seals):
     q0_campaign.validate_binaries(seals)
     if not isinstance(packages, dict) or set(packages) != set(seals) - {"land4"}:
         raise ValueError("Q0 requires an exact alternate package set")
+    staged = set()
     for role, source in packages.items():
         source = Path(source)
         verified = verify_directory(source)
@@ -736,10 +737,13 @@ def _stage_case_binaries(output, packages, seals):
                 or manifest["revision"] != seal["revision"] or verified["binary_sha256"] != seal["sha256"]
                 or manifest["dirty"] is not (role == "baseline_ab")):
             raise ValueError(f"case package does not bind the Q0 seal for {role}")
+        if seal["sha256"] in staged:
+            continue
         target = case_binary_path(output, seal["sha256"])
         target.parent.mkdir(parents=True, exist_ok=False)
         shutil.copyfile(source / "runtime/bin/kv-research", target)
         target.chmod(0o755)
+        staged.add(seal["sha256"])
 
 
 def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None, spdk_prefix=None, nvmet_fix_prefix=None,

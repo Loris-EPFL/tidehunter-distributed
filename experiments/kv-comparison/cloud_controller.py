@@ -177,6 +177,8 @@ def owner_host_index(config, job, index):
 
 
 def controller_matrix(spec):
+    if spec.get("selection") == q0_campaign.SELECTION:
+        return cloud_campaign.q0_matrix(spec)
     if spec.get("mode") == "focused":
         jobs = cloud_campaign.make_focused_matrix(spec["selection"])
         if spec["selection"] in cloud_campaign.M3_SELECTIONS and "owner_hosts" in spec:

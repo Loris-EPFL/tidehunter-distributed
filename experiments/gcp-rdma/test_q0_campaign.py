@@ -73,6 +73,72 @@ class SelectionTests(unittest.TestCase):
         value['land4']['instrumentation_patch_sha256'] = 'b' * 64
         with self.assertRaisesRegex(ValueError, 'reviewed instrumentation'):
             manual.q0_spec(value)
+        value = seals()
+        value['land4']['sha256'] = value['baseline_ab']['sha256']
+        with self.assertRaisesRegex(ValueError, 'across an instrumented A/B role'):
+            manual.q0_spec(value)
+
+    def test_byte_identical_history_runs_once_per_repeat(self):
+        alias = q0.BISECT_REVISIONS[-2]
+        binaries = seals()
+        binaries[alias]['sha256'] = binaries[q0.BASELINE]['sha256']
+        spec = manual.q0_spec(binaries)
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual(jobs, controller.controller_matrix(spec))
+        self.assertEqual(spec['bisect_revisions'][q0.BASELINE], [q0.BASELINE, alias])
+        self.assertEqual(sum(j['binary_role'] == q0.BASELINE for j in jobs), q0.REPEATS)
+        self.assertNotIn(alias, {j['binary_role'] for j in jobs})
+        self.assertEqual(len(jobs), 57)
+        for repeat in range(q0.REPEATS):
+            probe_digests = [binaries[j['binary_role']]['sha256'] for j in jobs
+                             if j['repeat'] == repeat and j['arm'] == 'bisect']
+            self.assertEqual(len(probe_digests), 11)
+            self.assertEqual(len(set(probe_digests)), 11)
+        quote = manual.q0_quote(spec)
+        self.assertEqual((quote['model_seconds'], quote['guard_slack_seconds'], quote['ceiling_cents']),
+                         (11100, 2700, 4834))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cloud_package.dump(root / 'matrix.json', {'spec': spec, 'jobs': jobs})
+            report = cloud_campaign.report(root)
+        self.assertEqual(report['bisect_revisions'][q0.BASELINE], [q0.BASELINE, alias])
+        self.assertEqual(sum(case.get('bisect_revisions') == [q0.BASELINE, alias]
+                             for case in report['cases']), q0.REPEATS)
+        spec['bisect_revisions'][q0.BASELINE].remove(alias)
+        with self.assertRaisesRegex(ValueError, 'revision attribution'):
+            controller.controller_matrix(spec)
+
+    def test_packaging_verifies_both_sources_but_installs_shared_bytes_once(self):
+        alias = q0.BISECT_REVISIONS[-2]
+        binaries = seals()
+        binaries[alias]['sha256'] = binaries[q0.BASELINE]['sha256']
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            packages = {}
+            for role, seal in binaries.items():
+                if role == 'land4':
+                    continue
+                package = root / role
+                binary = package / 'runtime/bin/kv-research'
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes((q0.BASELINE if role == alias else role).encode())
+                cloud_package.dump(package / 'manifest.json', {
+                    'revision': seal['revision'], 'dirty': role == 'baseline_ab',
+                })
+                packages[role] = package
+
+            def verify(package):
+                identity = cloud_package.identity(package / 'runtime/bin/kv-research')
+                return {'build_profile': 'focused', 'binary_sha256': identity['sha256']}
+
+            output = root / 'stage'
+            with patch.object(cloud_package, 'verify_directory', side_effect=verify) as verified:
+                cloud_package._stage_case_binaries(output, packages, binaries)
+            self.assertCountEqual([call.args[0] for call in verified.call_args_list], packages.values())
+            paths = list((output / 'runtime/case-binaries').glob('*/kv-research'))
+            self.assertEqual(len(paths), 12)
+            shared = cloud_package.case_binary_path(output, binaries[alias]['sha256'])
+            self.assertEqual(shared.read_bytes(), q0.BASELINE.encode())
 
     def test_rejects_generated_matrix_drift(self):
         spec = manual.q0_spec(seals())

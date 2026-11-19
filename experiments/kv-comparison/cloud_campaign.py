@@ -244,6 +244,8 @@ def make_matrix(spec, *, _allow_live_nvme=False):
     if spec.get("mode") == "focused":
         if spec.get("direct_control_arm") is not True:
             raise ValueError("focused campaign requires the reviewed direct control arm")
+        if spec.get("selection") == Q0_SELECTION:
+            return q0_matrix(spec)
         return make_focused_matrix(spec.get("selection"))
     jobs = _make_matrix(spec, _allow_live_nvme=_allow_live_nvme)
     spec_tier = spec.get("durability_tier", DEFAULT_DURABILITY_TIER)
@@ -2502,6 +2504,16 @@ def _valkey_rdma_reads():
                            live_io_queues=queues, live_io_queue_size=depth,
                            live_max_inflight_requests=128)
     return result
+
+
+def q0_matrix(spec):
+    """Verify and return the actual ordered Q0 cases, not the unbound template."""
+    jobs, attribution = q0_campaign.select_cases(make_focused_matrix(Q0_SELECTION), spec.get("case_binaries"))
+    digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if (spec.get("bisect_revisions") != attribution or spec.get("job_count") != len(jobs)
+            or spec.get("matrix_sha256") != digest):
+        raise ValueError("Q0 selected cases or revision attribution differ from the bound matrix")
+    return jobs
 
 
 def make_focused_matrix(selection):
@@ -4897,8 +4909,7 @@ def report(root):
     q0_seals = None
     if q0_spec.get("selection") == Q0_SELECTION:
         q0_seals = q0_spec["case_binaries"]
-        q0_campaign.validate_binaries(q0_seals)
-        if planned["jobs"] != make_focused_matrix(Q0_SELECTION):
+        if planned["jobs"] != q0_matrix(q0_spec):
             raise ValueError("Q0 result matrix differs from the reviewed workload")
     results = []
     focused_ids = set()
@@ -4927,6 +4938,11 @@ def report(root):
                                          "; report admission: " + type(exc).__name__ + ": " + str(exc)})
         else:
             results.append({"case_id": job["case_id"], "job": job, "status": "not_run"})
+    if q0_seals is not None:
+        for row in results:
+            role = row["job"]["binary_role"]
+            if role not in q0_campaign.AB_ROLES:
+                row["bisect_revisions"] = q0_spec["bisect_revisions"][role]
     baselines = {}
     for row in results:
         job = row["job"]
@@ -4961,6 +4977,11 @@ def report(root):
             "TideHunter native owner acknowledgement is a page-cache write with background fsync; compare only to a matching page-cache acknowledgement contract.",
             "Valkey GET is memory-resident even after OS-cache eviction; AOF is write acknowledgment, not a value-WAL-backed read. Synced uses appendfsync always; periodic_sync uses everysec; os_buffered uses no. Neither relaxed mode proves a per-case page-cache write; Valkey page_cache is unsupported.",
             "No Sui checkpoint/application or sustainable infinite-aging claim."]}
+    if q0_seals is not None:
+        value["bisect_revisions"] = q0_spec["bisect_revisions"]
+        value["interpretation"].append(
+            "Q0 runs each distinct historical executable once per repeat. "
+            "Every revision listed for a bisect row shares that measurement, not an independent sample.")
     if focused_ids:
         value["focused_coverage"] = {
             field: {name: sum(job.get(field) == name for job in planned["jobs"])
@@ -4976,6 +4997,11 @@ def report(root):
              "Raw per-operation API, response and scheduling latency are preserved; failed/rejected arrivals remain in denominators.", "",
              repetition_note, "Timing standard deviations describe within-case populations, not run-to-run variability.", "",
              "| Case/status | Backend | Value B | Cohort | Operation/outcome | N | Case calls/s | API mean µs | API p50 µs | API p95 µs | API p99 µs | Response p99 µs |", "|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+    if q0_seals is not None:
+        shared = [revisions for revisions in value["bisect_revisions"].values() if len(revisions) > 1]
+        lines[2:2] = [value["interpretation"][-1], *(
+            "Shared executable: " + ", ".join(f"`{revision}`" for revision in revisions)
+            for revisions in shared), ""]
     if "trace_capability" in value:
         capability = value["trace_capability"]
         lines[2:2] = [f"Request-identity tracing attached and stopped on all hosts: {capability.get('identity_backend_available')}.",

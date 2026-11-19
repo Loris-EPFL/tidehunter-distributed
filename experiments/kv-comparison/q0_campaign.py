@@ -41,7 +41,7 @@ ARCHIVE_LIMIT_BYTES = 16_000_000_000
 def validate_binaries(binaries):
     if not isinstance(binaries, dict) or set(binaries) != set(ROLES):
         raise ValueError("Q0 requires every selected binary role and no others")
-    digests = set()
+    digests = {}
     for role, seal in binaries.items():
         instrumented = role in AB_ROLES
         fields = {"revision", "sha256"} | ({"instrumentation_patch_sha256"} if instrumented else set())
@@ -53,9 +53,10 @@ def validate_binaries(binaries):
         expected = BASELINE if role == "baseline_ab" else role
         if role == "land4" and seal["revision"] in CANDIDATES or role != "land4" and seal["revision"] != expected:
             raise ValueError(f"Q0 incorrect source revision for {role}")
-        if seal["sha256"] in digests:
-            raise ValueError(f"Q0 reused a sealed executable in {role}")
-        digests.add(seal["sha256"])
+        previous = digests.get(seal["sha256"])
+        if previous is not None and (instrumented or previous in AB_ROLES):
+            raise ValueError(f"Q0 reused an executable across an instrumented A/B role: {previous}, {role}")
+        digests[seal["sha256"]] = role
     if any(binaries[role]["instrumentation_patch_sha256"] != COUNTER_PATCH_SHA256 for role in AB_ROLES):
         raise ValueError("Q0 A/B requires the reviewed instrumentation patch")
 
@@ -71,6 +72,17 @@ def probe_order():
             result.append(BISECT_REVISIONS[mid])
             pending.extend(((lo, mid), (mid, hi)))
     return (result[0], F1, BASELINE, *result[1:])
+
+
+def select_cases(jobs, binaries):
+    """Run each exact historical ELF once per repeat, preferring endpoint labels."""
+    validate_binaries(binaries)
+    groups = {}
+    for revision in (F1, BASELINE, *BISECT_REVISIONS[1:-1]):
+        groups.setdefault(binaries[revision]["sha256"], []).append(revision)
+    attribution = {revisions[0]: revisions for revisions in groups.values()}
+    selected = [job for job in jobs if job["binary_role"] in AB_ROLES or job["binary_role"] in attribution]
+    return selected, attribution
 
 
 def jobs(p13_jobs, clone):

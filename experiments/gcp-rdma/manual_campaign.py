@@ -405,9 +405,15 @@ def reviewed_window_spec(spec):
 
 def q0_spec(case_binaries):
     """Bind the fixed workload to the exact sealed binaries for this fleet."""
-    q0_campaign.validate_binaries(case_binaries)
-    return {**copy.deepcopy(REVIEWED_SPECS[q0_campaign.SELECTION]),
-            'case_binaries': copy.deepcopy(case_binaries)}
+    selection = q0_campaign.SELECTION
+    template = copy.deepcopy(REVIEWED_SPECS[selection])
+    jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
+    if len(jobs) != template['job_count'] or _digest(_json(jobs)) != template['matrix_sha256']:
+        raise ValueError('Q0 workload differs from the reviewed matrix')
+    selected, attribution = q0_campaign.select_cases(jobs, case_binaries)
+    return {**template, 'case_binaries': copy.deepcopy(case_binaries),
+            'bisect_revisions': attribution, 'job_count': len(selected),
+            'max_cases': len(selected), 'matrix_sha256': _digest(_json(selected))}
 
 
 def q0_quote(spec):
@@ -440,10 +446,7 @@ def _reviewed_jobs(spec):
     if isinstance(spec, dict) and spec.get('selection') == q0_campaign.SELECTION:
         if _json(spec) != _json(q0_spec(spec.get('case_binaries'))):
             raise ValueError('an exact reviewed Q0 specification is required')
-        jobs = workflow_input.cloud_campaign.make_focused_matrix(q0_campaign.SELECTION)
-        if len(jobs) != spec['job_count'] or _digest(_json(jobs)) != spec['matrix_sha256']:
-            raise ValueError('Q0 workload differs from the reviewed matrix')
-        return jobs
+        return workflow_input.cloud_campaign.q0_matrix(spec)
     # P13 and P16 pin the reservation as part of their exact reviews;
     # historical selections retain the legacy variable-window normalization.
     if not isinstance(spec, dict) or spec.get("selection") not in (
@@ -613,9 +616,13 @@ def _qualify_observer(package_dir, spec):
     if result.returncode:
         raise ValueError('frozen observer matrix qualification failed: ' + result.stderr.strip())
     proof = json.loads(result.stdout)
-    jobs = (workflow_input.cloud_campaign.make_focused_matrix(spec['selection'])
-            if spec.get('mode') == 'focused'
-            else workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k not in ('suite', 'reservation_hours')}))
+    if spec.get('selection') == q0_campaign.SELECTION:
+        jobs = _reviewed_jobs(spec)
+    else:
+        jobs = (workflow_input.cloud_campaign.make_focused_matrix(spec['selection'])
+                if spec.get('mode') == 'focused'
+                else workflow_input.cloud_campaign.make_matrix(
+                    {k: v for k, v in spec.items() if k not in ('suite', 'reservation_hours')}))
     if spec.get('selection') in workflow_input.cloud_campaign.M3_SELECTIONS:
         jobs = [job for job in jobs if workflow_input.cloud_campaign.job_owner_hosts(job) == spec['owner_hosts']]
     digest = hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

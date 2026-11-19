@@ -455,7 +455,9 @@ def validate_controller_config(config):
     if runtime['spec'].get('mode') == 'focused':
         if json.dumps(config['spec'], sort_keys=True) != json.dumps(_controller_spec(runtime['spec']), sort_keys=True):
             raise RuntimeSafetyError('focused controller spec differs from reviewed runtime')
-        jobs = cloud_campaign.make_focused_matrix(runtime['spec']['selection'])
+        jobs = (cloud_controller.controller_matrix(config['spec'])
+                if runtime['spec']['selection'] == cloud_campaign.Q0_SELECTION
+                else cloud_campaign.make_focused_matrix(runtime['spec']['selection']))
     else:
         jobs = cloud_campaign.make_matrix(config['spec'])
     cloud_controller.validate_read_tier_memory(jobs, config['fleet'])
