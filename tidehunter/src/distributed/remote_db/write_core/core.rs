@@ -32,6 +32,7 @@ pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub stream_last: &'a mut BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: &'a mut BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: &'a mut BTreeSet<(u32, u64)>,
+    pub committed_streams: &'a mut BTreeSet<(u32, u64)>,
     pub recent: &'a mut VecDeque<RecentReceipt>,
     pub latest: &'a mut Option<MutationVersion>,
     pub live_latest: &'a mut Option<MutationVersion>,
@@ -56,6 +57,10 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     pub stream_last: BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: BTreeSet<(u32, u64)>,
+    /// Every stream the committed root names in its positions, complete or
+    /// not. A generation trim adopts a replacement root only when the root
+    /// names the trimmed stream or the stream produced it (L1).
+    pub committed_streams: BTreeSet<(u32, u64)>,
     pub recent: VecDeque<RecentReceipt>,
     pub latest: Option<MutationVersion>,
     pub live_latest: Option<MutationVersion>,
@@ -85,6 +90,7 @@ impl PublisherState {
             stream_last: &mut self.stream_last,
             positions: &mut self.positions,
             committed_complete: &mut self.committed_complete,
+            committed_streams: &mut self.committed_streams,
             recent: &mut self.recent,
             latest: &mut self.latest,
             live_latest: &mut self.live_latest,
@@ -148,7 +154,6 @@ pub(in crate::distributed::remote_db) struct OpenState {
     pub write_profile: Arc<Mutex<WriteProfileSnapshot>>,
     pub write_timeline: Arc<WriteTimeline>,
     pub clients: Vec<super::super::ClientWorker>,
-    pub durable_cut: Option<super::super::durable_cut::DurableCut>,
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     pub publisher: PublisherState,
@@ -208,8 +213,10 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub stopped: AtomicBool,
     pub closing: AtomicBool,
     pub clients: Vec<super::super::ClientWorker>,
-    /// Present when this epoch is tracked under durable-prefix recovery.
-    pub durable_cut: Option<super::super::durable_cut::DurableCut>,
+    /// Set when this epoch is tracked under durable-prefix recovery. Open
+    /// attaches it after offline fencing-generation maintenance, before the
+    /// handle is returned and before any write can be admitted.
+    pub durable_cut: OnceLock<super::super::durable_cut::DurableCut>,
     pub live_pool: Option<Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>>,
     pub live_metrics: Option<Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>>,
     #[cfg(test)]
@@ -283,7 +290,7 @@ impl WriteCore {
             closing: AtomicBool::new(false),
             owner_controls,
             clients: open.clients,
-            durable_cut: open.durable_cut,
+            durable_cut: OnceLock::new(),
             live_pool: open.live_pool,
             live_metrics: open.live_metrics,
             #[cfg(test)]

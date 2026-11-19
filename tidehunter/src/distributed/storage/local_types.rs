@@ -8,8 +8,9 @@ use crate::distributed::types::{BatchVersion, MutationVersion};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Static placement, bounded resident authority windows and fenced epoch limits.
+/// Static placement and bounded resident authority windows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalInventoryConfig {
     pub database: [u8; 16],
     pub partitions: Vec<u32>,
@@ -21,10 +22,6 @@ pub struct LocalInventoryConfig {
     pub max_batches_per_partition: usize,
     /// Includes cold-authority cache and metadata pinned through read completion.
     pub max_reference_metadata_bytes: usize,
-    /// Includes interrupted preparation epochs. No epoch/identity history is
-    /// evicted to make room: reaching this limit requires an explicit lifecycle
-    /// extension, not silently recycling a directory or logical version.
-    pub max_epochs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

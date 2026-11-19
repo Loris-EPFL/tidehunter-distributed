@@ -29,7 +29,7 @@ pub(super) enum InlineExport {
     Resolve,
     Replay,
 }
-#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum EpochState {
     Preparing,
     Active,
@@ -41,14 +41,20 @@ struct Epoch {
     epoch: u64,
     state: EpochState,
 }
+/// Owner fencing ledger (format `generations::FORMAT`). Retained entries can
+/// be trimmed; `highest_fenced_generation` never decreases and is the only
+/// source of the stale-fence check.
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     format: u32,
     partition: PartitionConfig,
     shape_yaml: String,
-    max_epochs: usize,
+    highest_fenced_generation: u64,
+    /// The one generation whose directory deletion is durably intended.
+    trim_pending: Option<u64>,
     epochs: Vec<Epoch>,
 }
+mod generations;
 #[derive(Serialize, Deserialize)]
 struct LiveTargetMarker {
     config: super::super::nvmeof::LiveTargetConfig,
@@ -225,6 +231,11 @@ pub struct NodeInventory {
     metrics: Arc<Metrics>,
     // Owner incarnation, created once at open (see `durable_progress::new_incarnation`).
     incarnation: [u8; 16],
+    /// Incarnation-local ledger revision, raised before every ledger install
+    /// (`persist_manifest`). Inventory pages are frozen at one revision.
+    revision: u64,
+    #[cfg(test)]
+    trim_crash: Option<super::generation_control::OwnerTrimCrash>,
     /// Whether a live target is installed. Immutable after installation, so
     /// reading it needs no gate.
     pub(super) live_target_configured: bool,
@@ -373,7 +384,7 @@ impl NodeInventory {
         let manifest_path = config.root.join(MANIFEST);
         let mut manifest = match fs::symlink_metadata(&manifest_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                read_metadata::<Manifest>(&manifest_path).map_err(TcpError::component)?
+                generations::read_manifest(&manifest_path)?
             }
             Ok(_) => return Err(TcpError::new("node manifest is not a regular file")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -386,35 +397,16 @@ impl NodeInventory {
                         return Err(TcpError::new("missing node inventory beside existing data"));
                     }
                 }
-                let manifest = Manifest {
-                    format: 1,
-                    partition: config.partition.clone(),
-                    shape_yaml: config.shape_yaml.clone(),
-                    max_epochs: config.max_epochs,
-                    epochs: Vec::new(),
-                };
+                let manifest = generations::new_manifest(&config);
                 persist(&config.root, &manifest)?;
                 manifest
             }
             Err(error) => return Err(error.into()),
         };
-        if manifest.format != 1
-            || manifest.partition != config.partition
-            || manifest.shape_yaml != config.shape_yaml
-            || manifest.max_epochs != config.max_epochs
-            || manifest.epochs.len() > config.max_epochs
-            || manifest.epochs.iter().any(|e| e.epoch == 0)
-            || manifest.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch)
-            || manifest.epochs.iter().enumerate().any(|(index, e)| {
-                matches!(e.state, EpochState::Active | EpochState::Preparing)
-                    && index + 1 != manifest.epochs.len()
-            })
-        {
-            return Err(TcpError::new("node inventory/configuration differs"));
-        }
+        generations::validate_manifest(&manifest, &config.partition, &config.shape_yaml)?;
         // Hold the node lock before revoking capabilities: another process
         // must never revoke a currently running owner's namespaces.
-        let live_target = {
+        let mut live_target = {
             let marker = config.root.join(LIVE_TARGET_CONFIG);
             #[cfg(not(test))]
             use super::super::nvmeof::live_target::LiveTargetManager;
@@ -476,6 +468,9 @@ impl NodeInventory {
                 Err(error) => return Err(error.into()),
             }
         };
+        // A durably intended trim names the only directory open accepts without
+        // a ledger entry. Finish it before any log is recovered or published.
+        generations::resume_trim(&config.root, &mut manifest, live_target.as_mut())?;
         for entry in fs::read_dir(&config.root)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -544,6 +539,9 @@ impl NodeInventory {
             readers,
             metrics,
             incarnation: super::durable_progress::new_incarnation()?,
+            revision: 0,
+            #[cfg(test)]
+            trim_crash: None,
             live_target_configured: live_target.is_some(),
             lifecycle: Arc::new(Mutex::new(live_target)),
             live_shutdown: false,
@@ -582,16 +580,8 @@ impl NodeInventory {
         Ok(NodeStatus {
             partition: self.config.partition.clone(),
             shape_yaml: self.config.shape_yaml.clone(),
-            max_epochs: self.config.max_epochs,
-            epochs: self
-                .manifest
-                .epochs
-                .iter()
-                .map(|e| NodeEpoch {
-                    epoch: e.epoch,
-                    sealed: e.state != EpochState::Active,
-                })
-                .collect(),
+            highest_fenced_generation: self.manifest.highest_fenced_generation,
+            inventory_revision: self.revision,
             active_epoch: self
                 .manifest
                 .epochs
@@ -675,27 +665,23 @@ impl NodeInventory {
         if inventory.live_shutdown {
             return Err(TcpError::new("live target has shut down; reopen required"));
         }
-        if inventory
-            .manifest
-            .epochs
-            .last()
-            .is_some_and(|e| e.epoch == epoch && e.state == EpochState::Active)
-        {
-            return inventory.status();
-        }
-        if epoch == 0
-            || inventory
+        // Only a retained Active entry at the high-water on a healthy owner makes
+        // an equal fence idempotent; the high-water, never the retained list,
+        // rejects every other stale or repeated generation.
+        let highest = inventory.manifest.highest_fenced_generation;
+        if epoch == highest
+            && inventory
                 .manifest
                 .epochs
                 .last()
-                .is_some_and(|e| epoch <= e.epoch)
+                .is_some_and(|e| e.epoch == epoch && e.state == EpochState::Active)
         {
-            return Err(TcpError::new(
-                "epoch already fenced/sealed; cannot reactivate",
-            ));
+            return inventory.status();
         }
-        if inventory.manifest.epochs.len() == inventory.config.max_epochs {
-            return Err(TcpError::new("retained node epoch capacity reached"));
+        if epoch == 0 || epoch <= highest {
+            return Err(TcpError::new(format!(
+                "fencing generation {epoch} already fenced or sealed (owner high-water {highest})"
+            )));
         }
         let target = live_target(inventory, slot)?;
         let live = target.is_some();
@@ -781,6 +767,19 @@ impl NodeInventory {
         }
         inventory.healthy = false;
         inventory.readers.write().invalidate();
+        // A Preparing entry left by a failed fence of this incarnation can never
+        // grant; a strictly higher fence resolves it to Abandoned.
+        if let Some(last) = inventory
+            .manifest
+            .epochs
+            .last_mut()
+            .filter(|e| e.state == EpochState::Preparing)
+        {
+            last.state = EpochState::Abandoned;
+        }
+        // The high-water and Preparing are installed together, before the
+        // generation directory is touched.
+        inventory.manifest.highest_fenced_generation = epoch;
         inventory.manifest.epochs.push(Epoch {
             epoch,
             state: EpochState::Preparing,
@@ -818,6 +817,7 @@ impl NodeInventory {
     /// Install the manifest with the inventory released. Only lifecycle gate
     /// holders change the manifest, so installs happen in decision order.
     fn persist_manifest<H: InventoryAccess>(inventory: &mut H) -> Result<(), TcpError> {
+        inventory.bump_revision()?;
         let bytes = encode_metadata(&inventory.manifest).map_err(TcpError::component)?;
         let root = inventory.config.root.clone();
         inventory
@@ -1785,6 +1785,7 @@ mod tests {
         let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
         inventory.fence_to(1).unwrap();
         inventory.seal(1).unwrap();
+        inventory.manifest.highest_fenced_generation = 2;
         inventory.manifest.epochs.push(Epoch {
             epoch: 2,
             state: EpochState::Preparing,
@@ -1795,19 +1796,18 @@ mod tests {
         fs::create_dir(epoch_path(&config.root, 2)).unwrap();
         drop(inventory);
         let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
-        assert_eq!(
-            inventory.status().unwrap().epochs,
-            vec![
-                NodeEpoch {
-                    epoch: 1,
-                    sealed: true
-                },
-                NodeEpoch {
-                    epoch: 2,
-                    sealed: true
-                }
-            ]
+        let status = inventory.status().unwrap();
+        assert_eq!(status.highest_fenced_generation, 2);
+        assert_eq!(status.active_epoch, None);
+        assert!(
+            inventory
+                .manifest
+                .epochs
+                .iter()
+                .map(|e| (e.epoch, e.state == EpochState::Active))
+                .eq([(1, false), (2, false)])
         );
+        assert!(inventory.manifest.epochs[1].state == EpochState::Abandoned);
         assert!(inventory.fence_to(2).is_err());
         inventory.fence_to(3).unwrap();
         assert!(epoch_path(&config.root, 2).is_dir());

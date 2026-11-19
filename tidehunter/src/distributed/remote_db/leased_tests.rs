@@ -848,7 +848,6 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 wal_file_bytes: owner.wal_file_bytes,
                 max_batches_per_partition: owner.max_batches,
                 max_reference_metadata_bytes: owner.max_reference_metadata_bytes,
-                max_epochs: fixture.config.max_epochs,
             },
             endpoints: vec![RemoteEndpoint {
                 partition: owner.partition,

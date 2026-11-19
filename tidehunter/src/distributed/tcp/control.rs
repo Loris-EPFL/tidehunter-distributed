@@ -2090,6 +2090,40 @@ impl ControlContext {
                 .lock()
                 .process_resources_for_benchmark(epoch)
                 .map(Response::ProcessResources),
+            Request::InventoryPage(page) => self
+                .inventory
+                .lock()
+                .inventory_page(&page, limits.max_frame_bytes)
+                .map(Response::InventoryPage),
+            Request::CheckTrimGeneration(check) => {
+                let _gate = self.live_control_gate.lock();
+                let _lifecycle = self.lifecycle.lock();
+                let (result, _) = self
+                    .inventory
+                    .lock()
+                    .trim_readiness(check.authority_generation, check.generation)?;
+                Ok(Response::CheckTrimGeneration(
+                    super::generation_control::CheckTrimReply {
+                        generation: check.generation,
+                        result,
+                    },
+                ))
+            }
+            Request::TrimGeneration(trim) => {
+                let _gate = self.live_control_gate.lock();
+                let mut lifecycle = self.lifecycle.lock();
+                NodeInventory::trim_generation(
+                    &mut self.inventory.lock(),
+                    &mut lifecycle,
+                    trim.authority_generation,
+                    trim.generation,
+                )?;
+                Ok(Response::TrimGeneration(
+                    super::generation_control::TrimReply {
+                        generation: trim.generation,
+                    },
+                ))
+            }
         }
     }
 }

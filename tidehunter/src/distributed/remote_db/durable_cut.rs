@@ -102,7 +102,8 @@ pub(super) struct CutRecord {
     /// One entry per tracked epoch, written by the first recovery after it:
     /// that recovery kept only the batches of `epoch` below `next`. Every later
     /// recovery honours it, so a discarded batch never returns. Epochs ascend;
-    /// at most one entry per epoch, so the length is bounded by `max_epochs`.
+    /// at most one entry per retained fencing generation: an offline open drops
+    /// the entry of a trimmed generation (`forget_retired_generation`).
     truncations: Vec<EpochCut>,
 }
 
@@ -158,6 +159,28 @@ impl CutRecord {
                 path.join(RECORD).display()
             ))
         })
+    }
+
+    /// The tracked generation, if any.
+    pub(super) fn live_generation(&self) -> Option<u64> {
+        self.live.map(|live| live.epoch)
+    }
+
+    /// Drop the truncation of a trimmed fencing generation. Offline open only:
+    /// after every owner acknowledged the trim and before a durable-cut actor
+    /// starts. Never touches `live`. Returns whether the record changed.
+    pub(super) fn forget_retired_generation(
+        &mut self,
+        generation: u64,
+    ) -> Result<bool, LocalDbError> {
+        if self.live.is_some_and(|live| live.epoch == generation) {
+            return Err(LocalDbError::new(format!(
+                "durable cut still tracks fencing generation {generation}"
+            )));
+        }
+        let before = self.truncations.len();
+        self.truncations.retain(|cut| cut.epoch != generation);
+        Ok(self.truncations.len() != before)
     }
 }
 
@@ -354,6 +377,12 @@ pub(super) fn rewrite_marks_for_test(path: &Path, edit: impl FnOnce(&mut [OwnerM
     let mut record: CutRecord = read_metadata(&path.join(RECORD)).unwrap();
     edit(&mut record.owners);
     record.persist(path).unwrap();
+}
+
+/// Test hook: persisted truncation entries (zero when no record exists).
+#[cfg(test)]
+pub(super) fn truncation_count_for_test(path: &Path) -> usize {
+    read_metadata::<CutRecord>(&path.join(RECORD)).map_or(0, |record| record.truncations.len())
 }
 
 #[derive(Clone, Copy, Default)]

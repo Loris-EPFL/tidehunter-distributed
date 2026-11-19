@@ -143,7 +143,6 @@ pub fn prepare_external_case(
                     max_reference_metadata_bytes: storage.max_reference_metadata_bytes,
                 },
                 shape_yaml: serde_yaml::to_string(shape)?,
-                max_epochs: storage.max_epochs,
                 wal_member_read,
                 // Legacy harness behaviour, written explicitly because the owner
                 // default is on. The cloud and local harnesses rebind each case's

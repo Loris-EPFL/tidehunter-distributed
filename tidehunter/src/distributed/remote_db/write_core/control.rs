@@ -49,7 +49,7 @@ impl WriteCore {
         })?;
         // Every sequence below `next` is now published and synced, or aborted:
         // the explicit flush survives recovery only once the record says so.
-        if let Some(cut) = &self.durable_cut {
+        if let Some(cut) = self.durable_cut.get() {
             cut.certify(next)?;
         }
         self.ensure_healthy()
@@ -59,7 +59,7 @@ impl WriteCore {
         &self,
     ) -> super::super::DurableCutStats {
         self.durable_cut
-            .as_ref()
+            .get()
             .map_or_else(super::super::DurableCutStats::default, |cut| cut.stats())
     }
 
@@ -253,7 +253,7 @@ impl WriteCore {
         self.stats.lock().shutdown.checkpoint_ns = elapsed(started);
         // After the checkpoint: its owner syncs end every parked poll, and the
         // checkpoint then covers everything the cut covered.
-        if let Some(cut) = &self.durable_cut {
+        if let Some(cut) = self.durable_cut.get() {
             cut.stop();
         }
         let started = Instant::now();

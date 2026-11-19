@@ -1421,7 +1421,7 @@ mod live_fencing {
             });
             assert_eq!(
                 fence(&node, 1).err().unwrap().to_string(),
-                "epoch already fenced/sealed; cannot reactivate"
+                "fencing generation 1 already fenced or sealed (owner high-water 2)"
             );
             match lifecycle {
                 "seal" => {
@@ -2295,8 +2295,8 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 29);
-    preface[4..6].copy_from_slice(&28u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 30);
+    preface[4..6].copy_from_slice(&29u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }
 

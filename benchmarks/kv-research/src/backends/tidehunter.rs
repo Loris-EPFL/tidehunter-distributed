@@ -166,8 +166,6 @@ struct ExternalPreparationInput {
     owner_wal_geometry: OwnerWalGeometry,
     #[serde(default)]
     owner_wal_file_bytes: Option<u64>,
-    #[serde(default = "default_external_max_epochs")]
-    max_epochs: usize,
     max_admitted_batches: usize,
     max_index_bytes: usize,
     coordinator_cache_bytes: usize,
@@ -190,10 +188,6 @@ fn default_resident_first() -> bool {
 
 fn default_coordinator_read_memory_allowance_bytes() -> usize {
     512 * 1024 * 1024
-}
-
-fn default_external_max_epochs() -> usize {
-    4
 }
 
 fn backend_name(transport: &Transport) -> &'static str {
@@ -294,7 +288,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         || !matches!(input.addresses.len(), 1 | 2 | 4 | 5 | 16)
         || input.max_batches_per_partition == 0
         || input.max_batches_per_partition > 1_000_000
-        || !(1..=1024).contains(&input.max_epochs)
         || input.max_admitted_batches == 0
         || input.max_admitted_batches > 1_000_000
         || input.max_index_bytes == 0
@@ -378,7 +371,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             .unwrap_or_else(|| input.owner_wal_geometry.wal_file_bytes()),
         max_batches_per_partition: input.max_batches_per_partition,
         max_reference_metadata_bytes: 64 * 1024 * 1024,
-        max_epochs: input.max_epochs,
     };
     match fs::symlink_metadata(output) {
         Ok(_) => return Err("external preparation output must not exist".into()),
@@ -723,8 +715,6 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
             .is_multiple_of(config.storage.fragment_bytes)
         || config.storage.max_batches_per_partition == 0
         || config.storage.max_batches_per_partition > 1_000_000
-        || config.storage.max_epochs == 0
-        || config.storage.max_epochs > 1024
     {
         return Err("invalid external remote owner configuration".into());
     }
@@ -909,8 +899,7 @@ async fn open_with_shape(
                 remote_config.storage.wal_file_bytes,
             ),
             "wal_file_bytes": remote_config.storage.wal_file_bytes,
-            "max_reference_metadata_bytes": remote_config.storage.max_reference_metadata_bytes,
-            "max_epochs": remote_config.storage.max_epochs
+            "max_reference_metadata_bytes": remote_config.storage.max_reference_metadata_bytes
         },
         "cache_policy_receipt": {
             "coordinator_explicit_cache": {

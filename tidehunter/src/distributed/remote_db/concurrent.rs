@@ -201,16 +201,19 @@ fn wake_granted(granted: SmallVec<[Arc<AdmissionWaiter>; 4]>) {
 impl Admission {
     pub(super) fn for_open(database: &super::write_core::core::OpenState) -> Arc<Self> {
         // This is the exact fixed-width checkpoint_metadata_fits inequality,
-        // solved once at open rather than recomputed on every FIFO grant.
+        // solved once at open rather than recomputed on every FIFO grant. The
+        // streams are the actual retained (owner, generation) pairs; open-time
+        // trims only shrink them, and no generation is added while serving.
+        let streams: usize = database
+            .publisher
+            .retained_epochs
+            .iter()
+            .map(Vec::len)
+            .sum();
         let metadata_identities = MAX_CHECKPOINT_METADATA_BYTES
             .checked_sub(1024 * 1024)
             .map(|bytes| bytes / 128)
-            .and_then(|entries| {
-                entries.checked_sub(
-                    (database.config.endpoints.len() as u64)
-                        .checked_mul(database.config.storage.max_epochs as u64)?,
-                )
-            })
+            .and_then(|entries| entries.checked_sub(u64::try_from(streams).ok()?))
             .and_then(|entries| usize::try_from(entries).ok())
             .unwrap_or(0);
         let max_identities = if metadata_identities >= WAL_REPLAY_WINDOW_BATCHES {

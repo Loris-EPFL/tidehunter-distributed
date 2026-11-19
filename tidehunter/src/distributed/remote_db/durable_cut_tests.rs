@@ -307,7 +307,7 @@ fn truncation_survives_every_later_crash() {
     .unwrap();
     assert!(error.message().contains("after cut record"), "{error}");
     let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert!(!manifest.epochs[1].active);
+    assert_eq!(manifest.generations[1].state, GenerationState::Reserved);
     let mut db = fixture.open();
     assert_eq!(db.epoch(), 3);
     assert_eq!(db.recovery_stats().cut_discarded_batches, 1);
@@ -373,7 +373,7 @@ fn lagging_owner_is_nudged_and_idle_owner_does_not_pin_the_cut() {
         },
     );
     let db = fixture.open();
-    let cut = db.core.durable_cut.as_ref().unwrap();
+    let cut = db.core.durable_cut.get().unwrap();
     let persisted = cut.persisted_events();
     db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
         .unwrap();

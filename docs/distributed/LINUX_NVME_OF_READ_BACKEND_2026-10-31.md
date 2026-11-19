@@ -171,7 +171,7 @@ The feature-enabled `kv-research` binary supports `prepare-nvmeof-dataset RUN_CO
 
 The source recipe `kv-research-native-sealed-batch-v2` writes contiguous logical IDs in whole native batches of up to 32 members; the final batch may be smaller. Before writing, it probes the native complete-batch encoder against the configured operation and encoded-byte limits and lowers the member bound if necessary. Every member remains an ordinary native WAL mutation, and export derives its exact receipt-relative reference. Prepared and owner-ready metadata record the recipe and effective member bound; older singleton sources are not interchangeable.
 
-The existing `--prepare-external-case` input accepts optional `max_epochs` (1–1024, default 4). Set it before creating owners to accommodate preparation plus every coordinator reopen and recovery headroom. Both generated owner and coordinator inventories use the same limit; do not change it on an existing inventory.
+The `--prepare-external-case` input has no `max_epochs` field (an input that names it is rejected): fencing generations are unlimited, and each coordinator open trims the generations that no retained state needs.
 
 New external-case inventories use a 3 MiB native complete-batch limit and a 4 MiB WAL fragment (group payload limited to 4 MiB minus the frame header), so an atomic batch of 32 64 KiB values fits without splitting. This changes generated storage geometry; existing inventories must not be rewritten to match.
 

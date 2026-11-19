@@ -269,16 +269,13 @@ fn shutdown_targets(
             Client::connect(&endpoint.address, &tls, config.timeout, partition, shape)?;
         let status = client.status()?;
         check(status.live_nvmeof, "owner does not report live target")?;
-        let epoch = status
-            .epochs
-            .last()
-            .ok_or("owner has no authority epoch")?
-            .epoch;
+        let epoch = status.highest_fenced_generation;
+        check(epoch != 0, "owner has no authority epoch")?;
         if status.active_epoch == Some(epoch) {
             client.seal(epoch)?;
         } else {
             check(
-                status.active_epoch.is_none() && status.epochs.last().is_some_and(|e| e.sealed),
+                status.active_epoch.is_none(),
                 "owner authority not in expected latest epoch",
             )?;
         }
@@ -826,10 +823,9 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     check(
         remote.endpoints.len() == 1
             && remote.storage.partitions.len() == 1
-            && remote.storage.max_epochs >= 4
             && remote.replay_limits.max_batches >= 8
             && remote.replay_limits.max_encoded_bytes >= 4 * (input.value_bytes + 4096),
-        "two-host qualification requires one owner, four epochs and a replay window above the child batch",
+        "two-host qualification requires one owner and a replay window above the child batch",
     )?;
     let partitions = &remote.storage.partitions;
     fs::create_dir(output)?;

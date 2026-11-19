@@ -2171,6 +2171,9 @@ fn request_kind_code(request: &Request) -> u64 {
         Request::ReleaseLiveExportPin { .. } => 43,
         Request::DurableProgress { .. } => 44,
         Request::PartitionStats => 45,
+        Request::InventoryPage(_) => 46,
+        Request::CheckTrimGeneration(_) => 47,
+        Request::TrimGeneration(_) => 48,
     }
 }
 

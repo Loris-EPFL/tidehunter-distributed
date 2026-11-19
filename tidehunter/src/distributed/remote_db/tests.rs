@@ -215,10 +215,11 @@ fn recorded_live_identity_cannot_reopen_as_tcp() {
     assert!(
         error
             .to_string()
-            .contains("authority configuration/history differs")
+            .contains("authority configuration differs")
     );
     let after: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(after.epochs.len(), manifest.epochs.len());
+    assert_eq!(after.generations, manifest.generations);
+    assert_eq!(after.next_generation, manifest.next_generation);
 }
 
 #[test]
@@ -233,7 +234,9 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
         shape_yaml: String,
         replay_limits: ReplayLimits,
         live_nvme_identity: Option<(String, [u8; 16])>,
-        epochs: Vec<AuthorityEpoch>,
+        next_generation: u64,
+        generations: Vec<AuthorityGeneration>,
+        trim_pending: Option<u64>,
         checkpoint: Option<CheckpointCommit>,
         checkpoint_staging: Option<CheckpointFiles>,
         checkpoint_obsolete: Option<CheckpointCommit>,
@@ -249,7 +252,9 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
         shape_yaml: manifest.shape_yaml.clone(),
         replay_limits: manifest.replay_limits,
         live_nvme_identity: manifest.live_nvme_identity.clone(),
-        epochs: manifest.epochs.clone(),
+        next_generation: manifest.next_generation,
+        generations: manifest.generations.clone(),
+        trim_pending: manifest.trim_pending,
         checkpoint: manifest.checkpoint.clone(),
         checkpoint_staging: manifest.checkpoint_staging.clone(),
         checkpoint_obsolete: manifest.checkpoint_obsolete.clone(),
@@ -417,8 +422,13 @@ fn checkpoint_is_not_adopted_until_every_required_shard_is_fenced() {
     );
     let manifest: AuthorityManifest =
         read_metadata(&fixture.temp.path().join("authority").join(MANIFEST)).unwrap();
-    assert_eq!(manifest.epochs.last().unwrap().epoch, 2);
-    assert!(!manifest.epochs.last().unwrap().active);
+    assert_eq!(
+        manifest.generations.last().copied(),
+        Some(AuthorityGeneration {
+            generation: 2,
+            state: GenerationState::Reserved,
+        })
+    );
     let mut db = fixture.open();
     assert_eq!(db.epoch(), 3);
     assert!(db.recovery_stats().checkpoint_loaded);
@@ -489,13 +499,12 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
     };
     fixture.config.max_admitted_batches = 1024;
     let limits = fixture.config.replay_limits;
-    assert!(checkpoint_metadata_fits(
-        &fixture.config,
-        limits.max_batches + 8
-    ));
-    assert!(!checkpoint_metadata_fits(&fixture.config, usize::MAX));
+    // Eight retained generations per owner, the old fixture's lifetime quota.
+    let streams = fixture.config.endpoints.len() * 8;
+    assert!(checkpoint_metadata_fits(streams, limits.max_batches + 8));
+    assert!(!checkpoint_metadata_fits(streams, usize::MAX));
     assert!(!checkpoint_metadata_fits(
-        &fixture.config,
+        streams,
         MAX_CHECKPOINT_METADATA_BYTES as usize / 128
     ));
     let db = fixture.open();
@@ -892,7 +901,8 @@ fn failed_parallel_connect_does_not_reserve_or_escape_an_authority() {
         RemoteDatabase::open(&root, &fixture.shape, config.clone(), recovery_metrics()).is_err()
     );
     let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert!(manifest.epochs.is_empty());
+    assert!(manifest.generations.is_empty());
+    assert_eq!(manifest.next_generation, 1);
     // The failed attempt's scoped connection workers are all gone before lock
     // acquisition can succeed. Keep the recorded immutable endpoint inventory.
     let lock = DbLock::acquire(&root, Duration::ZERO).unwrap();
@@ -914,8 +924,13 @@ fn failed_setup_joins_owned_workers_and_next_open_reserves_a_new_epoch() {
         .is_err()
     );
     let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(manifest.epochs.len(), 1);
-    assert!(!manifest.epochs[0].active);
+    assert_eq!(
+        manifest.generations,
+        vec![AuthorityGeneration {
+            generation: 1,
+            state: GenerationState::Reserved,
+        }]
+    );
     let db = fixture.open();
     assert_eq!(db.epoch(), 2);
     assert_eq!(db.recovery_stats().fabric_worker_ns, None);
@@ -1949,7 +1964,7 @@ fn legacy_manifest_modes_fail_open_before_any_mutation() {
     for (index, node) in fixture.nodes.iter().enumerate() {
         // Fencing generation 1 only: no reopen reached an owner.
         assert_eq!(
-            node.status().unwrap().epochs.len(),
+            node.status().unwrap().highest_fenced_generation,
             1,
             "owner {index} was fenced by a legacy open"
         );
@@ -1965,6 +1980,27 @@ fn legacy_manifest_modes_fail_open_before_any_mutation() {
         &[7; 32]
     );
     db.shutdown().unwrap();
+}
+
+#[test]
+fn pre_generation_authority_manifest_is_rejected_without_rewrite() {
+    let fixture = Fixture::new();
+    fail_stop_without_checkpoint(fixture.open());
+    let root = fixture.temp.path().join("authority");
+    let mut old: serde_yaml::Value = read_metadata(&root.join(MANIFEST)).unwrap();
+    let fields = old.as_mapping_mut().unwrap();
+    fields.insert("format".into(), 2u32.into());
+    install_metadata(&root, MANIFEST, &encode_metadata(&old).unwrap()).unwrap();
+    let before = fs::read(root.join(MANIFEST)).unwrap();
+    let error = reopen_result(&fixture).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "unsupported distributed authority manifest format 2 (expected {})",
+            fencing_generations::AUTHORITY_FORMAT
+        )
+    );
+    assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before);
 }
 
 #[test]

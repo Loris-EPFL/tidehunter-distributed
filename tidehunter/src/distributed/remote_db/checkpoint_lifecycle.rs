@@ -96,7 +96,12 @@ fn core_start_checkpoint_with_floor(
             merge_checkpoint_floor(background.requested_floor.take(), floor)?;
         return Ok(());
     }
-    if floor.is_none() && *state.checkpoint_tail_batches == 0 && state.manifest.checkpoint.is_some()
+    // A prepared generation trim (L1) must adopt a replacement root even when
+    // no tail is pending; it is an open-time root like the recovery baseline.
+    if floor.is_none()
+        && *state.checkpoint_tail_batches == 0
+        && state.manifest.checkpoint.is_some()
+        && state.manifest.adopt_trim.is_none()
     {
         return Ok(());
     }
@@ -484,6 +489,7 @@ fn core_run_checkpoint(core: &Arc<WriteCore>, generation: u64) -> Result<(), Loc
             .iter()
             .filter_map(|(key, position)| position.complete.then_some(*key))
             .collect();
+        *state.committed_streams = completed.positions.keys().copied().collect();
         *state.positions = std::mem::take(&mut completed.positions);
         *state.recent = std::mem::take(&mut completed.recent);
         state.known.retain(|_, receipt| {
@@ -1002,6 +1008,10 @@ fn persist_checkpoint(
     // the post-cut suffix remains recoverable from the value WALs.
     staging_manifest.checkpoint_obsolete = staging_manifest.checkpoint.replace(commit.clone());
     staging_manifest.checkpoint_staging = None;
+    // The same replacement excludes a prepared trimmed generation and records
+    // its trim intent, so no crash can select this root while planning replay
+    // of that generation (L1).
+    super::fencing_generations::apply_adoption_trim(&mut staging_manifest);
     #[cfg(test)]
     if interruption == Some(5) {
         return Err(LocalDbError::new(

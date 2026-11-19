@@ -168,7 +168,7 @@ impl WriteCore {
         // receipts (`release_leased_replies`); publication leaves it here.
         self.write_timeline
             .wait_leave(super::super::WriteWait::HarvestToDurable, receipts.len());
-        if let Some(cut) = &self.durable_cut
+        if let Some(cut) = self.durable_cut.get()
             && let Some(&index) = self.partition_indexes.get(&owner)
             && let Some(last) = receipts.iter().map(|(sequence, _)| *sequence).max()
         {
@@ -387,7 +387,7 @@ impl WriteCore {
                 }
                 publisher.published_next = sequence + 1;
             }
-            if let Some(cut) = &self.durable_cut {
+            if let Some(cut) = self.durable_cut.get() {
                 cut.published(publisher.published_next);
             }
             if let Some(upper) = publisher

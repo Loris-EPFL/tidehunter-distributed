@@ -98,7 +98,6 @@ pub(super) fn config(root: &Path) -> NodeConfig {
     NodeConfig {
         root: root.to_path_buf(),
         shape_yaml: shape().to_yaml().unwrap(),
-        max_epochs: 8,
         partition: PartitionConfig {
             inventory: StaticInventory {
                 database: [51; 16],
@@ -137,7 +136,7 @@ fn static_node_validation_opens_no_runtime_resources() {
         match fault {
             0 => invalid.read_max_device_reads = 0,
             1 => invalid.partition.inventory.epoch = 2,
-            2 => invalid.max_epochs = 0,
+            2 => invalid.partition.inventory.segment_generation = 2,
             3 => invalid.read_max_device_reads = 4097,
             _ => invalid.shape_yaml = "invalid shape".into(),
         }
@@ -255,13 +254,9 @@ fn node_restart_seals_and_never_reactivates_old_epoch() {
     );
     drop(node);
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
-    assert_eq!(
-        node.status().unwrap().epochs,
-        vec![NodeEpoch {
-            epoch: 7,
-            sealed: true
-        }]
-    );
+    let status = node.status().unwrap();
+    assert_eq!(status.highest_fenced_generation, 7);
+    assert_eq!(status.active_epoch, None);
     assert!(node.inventory.lock().fence_to(7).is_err());
     node.inventory.lock().fence_to(9).unwrap();
     assert_eq!(node.status().unwrap().active_epoch, Some(9));

@@ -27,7 +27,11 @@ pub use tidehunter_fabric::ProviderInfo;
 mod control;
 mod durable_progress;
 pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
+mod generation_control;
+pub use generation_control::{InventoryGeneration, OwnerGenerationState, TrimReadiness};
 mod inventory;
+#[cfg(test)]
+pub(crate) use generation_control::OwnerTrimCrash;
 mod live_client;
 pub use super::nvmeof::LiveQueueGeometry;
 #[cfg(test)]
@@ -102,7 +106,10 @@ pub use inventory::NodeInventory;
 /// `NodeStatus::{history_persistence, max_read_bytes}` and the SPDK, sealed-export
 /// and export-mode placeholders, and adds owner transport counters to
 /// `PartitionStats`.
-const PROTOCOL: u32 = 29;
+/// 30 (L1) replaces the retained generation vector and `max_epochs` in
+/// `NodeStatus` with the owner high-water and inventory revision, and appends
+/// InventoryPage, CheckTrimGeneration and TrimGeneration.
+const PROTOCOL: u32 = 30;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -152,9 +159,10 @@ fn read_transport_mode(stream: &mut impl Read, expected: &Transport) -> Result<(
 pub struct NodeConfig {
     pub root: PathBuf,
     /// Full static cluster inventory, this node's partition; template epoch = 1.
+    /// Retained fencing generations are bounded by the ones still referenced,
+    /// not by a configured count.
     pub partition: PartitionConfig,
     pub shape_yaml: String,
-    pub max_epochs: usize,
     /// Member read policy of owner WAL reads; with `Async`, also bounds each
     /// live record resolution (see `read_max_device_reads`).
     #[serde(default = "default_async_read_policy")]
@@ -187,10 +195,7 @@ impl NodeConfig {
 
     fn validated_shape(&self) -> Result<KeyShape, TcpError> {
         self.partition.validate().map_err(TcpError::component)?;
-        if self.partition.inventory.epoch != 1
-            || self.partition.inventory.segment_generation != 1
-            || !(1..=1024).contains(&self.max_epochs)
-        {
+        if self.partition.inventory.epoch != 1 || self.partition.inventory.segment_generation != 1 {
             return Err(TcpError::new("invalid node epoch/configuration template"));
         }
         KeyShape::from_yaml(&self.shape_yaml).map_err(TcpError::component)
@@ -307,17 +312,15 @@ impl TcpLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeEpoch {
-    pub epoch: u64,
-    pub sealed: bool,
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub partition: PartitionConfig,
     pub shape_yaml: String,
-    pub max_epochs: usize,
-    pub epochs: Vec<NodeEpoch>,
+    /// Highest fencing generation the owner ever accepted. Never decreases;
+    /// retained generations are read with `Client::inventory_sweep`.
+    pub highest_fenced_generation: u64,
+    /// Owner-incarnation-local ledger revision that freezes one page sweep.
+    pub inventory_revision: u64,
     pub active_epoch: Option<u64>,
     /// False means only a strictly higher live fence may recover this owner.
     pub healthy: bool,
@@ -512,6 +515,12 @@ enum Request {
     /// Tag 25. Benchmark evidence; owners built without Linux `test-utils`
     /// reply with an error.
     ProcessResources { epoch: u64 },
+    /// Tag 26.
+    InventoryPage(generation_control::InventoryPageRequest),
+    /// Tag 27.
+    CheckTrimGeneration(generation_control::CheckTrimRequest),
+    /// Tag 28.
+    TrimGeneration(generation_control::TrimRequest),
 }
 impl Request {
     /// Startup/recovery negotiation, durable epoch/retirement maintenance and
@@ -553,6 +562,10 @@ impl Request {
             | Self::LiveTargetStats
             | Self::ProcessResources { .. } => false,
             Self::ReadEvidence { evict, .. } => *evict,
+            // Cold control lane with normal lifecycle deadlines.
+            Self::InventoryPage(_) | Self::CheckTrimGeneration(_) | Self::TrimGeneration(_) => {
+                true
+            }
         };
         if lifecycle {
             data_timeout.max(LIFECYCLE_TIMEOUT)
@@ -678,6 +691,12 @@ enum Response {
     ReadEvidence(crate::read_probe::ReadEvidence),
     /// Tag 22.
     ProcessResources(crate::read_probe::ProcessResources),
+    /// Tag 23.
+    InventoryPage(generation_control::InventoryPageReply),
+    /// Tag 24.
+    CheckTrimGeneration(generation_control::CheckTrimReply),
+    /// Tag 25.
+    TrimGeneration(generation_control::TrimReply),
 }
 
 /// Named error of a benchmark evidence request this owner build cannot serve.
@@ -914,20 +933,35 @@ impl StorageNode {
                 "transport frame cannot carry configured complete groups",
             ));
         }
+        // The status no longer grows with retained history; the largest reply
+        // carrying generation data is a full inventory page.
         let mut largest_status = self.status()?;
         largest_status.active_epoch = Some(u64::MAX);
-        largest_status.epochs.resize(
-            largest_status.max_epochs,
-            NodeEpoch {
-                epoch: 1,
-                sealed: true,
-            },
-        );
+        largest_status.highest_fenced_generation = u64::MAX;
+        largest_status.inventory_revision = u64::MAX;
         wire_codec(limits.max_frame_bytes)
             .serialized_size(&reactor::Envelope {
                 protocol: PROTOCOL,
                 id: u64::MAX,
                 body: Response::Status(largest_status),
+            })
+            .map_err(TcpError::component)?;
+        wire_codec(limits.max_frame_bytes)
+            .serialized_size(&reactor::Envelope {
+                protocol: PROTOCOL,
+                id: u64::MAX,
+                body: Response::InventoryPage(generation_control::InventoryPageReply {
+                    incarnation: [u8::MAX; 16],
+                    revision: u64::MAX,
+                    entries: vec![
+                        InventoryGeneration {
+                            generation: u64::MAX,
+                            state: OwnerGenerationState::Abandoned,
+                        };
+                        generation_control::page_capacity(limits.max_frame_bytes)
+                    ],
+                    next: Some(u64::MAX),
+                }),
             })
             .map_err(TcpError::component)?;
         tls.transport.validate()?;
@@ -1638,12 +1672,6 @@ impl Client {
                 ),
             );
         }
-        if !(1..=1024).contains(&status.max_epochs) {
-            return self.wrong_response(
-                request,
-                format_args!("max_epochs={}; expected 1..=1024", status.max_epochs),
-            );
-        }
         if !(1024..=HARD_FRAME_LIMIT).contains(&status.max_frame_bytes) {
             return self.wrong_response(
                 request,
@@ -1668,39 +1696,16 @@ impl Client {
                 ),
             );
         }
-        if status.epochs.len() > status.max_epochs {
-            return self.wrong_response(
-                request,
-                format_args!(
-                    "epochs.len()={} exceeds max_epochs={}",
-                    status.epochs.len(),
-                    status.max_epochs
-                ),
-            );
-        }
-        if status.epochs.iter().any(|e| e.epoch == 0) {
-            return self.wrong_response(request, "epochs contains epoch zero");
-        }
-        if status.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch) {
-            return self.wrong_response(request, "epochs are not strictly increasing");
-        }
-        if status.epochs.iter().filter(|e| !e.sealed).count()
-            != usize::from(status.active_epoch.is_some())
+        // An active generation is always the owner high-water.
+        if status
+            .active_epoch
+            .is_some_and(|epoch| epoch == 0 || epoch != status.highest_fenced_generation)
         {
-            return self.wrong_response(request, "unsealed epoch count differs from active_epoch");
-        }
-        if status.active_epoch.is_some_and(|epoch| {
-            status.epochs.last()
-                != Some(&NodeEpoch {
-                    epoch,
-                    sealed: false,
-                })
-        }) {
             return self.wrong_response(
                 request,
                 format_args!(
-                    "active_epoch={:?} is not the last unsealed epoch",
-                    status.active_epoch
+                    "active_epoch={:?} is not the owner high-water {}",
+                    status.active_epoch, status.highest_fenced_generation
                 ),
             );
         }
