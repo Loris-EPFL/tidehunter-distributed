@@ -99,9 +99,26 @@ def active_partitions(job):
     return {str(index) for index in range(active_owner_count(job))}
 
 
+# Owner hosts serve databases provisioned later, so their receipt names no database.
 OWNER_RECEIPT_FIELDS = frozenset((
-    "partition", "database", "address", "launch_nonce", "pid", "boot_id", "started_unix_ns",
-    "durability"))
+    "partition", "address", "launch_nonce", "pid", "boot_id", "started_unix_ns", "durability"))
+# Archive single-database owners (launch `node`) also named their database.
+ARCHIVE_OWNER_RECEIPT_FIELDS = OWNER_RECEIPT_FIELDS | {"database"}
+
+
+def owner_launch_partition(launch):
+    """Partition an owner launch serves: owner host (`host`) or archive single-database (`node`)."""
+    return launch["partition"] if "host" in launch else launch["node"]["partition"]["partition"]
+
+
+def owner_launch_config(launch):
+    """Owner process settings (root, read and prewrite settings) of either launch schema."""
+    return launch["host"] if "host" in launch else launch["node"]
+
+
+def owner_launch_live(launch):
+    """Owner hosts serve leased live databases only; archive owners only with a `live_target`."""
+    return "host" in launch or launch["node"].get("live_target") is not None
 
 
 def owner_receipt_path(launch):
@@ -114,19 +131,26 @@ def owner_receipt_path(launch):
 
 def validate_owner_receipt(receipt, launch):
     """The receipt must name this exact owner and launch and carry an explicit tier."""
-    durability = receipt.get("durability") if isinstance(receipt, dict) else None
+    if not isinstance(receipt, dict):
+        raise ValueError("owner receipt must be an object")
+    durability = receipt.get("durability")
     launched = (launch.get("durability") or {}).get("tier", "native")
-    partition = launch["node"]["partition"]["partition"]
-    if (set(receipt) not in (OWNER_RECEIPT_FIELDS, OWNER_RECEIPT_FIELDS | {"history_persistence"})
-            or receipt.get("history_persistence", "on_disk") != launch.get("history_persistence", "on_disk")
+    partition = owner_launch_partition(launch)
+    owner_host = "host" in launch
+    fields = OWNER_RECEIPT_FIELDS if owner_host else ARCHIVE_OWNER_RECEIPT_FIELDS
+    allowed = (fields,) if owner_host else (fields, fields | {"history_persistence"})
+    if (set(receipt) not in allowed
+            or not owner_host and receipt.get("history_persistence", "on_disk") != launch.get("history_persistence", "on_disk")
             or not isinstance(durability, dict)
             or durability.get("tier") not in DURABILITY_TIERS or durability["tier"] != launched
-            or receipt["partition"] != partition
-            or receipt["database"] != launch["node"]["partition"]["inventory"]["database"]
+            or type(receipt["partition"]) is not int or receipt["partition"] != partition
+            or ("host" not in launch
+                and receipt["database"] != launch["node"]["partition"]["inventory"]["database"])
             or receipt["address"] != launch["listen"]
             or not launch.get("launch_nonce") or receipt["launch_nonce"] != launch["launch_nonce"]
-            or not isinstance(receipt["pid"], int) or not receipt["boot_id"]
-            or not isinstance(receipt["started_unix_ns"], int)):
+            or type(receipt["pid"]) is not int or receipt["pid"] <= 0
+            or not isinstance(receipt["boot_id"], str) or not receipt["boot_id"]
+            or type(receipt["started_unix_ns"]) is not int or receipt["started_unix_ns"] <= 0):
         raise ValueError("owner receipt does not match its owner, launch or tier")
     return receipt
 
@@ -142,10 +166,12 @@ def owner_receipt_is_fresh(previous, receipt):
     """Same owner and launch, but a later start by a different process incarnation."""
     identity = ("partition", "database", "address", "launch_nonce")
     process = ("pid", "boot_id", "started_unix_ns")
+    fields = set(previous) - {"history_persistence"}
     return (isinstance(receipt, dict)
-            and set(receipt) in (OWNER_RECEIPT_FIELDS, OWNER_RECEIPT_FIELDS | {"history_persistence"})
+            and fields in (OWNER_RECEIPT_FIELDS, ARCHIVE_OWNER_RECEIPT_FIELDS)
+            and set(receipt) - {"history_persistence"} == fields
             and receipt.get("history_persistence", "on_disk") == previous.get("history_persistence", "on_disk")
-            and all(receipt[name] == previous[name] for name in identity)
+            and all(receipt.get(name) == previous.get(name) for name in identity)
             and receipt["durability"] == previous["durability"]
             and [receipt[name] for name in process] != [previous[name] for name in process]
             and receipt["started_unix_ns"] > previous["started_unix_ns"])
@@ -2253,6 +2279,48 @@ def admit_live_write_contract(job, backend_info):
         raise ValueError("leased write acknowledgement contract differs")
 
 
+LIVE_HOST_SCOPE = re.compile(r"(nqn\.2026-01\.local\.tidehunter:db-([0-9a-f]{32})-p([0-9a-f]{8})-)host")
+UUID_TEXT = r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}"
+
+
+def live_identity_bytes(value):
+    return (isinstance(value, list) and len(value) == 16
+            and all(type(byte) is int and 0 <= byte <= 255 for byte in value) and any(value))
+
+
+def live_database_id(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{32}", value)) and value != "0" * 32
+
+
+def scoped_live_subsystem(nqn, scope):
+    return isinstance(nqn, str) and bool(re.fullmatch(re.escape(scope) + r"sub-" + UUID_TEXT, nqn))
+
+
+def effective_live_owner(configured, database, partition):
+    """Mirror distributed::tcp::host::identity for one admitted owner seed."""
+    if (not live_database_id(database) or type(partition) is not int or not 0 <= partition <= 0xffffffff
+            or not isinstance(configured, dict) or not live_identity_bytes(configured.get("host_id"))):
+        raise ValueError("invalid database-scoped live owner identity")
+    scope = f"nqn.2026-01.local.tidehunter:db-{database}-p{partition:08x}-"
+    identity = hashlib.blake2b(
+        b"tidehunter-db-initiator-v1\0" + bytes(configured["host_id"])
+        + bytes.fromhex(database) + partition.to_bytes(4, "big"), digest_size=32).digest()
+    return {**configured, "host_nqn": scope + "host", "host_id": list(identity[:16]), "subsystem_scope": scope}
+
+
+def live_route_matches_owner(route, owner):
+    ns = route.get("namespace_identity") if isinstance(route, dict) else None
+    scope = owner.get("subsystem_scope")
+    return (isinstance(scope, str) and isinstance(ns, dict) and live_identity_bytes(route.get("host_id"))
+            and all(route.get(key) == owner.get(key) for key in ("host_nqn", "host_id", "address", "service"))
+            and scoped_live_subsystem(ns.get("nqn"), scope))
+
+
+def backend_live_database(backend_info):
+    config = backend_info.get("configuration") if isinstance(backend_info, dict) else None
+    return config.get("database") if isinstance(config, dict) else None
+
+
 def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
     """Bind verified initiator namespaces and target implementations to the fleet."""
     result = qualify_live_nvme_measurement(evidence, job, backend_info)
@@ -2266,6 +2334,11 @@ def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
     host_nqn = expected.get("host_nqn")
     service = expected.get("service")
     owners = expected.get("owners")
+    scoped = expected.get("identity_scope") == "database"
+    database = backend_live_database(backend_info)
+    if ((scoped and (owners is None or not live_database_id(database)))
+            or (database is not None and not scoped)):
+        return {"qualified": False, "reasons": reasons + ["missing or mismatched live database identity"]}
     if owners is not None:
         if (not isinstance(owners, dict)
                 or set(owners) != {str(i) for i in range(active_owner_count(job))}):
@@ -2281,6 +2354,11 @@ def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
                 return {"qualified": False, "reasons": reasons + ["invalid live owner identity"]}
         if len({owner["host_nqn"] for owner in owners.values()}) != len(owners):
             return {"qualified": False, "reasons": reasons + ["duplicate live owner identity"]}
+    if scoped:
+        try:
+            owners = {index: effective_live_owner(owner, database, int(index)) for index, owner in owners.items()}
+        except ValueError:
+            return {"qualified": False, "reasons": reasons + ["invalid database-scoped live owner identity"]}
     try:
         if (not isinstance(addresses, list) or not addresses
                 or (owners is None and len(set(addresses)) != len(addresses))
@@ -2312,6 +2390,7 @@ def qualify_live_nvme_route(evidence, job, expected, backend_info=None):
             if (not isinstance(route, dict) or route.get("transport") != transport
                     or route.get("address") not in addresses or route.get("service") != service
                     or route.get("host_nqn") != host_nqn or route.get("host_id") != host_id
+                    or scoped and not live_route_matches_owner(route, admitted)
                     or not isinstance(ns, dict)
                     or not isinstance(ns.get("namespace_path"), str)
                     or not re.fullmatch(r"/dev/nvme[0-9]+n[0-9]+", ns["namespace_path"])
@@ -3213,6 +3292,13 @@ def summarize_case(directory, *, local_mode=False):
             live = runtime_options(config).get("external_remote_config", {}).get("live_nvme")
             if not isinstance(live, dict) or any(expected.get(k) != live.get(k) for k in ("host_id", "host_nqn")):
                 raise ValueError("live NVMe identity differs from executed configuration")
+            if expected.get("identity_scope") == "database":
+                owners, seeds = expected.get("owners"), live.get("owner_identities")
+                if (not isinstance(owners, dict) or not isinstance(seeds, dict) or owners.keys() != seeds.keys()
+                        or any(not isinstance(owners[index], dict) or not isinstance(seed, dict)
+                               or any(owners[index].get(key) != seed.get(key) for key in ("host_id", "host_nqn"))
+                               for index, seed in seeds.items())):
+                    raise ValueError("live NVMe owner identities differ from executed configuration")
         qualification = qualify_live_nvme_route(read_interval["observed"] if read_interval else None, job, expected, backend_info)
         value["live_nvme_measurement_qualification"] = qualification
         if admitted is not None and qualification != admitted:

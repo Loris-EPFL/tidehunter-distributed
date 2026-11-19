@@ -49,6 +49,9 @@ pub(super) struct ControlContext {
     /// `inventory`, held across lifecycle and live target syncs.
     pub(super) lifecycle: inventory::LifecycleGate,
     pub(super) readers: Arc<parking_lot::RwLock<inventory::ReaderAuthority>>,
+    /// A lifecycle drop sets this under the live-control and lifecycle gates.
+    /// Session sweeps acquire it; a queued fence rechecks under those gates.
+    pub(super) closed: AtomicBool,
     pub(super) terminal: Arc<AtomicBool>,
     pub(super) poison_pending: Arc<AtomicBool>,
     /// Sticky for this owner incarnation: set by both poison funnels, never cleared,
@@ -71,6 +74,8 @@ pub(super) struct ControlContext {
     /// against exclusive controls; it does not take this gate. Terminal
     /// publication only `try_lock`s it and defers while it is held.
     pub(super) live_control_gate: Mutex<()>,
+    #[cfg(test)]
+    pub(super) before_fence: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub(super) struct ControlWork {
@@ -1099,9 +1104,9 @@ fn run(shared: &Shared) {
         }
         // The tier lives here, not in the inventory that builds the status.
         let response = response.map(|response| match response {
-            Response::Status(mut status) => {
+            Response::Status(StatusReply::Database(mut status)) => {
                 status.durability_tier = shared.durability.lock().config.tier;
-                Response::Status(status)
+                Response::Status(StatusReply::Database(status))
             }
             response => response,
         });
@@ -2200,22 +2205,39 @@ impl ControlContext {
                 )
                 .map(Response::Retired)
             }
-            Request::Status { protocol } => {
+            Request::Status { protocol, database } => {
                 if protocol != PROTOCOL {
                     return Err(TcpError::new("unsupported wire protocol"));
+                }
+                // A database session is bound to exactly this database.
+                if database != Some(self.partition.inventory.database) {
+                    return Err(TcpError::with_kind(
+                        std::io::ErrorKind::InvalidInput,
+                        "status scope differs from the bound database",
+                    ));
                 }
                 let mut status = self.status()?;
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
-                Ok(Response::Status(status))
+                Ok(Response::Status(StatusReply::Database(status)))
             }
             Request::Fence { epoch } => {
+                #[cfg(test)]
+                {
+                    let before_fence = self.before_fence.lock().take();
+                    if let Some(before_fence) = before_fence {
+                        before_fence();
+                    }
+                }
                 let _gate = self.live_control_gate.lock();
                 // Lock order: live-control gate, lifecycle gate, inventory. The
                 // fence releases the inventory across every revocation and sync.
                 let mut lifecycle = self.lifecycle.lock();
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(TcpError::new("database closed for drop"));
+                }
                 let mut status = if self.recoverable_live_failure.load(Ordering::Acquire) {
                     let status = NodeInventory::fence_recoverable_live(
                         &mut self.inventory.lock(),
@@ -2245,7 +2267,7 @@ impl ControlContext {
                 status.max_reads = self.effective_max_reads(limits);
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
-                Ok(Response::Status(status))
+                Ok(Response::Status(StatusReply::Database(status)))
             }
             // The long-poll needs the control owner's progress hub.
             Request::DurableProgress { .. } => Err(TcpError::new(
@@ -2346,6 +2368,12 @@ impl ControlContext {
                     super::generation_control::TrimReply {
                         generation: trim.generation,
                     },
+                ))
+            }
+            Request::ProvisionDatabase { .. } | Request::DropDatabase { .. } => {
+                Err(TcpError::with_kind(
+                    std::io::ErrorKind::InvalidInput,
+                    "provision and drop require a host-scope session",
                 ))
             }
         }

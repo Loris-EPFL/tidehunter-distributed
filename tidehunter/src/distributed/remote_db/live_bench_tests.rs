@@ -1,21 +1,18 @@
 //! Opt-in workstation latency measurements; never hardware qualification.
+use super::pipeline_tests::trusted_owner_host_config;
 use super::*;
 use crate::distributed::codec::BatchLimits;
-use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
+use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::nvmeof::{
-    LiveTargetConfig, NvmeofTransport,
-    live_metrics::{LiveNvmeCounts, LiveNvmeMetrics},
-    live_target::LiveTargetManager,
-};
-use crate::distributed::tcp::{LeasedSync, LiveClientConfig, NodeConfig, StorageNode, Transport};
+use crate::distributed::nvmeof::live_metrics::{LiveNvmeCounts, LiveNvmeMetrics};
+use crate::distributed::tcp::{LeasedSync, LiveClientConfig, OwnerHost, StorageNode, Transport};
 use crate::key_shape::KeyType;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::Command as Process;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Barrier, OnceLock};
 
 const OUTPUT: &str = "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/p11-local-bench";
 const CACHE: &str = "/home/hybr1d/.cache/tidehunter";
@@ -60,7 +57,8 @@ fn operation(sequence: usize) -> [u8; 16] {
 }
 
 struct Fixture {
-    node: Arc<StorageNode>,
+    node: OnceLock<Arc<StorageNode>>,
+    host: Arc<OwnerHost>,
     config: RemoteDatabaseConfig,
     shape: KeyShape,
     live: Arc<LiveNvmeMetrics>,
@@ -105,7 +103,7 @@ impl Fixture {
         };
         let mut config = RemoteDatabaseConfig {
             storage: LocalInventoryConfig {
-                database: [81; 16],
+                database: [0; 16],
                 partitions: vec![0],
                 batch_limits: BatchLimits {
                     max_operations: 32,
@@ -145,47 +143,21 @@ impl Fixture {
             relocation_max_reclaim_pct: 100,
             compactor_cadence: Default::default(),
         };
-        let node = StorageNode::open(
-            NodeConfig {
-                root: root.join("owner"),
-                partition: config.partition_config(1, 0),
-                shape_yaml: shape.to_yaml().unwrap(),
-                wal_member_read: Default::default(),
-                wal_prewrite: false,
-                read_max_device_reads: 64,
-                live_target: None,
-            },
-            metrics(),
-        )
-        .unwrap();
-        node.set_durability(DurabilityConfig::with_tier(tier))
-            .unwrap();
         let target_root = std::env::var_os("TH_TAIL_TARGET_DIR")
             .map(|path| tempdir::TempDir::new_in(path, "tail-target").unwrap());
         let target_path = target_root
             .as_ref()
             .map_or(root, |directory| directory.path());
-        let state_dir = target_path.join("target");
         let configfs = target_path.join("configfs");
-        fs::create_dir(&state_dir).unwrap();
         for name in ["hosts", "ports", "subsystems"] {
             fs::create_dir_all(configfs.join(name)).unwrap();
         }
-        let target = LiveTargetManager::open_fixture(
-            LiveTargetConfig {
-                address: "127.0.0.1".into(),
-                service: 4420,
-                transport: NvmeofTransport::Tcp,
-                host_nqn: "nqn.2026-01.test:p11-bench".into(),
-                port_id: 42,
-                state_dir,
-                commissioning_port_id: 43,
-                commissioning_service: 4421,
-            },
+        let host = OwnerHost::open_with_live_fixture(
+            trusted_owner_host_config(root.join("owner")),
+            metrics(),
             configfs,
         )
         .unwrap();
-        node.bench_install_live_target(target);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         config.endpoints.push(RemoteEndpoint {
             partition: 0,
@@ -193,7 +165,7 @@ impl Fixture {
             server_name: tls.server_name.clone(),
         });
         let stop = Arc::new(AtomicBool::new(false));
-        let serving = node.clone();
+        let serving = Arc::clone(&host);
         let stopping = stop.clone();
         let server = thread::spawn(move || {
             serving
@@ -210,7 +182,8 @@ impl Fixture {
         });
         Self {
             root: directory,
-            node,
+            node: OnceLock::new(),
+            host,
             config,
             shape,
             live: LiveNvmeMetrics::new(),
@@ -229,6 +202,8 @@ impl Fixture {
             arm == "C-buf",
         )
         .unwrap();
+        self.node
+            .get_or_init(|| self.host.database(&db.database_id()).unwrap());
         for worker in &db.core.clients {
             worker
                 .client
@@ -238,11 +213,14 @@ impl Fixture {
         }
         db
     }
+    fn node(&self) -> &StorageNode {
+        self.node.get().unwrap()
+    }
     fn owner_stats(&self) -> PartitionStats {
-        self.node.log_for_test(1).stats()
+        self.node().log_for_test(1).stats()
     }
     fn owner_syncer_calls(&self) -> Option<u64> {
-        self.node
+        self.node()
             .log_for_test(1)
             .frontier()
             .map(|frontier| frontier.stats().fsync_calls)
@@ -361,18 +339,19 @@ fn owner_initiator_map_is_pinned_across_authority_reopen() {
         assert!(open(config).is_err(), "accepted changed map {change}");
     }
     let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    manifest.live_nvme_owner_identities.clear();
+    let configured = std::mem::take(&mut manifest.live_nvme_owner_identities);
     persist_manifest(&root, &manifest, CoordinatorIoCategory::Open).unwrap();
     assert!(
         open(f.config.clone())
             .err()
             .unwrap()
             .to_string()
-            .contains("authority configuration/history differs")
+            .contains("authority configuration differs from the recorded authority")
     );
-    f.config.live_nvme.owner_identities.clear();
-    let legacy = open(f.config.clone()).unwrap();
-    super::tests::fail_stop_without_checkpoint(legacy);
+    manifest.live_nvme_owner_identities = configured;
+    persist_manifest(&root, &manifest, CoordinatorIoCategory::Open).unwrap();
+    let restored = open(f.config.clone()).unwrap();
+    super::tests::fail_stop_without_checkpoint(restored);
 }
 
 #[derive(Serialize)]
@@ -661,7 +640,7 @@ fn configure_reads(
     }
     db.core
         .reads
-        .bench_install_owner_local(&fixture.node, reference);
+        .bench_install_owner_local(fixture.node(), reference);
 }
 #[test]
 fn leased_settled_dataset_matches_inline_and_worker_lanes_in_both_tiers() {
@@ -686,7 +665,7 @@ fn leased_settled_dataset_matches_inline_and_worker_lanes_in_both_tiers() {
             if inline_reads {
                 db.core
                     .reads
-                    .bench_install_owner_local(&fixture.node, reference);
+                    .bench_install_owner_local(fixture.node(), reference);
             }
             let live_before = fixture.live.snapshot().counts.completed_read_ops;
             let before = profile(&db);
@@ -771,7 +750,7 @@ fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize])
             if parked.is_some() {
                 db.core
                     .reads
-                    .bench_install_owner_local(&fixture.node, reference);
+                    .bench_install_owner_local(fixture.node(), reference);
             }
             // Warm the exact measured route after its final grant/queue setup.
             for key in &keys {
@@ -1350,7 +1329,7 @@ fn leased_checkpoint_tail_workstation() {
             )
             .unwrap();
         }
-        let preparation = fixture.node.log_for_test(1).live_file_preparation_stats();
+        let preparation = fixture.node().log_for_test(1).live_file_preparation_stats();
         println!(
             "checkpoint_tail_workstation {}",
             json!({
@@ -1365,9 +1344,9 @@ fn leased_checkpoint_tail_workstation() {
                 "live_leased_write_window": leased_write_window,
                 "live_leased_write_window_bound": leased_write_window_bound,
                 "live_file_prepare_failures": preparation.live_file_prepare_failures,
-                "grant_profiles": fixture.node.bench_live_grant_profiles(),
-                "live_file_diagnostics": fixture.node.log_for_test(1).live_test_diagnostics(),
-                "adoption": fixture.node.log_for_test(1).live_test_diagnostics().adoption,
+                "grant_profiles": fixture.node().bench_live_grant_profiles(),
+                "live_file_diagnostics": fixture.node().log_for_test(1).live_test_diagnostics(),
+                "adoption": fixture.node().log_for_test(1).live_test_diagnostics().adoption,
                 "target_dir": fixture.target_root.as_ref().map_or(fixture.root.path(), |directory| directory.path()),
                 "checkpoint_started": checkpoint_started,
                 "completed_checkpoint_lifetime_ns": completed_checkpoint_lifetime_ns,
@@ -1384,7 +1363,7 @@ fn leased_checkpoint_tail_workstation() {
         // Verify the coordinator index against the real owner's final WAL after
         // an explicit barrier, without asking a workstation for a fabrics device.
         db.flush_durable().unwrap();
-        let log = fixture.node.log_for_test(1);
+        let log = fixture.node().log_for_test(1);
         for sequence in 0..calls {
             let reference = db
                 .index_reference(KeySpace(0), &key(sequence), IndexReadCut::Latest)

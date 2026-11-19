@@ -38,6 +38,10 @@ pub type Result<T, E = DbError> = std::result::Result<T, E>;
 fn error(e: impl std::fmt::Display) -> DbError {
     DbError::Io(std::io::Error::other(e.to_string()))
 }
+/// Keep the typed class (busy, missing, invalid) of a remote open failure.
+fn remote_error(e: super::storage::LocalDbError) -> DbError {
+    DbError::Io(std::io::Error::new(e.kind(), e.to_string()))
+}
 
 /// Cumulative completed spans, including failed calls and unwinding. Nanoseconds
 /// are sums across callers, not wall time or means. Recording allocates nothing.
@@ -557,6 +561,15 @@ impl Db {
         }
     }
 
+    /// The provisioned database identity of a remote backend; `None` for the
+    /// native backend.
+    pub fn remote_database_id(&self) -> Option<[u8; 16]> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote.db.database_id()),
+            Backend::Native(_) => None,
+        }
+    }
+
     /// Owner persistence counters summed over owners (WAL syncs, live-frontier
     /// requests and installs). `None` for the native backend.
     pub fn owner_storage_stats(&self) -> Result<Option<super::storage::PartitionStats>> {
@@ -615,14 +628,13 @@ impl Db {
         }
     }
 
+    /// Native or coordinated remote drop, classified under the target's
+    /// namespace lock (never from an unlocked marker check): a remote
+    /// authority drops every owner and nested remote database first; an
+    /// unmarked directory with remote descendants is refused (`AlreadyExists`)
+    /// instead of being removed natively. Busy gives `AlreadyExists`.
     pub fn drop_db(path: &Path) -> std::io::Result<()> {
-        if path.join("tcp-database-authority-v1").exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "cannot destroy only a sharded-wal coordinator: retained shard history requires coordinated retirement",
-            ));
-        }
-        NativeDb::drop_db(path)
+        super::remote_db::drop_db(path, NativeDb::drop_db)
     }
     pub fn open_native(
         path: &Path,
@@ -685,9 +697,8 @@ impl Db {
         if let Some(unavailable) = super::sys::route_unavailable() {
             return Err(error(unavailable));
         }
-        let capture_id =
-            kv_capture::open(path, &shape, Some(&config.storage.database)).map_err(error)?;
-        let mut db = open(path, &shape, config).map_err(error)?;
+        let mut db = open(path, &shape, config).map_err(remote_error)?;
+        let capture_id = kv_capture::open(path, &shape, Some(&db.database_id())).map_err(error)?;
         db.configure_sui_read_cache();
         let epoch = db.epoch();
         let profile = db.read_profile_monitor();

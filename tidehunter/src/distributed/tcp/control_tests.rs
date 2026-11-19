@@ -1718,7 +1718,7 @@ pub(super) mod live_fencing {
             // A later real completion proves the no-op/rejected fences did not
             // stop the old frontier. Its next control must still be able to sync.
             let second = adopt_leased_frame(&node, &config, &leased, 1, leased.extent.start + 4096);
-            let Response::Status(status) = fence(&node, 2).unwrap() else {
+            let Response::Status(StatusReply::Database(status)) = fence(&node, 2).unwrap() else {
                 panic!("expected fenced status")
             };
             assert_eq!(status.active_epoch, Some(2));
@@ -1792,7 +1792,9 @@ pub(super) mod live_fencing {
             Err(mpsc::TryRecvError::Empty)
         ));
         resume_sync.send(()).unwrap();
-        let Response::Status(status) = receive(&completions, 2).response.unwrap() else {
+        let Response::Status(StatusReply::Database(status)) =
+            receive(&completions, 2).response.unwrap()
+        else {
             panic!("expected recovered authority")
         };
         assert_eq!(frontier.synced(), frontier.appended());
@@ -2080,7 +2082,9 @@ pub(super) mod live_fencing {
             };
             assert_eq!(adopted.adoption.receipt_count, 1);
             assert_eq!(adopted.adoption.adopted_end, frame.len() as u64);
-            let Response::Status(status) = receive(&completions, 2).response.unwrap() else {
+            let Response::Status(StatusReply::Database(status)) =
+                receive(&completions, 2).response.unwrap()
+            else {
                 panic!("expected higher-epoch fence")
             };
             assert_eq!(status.active_epoch, Some(2));
@@ -2144,7 +2148,7 @@ pub(super) mod live_fencing {
             .unwrap()
             .write_all_at(&frame, 0)
             .unwrap();
-        let Response::Status(status) = fence(&node, 2).unwrap() else {
+        let Response::Status(StatusReply::Database(status)) = fence(&node, 2).unwrap() else {
             panic!("expected fenced authority")
         };
         assert_eq!(status.active_epoch, Some(2));
@@ -2435,8 +2439,8 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 33);
-    preface[4..6].copy_from_slice(&32u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 34);
+    preface[4..6].copy_from_slice(&33u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }
 
@@ -2487,8 +2491,14 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
         config.wal_member_read = policy;
         config.read_max_device_reads = device_reads;
         let node = StorageNode::open(config.clone(), metrics()).unwrap();
-        let Response::Status(status) = node
-            .handle(Request::Status { protocol: PROTOCOL }, limits)
+        let Response::Status(StatusReply::Database(status)) = node
+            .handle(
+                Request::Status {
+                    protocol: PROTOCOL,
+                    database: Some(node.database()),
+                },
+                limits,
+            )
             .unwrap()
         else {
             panic!("{name}: status reply");

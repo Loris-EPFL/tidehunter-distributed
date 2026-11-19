@@ -46,23 +46,23 @@ impl Session {
 pub(super) struct OwnerProgress<'a> {
     /// The listener's level-triggered shutdown wake. Never drained here.
     shutdown: &'a WakeFd,
+    close: &'a WakeFd,
     completion: CompletionWake,
     /// The outstanding durable-progress request of this session.
     request: Option<u64>,
 }
 
 impl<'a> OwnerProgress<'a> {
-    pub(super) fn new(node: &StorageNode, shutdown: &'a WakeFd) -> Self {
+    pub(super) fn new(node: &'a StorageNode, shutdown: &'a WakeFd) -> Self {
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut completion = CompletionWake::new();
         #[cfg(test)]
         {
             completion.hook = node.progress_wait_hook.lock().clone();
         }
-        #[cfg(not(test))]
-        let _ = node;
         Self {
             shutdown,
+            close: &node.close_wake,
             completion,
             request: None,
         }
@@ -173,6 +173,7 @@ impl<'a> OwnerProgress<'a> {
         }
         set.completion(completion)?;
         set.stop(self.shutdown)?;
+        set.stop(self.close)?;
         #[cfg(test)]
         set.instrument(self.completion.hook.as_ref(), id);
         let began = profile.as_ref().map(|_| Instant::now());

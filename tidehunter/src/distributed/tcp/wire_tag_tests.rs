@@ -1,6 +1,6 @@
 //! Frozen owner-protocol wire tags. Bincode encodes an enum variant as its
 //! declaration index, so the ordered variant list below *is* the tag table of
-//! protocol 33. Changing it requires a protocol bump.
+//! protocol 34. Changing it requires a protocol bump.
 
 use super::{HARD_FRAME_LIMIT, PROTOCOL, Request, Response, wire_codec};
 use bincode::Options;
@@ -53,8 +53,8 @@ fn variants<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
 }
 
 #[test]
-fn protocol_33_request_tags_are_frozen() {
-    assert_eq!(PROTOCOL, 33);
+fn protocol_34_request_tags_are_frozen() {
+    assert_eq!(PROTOCOL, 34);
     assert_eq!(
         variants::<Request>(),
         [
@@ -89,12 +89,14 @@ fn protocol_33_request_tags_are_frozen() {
             "TrimGeneration",       // 28
             "FileInventoryPage",    // 29
             "RelocationPage",       // 30
+            "ProvisionDatabase",    // 31
+            "DropDatabase",         // 32
         ]
     );
 }
 
 #[test]
-fn protocol_33_response_tags_are_frozen() {
+fn protocol_34_response_tags_are_frozen() {
     assert_eq!(
         variants::<Response>(),
         [
@@ -126,6 +128,8 @@ fn protocol_33_response_tags_are_frozen() {
             "TrimGeneration",      // 25
             "FileInventoryPage",   // 26
             "RelocationPage",      // 27
+            "ProvisionDatabase",   // 28
+            "DropDatabase",        // 29
         ]
     );
 }
@@ -140,7 +144,13 @@ fn bincode_tag_is_the_declaration_index() {
             .expect("encode request")
     };
     for (request, tag) in [
-        (Request::Status { protocol: PROTOCOL }, 1u32),
+        (
+            Request::Status {
+                protocol: PROTOCOL,
+                database: None,
+            },
+            1u32,
+        ),
         (Request::PartitionStats, 12),
         (Request::LiveTargetStats, 15),
         (Request::ProcessResources { epoch: 3 }, 25),

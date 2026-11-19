@@ -223,10 +223,10 @@ fn recorded_live_identity_cannot_reopen_as_tcp() {
 }
 
 #[test]
-fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
-    // Exact field order and representations of the pre-owner-map manifest.
+fn empty_owner_identity_map_preserves_manifest_bytes() {
+    // Exact field order of the current manifest without the optional map.
     #[derive(Serialize, Deserialize)]
-    struct LegacyManifest {
+    struct ManifestWithoutOwnerMap {
         format: u32,
         storage: LocalInventoryConfig,
         history_persistence: String,
@@ -240,11 +240,13 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
         checkpoint: Option<CheckpointCommit>,
         checkpoint_staging: Option<CheckpointFiles>,
         checkpoint_obsolete: Option<CheckpointCommit>,
+        lifecycle: Option<AuthorityLifecycle>,
+        owner_control: Option<OwnerControlConfig>,
     }
     let f = Fixture::new();
     let db = f.open();
     let manifest = &manifest(&db);
-    let legacy = LegacyManifest {
+    let without_map = ManifestWithoutOwnerMap {
         format: manifest.format,
         storage: manifest.storage.clone(),
         history_persistence: "wal_replay".into(),
@@ -258,14 +260,16 @@ fn empty_owner_identity_map_preserves_legacy_manifest_bytes() {
         checkpoint: manifest.checkpoint.clone(),
         checkpoint_staging: manifest.checkpoint_staging.clone(),
         checkpoint_obsolete: manifest.checkpoint_obsolete.clone(),
+        lifecycle: manifest.lifecycle,
+        owner_control: manifest.owner_control.clone(),
     };
     assert_eq!(
         encode_metadata(manifest).unwrap(),
-        encode_metadata(&legacy).unwrap()
+        encode_metadata(&without_map).unwrap()
     );
-    let old: AuthorityManifest =
-        serde_yaml::from_str(&serde_yaml::to_string(&legacy).unwrap()).unwrap();
-    assert!(old.live_nvme_owner_identities.is_empty());
+    let decoded: AuthorityManifest =
+        serde_yaml::from_str(&serde_yaml::to_string(&without_map).unwrap()).unwrap();
+    assert!(decoded.live_nvme_owner_identities.is_empty());
     drop(db);
 }
 
@@ -567,10 +571,9 @@ fn checkpoint_does_not_turn_damaged_referenced_value_into_absence() {
     let file = fs::OpenOptions::new()
         .write(true)
         .open(
-            fixture
-                .temp
-                .path()
-                .join("node-0")
+            fixture.startups[0]
+                .0
+                .root
                 .join("epoch_0000000000000001")
                 .join(format!(
                     "wal_{:016x}",
@@ -889,18 +892,25 @@ fn failed_parallel_connect_does_not_reserve_or_escape_an_authority() {
     let fixture = Fixture::new();
     let mut config = fixture.config.clone();
     config.endpoints[2].server_name = "wrong-peer.invalid".to_owned();
-    let root = fixture.temp.path().join("failed-connect");
-    assert!(
-        RemoteDatabase::open(&root, &fixture.shape, config.clone(), recovery_metrics()).is_err()
-    );
-    let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
+    let root = fixture.authority();
+    let mut manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
+    // Match the recorded endpoint so open reaches the parallel mTLS handshakes
+    // rather than refusing changed geometry or a supplied ID for a new path.
+    manifest.endpoints[2].server_name = config.endpoints[2].server_name.clone();
+    persist_manifest(&root, &manifest, CoordinatorIoCategory::Open).unwrap();
+    let before = fs::read(root.join(MANIFEST)).unwrap();
+    let error = fixture.try_open_with(config.clone()).err().unwrap();
+    assert!(error.to_string().contains("wrong-peer.invalid"), "{error}");
     assert!(manifest.generations.is_empty());
     assert_eq!(manifest.next_generation, 1);
+    assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before);
     // The failed attempt's scoped connection workers are all gone before lock
     // acquisition can succeed. Keep the recorded immutable endpoint inventory.
     let lock = DbLock::acquire(&root, Duration::ZERO).unwrap();
     drop(lock);
-    assert!(RemoteDatabase::open(&root, &fixture.shape, config, recovery_metrics()).is_err());
+    let retry = fixture.try_open_with(config).err().unwrap();
+    assert!(retry.to_string().contains("wrong-peer.invalid"), "{retry}");
+    assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before);
 }
 
 #[test]
@@ -1044,7 +1054,6 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
     fixture.config.max_pending_reads = 1;
     fixture.config.max_pending_read_bytes = ReadService::MIN_FLIGHT_BYTES + 4096;
     fixture.config.read_cache_bytes = 0;
-    let root = fixture.temp.path().join("authority");
     for existing in [false, true] {
         if existing {
             let db = fixture.open();
@@ -1052,6 +1061,11 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
                 .unwrap();
             db.shutdown().unwrap();
         }
+        let root = if existing {
+            fixture.authority()
+        } else {
+            fixture.temp.path().join("unusable-before-provision")
+        };
         let before = existing.then(|| fs::read(root.join(MANIFEST)).unwrap());
         for (requests, bytes) in [
             (0, fixture.config.max_pending_read_bytes),
@@ -1060,6 +1074,9 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
             let mut config = fixture.config.clone();
             config.max_pending_reads = requests;
             config.max_pending_read_bytes = bytes;
+            if !existing {
+                config.storage.database = [0; 16];
+            }
             assert!(
                 RemoteDatabase::open(&root, &fixture.shape, config, recovery_metrics()).is_err(),
                 "accepted unusable read capacity: requests={requests}, bytes={bytes}"

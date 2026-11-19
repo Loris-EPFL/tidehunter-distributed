@@ -432,6 +432,52 @@ class CloudMatrixTests(unittest.TestCase):
         route["writer"]["file_identity"]["inode"] = 0
         self.assertFalse(cloud.qualify_live_nvme_route(evidence, spdk_job, expected)["qualified"])
 
+    def test_live_route_binds_database_and_partition_to_configured_seed(self):
+        database = "aa" * 16
+        host = {"host_id": [1] * 16, "host_nqn": "nqn.2014-08.org.nvmexpress:uuid:01010101-0101-0101-0101-010101010101"}
+        owner = dict(host, address="10.0.0.1", service=4420)
+        owners = {"0": owner}
+        for i in range(1, 5):
+            host_id = [i + 1] * 16
+            nqn = "nqn.2014-08.org.nvmexpress:uuid:" + str(cloud.uuid.UUID(bytes=bytes(host_id)))
+            owners[str(i)] = dict(host_id=host_id, host_nqn=nqn, address=f"10.0.0.{i + 1}", service=4420 + 2 * i)
+        expected = dict(host, transport="tcp", addresses=[r["address"] for r in owners.values()],
+                        service=4420, owners=owners, identity_scope="database")
+        effective = cloud.effective_live_owner(owner, database, 0)
+        self.assertEqual(bytes(effective["host_id"]).hex(), "ef6d1c505470b25f2ee82873ff29ed23")
+        route = {"transport": "tcp", **{key: effective[key] for key in ("host_id", "host_nqn", "address", "service")},
+                 "namespace_identity": {"namespace_path": "/dev/nvme0n1", "controller_instance": 0,
+                    "nqn": effective["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000001",
+                    "uuid": [2] * 16, "nsid": 1, "bytes": 4096, "block_size": 4096}}
+        routes = [route]
+        for index, seed in list(owners.items())[1:]:
+            effective = cloud.effective_live_owner(seed, database, int(index))
+            routes.append({"transport": "tcp",
+                **{key: effective[key] for key in ("host_id", "host_nqn", "address", "service")},
+                "namespace_identity": dict(route["namespace_identity"],
+                    nqn=effective["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000001")})
+        zero = dict.fromkeys(cloud.LIVE_NVME_COUNTERS, 0)
+        end = zero | {"completed_write_ops": 1, "completed_write_bytes": 4096}
+        evidence = {"measurement_attempted": True, "measurement_drained": True,
+                    "start": {"live_nvmeof": zero}, "end": {"live_nvmeof": end | {"routes": routes}},
+                    "live_nvmeof": {"available": True, "counters": end}}
+        job = {"backend": "tidehunter_nvme_tcp", "mix": cloud.mix(put=100)}
+        backend = {"configuration": {"database": database}}
+        def qualifies():
+            return cloud.qualify_live_nvme_route(evidence, job, expected, backend)
+        self.assertTrue(qualifies()["qualified"], qualifies()["reasons"])
+        for wrong in (None, "0" * 32, "bb" * 16, "aa" * 15):
+            with self.subTest(database=wrong):
+                backend["configuration"]["database"] = wrong
+                self.assertFalse(qualifies()["qualified"])
+        backend["configuration"]["database"] = database
+        nqn = route["namespace_identity"]["nqn"]
+        route["namespace_identity"]["nqn"] = nqn.replace("-p00000000-", "-p00000001-")
+        self.assertFalse(qualifies()["qualified"])
+        route["namespace_identity"]["nqn"] = nqn
+        route["host_id"] = host["host_id"]
+        self.assertFalse(qualifies()["qualified"])
+
     def test_timeline_twins_have_matched_counts_and_no_legacy_profile(self):
         spec = self.spec(1) | {"mode": "standard-with-live-nvmeof",
                 "backends": ["native", "tidehunter_nvme_tcp", "tidehunter_nvme_rdma"],

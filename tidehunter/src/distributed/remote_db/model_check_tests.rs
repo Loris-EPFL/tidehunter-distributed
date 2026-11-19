@@ -8,7 +8,7 @@
 //! gates follow a seed-selected acknowledged prefix, never a count of physical
 //! writes/flushes. Every failure retains its exact history, gate and boundary
 //! trace.
-use super::pipeline_tests::{Fixture, open_live_node};
+use super::pipeline_tests::{Fixture, open_live_fixture_host};
 use super::*;
 use crate::failpoints::write_model;
 use crate::key_shape::KeyType;
@@ -147,8 +147,47 @@ struct Restart {
     root: PathBuf,
     shape: KeyShape,
     config: RemoteDatabaseConfig,
-    nodes: Vec<(super::super::tcp::NodeConfig, TlsFiles)>,
+    database: [u8; 16],
+    owners: Vec<(super::super::tcp::OwnerHostConfig, TlsFiles)>,
     operations: Vec<[u8; 16]>,
+}
+
+impl Restart {
+    fn capture(fixture: &Fixture, operations: Vec<[u8; 16]>) -> Self {
+        Self {
+            root: fixture.temp.path().to_path_buf(),
+            shape: fixture.shape.clone(),
+            config: fixture.config.clone(),
+            database: fixture.config.storage.database,
+            owners: fixture
+                .host_configs
+                .iter()
+                .zip(&fixture.startups)
+                .map(|(host, (_, tls, _))| (host.clone(), tls.clone()))
+                .collect(),
+            operations,
+        }
+    }
+
+    fn serve_owners(
+        &self,
+        shutdown: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Vec<JoinHandle<Result<(), super::super::tcp::TcpError>>> {
+        self.owners
+            .iter()
+            .zip(&self.config.endpoints)
+            .map(|((config, tls), endpoint)| {
+                let host = open_live_fixture_host(config.clone()).unwrap();
+                assert!(host.database(&self.database).is_some());
+                let listener = std::net::TcpListener::bind(&endpoint.address).unwrap();
+                let tls = tls.clone();
+                let stop = Arc::clone(shutdown);
+                thread::spawn(move || {
+                    host.serve(listener, tls, super::super::tcp::TcpLimits::default(), stop)
+                })
+            })
+            .collect()
+    }
 }
 
 /// The owner tier of a case is the tier of its leased profile.
@@ -355,17 +394,7 @@ fn write_child(directory: &Path, case: &Case) {
             fixture.operation(owner as u32, id as u64 + 1)
         })
         .collect();
-    let restart = Restart {
-        root: fixture.temp.path().to_path_buf(),
-        shape: fixture.shape.clone(),
-        config: fixture.config.clone(),
-        operations: operations.clone(),
-        nodes: fixture
-            .startups
-            .iter()
-            .map(|(config, tls, _)| (config.clone(), tls.clone()))
-            .collect(),
-    };
+    let restart = Restart::capture(&fixture, operations.clone());
     fs::write(
         directory.join("restart.json"),
         serde_json::to_vec(&restart).unwrap(),
@@ -472,27 +501,7 @@ fn recover_child(directory: &Path) {
     let case: Case =
         serde_json::from_slice(&fs::read(directory.join("case.json")).unwrap()).unwrap();
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut servers = Vec::new();
-    let mut nodes = Vec::new();
-    for ((config, tls), endpoint) in restart.nodes.iter().zip(&restart.config.endpoints) {
-        let node = open_live_node(config.clone(), &restart.config.live_nvme.host_nqn).unwrap();
-        node.set_durability(super::super::durability::DurabilityConfig::with_tier(
-            if synchronous(&case) {
-                super::super::durability::DurabilityTier::Synchronous
-            } else {
-                super::super::durability::DurabilityTier::Native
-            },
-        ))
-        .unwrap();
-        let listener = std::net::TcpListener::bind(&endpoint.address).unwrap();
-        let serving = node.clone();
-        let tls = tls.clone();
-        let stop = shutdown.clone();
-        servers.push(thread::spawn(move || {
-            serving.serve(listener, tls, super::super::tcp::TcpLimits::default(), stop)
-        }));
-        nodes.push(node);
-    }
+    let servers = restart.serve_owners(&shutdown);
     // Recovery and every later read of the recovered files go through the
     // ordinary-file live fixture.
     let db = RemoteDatabase::open_local_live_fixture(
@@ -501,6 +510,7 @@ fn recover_child(directory: &Path) {
         restart.config.clone(),
     )
     .unwrap();
+    assert_eq!(db.database_id(), restart.database);
     // Durable-prefix recovery must run exactly for Native owners with WAL
     // replay, and may discard only batches that no caller saw acknowledged
     // (checked against the history by the parent).
@@ -578,7 +588,6 @@ fn recover_child(directory: &Path) {
     for server in servers {
         server.join().unwrap().unwrap();
     }
-    drop(nodes);
 }
 
 #[test]

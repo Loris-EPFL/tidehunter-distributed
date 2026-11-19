@@ -33,7 +33,6 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
     {
         return Err("distributed replay requires strictly increasing node DB ids in 0..=2".into());
     }
-    let mut identities = BTreeSet::new();
     let mut paths = Vec::<std::path::PathBuf>::new();
     let mut result = Vec::with_capacity(3);
     for node in parsed {
@@ -41,17 +40,10 @@ fn options(value: &serde_json::Value) -> BackendResult<Vec<(u16, serde_json::Val
         let remote = &opts.external_remote_config;
         remote.validate()?;
         if opts
-            .database
-            .is_some_and(|db| db != remote.storage.database)
-            || opts
-                .batch_limits
-                .is_some_and(|limits| limits != remote.storage.batch_limits)
+            .batch_limits
+            .is_some_and(|limits| limits != remote.storage.batch_limits)
         {
-            return Err("conflicting external replay database identity or batch limits".into());
-        }
-        let database = remote.storage.database;
-        if !identities.insert(database) {
-            return Err("distributed replay node DB identities must be distinct".into());
+            return Err("conflicting external replay batch limits".into());
         }
         if !opts.path.is_absolute()
             || opts

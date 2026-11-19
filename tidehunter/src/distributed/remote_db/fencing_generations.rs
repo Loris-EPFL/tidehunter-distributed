@@ -29,12 +29,8 @@ use crate::distributed::tcp::{
     InventoryGeneration, NodeStatus, OwnerGenerationState, TrimReadiness,
 };
 
-/// Authority manifest format that allows the Exact callback-start wrapper.
-pub(super) const AUTHORITY_FORMAT: u32 = 8;
-/// L1 introduced the monotone fencing ledger; its Exact roots are readable.
-const FENCING_AUTHORITY_FORMAT: u32 = 6;
-/// L3 gated DropCells batches. The ledger structure did not change.
-const DROP_CELLS_AUTHORITY_FORMAT: u32 = 7;
+/// L2 requires a provisioned identity and owner lifecycle metadata.
+pub(super) const AUTHORITY_FORMAT: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,14 +62,13 @@ struct FormatProbe {
 pub(super) fn read_authority_manifest(path: &Path) -> Result<AuthorityManifest, LocalDbError> {
     let probe: FormatProbe = read_metadata(path).map_err(LocalDbError::component)?;
     probe.mode.reject_legacy_mode(probe.format)?;
-    match probe.format {
-        FENCING_AUTHORITY_FORMAT | DROP_CELLS_AUTHORITY_FORMAT | AUTHORITY_FORMAT => {
-            read_metadata(path).map_err(LocalDbError::component)
-        }
-        format => Err(LocalDbError::new(format!(
-            "unsupported distributed authority manifest format {format} (expected {AUTHORITY_FORMAT})"
-        ))),
+    if probe.format != AUTHORITY_FORMAT {
+        return Err(LocalDbError::new(format!(
+            "unsupported distributed authority manifest format {} (expected {AUTHORITY_FORMAT})",
+            probe.format
+        )));
     }
+    read_metadata(path).map_err(LocalDbError::component)
 }
 
 /// Manifest invariants: nonzero strictly ascending generations below

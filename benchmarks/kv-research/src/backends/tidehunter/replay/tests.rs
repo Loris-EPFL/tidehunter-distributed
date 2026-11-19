@@ -14,10 +14,12 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
+use tidehunter::distributed::durability::DurabilityTier;
 use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
 use tidehunter::distributed::sui;
-use tidehunter::distributed::tcp::{NodeConfig, StorageNode, TcpLimits, TlsFiles, Transport};
+use tidehunter::distributed::tcp::{
+    LiveTargetPool, OwnerHost, OwnerHostConfig, TcpLimits, TlsFiles, Transport,
+};
 use tidehunter::metrics::Metrics;
 
 fn trace() -> Trace {
@@ -49,7 +51,7 @@ fn tls() -> TlsFiles {
 /// Leased coordinator configuration of node DB `id` with one owner at `address`.
 fn remote_config(id: u16, address: &str) -> RemoteDatabaseConfig {
     serde_json::from_value(serde_json::json!({
-        "storage":{"database":vec![id as u8+1;16],"partitions":[0],
+        "storage":{"partitions":[0],
             "batch_limits":{"max_operations":519,"max_encoded_bytes":500000},
             "group_limits":{"max_batches":32,"max_encoded_bytes":2097152},
             "fragment_bytes":4194304,"wal_file_bytes":16777216,"max_batches_per_partition":8192,
@@ -92,7 +94,10 @@ fn explicit_domains_and_complete_batch_limits_are_admitted_before_open() {
     }
     let mut bad = good.clone();
     bad["databases"][1]["options"]["external_remote_config"]["storage"]["database"] =
-        bad["databases"][0]["options"]["external_remote_config"]["storage"]["database"].clone();
+        serde_json::json!(vec![1; 16]);
+    assert!(TidehunterReplayBackend::validate(&bad, &trace).is_err());
+    let mut bad = good.clone();
+    bad["databases"][1]["options"]["database"] = serde_json::json!(vec![1; 16]);
     assert!(TidehunterReplayBackend::validate(&bad, &trace).is_err());
     let mut bad = good.clone();
     bad["databases"][1]["options"]["path"] = bad["databases"][0]["options"]["path"].clone();
@@ -123,6 +128,7 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
         servers: Vec::new(),
     };
     let mut databases = BTreeMap::new();
+    let mut identities = BTreeSet::new();
     for id in trace
         .batches
         .iter()
@@ -134,57 +140,34 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
         let shape = shape(&trace.tables, id);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = remote_config(id, &listener.local_addr().unwrap().to_string());
-        let node_config = NodeConfig {
+        let host_config = OwnerHostConfig {
             root: base.join("owner"),
-            partition: tidehunter::distributed::storage::PartitionConfig {
-                inventory: tidehunter::distributed::storage::StaticInventory {
-                    database: config.storage.database,
-                    epoch: 1,
-                    segment_generation: 1,
-                    partitions: config.storage.partitions.clone(),
-                },
-                partition: 0,
-                batch_limits: config.storage.batch_limits,
-                group_limits: config.storage.group_limits,
-                fragment_bytes: config.storage.fragment_bytes,
-                wal_file_bytes: config.storage.wal_file_bytes,
-                max_batches: config.storage.max_batches_per_partition,
-                max_reference_metadata_bytes: config.storage.max_reference_metadata_bytes,
+            max_databases: 1,
+            live_target_pool: LiveTargetPool {
+                address: "127.0.0.1".into(),
+                transport: tidehunter::distributed::nvmeof::NvmeofTransport::Tcp,
+                public_port_base: 42,
+                public_service_base: 4420,
+                commissioning_port_base: 43,
+                commissioning_service_base: 4421,
             },
-            shape_yaml: serde_yaml::to_string(&shape).unwrap(),
+            trusted_coordinator_id: Some([1; 32]),
             wal_member_read: Default::default(),
             wal_prewrite: false,
             read_max_device_reads: 64,
-            live_target: None,
+            durability: Default::default(),
         };
-        let node = StorageNode::open(
-            node_config,
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-        )
-        .unwrap();
-        node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
-            .unwrap();
-        let state = base.join("target");
         let configfs = base.join("configfs");
-        std::fs::create_dir_all(&state).unwrap();
         for name in ["hosts", "ports", "subsystems"] {
             std::fs::create_dir_all(configfs.join(name)).unwrap();
         }
-        node.set_live_target_fixture(
-            tidehunter::distributed::nvmeof::LiveTargetConfig {
-                address: "127.0.0.1".into(),
-                service: 4420,
-                transport: tidehunter::distributed::nvmeof::NvmeofTransport::Tcp,
-                host_nqn: config.live_nvme.host_nqn.clone(),
-                port_id: 42,
-                state_dir: state,
-                commissioning_port_id: 43,
-                commissioning_service: 4421,
-            },
+        let host = OwnerHost::open_with_live_fixture(
+            host_config,
+            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
             configfs,
         )
         .unwrap();
-        let serving = Arc::clone(&node);
+        let serving = Arc::clone(&host);
         let stop = Arc::clone(&owners.stop);
         owners.servers.push(std::thread::spawn(move || {
             serving
@@ -206,6 +189,10 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             false,
         )
         .unwrap();
+        let database = db.remote_database_id().unwrap();
+        assert_ne!(database, [0; 16]);
+        assert!(identities.insert(database));
+        assert_eq!(host.databases(), [database]);
         let open_record = crate::index_checkpoint::OpenRecord {
             kind: open_kind,
             open_start_ns,
@@ -223,7 +210,7 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             db:Some(db),keyspace,
             endpoints:config.endpoints.iter().map(|e|(e.partition,e.address.clone())).collect(),owners:1,
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
-            effective_configuration:serde_json::json!({"fixture_route":"leased","remote":config}),
+            effective_configuration:serde_json::json!({"fixture_route":"leased","database":tidehunter::distributed::tcp::host::identity::database_hex(&database),"remote":config}),
             read_evidence_written:false,owner_sample_gate:Default::default(),coordinator_interval_baseline:std::sync::Mutex::new(None),
             coordinator_path:base.join("coordinator"),open_record,
             live_write_profile:std::sync::Mutex::new(None),

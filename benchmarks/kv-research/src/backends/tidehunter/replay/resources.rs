@@ -227,7 +227,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let input = serde_json::json!({
             "guest_root":root.join("guest"),"addresses":["127.0.0.1:19001","127.0.0.1:19002"],
-            "database":vec![7;16],"transport":{"kind":"tcp-trusted"},
+            "transport":{"kind":"tcp-trusted"},
             "owner_wal_geometry":"native_default","replay_node_db_id":0,
             "batch_limits":{"max_operations":519,"max_encoded_bytes":500000},
             "max_batches_per_partition":32768,"max_admitted_batches":1000000,"max_index_bytes":512*1024*1024,
@@ -256,8 +256,10 @@ mod tests {
         let database = &bound["databases"][0];
         assert_eq!(database["batches"], 20480);
         assert_eq!(database["full_index_image_bytes"], 797_710_617_u64);
-        assert_eq!(database["maximum_checkpoints"], 219);
-        assert_eq!(bound["reservation_bytes"], 176_564_578_965_u64);
+        // The ordered cell directory charges a second cell identity and birth
+        // ID, shrinking the index-pressure window compared to pre-L3.
+        assert_eq!(database["maximum_checkpoints"], 225);
+        assert_eq!(bound["reservation_bytes"], 181_350_842_667_u64);
         // z4m-highmem-16: one 14,000 GiB local SSD; keep the owner's 50% guard.
         assert!(bound["reservation_bytes"].as_u64().unwrap() < 14000 * 1024_u64.pow(3) / 2);
         eprintln!("cloud-replay-coordinator-bound={bound}");

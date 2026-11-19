@@ -142,17 +142,7 @@ fn write_stage(directory: &Path, case: &DropCase) {
     let operations: Vec<_> = (0..plan.len())
         .map(|id| fixture.operation((id % case.owners) as u32, id as u64 + 1))
         .collect();
-    let restart = Restart {
-        root: fixture.temp.path().to_path_buf(),
-        shape: fixture.shape.clone(),
-        config: fixture.config.clone(),
-        operations: operations.clone(),
-        nodes: fixture
-            .startups
-            .iter()
-            .map(|(config, tls, _)| (config.clone(), tls.clone()))
-            .collect(),
-    };
+    let restart = Restart::capture(&fixture, operations.clone());
     fs::write(
         directory.join("restart.json"),
         serde_json::to_vec(&restart).unwrap(),
@@ -215,32 +205,7 @@ fn recover_stage(directory: &Path) {
     let case: DropCase =
         serde_json::from_slice(&fs::read(directory.join("case.json")).unwrap()).unwrap();
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut servers = Vec::new();
-    let mut nodes = Vec::new();
-    for ((config, tls), endpoint) in restart.nodes.iter().zip(&restart.config.endpoints) {
-        let node = open_live_node(config.clone(), &restart.config.live_nvme.host_nqn).unwrap();
-        node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
-            if case.leased.synchronous {
-                crate::distributed::durability::DurabilityTier::Synchronous
-            } else {
-                crate::distributed::durability::DurabilityTier::Native
-            },
-        ))
-        .unwrap();
-        let listener = std::net::TcpListener::bind(&endpoint.address).unwrap();
-        let serving = node.clone();
-        let tls = tls.clone();
-        let stop = shutdown.clone();
-        servers.push(thread::spawn(move || {
-            serving.serve(
-                listener,
-                tls,
-                crate::distributed::tcp::TcpLimits::default(),
-                stop,
-            )
-        }));
-        nodes.push(node);
-    }
+    let servers = restart.serve_owners(&shutdown);
     // Recovery and every later read of the recovered files go through the
     // ordinary-file live fixture.
     let db = RemoteDatabase::open_local_live_fixture(
@@ -249,6 +214,7 @@ fn recover_stage(directory: &Path) {
         restart.config.clone(),
     )
     .unwrap();
+    assert_eq!(db.database_id(), restart.database);
     let recovery = db.recovery_stats();
     assert_eq!(
         recovery.recovered_cut.is_some(),
@@ -306,7 +272,6 @@ fn recover_stage(directory: &Path) {
     for server in servers {
         server.join().unwrap().unwrap();
     }
-    drop(nodes);
 }
 
 #[test]

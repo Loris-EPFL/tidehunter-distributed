@@ -5,6 +5,7 @@ The helpers own target and initiator identities. No global cleanup is performed.
 """
 import errno
 import fcntl
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zlib
 
 ROOT = ["docker", "run", "--rm", "--privileged", "--network=host", "--pid=host",
         "--cgroupns=host", "--entrypoint", "nsenter",
@@ -38,9 +40,10 @@ KERNEL_SERVICE_PORTS = range(20000, 65535, 2)
 DIAGNOSTIC_ENTRIES = 256
 
 
-def _owned_controllers(sysfs, transport, address, services, hostnqn, *, sample_errors=None):
-    """Initiator controllers of this run: the host NQN is fresh per run."""
+def _owned_controllers(sysfs, transport, address, services, identity, *, sample_errors=None):
+    """Initiator controllers scoped to this run's addresses, services and NQN."""
     rows = []
+    services = {str(service) for service in services}
     for path in sysfs.glob("nvme*"):
         if not re.fullmatch(r"nvme[0-9]+", path.name):
             continue
@@ -51,8 +54,9 @@ def _owned_controllers(sysfs, transport, address, services, hostnqn, *, sample_e
                 attrs[name] = attribute.read_text().strip()
             fields = dict(p.split("=", 1) for p in attrs["address"].split(",") if "=" in p)
             if (attrs["transport"] == transport and fields.get("traddr") == address
-                    and fields.get("trsvcid") in {str(s) for s in services}
-                    and attrs["hostnqn"] == hostnqn):
+                    and fields.get("trsvcid") in services
+                    and (identity(attrs["hostnqn"], attrs["subsysnqn"]) if callable(identity)
+                         else attrs["hostnqn"] == identity)):
                 attribute = path
                 stat = path.stat()
                 rows.append(dict(attrs, controller=path.name, device=stat.st_dev, inode=stat.st_ino))
@@ -130,16 +134,16 @@ def _delete_enumerated_controller(sysfs, row, timeout):
     _write_fd_bounded(delete, b"1", timeout)
 
 
-def _delete_owned_controllers(sysfs, transport, address, services, hostnqn, deadline):
+def _delete_owned_controllers(sysfs, transport, address, services, identity, deadline):
     """Delete this run's initiator controllers and wait until they are gone.
 
     The client deletes them on graceful close. A client killed at its deadline
     cannot, and nothing else owns them. Returns the enumerated controller names.
     """
-    rows = _owned_controllers(sysfs, transport, address, services, hostnqn)
+    rows = _owned_controllers(sysfs, transport, address, services, identity)
     for row in rows:
         _delete_enumerated_controller(sysfs, row, max(.1, deadline - time.monotonic()))
-    while _owned_controllers(sysfs, transport, address, services, hostnqn):
+    while _owned_controllers(sysfs, transport, address, services, identity):
         if time.monotonic() >= deadline:
             raise TargetError("owned initiator controllers remain after delete")
         time.sleep(.05)
@@ -560,13 +564,13 @@ def _kernel_live_ports(address, *, commissioning_address, control_address, state
 
 
 def _queue_identity(row):
-    return row["controller"], row["subsysnqn"], row["hostid"]
+    return row["controller"], row["subsysnqn"], row["hostnqn"], row["hostid"]
 
 
-def _admit_kernel_geometry(record, proof, hostid, samples):
-    routes = proof.get("member_transition", {}).get("writer_routes", [])
+def _admit_kernel_geometry(record, routes, samples):
     expected = {(f"nvme{r['namespace_identity']['controller_instance']}",
-                 r["namespace_identity"]["nqn"], hostid) for r in routes}
+                 r["namespace_identity"]["nqn"], r["host_nqn"],
+                 str(uuid.UUID(bytes=bytes(r["host_id"])))) for r in routes}
     matched = [r for r in samples if _queue_identity(r) in expected]
     missing = sorted(expected - {_queue_identity(r) for r in matched})
     invalid = [r for r in matched if (r["queue_count"], r["sqsize"]) != ("2", "31")]
@@ -581,6 +585,120 @@ def _admit_kernel_geometry(record, proof, hostid, samples):
 def _admit_kernel_durability(remote, tier):
     if (remote.get("live_nvme") or {}).get("leased_durability") != tier:
         raise TargetError("prepared kernel qualification durability differs from the requested tier")
+
+
+def _kernel_public_identity(host_nqn, subsystem):
+    import cloud_campaign as campaign
+
+    match = campaign.LIVE_HOST_SCOPE.fullmatch(host_nqn)
+    return (match is not None and campaign.live_database_id(match[2]) and match[3] == "00000000"
+            and campaign.scoped_live_subsystem(subsystem, match[1]))
+
+
+def _kernel_commissioning_identities(root, address, transport, service, port_id):
+    """Bind commissioning identities to this owner's exact persisted slot journals."""
+    import cloud_campaign as campaign
+    import nvme_campaign_owner as owner
+
+    try:
+        owner._trusted_dir(root)
+    except FileNotFoundError:
+        return {}
+    with os.scandir(root) as entries:
+        candidates = list(islice(entries, DIAGNOSTIC_ENTRIES + 1))
+    if len(candidates) > DIAGNOSTIC_ENTRIES:
+        raise TargetError("owner root exceeds commissioning identity scan bound")
+    identities = {}
+    for entry in candidates:
+        database = entry.name.removeprefix("db-")
+        if not entry.name.startswith("db-") or not campaign.live_database_id(database):
+            continue
+        state_dir = Path(entry.path) / "live-target"
+        try:
+            owner._trusted_dir(state_dir)
+            maximum = 4 * 1024**2  # live_target.rs::MAX_STATE
+            raw = owner._read_bytes(state_dir / "live-target.json", maximum)
+            if not 4 < len(raw) <= maximum or int.from_bytes(raw[:4], "little") != zlib.crc32(raw[4:]):
+                raise TargetError("invalid commissioning journal checksum or size")
+            state = json.loads(raw[4:])
+        except FileNotFoundError:
+            continue
+        scope = f"nqn.2026-01.local.tidehunter:db-{database}-p00000000-"
+        config = state.get("config") if isinstance(state, dict) else None
+        expected = {"state_dir": str(state_dir), "host_nqn": scope + "host", "address": address,
+                    "transport": transport, "service": service, "port_id": port_id,
+                    "commissioning_service": service + 1, "commissioning_port_id": port_id + 1}
+        private = state.get("private_host") if isinstance(state, dict) else None
+        if (not isinstance(config, dict) or state.get("version") != 1
+                or any(config.get(key) != value for key, value in expected.items())
+                or not isinstance(private, str) or not re.fullmatch(
+                    r"nqn\.2026-01\.local\.tidehunter:commission-" + campaign.UUID_TEXT, private)
+                or private in identities):
+            raise TargetError("commissioning journal differs from the exact owner slot")
+        identities[private] = scope
+    return identities
+
+
+def _admit_kernel_reuse(proof, remote, address, service, transport, endpoint):
+    import cloud_campaign as campaign
+
+    reuse = proof.get("target_reuse")
+    if not isinstance(reuse, dict) or reuse.get("dropped_database") == reuse.get("database"):
+        raise TargetError("kernel qualification lacks distinct database identities")
+    live = remote["live_nvme"]
+    seed = live.get("owner_identities", {}).get("0", live)
+    writer_routes = proof.get("member_transition", {}).get("writer_routes")
+    if not isinstance(writer_routes, list) or not writer_routes:
+        raise TargetError("kernel qualification lacks writer routes")
+    for db_key, initiator_key, route_key in (
+        ("dropped_database", "dropped_initiators", "routes_before_drop"),
+        ("database", "initiators", "routes_after_reprovision"),
+    ):
+        database = reuse.get(db_key)
+        if not campaign.live_database_id(database):
+            raise TargetError("invalid kernel qualification database identity")
+        effective = campaign.effective_live_owner({**seed, "address": address, "service": service}, database, 0)
+        expected = {"database": database, "partition": 0, "host_nqn": effective["host_nqn"],
+                    "host_id": effective["host_id"]}
+        routes = reuse.get(route_key)
+        if (reuse.get(initiator_key) != [expected] or not isinstance(routes, list) or not routes
+                or any(not campaign.live_route_matches_owner(route, effective) or route.get("transport") != transport
+                       or route.get("target_implementation", "kernel") != "kernel"
+                       or type(route["namespace_identity"].get("controller_instance")) is not int
+                       or route["namespace_identity"]["controller_instance"] < 0
+                       for route in routes + (writer_routes if db_key == "dropped_database" else []))):
+            raise TargetError("kernel target reuse route differs from the provisioned database and slot")
+    shutdown = proof.get("target_shutdown")
+    if not isinstance(shutdown, list) or len(shutdown) != 1 or not isinstance(shutdown[0], dict):
+        raise TargetError("kernel target shutdown proof missing")
+    row = shutdown[0]
+    stats = row.get("stats")
+    if (not campaign.live_identity_bytes(row.get("database")) or bytes(row["database"]).hex() != reuse["database"]
+            or type(row.get("partition")) is not int or row["partition"] != 0 or row.get("endpoint") != endpoint
+            or type(row.get("epoch")) is not int or row["epoch"] < 1
+            or not isinstance(stats, dict) or stats.get("fixture_only") is not False
+            or any(type(stats.get(key)) is not int or stats[key] != 0 for key in ("errors", "owned_namespace_count"))):
+        raise TargetError("kernel target shutdown does not name the clean reprovisioned database")
+    return reuse, writer_routes + reuse["routes_after_reprovision"]
+
+
+def _kernel_live_prepare_input(guest, control_endpoint, transport, addr, service, port_id, tier,
+                               owner_wal_file_bytes=None):
+    prep = {"guest_root": str(guest), "addresses": [control_endpoint],
+        "transport": {"kind": "tcp"}, "durability_tier": tier,
+        "owner_wal_geometry": "research",
+        "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
+        "max_index_bytes": 128 * 1024**2,
+        "coordinator_cache_bytes": 4 * 1024**2,
+        "owner_wal_member_read": "async", "polling": "adaptive",
+        # One host slot: drop -> reprovision must reuse it.
+        "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
+            "port_id": port_id, "max_databases": 1, "max_inflight_requests": 32,
+            "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
+            "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
+    if owner_wal_file_bytes is not None:
+        prep["owner_wal_file_bytes"] = owner_wal_file_bytes
+    return prep
 
 
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
@@ -635,9 +753,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         return result.stdout
 
 
-    def controllers(address, services, hostnqn):
-        return _owned_controllers(SYSFS_NVME, transport, address, services, hostnqn)
-
     def tier_run(tier):
         directory = root / tier
         directory.mkdir(mode=0o700)
@@ -662,7 +777,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         stop = threading.Event()
         samples = {}
         record.update(sample_errors=[], sample_errors_truncated=False)
-        launch = remote = None
+        launch = remote = reprovisioned_database = None
 
         def remaining(cap):
             left = deadline - time.monotonic()
@@ -683,8 +798,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             while not stop.wait(.02):
                 errors = []
                 try:
-                    rows = _owned_controllers(SYSFS_NVME, transport, addr, (service, commissioning),
-                                              remote["live_nvme"]["host_nqn"], sample_errors=errors)
+                    rows = _owned_controllers(SYSFS_NVME, transport, addr, (service,),
+                                              _kernel_public_identity, sample_errors=errors)
                 except OSError as error:
                     rows = []
                     errors.append({"path": str(error.filename or SYSFS_NVME), "errno": error.errno,
@@ -712,20 +827,9 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             (evidence / f"{label}-gdb.txt").write_text(_gdb_backtrace(pid, 10))
 
         try:
-            prep = {"guest_root": str(guest), "addresses": [f"{control_address}:{control}"],
-                "transport": {"kind": "tcp"}, "durability_tier": tier,
-                "owner_wal_geometry": "research",
-                "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
-                "max_index_bytes": 128 * 1024**2, "max_epochs": 4,
-                "coordinator_cache_bytes": 4 * 1024**2,
-                "owner_wal_member_read": "async", "polling": "adaptive",
-                "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
-                    "port_id": port_id, "commissioning_service": commissioning,
-                    "commissioning_port_id": port_id + 1, "max_inflight_requests": 32,
-                    "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
-                    "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
-            if owner_wal_file_bytes is not None:
-                prep["owner_wal_file_bytes"] = owner_wal_file_bytes
+            prep = _kernel_live_prepare_input(
+                guest, f"{control_address}:{control}", transport, addr, service, port_id, tier,
+                owner_wal_file_bytes)
             prep_path = evidence / "prepare.json"
             prep_path.write_text(json.dumps(prep))
             run([binary, "--prepare-external-case", prep_path, "--output", prepared],
@@ -734,17 +838,20 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             launch = yaml.safe_load((prepared / "node-0/launch.yaml").read_text())
             launch["launch_nonce"] = uuid.uuid4().hex
             if owner_wal_file_bytes is not None and (
-                    remote["storage"]["wal_file_bytes"] != owner_wal_file_bytes
-                    or launch["node"]["partition"]["wal_file_bytes"] != owner_wal_file_bytes):
+                    remote["storage"]["wal_file_bytes"] != owner_wal_file_bytes):
                 raise TargetError("prepared qualification WAL member size differs from request")
-            target = launch["node"]["live_target"]
+            host = launch["host"]
+            target = host["live_target_pool"]
             _admit_kernel_durability(remote, tier)
             if (launch["listen"] != f"{control_address}:{control}" or target["address"] != addr
-                    or target["transport"] != transport
-                    or target["port_id"] != port_id or target["commissioning_port_id"] != port_id + 1):
+                    or target["transport"] != transport or host["max_databases"] != 1
+                    or target["public_port_base"] != port_id
+                    or target["commissioning_port_base"] != port_id + 1
+                    or target["public_service_base"] != service
+                    or target["commissioning_service_base"] != commissioning):
                 raise TargetError("generated kernel owner identity differs from requested fixture")
+            # The host creates its root and each database's target state below it.
             node.mkdir(mode=0o700, parents=True)
-            Path(target["state_dir"]).mkdir(mode=0o700)
             for tls, tls_root in ((remote["tls"], guest), (launch["tls"], node)):
                 for name in ("ca", "cert", "key"):
                     if not tls.get(name):
@@ -767,7 +874,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             launch_path = node / "launch.yaml"
             launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
             launch_path.chmod(0o600)
-            if controllers(addr, (service, commissioning), remote["live_nvme"]["host_nqn"]):
+            if _owned_controllers(SYSFS_NVME, transport, addr, (service,), _kernel_public_identity):
                 raise TargetError("existing controller matches fresh host identity")
             lifetime = int(deadline - time.monotonic()) - 31
             if lifetime < 1:
@@ -798,7 +905,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             if ready.read_text().strip() != launch["listen"]:
                 raise TargetError("owner readiness mismatch")
             receipt = cloud_campaign.read_owner_receipt(launch)
-            if receipt.get("durability", {}).get("tier") != tier:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            if (receipt["durability"] != launch["durability"] or receipt["durability"]["tier"] != tier
+                    or receipt["pid"] != record["owner_identity"]["process_id"]
+                    or receipt["boot_id"] != boot_id):
                 raise TargetError("owner durability receipt mismatch")
             record["durability_receipt"] = receipt
             input_path = directory / "qualification.json"
@@ -836,8 +946,9 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             checks = proof.get("checks", {})
             required = ("scalar_write_delete", "mixed_batch", "ordered_batch_missing_exists",
                         "checkpoint_iteration", "cache_miss_hit", "flush_reopen",
-                        "abrupt_tail_recovery", "fence_drain")
-            if (proof.get("kind") != "live_nvmeof_qualification" or proof.get("expected_route") != transport
+                        "abrupt_tail_recovery", "fence_drain", "target_reuse")
+            if (proof.get("kind") != "live_nvmeof_qualification" or proof.get("schema_version") != 2
+                    or proof.get("expected_route") != transport
                     or proof.get("durability_tier") != receipt["durability"]["tier"]
                     or any(checks.get(k) is not True for k in required)):
                 raise TargetError("kernel qualification proof incomplete")
@@ -845,8 +956,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             sampler.join(timeout=5)
             if sampler.is_alive():
                 raise TargetError("controller sampler did not stop")
-            hostid = str(uuid.UUID(bytes=bytes(remote["live_nvme"]["host_id"])))
-            _admit_kernel_geometry(record, proof, hostid, samples.values())
+            reuse, routes = _admit_kernel_reuse(proof, remote, addr, service, transport, launch["listen"])
+            reprovisioned_database = reuse["database"]
+            record["target_reuse"] = {key: reuse[key] for key in ("dropped_database", "database")}
+            _admit_kernel_geometry(record, routes, samples.values())
             record["qualification_sha256"] = hashlib.sha256(
                 (evidence / "native/qualification.json").read_bytes()).hexdigest()
             record["qualified"] = True
@@ -870,10 +983,19 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                         raise TargetError("client process group remains")
                 if record["errors"]:
                     diagnose("nvme state", lambda: _write(evidence / "nvme-state.json", _nvme_state()))
-                if remote:
+                private = {}
+                def private_identity(host_nqn, subsystem):
+                    return (host_nqn in private
+                            and cloud_campaign.scoped_live_subsystem(subsystem, private[host_nqn]))
+
+                if captured:
+                    private = _kernel_commissioning_identities(launch["host"]["root"], addr, transport, service, port_id)
+                    cleanup_deadline = time.monotonic() + remaining(20)
                     deleted = _delete_owned_controllers(
-                        SYSFS_NVME, transport, addr, (service, commissioning),
-                        remote["live_nvme"]["host_nqn"], time.monotonic() + remaining(20))
+                        SYSFS_NVME, transport, addr, (service,), _kernel_public_identity, cleanup_deadline)
+                    if private:
+                        deleted += _delete_owned_controllers(
+                            SYSFS_NVME, "tcp", control_address, (commissioning,), private_identity, cleanup_deadline)
                     if deleted:
                         record["initiator_teardown"] = deleted
                         if record.pop("qualified", False):
@@ -893,13 +1015,17 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                             if current.get("ActiveState") in ("failed", "inactive"):
                                 raise TargetError("owner did not exit gracefully")
                             time.sleep(min(.1, remaining(1)))
-                    record["owner_shutdown"] = owner.admit_live_shutdown(node, launch_path, launch, 0, current)
+                    record["owner_shutdown"] = owner.admit_live_shutdown(
+                        node, launch_path, launch, 0, current, expected_database=reprovisioned_database)
                     run(["systemctl", "stop", unit], remaining(20))
                     current = status()
                     if current.get("LoadState") != "not-found" and (
                             current.get("MainPID") != "0" or current.get("ActiveState") != "inactive"):
                         raise TargetError("owner unit remains active")
-                if remote and controllers(addr, (service, commissioning), remote["live_nvme"]["host_nqn"]):
+                if captured and (
+                        _owned_controllers(SYSFS_NVME, transport, addr, (service,), _kernel_public_identity)
+                        or private and _owned_controllers(
+                            SYSFS_NVME, "tcp", control_address, (commissioning,), private_identity)):
                     raise TargetError("controller reappeared after owner shutdown")
                 if attempted and any((NVMET_CONFIGFS / "ports" / str(port)).exists()
                                      for port in (service, commissioning)):

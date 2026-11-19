@@ -5251,30 +5251,6 @@ impl super::Client {
 }
 
 #[cfg(test)]
-impl super::StorageNode {
-    pub(crate) fn bench_open_live_fixture(
-        config: super::NodeConfig,
-        metrics: std::sync::Arc<crate::metrics::Metrics>,
-        configfs: std::path::PathBuf,
-    ) -> Result<std::sync::Arc<Self>, super::TcpError> {
-        let mut node =
-            super::inventory::with_live_target_fixture(configfs, || Self::open(config, metrics))?;
-        // Match the existing local-file fixture: allow owner RPC oracle reads,
-        // but keep the commissioned target/marker and the real leased writer.
-        std::sync::Arc::get_mut(&mut node)
-            .unwrap()
-            .live_nvme_selected = false;
-        Ok(node)
-    }
-    pub(crate) fn bench_install_live_target(
-        &self,
-        target: crate::distributed::nvmeof::live_target::LiveTargetManager,
-    ) {
-        self.install_live_target(target).unwrap();
-    }
-}
-
-#[cfg(test)]
 mod leased_rollover_tests {
     use super::*;
     use crate::distributed::durability::DurabilityTier;

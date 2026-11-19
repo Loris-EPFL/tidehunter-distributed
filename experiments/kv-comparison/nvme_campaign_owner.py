@@ -49,13 +49,13 @@ def _remove_export(path, remaining):
 
 
 
-def _read_bytes(path):
+def _read_bytes(path, limit=MAX_JSON):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as stream:
         st = os.fstat(stream.fileno())
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or st.st_size > MAX_JSON:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or st.st_size > limit:
             raise ValueError('untrusted file: ' + str(path))
-        return stream.read(MAX_JSON + 1)
+        return stream.read(limit + 1)
 
 
 def _read_json(path):
@@ -144,20 +144,49 @@ def capture_live_owner_identity(node, launch_path, status):
     return identity
 
 
-def admit_live_shutdown(node, launch_path, launch, index, graceful_status):
+def admit_live_shutdown(node, launch_path, launch, index, graceful_status, *, expected_database=None):
     """Admit only a shutdown proof from the exact previously observed owner."""
     _trusted_dir(node)
     if not _stopped(graceful_status):
         raise ValueError('live owner did not exit gracefully')
     identity = _read_json(Path(node) / 'live-owner-identity.json')
     proof = _read_json(Path(launch_path).with_suffix('.live-target-shutdown.json'))
-    owner = launch['node']
-    expected = {'database': owner['partition']['inventory']['database'],
-                'partition': owner['partition']['partition'], 'root': owner['root']}
-    target = proof.get('target')
-    expected_scope = ('spdk_live_target_shutdown' if (owner.get('live_target') or {}).get('spdk') is not None
-                      else 'kernel_live_target_shutdown')
-    if (expected['partition'] != index or proof.get('schema_version') != 1
+    if not isinstance(identity, dict) or not isinstance(proof, dict):
+        raise ValueError('live shutdown and process receipts must be objects')
+
+    def target_clean(target):
+        return (isinstance(target, dict) and target.get('fixture_only') is False
+                and type(target.get('errors')) is int and target['errors'] == 0
+                and type(target.get('owned_namespace_count')) is int
+                and target['owned_namespace_count'] == 0)
+
+    def database_id(value):
+        return (isinstance(value, list) and len(value) == 16 and any(value)
+                and all(type(byte) is int and 0 <= byte <= 255 for byte in value))
+
+    if 'host' in launch:
+        # Owner host: one entry per routed database that owned a kernel target.
+        expected = {'partition': launch['partition'], 'root': launch['host']['root']}
+        targets = proof.get('targets')
+        targets_clean = (isinstance(targets, list) and bool(targets)
+                         and all(isinstance(entry, dict) and set(entry) == {'database', 'target'}
+                                 and database_id(entry['database']) and target_clean(entry['target'])
+                                 for entry in targets)
+                         and len({bytes(entry['database']) for entry in targets}) == len(targets))
+        if expected_database is not None and targets_clean:
+            targets_clean = [bytes(entry['database']).hex() for entry in targets] == [expected_database]
+        schema, expected_scope = 2, 'kernel_live_target_shutdown'
+    else:
+        # Archive single-database owner launch (`node`).
+        owner = launch['node']
+        expected = {'database': owner['partition']['inventory']['database'],
+                    'partition': owner['partition']['partition'], 'root': owner['root']}
+        targets_clean = target_clean(proof.get('target'))
+        schema = 1
+        expected_scope = ('spdk_live_target_shutdown' if (owner.get('live_target') or {}).get('spdk') is not None
+                          else 'kernel_live_target_shutdown')
+    if (type(expected['partition']) is not int or expected['partition'] != index
+            or type(proof.get('schema_version')) is not int or proof['schema_version'] != schema
             or proof.get('scope') != expected_scope or proof.get('complete') is not True
             or proof.get('owner') != expected or proof.get('serve_error') is not None
             or proof.get('cleanup_error') is not None
@@ -166,9 +195,7 @@ def admit_live_shutdown(node, launch_path, launch, index, graceful_status):
                    ('process_id', 'process_start_ticks', 'launch_blake2b512'))
             or type(identity.get('process_id')) is not int or identity['process_id'] <= 0
             or type(identity.get('process_start_ticks')) is not int or identity['process_start_ticks'] <= 0
-            or not isinstance(target, dict) or target.get('fixture_only') is not False
-            or type(target.get('errors')) is not int or target['errors'] != 0
-            or type(target.get('owned_namespace_count')) is not int or target['owned_namespace_count'] != 0):
+            or not targets_clean):
         raise ValueError('live target shutdown proof differs from exact owner or is incomplete')
     return proof
 

@@ -1,18 +1,16 @@
 //! R0 observer on the leased ordinary-file fixture: several real file rolls,
 //! one real prune (checkpoint, floor advance), and zero Value WAL unlinks.
 //! Ordinary files never qualify the Linux target; this checks accounting only.
+use super::pipeline_tests::{open_live_fixture_host, trusted_owner_host_config};
 use super::*;
 use crate::distributed::capacity::{
     Blocker, CapacityObserverConfig, R0Sample, R0Sink, SampleEvent,
 };
 use crate::distributed::codec::BatchLimits;
-use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
+use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::nvmeof::{
-    LiveTargetConfig, NvmeofTransport, live_metrics::LiveNvmeMetrics,
-    live_target::LiveTargetManager,
-};
-use crate::distributed::tcp::{LeasedSync, LiveClientConfig, NodeConfig, StorageNode, Transport};
+use crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics;
+use crate::distributed::tcp::{LeasedSync, LiveClientConfig, Transport};
 use crate::key_shape::KeyType;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +29,7 @@ impl R0Sink for Collect {
 struct Fixture {
     config: RemoteDatabaseConfig,
     shape: KeyShape,
+    node_root: PathBuf,
     live: Arc<LiveNvmeMetrics>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
@@ -51,7 +50,7 @@ impl Fixture {
         };
         let mut config = RemoteDatabaseConfig {
             storage: LocalInventoryConfig {
-                database: [82; 16],
+                database: [0; 16],
                 partitions: vec![0],
                 batch_limits: BatchLimits {
                     max_operations: 32,
@@ -111,43 +110,8 @@ impl Fixture {
             relocation_max_reclaim_pct: 100,
             compactor_cadence: Default::default(),
         };
-        let node = StorageNode::open(
-            NodeConfig {
-                root: root.path().join("owner"),
-                partition: config.partition_config(1, 0),
-                shape_yaml: shape.to_yaml().unwrap(),
-                wal_member_read: Default::default(),
-                wal_prewrite: false,
-                read_max_device_reads: 64,
-                live_target: None,
-            },
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-        )
-        .unwrap();
-        node.set_durability(DurabilityConfig::with_tier(tier))
-            .unwrap();
-        let state_dir = root.path().join("target");
-        let configfs = root.path().join("configfs");
-        fs::create_dir(&state_dir).unwrap();
-        for name in ["hosts", "ports", "subsystems"] {
-            fs::create_dir_all(configfs.join(name)).unwrap();
-        }
-        node.bench_install_live_target(
-            LiveTargetManager::open_fixture(
-                LiveTargetConfig {
-                    address: "127.0.0.1".into(),
-                    service: 4420,
-                    transport: NvmeofTransport::Tcp,
-                    host_nqn: "nqn.2026-01.test:r0-capacity".into(),
-                    port_id: 42,
-                    state_dir,
-                    commissioning_port_id: 43,
-                    commissioning_service: 4421,
-                },
-                configfs,
-            )
-            .unwrap(),
-        );
+        let host =
+            open_live_fixture_host(trusted_owner_host_config(root.path().join("owner"))).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         config.endpoints.push(RemoteEndpoint {
             partition: 0,
@@ -155,9 +119,8 @@ impl Fixture {
             server_name: tls.server_name.clone(),
         });
         let stop = Arc::new(AtomicBool::new(false));
-        // The serving thread owns the node; it is joined before the
-        // fixture directory is removed.
-        let serving = node;
+        // Join the owner before removing the fixture directory.
+        let serving = Arc::clone(&host);
         let stopping = stop.clone();
         let server = thread::spawn(move || {
             serving
@@ -169,9 +132,21 @@ impl Fixture {
                 )
                 .unwrap()
         });
+        authority_lifecycle::provision_for_test(
+            &root.path().join("authority"),
+            &shape,
+            &mut config,
+        )
+        .unwrap();
+        let node_root = host
+            .database(&config.storage.database)
+            .unwrap()
+            .config_for_test()
+            .root;
         Self {
             config,
             shape,
+            node_root,
             live: LiveNvmeMetrics::new(),
             stop,
             server: Some(server),
@@ -198,7 +173,7 @@ impl Fixture {
     }
 
     fn wal_files(&self) -> usize {
-        fs::read_dir(self.root.path().join("owner"))
+        fs::read_dir(&self.node_root)
             .unwrap()
             .flatten()
             .flat_map(|epoch| fs::read_dir(epoch.path()).into_iter().flatten().flatten())

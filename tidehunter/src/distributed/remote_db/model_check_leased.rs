@@ -186,19 +186,12 @@ fn write_model_leased_reopen_rejects_missing_registry() {
         |config| configure(config, profile(0)),
         |_| {},
     );
-    let config = fixture.startups[0].0.clone();
-    let host_nqn = fixture.config.live_nvme.host_nqn.clone();
+    let root = fixture.startups[0].0.root.clone();
     fixture.stop_owners();
-    let registry = config
-        .root
-        .with_extension("live-target")
-        .join("live-target.json");
+    let registry = root.join("live-target/live-target.json");
     assert!(registry.is_file());
     fs::remove_file(&registry).unwrap();
-    let error = match open_live_node(config, &host_nqn) {
-        Ok(_) => panic!("owner reopened with a missing commissioned target registry"),
-        Err(error) => error,
-    };
+    let error = fixture.restart_owners().unwrap_err();
     assert!(
         error.to_string().contains("open target state registry"),
         "{error}"

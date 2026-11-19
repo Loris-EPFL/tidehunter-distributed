@@ -49,7 +49,8 @@ use std::time::Instant;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Stream settings, fixed by the sealed job.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct R1EventConfig {
     /// Case output directory; streams go under `capacity/r1-events/`.
     pub case_output: PathBuf,

@@ -1541,11 +1541,12 @@ class CommandSafetyTests(unittest.TestCase):
                     result = directory / "result"
                     result.mkdir()
                     core_status = "failed" if failed else "completed"
+                    backend = {"configuration": {"database": "aa" * 16}}
                     controller.dump(result / "manifest.json", {"schema_version": 1, "status": core_status,
-                        "backend_info": {}, "raw_samples_complete": True,
+                        "backend_info": backend, "raw_samples_complete": True,
                         "run": {"qualification_failure": "qualification initial read: Valkey RDMA GET timed out"}
                                if qualification else {}})
-                    controller.dump(result / "summary.json", {"status": core_status, "backend": {}})
+                    controller.dump(result / "summary.json", {"status": core_status, "backend": backend})
                     (result / "samples.csv").write_text(
                         "phase,operation,outcome,error_kind\npreload,put,error,authority stopped before acknowledgement\n"
                         if failed else "phase,operation,outcome,error_kind\nmeasurement,get,success,\n")

@@ -292,6 +292,9 @@ class MultiOwnerTests(unittest.TestCase):
     def test_short_admission_connects_writes_and_reads_each_slot(self):
         job = next(j for j in self.jobs if j['owner_count'] == 16 and j['owner_topology'] == 'colocated')
         identities = {str(i): {'host_nqn': 'owner-' + str(i), 'host_id': [i + 1] * 16} for i in range(16)}
+        database = 'aa' * 16
+        effective = [campaign.effective_live_owner(seed, database, i)
+                     for i, seed in enumerate(identities.values())]
         options = {'owners': 16, 'external_remote_config': {'storage': {'partitions': list(range(16))},
             'endpoints': [{'partition': i, 'address': '10.0.0.1:' + str(9400 + i)} for i in range(16)],
             'live_nvme': {'owner_identities': identities}},
@@ -302,6 +305,7 @@ class MultiOwnerTests(unittest.TestCase):
         instance.run_logical_owner_admission = lambda *args: controller.Controller.run_logical_owner_admission(instance, *args)
         configs = []
         missing = None
+        wrong_host_id = False
         completed_writes = 256
         def run(argv, **kwargs):
             config = json.loads(Path(argv[2]).read_text())
@@ -317,13 +321,16 @@ class MultiOwnerTests(unittest.TestCase):
             Path(selected['path']).mkdir()
             output = Path(argv[-1])
             output.mkdir()
-            (output / 'summary.json').write_text(json.dumps({'status': 'completed'}))
+            (output / 'summary.json').write_text(json.dumps({'status': 'completed',
+                'backend': {'configuration': {'database': database}}}))
             (output / 'samples.csv').write_text('phase,operation,outcome\n'
                 + 'preload,put,success\n' * 256 + 'measurement,read,success\n' * 256)
             routes = [{'host_nqn': identity['host_nqn'], 'writer': writer,
+                       'host_id': identities['0']['host_id'] if wrong_host_id and i == 0 else identity['host_id'],
                        'transport': 'rdma', 'address': '10.0.0.1', 'service': 4420 + 2 * i,
-                       'namespace_identity': {'nqn': 'target-' + str(i)}}
-                      for i, identity in enumerate(identities.values()) if i != missing
+                       'namespace_identity': {'nqn': identity['subsystem_scope']
+                           + 'sub-00000000-0000-0000-0000-000000000001'}}
+                      for i, identity in enumerate(effective) if i != missing
                       for writer in (None, {'epoch': 1, 'file_index': 0})]
             (output / 'measurement-read-evidence.json').write_text(json.dumps({'end': {'live_nvmeof': {
                 'completed_read_ops': 256, 'completed_write_ops': completed_writes, 'errors': 0,
@@ -340,6 +347,8 @@ class MultiOwnerTests(unittest.TestCase):
             proofs = json.loads((root / 'owner-admission.json').read_text())
             self.assertEqual(len(configs), 1)
             self.assertEqual(len(proofs['owners']), 16)
+            self.assertEqual([row['host_nqn'] for row in proofs['owners']],
+                             [row['host_nqn'] for row in effective])
             self.assertTrue(proofs['coordinator_exited'])
             self.assertTrue(proofs['coordinator_database_retained'])
             self.assertEqual(proofs['authority_database'], 'database')
@@ -352,6 +361,12 @@ class MultiOwnerTests(unittest.TestCase):
             grouped.mkdir()
             controller.Controller.admit_logical_owners(instance, job, grouped, options)
             self.assertTrue(json.loads((grouped / 'owner-admission.json').read_text())['coordinator_exited'])
+            wrong_host_id = True
+            invalid = Path(tmp) / 'wrong-initiator'
+            invalid.mkdir()
+            with self.assertRaisesRegex(controller.SafetyError, 'wrong route identity'):
+                controller.Controller.admit_logical_owners(instance, job, invalid, options)
+            wrong_host_id = False
             completed_writes = 256
             for missing in range(16):
                 failed = Path(tmp) / f'missing-{missing}'

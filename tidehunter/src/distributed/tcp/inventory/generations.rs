@@ -198,8 +198,7 @@ impl NodeInventory {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(super) fn highest_fenced_generation(&self) -> u64 {
+    pub(in crate::distributed::tcp) fn highest_fenced_generation(&self) -> u64 {
         self.manifest.highest_fenced_generation
     }
 

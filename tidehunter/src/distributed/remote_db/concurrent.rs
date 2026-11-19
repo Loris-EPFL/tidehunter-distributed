@@ -969,6 +969,11 @@ impl ConcurrentRemoteDatabase {
         self.database.storage_stats()
     }
 
+    /// The provisioned database identity of the wrapped authority.
+    pub fn database_id(&self) -> [u8; 16] {
+        self.database.database_id()
+    }
+
     pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
         self.live_metrics.as_ref().map(|metrics| metrics.snapshot())
     }

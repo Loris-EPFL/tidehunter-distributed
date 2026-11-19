@@ -8,15 +8,13 @@
 //!
 //! Ordinary files never qualify the Linux target; namespace drain is the CI
 //! kernel job's to prove.
+use super::pipeline_tests::{open_live_fixture_host, trusted_owner_host_config};
 use super::*;
 use crate::distributed::codec::BatchLimits;
-use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
+use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
 use crate::distributed::sui::Db;
-use crate::distributed::tcp::{
-    LeasedSync, LiveClientConfig, NodeConfig, StorageNode, TcpLimits, Transport,
-};
+use crate::distributed::tcp::{LeasedSync, LiveClientConfig, TcpLimits, Transport};
 use crate::distributed::types::PhysicalValueAddress;
 use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
 use crate::{Decision, RelocationObservation, RelocationTestError};
@@ -116,9 +114,8 @@ fn decode(value: &[u8]) -> (u64, u8) {
     (u64::from_be_bytes(sequence), value[8])
 }
 
-/// One owner process: the node and its serving thread.
+/// The serving thread holds the owner host until shutdown.
 struct Owner {
-    _node: Arc<StorageNode>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
 }
@@ -155,10 +152,9 @@ impl Fixture {
         let listeners: Vec<TcpListener> = (0..owners)
             .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
-        let host_nqn = "nqn.2026-01.test:r1-relocation".to_string();
-        let config = RemoteDatabaseConfig {
+        let mut config = RemoteDatabaseConfig {
             storage: LocalInventoryConfig {
-                database: [87; 16],
+                database: [0; 16],
                 partitions: (0..owners).collect(),
                 batch_limits: BatchLimits {
                     max_operations: 32,
@@ -207,7 +203,7 @@ impl Fixture {
             live_nvme: LiveClientConfig {
                 lease_ahead: true,
                 polled_writes: false,
-                host_nqn: host_nqn.clone(),
+                host_nqn: "nqn.2026-01.test:r1-relocation".into(),
                 host_id: [5; 16],
                 owner_identities: Default::default(),
                 leased_write_window: Some(4),
@@ -229,42 +225,12 @@ impl Fixture {
         let mut node_roots = Vec::new();
         let mut started = Vec::new();
         for (partition, listener) in (0..owners).zip(listeners) {
-            let state_dir = root.path().join(format!("target-{partition}"));
-            let configfs = root.path().join(format!("configfs-{partition}"));
-            fs::create_dir(&state_dir).unwrap();
-            for name in ["hosts", "ports", "subsystems"] {
-                fs::create_dir_all(configfs.join(name)).unwrap();
-            }
-            let port = 2 * partition as u16;
-            let node_config = NodeConfig {
-                root: root.path().join(format!("owner-{partition}")),
-                partition: config.partition_config(1, partition),
-                shape_yaml: shape.to_yaml().unwrap(),
-                wal_member_read: Default::default(),
-                wal_prewrite: false,
-                read_max_device_reads: 64,
-                live_target: Some(LiveTargetConfig {
-                    address: "127.0.0.1".into(),
-                    service: 4420 + port,
-                    transport: NvmeofTransport::Tcp,
-                    host_nqn: host_nqn.clone(),
-                    port_id: 42 + port,
-                    state_dir,
-                    commissioning_port_id: 43 + port,
-                    commissioning_service: 4421 + port,
-                }),
-            };
-            node_roots.push(node_config.root.clone());
-            let node = StorageNode::bench_open_live_fixture(
-                node_config,
-                Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-                configfs,
-            )
-            .unwrap();
-            node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
-                .unwrap();
+            let host_config =
+                trusted_owner_host_config(root.path().join(format!("owner-{partition}")));
+            node_roots.push(host_config.root.clone());
+            let host = open_live_fixture_host(host_config).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
-            let serving = Arc::clone(&node);
+            let serving = host;
             let stopping = Arc::clone(&stop);
             let tls = config.tls.clone();
             let server = thread::spawn(move || {
@@ -273,10 +239,21 @@ impl Fixture {
                     .unwrap()
             });
             started.push(Owner {
-                _node: node,
                 stop,
                 server: Some(server),
             });
+        }
+        authority_lifecycle::provision_for_test(
+            &root.path().join("authority"),
+            &shape,
+            &mut config,
+        )
+        .unwrap();
+        let database =
+            crate::distributed::tcp::host::identity::database_hex(&config.storage.database);
+        let directory = format!("db-{database}");
+        for path in &mut node_roots {
+            path.push(&directory);
         }
         Self {
             config,

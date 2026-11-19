@@ -14,17 +14,16 @@
 //!
 //! Ordinary files never qualify the Linux target; kernel namespace drain is
 //! the CI kernel job's to prove.
+use super::pipeline_tests::{open_live_fixture_host, trusted_owner_host_config};
 use super::*;
 use crate::distributed::capacity::{CapacityObserverConfig, R0Sample, R0Sink};
 use crate::distributed::codec::BatchLimits;
-use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
+use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::nvmeof::{
-    LiveTargetConfig, NvmeofTransport, live_metrics::LiveNvmeMetrics,
-};
+use crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics;
 use crate::distributed::storage::CrashCut;
 use crate::distributed::tcp::{
-    LeasedSync, LiveClientConfig, NodeConfig, StorageNode, TcpLimits, Transport,
+    LeasedSync, LiveClientConfig, OwnerHostConfig, StorageNode, TcpLimits, Transport,
 };
 use crate::key_shape::KeyType;
 use std::net::TcpListener;
@@ -39,7 +38,7 @@ const INITIAL_WRITES: usize = 240;
 const ROUND_WRITES: usize = 48;
 const ROUNDS: usize = 6;
 /// Directories that make up both processes' durable state.
-const CRASH_STATE: [&str; 4] = ["owner", "target", "configfs", "authority"];
+const CRASH_STATE: [&str; 3] = ["owner", "owner.configfs", "authority"];
 
 struct Discard;
 
@@ -159,9 +158,8 @@ impl Drop for Owner {
 }
 
 struct Fixture {
-    tier: DurabilityTier,
     config: RemoteDatabaseConfig,
-    node_config: NodeConfig,
+    host_config: OwnerHostConfig,
     shape: KeyShape,
     address: String,
     live: Arc<LiveNvmeMetrics>,
@@ -188,7 +186,7 @@ impl Fixture {
             .to_string();
         let config = RemoteDatabaseConfig {
             storage: LocalInventoryConfig {
-                database: [83; 16],
+                database: [0; 16],
                 partitions: vec![0],
                 batch_limits: BatchLimits {
                     max_operations: 32,
@@ -252,32 +250,10 @@ impl Fixture {
             relocation_max_reclaim_pct: 100,
             compactor_cadence: Default::default(),
         };
-        let node_config = NodeConfig {
-            root: root.path().join("owner"),
-            partition: config.partition_config(1, 0),
-            shape_yaml: shape.to_yaml().unwrap(),
-            wal_member_read: Default::default(),
-            wal_prewrite: false,
-            read_max_device_reads: 64,
-            live_target: Some(LiveTargetConfig {
-                address: "127.0.0.1".into(),
-                service: 4420,
-                transport: NvmeofTransport::Tcp,
-                host_nqn: "nqn.2026-01.test:r1-dead-files".into(),
-                port_id: 42,
-                state_dir: root.path().join("target"),
-                commissioning_port_id: 43,
-                commissioning_service: 4421,
-            }),
-        };
-        fs::create_dir(root.path().join("target")).unwrap();
-        for name in ["hosts", "ports", "subsystems"] {
-            fs::create_dir_all(root.path().join("configfs").join(name)).unwrap();
-        }
+        let host_config = trusted_owner_host_config(root.path().join("owner"));
         let mut fixture = Self {
-            tier,
             config,
-            node_config,
+            host_config,
             shape,
             address,
             live: LiveNvmeMetrics::new(),
@@ -291,19 +267,12 @@ impl Fixture {
     /// Start (or restart after a crash) the owner process on the same root,
     /// target journal and address. Recovery repeats any pending retirement.
     fn start_owner(&mut self) {
-        let node = StorageNode::bench_open_live_fixture(
-            self.node_config.clone(),
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-            self.root.path().join("configfs"),
-        )
-        .unwrap();
-        node.set_durability(DurabilityConfig::with_tier(self.tier))
-            .unwrap();
+        let host = open_live_fixture_host(self.host_config.clone()).unwrap();
         // std sets SO_REUSEADDR on Unix listeners: the restarted owner binds
         // the address its predecessor released.
         let listener = TcpListener::bind(&self.address).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let serving = node.clone();
+        let serving = Arc::clone(&host);
         let stopping = stop.clone();
         let tls = self.config.tls.clone();
         let server = thread::spawn(move || {
@@ -311,6 +280,15 @@ impl Fixture {
                 .serve(listener, tls, TcpLimits::default(), stopping)
                 .unwrap()
         });
+        if self.config.storage.database == [0; 16] {
+            authority_lifecycle::provision_for_test(
+                &self.root.path().join("authority"),
+                &self.shape,
+                &mut self.config,
+            )
+            .unwrap();
+        }
+        let node = host.database(&self.config.storage.database).unwrap();
         self.owner = Some(Owner {
             node,
             stop,
@@ -320,6 +298,13 @@ impl Fixture {
 
     fn node(&self) -> &StorageNode {
         &self.owner.as_ref().unwrap().node
+    }
+
+    fn database_root(&self) -> PathBuf {
+        self.host_config.root.join(format!(
+            "db-{}",
+            crate::distributed::tcp::host::identity::database_hex(&self.config.storage.database)
+        ))
     }
 
     /// Open the authority with every client on the ordinary-file live fixture
@@ -379,8 +364,7 @@ impl Fixture {
     /// Sorted WAL file indexes of `generation` on the owner.
     fn wal_files(&self, generation: u64) -> Vec<u64> {
         let directory = self
-            .node_config
-            .root
+            .database_root()
             .join(format!("epoch_{generation:016x}"));
         let mut files: Vec<u64> = fs::read_dir(directory)
             .unwrap()
@@ -715,8 +699,7 @@ fn fence_waits_for_a_parked_serving_retirement() {
             let (_, pending) = log.file_retirement_state();
             let victim = *pending.first().expect("parked retirement has victims");
             let path = fixture
-                .node_config
-                .root
+                .database_root()
                 .join(format!("epoch_{generation:016x}"))
                 .join(format!("wal_{:016x}", victim.start / FILE_BYTES));
             drop(log);
@@ -800,8 +783,7 @@ fn writes_roll_into_a_later_file_while_a_retirement_is_parked_before_unlink() {
                 let (_, pending) = log.file_retirement_state();
                 let victim = *pending.first().expect("parked retirement has victims");
                 let victim_path = fixture
-                    .node_config
-                    .root
+                    .database_root()
                     .join(format!("epoch_{generation:016x}"))
                     .join(format!("wal_{:016x}", victim.start / FILE_BYTES));
                 assert_eq!(fs::metadata(&victim_path).unwrap().ino(), victim.inode);

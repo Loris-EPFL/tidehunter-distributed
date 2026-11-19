@@ -13,8 +13,11 @@ use super::*;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::nvmeof::{LiveTargetConfig, NvmeofTransport};
-use crate::distributed::tcp::{LiveClientConfig, NodeConfig, StorageNode, TcpError, TcpLimits};
+use crate::distributed::nvmeof::NvmeofTransport;
+use crate::distributed::tcp::{
+    LiveClientConfig, LiveTargetPool, NodeConfig, OwnerHost, OwnerHostConfig, StorageNode,
+    TcpError, TcpLimits,
+};
 use crate::key_shape::KeyType;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +64,7 @@ pub(super) fn coordinator_config(
 ) -> RemoteDatabaseConfig {
     RemoteDatabaseConfig {
         storage: LocalInventoryConfig {
-            database: [71; 16],
+            database: [0; 16],
             partitions: (0..owner_count as u32).collect(),
             batch_limits: BatchLimits {
                 max_operations: 4,
@@ -105,39 +108,69 @@ pub(super) fn coordinator_config(
     }
 }
 
-/// Open (or reopen) one owner with its commissioned fixture target. Target
-/// state and fake configfs live beside the owner root, so a reopen finds the
-/// same registry.
-pub(super) fn open_live_node(
-    mut config: NodeConfig,
-    host_nqn: &str,
-) -> Result<Arc<StorageNode>, TcpError> {
-    let state_dir = config.root.with_extension("live-target");
-    let configfs = config.root.with_extension("live-configfs");
-    fs::create_dir_all(&state_dir).unwrap();
+/// Owner host whose databases use the ordinary-file live target fixture; the
+/// host derives each database's target (registry under the database root,
+/// effective initiator NQN, per-owner exports) from its slot pool.
+pub(super) fn open_live_fixture_host(config: OwnerHostConfig) -> Result<Arc<OwnerHost>, TcpError> {
+    let configfs = config.root.with_extension("configfs");
     for name in ["hosts", "ports", "subsystems"] {
-        fs::create_dir_all(configfs.join(name)).unwrap();
+        std::fs::create_dir_all(configfs.join(name))?;
     }
-    config.live_target = Some(LiveTargetConfig {
-        address: "127.0.0.1".into(),
-        service: 4420,
-        transport: NvmeofTransport::Tcp,
-        host_nqn: host_nqn.into(),
-        port_id: 42,
-        state_dir,
-        commissioning_port_id: 43,
-        commissioning_service: 4421,
-    });
-    StorageNode::bench_open_live_fixture(config, metrics(), configfs)
+    OwnerHost::open_with_live_fixture(config, metrics(), configfs)
 }
 
+/// Owner host configuration of the coordinator fixtures: the per-database
+/// settings the fixtures used before owners became multi-database hosts.
+pub(super) fn owner_host_config(root: PathBuf) -> OwnerHostConfig {
+    OwnerHostConfig {
+        root,
+        max_databases: 16,
+        live_target_pool: LiveTargetPool {
+            address: "127.0.0.1".into(),
+            transport: NvmeofTransport::Tcp,
+            public_port_base: 42,
+            public_service_base: 4420,
+            commissioning_port_base: 142,
+            commissioning_service_base: 5420,
+        },
+        trusted_coordinator_id: None,
+        wal_member_read: Default::default(),
+        wal_prewrite: false,
+        read_max_device_reads: 128,
+        durability: Default::default(),
+    }
+}
+
+pub(super) fn trusted_owner_host_config(root: PathBuf) -> OwnerHostConfig {
+    let mut config = owner_host_config(root);
+    config.max_databases = 1;
+    config.trusted_coordinator_id = Some([1; 32]);
+    config.read_max_device_reads = 64;
+    config
+}
+
+fn owner_limits() -> TcpLimits {
+    TcpLimits {
+        io_timeout: Duration::from_secs(30),
+        ..TcpLimits::default()
+    }
+}
+
+/// Coordinator fixture over `OwnerHost`s (one per partition). The database
+/// is provisioned at construction through the real coordinator open path,
+/// so `config.storage.database` and `nodes` name it before the first open.
 pub(super) struct Fixture {
     pub(super) config: RemoteDatabaseConfig,
     pub(super) shape: KeyShape,
+    /// The provisioned database on each owner host, in partition order.
     pub(super) nodes: Vec<Arc<StorageNode>>,
+    pub(super) hosts: Vec<Arc<OwnerHost>>,
     shutdown: Arc<AtomicBool>,
     servers: Vec<JoinHandle<Result<(), TcpError>>>,
+    /// Per owner: the database's owner config as derived by its host (its
+    /// `root` is `<host root>/db-<hex>`), the host TLS identity and listener.
     pub(super) startups: Vec<(NodeConfig, TlsFiles, TcpListener)>,
+    pub(super) host_configs: Vec<OwnerHostConfig>,
     pub(super) temp: tempdir::TempDir,
 }
 
@@ -221,9 +254,10 @@ impl Fixture {
         );
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut nodes = Vec::new();
+        let mut hosts = Vec::new();
+        let mut host_configs = Vec::new();
         let mut servers = Vec::new();
-        let mut startups = Vec::new();
+        let mut listeners = Vec::new();
         for (index, identity) in certs.nodes.into_iter().enumerate() {
             let mut node_config = NodeConfig {
                 root: temp.path().join(format!("node-{index}")),
@@ -235,11 +269,11 @@ impl Fixture {
                 live_target: None,
             };
             configure_node(&mut node_config);
-            let node = open_live_node(node_config.clone(), &config.live_nvme.host_nqn).unwrap();
-            node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
-                tier,
-            ))
-            .unwrap();
+            let mut host_config = owner_host_config(node_config.root);
+            host_config.wal_member_read = node_config.wal_member_read;
+            host_config.wal_prewrite = node_config.wal_prewrite;
+            host_config.read_max_device_reads = node_config.read_max_device_reads;
+            let host = open_live_fixture_host(host_config.clone()).unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             config.endpoints.push(RemoteEndpoint {
                 partition: index as u32,
@@ -253,61 +287,89 @@ impl Fixture {
                 key: identity.private_key,
                 server_name: identity.server_name,
             };
-            startups.push((node_config, tls.clone(), listener.try_clone().unwrap()));
-            let serving = Arc::clone(&node);
+            listeners.push((tls.clone(), listener.try_clone().unwrap()));
+            let serving = Arc::clone(&host);
             let stop = Arc::clone(&shutdown);
             servers.push(thread::spawn(move || {
-                serving.serve(
-                    listener,
-                    tls,
-                    TcpLimits {
-                        io_timeout: Duration::from_secs(30),
-                        ..TcpLimits::default()
-                    },
-                    stop,
-                )
+                serving.serve(listener, tls, owner_limits(), stop)
             }));
+            hosts.push(host);
+            host_configs.push(host_config);
+        }
+        authority_lifecycle::provision_for_test(
+            &temp.path().join("authority"),
+            &shape,
+            &mut config,
+        )
+        .unwrap();
+        let database = config.storage.database;
+        let mut nodes = Vec::new();
+        let mut startups = Vec::new();
+        for (host, (tls, listener)) in hosts.iter().zip(listeners) {
+            let node = host.database(&database).unwrap();
+            node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+                tier,
+            ))
+            .unwrap();
+            startups.push((node.config_for_test(), tls, listener));
             nodes.push(node);
         }
         Self {
             config,
             shape,
             nodes,
+            hosts,
             shutdown,
             servers,
             startups,
+            host_configs,
             temp,
         }
     }
 
+    pub(super) fn authority(&self) -> PathBuf {
+        self.temp.path().join("authority")
+    }
+
+    /// The provisioned database directory, also available after owner stop.
+    pub(super) fn owner_database_root(&self, owner: usize) -> &Path {
+        &self.startups[owner].0.root
+    }
+
+    /// Stop serving and release every owner host: the next restart sees
+    /// only the durable image.
     pub(super) fn stop_owners(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         for server in self.servers.drain(..) {
             server.join().unwrap().unwrap();
         }
         self.nodes.clear();
+        self.hosts.clear();
     }
 
     /// Reopen every stopped owner with its commissioned fixture target.
     pub(super) fn restart_owners(&mut self) -> Result<(), TcpError> {
         self.shutdown.store(false, Ordering::Release);
-        for (config, tls, listener) in &self.startups {
-            let node = open_live_node(config.clone(), &self.config.live_nvme.host_nqn)?;
-            let serving = node.clone();
+        let database = self.config.storage.database;
+        for (host_config, (_, tls, listener)) in self.host_configs.iter().zip(&self.startups) {
+            let host = open_live_fixture_host(host_config.clone())?;
+            let node = host.database(&database).ok_or_else(|| {
+                TcpError::with_kind(
+                    std::io::ErrorKind::NotFound,
+                    "restarted owner host lost the database",
+                )
+            })?;
+            node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+                self.config.live_nvme.leased_durability,
+            ))?;
+            let serving = host.clone();
             let tls = tls.clone();
-            let listener = listener.try_clone().unwrap();
+            let listener = listener.try_clone()?;
             let stop = self.shutdown.clone();
             self.servers.push(thread::spawn(move || {
-                serving.serve(
-                    listener,
-                    tls,
-                    TcpLimits {
-                        io_timeout: Duration::from_secs(30),
-                        ..Default::default()
-                    },
-                    stop,
-                )
+                serving.serve(listener, tls, owner_limits(), stop)
             }));
+            self.hosts.push(host);
             self.nodes.push(node);
         }
         Ok(())

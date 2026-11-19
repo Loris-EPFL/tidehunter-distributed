@@ -41,10 +41,18 @@ pub struct FileMaintenanceStats {
     pub unprepared_gate_wait_ns: u64,
 }
 
-const MANIFEST: &str = "tcp-node-inventory-v1";
-const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
+pub(super) const MANIFEST: &str = "tcp-node-inventory-v1";
+pub(super) const LIVE_TARGET_CONFIG: &str = "tcp-node-live-target-v1";
 /// Registry of the removed sealed-export route; see `reject_legacy_owner_state`.
 const LEGACY_EXPORT_LEASES: &str = "nvmeof-export-leases-v1";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum OpenMode {
+    /// Provisioning (or a direct test fixture) can initialize the inventory.
+    Prepare,
+    /// A Ready host entry requires the surviving ledger and target identity.
+    Ready,
+}
 // Bound idle history namespaces, subsystem objects and pinned target FDs
 // independently of WAL history size. In-flight pages keep their separate pins.
 pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
@@ -90,14 +98,45 @@ struct LiveTargetMarker {
     identity: super::super::nvmeof::live_target::LiveTargetIdentity,
 }
 
-#[cfg(test)]
+/// Database drop: the persisted target marker of one database root, or
+/// `None` when it does not exist. A non-regular file is corruption.
+pub(super) fn read_live_target_marker(
+    root: &Path,
+) -> Result<
+    Option<(
+        super::super::nvmeof::LiveTargetConfig,
+        super::super::nvmeof::live_target::LiveTargetIdentity,
+    )>,
+    TcpError,
+> {
+    let marker = root.join(LIVE_TARGET_CONFIG);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let saved: LiveTargetMarker = read_metadata(&marker).map_err(|error| {
+                TcpError::with_kind(
+                    io::ErrorKind::InvalidData,
+                    format!("live target marker {}: {error}", marker.display()),
+                )
+            })?;
+            Ok(Some((saved.config, saved.identity)))
+        }
+        Ok(_) => Err(TcpError::with_kind(
+            io::ErrorKind::InvalidData,
+            "live target configuration is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 std::thread_local! {
     static LIVE_FIXTURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Select only configfs emulation; `open` still commissions and validates the
 /// normal durable marker while holding the node lock, before recovering WALs.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(super) fn with_live_target_fixture<R>(configfs: PathBuf, open: impl FnOnce() -> R) -> R {
     struct Reset;
     impl Drop for Reset {
@@ -110,7 +149,7 @@ pub(super) fn with_live_target_fixture<R>(configfs: PathBuf, open: impl FnOnce()
     open()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 fn open_live_target_fixture(
     config: super::super::nvmeof::LiveTargetConfig,
     expected: Option<super::super::nvmeof::live_target::LiveTargetIdentity>,
@@ -396,22 +435,45 @@ impl NodeInventory {
         }
         Ok(evidence)
     }
-    pub fn open(mut config: NodeConfig, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
+    pub(in crate::distributed::tcp) fn persisted_high_water(
+        config: &NodeConfig,
+    ) -> Result<u64, TcpError> {
+        let manifest = generations::read_manifest(&config.root.join(MANIFEST))?;
+        let shape = config
+            .validated_shape()?
+            .to_yaml()
+            .map_err(TcpError::component)?;
+        generations::validate_manifest(&manifest, &config.partition, &shape)?;
+        Ok(manifest.highest_fenced_generation)
+    }
+
+    #[cfg(test)]
+    pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
+        Self::open_with_mode(config, metrics, OpenMode::Prepare)
+    }
+
+    pub(super) fn open_with_mode(
+        mut config: NodeConfig,
+        metrics: Arc<Metrics>,
+        mode: OpenMode,
+    ) -> Result<Self, TcpError> {
         let shape = config.validated_shape()?;
         config.shape_yaml = shape.to_yaml().map_err(TcpError::component)?;
-        match fs::create_dir(&config.root) {
-            Ok(()) => {
-                File::open(
-                    config
-                        .root
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .unwrap_or(Path::new(".")),
-                )?
-                .sync_all()?;
+        if mode == OpenMode::Prepare {
+            match fs::create_dir(&config.root) {
+                Ok(()) => {
+                    File::open(
+                        config
+                            .root
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .unwrap_or(Path::new(".")),
+                    )?
+                    .sync_all()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
         }
         directory(&config.root)?;
         config.root = config.root.canonicalize()?;
@@ -423,6 +485,15 @@ impl NodeInventory {
                 generations::read_manifest(&manifest_path)?
             }
             Ok(_) => return Err(TcpError::new("node manifest is not a regular file")),
+            Err(error) if mode == OpenMode::Ready && error.kind() == io::ErrorKind::NotFound => {
+                return Err(TcpError::with_kind(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Ready owner inventory ledger is missing: {}",
+                        manifest_path.display()
+                    ),
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 for entry in fs::read_dir(&config.root)? {
                     let entry = entry?;
@@ -444,7 +515,7 @@ impl NodeInventory {
         // must never revoke a currently running owner's namespaces.
         let mut live_target = {
             let marker = config.root.join(LIVE_TARGET_CONFIG);
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-utils")))]
             use super::super::nvmeof::live_target::LiveTargetManager;
             match fs::symlink_metadata(&marker) {
                 Ok(metadata) if metadata.file_type().is_file() => {
@@ -455,10 +526,10 @@ impl NodeInventory {
                             "live target configuration required and must match persisted configuration",
                         ));
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-utils"))]
                     let manager = open_live_target_fixture(saved.config, Some(saved.identity))
                         .map_err(TcpError::component)?;
-                    #[cfg(not(test))]
+                    #[cfg(not(any(test, feature = "test-utils")))]
                     let manager = LiveTargetManager::open_existing(saved.config, saved.identity)
                         .map_err(TcpError::component)?;
                     Some(manager)
@@ -466,6 +537,17 @@ impl NodeInventory {
                 Ok(_) => {
                     return Err(TcpError::new(
                         "live target configuration is not a regular file",
+                    ));
+                }
+                Err(error)
+                    if mode == OpenMode::Ready && error.kind() == io::ErrorKind::NotFound =>
+                {
+                    return Err(TcpError::with_kind(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Ready owner live target identity marker is missing: {}",
+                            marker.display()
+                        ),
                     ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -480,10 +562,13 @@ impl NodeInventory {
                         }
                     }
                     if let Some(target_config) = config.live_target.clone() {
-                        #[cfg(test)]
+                        // The host slot's target directory is created only after the
+                        // owner inventory has reached its first durable image.
+                        super::host::prepare_host_target(&config.root, &target_config)?;
+                        #[cfg(any(test, feature = "test-utils"))]
                         let manager = open_live_target_fixture(target_config.clone(), None)
                             .map_err(TcpError::component)?;
-                        #[cfg(not(test))]
+                        #[cfg(not(any(test, feature = "test-utils")))]
                         let manager = LiveTargetManager::open(target_config.clone())
                             .map_err(TcpError::component)?;
                         let saved = LiveTargetMarker {

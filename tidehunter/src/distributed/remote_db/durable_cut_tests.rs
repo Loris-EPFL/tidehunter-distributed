@@ -255,9 +255,8 @@ fn restarted_owner_process_stops_extend_at_its_lost_version() {
     // target by inode, size and allocation, so the dropped pages read back as
     // the zeros of its never-synced blocks: zero the contents, keep the file.
     let wal = fixture
-        .temp
-        .path()
-        .join(format!("node-1/epoch_{epoch:016}/wal_0000000000000000"));
+        .owner_database_root(1)
+        .join(format!("epoch_{epoch:016x}/wal_0000000000000000"));
     let file = std::fs::OpenOptions::new().write(true).open(wal).unwrap();
     let len = file.metadata().unwrap().len();
     std::os::unix::fs::FileExt::write_all_at(&file, &vec![0; len as usize], 0).unwrap();

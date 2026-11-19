@@ -105,16 +105,6 @@ impl Args {
     }
 }
 
-#[derive(Deserialize)]
-struct NodeLaunch {
-    node: NodeShape,
-}
-
-#[derive(Deserialize)]
-struct NodeShape {
-    shape_yaml: String,
-}
-
 struct Launch {
     config: RemoteDatabaseConfig,
     shape: KeyShape,
@@ -140,8 +130,10 @@ impl Launch {
         if config.storage.partitions.len() != 5 {
             return Err(invalid("recovery campaign requires five prepared partitions").into());
         }
-        // Use the actual launch shape, and reject anything the existing benchmark
+        // Use the actual prepared shape, and reject anything the existing benchmark
         // key generator cannot represent. Never open with an assumed key length.
+        // Owners receive the shape when the coordinator provisions them; the
+        // prepared case records it once beside the coordinator config.
         let generated = KeyShape::new_single_config(
             8,
             16,
@@ -149,21 +141,12 @@ impl Launch {
             KeySpaceConfig::new().with_value_cache_size(0),
         );
         let expected = serde_yaml::to_value(&generated)?;
-        let mut shape = None;
-        for partition in &config.storage.partitions {
-            let node: NodeLaunch = serde_yaml::from_slice(&fs::read(
-                root.join(format!("node-{partition}/launch.yaml")),
-            )?)?;
-            let actual: KeyShape = serde_yaml::from_str(&node.node.shape_yaml)?;
-            if serde_yaml::to_value(&actual)? != expected {
-                return Err(invalid(format!(
-                    "partition {partition} does not use the generated benchmark KeyShape"
-                ))
-                .into());
-            }
-            shape = Some(actual);
+        let shape: KeyShape = serde_yaml::from_slice(&fs::read(root.join("shape.yaml"))?)?;
+        if serde_yaml::to_value(&shape)? != expected {
+            return Err(
+                invalid("the prepared case does not use the generated benchmark KeyShape").into(),
+            );
         }
-        let shape = shape.ok_or_else(|| invalid("missing prepared key shape"))?;
         let keyspace = shape
             .iter_ks()
             .next()

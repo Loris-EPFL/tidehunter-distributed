@@ -130,8 +130,8 @@ enum Role {
     Stop,
 }
 
-/// Largest set: CQ fd, liveness socket, completion wake, shutdown wake.
-const WAIT_FDS: usize = 4;
+/// CQ fd, liveness socket, completion wake, listener shutdown and database close.
+const WAIT_FDS: usize = 5;
 
 /// The fixed descriptor set of one parked wait, on the stack.
 pub(super) struct WaitSet {
@@ -322,16 +322,6 @@ impl TcpError {
     pub(super) fn owner_closed(reason: &str) -> Self {
         let mut error = Self::new(format!("owner closed the session: {reason}"));
         error.wait_unavailable = reason.starts_with(WAIT_UNAVAILABLE);
-        error
-    }
-
-    /// A correlated `Response::Error` reply, classified by the same prefix: an
-    /// owner refuses a durable-progress poll it cannot park without spinning
-    /// with this reply and keeps the session (see `OwnerProgress::refusal`).
-    pub(super) fn owner_error(message: String) -> Self {
-        let wait_unavailable = message.starts_with(WAIT_UNAVAILABLE);
-        let mut error = Self::new(message);
-        error.wait_unavailable = wait_unavailable;
         error
     }
 

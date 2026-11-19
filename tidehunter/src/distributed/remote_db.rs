@@ -50,6 +50,9 @@ mod capacity_observer;
 pub use capacity_observer::CapacityObserver;
 mod checkpoint_attribution;
 use checkpoint_attribution::CoordinatorIoCategory;
+mod authority_lifecycle;
+pub(crate) use authority_lifecycle::drop_db;
+pub use authority_lifecycle::{AuthorityLifecycle, OwnerControlConfig};
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
@@ -125,6 +128,9 @@ pub struct RemoteEndpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteDatabaseConfig {
+    /// Storage geometry. The database identity is provisioned at first open
+    /// and stored in the authority; it never appears in documents.
+    #[serde(with = "authority_lifecycle::storage_geometry")]
     pub storage: LocalInventoryConfig,
     pub endpoints: Vec<RemoteEndpoint>,
     pub tls: TlsFiles,
@@ -560,6 +566,8 @@ struct AuthorityManifest {
     /// Previous committed files, removable only after the new root is durable.
     #[serde(default)]
     checkpoint_obsolete: Option<CheckpointCommit>,
+    lifecycle: Option<AuthorityLifecycle>,
+    owner_control: Option<OwnerControlConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -627,6 +635,33 @@ impl AuthorityMode {
             return Err(legacy_mode_error(&self.history_persistence));
         }
         Ok(())
+    }
+}
+
+fn new_authority_manifest(config: &RemoteDatabaseConfig, shape_yaml: &str) -> AuthorityManifest {
+    AuthorityManifest {
+        format: fencing_generations::AUTHORITY_FORMAT,
+        storage: config.storage.clone(),
+        mode: AuthorityMode {
+            history_persistence: MANIFEST_HISTORY.into(),
+            checkpoint_mode: None,
+            cell_checkpoint: None,
+            cell_checkpoint_obsolete: None,
+        },
+        endpoints: config.endpoints.clone(),
+        shape_yaml: shape_yaml.to_owned(),
+        replay_limits: config.replay_limits,
+        live_nvme_identity: Some((config.live_nvme.host_nqn.clone(), config.live_nvme.host_id)),
+        live_nvme_owner_identities: config.live_nvme.owner_identities.clone(),
+        next_generation: 1,
+        generations: Vec::new(),
+        trim_pending: None,
+        adopt_trim: None,
+        checkpoint: None,
+        checkpoint_staging: None,
+        checkpoint_obsolete: None,
+        lifecycle: None,
+        owner_control: None,
     }
 }
 
@@ -1347,71 +1382,30 @@ impl RemoteDatabase {
         }
         config.validate()?;
         config.validate_read_lane_pinning(config.effective_read_lanes())?;
+        let compactor =
+            super::native_index::CompactorPolicy::from_shape(shape, config.compactor_cadence);
+        let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
+        // Preserve callback closures; YAML describes the shape, not its policy.
+        let shape = shape.clone();
+        // Namespace locks, native lock, pending-drop recovery and, for a new
+        // path, identity provisioning on every owner. The resolved config
+        // carries the provisioned database identity from here on.
+        let mut config = config;
+        let authority_lifecycle::OpenedAuthority {
+            lock,
+            path,
+            mut manifest,
+            namespace: _namespace,
+        } = authority_lifecycle::open_authority(path, &mut config, &shape_yaml, |config| {
+            new_authority_manifest(config, &shape_yaml)
+        })?;
         let mut index = NativeIndex::with_shards(
-            shape,
+            &shape,
             config.storage.database,
             config.max_index_bytes,
             config.index_shards,
         )
         .map_err(LocalDbError::component)?;
-        let compactor =
-            super::native_index::CompactorPolicy::from_shape(shape, config.compactor_cadence);
-        let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
-        // Keep the caller's shape: relocation filters and compactors are
-        // closures, which the YAML form (manifest and owner check) drops.
-        let shape = shape.clone();
-        match fs::create_dir(path) {
-            Ok(()) => File::open(
-                path.parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new(".")),
-            )
-            .and_then(|f| f.sync_all())
-            .map_err(LocalDbError::component)?,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(LocalDbError::component(e)),
-        }
-        let lock = DbLock::acquire(path, Duration::ZERO).map_err(LocalDbError::component)?;
-        let path = path.canonicalize().map_err(LocalDbError::component)?;
-        let mut manifest: AuthorityManifest = if path.join(MANIFEST).exists() {
-            fencing_generations::read_authority_manifest(&path.join(MANIFEST))?
-        } else {
-            for entry in fs::read_dir(&path).map_err(LocalDbError::component)? {
-                let name = entry.map_err(LocalDbError::component)?.file_name();
-                if name != "LOCK" && name != format!(".{MANIFEST}.pending").as_str() {
-                    return Err(LocalDbError::new(
-                        "missing authority manifest beside retained data",
-                    ));
-                }
-            }
-            let manifest = AuthorityManifest {
-                format: fencing_generations::AUTHORITY_FORMAT,
-                storage: config.storage.clone(),
-                mode: AuthorityMode {
-                    history_persistence: MANIFEST_HISTORY.into(),
-                    checkpoint_mode: None,
-                    cell_checkpoint: None,
-                    cell_checkpoint_obsolete: None,
-                },
-                endpoints: config.endpoints.clone(),
-                shape_yaml: shape_yaml.clone(),
-                replay_limits: config.replay_limits,
-                live_nvme_identity: Some((
-                    config.live_nvme.host_nqn.clone(),
-                    config.live_nvme.host_id,
-                )),
-                live_nvme_owner_identities: config.live_nvme.owner_identities.clone(),
-                next_generation: 1,
-                generations: Vec::new(),
-                trim_pending: None,
-                adopt_trim: None,
-                checkpoint: None,
-                checkpoint_staging: None,
-                checkpoint_obsolete: None,
-            };
-            persist_manifest(&path, &manifest, CoordinatorIoCategory::Open)?;
-            manifest
-        };
         if manifest.storage != config.storage
             || manifest.endpoints != config.endpoints
             || manifest.shape_yaml != shape_yaml
@@ -1431,6 +1425,10 @@ impl RemoteDatabase {
             .replay_limits
             .validate()
             .map_err(LocalDbError::new)?;
+        // Use the configured identity for comparisons, and the provisioned
+        // per-database identity for actual namespace grants and connections.
+        authority_lifecycle::apply_effective_initiators(&mut config);
+        let config = config;
         let live_pool = {
             let registry = super::nvmeof::live_connect::LiveConnectionRegistry::open(
                 &path.join("live-nvme-connections"),
@@ -1926,6 +1924,11 @@ impl RemoteDatabase {
     }
     pub fn epoch(&self) -> u64 {
         self.core.epoch
+    }
+
+    /// The database identity provisioned at this path's first open.
+    pub fn database_id(&self) -> [u8; 16] {
+        self.core.config.storage.database
     }
 
     pub fn validate_cached_read(&self) -> Result<(), LocalDbError> {

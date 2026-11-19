@@ -254,23 +254,14 @@ establish a hardware data path. Software OFI correctness does not qualify
 hardware or performance. Exercised local checks and explicit hardware limits
 are recorded in the [27 October fabric qualification](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026).
 
-Every distributed adapter accepts the existing `external_remote_config` object plus an `external_owner_read_config` array. The latter is required for external owners and must have exactly one entry for every configured partition:
-
-```json
-{
-  "partition": 0,
-  "read_workers": 2,
-  "wal_member_read": "async",
-  "read_resident_first": false,
-  "read_memory_allowance_bytes": 536870912,
-  "read_max_inflight_requests": 32,
-  "read_max_inflight_bytes": 67108864,
-  "read_max_device_reads": 128
-}
-```
+Every distributed adapter requires `external_remote_config` with `live_nvme`.
+The owner launch describes an `OwnerHost` and has no database ID, shape or WAL
+geometry. The coordinator supplies those on first open. Subsequent opens of
+the same authority recover its provisioned identity; dropping it removes
+owner state before the path can provision a new identity.
 
 The coordinator's `external_remote_config` serializes its engine `Transport`
-under its `tls` settings; each owner's generated `NodeConfig` serializes its
+under its `tls` settings; each owner's launch serializes its
 own selected `Transport`. Prep input `owner_transports` supplies the per-owner
 transport vector and its selectors for generated launch/config metadata; it is
 not a field added to `RemoteDatabaseConfig`. Client and owner provider/security
@@ -302,25 +293,18 @@ Use the built binary's pure prep mode to generate engine-native external configs
 kv-research --prepare-external-case input.json --output FRESH_DIR
 ```
 
-`input.json` has the required fields: absolute `guest_root`; five unique
-`addresses` as `IPv4:port`/`[IPv6]:port`; canonical `transport` as a structured
-engine `Transport`; optional `owner_transports` for per-owner selectors;
-positive `max_batches_per_partition`, `max_admitted_batches`, and
-`max_index_bytes`; nonnegative `coordinator_cache_bytes`; positive
-`owner_read_workers` and `owner_read_memory_allowance_bytes`;
-`owner_wal_member_read` (`async`, `mapped`, or `positional`); optional
-`owner_read_resident_first` (default `true`) enables Linux page-cache NOWAIT with
-async reads; set it explicitly to `false` for `mapped`, `positional`, or forced
-async controls;
-and `polling` (`adaptive` or `busy`). The helper fixes the keyshape at 16 mutexes
-× 64 cells and writes `node-{0..4}/launch.yaml`, `remote.yaml`, `remote.json`,
-`shape.yaml`, generated `tls/` material when TLS is selected, and
-`external_owner_read_config.json` extracted from each actual launch file. Owner
-limits remain as configured by the prep helper. Each launch states
-`wal_prewrite: false` explicitly (the legacy harness behaviour; an owner reads
-an absent key as on). The cloud and local harnesses rebind it to the case's
-`owner_wal_prewrite` before starting the owner. A pre-existing output
-directory is rejected. The signing key stays in the generated
+`input.json` specifies an absolute `guest_root`, one, two, four, five, or sixteen
+unique `addresses` as `IPv4:port`/`[IPv6]:port`, a structured engine `transport`,
+optional `owner_transports`, and the required `live_nvmeof` settings below.
+Set positive `max_batches_per_partition`, `max_admitted_batches` and
+`max_index_bytes`, a nonnegative `coordinator_cache_bytes`, an
+`owner_wal_member_read` policy (`async`, `mapped` or `positional`), and
+`polling` (`adaptive` or `busy`). The default synthetic keyshape has 16 mutexes
+× 64 cells. The helper writes `node-*/launch.yaml`, `remote.yaml`, `remote.json`,
+`shape.yaml`, and generated TLS material when TLS is selected. Each launch
+sets `host.wal_prewrite: false`; the cloud and local harnesses can set it from
+`owner_wal_prewrite` before starting the owner. A pre-existing output directory
+is rejected. The signing key stays in the generated
 coordinator-side TLS tree; stage each node's launch config and required CA
 certificate/server leaf certificate+key to that owner, never the CA signing
 key. The coordinator uses `remote.json` credentials.
@@ -363,9 +347,13 @@ scalar writes/deletes, atomic batches and mixed workloads. Historical sealed
 controls carry the explicit `sealed_read` route and remain separate populations.
 See [live WAL architecture and source map](../../experiments/nvmeof/LIVE_WAL.md).
 
-The external preparation CLI accepts one, two or five owners and a
-`live_nvmeof` target configuration. It emits the exact owner target settings
-and persistent initiator NQN/UUID into the generated remote configuration.
+External preparation accepts one, two, four, five, or sixteen owners. In
+`live_nvmeof`, `port_id` and `service` are the public pool bases for owner 0.
+`max_databases` is optional (default 1, valid range 1–16). With `M` slots per
+owner, owner `p` gets `M` public slots starting at `base + 2*p*M`, followed
+by `M` private commissioning slots. These ranges apply to both port IDs and
+services. Launch files contain `host.live_target_pool`, not a per-database
+target. The coordinator provisions database and effective target identities.
 Selected RDMA requires the actual Linux NVMe/RDMA initiator; there is no TCP payload fallback.
 Private loopback TCP commissioning is a target-control prerequisite, not the
 selected payload route.

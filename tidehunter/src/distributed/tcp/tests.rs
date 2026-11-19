@@ -515,7 +515,10 @@ fn authenticated_roundtrip(transport: Transport) {
     let mut anonymous = StreamOwned::new(connection, socket);
     let anonymous_result = write_frame(
         &mut anonymous,
-        &Request::Status { protocol: PROTOCOL },
+        &Request::Status {
+            protocol: PROTOCOL,
+            database: None,
+        },
         1024,
     )
     .and_then(|()| read_frame::<Response>(&mut anonymous, 4096));

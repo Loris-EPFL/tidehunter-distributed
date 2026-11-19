@@ -828,82 +828,66 @@ fn leased_worker_completes_flight_while_adoption_pending_without_timer_wait() {
 
 #[test]
 fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
-    use crate::distributed::tcp::LiveClientConfig;
+    use super::pipeline_tests::Fixture as DatabaseFixture;
+    use crate::key_shape::KeyType;
     for (result, already_poisoned) in [
         (Some(-libc::EIO), false),
         (Some(2048), false),
         (None, false),
         (None, true),
     ] {
-        let fixture = Fixture::single_partition(DurabilityTier::Native, 16384);
-        let owner = &fixture.config.partition;
-        let root = tempdir::TempDir::new("leased-shutdown").unwrap();
-        let config = RemoteDatabaseConfig {
-            storage: LocalInventoryConfig {
-                database: owner.inventory.database,
-                partitions: owner.inventory.partitions.clone(),
-                batch_limits: owner.batch_limits,
-                group_limits: owner.group_limits,
-                fragment_bytes: owner.fragment_bytes,
-                wal_file_bytes: owner.wal_file_bytes,
-                max_batches_per_partition: owner.max_batches,
-                max_reference_metadata_bytes: owner.max_reference_metadata_bytes,
+        let fixture = DatabaseFixture::new_with_root(
+            tempdir::TempDir::new("leased-shutdown").unwrap(),
+            1,
+            4096,
+            KeyShape::new_single(4, 1, KeyType::uniform(1)),
+            8,
+            |config| {
+                // Leave room after one 4 KiB frame for shutdown to write a skip
+                // marker. Keep one live flight and no cache or flush batching.
+                config.storage.batch_limits.max_operations = 8;
+                config.storage.batch_limits.max_encoded_bytes = 8192;
+                config.storage.group_limits.max_encoded_bytes = 16376;
+                config.storage.fragment_bytes = 16384;
+                config.storage.wal_file_bytes = 32768;
+                config.storage.max_reference_metadata_bytes = 64 * 1024 * 1024;
+                config.timeout = Duration::from_secs(5);
+                config.max_admitted_batches = 16;
+                config.index_shards = 2;
+                config.max_pending_batches = 16;
+                config.max_pending_bytes = 4 * 1024 * 1024;
+                config.replay_limits = ReplayLimits {
+                    max_batches: 4096,
+                    max_encoded_bytes: 16 * 1024 * 1024,
+                };
+                config.owner_append_occupancy = 1;
+                config.read_cache_bytes = 0;
+                config.read_memory_allowance_bytes = 64 * 1024 * 1024;
+                config.scan_prefetch_pages = 1;
+                config.read_lanes = Some(1);
+                config.max_pending_reads = 4;
+                config.max_pending_read_bytes = 128 * 1024;
+                config.live_nvme.leased_write_window = Some(1);
+                config.live_nvme.leased_flush_min_frame_bytes = 0;
+                config.live_nvme.max_inflight_requests = 4;
+                config.live_nvme.max_inflight_bytes = 128 * 1024;
+                config.live_nvme.connect_timeout_ms = 1000;
+                config.live_nvme.io_timeout_ms = 1000;
             },
-            endpoints: vec![RemoteEndpoint {
-                partition: owner.partition,
-                address: fixture.endpoint.clone(),
-                server_name: fixture.tls.server_name.clone(),
-            }],
-            tls: fixture.tls.clone(),
-            timeout: Duration::from_secs(5),
-            max_admitted_batches: 16,
-            max_index_bytes: 1024 * 1024,
-            index_shards: 2,
-            max_pending_batches: 16,
-            max_pending_bytes: 4 * 1024 * 1024,
-            replay_limits: ReplayLimits {
-                max_batches: 4096,
-                max_encoded_bytes: 16 * 1024 * 1024,
-            },
-            owner_append_occupancy: 1,
-            pipelined_writes: true,
-            leased_submit_redrain: true,
-            read_cache_bytes: 0,
-            read_memory_allowance_bytes: 64 * 1024 * 1024,
-            scan_prefetch_pages: 1,
-            read_lanes: Some(1),
-            pin_read_lanes: false,
-            max_pending_reads: 4,
-            max_pending_read_bytes: 128 * 1024,
-            write_profile_limit: 0,
-            live_nvme: LiveClientConfig {
-                lease_ahead: true,
-                polled_writes: false,
-                host_nqn: "nqn.2026-01.test:leased".into(),
-                host_id: [1; 16],
-                owner_identities: Default::default(),
-                leased_write_window: Some(1),
-                leased_sync: Default::default(),
-                leased_flush_min_frame_bytes: 0,
-                max_inflight_requests: 4,
-                max_inflight_bytes: 128 * 1024,
-                connect_timeout_ms: 1000,
-                io_timeout_ms: 1000,
-                leased_durability: DurabilityTier::Native,
-                inline_reads: true,
-                queue_geometry: Default::default(),
-            },
-            durable_cut: Default::default(),
-            relocation_max_reclaim_pct: 100,
-            compactor_cadence: Default::default(),
-        };
-        let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
-        let database =
-            RemoteDatabase::open_local_live_fixture(root.path(), &shape, config).unwrap();
+            |_| {},
+        );
+        let database = fixture.open();
         let client = database.core.clients[0].client.clone();
-        let batch = fixture.batch(0);
+        let operation = fixture.operation(0, 0);
         database
-            .write_batch(batch.id().operation, batch.mutations().to_vec())
+            .write_batch(
+                operation,
+                vec![Mutation::Put {
+                    keyspace: KeySpace(0),
+                    key: b"key1"[..].into(),
+                    value: vec![0; 32].into(),
+                }],
+            )
             .unwrap();
         let metrics = database.core.live_metrics.as_ref().unwrap().clone();
         let deadline = Instant::now() + Duration::from_secs(5);

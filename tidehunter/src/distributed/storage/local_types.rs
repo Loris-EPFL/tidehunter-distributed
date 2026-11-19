@@ -7,6 +7,7 @@ use crate::distributed::native_index::IndexReadPin;
 use crate::distributed::types::{BatchVersion, MutationVersion};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io;
 
 /// Static placement and bounded resident authority windows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,15 +57,23 @@ impl LocalCheckpoint {
 #[derive(Debug)]
 pub struct LocalDbError {
     message: String,
+    kind: io::ErrorKind,
     pub uncertain_version: Option<BatchVersion>,
 }
 
 impl LocalDbError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(io::ErrorKind::Other, message)
+    }
+    pub(crate) fn with_kind(kind: io::ErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind,
             uncertain_version: None,
         }
+    }
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        self.kind
     }
     pub(crate) fn message(&self) -> &str {
         &self.message
@@ -75,6 +84,7 @@ impl LocalDbError {
     pub(crate) fn unknown(version: BatchVersion, error: impl fmt::Display) -> Self {
         Self {
             message: format!("outcome requires recovery for {version:?}: {error}"),
+            kind: io::ErrorKind::Other,
             uncertain_version: Some(version),
         }
     }
@@ -87,3 +97,9 @@ impl fmt::Display for LocalDbError {
 }
 
 impl std::error::Error for LocalDbError {}
+
+impl From<io::Error> for LocalDbError {
+    fn from(error: io::Error) -> Self {
+        Self::with_kind(error.kind(), error.to_string())
+    }
+}

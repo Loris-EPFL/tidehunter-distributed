@@ -14,10 +14,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
+use tidehunter::distributed::nvmeof::NvmeofTransport;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, RemoteEndpoint};
-use tidehunter::distributed::storage::{LocalInventoryConfig, PartitionConfig, StaticInventory};
+use tidehunter::distributed::storage::LocalInventoryConfig;
 use tidehunter::distributed::tcp::{
-    LiveClientConfig, NodeConfig, PollingPolicy, StorageNode, TcpLimits, TlsFiles, Transport,
+    HostDurabilityDefaults, LiveClientConfig, LiveTargetPool, OwnerHost, OwnerHostConfig,
+    PollingPolicy, TcpLimits, TlsFiles, Transport,
 };
 use tidehunter::key_shape::KeyShape;
 use tidehunter::metrics::Metrics;
@@ -28,8 +30,8 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// No sockets are opened and no remote data is reset. Callers transport each
 /// node's leaf key/config separately; the CA signing key never belongs on nodes.
 /// Leased NVMe-oF is the only distributed route, so the coordinator config
-/// always carries `live_nvme`; each owner's `live_target` is added by the caller.
-/// `durability` is the config every owner launch applies.
+/// always carries `live_nvme`; each owner launch supplies a live target slot pool.
+/// `durability` describes the tier requested for this namespace and owner defaults.
 #[allow(clippy::too_many_arguments)] // Explicit harness inputs bind the external namespace and transport.
 pub fn prepare_external_case(
     directory: &Path,
@@ -125,32 +127,15 @@ pub fn prepare_external_case(
             )
         };
         let launch = NodeLaunch {
-            node: NodeConfig {
-                root: node_root.join("storage"),
-                partition: PartitionConfig {
-                    inventory: StaticInventory {
-                        database: storage.database,
-                        epoch: 1,
-                        segment_generation: 1,
-                        partitions: storage.partitions.clone(),
-                    },
-                    partition,
-                    batch_limits: storage.batch_limits,
-                    group_limits: storage.group_limits,
-                    fragment_bytes: storage.fragment_bytes,
-                    wal_file_bytes: storage.wal_file_bytes,
-                    max_batches: storage.max_batches_per_partition,
-                    max_reference_metadata_bytes: storage.max_reference_metadata_bytes,
-                },
-                shape_yaml: serde_yaml::to_string(shape)?,
+            partition,
+            host: host_config(
+                node_root.join("storage"),
+                partition,
+                address.ip().to_string(),
                 wal_member_read,
-                // Legacy harness behaviour, written explicitly because the owner
-                // default is on. The cloud and local harnesses rebind each case's
-                // owner_wal_prewrite before validating the launch.
-                wal_prewrite: false,
-                read_max_device_reads: 128,
-                live_target: None,
-            },
+                durability,
+            )?,
+            r1_events: None,
             tls: TlsFiles {
                 transport: owner_transport.clone(),
                 ca,
@@ -237,21 +222,69 @@ pub fn prepare_external_case(
     Ok(())
 }
 
+/// One owner process: an `OwnerHost` whose databases are provisioned at run
+/// time by their coordinators. `partition` is harness metadata only (the
+/// endpoint this process serves in the generated coordinator config).
 #[derive(Clone, Serialize, Deserialize)]
 struct NodeLaunch {
-    node: NodeConfig,
+    partition: u32,
+    host: OwnerHostConfig,
     tls: TlsFiles,
     limits: TcpLimits,
     listen: SocketAddr,
     ready_file: PathBuf,
     stop_file: PathBuf,
-    /// Absent in older launch files: the native tier, the engine default.
+    #[serde(default)]
+    r1_events: Option<tidehunter::distributed::r1_events::R1EventConfig>,
     #[serde(default)]
     durability: DurabilityConfig,
     /// Fresh per start (the controller writes it); the owner echoes it in its receipt so a
     /// stale receipt is recognizable.
     #[serde(default)]
     launch_nonce: String,
+}
+
+/// Owner host configuration of the harness. Target slots are derived from
+/// `target_address`; no live target is created unless a coordinator
+/// provisions a leased database.
+fn host_config(
+    root: PathBuf,
+    partition: u32,
+    target_address: String,
+    wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
+    durability: DurabilityConfig,
+) -> Result<OwnerHostConfig> {
+    // Colocated owners share nvmet port IDs and, on one address, services:
+    // owner `p` takes 16 public then 16 commissioning slots from `32 p`.
+    let base = u16::try_from(partition)
+        .ok()
+        .filter(|partition| *partition < 16)
+        .map(|partition| partition * 32)
+        .ok_or_else(|| io::Error::other("owner harness supports at most sixteen owners"))?;
+    Ok(OwnerHostConfig {
+        root,
+        max_databases: 16,
+        live_target_pool: LiveTargetPool {
+            address: target_address,
+            transport: NvmeofTransport::Tcp,
+            public_port_base: 1 + base,
+            public_service_base: 4420 + base,
+            commissioning_port_base: 17 + base,
+            commissioning_service_base: 4436 + base,
+        },
+        // Required only by the trusted transports, ignored with mTLS.
+        trusted_coordinator_id: Some([0x7d; 32]),
+        wal_member_read,
+        // Legacy harness behaviour, written explicitly because the owner
+        // default is on. The cloud and local harnesses rebind each case's
+        // owner_wal_prewrite before validating the launch.
+        wal_prewrite: false,
+        read_max_device_reads: 128,
+        durability: HostDurabilityDefaults {
+            max_unsynced_age_ms: durability.max_unsynced_age_ms,
+            max_pending_completions: durability.max_pending_completions,
+        },
+    })
 }
 
 /// Owner process output that proves the tier it applied; written before the ready file.
@@ -308,13 +341,14 @@ impl ReceiptDurability {
 }
 
 /// What one owner process publishes before its ready file. It names the owner (partition,
-/// database, bound address), the exact process (pid, boot id, start time) and the launch
-/// (nonce), so one receipt can neither confirm another partition nor outlive a restart.
+/// bound address), the exact process (pid, boot id, start time) and the launch (nonce), so
+/// one receipt can neither confirm another partition nor outlive a restart. The owner hosts
+/// databases provisioned later, so the receipt names no database; `durability` is the policy
+/// the host applies to every database it opens.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerReceipt {
     pub partition: u32,
-    pub database: [u8; 16],
     pub address: String,
     pub launch_nonce: String,
     pub pid: u32,
@@ -375,7 +409,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             }
             let launch: NodeLaunch = serde_yaml::from_slice(&fs::read(&file)?)?;
             launch
-                .node
+                .host
                 .validate()
                 .map_err(|e| io::Error::other(format!("{file}: {e}")))?;
             launch.limits.validate()?;
@@ -411,16 +445,8 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     }
     let launch_bytes = fs::read(&file)?;
     let config: NodeLaunch = serde_yaml::from_slice(&launch_bytes)?;
-    let live_shutdown_owner = config.node.live_target.as_ref().map(|_| {
-        serde_json::json!({
-            "database": config.node.partition.inventory.database,
-            "partition": config.node.partition.partition,
-            "root": config.node.root,
-        })
-    });
     let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
-    let partition = config.node.partition.partition;
-    let database = config.node.partition.inventory.database;
+    let partition = config.partition;
     let owner_events =
         if std::env::var_os("TIDEHUNTER_OWNER_EVENTS").is_some_and(|value| value == "1") {
             tidehunter::distributed::owner_events::enable(65_536);
@@ -428,11 +454,9 @@ pub fn maybe_run_storage_node() -> Result<bool> {
         } else {
             None
         };
-    let node = StorageNode::open(config.node, metrics)?;
-    // Applied before the listener exists, so no client request can see another tier.
-    node.set_durability(config.durability)?;
-    let effective = node.durability();
-    println!("durability_tier={}", effective.tier);
+    let host =
+        OwnerHost::open_with_r1_events(config.host.clone(), metrics, config.r1_events.clone())?;
+    println!("durability_tier={}", config.durability.tier);
     let listener = TcpListener::bind(config.listen)?;
     let address = listener.local_addr()?;
     // The receipt names this exact process and launch and lands before the ready file.
@@ -444,13 +468,12 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     }
     let receipt = OwnerReceipt {
         partition,
-        database,
         address: address.to_string(),
-        launch_nonce: config.launch_nonce,
+        launch_nonce: config.launch_nonce.clone(),
         pid: std::process::id(),
         boot_id,
         started_unix_ns: u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?,
-        durability: ReceiptDurability::of(effective),
+        durability: ReceiptDurability::of(config.durability),
     };
     publish_synced(
         &durability_file(&config.ready_file),
@@ -462,30 +485,47 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     println!("storage_node_pid={} address={address}", std::process::id());
     let shutdown = Arc::new(AtomicBool::new(false));
     let monitor_shutdown = shutdown.clone();
+    let stop_file = config.stop_file.clone();
     let monitor = std::thread::spawn(move || {
         while !monitor_shutdown.load(Ordering::Acquire) {
-            if config.stop_file.exists() {
+            if stop_file.exists() {
                 monitor_shutdown.store(true, Ordering::Release);
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     });
-    let result = node.serve(listener, config.tls, config.limits, shutdown.clone());
+    let result = host.serve(
+        listener,
+        config.tls.clone(),
+        config.limits,
+        shutdown.clone(),
+    );
     shutdown.store(true, Ordering::Release);
     monitor
         .join()
         .map_err(|_| io::Error::other("node stop monitor panicked"))?;
-    if let Some(owner) = live_shutdown_owner {
+    // Serving has joined every session; finish evidence for the databases
+    // still routed (the lifecycle actor finishes streams of dropped ones).
+    let evidence = host.finish_r1_events();
+    let cleanup = host.finish_live_target_shutdown();
+    let targets: Vec<_> = cleanup
+        .as_ref()
+        .map(|targets| {
+            targets
+                .iter()
+                .filter_map(|(database, stats)| stats.as_ref().map(|stats| (*database, stats)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if cleanup.is_err() || !targets.is_empty() {
         use blake2::{Blake2b512, Digest};
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        // This runs only after every serving session has joined. Ordinary
-        // database close does not destroy the target: it must permit reopen.
-        let cleanup = node.finish_live_target_shutdown();
-        let target = cleanup.as_ref().ok().and_then(Option::as_ref);
-        let complete = qualified_live_target_shutdown(result.is_ok(), target);
-        let scope = "kernel_live_target_shutdown";
+        let complete = !targets.is_empty()
+            && targets
+                .iter()
+                .all(|(_, stats)| qualified_live_target_shutdown(result.is_ok(), Some(stats)));
         let launch_hash: String = Blake2b512::digest(&launch_bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -496,23 +536,33 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             .and_then(|(_, fields)| fields.split_whitespace().nth(19))
             .ok_or_else(|| io::Error::other("missing process start time"))?
             .parse::<u64>()?;
-        let (wal_prewrite_bytes, wal_prewrite_ns, wal_prewrite_files) = node.wal_prewrite_stats();
+        let (wal_prewrite_bytes, wal_prewrite_ns, wal_prewrite_files) = host.wal_prewrite_stats();
         let proof = serde_json::json!({
-            "schema_version": 1,
-            "scope": scope,
+            "schema_version": 2,
+            "scope": "kernel_live_target_shutdown",
             "complete": complete,
             "launch_blake2b512": launch_hash,
-            "owner": owner,
+            "owner": {
+                "partition": partition,
+                "root": config.host.root,
+            },
             "process_id": std::process::id(),
             "process_start_ticks": process_start_ticks,
-            "target": target,
+            // One entry per routed database that owned a live target.
+            "targets": targets
+                .iter()
+                .map(|(database, stats)| serde_json::json!({
+                    "database": database,
+                    "target": stats,
+                }))
+                .collect::<Vec<_>>(),
             "preparation": {
                 "wal_prewrite_bytes": wal_prewrite_bytes,
                 "wal_prewrite_ns": wal_prewrite_ns,
                 "wal_prewrite_files": wal_prewrite_files,
             },
             // Exports a request created inline while its caller waited.
-            "inline_exports": node.live_inline_export_stats(),
+            "inline_exports": host.live_inline_export_stats(),
             "serve_error": result.as_ref().err().map(ToString::to_string),
             "cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
         });
@@ -540,6 +590,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
         }
     }
     result?;
+    evidence?;
     if let Some(path) = owner_events {
         tidehunter::distributed::owner_events::write_json(&path)?;
     }
@@ -570,7 +621,6 @@ mod durability_receipt_tests {
     fn receipt(partition: u32, tier: DurabilityTier) -> OwnerReceipt {
         OwnerReceipt {
             partition,
-            database: [7; 16],
             address: "127.0.0.1:9400".to_owned(),
             launch_nonce: "nonce".to_owned(),
             pid: 1,

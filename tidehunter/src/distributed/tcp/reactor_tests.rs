@@ -207,7 +207,9 @@ fn owner_session_deadlines_extend_fence() {
         assert!(Instant::now() < completion_deadline, "Fence did not finish");
         thread::yield_now();
     };
-    assert!(matches!(response, Response::Status(status) if status.active_epoch == Some(1)));
+    assert!(
+        matches!(response, Response::Status(StatusReply::Database(status)) if status.active_epoch == Some(1))
+    );
 }
 
 #[test]
@@ -499,7 +501,13 @@ fn faulty_peer(fault: Fault, transport: Transport) {
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
     let status = node
-        .handle(Request::Status { protocol: PROTOCOL }, TcpLimits::default())
+        .handle(
+            Request::Status {
+                protocol: PROTOCOL,
+                database: Some(node.database()),
+            },
+            TcpLimits::default(),
+        )
         .unwrap();
     let response = node
         .handle(Request::Fence { epoch: 1 }, TcpLimits::default())
@@ -605,7 +613,7 @@ fn faulty_peer(fault: Fault, transport: Transport) {
             assert!(matches!(fault, Fault::PartialValid));
             assert!(matches!(
                 result.unwrap(),
-                Response::Status(status) if status.active_epoch == Some(1)
+                Response::Status(StatusReply::Database(status)) if status.active_epoch == Some(1)
             ));
             break;
         }

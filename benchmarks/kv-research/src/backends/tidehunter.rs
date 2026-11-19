@@ -23,12 +23,13 @@ use std::path::{Path, PathBuf};
 // Only the Linux live-route boundary snapshot waits with a timeout.
 use std::time::Duration;
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
+use tidehunter::distributed::nvmeof::NvmeofTransport;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, ReplayLimits};
 use tidehunter::distributed::storage::{
     LocalInventoryConfig, NATIVE_FRAGMENT_BYTES, NATIVE_WAL_FILE_BYTES,
 };
 use tidehunter::distributed::sui;
-use tidehunter::distributed::tcp::{FabricSecurity, PollingPolicy, Transport};
+use tidehunter::distributed::tcp::{FabricSecurity, LiveTargetPool, PollingPolicy, Transport};
 use tidehunter::key_shape::{KeyShape, KeyType};
 use tidehunter::minibytes::Bytes;
 
@@ -94,8 +95,6 @@ struct Options {
     #[serde(default)]
     batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
     #[serde(default)]
-    database: Option<[u8; 16]>,
-    #[serde(default)]
     coordinator_read_cache_bytes: Option<usize>,
     #[serde(default)]
     replay_limits: Option<ReplayLimits>,
@@ -116,11 +115,12 @@ struct Options {
 #[serde(deny_unknown_fields)]
 struct ExternalLiveNvmeof {
     addresses: Vec<std::net::IpAddr>,
-    transport: String,
+    transport: NvmeofTransport,
+    /// Owner 0's public pool bases. Other owners follow after both ranges.
     service: u16,
     port_id: u16,
-    commissioning_service: u16,
-    commissioning_port_id: u16,
+    #[serde(default = "default_owner_max_databases")]
+    max_databases: usize,
     max_inflight_requests: usize,
     #[serde(default)]
     leased_write_window: Option<usize>,
@@ -149,9 +149,7 @@ struct ExternalPreparationInput {
     guest_root: PathBuf,
     addresses: Vec<String>,
     transport: Transport,
-    /// Independent owner identity and complete-batch bounds; absent retains synthetic defaults.
-    #[serde(default)]
-    database: Option<[u8; 16]>,
+    /// Complete-batch admission bounds for table-aware replay.
     #[serde(default)]
     batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
     /// Pinned node DB table declarations, not the synthetic root keyspace.
@@ -188,6 +186,10 @@ fn default_resident_first() -> bool {
 
 fn default_coordinator_read_memory_allowance_bytes() -> usize {
     512 * 1024 * 1024
+}
+
+fn default_owner_max_databases() -> usize {
+    1
 }
 
 fn backend_name(transport: &Transport) -> &'static str {
@@ -264,6 +266,34 @@ impl Drop for ExternalPreparationStaging {
     }
 }
 
+/// Each owner gets `M` consecutive public slots at `base + 2*p*M`,
+/// followed by `M` private commissioning slots, for ports and services.
+fn owner_target_pool(live: &ExternalLiveNvmeof, partition: u32) -> BackendResult<LiveTargetPool> {
+    const INVALID: &str = "invalid live NVMe-oF target ports or max_databases";
+    if !(1..=16).contains(&live.max_databases) {
+        return Err(INVALID.into());
+    }
+    let slots = u32::try_from(live.max_databases)?;
+    let offset = |base: u16, extra: u32| {
+        partition
+            .checked_mul(2 * slots)
+            .and_then(|start| start.checked_add(extra + u32::from(base)))
+            .and_then(|start| u16::try_from(start).ok())
+            .ok_or(INVALID)
+    };
+    let pool = LiveTargetPool {
+        address: live.addresses[partition as usize].to_string(),
+        transport: live.transport,
+        public_port_base: offset(live.port_id, 0)?,
+        public_service_base: offset(live.service, 0)?,
+        commissioning_port_base: offset(live.port_id, slots)?,
+        commissioning_service_base: offset(live.service, slots)?,
+    };
+    pool.validate(live.max_databases)
+        .map_err(|error| format!("owner {partition} target pool: {error}"))?;
+    Ok(pool)
+}
+
 /// Generate external node launch files with the exact engine harness schema.
 // Keep emitted owner budgets beside their admission checks to prevent drift.
 #[allow(clippy::too_many_lines)]
@@ -272,10 +302,8 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     if input.replay_node_db_id.is_some_and(|id| id > 2) {
         return Err("replay_node_db_id must be 0, 1 or 2".into());
     }
-    if input.replay_node_db_id.is_some()
-        && (input.database.is_none() || input.batch_limits.is_none())
-    {
-        return Err("replay owner preparation requires explicit database and batch_limits".into());
+    if input.replay_node_db_id.is_some() && input.batch_limits.is_none() {
+        return Err("replay owner preparation requires explicit batch_limits".into());
     }
     let batch_limits = input
         .batch_limits
@@ -319,21 +347,8 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             .addresses
             .iter()
             .any(|ip| ip.is_unspecified() || ip.is_multicast())
-        || !matches!(live.transport.as_str(), "tcp" | "rdma")
         || live.service == 0
         || live.port_id == 0
-        || live.commissioning_service == 0
-        || live.commissioning_port_id == 0
-        || live
-            .commissioning_service
-            .checked_add(2 * (input.addresses.len() as u16 - 1))
-            .is_none()
-        || live.commissioning_service != live.service.checked_add(1).unwrap_or(0)
-        || live
-            .commissioning_port_id
-            .checked_add(2 * (input.addresses.len() as u16 - 1))
-            .is_none()
-        || live.commissioning_port_id != live.port_id.checked_add(1).unwrap_or(0)
         || live.max_inflight_requests == 0
         || live.max_inflight_bytes == 0
         || live.connect_timeout_ms == 0
@@ -343,6 +358,8 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             "invalid live NVMe-oF addresses, target identity, ports or client limits".into(),
         );
     }
+    // The last owner's upper bound covers every earlier slot range.
+    owner_target_pool(live, u32::try_from(input.addresses.len() - 1)?)?;
     let addresses = input
         .addresses
         .iter()
@@ -358,7 +375,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     let owner_transports =
         select_owner_transports(&input.transport, input.owner_transports, addresses.len())?;
     let storage = LocalInventoryConfig {
-        database: input.database.unwrap_or([0x4b; 16]),
+        database: [0; 16],
         partitions: (0..u32::try_from(addresses.len())?).collect(),
         batch_limits,
         group_limits: tidehunter::distributed::group::GroupLimits {
@@ -485,19 +502,9 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             .join(format!("node-{partition}"))
             .join("launch.yaml");
         let mut launch: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&launch_path)?)?;
-        let (_, host_nqn) = &live_identities[partition as usize];
-        let port_offset = 2 * partition as u16;
-        let config = serde_json::json!({
-            "address": live.addresses[partition as usize].to_string(),
-            "service": live.service + port_offset,
-            "transport": live.transport,
-            "host_nqn": host_nqn,
-            "port_id": live.port_id + port_offset,
-            "state_dir": input.guest_root.join(format!("node-{partition}")).join("live-nvmeof"),
-            "commissioning_port_id": live.commissioning_port_id + port_offset,
-            "commissioning_service": live.commissioning_service + port_offset
-        });
-        launch["node"]["live_target"] = serde_yaml::to_value(config)?;
+        launch["host"]["max_databases"] = serde_yaml::to_value(live.max_databases)?;
+        launch["host"]["live_target_pool"] =
+            serde_yaml::to_value(owner_target_pool(live, partition)?)?;
         fs::write(&launch_path, serde_yaml::to_string(&launch)?)?;
     }
     fs::rename(&prepared, output)?;
@@ -731,13 +738,11 @@ pub async fn open(
     open_for(value, registry).await
 }
 
-/// Every partition must be confirmed by exactly one receipt that names it, its database and its
-/// endpoint, and that carries the requested tier. A receipt copied from another owner, another
-/// database or an unrelated address cannot confirm a partition.
+/// Every partition needs one receipt for its owner process and endpoint.
+/// The coordinator separately verifies the provisioned database's tier.
 fn confirm_owner_receipts(
     receipts: &[tcp_cluster::OwnerReceipt],
     partitions: &[u32],
-    database: [u8; 16],
     endpoints: &[(u32, String)],
     tier: DurabilityTier,
 ) -> Result<(), String> {
@@ -761,13 +766,12 @@ fn confirm_owner_receipts(
             .iter()
             .find(|(candidate, _)| candidate == partition)
             .map(|(_, address)| address);
-        if receipt.database != database
-            || address != Some(&receipt.address)
+        if address != Some(&receipt.address)
             || receipt.launch_nonce.is_empty()
             || receipt.durability.tier != tier
         {
             return Err(format!(
-                "owner receipt for partition {partition} does not match its database, endpoint or tier {tier}"
+                "owner receipt for partition {partition} does not match its endpoint or tier {tier}"
             ));
         }
     }
@@ -813,8 +817,7 @@ async fn open_with_shape(
         .into());
     }
     // Report only what every owner process confirmed. Each publishes a receipt naming its
-    // partition, database, bound address and process before its ready file; a missing, incomplete
-    // or foreign one fails the open.
+    // partition, bound address and process before its ready file.
     let owner_receipts: Vec<tcp_cluster::OwnerReceipt> = options
         .external_owner_durability_receipts
         .iter()
@@ -828,7 +831,6 @@ async fn open_with_shape(
     confirm_owner_receipts(
         &owner_receipts,
         &remote_config.storage.partitions,
-        remote_config.storage.database,
         &receipt_endpoints,
         options.durability_tier,
     )?;
@@ -836,7 +838,7 @@ async fn open_with_shape(
         "requested_tier": options.durability_tier.as_str(),
         "receipt_durability": options.durability_tier.receipt_durability().as_str(),
         "comparison_cohort": options.durability_tier.comparison_cohort(),
-        "source": "each owner process published a receipt naming its partition, database, address, process and launch before its ready file",
+        "source": "each owner process published a receipt naming its partition, address, process and launch before its ready file",
         "owners": owner_receipts,
     });
     if let Some(cache_bytes) = options.coordinator_read_cache_bytes {
@@ -1017,6 +1019,12 @@ async fn open_with_shape(
                 None => serde_json::Value::Null,
             };
     }
+    let database = db
+        .remote_database_id()
+        .ok_or("opened backend is not remote")?;
+    effective_configuration["database"] = serde_json::json!(
+        tidehunter::distributed::tcp::host::identity::database_hex(&database)
+    );
     effective_configuration["read_backend"] = serde_json::json!("live_nvmeof");
     effective_configuration["write_backend"] = serde_json::json!("live_nvmeof");
     effective_configuration["data_route_evidence"] = serde_json::json!({
@@ -1904,7 +1912,6 @@ pub(crate) fn test_live_nvmeof(owners: usize) -> serde_json::Value {
     serde_json::json!({
         "addresses": (1..=owners).map(|owner| format!("10.1.0.{owner}")).collect::<Vec<_>>(),
         "transport": "rdma", "service": 4420, "port_id": 4420,
-        "commissioning_service": 4421, "commissioning_port_id": 4421,
         "max_inflight_requests": 8, "max_inflight_bytes": 8388608,
         "connect_timeout_ms": 10000, "io_timeout_ms": 10000
     })
@@ -1979,12 +1986,12 @@ mod tests {
     fn external_live_options_default_inline_and_reject_unknown_fields() {
         let mut input = serde_json::json!({
             "addresses": ["10.1.0.1"], "transport": "rdma", "service": 4420, "port_id": 4420,
-            "commissioning_service": 4421, "commissioning_port_id": 4421,
             "max_inflight_requests": 8, "max_inflight_bytes": 8388608,
             "connect_timeout_ms": 10000, "io_timeout_ms": 10000
         });
         let parsed: ExternalLiveNvmeof = serde_json::from_value(input.clone()).unwrap();
         assert!(parsed.inline_reads);
+        assert_eq!(parsed.max_databases, 1);
         assert_eq!(
             parsed.leased_sync,
             tidehunter::distributed::tcp::LeasedSync::GroupFlush
@@ -2066,11 +2073,14 @@ mod tests {
             serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap()).unwrap();
         assert!(launch.get("history_persistence").is_none());
         assert!(launch.get("drop_first_append_response").is_none());
-        assert!(launch["node"]["live_target"].is_mapping());
+        assert!(launch.get("node").is_none());
+        assert!(launch["host"]["live_target_pool"].is_mapping());
+        assert_eq!(launch["host"]["max_databases"].as_u64(), Some(1));
         assert!(!output.join("external_owner_read_config.json").exists());
         let remote: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
         assert!(remote["live_nvme"].is_object());
+        assert!(remote["storage"].get("database").is_none());
         // Removed inputs (history, owner-RPC reads) are rejected; live_nvmeof is required.
         for (index, key) in [
             "history_persistence",
@@ -2165,9 +2175,8 @@ mod tests {
                     &fs::read(output.join(format!("node-{partition}/launch.yaml"))).unwrap(),
                 )
                 .unwrap();
-                let storage = &launch["node"]["partition"];
-                assert_eq!(storage["fragment_bytes"].as_u64(), Some(fragment_bytes));
-                assert_eq!(storage["wal_file_bytes"].as_u64(), Some(wal_file_bytes));
+                assert!(launch.get("node").is_none());
+                assert_eq!(launch["partition"].as_u64(), Some(partition));
                 for (field, name) in [
                     ("ca", "ca.der".to_owned()),
                     ("cert", format!("tidehunter-node-{partition}.der")),
@@ -2217,7 +2226,6 @@ mod tests {
             "guest_root": "/mnt/tidehunter-kv-comparison/bench-b2eec4ef24bc4f90/cells/G18W-r0-219b8b655801a7844229",
             "live_nvmeof": {
                 "addresses": ["10.20.15.197"],
-                "commissioning_port_id": 1001, "commissioning_service": 4421,
                 "connect_timeout_ms": 30000,
                 "inline_reads": true, "io_timeout_ms": 30000,
                 "max_inflight_bytes": 16777216, "max_inflight_requests": 32,
@@ -2313,15 +2321,12 @@ mod tests {
                 serde_yaml::from_slice(&fs::read(output.join("node-0/launch.yaml")).unwrap())
                     .unwrap();
             assert!(launch.get("history_persistence").is_none());
-            assert!(launch["node"]["live_target"].get("export_mode").is_none());
-            assert_eq!(
-                launch["node"]["live_target"]["host_nqn"].as_str(),
-                remote["live_nvme"]["host_nqn"].as_str()
-            );
-            assert_eq!(
-                launch["node"]["partition"]["fragment_bytes"].as_u64(),
-                Some(134217728)
-            );
+            assert!(launch.get("node").is_none());
+            let pool = &launch["host"]["live_target_pool"];
+            assert!(pool.is_mapping());
+            assert!(pool.get("export_mode").is_none());
+            assert!(pool.get("host_nqn").is_none());
+            assert_eq!(remote["storage"]["fragment_bytes"], 134217728);
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -2380,7 +2385,6 @@ mod tests {
             config["live_nvmeof"] = serde_json::json!({
                 "addresses": ["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.5"],
                 "transport": "rdma", "service": 4420, "port_id": 4420,
-                "commissioning_service": 4421, "commissioning_port_id": 4421,
                 "max_inflight_requests": 8, "max_inflight_bytes": 8388608,
                 "connect_timeout_ms": 10000, "io_timeout_ms": 10000
             });
@@ -2408,23 +2412,18 @@ mod tests {
                     &fs::read(output.join(format!("node-{partition}/launch.yaml"))).unwrap(),
                 )
                 .unwrap();
-                let node: tidehunter::distributed::tcp::NodeConfig =
-                    serde_yaml::from_value(launch["node"].clone()).unwrap();
-                assert!(node.live_target.is_some());
-                let target = &launch["node"]["live_target"];
+                let owner: tidehunter::distributed::tcp::OwnerHostConfig =
+                    serde_yaml::from_value(launch["host"].clone()).unwrap();
+                assert_eq!(owner.max_databases, 1);
+                let target = &launch["host"]["live_target_pool"];
                 assert_eq!(
                     target["address"].as_str().unwrap(),
                     format!("10.1.0.{}", partition + 1)
                 );
                 assert_eq!(target["transport"].as_str().unwrap(), "rdma");
-                let owner_identity =
-                    &remote["live_nvme"]["owner_identities"][partition.to_string()];
+                assert!(target.get("host_nqn").is_none());
                 assert_eq!(
-                    target["host_nqn"].as_str(),
-                    owner_identity["host_nqn"].as_str()
-                );
-                assert_eq!(
-                    target["commissioning_service"].as_u64(),
+                    target["commissioning_service_base"].as_u64(),
                     Some(4421 + 2 * partition)
                 );
             }
@@ -2449,13 +2448,20 @@ mod tests {
                         &fs::read(colocated.join(format!("node-{owner}/launch.yaml"))).unwrap(),
                     )
                     .unwrap();
-                    let target = &launch["node"]["live_target"];
-                    assert!(nqns.insert(target["host_nqn"].as_str().unwrap().to_owned()));
-                    assert_eq!(target["service"].as_u64(), Some(4420 + 2 * owner as u64));
-                    assert_eq!(target["port_id"].as_u64(), Some(4420 + 2 * owner as u64));
+                    let target = &launch["host"]["live_target_pool"];
+                    let identity = &identities[&owner.to_string()];
+                    assert!(nqns.insert(identity["host_nqn"].as_str().unwrap()));
                     assert_eq!(
-                        target["state_dir"].as_str().unwrap(),
-                        root.join(format!("guest/node-{owner}/live-nvmeof"))
+                        target["public_service_base"].as_u64(),
+                        Some(4420 + 2 * owner as u64)
+                    );
+                    assert_eq!(
+                        target["public_port_base"].as_u64(),
+                        Some(4420 + 2 * owner as u64)
+                    );
+                    assert_eq!(
+                        launch["host"]["root"].as_str().unwrap(),
+                        root.join(format!("guest/node-{owner}/storage"))
                             .to_str()
                             .unwrap()
                     );
@@ -2567,7 +2573,6 @@ mod tests {
     fn receipt(partition: u32, address: &str, tier: DurabilityTier) -> tcp_cluster::OwnerReceipt {
         tcp_cluster::OwnerReceipt {
             partition,
-            database: [4; 16],
             address: address.to_owned(),
             launch_nonce: "n".to_owned(),
             pid: 1,
@@ -2591,26 +2596,25 @@ mod tests {
             receipt(0, "10.0.0.1:9400", DurabilityTier::Synchronous),
             receipt(1, "10.0.0.2:9400", DurabilityTier::Synchronous),
         ];
-        let confirm = |receipts: &[tcp_cluster::OwnerReceipt], database, tier| {
-            confirm_owner_receipts(receipts, &[0, 1], database, &endpoints, tier)
+        let confirm = |receipts: &[tcp_cluster::OwnerReceipt], tier| {
+            confirm_owner_receipts(receipts, &[0, 1], &endpoints, tier)
         };
-        assert!(confirm(&good, [4; 16], DurabilityTier::Synchronous).is_ok());
+        assert!(confirm(&good, DurabilityTier::Synchronous).is_ok());
         // The same receipt listed for both partitions.
         let copied = [good[0].clone(), good[0].clone()];
-        assert!(confirm(&copied, [4; 16], DurabilityTier::Synchronous).is_err());
-        // A receipt from another endpoint, another database or another tier.
+        assert!(confirm(&copied, DurabilityTier::Synchronous).is_err());
+        // A receipt from another endpoint or another tier.
         let foreign = [
             good[0].clone(),
             receipt(1, "10.0.0.9:9400", DurabilityTier::Synchronous),
         ];
-        assert!(confirm(&foreign, [4; 16], DurabilityTier::Synchronous).is_err());
-        assert!(confirm(&good, [5; 16], DurabilityTier::Synchronous).is_err());
-        assert!(confirm(&good, [4; 16], DurabilityTier::Native).is_err());
+        assert!(confirm(&foreign, DurabilityTier::Synchronous).is_err());
+        assert!(confirm(&good, DurabilityTier::Native).is_err());
         // A missing receipt, and a receipt with no launch nonce.
-        assert!(confirm(&good[..1], [4; 16], DurabilityTier::Synchronous).is_err());
+        assert!(confirm(&good[..1], DurabilityTier::Synchronous).is_err());
         let mut unlaunched = good;
         unlaunched[1].launch_nonce.clear();
-        assert!(confirm(&unlaunched, [4; 16], DurabilityTier::Synchronous).is_err());
+        assert!(confirm(&unlaunched, DurabilityTier::Synchronous).is_err());
     }
 
     #[test]

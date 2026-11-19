@@ -133,9 +133,8 @@ fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
     fail_stop_without_checkpoint(db);
     fixture.stop_owners();
     let file = fixture
-        .temp
-        .path()
-        .join("node-0/epoch_0000000000000001/wal_0000000000000000");
+        .owner_database_root(0)
+        .join("epoch_0000000000000001/wal_0000000000000000");
     fs::OpenOptions::new()
         .write(true)
         .open(file)
@@ -173,9 +172,8 @@ fn wal_replay_reopen_fails_when_owner_wal_content_ends_below_checkpoint_position
         .write(true)
         .open(
             fixture
-                .temp
-                .path()
-                .join("node-0/epoch_0000000000000001/wal_0000000000000000"),
+                .owner_database_root(0)
+                .join("epoch_0000000000000001/wal_0000000000000000"),
         )
         .unwrap();
     let len = file.metadata().unwrap().len();
@@ -250,9 +248,8 @@ fn wal_replay_retires_sealed_file_only_after_complete_image() {
     }
     db.flush_index().unwrap();
     let file = fixture
-        .temp
-        .path()
-        .join("node-0/epoch_0000000000000001/wal_0000000000000000");
+        .owner_database_root(0)
+        .join("epoch_0000000000000001/wal_0000000000000000");
     assert!(file.exists());
     fail_stop_without_checkpoint(db);
     let db = fixture.open();
@@ -393,9 +390,8 @@ fn wal_replay_native_owner_loss_beyond_durable_end_keeps_checkpoint() {
     fixture.stop_owners();
     // Simulate lost native-tier page-cache bytes, not a synchronous-tier loss.
     let path = fixture
-        .temp
-        .path()
-        .join("node-0/epoch_0000000000000001/wal_0000000000000000");
+        .owner_database_root(0)
+        .join("epoch_0000000000000001/wal_0000000000000000");
     let file = fs::OpenOptions::new().write(true).open(path).unwrap();
     file.write_all_at(&[0; 8], frame_end).unwrap();
     file.sync_all().unwrap();

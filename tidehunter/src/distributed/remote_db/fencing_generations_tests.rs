@@ -82,7 +82,7 @@ impl Harness {
         (0..2)
             .map(|owner| {
                 let mut generations: Vec<u64> =
-                    fs::read_dir(self.fixture.temp.path().join(format!("node-{owner}")))
+                    fs::read_dir(self.fixture.owner_database_root(owner))
                         .unwrap()
                         .filter_map(|entry| {
                             let name = entry.unwrap().file_name();
