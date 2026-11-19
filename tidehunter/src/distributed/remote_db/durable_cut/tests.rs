@@ -31,6 +31,20 @@ fn replay(plan: &mut RecoveryPlan) -> Vec<u64> {
         .collect()
 }
 
+/// Only a missing record means "no record". A directory in its place (EISDIR on
+/// read) or a file in place of the authority directory (ENOTDIR) fails the load.
+#[test]
+fn unreadable_record_fails_instead_of_reading_as_absent() {
+    let directory = tempdir::TempDir::new("durable-cut-record-errors").unwrap();
+    assert_eq!(CutRecord::load(directory.path(), DB, 5).unwrap(), None);
+    std::fs::create_dir(directory.path().join(RECORD)).unwrap();
+    let error = CutRecord::load(directory.path(), DB, 5).unwrap_err();
+    assert!(error.message().contains(RECORD), "{error}");
+    let not_directory = directory.path().join("authority-file");
+    std::fs::write(&not_directory, b"x").unwrap();
+    assert!(CutRecord::load(&not_directory, DB, 5).is_err());
+}
+
 #[test]
 fn record_round_trips_and_rejects_foreign_or_future_state() {
     let directory = tempdir::TempDir::new("durable-cut-record").unwrap();
@@ -213,21 +227,21 @@ fn no_record_and_no_tracking_writes_nothing() {
     );
 }
 
-const BOOT: [u8; 16] = [1; 16];
-const OTHER_BOOT: [u8; 16] = [2; 16];
+const INCARNATION: [u8; 16] = [1; 16];
+const OTHER_INCARNATION: [u8; 16] = [2; 16];
 
 fn mark(partition: u32, synced_next: u64) -> OwnerMark {
     OwnerMark {
         partition,
-        boot_id: BOOT,
+        incarnation: INCARNATION,
         synced_next,
     }
 }
 
-fn fence(partition: u32, boot_id: [u8; 16], recovery_clean: bool) -> OwnerFence {
+fn fence(partition: u32, incarnation: [u8; 16], recovery_clean: bool) -> OwnerFence {
     OwnerFence {
         partition,
-        boot_id,
+        incarnation,
         recovery_clean,
     }
 }
@@ -239,11 +253,11 @@ fn continuity_plan(cut: CutRecovery, owner1_synced: u64, fenced: &[OwnerFence]) 
     RecoveryPlan::new(Some(stored), DB, &config(cut), None, fenced)
 }
 
-/// Coordinator-only crash: every owner kept its page cache, so the missing 5
+/// Coordinator-only crash: every owner process kept running, so the missing 5
 /// was never written and the acknowledged 6 and 7 survive.
 #[test]
 fn continuous_owners_skip_a_never_written_version() {
-    let fenced = [fence(0, BOOT, true), fence(1, BOOT, true)];
+    let fenced = [fence(0, INCARNATION, true), fence(1, INCARNATION, true)];
     let mut plan = continuity_plan(CutRecovery::Extend, 1, &fenced);
     assert_eq!(plan.continuity_bound, Some(u64::MAX));
     assert_eq!(replay(&mut plan), [0, 1, 2, 3, 4, 6, 7]);
@@ -254,16 +268,17 @@ fn continuous_owners_skip_a_never_written_version() {
     );
 }
 
-/// A rebooted owner or one whose recovery found a hole bounds the skip at its
-/// recorded synced end: below it nothing was lost, at or above it the run stops.
+/// A restarted owner (new incarnation) or one whose recovery found a hole or
+/// that saw a persistence failure bounds the skip at its recorded synced end:
+/// below it nothing was lost, at or above it the run stops.
 #[test]
 fn a_discontinuous_owner_bounds_the_skip_at_its_recorded_sync() {
     for discontinuity in [
-        fence(1, OTHER_BOOT, true),
-        fence(1, BOOT, false),
-        fence(1, OTHER_BOOT, false),
+        fence(1, OTHER_INCARNATION, true),
+        fence(1, INCARNATION, false),
+        fence(1, OTHER_INCARNATION, false),
     ] {
-        let fenced = [fence(0, BOOT, true), discontinuity];
+        let fenced = [fence(0, INCARNATION, true), discontinuity];
         for (synced, kept) in [(6, &[0, 1, 2, 3, 4, 6, 7][..]), (5, &[0, 1, 2, 3, 4])] {
             let mut plan = continuity_plan(CutRecovery::Extend, synced, &fenced);
             assert_eq!(plan.continuity_bound, Some(synced));
@@ -276,9 +291,9 @@ fn a_discontinuous_owner_bounds_the_skip_at_its_recorded_sync() {
 #[test]
 fn missing_continuity_evidence_stops_at_the_first_gap() {
     let unmarked = [
-        fence(0, BOOT, true),
-        fence(1, BOOT, true),
-        fence(2, BOOT, true),
+        fence(0, INCARNATION, true),
+        fence(1, INCARNATION, true),
+        fence(2, INCARNATION, true),
     ];
     let mut plan = continuity_plan(CutRecovery::Extend, 9, &unmarked);
     assert_eq!(plan.continuity_bound, Some(0));
@@ -295,18 +310,21 @@ fn missing_continuity_evidence_stops_at_the_first_gap() {
 
 #[test]
 fn strict_ignores_continuity() {
-    let fenced = [fence(0, BOOT, true), fence(1, BOOT, true)];
+    let fenced = [fence(0, INCARNATION, true), fence(1, INCARNATION, true)];
     let mut plan = continuity_plan(CutRecovery::Strict, 9, &fenced);
     assert_eq!(plan.continuity_bound, None);
     assert_eq!(replay(&mut plan), [0, 1, 2]);
 }
 
-/// A tracked epoch starts with every fenced owner's boot and nothing synced; an
+/// A tracked epoch starts with every fenced owner's incarnation and nothing synced; an
 /// untracked one has no marks, and a record with marks but no tracked epoch is
 /// rejected.
 #[test]
 fn finish_marks_every_fenced_owner_of_a_tracked_epoch() {
-    let fenced = [fence(4, BOOT, true), fence(9, OTHER_BOOT, false)];
+    let fenced = [
+        fence(4, INCARNATION, true),
+        fence(9, OTHER_INCARNATION, false),
+    ];
     let plan = RecoveryPlan::new(None, DB, &config(CutRecovery::Extend), None, &fenced);
     let record = plan.finish(3, true, &fenced).0.unwrap();
     assert_eq!(
@@ -314,12 +332,12 @@ fn finish_marks_every_fenced_owner_of_a_tracked_epoch() {
         [
             OwnerMark {
                 partition: 4,
-                boot_id: BOOT,
+                incarnation: INCARNATION,
                 synced_next: 0
             },
             OwnerMark {
                 partition: 9,
-                boot_id: OTHER_BOOT,
+                incarnation: OTHER_INCARNATION,
                 synced_next: 0
             }
         ]
@@ -345,6 +363,46 @@ fn finish_marks_every_fenced_owner_of_a_tracked_epoch() {
     orphan.owners = vec![mark(4, 0)];
     orphan.persist(directory.path()).unwrap();
     assert!(CutRecord::load(directory.path(), DB, 5).is_err());
+}
+
+/// A format 1 record (marks with the kernel boot id) fails the open: it never
+/// reads as format 2 and never reads as absent.
+#[test]
+fn format_1_record_fails_to_load() {
+    #[derive(Serialize)]
+    struct BootMark {
+        partition: u32,
+        boot_id: [u8; 16],
+        synced_next: u64,
+    }
+    #[derive(Serialize)]
+    struct FormatOne {
+        format: u32,
+        database: [u8; 16],
+        live: Option<EpochCut>,
+        owners: Vec<BootMark>,
+        truncations: Vec<EpochCut>,
+    }
+    let directory = tempdir::TempDir::new("durable-cut-format-1").unwrap();
+    let live = Some(EpochCut { epoch: 2, next: 1 });
+    let old = FormatOne {
+        format: 1,
+        database: DB,
+        live,
+        owners: vec![BootMark {
+            partition: 0,
+            boot_id: INCARNATION,
+            synced_next: 1,
+        }],
+        truncations: Vec::new(),
+    };
+    install_metadata(directory.path(), RECORD, &encode_metadata(&old).unwrap()).unwrap();
+    assert!(CutRecord::load(directory.path(), DB, 3).is_err());
+    let mut renamed = record(live, Vec::new());
+    renamed.owners = vec![mark(0, 1)];
+    renamed.format = 1;
+    renamed.persist(directory.path()).unwrap();
+    assert!(CutRecord::load(directory.path(), DB, 3).is_err());
 }
 
 fn evaluate(
@@ -465,6 +523,76 @@ fn full_sample_queue_keeps_the_oldest_age() {
     );
 }
 
+/// A lagging peer pins the cut while owner 0 keeps appending and reporting.
+/// The lag triggers stay true, yet owner 0 gets at most one nudge (one live
+/// root install) per `lag_ms`: the first fires at once when the byte trigger
+/// first holds, and its advancing reports do not re-arm it.
+#[test]
+fn nudges_to_a_pinned_owner_are_bounded_by_the_lag() {
+    let config = DurableCutConfig::default();
+    let lag = Duration::from_millis(config.lag_ms);
+    let mut tracker = Tracker::new(2, &config);
+    let start = Instant::now();
+    let step = Duration::from_millis(10);
+    let total = Duration::from_secs(10);
+    // Owner 1 never syncs past its first receipt: it pins the cut at 0.
+    tracker.report(1, 0, 0);
+    let mut nudges = Vec::new();
+    for k in 0..=(total.as_millis() / step.as_millis()) as u64 {
+        let at = start + step * u32::try_from(k).unwrap();
+        let published = k + 2;
+        // Owner 0 reports one version behind its receipts, 1 MiB more each step.
+        tracker.report(0, published - 1, (k + 1) << 20);
+        let (cut, nudged) = evaluate(&mut tracker, at, published, &[published, 1]);
+        assert_eq!(cut, 0);
+        if nudged.contains(&0) {
+            nudges.push(at - start);
+        }
+    }
+    // 64 MiB above the cut first holds at step 63.
+    assert_eq!(nudges.first(), Some(&Duration::from_millis(630)));
+    assert!(nudges.windows(2).all(|pair| pair[1] - pair[0] >= lag));
+    let bound = total.as_millis().div_ceil(lag.as_millis());
+    assert!(nudges.len() as u128 <= bound, "{nudges:?}");
+    assert_eq!(nudges.len(), 10);
+}
+
+/// The rate bound does not hold a catching-up peer back: it is re-nudged
+/// exactly `lag_ms` after its previous nudge, and the evaluation after its
+/// covering report advances the cut to the floor.
+#[test]
+fn cut_advances_within_the_lag_after_the_lagging_peer_catches_up() {
+    let mut tracker = Tracker::new(2, &DurableCutConfig::default());
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    tracker.report(0, 5, 0);
+    tracker.report(1, 1, 0);
+    let receipted = [5, 4];
+    assert_eq!(
+        evaluate(&mut tracker, at(0), 5, &receipted),
+        (1, Vec::new())
+    );
+    assert_eq!(
+        evaluate(&mut tracker, at(1000), 5, &receipted),
+        (1, vec![1])
+    );
+    // The reply covers part of the peer's receipts; it stays pinned.
+    tracker.report(1, 3, 0);
+    assert_eq!(
+        evaluate(&mut tracker, at(1500), 5, &receipted),
+        (3, Vec::new())
+    );
+    assert_eq!(
+        evaluate(&mut tracker, at(2000), 5, &receipted),
+        (3, vec![1])
+    );
+    tracker.report(1, 4, 0);
+    assert_eq!(
+        evaluate(&mut tracker, at(2001), 5, &receipted),
+        (5, Vec::new())
+    );
+}
+
 /// The inbox is pre-filled past several drain passes (owners + 8 messages
 /// each). A loop that received one message beyond the bound would drop the
 /// message at position `drain + 1` of the first pass and `2 * (drain + 1)` of
@@ -505,11 +633,11 @@ fn saturated_inbox_handles_every_report_and_certification() {
                 owner,
                 synced_next: FLOOR,
                 appended_end: 100,
-                // The last owner reports a boot other than its epoch mark.
-                boot_id: if owner + 1 == OWNERS {
-                    OTHER_BOOT
+                // The last owner reports an incarnation other than its epoch mark.
+                incarnation: if owner + 1 == OWNERS {
+                    OTHER_INCARNATION
                 } else {
-                    BOOT
+                    INCARNATION
                 },
             })
             .unwrap();
@@ -553,18 +681,18 @@ fn saturated_inbox_handles_every_report_and_certification() {
             next: FLOOR
         })
     );
-    // Marks travel with the cut: synced ends advance, a changed boot is zeroed.
+    // Marks travel with the cut: synced ends advance, a changed incarnation is zeroed.
     let marks: Vec<_> = persisted
         .owners
         .iter()
-        .map(|mark| (mark.synced_next, mark.boot_id))
+        .map(|mark| (mark.synced_next, mark.incarnation))
         .collect();
     assert_eq!(
         marks,
         [
-            (FLOOR, BOOT),
-            (FLOOR, BOOT),
-            (FLOOR, BOOT),
+            (FLOOR, INCARNATION),
+            (FLOOR, INCARNATION),
+            (FLOOR, INCARNATION),
             (FLOOR, [0; 16])
         ]
     );

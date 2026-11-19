@@ -274,6 +274,7 @@ pub async fn run<B: KvBackend>(
         }
         if fatal_reason.is_none() {
             measurement_attempted = true;
+            backend.set_measurement_window(true);
             reporter.set_phase("measurement");
             let phase_result = if config.execution.mode == ExecutionMode::Interference {
                 let (result, phase_result) = run_interference_phase(
@@ -310,6 +311,8 @@ pub async fn run<B: KvBackend>(
                 )
                 .await
             };
+            // Close before the end boundary, also when the phase failed.
+            backend.set_measurement_window(false);
             measurement_drained = phase_result.is_ok();
             if let Err(error) = phase_result {
                 failed = true;
@@ -962,6 +965,133 @@ fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_js
     })
 }
 
+/// Live NVMe-oF counters whose measurement-window delta is exported: every `sum`
+/// field of `LiveNvmeCounts` plus the two evidence-drop counters of `LiveNvmeStats`.
+/// The observer exporter admits exactly this set; both sides are pinned to
+/// `experiments/kv-comparison/observability/live_nvmeof_counter_fields.json`.
+const LIVE_NVMEOF_DELTA_FIELDS: &[&str] = &[
+    "completed_read_ops",
+    "completed_read_bytes",
+    "completed_write_ops",
+    "completed_write_bytes",
+    "recovery_read_ops",
+    "recovery_read_bytes",
+    "metadata_requests",
+    "namespace_connects",
+    "payload_rpc_requests",
+    "unknown_writes",
+    "errors",
+    "queue_ns",
+    "queue_samples",
+    "submit_ns",
+    "submit_samples",
+    "cq_ns",
+    "cq_samples",
+    "control_ns",
+    "control_samples",
+    "validation_ns",
+    "validation_samples",
+    "allocation_ns",
+    "allocation_samples",
+    "publication_ns",
+    "publication_samples",
+    "namespace_setup_ns",
+    "namespace_setup_samples",
+    "read_io_ns",
+    "read_io_samples",
+    "persistence_ns",
+    "persistence_samples",
+    "owner_completion_ns",
+    "owner_completion_samples",
+    "wal_persistence_ns",
+    "wal_persistence_samples",
+    "wal_namespace_ns",
+    "wal_namespace_samples",
+    "frontier_file_ns",
+    "frontier_file_samples",
+    "frontier_namespace_ns",
+    "frontier_namespace_samples",
+    "route_evidence_dropped",
+    "fence_evidence_dropped",
+    "lane_inflight_samples",
+    "lane_inflight_request_sum",
+    "lane_inflight_op_sum",
+    "delivery_ns",
+    "delivery_samples",
+    "controller_connect_ns",
+    "controller_connect_samples",
+    "controller_disconnect_ns",
+    "controller_disconnect_samples",
+    "grant_hits",
+    "grant_misses",
+    "grant_evictions",
+    "copy_bytes_avoided",
+    "leased_frame_batches",
+    "write_submit_calls",
+    "owner_drains",
+    "owner_drain_batches",
+    "owner_drain_stop_empty",
+    "owner_drain_stop_allocated",
+    "owner_drain_stop_fence",
+    "owner_drain_stop_limit",
+    "owner_drain_stop_credit",
+    "leased_submit_ready_left",
+    "leased_submit_ready_left_batches",
+    "leased_submit_ready_left_full",
+    "leased_submit_ready_left_full_batches",
+    "leased_deferred_submits",
+    "reserve_exchanges",
+    "complete_exchanges",
+    "lease_exchanges",
+    "leased_frames",
+    "leased_eventfd_unavailable",
+    "leased_worker_waits",
+    "leased_worker_wait_timeouts",
+    "leased_flushes",
+    "leased_flush_ns",
+    "leased_flush_samples",
+    "leased_flush_covered_frames",
+    "read_lane_pin_failures",
+    "leased_bytes",
+    "leased_skip_markers",
+    "extents_leased",
+    "adoption_async_exchanges",
+    "adoption_sync_exchanges",
+    "adoption_async_ns",
+    "adoption_async_samples",
+    "adoption_settle_ns",
+    "adoption_settle_samples",
+    "adoption_history_full_settles",
+    "fua_writes",
+    "leased_write_ns",
+    "leased_write_samples",
+    "extent_switch_ns",
+    "extent_switch_samples",
+    "lease_reserve_ns",
+    "lease_namespace_sync_ns",
+    "lease_publish_ns",
+    "lease_profile_samples",
+    "adopt_owner_ns",
+    "adopt_close_scan_ns",
+    "adopt_close_scan_bytes",
+    "adopt_profile_samples",
+    "extent_preleases",
+    "extent_switch_waits",
+    "leased_failed_writes",
+    "leased_short_writes",
+    "leased_timed_out_writes",
+    "leased_full_writes",
+    "failed_write_ops",
+    "short_write_ops",
+    "short_write_bytes",
+];
+/// Lifetime maxima of `LiveNvmeCounts`: gauge peaks recorded at both boundaries, never deltas.
+const LIVE_NVMEOF_PEAK_FIELDS: &[&str] = &[
+    "lane_inflight_request_max",
+    "lane_inflight_op_max",
+    "max_leased_in_flight",
+];
+
 pub(crate) fn measurement_read_evidence(
     start: &serde_json::Value,
     end: &serde_json::Value,
@@ -1044,108 +1174,7 @@ pub(crate) fn measurement_read_evidence(
         nvmeof_counter_delta(
             &start["live_nvmeof"],
             &end["live_nvmeof"],
-            &[
-                "completed_read_ops",
-                "completed_read_bytes",
-                "completed_write_ops",
-                "completed_write_bytes",
-                "recovery_read_ops",
-                "recovery_read_bytes",
-                "metadata_requests",
-                "namespace_connects",
-                "payload_rpc_requests",
-                "unknown_writes",
-                "errors",
-                "queue_ns",
-                "queue_samples",
-                "submit_ns",
-                "submit_samples",
-                "cq_ns",
-                "cq_samples",
-                "control_ns",
-                "control_samples",
-                "validation_ns",
-                "validation_samples",
-                "allocation_ns",
-                "allocation_samples",
-                "publication_ns",
-                "publication_samples",
-                "namespace_setup_ns",
-                "namespace_setup_samples",
-                "read_io_ns",
-                "read_io_samples",
-                "persistence_ns",
-                "persistence_samples",
-                "owner_completion_ns",
-                "owner_completion_samples",
-                "wal_persistence_ns",
-                "wal_persistence_samples",
-                "wal_namespace_ns",
-                "wal_namespace_samples",
-                "frontier_file_ns",
-                "frontier_file_samples",
-                "frontier_namespace_ns",
-                "frontier_namespace_samples",
-                "route_evidence_dropped",
-                "fence_evidence_dropped",
-                "lane_inflight_samples",
-                "lane_inflight_request_sum",
-                "lane_inflight_op_sum",
-                "delivery_ns",
-                "delivery_samples",
-                "controller_connect_ns",
-                "controller_connect_samples",
-                "controller_disconnect_ns",
-                "controller_disconnect_samples",
-                "grant_hits",
-                "grant_misses",
-                "grant_evictions",
-                "copy_bytes_avoided",
-                "reserve_exchanges",
-                "complete_exchanges",
-                "lease_exchanges",
-                "leased_frames",
-                "leased_eventfd_unavailable",
-                "leased_worker_waits",
-                "leased_worker_wait_timeouts",
-                "leased_flushes",
-                "leased_flush_ns",
-                "leased_flush_samples",
-                "leased_flush_covered_frames",
-                "read_lane_pin_failures",
-                "leased_bytes",
-                "leased_skip_markers",
-                "extents_leased",
-                "adoption_async_exchanges",
-                "adoption_sync_exchanges",
-                "adoption_async_ns",
-                "adoption_async_samples",
-                "adoption_settle_ns",
-                "adoption_settle_samples",
-                "adoption_history_full_settles",
-                "fua_writes",
-                "leased_write_ns",
-                "leased_write_samples",
-                "extent_switch_ns",
-                "extent_switch_samples",
-                "lease_reserve_ns",
-                "lease_namespace_sync_ns",
-                "lease_publish_ns",
-                "lease_profile_samples",
-                "adopt_owner_ns",
-                "adopt_close_scan_ns",
-                "adopt_close_scan_bytes",
-                "adopt_profile_samples",
-                "extent_preleases",
-                "extent_switch_waits",
-                "leased_failed_writes",
-                "leased_short_writes",
-                "leased_timed_out_writes",
-                "leased_full_writes",
-                "failed_write_ops",
-                "short_write_ops",
-                "short_write_bytes",
-            ],
+            LIVE_NVMEOF_DELTA_FIELDS,
         )
     } else {
         serde_json::json!({"available":false,"error":"measurement not attempted or not drained"})
@@ -1166,23 +1195,19 @@ pub(crate) fn measurement_read_evidence(
     };
     // Lifetime maxima are not monotonic counters: a delta would be meaningless, so both
     // boundary values are recorded and the maximum is not attributed to the measurement window.
-    let live_peaks = [
-        "lane_inflight_request_max",
-        "lane_inflight_op_max",
-        "max_leased_in_flight",
-    ]
-    .iter()
-    .map(|field| {
-        (
-            (*field).to_owned(),
-            serde_json::json!({
-                "at_start": start["live_nvmeof"].get(field),
-                "at_end": end["live_nvmeof"].get(field),
-                "scope": "lifetime maximum, not a measurement-window maximum",
-            }),
-        )
-    })
-    .collect::<serde_json::Map<_, _>>();
+    let live_peaks = LIVE_NVMEOF_PEAK_FIELDS
+        .iter()
+        .map(|field| {
+            (
+                (*field).to_owned(),
+                serde_json::json!({
+                    "at_start": start["live_nvmeof"].get(field),
+                    "at_end": end["live_nvmeof"].get(field),
+                    "scope": "lifetime maximum, not a measurement-window maximum",
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     serde_json::json!({
         "schema_version": 1, "scope": "measurement_boundary",
         "start_boundary": "after warmup, aging and measurement gate; before measurement run_phase",
@@ -6999,6 +7024,20 @@ mod tests {
             "grant_misses",
             "grant_evictions",
             "copy_bytes_avoided",
+            "leased_frame_batches",
+            "write_submit_calls",
+            "owner_drains",
+            "owner_drain_batches",
+            "owner_drain_stop_empty",
+            "owner_drain_stop_allocated",
+            "owner_drain_stop_fence",
+            "owner_drain_stop_limit",
+            "owner_drain_stop_credit",
+            "leased_submit_ready_left",
+            "leased_submit_ready_left_batches",
+            "leased_submit_ready_left_full",
+            "leased_submit_ready_left_full_batches",
+            "leased_deferred_submits",
             "reserve_exchanges",
             "complete_exchanges",
             "lease_exchanges",
@@ -7418,5 +7457,53 @@ mod tests {
         }
         assert_eq!(row["stages"]["lock_wait"]["lifetime_max_ns_at_end"], 300);
         assert_eq!(row["available"], true);
+    }
+
+    /// The exported live delta and peak sets and the observer exporter's admitted
+    /// sets change together: both are pinned to one checked-in fixture.
+    #[test]
+    fn live_nvmeof_counter_fields_match_the_observer_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../experiments/kv-comparison/observability/live_nvmeof_counter_fields.json");
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let sorted = |fields: &[&'static str]| {
+            let mut fields = fields.to_vec();
+            fields.sort_unstable();
+            fields
+        };
+        let expected = serde_json::json!({
+            "delta": sorted(LIVE_NVMEOF_DELTA_FIELDS),
+            "peak": sorted(LIVE_NVMEOF_PEAK_FIELDS),
+        });
+        assert_eq!(
+            fixture,
+            expected,
+            "update {} to:\n{}",
+            path.display(),
+            serde_json::to_string_pretty(&expected).unwrap()
+        );
+    }
+
+    /// Every serialized live counter is either a measurement delta or a lifetime peak.
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    #[test]
+    fn live_nvmeof_counter_fields_cover_every_serialized_live_counter() {
+        let stats = serde_json::to_value(
+            tidehunter::distributed::nvmeof::live_metrics::LiveNvmeStats::default(),
+        )
+        .unwrap();
+        // Routes and fences are evidence lists, not counters.
+        let mut serialized: Vec<&str> = stats
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !matches!(*key, "routes" | "fences"))
+            .collect();
+        serialized.sort_unstable();
+        let mut fields = [LIVE_NVMEOF_DELTA_FIELDS, LIVE_NVMEOF_PEAK_FIELDS].concat();
+        fields.sort_unstable();
+        assert_eq!(serialized, fields);
     }
 }

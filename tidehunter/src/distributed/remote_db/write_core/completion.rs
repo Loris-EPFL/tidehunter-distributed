@@ -57,10 +57,50 @@ pub(crate) struct WorkerAccounting {
     pub(crate) groups: AtomicUsize,
     pub(crate) formed: AtomicU64,
     pub(crate) peak_groups: AtomicUsize,
+    /// Group drains, batches they took, and drains per [`DrainStop`] reason.
+    pub(crate) drains: AtomicU64,
+    pub(crate) drain_batches: AtomicU64,
+    pub(crate) drain_stops: [AtomicU64; DrainStop::COUNT],
     /// Test-only exact membership of every formed group, in formation order.
     /// Pushed by the forming worker only; tests read it after durability.
     #[cfg(test)]
     pub(crate) formed_groups: parking_lot::Mutex<Vec<Vec<u64>>>,
+}
+
+/// Why one drain of the READY owner queue stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DrainStop {
+    Empty,
+    Allocated,
+    Fence,
+    Limit,
+    Credit,
+}
+
+impl DrainStop {
+    pub(crate) const COUNT: usize = 5;
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn live(self) -> crate::distributed::nvmeof::live_metrics::OwnerDrainStop {
+        use crate::distributed::nvmeof::live_metrics::OwnerDrainStop;
+        match self {
+            Self::Empty => OwnerDrainStop::Empty,
+            Self::Allocated => OwnerDrainStop::Allocated,
+            Self::Fence => OwnerDrainStop::Fence,
+            Self::Limit => OwnerDrainStop::Limit,
+            Self::Credit => OwnerDrainStop::Credit,
+        }
+    }
+}
+
+impl WorkerAccounting {
+    pub(crate) fn record_drain(&self, batches: usize, stop: DrainStop) {
+        // Relaxed: worker-only diagnostics; no payload or ordering depends on them.
+        self.drains.fetch_add(1, Ordering::Relaxed);
+        self.drain_batches
+            .fetch_add(batches as u64, Ordering::Relaxed);
+        self.drain_stops[stop as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The sole owner-worker completion route. Production uses a Weak<WriteCore>;

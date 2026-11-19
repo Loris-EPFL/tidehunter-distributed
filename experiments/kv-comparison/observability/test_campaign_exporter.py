@@ -407,6 +407,26 @@ class CaseIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete live"):
             campaign.measurement_read_metrics(evidence, {})
 
+    def test_live_counter_sets_match_the_rust_delta_and_peak_fixture(self):
+        # kv-research pins the same fixture to its exported delta/peak lists and to the
+        # serialized LiveNvmeStats fields, so either side changing alone fails CI.
+        fixture = json.loads((Path(__file__).parent / "live_nvmeof_counter_fields.json").read_text())
+        self.assertEqual(set(fixture["delta"]), campaign.live_nvmeof_allowed_counters())
+        self.assertLessEqual(campaign.live_nvmeof_expected_counters(), set(fixture["delta"]))
+        self.assertEqual(set(fixture["peak"]), set(campaign.LIVE_NVMEOF_PEAKS))
+        self.assertFalse(set(fixture["delta"]) & set(fixture["peak"]))
+        # A complete Rust delta is admitted, and each field lands in its unit family.
+        counters = {field: 1 for field in fixture["delta"]}
+        text = campaign.measurement_read_metrics(
+            {"scope": "measurement_boundary", "deltas": {"available": False},
+             "live_nvmeof": {"available": True, "counters": counters}}, {})
+        for name in ("leased_frame_batches", "write_submit_calls", "owner_drains", "owner_drain_batches",
+                     "owner_drain_stop_empty", "owner_drain_stop_allocated", "owner_drain_stop_fence",
+                     "owner_drain_stop_limit", "owner_drain_stop_credit", "leased_submit_ready_left",
+                     "leased_submit_ready_left_batches", "leased_submit_ready_left_full",
+                     "leased_submit_ready_left_full_batches", "leased_deferred_submits"):
+            self.assertIn(f'kv_live_nvmeof_events{{scope="measurement_boundary",counter="{name}"}} 1', text)
+
     def test_new_transport_observations_do_not_require_cq_timing(self):
         evidence = read_diagnostics()
         counters = evidence["profile"]["counters"]
@@ -449,6 +469,38 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('counter="copy_bytes_avoided"} 128', text)
         self.assertIn('stage="delivery_ns"} 9e-09', text)
         self.assertNotIn('stage="controller_connect_ns"', text)
+
+    def test_live_write_profile_fields_and_shared_clocks_match_rust_contract(self):
+        expected = json.loads(Path(__file__).with_name("live_nvmeof_write_profile_fields.json").read_text())
+        self.assertEqual(sorted(campaign.LIVE_NVME_WRITE_COUNTERS), expected)
+        evidence = live_write_diagnostics()
+        counters = dict.fromkeys(expected, 0) | evidence["profile"]["stages"]["live_nvmeof"]
+        evidence["profile"]["stages"]["live_nvmeof"] = counters
+        clocks = {"lease_reserve_ns": 125_000_000, "lease_namespace_sync_ns": 250_000_000,
+                  "lease_publish_ns": 375_000_000, "adopt_owner_ns": 500_000_000,
+                  "adopt_close_scan_ns": 625_000_000}
+        events = {"lease_profile_samples": 2, "adopt_profile_samples": 3,
+                  "extent_preleases": 4, "extent_switch_waits": 5}
+        counters.update(clocks | events | {"adopt_close_scan_bytes": 8_192})
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        labels = ('phase="measurement",scope="measurement_nvme_io_cumulative_delta",'
+                  'diagnostic_backend="tidehunter_live_nvmeof",component="stages.live_nvmeof"')
+        for name, value in clocks.items():
+            self.assertIn(f'kv_case_write_diagnostic_stage_seconds{{{labels},stage="{name}"}} {value / 1e9}\n', text)
+        for name, value in events.items():
+            self.assertIn(f'kv_case_write_diagnostic_stage_count{{{labels},counter="{name}"}} {value}\n', text)
+        self.assertIn(f'kv_live_nvmeof_bytes{{{labels},counter="adopt_close_scan_bytes"}} 8192\n', text)
+        self.assertNotIn(f'kv_case_write_diagnostic_stage_count{{{labels},counter="adopt_close_scan_bytes"}}', text)
+        counters["lease_profile_samples"] = 0
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertNotIn('stage="lease_reserve_ns"', text)
+        self.assertIn('stage="adopt_owner_ns"', text)
+        for missing in ("lease_profile_samples", "adopt_close_scan_ns"):
+            with self.subTest(missing=missing):
+                previous = counters.pop(missing)
+                with self.assertRaisesRegex(ValueError, "lacks its clock|lacks its sample count"):
+                    campaign.write_diagnostic_metrics(evidence, {})
+                counters[missing] = previous
 
     def test_leased_fields_are_strict_and_zero_stages_unavailable(self):
         evidence = live_write_diagnostics()

@@ -56,6 +56,10 @@ pub(super) struct ControlContext {
     pub(super) readers: Arc<parking_lot::RwLock<inventory::ReaderAuthority>>,
     pub(super) terminal: Arc<AtomicBool>,
     pub(super) poison_pending: Arc<AtomicBool>,
+    /// Sticky for this owner incarnation: set by both poison funnels, never cleared,
+    /// not even by a successful live recovery fence. Shared with the inventory, which
+    /// reports `NodeStatus::recovery_clean = false` once it is set.
+    pub(super) persistence_failed: Arc<AtomicBool>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) recoverable_live_failure: AtomicBool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -316,7 +320,18 @@ impl Shared {
         report
             .into_synced()
             .map(|_| ())
-            .map_err(|error| TcpError::new(format!("log frontier flush failed: {error}")))
+            .map_err(|error| TcpError::new(format!("log frontier flush failed: {error}")))?;
+        // An explicit flush also catches up a live root the syncer deferred. The
+        // catch-up publishes durable progress, so parked polls re-check.
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            for log in &logs {
+                log.persist_live_root()
+                    .map_err(|error| TcpError::new(format!("live root flush failed: {error}")))?;
+            }
+            self.progress.advanced();
+        }
+        Ok(())
     }
 
     /// Called only by an exclusive, validated live fence after target revocation.
@@ -346,7 +361,11 @@ impl Shared {
                 .map(|index| slots.swap_remove(index))
         };
         if let Some(SyncerSlot { log, syncer }) = slot {
-            let result = syncer.shutdown();
+            let result = syncer.shutdown().map_err(|error| error.to_string());
+            // Fence and retirement also catch up a deferred live root.
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let result =
+                result.and_then(|()| log.persist_live_root().map_err(|error| error.to_string()));
             drop(log);
             result.map_err(|error| {
                 self.context.poison_readers();
@@ -697,6 +716,19 @@ impl Drop for ControlOwner {
         {
             self.shared.context.poison_readers();
         }
+        // Shutdown drains each syncer, then catches up a deferred live root.
+        // The registry lock is released before any join or file sync.
+        let syncers = std::mem::take(&mut *self.shared.syncers.lock());
+        for SyncerSlot { log, syncer } in syncers {
+            let drained = syncer.shutdown().is_ok();
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let drained = drained && log.persist_live_root().is_ok();
+            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+            let _ = log;
+            if !drained {
+                self.shared.context.poison_readers();
+            }
+        }
     }
 }
 
@@ -1037,9 +1069,17 @@ fn run(shared: &Shared) {
                     {
                         shared.trigger_file_preparation(&log);
                     }
-                    // Native keeps its fragment-boundary/on-demand policy;
-                    // only synchronous adoption requests a per-prefix root sync.
-                    if adoption && (tier == DurabilityTier::Synchronous || closes_extent) {
+                    // Neither tier requests a per-frame sync on adoption.
+                    // Synchronous frames are already FUA- or flush-covered
+                    // before acknowledgement; synchronous owner reads of a
+                    // newer batch persist on demand. Extent close requests the
+                    // fragment-boundary sync (and root install) in both tiers.
+                    // The test-only baseline arm restores the pre-change
+                    // per-adoption synchronous sync request for measurement.
+                    let baseline = tier == DurabilityTier::Synchronous
+                        && crate::distributed::storage::baseline_write_path();
+                    if adoption && (closes_extent || baseline) {
+                        log.note_live_frontier_request();
                         frontier.request_sync().map_err(TcpError::component)?;
                     }
                     Ok(reply)
@@ -1272,8 +1312,11 @@ enum DurablePoll {
 }
 
 /// Validate a poll and answer it now when its condition holds or its wait is zero.
-/// A nudge (`sync`) adopts leased frames and asks the log syncer to cover everything
-/// appended now; it never syncs on this worker.
+/// A nudge (`sync`) adopts leased frames. On a live stream it then runs one barrier
+/// here that syncs everything appended and installs the strict live root over it:
+/// the report covers only the root's prefix, and the bounded syncer may defer the
+/// root for a whole fragment. On any other stream it asks the log syncer to cover
+/// everything appended now and never syncs on this worker.
 fn durable_progress_poll(
     shared: &Shared,
     authority_epoch: u64,
@@ -1298,7 +1341,7 @@ fn durable_progress_poll(
             partition: shared.context.partition.partition,
             authority_epoch,
             epoch,
-            boot_id: inventory.boot_id(),
+            incarnation: inventory.incarnation(),
         };
         (
             identity,
@@ -1313,16 +1356,24 @@ fn durable_progress_poll(
     let wake = if sync {
         #[cfg(feature = "experimental-nvmeof")]
         log.self_adopt_live_extent().map_err(TcpError::component)?;
+        #[cfg(feature = "experimental-nvmeof")]
+        let live = log.persist_live_progress().map_err(TcpError::component)?;
+        #[cfg(not(feature = "experimental-nvmeof"))]
+        let live = false;
+        if live {
+            // Other parked polls of this log see the barrier's publication.
+            shared.progress.advanced();
+        }
         let progress = log.durable_progress();
         // Lag implies an append, which starts the frontier and fixes the tier anyway;
         // an idle log must not start a frontier here.
-        let target = if progress.appended_end > progress.synced_end {
+        let target = if !live && progress.appended_end > progress.synced_end {
             shared
                 .frontier_for(&log)?
                 .request_sync()
                 .map_err(TcpError::component)?
         } else {
-            progress.appended_end
+            progress.synced_end
         };
         Wake::Synced(target)
     } else {
@@ -1816,6 +1867,9 @@ impl ControlContext {
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn poison_incomplete_live(&self) {
+        // Release: before the flags below, so a fence that observes the recoverable
+        // failure (Acquire) also observes the latch.
+        self.persistence_failed.store(true, Ordering::Release);
         {
             let _gate = self.poison_gate.lock();
             if !self.poison_pending.load(Ordering::Acquire) {
@@ -1831,6 +1885,8 @@ impl ControlContext {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         self.recoverable_live_failure
             .store(false, Ordering::Release);
+        // Release, before `poison_pending`: see `poison_incomplete_live`.
+        self.persistence_failed.store(true, Ordering::Release);
         self.poison_pending.store(true, Ordering::Release);
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         drop(_gate);
@@ -3297,6 +3353,9 @@ impl ControlContext {
                     metadata: stats.reference_metadata_bytes,
                 })
             }
+            Request::PartitionStats => Ok(Response::PartitionStats(Box::new(
+                self.inventory.lock().stats()?,
+            ))),
             Request::Stats => {
                 let stats = self.inventory.lock().stats()?;
                 Ok(Response::Stats {

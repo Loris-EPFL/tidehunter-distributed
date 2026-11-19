@@ -32,7 +32,7 @@ import gcp_qualify_bootstrap as qualify
 import gcp_runtime
 import prepare
 import workflow_input
-from cloud_campaign import NVMEOF_PATH_SELECTIONS
+from cloud_campaign import NVMEOF_PATH_SELECTIONS, REDRAIN_AB_SELECTION
 from gcp_api import ApiError
 from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, DelegatedArtifacts, TRANSPORT
 
@@ -138,7 +138,8 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_f9_tools': '68915419fabaa9f74f52c3f4f29beedbf1aa64550c81109682bc0db1eada682d',
     'nvmeof_p9_small_put': 'e4c667a6080f8cc19efc3b35ba4ed7120d864a7d20c0eca12b998e753095f176',
     'nvmeof_p9_write_engine': '7e9089717674ec2980a652984005bf6c210a52a21d94e3ba393e12ed47b275b9',
-    'nvmeof_p13_write_engine': 'fecd37a8ae5139daf2ff1adf92a507a5f22c492a61fe8dd422dd41281715f5b7',
+    'nvmeof_p13_write_engine': '674cd71e117824550abb4624747e462b739cb9535912b5a6415782e186e03d18',
+    REDRAIN_AB_SELECTION: '33349d644ad5295f39bc88d23d0fcd8dbf088a6fb9e2dec429545a792f631808',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -243,14 +244,21 @@ REVIEWED_SPECS["nvmeof_p9_write_engine"] = {
 }
 REVIEWED_SPECS["nvmeof_p13_write_engine"] = {
     **copy.deepcopy(REVIEWED_SPECS["nvmeof_p9_write_engine"]),
-    "selection": "nvmeof_p13_write_engine", "job_count": 22, "max_cases": 22,
-    "reservation_hours": 3, "hard_deadline_seconds": 10800,
+    "selection": "nvmeof_p13_write_engine", "job_count": 50, "max_cases": 50,
+    "reservation_hours": 5.5, "hard_deadline_seconds": 19800,
     "matrix_sha256": FOCUSED_MATRIX_SHA256["nvmeof_p13_write_engine"],
+}
+REVIEWED_SPECS[REDRAIN_AB_SELECTION] = {
+    **{key: copy.deepcopy(value) for key, value in REVIEWED_SPECS["nvmeof_m3_t2_2"].items()
+       if key != "diagnostics"},
+    "selection": REDRAIN_AB_SELECTION, "job_count": 22, "max_cases": 22, "repeats": 2,
+    "reservation_hours": 4.5, "hard_deadline_seconds": 16200, "case_deadline_seconds": 386,
+    "matrix_sha256": FOCUSED_MATRIX_SHA256[REDRAIN_AB_SELECTION],
 }
 SELECTED_MATRIX_SHA256 = {
     "nvmeof_p13_write_engine": {
-        "file": "f67708737e501985f11ccbfcfcd7e7c191e18dbda8ecc4fe8611916862b11301",
-        "prewritten": "abbd468292ed945e553a5a28aed7da51ca016ba6a6eaa1e919cf8e30f3128e4e",
+        "file": "fd9a0184200cb938a0a81407aaf3a7a38aa5956bd73b10337bf3e2521c9d490c",
+        "prewritten": "2080413ba4e1fb6202fc6d4510d45dfbc141678ca4d6ebbc75be33c2047eb43d",
     },
 }
 
@@ -354,6 +362,10 @@ def _record(path, state, phase):
 
 def reservation_seconds(spec):
     hours = spec.get('reservation_hours', 6)
+    reviewed_hours = REVIEWED_SPECS.get(spec.get('selection'), {}).get('reservation_hours')
+    # Only explicitly reviewed durations may use a fractional hour.
+    if type(reviewed_hours) is float and type(hours) is float and hours == reviewed_hours:
+        return int(hours * 3600)
     if type(hours) is not int or not 2 <= hours <= 6:
         raise ValueError('reservation_hours must be an integer from 2 to 6')
     return hours * 3600
@@ -382,9 +394,10 @@ def reviewed_window_spec(spec):
 
 
 def _reviewed_jobs(spec):
-    # P13 pins the reservation as part of its exact review; historical
-    # selections retain the legacy variable-window normalization.
-    if not isinstance(spec, dict) or spec.get("selection") != "nvmeof_p13_write_engine":
+    # P13 and P16 pin the reservation as part of their exact reviews;
+    # historical selections retain the legacy variable-window normalization.
+    if not isinstance(spec, dict) or spec.get("selection") not in (
+            "nvmeof_p13_write_engine", REDRAIN_AB_SELECTION):
         spec = reviewed_window_spec(spec)
     if isinstance(spec, dict) and 'machine_type' in spec:
         if spec['machine_type'] not in MACHINE_RATE_NANODOLLARS:
@@ -1443,7 +1456,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
               'children': {}, 'phase': 'initial', 'cleanup_verified': False,
               'budget': {'ceiling_cents': ceiling, 'compute_cents': compute,
                          'non_compute_quote_cents': surcharge_cents, 'weekly_limit_cents': weekly_limit,
-                         'reservation_hours': duration // 3600},
+                         'reservation_hours': spec.get('reservation_hours', 6)},
               'reservation': {'cents': ceiling, 'region': 'us-central1',
                               'instances': host_count,
                               'vcpus': int(config['machine_type'].rsplit('-', 1)[-1]) * host_count,

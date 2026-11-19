@@ -413,6 +413,16 @@ pub struct RemoteDatabaseConfig {
     /// Dispatch full per-node groups during admission; drain remains the ack barrier.
     #[serde(default = "default_pipeline")]
     pub pipelined_writes: bool,
+    /// Leased live writes only: before each frame submission, the owner
+    /// worker polls the owner queue again and merges groups that became
+    /// READY after the drain at the top of its turn. `false` keeps only that
+    /// first drain; it is an A/B measurement control, valid only with leased
+    /// live writes. Absent means `true`, so documents are unchanged.
+    #[serde(
+        default = "default_leased_submit_redrain",
+        skip_serializing_if = "is_true"
+    )]
+    pub leased_submit_redrain: bool,
     /// Derivative verified-record cache. Zero disables it; never authoritative.
     #[serde(default = "default_read_cache_bytes")]
     pub read_cache_bytes: usize,
@@ -462,6 +472,12 @@ fn default_scan_prefetch_pages() -> usize {
 
 fn default_pipeline() -> bool {
     true
+}
+fn default_leased_submit_redrain() -> bool {
+    true
+}
+fn is_true(value: &bool) -> bool {
+    *value
 }
 fn default_read_cache_bytes() -> usize {
     8 * 1024 * 1024
@@ -607,6 +623,18 @@ impl RemoteDatabaseConfig {
             ));
         }
         self.durable_cut.validate().map_err(LocalDbError::new)?;
+        // Only the leased worker has the pre-submit re-drain. Reject `false`
+        // elsewhere, so a control arm cannot run as a silent no-op.
+        if !self.leased_submit_redrain
+            && !self
+                .live_nvme
+                .as_ref()
+                .is_some_and(|live| live.write_mode == super::tcp::LiveWriteMode::Leased)
+        {
+            return Err(LocalDbError::new(
+                "leased_submit_redrain=false requires live_nvme.write_mode=leased",
+            ));
+        }
         if let Some(live) = &self.live_nvme {
             live.validate().map_err(LocalDbError::new)?;
             if let Some(read_lanes) = self.read_lanes {
@@ -1032,6 +1060,15 @@ pub struct PipelineStats {
     pub concurrent_pending_peak: usize,
     pub concurrent_queued_peak: usize,
     pub concurrent_queue_bytes_peak: usize,
+    /// Owner-worker drains that took a batch or stopped at a nonempty head,
+    /// the batches they took, and why each stopped.
+    pub owner_drains: u64,
+    pub owner_drain_batches: u64,
+    pub owner_drain_stop_empty: u64,
+    pub owner_drain_stop_allocated: u64,
+    pub owner_drain_stop_fence: u64,
+    pub owner_drain_stop_limit: u64,
+    pub owner_drain_stop_credit: u64,
 }
 
 /// Monotonic diagnostic spans. Background checkpoint lifetimes overlap foreground
@@ -1881,7 +1918,7 @@ impl RemoteDatabase {
                     status.durability_tier,
                     durable_cut::OwnerFence {
                         partition: config.endpoints[node].partition,
-                        boot_id: status.boot_id,
+                        incarnation: status.incarnation,
                         recovery_clean: status.recovery_clean,
                     },
                 ),
@@ -2035,6 +2072,7 @@ impl RemoteDatabase {
                         config.partition_config(epoch, partition),
                         config.max_pending_batches,
                         config.effective_owner_append_occupancy(),
+                        config.leased_submit_redrain,
                     )?,
                 },
                 completion.clone(),
@@ -2826,6 +2864,13 @@ impl RemoteDatabase {
             total.inventory_witnesses += stats.inventory_witnesses;
             total.live_frontier_file_syncs += stats.live_frontier_file_syncs;
             total.live_frontier_namespace_syncs += stats.live_frontier_namespace_syncs;
+            total.wal_file_syncs += stats.wal_file_syncs;
+            total.live_frontier_requests += stats.live_frontier_requests;
+            total.live_frontier_installs += stats.live_frontier_installs;
+            total.live_frontier_bytes += stats.live_frontier_bytes;
+            total.live_frontier_deferred += stats.live_frontier_deferred;
+            total.read_persist_requests += stats.read_persist_requests;
+            total.cold_grant_syncs += stats.cold_grant_syncs;
             total.registered_records += stats.registered_records;
             total.reference_metadata_bytes += stats.reference_metadata_bytes;
         }

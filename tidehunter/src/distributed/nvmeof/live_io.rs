@@ -110,6 +110,9 @@ pub struct LiveIoStats {
     /// Bytes reported by short write CQEs; acknowledgement is still unknown.
     #[serde(default)]
     pub short_write_bytes: u64,
+    /// io_uring enter calls that consumed at least one SQE.
+    #[serde(default)]
+    pub submit_calls: u64,
 }
 
 struct Buffer {
@@ -1070,6 +1073,7 @@ impl LiveIo {
             self.stats.submit_ns += started.elapsed().as_nanos();
         }
         self.stats.submissions += submitted as u64;
+        self.stats.submit_calls += u64::from(submitted != 0);
         for _ in 0..submitted {
             let Some(token) = self.queued.pop_front() else {
                 std::process::abort()

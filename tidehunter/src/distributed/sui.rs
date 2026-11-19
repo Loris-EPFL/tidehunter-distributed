@@ -649,6 +649,15 @@ impl Db {
         }
     }
 
+    /// Owner persistence counters summed over owners (WAL syncs, live-frontier
+    /// requests and installs). `None` for the native backend.
+    pub fn owner_storage_stats(&self) -> Result<Option<super::storage::PartitionStats>> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.storage_stats().map(Some).map_err(error),
+            Backend::Native(_) => Ok(None),
+        }
+    }
+
     /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
     /// live target's exported namespaces and is not a reopen operation.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

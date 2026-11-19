@@ -708,8 +708,9 @@ fn recover_child(directory: &Path) {
         durable_prefix(&case),
         "durable-prefix recovery selection {case:?}"
     );
-    // Owner continuity: when every owner kept its boot and recovered without a
-    // hole, a missing version was never written, so Extend discards nothing.
+    // Owner continuity: when every owner process kept running without a failure
+    // and recovered without a hole, a missing version was never written, so
+    // Extend discards nothing.
     if recovery.cut_continuity_bound == Some(u64::MAX) {
         assert_eq!(
             recovery.cut_discarded_batches, 0,
@@ -719,6 +720,16 @@ fn recover_child(directory: &Path) {
     fs::write(
         directory.join("cut-discarded.json"),
         serde_json::to_vec(&recovery.cut_discarded_batches).unwrap(),
+    )
+    .unwrap();
+    let discard = recovery.recovered_cut.map(|cut| Discard {
+        epoch: cut.epoch,
+        next: cut.next,
+        bound: recovery.cut_continuity_bound,
+    });
+    fs::write(
+        directory.join("recovered-cut.json"),
+        serde_json::to_vec(&discard).unwrap(),
     )
     .unwrap();
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -738,11 +749,15 @@ fn recover_child(directory: &Path) {
     // Retry every externally acknowledged identity after a real owner restart.
     // Such retries must return their original receipt without overwriting newer
     // values. Pending identities are deliberately not retried before the oracle.
+    // Neither are acknowledged identities the durable cut discarded: recovery
+    // removed them, so a retry would be a new write (the parent checks that the
+    // cut allowed each discard).
     let calls = history(directory, values.clone());
     let mut retried = HashSet::new();
     for call in &calls {
         if let Action::Write { operation, edits } = &call.action
-            && call.end.is_some()
+            && let Some(receipt) = &call.receipt
+            && !discard.is_some_and(|discard| discard.covers(receipt))
             && retried.insert(*operation)
         {
             let receipt = db
@@ -796,6 +811,37 @@ fn write_model_child() {
         "recover" => recover_child(&directory),
         other => panic!("unknown model stage {other}"),
     }
+}
+
+/// The bound of a durable-prefix recovery: it discarded every batch of `epoch`
+/// at or above `next`. `bound` is its continuity bound (Extend only).
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+struct Discard {
+    epoch: u64,
+    next: u64,
+    bound: Option<u64>,
+}
+
+impl Discard {
+    /// Whether recovery discarded the batch acknowledged with `receipt`.
+    fn covers(&self, receipt: &str) -> bool {
+        let version = receipt_version(receipt);
+        version.epoch == self.epoch && version.sequence >= self.next
+    }
+}
+
+/// Receipts are recorded as `BatchVersion` debug text.
+fn receipt_version(receipt: &str) -> BatchVersion {
+    let mut numbers = receipt
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap());
+    let version = BatchVersion {
+        epoch: numbers.next().unwrap(),
+        sequence: numbers.next().unwrap(),
+    };
+    assert_eq!(format!("{version:?}"), receipt, "receipt is not a version");
+    version
 }
 
 #[derive(Clone, Debug)]
@@ -1037,7 +1083,7 @@ fn run_case(case: &Case) {
     let values: Vec<Option<u64>> =
         serde_json::from_slice(&fs::read(directory.join("recovered.json")).unwrap()).unwrap();
     assert!(values.iter().any(Option::is_some), "vacuous empty recovery");
-    let calls = history(&directory, values);
+    let mut calls = history(&directory, values);
     let acknowledged: Vec<_> = calls
         .iter()
         .filter(|call| call.end.is_some() && matches!(call.action, Action::Write { .. }))
@@ -1046,18 +1092,46 @@ fn run_case(case: &Case) {
         acknowledged.len() >= case.gate_acks(),
         "gate has no acknowledged WAL tail"
     );
-    // Prefix oracle: a discarded tail batch is never an acknowledged one. The
-    // linearizability search below also requires every acknowledged write.
+    // Prefix oracle. A discarded tail batch is pending, or acknowledged and at or
+    // above the continuity bound of an owner that restarted or failed: only
+    // there can a missing version hide a lost batch, so the run stops and the
+    // acknowledged batches after it go with the discarded suffix (Native
+    // acknowledges before the sync). No acknowledged batch below the bound may
+    // be discarded, and none at all when every owner was continuous.
     let discarded: u64 =
         serde_json::from_slice(&fs::read(directory.join("cut-discarded.json")).unwrap()).unwrap();
+    let discard: Option<Discard> =
+        serde_json::from_slice(&fs::read(directory.join("recovered-cut.json")).unwrap()).unwrap();
     let pending = calls
         .iter()
         .filter(|call| call.end.is_none() && matches!(call.action, Action::Write { .. }))
         .count() as u64;
+    let lost: HashSet<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| {
+            call.receipt
+                .as_ref()
+                .is_some_and(|receipt| discard.is_some_and(|discard| discard.covers(receipt)))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    for &index in &lost {
+        let sequence = receipt_version(calls[index].receipt.as_ref().unwrap()).sequence;
+        assert!(
+            discard
+                .and_then(|discard| discard.bound)
+                .is_some_and(|bound| bound != u64::MAX && sequence >= bound),
+            "durable cut discarded acknowledged sequence {sequence} below its bound \
+             {discard:?} {case:?} artifacts={}",
+            directory.display()
+        );
+    }
     assert!(
-        discarded <= pending,
+        discarded <= pending + lost.len() as u64,
         "durable cut discarded {discarded} batches but only {pending} writes were pending \
-         {case:?} artifacts={}",
+         and {} acknowledged ones were allowed {case:?} artifacts={}",
+        lost.len(),
         directory.display()
     );
     let sizes: &[usize] = if case.concurrent {
@@ -1073,6 +1147,14 @@ fn run_case(case: &Case) {
             "no acknowledged {size}-key batch before the crash"
         );
     }
+    // Linearizability without exactly the discarded acknowledged writes: each
+    // must be absent (no other call explains its values), every other
+    // acknowledged write must be present.
+    let mut index = 0;
+    calls.retain(|_| {
+        index += 1;
+        !lost.contains(&(index - 1))
+    });
     assert!(
         linearizable(&calls),
         "non-linearizable history {case:?} artifacts={}\n{calls:#?}",

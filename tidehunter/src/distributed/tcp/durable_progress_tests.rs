@@ -295,31 +295,70 @@ fn status_and_fence_report_the_owner_durability_tier() {
                 panic!("expected a status reply")
             };
             assert_eq!(status.durability_tier, tier);
-            assert_eq!(status.boot_id, read_boot_id().unwrap());
+            assert_eq!(status.incarnation, node.inventory.lock().incarnation());
             assert!(status.recovery_clean);
         }
     }
 }
 
+/// Every owner open is a new incarnation, so an owner process restart changes it on
+/// the same boot. One incarnation reports one value.
 #[test]
-fn boot_id_parses_the_kernel_uuid_text_only() {
+fn every_owner_open_is_a_new_incarnation() {
+    let temp = tempdir::TempDir::new("progress-incarnation").unwrap();
+    let config = config(&temp.path().join("node"));
+    let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    let first = node.inventory.lock().incarnation();
+    assert_ne!(first, [0; 16]);
     assert_eq!(
-        parse_boot_id("0123abcd-4567-89ef-0a1b-2c3d4e5f6789\n"),
-        Some([
-            0x01, 0x23, 0xab, 0xcd, 0x45, 0x67, 0x89, 0xef, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f,
-            0x67, 0x89
-        ])
+        node.inventory.lock().fence_to(1).unwrap().incarnation,
+        first
     );
-    for bad in [
-        "",
-        "0123abcd456789ef0a1b2c3d4e5f6789",
-        "0123abcd-4567-89ef-0a1b-2c3d4e5f678",
-        "0123abcg-4567-89ef-0a1b-2c3d4e5f6789",
-        "+123abcd-4567-89ef-0a1b-2c3d4e5f6789",
-    ] {
-        assert_eq!(parse_boot_id(bad), None, "{bad:?}");
-    }
-    assert_ne!(read_boot_id().unwrap(), [0; 16]);
+    assert_eq!(node.status().unwrap().incarnation, first);
+    drop(node);
+    let reopened = StorageNode::open(config, metrics()).unwrap();
+    let second = reopened.status().unwrap().incarnation;
+    assert_ne!(second, [0; 16]);
+    assert_ne!(second, first);
+}
+
+/// A failed syncer fsync can drop acknowledged dirty pages without a hole and without a
+/// reboot. The incarnation never reports a clean recovery again, its next control
+/// barrier fails and stops it (no in-process fence), and only a restarted owner (a new
+/// incarnation) is clean.
+#[test]
+fn failed_sync_is_unclean_until_the_owner_restarts() {
+    let temp = tempdir::TempDir::new("progress-unclean").unwrap();
+    let (config, node) = native_node(&temp);
+    let incarnation = node.status().unwrap().incarnation;
+    let log = node.log_for_test(1);
+    let (completed, completions) = mpsc::sync_channel(4);
+    submit(&node, 1, append(&config, 0), &completed);
+    assert!(matches!(
+        receive(&completions, 1),
+        Ok(Response::Appended(_))
+    ));
+    assert!(node.status().unwrap().recovery_clean);
+    log.fail_next_persist();
+    submit(&node, 2, poll(1, 1, 0, WAIT_MS, true), &completed);
+    assert!(receive(&completions, 2).is_err());
+    drop(log);
+    let status = node.status().unwrap();
+    assert_eq!(status.incarnation, incarnation);
+    assert!(!status.recovery_clean);
+    // The barrier before the status meets the failed frontier: the owner stops.
+    submit(&node, 3, Request::Status { protocol: PROTOCOL }, &completed);
+    assert!(receive(&completions, 3).is_err());
+    assert!(
+        node.control_context
+            .persistence_failed
+            .load(Ordering::Acquire)
+    );
+    drop(node);
+    let reopened = StorageNode::open(config, metrics()).unwrap();
+    let status = reopened.status().unwrap();
+    assert_ne!(status.incarnation, incarnation);
+    assert!(status.recovery_clean);
 }
 
 #[test]
@@ -362,7 +401,7 @@ fn client_polls_over_a_dedicated_connection() {
         (synced.synced, synced.appended, synced.idle),
         (Some(version(0)), Some(version(0)), true)
     );
-    assert_eq!(synced.boot_id, status.boot_id);
+    assert_eq!(synced.incarnation, status.incarnation);
     // Parks past the data timeout, then replies at its deadline with the current report.
     let parked = progress
         .durable_progress(1, 1, synced.generation, Duration::from_secs(3), false)
@@ -403,7 +442,8 @@ fn leased_owner_reports_the_adopted_and_synced_prefix() {
     assert_eq!((first.authority_epoch, first.epoch), (1, 1));
     drop(progress);
     // The nudge self-adopts any frames the writer has not had adopted yet, then
-    // syncs them; with the long cap no deadline can answer it first.
+    // syncs them and installs the strict root over them; with the long cap no
+    // deadline can answer it first.
     fixture.node.set_durable_progress_cap_for_test(LONG_CAP);
     let (completed, completions) = mpsc::sync_channel(1);
     submit(&fixture.node, 1, poll(1, 1, 0, WAIT_MS, true), &completed);
@@ -412,5 +452,23 @@ fn leased_owner_reports_the_adopted_and_synced_prefix() {
         (synced.appended, synced.synced, synced.idle),
         (Some(version(1)), Some(version(1)), true)
     );
+    // A later group: the bounded syncer may defer its root within the fragment,
+    // and only a root install reports it. A nudge without its own barrier would
+    // park until the long cap unless the syncer happened to cross a fragment.
+    writer
+        .submit_and_drain_leased_group(1, vec![fixture.batch(2)], &WriteTimeline::default(), 2)
+        .unwrap();
+    submit(
+        &fixture.node,
+        2,
+        poll(1, 1, synced.generation, WAIT_MS, true),
+        &completed,
+    );
+    let rooted = report(receive(&completions, 2));
+    assert_eq!(
+        (rooted.appended, rooted.synced, rooted.idle),
+        (Some(version(2)), Some(version(2)), true)
+    );
+    assert!(rooted.generation > synced.generation);
     writer.close_leased_extent(&mut Vec::new(), None).unwrap();
 }

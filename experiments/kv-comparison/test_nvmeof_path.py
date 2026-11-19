@@ -146,6 +146,92 @@ class NvmeofPathTests(unittest.TestCase):
         (native.parent / 'native-wal-evidence.json').write_text(json.dumps({'available': False}))
         self.assertIsNone(analysis.result_row(self.cases[1], self.export)['native_logical_wal_bytes_per_payload'])
 
+    def test_replay_amplification_uses_committed_payload(self):
+        directory = self.add('tidehunter_nvme_rdma', group='G35S', case_kind='mainnet_replay',
+                             mix=cloud_campaign.mix(read=50, put=50),
+                             samples=[('measurement', 'commit', value) for value in (1000, 2000, 3000)])
+        row = analysis.result_row(self.cases[0], self.export)
+        for name in ('wal_bytes_per_payload', 'device_write_payload_ratio', *analysis.REPLAY_AMPLIFICATION_COLUMNS):
+            self.assertIsNone(row[name])
+        summary = {'phase_counts': {'profile': {'write_amplification': {'payload': {
+            'commits': 3, 'rows': 7, 'value_bytes': 1000, 'key_bytes': 250, 'key_value_bytes': 1250}}}}}
+        (directory / 'summary.json').write_text(json.dumps(summary))
+        (directory / 'measurement-read-evidence.json').write_text(json.dumps({
+            'live_nvmeof': {'counters': {'completed_write_bytes': 2500, 'leased_frames': 3}}}))
+        (directory.parent / 'device_counters.json').write_text(json.dumps({
+            'before': [{'write_sectors': 10}, {'write_sectors': 20}],
+            'after': [{'write_sectors': 14}, {'write_sectors': 26}]}))
+        row = analysis.result_row(self.cases[0], self.export)
+        # The put formula (successful 'put' rows times value_size) never applies to replay rows.
+        self.assertEqual(row['wal_bytes_per_payload'], 2.5)
+        self.assertEqual(row['wal_bytes_per_key_value'], 2)
+        self.assertEqual(row['device_write_payload_ratio'], 5.12)
+        self.assertEqual(row['device_write_per_key_value'], 4.096)
+        self.assertEqual(row['replay_committed_value_bytes'], 1000)
+        self.assertEqual(row['replay_committed_key_value_bytes'], 1250)
+        self.generate()
+        with (self.output / 'replays.csv').open() as stream:
+            exported = list(csv.DictReader(stream))
+        self.assertEqual([r['case_id'] for r in exported], ['0'])
+        self.assertEqual(float(exported[0]['wal_bytes_per_key_value']), 2)
+        for payload in ({'value_bytes': 0, 'key_value_bytes': 0}, {'value_bytes': 1000},
+                        {'value_bytes': 1000.0, 'key_value_bytes': 1250},
+                        {'value_bytes': 1300, 'key_value_bytes': 1250}):
+            with self.subTest(payload=payload):
+                summary['phase_counts']['profile']['write_amplification']['payload'] = payload
+                (directory / 'summary.json').write_text(json.dumps(summary))
+                row = analysis.result_row(self.cases[0], self.export)
+                for name in ('wal_bytes_per_payload', 'device_write_payload_ratio',
+                             *analysis.REPLAY_AMPLIFICATION_COLUMNS):
+                    self.assertIsNone(row[name])
+
+    def test_p13_replay_partitions_apis_and_exports_pipeline_depth(self):
+        for depth in (None, 4):
+            settings = {} if depth is None else {'checkpoint_pipeline_depth': depth}
+            directory = self.add(
+                'tidehunter_nvme_rdma', group='G35S', case_kind='mainnet_replay',
+                concurrency=16, mix=cloud_campaign.mix(read=50, put=50), **settings,
+                samples=[('preload', 'commit', 100), ('measurement', 'commit', 2000),
+                         ('measurement', 'get', 1000), ('measurement', 'get', 3000),
+                         ('measurement', 'commit', 7000)])
+            identity = {'N': 16, 'W': 1}
+            if depth is not None:
+                identity['K'] = depth
+            profile = {'case_identity': identity, 'measurement_elapsed_seconds': .02,
+                       'checkpoints_per_second': 50}
+            (directory / 'summary.json').write_text(json.dumps(
+                {'phase_counts': {'profile': profile}}))
+        self.generate()
+        with (self.output / 'replays.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([(r['concurrency'], r['K']) for r in rows], [('16', '1'), ('16', '4')])
+        for row in rows:
+            self.assertEqual(row['operation'], 'mainnet_replay')
+            self.assertEqual(row['p50_us'], analysis.NA)
+            self.assertEqual(float(row['checkpoints_per_second']), 50)
+            for op, p50, p99, total_api_ns in (('commit', 2, 7, 9000), ('get', 1, 3, 4000)):
+                with self.subTest(K=row['K'], operation=op):
+                    self.assertEqual(float(row[f'{op}_p50_us']), p50)
+                    self.assertEqual(float(row[f'{op}_p99_us']), p99)
+                    self.assertEqual(float(row[f'{op}_p999_us']), p99)
+                    self.assertEqual(int(row[f'{op}_offered_calls']), 2)
+                    self.assertEqual(int(row[f'{op}_successful_calls']), 2)
+                    self.assertEqual(int(row[f'{op}_rejected_calls']), 0)
+                    self.assertEqual(float(row[f'{op}_calls_per_second']), 100)
+                    self.assertAlmostEqual(float(row[f'{op}_mean_inflight_calls']), total_api_ns / 2e7)
+
+    def test_p13_scalar_cases_reach_the_operation_tables(self):
+        self.add('tidehunter_nvme_rdma', group='G35W', concurrency=32, value_size=512)
+        self.add('tidehunter_nvme_rdma', group='G35R', concurrency=16, op='read',
+                 coordinator_cache_bytes=0, durability_tier='synchronous')
+        self.generate()
+        for table, expected in (('puts', ('G35W', 'put', '32', '512')),
+                                ('reads', ('G35R', 'read', '16', '1024'))):
+            with (self.output / (table + '.csv')).open() as stream:
+                row, = csv.DictReader(stream)
+            self.assertEqual(tuple(row[k] for k in ('group', 'operation', 'concurrency', 'value_size')), expected)
+            self.assertEqual(float(row['p99_us']), 3)
+
     def test_every_reviewed_selection_group_is_accepted(self):
         for selection in cloud_campaign.NVMEOF_PATH_SELECTIONS:
             with self.subTest(selection=selection):
@@ -507,7 +593,8 @@ class NvmeofPathTests(unittest.TestCase):
         self.output = self.root / 'output'
         self.jobs = []; self.cases = []
 
-    def add(self, backend='native', repeat=0, group='G18N', op='put', latency=1000, **changes):
+    def add(self, backend='native', repeat=0, group='G18N', op='put', latency=1000,
+            samples=None, **changes):
         job = dict(case_id=str(len(self.jobs)), group=group, backend=backend, repeat=repeat,
                    durability_tier='page_cache' if backend == 'native' else 'native',
                    native_durability='page_cache',
@@ -524,8 +611,13 @@ class NvmeofPathTests(unittest.TestCase):
         fields = ('phase', 'operation', 'outcome', 'scheduled_ns', 'dispatched_ns', 'dispatch_observed', 'completed_ns', 'api_ns', 'response_ns', 'scheduling_ns', 'logical_keys', 'bytes', 'error_kind')
         with (directory / 'samples.csv').open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
-            for value in (latency, latency * 3):
-                writer.writerow(dict(phase='measurement', operation=op, outcome='ok', scheduled_ns=1, dispatched_ns=1, dispatch_observed='true', completed_ns=value + 1, api_ns=value, response_ns=value, scheduling_ns=0, logical_keys=1, bytes=1024, error_kind=''))
+            if samples is None:
+                samples = [('measurement', op, value) for value in (latency, latency * 3)]
+            for phase, operation, value in samples:
+                writer.writerow(dict(phase=phase, operation=operation, outcome='success', scheduled_ns=1,
+                                     dispatched_ns=1, dispatch_observed='true', completed_ns=value + 1,
+                                     api_ns=value, response_ns=value, scheduling_ns=0, logical_keys=1,
+                                     bytes=1024, error_kind=''))
         return directory
 
     def publish(self):

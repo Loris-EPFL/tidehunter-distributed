@@ -20,14 +20,17 @@ class MultiOwnerTests(unittest.TestCase):
         cls.jobs = [job for selection in campaign.M3_SELECTIONS for job in campaign.make_focused_matrix(selection)]
 
     def test_reviewed_matrix(self):
-        self.assertEqual(len(self.jobs), 71)
-        self.assertEqual(len({job['case_id'] for job in self.jobs}), 71)
+        self.assertEqual(len(self.jobs), 121)
+        self.assertEqual(len({job['case_id'] for job in self.jobs}), 121)
         self.assertEqual({(j['owner_topology'], j['owner_count']) for j in self.jobs},
                          {('colocated', 16), ('separate', 2), ('separate', 5)})
         for job in self.jobs:
             campaign.validate_focused_job(job)
             self.assertTrue(job['thread_cpu_sampling'])
-            concurrencies = (8, 16, 32, 64) if job['selection'] == 'nvmeof_p13_write_engine' else (16, 64, 256)
+            if job['selection'] == 'nvmeof_p13_write_engine':
+                concurrencies = (4, 8, 16, 32, 64) if job['case_kind'] == 'mainnet_replay' else (8, 16, 32, 64)
+            else:
+                concurrencies = (16, 64, 256)
             self.assertIn(job['concurrency'], concurrencies)
             self.assertEqual(campaign.active_owner_count(job), job['owner_count'])
             self.assertEqual(campaign.job_owner_hosts(job),
@@ -148,10 +151,11 @@ class MultiOwnerTests(unittest.TestCase):
             sizing = job["measurement_sizing"]
             if job["case_kind"] == "mainnet_replay":
                 self.assertEqual(job["measurement_operations"], 4096 * 510)
-                self.assertEqual(sizing["case_deadline_seconds"], 600)
+                deadline = {4: 1000, 8: 800}.get(job["concurrency"], 600)
+                self.assertEqual(sizing["case_deadline_seconds"], deadline)
                 continue
-            if job["selection"] == "nvmeof_p9_small_put" or (
-                    job["selection"] in campaign.WRITE_ENGINE_SELECTIONS and job["case_kind"] == "remote_put"):
+            if job["case_kind"] == "remote_put" and job["selection"] in (
+                    "nvmeof_p9_small_put", *campaign.WRITE_ENGINE_SELECTIONS, campaign.REDRAIN_AB_SELECTION):
                 self.assertEqual(sizing["measurement_seconds"],
                                  job["measurement_operations"] / sizing["rate_calls_per_second"])
             else:
@@ -165,10 +169,11 @@ class MultiOwnerTests(unittest.TestCase):
                 self.assertLessEqual(4096 + job["warmup_operations"] + job["measurement_operations"], 1_000_000)
         for selection in campaign.M3_SELECTIONS:
             arms = ("file", "prewritten") if selection in campaign.WRITE_ENGINE_SELECTIONS else (None,)
+            limit = campaign.WRITE_ENGINE_ARCHIVE_LIMIT_BYTES.get(selection, 3_000_000_000)
             for arm in arms:
                 self.assertLessEqual(sum(job["measurement_sizing"]["expected_archive_bytes"]
                                          for job in self.jobs if job["selection"] == selection
-                                         and (arm is None or job["arm"] == arm)), 3_000_000_000)
+                                         and (arm is None or job["arm"] == arm)), limit)
 
     def test_cache_pair_has_explicit_hit_window_and_remote_deadline_rates(self):
         pairs = [job for job in self.jobs

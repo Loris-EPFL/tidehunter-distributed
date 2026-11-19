@@ -134,6 +134,7 @@ impl Fixture {
             replay_limits: Default::default(),
             owner_append_occupancy: DEFAULT_OWNER_APPEND_OCCUPANCY,
             pipelined_writes: true,
+            leased_submit_redrain: true,
             read_cache_bytes: 64 * 1024,
             index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
             read_memory_allowance_bytes: 512 * 1024 * 1024,

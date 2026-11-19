@@ -8,9 +8,11 @@
 //! writes acknowledge a successful Data/FUA completion on the final WAL inode,
 //! after the lease made its preallocation, name and inventory witness durable.
 //! Neither completion implies that the owner's frontier root has caught up.
-//! Adoption publishes only APPENDED authority. Synchronous adoption requests a
-//! later root sync without waiting. Native adoption requests no per-frame sync:
-//! it keeps fragment-boundary (extent-close) and on-demand persistence.
+//! Adoption publishes only APPENDED authority and requests no per-frame sync
+//! in either tier. A synchronous owner read beyond the durable prefix syncs the
+//! WAL on demand. Extent close requests the fragment-boundary sync; the live
+//! root is installed there and at explicit barriers (flush, seal, fence,
+//! retirement, shutdown).
 //! Synchronous cold record grants require a covering owner barrier on the pinned
 //! inode; its scoped proof never advances the adopted or durable prefix.
 //! Checkpoint proofs still require the contiguous owner barrier. Recovery scans

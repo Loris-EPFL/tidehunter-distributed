@@ -1385,6 +1385,8 @@ class CloudReports(unittest.TestCase):
             path = directory / "result/write-diagnostics.json"
             job = {"backend": "tidehunter_nvme_rdma", "nvmeof_route": "live",
                    "diagnostics": {"write_profile_limit": 2}}
+            fields = json.loads((Path(__file__).parent / "observability" /
+                                 "live_nvmeof_write_profile_fields.json").read_text())
             def evidence():
                 return {"schema_version": 1, "backend": "tidehunter_live_nvmeof",
                         "phase": "measurement", "phase_attempted": True, "measurement_drained": True,
@@ -1396,11 +1398,14 @@ class CloudReports(unittest.TestCase):
                         "profile": {"runtime_observation_mode": "live_nvmeof_phase_counters",
                                     "scope": "measurement_nvme_io_cumulative_delta", "requested_limit": 2,
                                     "selected_operations": 3,
-                                    "finalization_error": None, "stages": {"live_nvmeof": {
-                                        "completed_write_ops": 3, "completed_write_bytes": 12288,
-                                        "errors": 0, "unknown_writes": 0,
-                                        "queue_ns": 600, "queue_samples": 3,
-                                        "cq_ns": 0, "cq_samples": 0}}}}
+                                    "finalization_error": None, "stages": {"live_nvmeof":
+                                        dict.fromkeys(fields, 0) | {
+                                            "completed_write_ops": 3, "completed_write_bytes": 12288,
+                                            "queue_ns": 600, "queue_samples": 3,
+                                            "lease_reserve_ns": 600, "lease_namespace_sync_ns": 800,
+                                            "lease_publish_ns": 1000, "lease_profile_samples": 2,
+                                            "adopt_owner_ns": 900, "adopt_close_scan_ns": 600,
+                                            "adopt_profile_samples": 3, "adopt_close_scan_bytes": 4096}}}}
             value = evidence()
             path.write_text(json.dumps(value))
             admitted = cloud.admit_write_diagnostics(directory, job, completed=True)
@@ -1410,6 +1415,11 @@ class CloudReports(unittest.TestCase):
             self.assertEqual(clocks["queue"]["mean_ns"], 200)
             self.assertEqual(clocks["queue"]["scope"], "measurement_nvme_io_cumulative_delta")
             self.assertIsNone(clocks["cq"]["mean_ns"])
+            self.assertEqual(clocks["lease_reserve"]["mean_ns"], 300)
+            self.assertEqual(clocks["lease_namespace_sync"]["mean_ns"], 400)
+            self.assertEqual(clocks["lease_publish"]["mean_ns"], 500)
+            self.assertEqual(clocks["adopt_owner"]["mean_ns"], 300)
+            self.assertEqual(clocks["adopt_close_scan"]["mean_ns"], 200)
             self.assertIn("measurement_nvme_io_cumulative_delta", "\n".join(cloud.write_diagnostic_report([row])))
             bad = []
             value = evidence()

@@ -2,6 +2,68 @@
 use super::*;
 use bincode::Options;
 
+mod recovered_suffix;
+use recovered_suffix::SuffixRewrite;
+
+/// Recovery scans read beyond the durable frontier, where a frame can be absent or
+/// torn. Only these outcomes mean "no valid frame here": a missing file, a short
+/// file, or bytes that fail the frame, CRC, decode or batch checks. Any other I/O
+/// error leaves the bytes unknown: recovery must fail, never read it as absent.
+fn frame_missing_or_invalid(error: &StorageError) -> bool {
+    match error {
+        StorageError::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+        ),
+        StorageError::Wal(_) | StorageError::Unknown(_) => false,
+        _ => true,
+    }
+}
+
+/// A recovery read beyond the durable frontier. Names the read for the test hook,
+/// which can replace its result with EIO; production code passes results through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryRead {
+    /// Later-fragment probe: open, header read, body read.
+    ProbeOpen,
+    ProbeHeader,
+    ProbeBody,
+    /// Main replay scan: a frame header read.
+    ScanHeader,
+}
+
+#[cfg(test)]
+thread_local! {
+    // Recovery runs on the calling thread, so a thread-local hook is deterministic.
+    static READ_FAULT: std::cell::Cell<Option<(RecoveryRead, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: replace the result of the next `read` at WAL `offset` on this thread
+/// with EIO. The faulted reads are on live streams, which need the NVMe-oF feature.
+#[cfg(all(test, feature = "experimental-nvmeof"))]
+pub(crate) fn inject_read_fault(read: RecoveryRead, offset: u64) {
+    READ_FAULT.with(|slot| slot.set(Some((read, offset))));
+}
+
+/// The read's own result, or EIO when the test hook selects it. Callers classify
+/// the returned error with the production classifier either way.
+#[cfg_attr(not(test), inline(always))]
+fn read_result<T>(
+    read: RecoveryRead,
+    offset: u64,
+    result: Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    #[cfg(test)]
+    if READ_FAULT.with(|slot| slot.get()) == Some((read, offset)) {
+        READ_FAULT.with(|slot| slot.set(None));
+        return Err(StorageError::Io(io::Error::from_raw_os_error(libc::EIO)));
+    }
+    #[cfg(not(test))]
+    let _ = (read, offset);
+    result
+}
+
 pub(super) const ROOT: &str = "partition-wal-root-v1";
 const MEMBER_MISMATCH: &str = "WAL member differs from the reference";
 const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
@@ -404,6 +466,47 @@ impl PartitionLog {
         Ok(header)
     }
 
+    /// Whether a valid group starts at `offset`. `Ok(false)` only for an absent or
+    /// invalid frame; any other I/O error is returned.
+    fn probe_valid_frame(
+        &self,
+        cached: &mut Option<(u64, File)>,
+        offset: u64,
+    ) -> Result<bool, StorageError> {
+        let absent = |error: StorageError| {
+            if frame_missing_or_invalid(&error) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        };
+        let file = match read_result(
+            RecoveryRead::ProbeOpen,
+            offset,
+            self.replay_file(cached, offset),
+        ) {
+            Ok(file) => file,
+            Err(error) => return absent(error),
+        };
+        match read_result(
+            RecoveryRead::ProbeHeader,
+            offset,
+            self.frame_header(file, offset),
+        ) {
+            Ok(header) if header == [0; 8] || header == [0xff; 8] => return Ok(false),
+            Ok(_) => {}
+            Err(error) => return absent(error),
+        }
+        match read_result(
+            RecoveryRead::ProbeBody,
+            offset,
+            self.decode_group_from_file(file, offset),
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) => absent(error),
+        }
+    }
+
     /// Decode one complete, CRC-checked group at an exact WAL frame boundary.
     pub fn decode_group_at(&self, offset: u64) -> Result<DecodedGroup, StorageError> {
         let file = self.open_replay_file(offset)?;
@@ -799,12 +902,14 @@ impl PartitionLog {
                 last_live_complete: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                live_root_end: physical_end,
                 writer: None,
                 wal_root: Some(root.clone()),
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
-                progress: ProgressTail::default(),
+                progress: ProgressTail::recovered(physical_end),
                 namespace_synced_file: None,
                 poison: None,
                 sealed: true,
@@ -880,6 +985,10 @@ impl PartitionLog {
         // tail. Unwritten space at the tail is not a hole.
         let mut gap = false;
         let mut recovery_hole = false;
+        // Restart durability guard (see `recovered_suffix`): every frame and skip
+        // marker accepted above the persisted root is written back from the bytes
+        // this scan validated. A sealed stream was synced whole before its seal.
+        let mut rewrite = recorded.is_none().then(SuffixRewrite::default);
         // Live streams stop globally at an invalid tail. Ordinary owner-RPC
         // streams scan fragments independently, including after a lost skip.
         // In both cases only present WAL files bound the uncheckpointed suffix.
@@ -893,23 +1002,39 @@ impl PartitionLog {
             }
             let fragment_end = (cursor / expected.fragment_bytes + 1) * expected.fragment_bytes;
             let current_file = log.replay_file(&mut file, cursor);
-            let header = current_file
-                .as_ref()
-                .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))
-                .and_then(|file| log.frame_header(file, cursor));
-            if header.as_ref().is_ok_and(|header| *header == [0xff; 8]) {
+            // A real I/O error on the header read fails recovery here: a retry by
+            // the decode below could read a skip marker as an invalid frame and
+            // report a gap. A missing or short file falls through to the decode,
+            // which classifies it.
+            let header = match current_file.as_ref() {
+                Ok(current) => match read_result(
+                    RecoveryRead::ScanHeader,
+                    cursor,
+                    log.frame_header(current, cursor),
+                ) {
+                    Ok(header) => Some(header),
+                    Err(error) if frame_missing_or_invalid(&error) => None,
+                    Err(error) => return Err(error),
+                },
+                Err(_) => None,
+            };
+            if header == Some([0xff; 8]) {
                 if let Err(error) = log.validate_skip_suffix(
                     current_file.as_ref().expect("header read file"),
                     cursor,
                     fragment_end,
                 ) {
-                    if cursor < strict_end {
+                    if cursor < strict_end || !frame_missing_or_invalid(&error) {
                         return Err(error);
                     }
                     gap = true;
                     if live {
                         break;
                     }
+                } else if cursor >= strict_end
+                    && let Some(rewrite) = rewrite.as_mut()
+                {
+                    log.rewrite_skip_marker(rewrite, cursor, fragment_end)?;
                 }
                 cursor = fragment_end;
                 continue;
@@ -917,7 +1042,9 @@ impl PartitionLog {
             let decoded =
                 match current_file.and_then(|file| log.decode_group_from_file(file, cursor)) {
                     Ok(decoded) => decoded,
-                    Err(error) if cursor < strict_end => return Err(error),
+                    Err(error) if cursor < strict_end || !frame_missing_or_invalid(&error) => {
+                        return Err(error);
+                    }
                     Err(_) if live => {
                         gap = true;
                         break;
@@ -1012,6 +1139,11 @@ impl PartitionLog {
             // early fragment end lies above a hole.
             recovery_hole |= gap;
             log.state.lock().references.publish_group(metadata)?;
+            if cursor >= strict_end
+                && let Some(rewrite) = rewrite.as_mut()
+            {
+                log.rewrite_validated_frame(rewrite, cursor, decoded.group.encoded())?;
+            }
             physical_end = physical_end.max(decoded.frame_end);
             cursor = decoded
                 .frame_end
@@ -1020,17 +1152,13 @@ impl PartitionLog {
                 & !7;
         }
         // A live scan stops at its first defect; probe the first frame of every later
-        // fragment (bounded by the scan end) for a valid frame above it.
+        // fragment (bounded by the scan end) for a valid frame above it. An I/O error
+        // leaves continuity unknown, so it fails recovery instead of reading as clean.
         let mut probe = (cursor / expected.fragment_bytes + 1) * expected.fragment_bytes;
         while live && gap && !recovery_hole && probe < scan_end {
             let file_start = probe / expected.wal_file_bytes * expected.wal_file_bytes;
-            if root.retired.binary_search(&file_start).is_err()
-                && let Ok(current) = log.replay_file(&mut file, probe)
-                && log
-                    .frame_header(current, probe)
-                    .is_ok_and(|header| header != [0; 8] && header != [0xff; 8])
-            {
-                recovery_hole = log.decode_group_from_file(current, probe).is_ok();
+            if root.retired.binary_search(&file_start).is_err() {
+                recovery_hole = log.probe_valid_frame(&mut file, probe)?;
             }
             probe = probe
                 .checked_add(expected.fragment_bytes)
@@ -1041,6 +1169,11 @@ impl PartitionLog {
         }
         if !tail_seen {
             return Err(StorageError::Invalid("missing live durable frontier tail"));
+        }
+        // The rewritten suffix reaches the device before the barrier below may
+        // certify it and before any root or seal is installed.
+        if let Some(rewrite) = rewrite {
+            log.finish_suffix_rewrite(rewrite)?;
         }
         log.wal.persist_registered_files()?;
         if live
@@ -1072,6 +1205,11 @@ impl PartitionLog {
             let mut state = log.state.lock();
             state.appended_end = physical_end;
             state.durable_end = physical_end;
+            state.progress = ProgressTail::recovered(physical_end);
+            #[cfg(feature = "experimental-nvmeof")]
+            {
+                state.live_root_end = physical_end;
+            }
         }
         log.durable_frontier.store(physical_end, Ordering::Release);
         log.recovery_hole = recovery_hole;

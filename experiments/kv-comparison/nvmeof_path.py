@@ -48,6 +48,17 @@ THREAD_CPU_COLUMNS = tuple(
     'coordinator_other_busiest_thread', 'owner_other_busiest_thread')
 RESULTS += (*THREAD_CPU_COLUMNS, 'wal_bytes_per_payload', 'puts_per_frame',
             'native_logical_wal_bytes_per_payload')
+# Replay rows reuse wal_bytes_per_payload and device_write_payload_ratio with payload =
+# successful committed value bytes; these add the key+value denominator and both payloads.
+REPLAY_AMPLIFICATION_COLUMNS = ('replay_committed_value_bytes', 'replay_committed_key_value_bytes',
+                                'wal_bytes_per_key_value', 'device_write_per_key_value')
+RESULTS += REPLAY_AMPLIFICATION_COLUMNS
+REPLAY_OPERATIONS = ('commit', 'get')
+API_METRICS = ('p50_us', 'p99_us', 'p999_us', 'mean_us', 'calls_per_second',
+               'mean_inflight_calls', 'calls_ge_5ms', 'time_ge_5ms_share')
+REPLAY_COLUMNS = ('K', 'checkpoints_per_second', 'measurement_elapsed_seconds') + tuple(
+    f'{op}_{field}' for op in REPLAY_OPERATIONS
+    for field in (*API_METRICS, 'offered_calls', 'successful_calls', 'rejected_calls'))
 AUTHORITY_COUNTERS = ('write_authority_prepare_ns', 'write_authority_admit_ns',
                       'write_authority_windows', 'write_authority_batches')
 AUTHORITY_COLUMNS = ('authority_prepare_us_per_put', 'authority_admit_us_per_put',
@@ -77,6 +88,8 @@ def contract_class(job):
 
 
 def operation(job):
+    if job.get('case_kind') == 'mainnet_replay':
+        return 'mainnet_replay'
     return next((k for k, v in job.get('mix', {}).items() if v), NA)
 
 
@@ -276,6 +289,106 @@ def owner_trace_columns(artifact):
     return columns
 
 
+def device_write_bytes(devices):
+    """Whole-device bytes written between the controller snapshots (512-byte sectors)."""
+    before, after = devices.get('before'), devices.get('after')
+    if before is None or after is None:
+        return None
+    a = list(find_values(after, 'write_sectors')); b = list(find_values(before, 'write_sectors'))
+    if not a or len(a) != len(b):
+        return None
+    delta = nonnegative(sum(a) - sum(b))
+    return None if delta is None else 512 * delta
+
+
+def replay_amplification_columns(summary, counters, device_bytes):
+    """Replay forms of the put WAL and device ratios over the same gate windows.
+
+    Payload is the replay's successful measurement-window committed value bytes (the put
+    denominator is successful puts times value_size); key+value bytes are a second denominator.
+    """
+    columns = dict.fromkeys(('wal_bytes_per_payload', 'device_write_payload_ratio', *REPLAY_AMPLIFICATION_COLUMNS))
+    profile = (summary.get('phase_counts') or {}).get('profile') or {}
+    payload = (profile.get('write_amplification') or {}).get('payload') or {}
+    values, pairs = payload.get('value_bytes'), payload.get('key_value_bytes')
+    if type(values) is not int or type(pairs) is not int or not 0 < values <= pairs:
+        return columns
+    columns.update(replay_committed_value_bytes=values, replay_committed_key_value_bytes=pairs)
+    written = counters.get('completed_write_bytes')
+    if type(written) is int and written >= 0:
+        columns.update(wal_bytes_per_payload=written / values, wal_bytes_per_key_value=written / pairs)
+    if device_bytes is not None:
+        columns.update(device_write_payload_ratio=device_bytes / values,
+                       device_write_per_key_value=device_bytes / pairs)
+    return columns
+
+
+def api_metrics(latencies, seconds):
+    if not latencies:
+        return {}
+    latencies.sort()
+    count = len(latencies)
+    total = sum(latencies)
+    slow_count = slow_ns = 0
+    for ns in reversed(latencies):
+        if ns < 5_000_000:
+            break
+        slow_count += 1
+        slow_ns += ns
+    return {
+        **{name: latencies[(count * rank + 999) // 1000 - 1] / 1000
+           for name, rank in (('p50_us', 500), ('p99_us', 990), ('p999_us', 999))},
+        'mean_us': total / count / 1000,
+        'calls_per_second': count / seconds if seconds else None,
+        'mean_inflight_calls': total / (seconds * 1e9) if seconds else None,
+        'calls_ge_5ms': slow_count,
+        'time_ge_5ms_share': slow_ns / total if total else None,
+    }
+
+
+def measurement_columns(path, op, profile):
+    """Use separate replay API populations and a shared replay measurement window."""
+    replay = op == 'mainnet_replay'
+    operations = REPLAY_OPERATIONS if replay else (op,)
+    latencies = {name: [] for name in operations}
+    offered = dict.fromkeys(operations, 0)
+    rejected = dict.fromkeys(operations, 0)
+    first_call = None
+    start, end, puts = None, 0, 0
+    for sample in analyze.read_samples(path):
+        operation = sample['operation']
+        if operation == 'put' and sample['outcome'] in ('success', 'ok'):
+            puts += 1
+        scheduled, completed = sample['scheduled_ns'], sample['completed_ns']
+        start = scheduled if start is None else min(start, scheduled)
+        end = max(end, completed)
+        if sample['dispatch_observed'] == 'true' and (
+                first_call is None or sample['dispatched_ns'] < first_call['dispatched_ns']):
+            first_call = sample
+        if operation not in latencies:
+            continue
+        offered[operation] += 1
+        if sample['outcome'] in ('success', 'ok'):
+            if sample['api_ns'] is not None:
+                latencies[operation].append(sample['api_ns'])
+        elif sample['outcome'] == 'rejected':
+            rejected[operation] += 1
+    columns = {'first_call_us': first_call['api_ns'] / 1000 if first_call is not None else None}
+    if replay:
+        seconds = nonnegative(profile.get('measurement_elapsed_seconds'))
+        columns.update(measurement_elapsed_seconds=seconds,
+                       checkpoints_per_second=nonnegative(profile.get('checkpoints_per_second')))
+        for name, times in latencies.items():
+            metrics = api_metrics(times, seconds)
+            metrics.update(offered_calls=offered[name], successful_calls=len(times),
+                           rejected_calls=rejected[name])
+            columns.update({f'{name}_{key}': value for key, value in metrics.items()})
+        return columns, 0, 0
+    seconds = (end - start) / 1e9 if start is not None else None
+    columns.update(api_metrics(latencies[op], seconds))
+    return columns, len(latencies[op]), puts
+
+
 def result_row(case, export):
     j = case['job']; op = operation(j)
     directory = export / 'cases' / case['case_id'] / 'result'
@@ -306,21 +419,19 @@ def result_row(case, export):
                lease_ahead=j.get('live_lease_ahead', True) if live(j) else None,
                polled_writes=(configuration.get('live_polled_writes')
                               if live(j) and has_execution and type(configuration.get('live_polled_writes')) is bool else None))
-    samples = list(analyze.read_samples(directory / 'samples.csv')) if (directory / 'samples.csv').is_file() and case.get('status') == 'completed' else []
-    first_call = first_measured_sample(samples)
-    row['first_call_us'] = first_call['api_ns'] / 1000 if first_call is not None else None
-    good = [s['api_ns'] for s in samples if s['operation'] == op and s['outcome'] in ('ok', 'success') and nonnegative(s['api_ns']) is not None]
-    if good:
-        span = max(s['completed_ns'] for s in samples) - min(s['scheduled_ns'] for s in samples)
-        for name, q in (('p50', .5), ('p99', .99), ('p999', .999)):
-            row[name + '_us'] = analyze.quantile(good, q) / 1000
-        row.update(mean_us=sum(good) / len(good) / 1000, calls_per_second=len(good) * 1e9 / span if span > 0 else None, mean_inflight_calls=sum(good) / span if span > 0 else None)
-        slow = [x for x in good if x >= 5000000]
-        row.update(calls_ge_5ms=len(slow), time_ge_5ms_share=sum(slow) / sum(good) if sum(good) else None)
+    replay = op == 'mainnet_replay'
+    if replay:
+        row['K'] = j.get('checkpoint_pipeline_depth', 1)
+    summary = load(directory / 'summary.json') if replay else {}
+    profile = (summary.get('phase_counts') or {}).get('profile') or {}
+    sample_path = directory / 'samples.csv'
+    successes = puts = 0
+    if case.get('status') == 'completed' and sample_path.is_file():
+        timing, successes, puts = measurement_columns(sample_path, op, profile)
+        row.update(timing)
     boundary = load(directory / 'measurement-read-evidence.json')
     row.update(authority_columns(boundary, load(directory / 'write-diagnostics.json')))
     counters = (boundary.get('live_nvmeof') or {}).get('counters') or {}
-    puts = sum(sample['operation'] == 'put' and sample['outcome'] in ('ok', 'success') for sample in samples)
     written, frames = nonnegative(counters.get('completed_write_bytes')), nonnegative(counters.get('leased_frames'))
     if live(j) and puts and j.get('value_size') and written is not None:
         row['wal_bytes_per_payload'] = written / (puts * j['value_size'])
@@ -369,13 +480,11 @@ def result_row(case, export):
     elif j['group'] == 'G18M':
         row['cache_label'] = 'cache case'
     devices = load(directory / 'device_counters.json') or load(directory.parent / 'device_counters.json')
-    before, after = devices.get('before'), devices.get('after')
-    if before is not None and after is not None and good and j.get('value_size'):
-        a = list(find_values(after, 'write_sectors')); b = list(find_values(before, 'write_sectors'))
-        if a and len(a) == len(b):
-            delta = nonnegative(sum(a) - sum(b))
-            if delta is not None:
-                row['device_write_payload_ratio'] = 512 * delta / (len(good) * j['value_size'] * (j.get('batch_size', 32) if op == 'put_batch' else 1))
+    device_bytes = device_write_bytes(devices)
+    if replay:
+        row.update(replay_amplification_columns(summary, counters, device_bytes))
+    elif device_bytes is not None and successes and j.get('value_size'):
+        row['device_write_payload_ratio'] = device_bytes / (successes * j['value_size'] * (j.get('batch_size', 32) if op == 'put_batch' else 1))
     history = load(directory / 'owner-history-maintenance.json') or load(directory.parent / 'owner-history-maintenance.json')
     if not history:
         history = [load(path) for path in sorted((directory.parent / 'owner-durability').glob('*.history-maintenance.json'))]
@@ -548,7 +657,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G29R', 'G29G', 'G30R', 'G30S', 'G30W', 'G30V', 'G31W', 'G31H', 'G31S', 'G31X', 'G31G', 'G32W', 'G32H', 'G32S', 'G32N', 'G33W', 'G33R', 'G33M', 'G34W', 'G35W', 'G35R', 'G35S', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N', 'G21W', 'G21R', 'G21N', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G29R', 'G29G', 'G30R', 'G30S', 'G30W', 'G30V', 'G31W', 'G31H', 'G31S', 'G31X', 'G31G', 'G32W', 'G32H', 'G32S', 'G32N', 'G33W', 'G33R', 'G33M', 'G34W', 'G35W', 'G35R', 'G35S', 'G36W', 'G36T', 'G24R', 'G24Q', 'G24L', 'G24P', 'G24S', 'G24M', 'G24C', 'G24W', 'G24N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -590,14 +699,17 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
                   'Owner trace columns describe only the primary owner (owner-ftrace.json), not a fleet aggregate. Captured events and covered seconds use validated mono trace_coverage timestamps; observed events/s is captured event_count divided by duration_ns, never by case elapsed time. Zero duration or missing/invalid coverage leaves the rate unavailable. This observed event rate is not read IOPS: event types include non-read work, and truncation or buffer overruns can omit events. Truncation and buffer overruns are reported independently; partial captures remain diagnostic. CPU columns retain their separate full sampling window.', ''])
     lines.extend(['Thread CPU columns use /proc/PID/task/*/stat at one-second intervals around the measurement gate. One logical CPU is 100%; max and mean are across per-thread window-average utilization in each class, not across machines or sampling peaks. Coordinator and owner columns are separate; owner means are weighted by thread count. The other-thread name identifies its busiest thread. Linux comm truncation is accounted for; missing, churning or incomplete classes remain unavailable. Start/stop includes boundary RPC overlap and the final partial interval.', '',
                   'wal_bytes_per_payload uses live completed_write_bytes (aligned NVMe-oF frames) divided by measured successful scalar puts times value_size; puts_per_frame uses that put count divided by leased_frames. Native logical_wal_bytes_per_payload uses the gate-boundary delta of native wal_written_bytes_type counters, including background WAL records but excluding preload/warmup. Neither is physical SSD write amplification. Device/payload ratios still cover the whole device observation window; F8 disables ext4 lazy initialization, but the remaining background-write scope must still be checked.', ''])
+    lines.extend(['Replay rows (`replays` table) report read callers as `concurrency` and planned pipeline depth as `K` (the legacy default is 1). Commit and get metrics are separate; rates and mean in-flight API calls use the same replay measurement window from summary.json. `checkpoints_per_second` counts trace repetitions, not full-node checkpoint processing.', '',
+                  'Replay amplification uses the same gate counters as puts. Payload is successful measurement-window committed value bytes from summary.json phase_counts.profile.write_amplification.payload: wal_bytes_per_payload and device_write_payload_ratio divide by value bytes, wal_bytes_per_key_value and device_write_per_key_value by key+value bytes. The WAL counter measures completed live writes, including alignment; the device window also includes owner adoption, index and background writes.', ''])
     lines.extend(['Authority preparation/admission columns are exclusive coordinator wall elapsed time per attempted input batch (called per put for scalar F8), not CPU time, device time or latency quantiles. They divide the nanosecond counter deltas by write_authority_batches and 1000; batches_per_window divides batches by write_authority_windows. Missing counters, invalid/reset/saturated boundaries and zero denominators remain unavailable. The validated measurement-read-evidence.json start/end/deltas.coordinator counters take precedence; write-profile intervals are a fallback only when read observations contain no authority counters. authority_interval_source and authority_interval_scope identify the selected population/window; no intervals are added together.', ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
     tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W', 'G21N', 'G21W', 'G22W', 'G23W', 'G23X', 'G23N', 'G28W', 'G28C', 'G28N', 'G29W', 'G29X', 'G30W', 'G31W', 'G31H', 'G31S', 'G31X', 'G32W', 'G32H', 'G32S', 'G32N') and r['operation'] in ('put', 'put_batch')]
     tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R', 'G21N', 'G21R', 'G29R', 'G29G', 'G30R', 'G30S', 'G30V', 'G31G') and r['operation'] in ('read', 'get_many')]
-    tables['puts'] += [r for r in rows if r['group'] in ('G24W', 'G24M', 'G33W', 'G33M') and r['operation'] == 'put']
+    tables['puts'] += [r for r in rows if r['group'] in ('G24W', 'G24M', 'G33W', 'G33M', 'G35W', 'G36W') and r['operation'] == 'put']
     tables['reads'] += [r for r in rows if r['group'].startswith('G24') and r['operation'] in ('read', 'get_many')]
-    tables['reads'] += [r for r in rows if r['group'] in ('G33R', 'G33M') and r['operation'] in ('read', 'get_many')]
+    tables['reads'] += [r for r in rows if r['group'] in ('G33R', 'G33M', 'G35R') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']
+    tables['replays'] = [r for r in rows if planned[r['case_id']].get('case_kind') == 'mainnet_replay']
     write_csv(output / 'stalls.csv', STALL_FIELDS,
               [row for case in cases for row in stall_rows(case, export)])
     write_csv(output / 'stages.csv', STAGE_FIELDS,
@@ -605,7 +717,8 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
     lines.append('Stages use complete captured coordinator calls. Missing adjacent pairs contribute zero per call; their shares use the mean captured call duration.')
     lines.append('`p50_us` counts a missing pair as zero; `cond_*` columns use only calls that contain the pair.')
     for name, entries in tables.items():
-        fields = tuple(dict.fromkeys(k for r in entries for k in r)) if name == 'floors' and entries else RESULTS
+        fields = (tuple(dict.fromkeys(k for r in entries for k in r)) if name == 'floors' and entries
+                  else RESULTS + REPLAY_COLUMNS if name == 'replays' else RESULTS)
         write_csv(output / (name + '.csv'), fields, entries)
         if name == 'floors':
             leased_ab._table(lines, name.title(), fields, entries)

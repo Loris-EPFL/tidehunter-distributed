@@ -1,4 +1,6 @@
-//! W=1 checkpoint-commit replay. The scheduler alone owns the DAG and dirty overlay.
+//! W=1 checkpoint-commit replay with Sui checkpoint pipelining depth K
+//! (`workload.checkpoint_pipeline_depth`, default 1 = strictly sequential).
+//! The scheduler alone owns the DAG, the dirty overlay and the pipeline state.
 use crate::backend::{BackendInfo, BackendResult, BatchAtomicity};
 use crate::backends::native::replay::NativeReplayBackend;
 use crate::backends::replay::{
@@ -15,7 +17,7 @@ use crate::report::{ReplayIdentity, Reporter, RunSummary, Sample};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +41,12 @@ pub struct ReplayWorkload {
     pub minimum_measurement_seconds: f64,
     #[serde(default)]
     pub node_databases: Option<Vec<u8>>,
+    /// Checkpoints in flight (K), the analogue of Sui's
+    /// `checkpoint_execution_max_concurrency` (`.buffered(K)` in the checkpoint executor).
+    /// Absent means K=1, the sequential scheduler. Absent stays absent when the config is
+    /// echoed, so K=1 configurations keep their serialized identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_pipeline_depth: Option<u32>,
 }
 /// Replay has no synthetic dataset, seed, mix, phases or key namespace.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -60,6 +68,8 @@ pub struct ReplayConfig {
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
 }
+/// Largest admitted checkpoint pipeline depth; Sui's default is 4 (sui-config node.rs).
+const MAX_PIPELINE_DEPTH: u32 = 64;
 fn ensure(ok: bool, message: &str) -> BackendResult<()> {
     if ok {
         Ok(())
@@ -68,6 +78,12 @@ fn ensure(ok: bool, message: &str) -> BackendResult<()> {
     }
 }
 impl ReplayConfig {
+    /// Checkpoint pipeline depth K; absent means the sequential scheduler.
+    pub fn pipeline_depth(&self) -> usize {
+        self.workload
+            .checkpoint_pipeline_depth
+            .map_or(1, |depth| depth as usize)
+    }
     pub fn validate(&self) -> BackendResult<Trace> {
         ensure(self.schema_version == 1, "replay schema_version must be 1")?;
         if !matches!(
@@ -118,6 +134,12 @@ impl ReplayConfig {
                 && self.workload.minimum_measurement_seconds.is_finite()
                 && self.workload.minimum_measurement_seconds >= 0.0,
             "replay requires finite repetitions and nonnegative minimum duration",
+        )?;
+        ensure(
+            self.workload
+                .checkpoint_pipeline_depth
+                .is_none_or(|depth| (1..=MAX_PIPELINE_DEPTH).contains(&depth)),
+            "checkpoint_pipeline_depth must be within 1..=64",
         )?;
         ensure(
             (1..=86400).contains(&self.limits.deadline_seconds)
@@ -776,16 +798,12 @@ struct Measurements {
     calls: Vec<(Sample, ReplayIdentity)>,
     counts: Counts,
     dependency_wait_ns: u64,
-    completed: Vec<bool>,
-    remaining: Vec<usize>,
-    dependents: Vec<Vec<usize>>,
-    ready: BinaryHeap<Reverse<usize>>,
-    ready_at: Vec<Option<Instant>>,
-    read_index: Vec<usize>,
-    idle: Vec<usize>,
+    max_in_flight: usize,
+    cross_overlay_reads: u64,
+    cross_store_reads: u64,
 }
 impl Measurements {
-    fn new(trace: &Trace, repetitions: usize, callers: usize) -> BackendResult<Self> {
+    fn new(trace: &Trace, repetitions: usize) -> BackendResult<Self> {
         let per_checkpoint = trace
             .reads
             .iter()
@@ -797,36 +815,674 @@ impl Measurements {
         let capacity = per_checkpoint
             .checked_mul(repetitions)
             .ok_or("sample count overflow")?;
+        Ok(Self {
+            calls: Vec::with_capacity(capacity),
+            counts: Counts::default(),
+            dependency_wait_ns: 0,
+            max_in_flight: 0,
+            cross_overlay_reads: 0,
+            cross_store_reads: 0,
+        })
+    }
+
+    fn pipeline(&self, depth: usize, readers: usize) -> serde_json::Value {
+        serde_json::json!({
+            "checkpoint_pipeline_depth": depth,
+            "max_in_flight_checkpoints": self.max_in_flight,
+            "cross_checkpoint_overlay_reads": self.cross_overlay_reads,
+            "cross_checkpoint_store_reads": self.cross_store_reads,
+            "read_callers": readers,
+            "commit_caller": if depth == 1 { "read caller 0; commits never overlap reads" } else { "one dedicated caller; W=1 serializes every write call" },
+            "ordering": PIPELINE_ORDERING,
+        })
+    }
+}
+
+/// Report text of the ordering rules the scheduler enforces.
+const PIPELINE_ORDERING: &str = "Sui PipelineStages: stage s of checkpoint r begins after stage s of r-1 and stage s-1 of r end; stages sync(phases 0-4), execute(reads), finalize(phases 5-6), commit_outputs(phase 7), bump_executed(phase 8); at most K checkpoints admitted (buffered(K)), retired in order; reads see earlier in-flight checkpoints' outputs through the dirty overlay until committed; one W=1 commit caller picks the oldest eligible batch";
+
+/// Sui checkpoint-executor pipeline stage that owns a replay batch phase
+/// (`checkpoint_executor/utils.rs` `PipelineStage`). Ordered as executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Stage {
+    /// Phases 0-4: state sync stores the certified checkpoint, its contents and the
+    /// verified/synced watermarks before `stream_synced_checkpoints` yields it.
+    Sync,
+    /// ExecuteTransactions + WaitForTransactions: the store reads. Commits no batch.
+    Execute,
+    /// Phases 5-6: `insert_finalized_transactions` (FinalizeTransactions).
+    Finalize,
+    /// Phase 7: `commit_transaction_outputs` with the committed watermark (CommitTransactionOutputs).
+    CommitOutputs,
+    /// Phase 8: highest-executed watermark (BumpHighestExecutedCheckpoint).
+    BumpExecuted,
+}
+fn batch_stage(phase: u16) -> Stage {
+    match phase {
+        0..=4 => Stage::Sync,
+        5 | 6 => Stage::Finalize,
+        7 => Stage::CommitOutputs,
+        _ => Stage::BumpExecuted,
+    }
+}
+
+/// Event after which a cross-checkpoint read's value exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Gate {
+    /// The earlier checkpoint's producing transaction executed: its phase-7 outputs are in
+    /// Sui's writeback dirty set before `commit_transaction_outputs`.
+    Publish { repetition: usize, tx: usize },
+    /// Any other post-execution write (finalize rows, checkpoint-level rows) is visible
+    /// only once its batch commits.
+    Commit { repetition: usize, batch: usize },
+}
+/// A store read whose key an earlier checkpoint inside the pipeline window writes.
+#[derive(Debug)]
+struct CrossRead {
+    /// Window writer batches `(repetition, batch index)`; all commit in one stage, in order.
+    writers: Vec<(usize, usize)>,
+    /// Latest writer's value: Sui reads the newest version, dirty or committed.
+    value: tidehunter::minibytes::Bytes,
+}
+/// Cross-checkpoint data dependencies for K>1, computed before measurement. Sparse:
+/// per-repetition keys are distinct for every non-control table, so the v1 fixture has none.
+#[derive(Debug, Default)]
+struct CrossLinks {
+    reads: BTreeMap<(usize, usize, usize), CrossRead>,
+    gates: BTreeMap<(usize, usize), Vec<Gate>>,
+    waiters: BTreeMap<Gate, Vec<(usize, usize)>>,
+}
+struct Writer<'a> {
+    repetition: usize,
+    batch: usize,
+    stage: Stage,
+    row: &'a Row,
+}
+impl CrossLinks {
+    /// Link every store read to the writers of its key among the previous K-1 checkpoints.
+    /// Checkpoints at least K apart never overlap: checkpoint r is admitted only after r-K retired.
+    fn new(trace: &Trace, prepared: &[Prepared], depth: usize) -> BackendResult<Self> {
+        let mut links = Self::default();
+        if depth <= 1 {
+            return Ok(links);
+        }
+        let mut window: HashMap<(u16, &[u8]), Vec<Writer<'_>>> = HashMap::new();
+        for (repetition, p) in prepared.iter().enumerate() {
+            if let Some(old) = repetition.checked_sub(depth) {
+                for row in prepared[old].batches.iter().flat_map(|b| &b.entries) {
+                    if let std::collections::hash_map::Entry::Occupied(mut writers) =
+                        window.entry((row.table, &row.key[..]))
+                    {
+                        writers.get_mut().retain(|w| w.repetition != old);
+                        if writers.get().is_empty() {
+                            writers.remove();
+                        }
+                    }
+                }
+            }
+            for (batch, b) in p.batches.iter().enumerate() {
+                let stage = batch_stage(b.phase);
+                for row in &b.entries {
+                    let writers = window.entry((row.table, &row.key[..])).or_default();
+                    // Same-stage writes commit in checkpoint order; writes of one key in two
+                    // stages by overlapping checkpoints could commit out of sequential order.
+                    ensure(
+                        writers
+                            .iter()
+                            .all(|w| w.repetition == repetition || w.stage == stage),
+                        "cross-checkpoint write-write conflict across pipeline stages",
+                    )?;
+                    writers.push(Writer {
+                        repetition,
+                        batch,
+                        stage,
+                        row,
+                    });
+                }
+            }
+            for (tx, reads) in p.reads.iter().enumerate() {
+                let mut gates = Vec::new();
+                for (index, read) in reads.iter().enumerate() {
+                    if read.producer.is_some() {
+                        continue;
+                    }
+                    let Some(writers) = window.get(&(read.row.table, &read.row.key[..])) else {
+                        continue;
+                    };
+                    // Own sync writes and earlier sync writes commit before this execution.
+                    if writers
+                        .iter()
+                        .any(|w| w.repetition == repetition && w.stage == Stage::Sync)
+                    {
+                        continue;
+                    }
+                    let Some(latest) = writers.iter().rev().find(|w| w.repetition < repetition)
+                    else {
+                        continue;
+                    };
+                    if latest.stage == Stage::Sync {
+                        continue;
+                    }
+                    // Only transaction outputs (phase 7 rows of a transaction) sit in Sui's
+                    // writeback dirty set after execution; every other write is visible
+                    // once its batch commits.
+                    let producer = latest.row.tx as usize;
+                    gates.push(
+                        if latest.stage == Stage::CommitOutputs && producer < trace.transactions {
+                            Gate::Publish {
+                                repetition: latest.repetition,
+                                tx: producer,
+                            }
+                        } else {
+                            Gate::Commit {
+                                repetition: latest.repetition,
+                                batch: latest.batch,
+                            }
+                        },
+                    );
+                    links.reads.insert(
+                        (repetition, tx, index),
+                        CrossRead {
+                            writers: writers
+                                .iter()
+                                .filter(|w| w.repetition < repetition)
+                                .map(|w| (w.repetition, w.batch))
+                                .collect(),
+                            value: latest.row.value.clone(),
+                        },
+                    );
+                }
+                gates.sort_unstable();
+                gates.dedup();
+                for &gate in &gates {
+                    links
+                        .waiters
+                        .entry(gate)
+                        .or_default()
+                        .push((repetition, tx));
+                }
+                if !gates.is_empty() {
+                    links.gates.insert((repetition, tx), gates);
+                }
+            }
+        }
+        Ok(links)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Execution {
+    /// Admitted; sync commits or the previous checkpoint's execution start pending.
+    Waiting,
+    /// Transactions enqueued at this clock.
+    Running(Instant),
+    /// Every transaction executed and the previous checkpoint's execution ended.
+    Ended,
+}
+/// Per in-flight checkpoint state; slot `r % K` belongs to repetition r.
+struct Slot {
+    repetition: usize,
+    next_batch: usize,
+    execution: Execution,
+    published: usize,
+    completed: Vec<bool>,
+    remaining: Vec<usize>,
+    ready_at: Vec<Option<Instant>>,
+    read_index: Vec<usize>,
+}
+/// Owns all pipeline state on the scheduler task; workers only see dispatched `Work`.
+/// Read callers `0..readers`; commits use caller 0 when K=1 (reads are idle by
+/// construction) and the extra caller `readers` when K>1, so read parallelism stays N.
+/// The ready heap is preallocated for K checkpoints' transactions, one entry each.
+struct Scheduler<'a> {
+    trace: &'a Trace,
+    prepared: &'a [Prepared],
+    links: &'a CrossLinks,
+    depth: usize,
+    readers: usize,
+    commit_worker: usize,
+    transactions: usize,
+    deadline: Instant,
+    dependents: Vec<Vec<usize>>,
+    slots: Vec<Slot>,
+    ready: BinaryHeap<Reverse<(usize, usize)>>,
+    idle: Vec<usize>,
+    active_reads: usize,
+    committing: bool,
+    admitted: usize,
+    retired: usize,
+}
+/// Pool callers for N readers at depth K.
+fn callers(readers: usize, depth: usize) -> usize {
+    readers + usize::from(depth > 1)
+}
+impl<'a> Scheduler<'a> {
+    fn new(
+        trace: &'a Trace,
+        prepared: &'a [Prepared],
+        links: &'a CrossLinks,
+        readers: usize,
+        depth: usize,
+        deadline: Instant,
+    ) -> BackendResult<Self> {
+        ensure(
+            depth >= 1 && readers >= 1,
+            "replay needs one checkpoint and caller",
+        )?;
         let mut dependents = vec![Vec::new(); trace.transactions];
         for (consumer, producers) in trace.dependencies.iter().enumerate() {
             for &producer in producers {
                 dependents[producer].push(consumer);
             }
         }
+        let n = trace.transactions;
+        let slots = (0..depth)
+            .map(|_| Slot {
+                repetition: usize::MAX,
+                next_batch: 0,
+                execution: Execution::Waiting,
+                published: 0,
+                completed: vec![false; n],
+                remaining: vec![0; n],
+                ready_at: vec![None; n],
+                read_index: vec![0; n],
+            })
+            .collect();
         Ok(Self {
-            calls: Vec::with_capacity(capacity),
-            counts: Counts::default(),
-            dependency_wait_ns: 0,
-            completed: vec![false; trace.transactions],
-            remaining: vec![0; trace.transactions],
+            trace,
+            prepared,
+            links,
+            depth,
+            readers,
+            commit_worker: if depth == 1 { 0 } else { readers },
+            // Without selected reads there is no execution stage (no transactions published).
+            transactions: if trace.reads.iter().any(|reads| !reads.is_empty()) {
+                n
+            } else {
+                0
+            },
+            deadline,
             dependents,
-            ready: BinaryHeap::with_capacity(trace.transactions),
-            ready_at: vec![None; trace.transactions],
-            read_index: vec![0; trace.transactions],
-            idle: Vec::with_capacity(callers),
+            slots,
+            ready: BinaryHeap::with_capacity(n.saturating_mul(depth)),
+            idle: Vec::with_capacity(readers),
+            active_reads: 0,
+            committing: false,
+            admitted: 0,
+            retired: 0,
         })
     }
 
-    fn publish(&mut self, tx: usize, now: Instant) {
-        // Each producer completes once; unique edges decrement each indegree once.
-        // The preallocated heap holds at most one entry per transaction.
-        self.completed[tx] = true;
-        self.counts.transactions += 1;
+    fn slot(&self, repetition: usize) -> &Slot {
+        &self.slots[repetition % self.depth]
+    }
+
+    /// The slot of an admitted, unretired repetition.
+    fn live(&self, repetition: usize) -> Option<&Slot> {
+        let slot = self.slot(repetition);
+        (repetition >= self.retired && repetition < self.admitted && slot.repetition == repetition)
+            .then_some(slot)
+    }
+
+    fn stage_ended(&self, repetition: usize, stage: Stage) -> bool {
+        let Some(slot) = self.live(repetition) else {
+            return repetition < self.retired;
+        };
+        (stage < Stage::Execute || slot.execution == Execution::Ended)
+            && self.prepared[repetition]
+                .batches
+                .get(slot.next_batch)
+                .is_none_or(|batch| batch_stage(batch.phase) > stage)
+    }
+
+    fn committed(&self, repetition: usize, batch: usize) -> bool {
+        repetition < self.retired || self.live(repetition).is_some_and(|s| s.next_batch > batch)
+    }
+
+    fn gate_open(&self, gate: Gate) -> bool {
+        match gate {
+            Gate::Publish { repetition, tx } => {
+                repetition < self.retired
+                    || self
+                        .live(repetition)
+                        .is_some_and(|s| s.execution != Execution::Waiting && s.completed[tx])
+            }
+            Gate::Commit { repetition, batch } => self.committed(repetition, batch),
+        }
+    }
+
+    /// Make `tx` of `repetition` ready if it was waiting only on this decrement. Each
+    /// producer and gate completes once and edges are unique, so each indegree unit is
+    /// decremented once; the preallocated heap holds at most one entry per transaction.
+    fn release_one(
+        slot: &mut Slot,
+        ready: &mut BinaryHeap<Reverse<(usize, usize)>>,
+        repetition: usize,
+        tx: usize,
+        now: Instant,
+    ) {
+        slot.remaining[tx] -= 1;
+        if slot.remaining[tx] == 0 {
+            slot.ready_at[tx] = Some(now);
+            ready.push(Reverse((repetition, tx)));
+        }
+    }
+
+    /// Readers counted this gate as closed only if their execution began before it opened.
+    fn release(&mut self, gate: Gate, now: Instant) {
+        let links = self.links;
+        let Some(waiters) = links.waiters.get(&gate) else {
+            return;
+        };
+        for &(repetition, tx) in waiters {
+            if self
+                .live(repetition)
+                .is_some_and(|s| matches!(s.execution, Execution::Running(_)))
+            {
+                Self::release_one(
+                    &mut self.slots[repetition % self.depth],
+                    &mut self.ready,
+                    repetition,
+                    tx,
+                    now,
+                );
+            }
+        }
+    }
+
+    fn publish(&mut self, repetition: usize, tx: usize, now: Instant, m: &mut Measurements) {
+        let index = repetition % self.depth;
+        self.slots[index].completed[tx] = true;
+        self.slots[index].published += 1;
+        m.counts.transactions += 1;
         for &consumer in &self.dependents[tx] {
-            self.remaining[consumer] -= 1;
-            if self.remaining[consumer] == 0 {
-                self.ready_at[consumer] = Some(now);
-                self.ready.push(Reverse(consumer));
+            Self::release_one(
+                &mut self.slots[index],
+                &mut self.ready,
+                repetition,
+                consumer,
+                now,
+            );
+        }
+        if !self.links.waiters.is_empty() {
+            self.release(Gate::Publish { repetition, tx }, now);
+        }
+    }
+
+    /// Sui ExecuteTransactions: enqueue every transaction; roots are ready now.
+    fn begin_execution(&mut self, repetition: usize) {
+        if self.active_reads == 0 {
+            self.idle.clear();
+            self.idle.extend((0..self.readers).rev());
+        }
+        let index = repetition % self.depth;
+        let slot = &mut self.slots[index];
+        slot.completed.fill(false);
+        slot.ready_at.fill(None);
+        slot.read_index.fill(0);
+        slot.published = 0;
+        let start = Instant::now();
+        slot.execution = Execution::Running(start);
+        if self.transactions == 0 {
+            return;
+        }
+        let links = self.links;
+        let trace = self.trace;
+        for (tx, producers) in trace.dependencies.iter().enumerate() {
+            let closed = links.gates.get(&(repetition, tx)).map_or(0, |gates| {
+                gates.iter().filter(|gate| !self.gate_open(**gate)).count()
+            });
+            let slot = &mut self.slots[index];
+            slot.remaining[tx] = producers.len() + closed;
+            if slot.remaining[tx] == 0 {
+                slot.ready_at[tx] = Some(start);
+                self.ready.push(Reverse((repetition, tx)));
+            }
+        }
+    }
+
+    /// Retire, admit and move execution stages until nothing changes.
+    fn advance(&mut self, m: &mut Measurements) -> bool {
+        let mut progressed = false;
+        loop {
+            let mut changed = false;
+            // Sui yields `.buffered(K)` outputs in order; bump_executed already orders them.
+            while self.retired < self.admitted {
+                let slot = self.slot(self.retired);
+                if slot.execution != Execution::Ended
+                    || slot.next_batch < self.prepared[self.retired].batches.len()
+                {
+                    break;
+                }
+                m.counts.checkpoints += 1;
+                self.retired += 1;
+                changed = true;
+            }
+            while self.admitted < self.prepared.len() && self.admitted < self.retired + self.depth {
+                let slot = &mut self.slots[self.admitted % self.depth];
+                slot.repetition = self.admitted;
+                slot.next_batch = 0;
+                slot.execution = Execution::Waiting;
+                slot.published = 0;
+                self.admitted += 1;
+                m.max_in_flight = m.max_in_flight.max(self.admitted - self.retired);
+                changed = true;
+            }
+            for repetition in self.retired..self.admitted {
+                let previous = (repetition > self.retired).then(|| self.slot(repetition - 1));
+                let previous_started = previous.is_none_or(|s| s.execution != Execution::Waiting);
+                let previous_ended = previous.is_none_or(|s| s.execution == Execution::Ended);
+                let (execution, published) = {
+                    let slot = self.slot(repetition);
+                    (slot.execution, slot.published)
+                };
+                match execution {
+                    Execution::Waiting
+                        if previous_started && self.stage_ended(repetition, Stage::Sync) =>
+                    {
+                        self.begin_execution(repetition);
+                        changed = true;
+                    }
+                    Execution::Running(_) if previous_ended && published == self.transactions => {
+                        self.slots[repetition % self.depth].execution = Execution::Ended;
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !changed {
+                return progressed;
+            }
+            progressed = true;
+        }
+    }
+
+    /// Dispatch the oldest eligible batch on the single commit caller.
+    fn dispatch_commit(&mut self, pool: &mut Pool) -> BackendResult<bool> {
+        if self.committing {
+            return Ok(false);
+        }
+        for repetition in self.retired..self.admitted {
+            let slot = self.slot(repetition);
+            let Some(batch) = self.prepared[repetition].batches.get(slot.next_batch) else {
+                continue;
+            };
+            let stage = batch_stage(batch.phase);
+            if (stage > Stage::Execute && slot.execution != Execution::Ended)
+                || (repetition > self.retired && !self.stage_ended(repetition - 1, stage))
+            {
+                continue;
+            }
+            ensure(
+                self.depth > 1 || self.active_reads == 0,
+                "sequential replay commit overlaps reads",
+            )?;
+            let operation = Operation::Commit(slot.next_batch);
+            pool.dispatch(
+                self.commit_worker,
+                repetition,
+                operation,
+                Instant::now(),
+                self.deadline,
+            )?;
+            self.committing = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// First store read at or after `from`. A cross-checkpoint read with an uncommitted
+    /// window writer is served from that checkpoint's dirty output instead of the store.
+    fn next_store_read(
+        &self,
+        repetition: usize,
+        tx: usize,
+        from: usize,
+        m: &mut Measurements,
+    ) -> BackendResult<Option<usize>> {
+        let reads = &self.prepared[repetition].reads[tx];
+        for (index, read) in reads.iter().enumerate().skip(from) {
+            if read.producer.is_some() {
+                continue;
+            }
+            if !self.links.reads.is_empty()
+                && let Some(cross) = self.links.reads.get(&(repetition, tx, index))
+            {
+                if !cross.writers.iter().all(|&(r, b)| self.committed(r, b)) {
+                    ensure(
+                        cross.value == read.row.value,
+                        "cross-checkpoint overlay missing/wrong value",
+                    )?;
+                    m.counts.overlay_demands += 1;
+                    m.cross_overlay_reads += 1;
+                    continue;
+                }
+                m.cross_store_reads += 1;
+            }
+            return Ok(Some(index));
+        }
+        Ok(None)
+    }
+
+    /// Hand ready transactions to idle read callers, oldest checkpoint first.
+    fn dispatch_reads(&mut self, pool: &mut Pool, m: &mut Measurements) -> BackendResult<bool> {
+        let mut progressed = false;
+        while let Some(worker) = self.idle.pop() {
+            let Some(Reverse((repetition, tx))) = self.ready.pop() else {
+                self.idle.push(worker);
+                break;
+            };
+            progressed = true;
+            let index = repetition % self.depth;
+            let Execution::Running(start) = self.slots[index].execution else {
+                return Err("ready transaction outside its execution stage".into());
+            };
+            let ready =
+                self.slots[index].ready_at[tx].ok_or("ready transaction lacks arrival clock")?;
+            let prepared = &self.prepared[repetition];
+            for (position, read) in prepared.reads[tx].iter().enumerate() {
+                if let Some(producer) = read.producer {
+                    ensure(
+                        self.slots[index].completed[producer],
+                        "dirty overlay producer not published",
+                    )?;
+                    ensure(
+                        prepared.overlay[tx][position].as_ref() == Some(&read.row.value),
+                        "dirty overlay missing/wrong value",
+                    )?;
+                    m.counts.overlay_demands += 1;
+                }
+            }
+            m.dependency_wait_ns += duration_ns(ready.saturating_duration_since(start));
+            if let Some(position) = self.next_store_read(repetition, tx, 0, m)? {
+                self.slots[index].read_index[tx] = position;
+                pool.dispatch(
+                    worker,
+                    repetition,
+                    Operation::Read {
+                        tx,
+                        index: position,
+                    },
+                    ready,
+                    self.deadline,
+                )?;
+                self.active_reads += 1;
+            } else {
+                self.publish(repetition, tx, Instant::now(), m);
+                self.idle.push(worker);
+            }
+        }
+        Ok(progressed)
+    }
+
+    fn schedule(&mut self, pool: &mut Pool, m: &mut Measurements) -> BackendResult<()> {
+        // Each pass retires, admits, dispatches or publishes; finite work bounds the loop.
+        loop {
+            let mut progressed = self.advance(m);
+            progressed |= self.dispatch_commit(pool)?;
+            progressed |= self.dispatch_reads(pool, m)?;
+            if !progressed {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn run(mut self, pool: &mut Pool, m: &mut Measurements) -> BackendResult<()> {
+        loop {
+            self.schedule(pool, m)?;
+            if self.retired == self.prepared.len() {
+                return Ok(());
+            }
+            ensure(
+                self.active_reads > 0 || self.committing,
+                "replay dependency cycle",
+            )?;
+            let completion = pool.receive(self.deadline).await?;
+            let repetition = completion.work.repetition;
+            observe_completion(
+                self.trace,
+                &self.prepared[repetition],
+                &completion,
+                &mut m.calls,
+                &mut m.counts,
+            )?;
+            let worker = completion.worker;
+            let operation = completion.work.operation;
+            pool.recycle(completion)?;
+            let index = repetition % self.depth;
+            match operation {
+                Operation::Read { tx, .. } => {
+                    let from = self.slots[index].read_index[tx] + 1;
+                    if let Some(position) = self.next_store_read(repetition, tx, from, m)? {
+                        self.slots[index].read_index[tx] = position;
+                        pool.dispatch(
+                            worker,
+                            repetition,
+                            Operation::Read {
+                                tx,
+                                index: position,
+                            },
+                            Instant::now(),
+                            self.deadline,
+                        )?;
+                    } else {
+                        self.publish(repetition, tx, Instant::now(), m);
+                        self.active_reads -= 1;
+                        self.idle.push(worker);
+                    }
+                }
+                Operation::Commit(batch) => {
+                    ensure(
+                        self.slots[index].next_batch == batch,
+                        "replay commit completed out of order",
+                    )?;
+                    self.slots[index].next_batch += 1;
+                    self.committing = false;
+                    if !self.links.waiters.is_empty() {
+                        self.release(Gate::Commit { repetition, batch }, Instant::now());
+                    }
+                }
+                Operation::Preload => return Err("unexpected replay completion".into()),
             }
         }
     }
@@ -893,136 +1549,6 @@ fn observe_completion(
     Ok(())
 }
 
-async fn checkpoint(
-    pool: &mut Pool,
-    trace: &Trace,
-    prepared: &Prepared,
-    rep: usize,
-    deadline: Instant,
-    measurements: &mut Measurements,
-) -> BackendResult<()> {
-    for phase in 0..9 {
-        if phase == 5 && trace.reads.iter().any(|reads| !reads.is_empty()) {
-            measurements.completed.fill(false);
-            measurements.ready_at.fill(None);
-            measurements.read_index.fill(0);
-            measurements.idle.clear();
-            measurements.idle.extend((0..pool.senders.len()).rev());
-            measurements.ready.clear();
-            let execution_start = Instant::now();
-            for (tx, producers) in trace.dependencies.iter().enumerate() {
-                measurements.remaining[tx] = producers.len();
-                if producers.is_empty() {
-                    measurements.ready_at[tx] = Some(execution_start);
-                    measurements.ready.push(Reverse(tx));
-                }
-            }
-            let mut finished = 0usize;
-            let mut active = 0usize;
-            // Publication bits gate immutable staged output views, owned only here.
-            while finished < trace.transactions {
-                while let Some(worker) = measurements.idle.pop() {
-                    let Some(Reverse(tx)) = measurements.ready.pop() else {
-                        measurements.idle.push(worker);
-                        break;
-                    };
-                    let ready =
-                        measurements.ready_at[tx].ok_or("ready transaction lacks arrival clock")?;
-                    for (index, read) in prepared.reads[tx].iter().enumerate() {
-                        if let Some(producer) = read.producer {
-                            ensure(
-                                measurements.completed[producer],
-                                "dirty overlay producer not published",
-                            )?;
-                            ensure(
-                                prepared.overlay[tx][index].as_ref() == Some(&read.row.value),
-                                "dirty overlay missing/wrong value",
-                            )?;
-                            measurements.counts.overlay_demands += 1;
-                        }
-                    }
-                    measurements.dependency_wait_ns +=
-                        duration_ns(ready.saturating_duration_since(execution_start));
-                    if let Some(index) =
-                        prepared.reads[tx].iter().position(|r| r.producer.is_none())
-                    {
-                        measurements.read_index[tx] = index;
-                        pool.dispatch(worker, rep, Operation::Read { tx, index }, ready, deadline)?;
-                        active += 1;
-                    } else {
-                        measurements.publish(tx, Instant::now());
-                        finished += 1;
-                        measurements.idle.push(worker);
-                    }
-                }
-                if finished == trace.transactions {
-                    break;
-                }
-                ensure(active > 0, "replay dependency cycle")?;
-                let completion = pool.receive(deadline).await?;
-                let Operation::Read { tx, .. } = completion.work.operation else {
-                    return Err("unexpected replay completion".into());
-                };
-                observe_completion(
-                    trace,
-                    prepared,
-                    &completion,
-                    &mut measurements.calls,
-                    &mut measurements.counts,
-                )?;
-                let worker = completion.worker;
-                pool.recycle(completion)?;
-                let next = prepared.reads[tx]
-                    .iter()
-                    .enumerate()
-                    .skip(measurements.read_index[tx] + 1)
-                    .find(|(_, r)| r.producer.is_none())
-                    .map(|(index, _)| index);
-                if let Some(index) = next {
-                    measurements.read_index[tx] = index;
-                    pool.dispatch(
-                        worker,
-                        rep,
-                        Operation::Read { tx, index },
-                        Instant::now(),
-                        deadline,
-                    )?;
-                } else {
-                    measurements.publish(tx, Instant::now());
-                    finished += 1;
-                    active -= 1;
-                    measurements.idle.push(worker);
-                }
-            }
-        }
-        let Some(batch_index) = prepared
-            .batches
-            .iter()
-            .position(|batch| usize::from(batch.phase) == phase)
-        else {
-            continue;
-        };
-        pool.dispatch(
-            0,
-            rep,
-            Operation::Commit(batch_index),
-            Instant::now(),
-            deadline,
-        )?;
-        let completion = pool.receive(deadline).await?;
-        observe_completion(
-            trace,
-            prepared,
-            &completion,
-            &mut measurements.calls,
-            &mut measurements.counts,
-        )?;
-        pool.recycle(completion)?;
-    }
-    measurements.counts.checkpoints += 1;
-    Ok(())
-}
-
 /// Native fixture evidence and tests use this same scheduler, not a mock execution path.
 pub async fn execute<B: ReplayBackend + ?Sized>(
     backend: Arc<B>,
@@ -1032,15 +1558,39 @@ pub async fn execute<B: ReplayBackend + ?Sized>(
     deadline: Instant,
     timeout_ms: u64,
 ) -> BackendResult<Counts> {
+    Ok(replay(
+        backend,
+        trace,
+        prepared,
+        concurrency,
+        1,
+        deadline,
+        timeout_ms,
+    )
+    .await?
+    .counts)
+}
+
+/// Preload, then replay every repetition at pipeline depth `depth`.
+async fn replay<B: ReplayBackend + ?Sized>(
+    backend: Arc<B>,
+    trace: &Trace,
+    prepared: Arc<Vec<Prepared>>,
+    concurrency: usize,
+    depth: usize,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> BackendResult<Measurements> {
+    let links = CrossLinks::new(trace, &prepared, depth)?;
     let origin = Instant::now();
     let mut pool = Pool::new(
         Arc::clone(&backend),
         Arc::clone(&prepared),
-        concurrency,
+        callers(concurrency, depth),
         origin,
         timeout_ms,
     )?;
-    let mut m = Measurements::new(trace, prepared.len(), concurrency)?;
+    let mut m = Measurements::new(trace, prepared.len())?;
     let result: BackendResult<()> = async {
         for rep in 0..prepared.len() {
             pool.dispatch(0, rep, Operation::Preload, Instant::now(), deadline)?;
@@ -1048,9 +1598,9 @@ pub async fn execute<B: ReplayBackend + ?Sized>(
             pool.recycle(c)?;
         }
         backend.check_background_health()?;
-        for (rep, p) in prepared.iter().enumerate() {
-            checkpoint(&mut pool, trace, p, rep, deadline, &mut m).await?;
-        }
+        Scheduler::new(trace, &prepared, &links, concurrency, depth, deadline)?
+            .run(&mut pool, &mut m)
+            .await?;
         backend.check_background_health()?;
         Ok(())
     }
@@ -1067,7 +1617,26 @@ pub async fn execute<B: ReplayBackend + ?Sized>(
     pool.close().await?;
     backend.check_background_health()?;
     result?;
-    Ok(m.counts)
+    Ok(m)
+}
+
+/// Independent final-state oracle: every preload (all precede measurement), then every
+/// prepared batch in sequential checkpoint-then-phase order, regardless of K or of the
+/// observed commit order. Exact under pipelining because `CrossLinks` rejects keys that
+/// overlapping checkpoints write in different stages, and same-stage writes commit in
+/// checkpoint order; a skipped, lost or reordered same-key commit fails verification.
+fn expected_final_rows(prepared: &[Prepared]) -> FinalRows {
+    let mut expected = FinalRows::new();
+    for row in prepared.iter().flat_map(|p| &p.preload) {
+        expected.insert((row.table, row.key.clone()), row.clone());
+    }
+    for row in prepared
+        .iter()
+        .flat_map(|p| p.batches.iter().flat_map(|b| &b.entries))
+    {
+        expected.insert((row.table, row.key.clone()), row.clone());
+    }
+    expected
 }
 fn now_unix() -> f64 {
     SystemTime::now()
@@ -1263,7 +1832,7 @@ pub async fn run(config: ReplayConfig, output: &Path) -> BackendResult<()> {
     .await
 }
 
-async fn run_prepared<B: ReplayBackend + ?Sized>(
+pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
     config: ReplayConfig,
     output: &Path,
     trace: Trace,
@@ -1279,6 +1848,9 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     };
     let deadline = started + Duration::from_secs(config.limits.deadline_seconds);
     let capability = backend.commit_capability().labels(&info)?;
+    let depth = config.pipeline_depth();
+    // Cold, before preload and measurement; empty when K=1.
+    let links = CrossLinks::new(&trace, &prepared, depth)?;
     let mut reporter = Reporter::create(
         output,
         prometheus::Registry::new(),
@@ -1287,11 +1859,11 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     let mut pool = Pool::new(
         Arc::clone(&backend),
         Arc::clone(&prepared),
-        config.execution.concurrency,
+        callers(config.execution.concurrency, depth),
         started,
         config.execution.request_timeout_ms,
     )?;
-    let mut m = Measurements::new(&trace, prepared.len(), config.execution.concurrency)?;
+    let mut m = Measurements::new(&trace, prepared.len())?;
     let preload_start = Instant::now();
     let mut preload_ns = 0;
     let mut window_start = None;
@@ -1313,9 +1885,16 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         reporter.set_phase("measurement");
         let begin = Instant::now();
         window_start = Some(begin);
-        for (rep, p) in prepared.iter().enumerate() {
-            checkpoint(&mut pool, &trace, p, rep, deadline, &mut m).await?;
-        }
+        Scheduler::new(
+            &trace,
+            &prepared,
+            &links,
+            config.execution.concurrency,
+            depth,
+            deadline,
+        )?
+        .run(&mut pool, &mut m)
+        .await?;
         elapsed = begin.elapsed();
         physical_after = backend.physical_counts();
         backend.check_background_health()?;
@@ -1345,16 +1924,7 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     let unresolved_workers = pool.close().await?;
     let mut final_verification = serde_json::Value::Null;
     if result.is_ok() {
-        let mut expected = FinalRows::new();
-        for p in prepared.iter() {
-            for row in p
-                .preload
-                .iter()
-                .chain(p.batches.iter().flat_map(|b| &b.entries))
-            {
-                expected.insert((row.table, row.key.clone()), row.clone());
-            }
-        }
+        let expected = expected_final_rows(&prepared);
         let verifier = Arc::clone(&backend);
         match tokio::task::spawn_blocking(move || verifier.verify_final(&expected, deadline))
             .await?
@@ -1385,6 +1955,13 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
     let mut metrics = metrics;
     metrics["replay_contract"] = capability;
     metrics["physical"] = serde_json::json!({"before_measurement":physical_before,"after_measurement":physical_after,"including_preload":backend.physical_counts()});
+    metrics["write_amplification"] = write_amplification(
+        &m,
+        &prepared,
+        &physical_before,
+        &physical_after,
+        result.is_ok(),
+    );
     metrics["final_verification"] = final_verification;
     metrics["functional_qualification"] =
         serde_json::json!(result.is_ok() && unresolved_workers == 0);
@@ -1419,7 +1996,8 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         )?;
     }
     metrics["topology"] = info.topology.clone();
-    metrics["case_identity"] = serde_json::json!({"scope":trace.scope(),"fixture_sha256":config.workload.manifest_sha256,"source":trace.manifest["source"],"repeat_domain":std::str::from_utf8(crate::mainnet_trace::DOMAIN)?,"repeat_version":1,"repetitions":prepared.len(),"N":config.execution.concurrency,"W":1,"table_mapping":trace.tables,"device_counters":"unmeasured"});
+    metrics["case_identity"] = serde_json::json!({"scope":trace.scope(),"fixture_sha256":config.workload.manifest_sha256,"source":trace.manifest["source"],"repeat_domain":std::str::from_utf8(crate::mainnet_trace::DOMAIN)?,"repeat_version":1,"repetitions":prepared.len(),"N":config.execution.concurrency,"K":depth,"W":1,"table_mapping":trace.tables,"device_counters":device_counters_scope()});
+    metrics["pipeline"] = m.pipeline(depth, config.execution.concurrency);
     let unknown_outcomes = m
         .calls
         .iter()
@@ -1439,6 +2017,143 @@ async fn run_prepared<B: ReplayBackend + ?Sized>(
         distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
     reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":trace.scope(),"config":config,"binary":resources["binary"],"trace_manifest":trace.manifest,"profile":metrics}))?;
     result
+}
+
+/// Where replay device bytes come from. Owner block devices are outside this client
+/// process; the campaign controller snapshots them at the measurement gates when the job
+/// requests `device_counters`, exactly as for the put cases.
+fn device_counters_scope() -> serde_json::Value {
+    serde_json::json!({"collector":"campaign controller","artifact":"device_counters.json","window":"block-device snapshots at the measurement.ready and measurement.complete gates; whole device, including background writes","payload":"write_amplification.payload"})
+}
+
+/// Payload of the successful commits inside the measurement window. `value_bytes` is the
+/// denominator of the put cases' `wal_bytes_per_payload` (successful puts times value
+/// size); `key_value_bytes` adds the logical key bytes the store encodes with each value.
+#[derive(Default, Serialize)]
+struct CommittedPayload {
+    commits: u64,
+    rows: u64,
+    value_bytes: u64,
+    key_bytes: u64,
+    key_value_bytes: u64,
+}
+
+fn committed_payload(m: &Measurements, prepared: &[Prepared]) -> BackendResult<CommittedPayload> {
+    let mut payload = CommittedPayload::default();
+    for (sample, id) in &m.calls {
+        if sample.operation != "commit" || sample.outcome != "success" {
+            continue;
+        }
+        let phase = id.batch_phase.ok_or("commit sample lacks a batch phase")?;
+        let batch = prepared
+            .get(usize::try_from(id.repetition)?)
+            .and_then(|p| p.batches.iter().find(|batch| batch.phase == phase))
+            .ok_or("commit sample has no prepared batch")?;
+        ensure(
+            batch.entries.len() as u64 == sample.logical_keys,
+            "commit sample members differ from its prepared batch",
+        )?;
+        let key_bytes = batch
+            .entries
+            .iter()
+            .map(|r| r.key.len() as u64)
+            .sum::<u64>();
+        payload.commits += 1;
+        payload.rows += sample.logical_keys;
+        payload.value_bytes += sample.bytes;
+        payload.key_bytes += key_bytes;
+        payload.key_value_bytes += key_bytes + sample.bytes;
+    }
+    Ok(payload)
+}
+
+/// Measurement-boundary delta of the coordinator's live leased-write counters, summed over
+/// node databases: the counter the put cases divide by payload (`completed_write_bytes`,
+/// whole aligned NVMe-oF frames), plus write operations and leased frames.
+fn live_write_delta(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<[u64; 3], String> {
+    const FIELDS: [&str; 3] = [
+        "completed_write_bytes",
+        "completed_write_ops",
+        "leased_frames",
+    ];
+    // `physical_counts` returns one observation, or `{"databases": {id: observation}}`.
+    fn snapshots(value: &serde_json::Value) -> Vec<(&str, &serde_json::Value)> {
+        match value
+            .get("databases")
+            .and_then(serde_json::Value::as_object)
+        {
+            Some(databases) => databases
+                .iter()
+                .map(|(id, db)| (id.as_str(), &db["live_nvmeof"]))
+                .collect(),
+            None => vec![("", &value["live_nvmeof"])],
+        }
+    }
+    let (start, end) = (snapshots(before), snapshots(after));
+    if start.len() != end.len() || start.iter().zip(&end).any(|(a, b)| a.0 != b.0) {
+        return Err("node database population differs between measurement boundaries".into());
+    }
+    let mut total = [0u64; 3];
+    for ((_, a), (_, b)) in start.iter().zip(&end) {
+        for (slot, field) in total.iter_mut().zip(FIELDS) {
+            let (Some(first), Some(last)) = (
+                a.get(field).and_then(serde_json::Value::as_u64),
+                b.get(field).and_then(serde_json::Value::as_u64),
+            ) else {
+                return Err(format!(
+                    "live NVMe-oF counter {field} unavailable; owner-RPC and non-TideHunter routes expose no leased-write bytes"
+                ));
+            };
+            // u64::MAX is the saturated-counter sentinel, as in the measurement read evidence.
+            if first == u64::MAX || last == u64::MAX {
+                return Err(format!("live NVMe-oF counter {field} saturated"));
+            }
+            *slot = last
+                .checked_sub(first)
+                .and_then(|delta| slot.checked_add(delta))
+                .ok_or_else(|| format!("live NVMe-oF counter {field} decreased or overflowed"))?;
+        }
+    }
+    Ok(total)
+}
+
+fn per_payload_byte(bytes: u64, payload: u64) -> Option<f64> {
+    (payload > 0).then(|| bytes as f64 / payload as f64)
+}
+
+/// Replay counterpart of the put cases' write amplification: payload of the successful
+/// measurement-window commits and logical WAL bytes over the same boundaries. Device
+/// bytes per payload use the controller's `device_counters.json` with this payload.
+fn write_amplification(
+    m: &Measurements,
+    prepared: &[Prepared],
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    drained: bool,
+) -> serde_json::Value {
+    let payload = match committed_payload(m, prepared) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return serde_json::json!({"available":false,"error":error.to_string(),"device":device_counters_scope()});
+        }
+    };
+    let logical_wal = if !drained {
+        serde_json::json!({"available":false,"error":"measurement did not complete and drain successfully"})
+    } else {
+        match live_write_delta(before, after) {
+            Ok([bytes, write_ops, leased_frames]) => serde_json::json!({
+                "available":true,"counter":"live_nvmeof.completed_write_bytes","bytes":bytes,
+                "write_ops":write_ops,"leased_frames":leased_frames,
+                "bytes_per_value_byte":per_payload_byte(bytes, payload.value_bytes),
+                "bytes_per_key_value_byte":per_payload_byte(bytes, payload.key_value_bytes)}),
+            Err(error) => serde_json::json!({"available":false,"error":error}),
+        }
+    };
+    serde_json::json!({"available":true,"scope":"successful measurement-window commits; logical WAL is the gate-boundary delta of the coordinator live leased-write counters, not physical device bytes",
+        "payload":payload,"logical_wal":logical_wal,"device":device_counters_scope()})
 }
 /// Backend durability evidence plus the tier the backend confirmed from owner receipts,
 /// in the field the campaign admits (`confirmed_by_backend_receipt`), as the runner records it.
@@ -1634,7 +2349,7 @@ fn profile(
         "put_members_per_second":m.counts.put_members as f64/seconds,"transactions_per_second":m.counts.transactions as f64/seconds,"checkpoints_per_second":m.counts.checkpoints as f64/seconds,
         "value_bytes_per_second":m.calls.iter().filter(|(s,_)|s.outcome=="success").map(|(s,_)|s.bytes).sum::<u64>() as f64/seconds,
         "mean_in_flight_api_calls":api_sum as f64/(seconds*1e9),"verification_ns":verification,"dependency_wait_ns":m.dependency_wait_ns,"complete_one_second_api_rate_buckets":buckets,
-        "latency":latency,"tables":tables,"topology":"one process; three node DBs on one local filesystem; no network; source caches not modeled","device_counters":"unmeasured"})
+        "latency":latency,"tables":tables,"topology":"one process; three node DBs on one local filesystem; no network; source caches not modeled","device_counters":device_counters_scope()})
 }
 
 #[cfg(test)]

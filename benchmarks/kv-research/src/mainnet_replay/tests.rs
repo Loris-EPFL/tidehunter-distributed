@@ -1,5 +1,5 @@
 use super::*;
-use crate::mainnet_trace::SCOPE;
+use crate::mainnet_trace::{OBJECTS, SCOPE};
 use tidehunter::minibytes::Bytes;
 fn trace() -> Trace {
     Trace::load(
@@ -39,6 +39,7 @@ fn config(root: &Path) -> ReplayConfig {
             repetitions: 2,
             minimum_measurement_seconds: 0.0,
             node_databases: None,
+            checkpoint_pipeline_depth: None,
         },
         execution: ExecutionConfig {
             mode: ExecutionMode::ClosedLoop,
@@ -722,4 +723,751 @@ fn all_node_database_subsets_preserve_source_phases() {
         );
         prepare(&selected, 2).unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_replay_records_committed_payload_and_device_counter_scope() {
+    let root = temp("amplification");
+    let mut cfg = config(&root);
+    cfg.workload.node_databases = Some(vec![0]);
+    cfg.execution.concurrency = 4;
+    let selected = cfg.validate().unwrap();
+    run(cfg, &root.join("result")).await.unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("result/summary.json")).unwrap()).unwrap();
+    let profile = &summary["phase_counts"]["profile"];
+    let amplification = &profile["write_amplification"];
+    // Perpetual manifest batches (phases 2, 6, 7): 654 rows, 500,324 value and 23,832 key
+    // bytes per repetition. Repeated keys keep their source length.
+    let values = selected
+        .batches
+        .iter()
+        .flat_map(|b| &b.entries)
+        .map(|r| r.value.len() as u64)
+        .sum::<u64>();
+    let keys = selected
+        .batches
+        .iter()
+        .flat_map(|b| &b.entries)
+        .map(|r| r.key.len() as u64)
+        .sum::<u64>();
+    assert_eq!((values, keys), (500_324, 23_832));
+    assert_eq!(amplification["available"], true);
+    assert_eq!(
+        amplification["payload"],
+        serde_json::json!({"commits":6,"rows":1308,"value_bytes":2*values,"key_bytes":2*keys,"key_value_bytes":2*(values+keys)})
+    );
+    assert_eq!(profile["logical_key_bytes"], 2 * keys);
+    // The raw rows reproduce the value-byte denominator independently.
+    let rows = std::fs::read_to_string(root.join("result/samples.csv")).unwrap();
+    let mut lines = rows.lines();
+    let header: Vec<_> = lines.next().unwrap().split(',').collect();
+    let column = |name: &str| header.iter().position(|c| *c == name).unwrap();
+    let (operation, outcome, bytes, members) = (
+        column("operation"),
+        column("outcome"),
+        column("bytes"),
+        column("members"),
+    );
+    let (mut commits, mut committed_bytes, mut committed_rows) = (0u64, 0u64, 0u64);
+    for line in lines {
+        let fields: Vec<_> = line.split(',').collect();
+        if fields[operation] == "commit" && fields[outcome] == "success" {
+            commits += 1;
+            committed_bytes += fields[bytes].parse::<u64>().unwrap();
+            committed_rows += fields[members].parse::<u64>().unwrap();
+        }
+    }
+    assert_eq!(
+        (commits, committed_bytes, committed_rows),
+        (6, 2 * values, 1308)
+    );
+    // The native engine exposes no live leased-write counter; no ratio is fabricated.
+    assert_eq!(amplification["logical_wal"]["available"], false);
+    assert!(
+        amplification["logical_wal"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("completed_write_bytes unavailable"),
+        "{amplification}"
+    );
+    for scope in [
+        &amplification["device"],
+        &profile["device_counters"],
+        &profile["case_identity"]["device_counters"],
+    ] {
+        assert_eq!(scope["artifact"], "device_counters.json");
+        assert_eq!(scope["payload"], "write_amplification.payload");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_write_delta_sums_databases_and_rejects_unusable_counters() {
+    let live = |bytes: u64, ops: u64, frames: u64| serde_json::json!({"completed_write_bytes":bytes,"completed_write_ops":ops,"leased_frames":frames});
+    let single = |bytes, ops, frames| serde_json::json!({"live_nvmeof": live(bytes, ops, frames)});
+    assert_eq!(
+        live_write_delta(&single(4096, 1, 1), &single(16384, 4, 3)),
+        Ok([12288, 3, 2])
+    );
+    let databases = |a: serde_json::Value, b: serde_json::Value| serde_json::json!({"databases":{"0":{"live_nvmeof":a},"1":{"live_nvmeof":b}}});
+    assert_eq!(
+        live_write_delta(
+            &databases(live(0, 0, 0), live(8192, 2, 2)),
+            &databases(live(4096, 1, 1), live(16384, 4, 3)),
+        ),
+        Ok([12288, 3, 2])
+    );
+    assert!(
+        live_write_delta(
+            &databases(live(0, 0, 0), live(0, 0, 0)),
+            &single(4096, 1, 1)
+        )
+        .is_err()
+    );
+    assert!(live_write_delta(&single(8192, 2, 2), &single(4096, 2, 2)).is_err());
+    assert!(live_write_delta(&single(0, 0, 0), &single(u64::MAX, 2, 2)).is_err());
+    assert!(
+        live_write_delta(
+            &serde_json::json!({"live_nvmeof":null}),
+            &single(4096, 1, 1)
+        )
+        .is_err()
+    );
+    assert!(live_write_delta(&serde_json::Value::Null, &serde_json::Value::Null).is_err());
+}
+
+fn native(root: &Path, trace: &Trace) -> Arc<NativeReplayBackend> {
+    Arc::new(NativeReplayBackend::open(&config(root).backend.options, &trace.tables).unwrap())
+}
+
+fn assert_contents(backend: &NativeReplayBackend, expected: &FinalRows) {
+    for ((table, key), row) in expected {
+        assert_eq!(backend.get(*table, key).unwrap().unwrap(), row.value);
+    }
+}
+
+/// Exact counts of the full three-database fixture, per repetition.
+fn assert_full_counts(counts: &Counts, repetitions: u64) {
+    assert_eq!(counts.store_gets, 507 * repetitions);
+    assert_eq!(counts.overlay_demands, 116 * repetitions);
+    assert_eq!(counts.put_members, 707 * repetitions);
+    assert_eq!(counts.write_calls, 9 * repetitions);
+    assert_eq!(counts.transactions, 45 * repetitions);
+    assert_eq!(counts.checkpoints, repetitions);
+}
+
+/// One measured call, reduced to what the pipeline ordering rules constrain.
+#[derive(Clone, Copy, Debug)]
+struct Call {
+    repetition: usize,
+    phase: Option<u16>,
+    tx: Option<u32>,
+    dispatched: u64,
+    completed: u64,
+}
+
+fn calls(m: &Measurements) -> Vec<Call> {
+    m.calls
+        .iter()
+        .map(|(sample, id)| {
+            assert_eq!(sample.outcome, "success");
+            Call {
+                repetition: usize::try_from(id.repetition).unwrap(),
+                phase: id.batch_phase,
+                tx: id.source_tx,
+                dispatched: sample.dispatched_ns,
+                completed: sample.completed_ns,
+            }
+        })
+        .collect()
+}
+
+/// Observed commits `(repetition, phase)` in dispatch order (W=1: one at a time).
+fn commit_order(calls: &[Call]) -> Vec<(usize, u16)> {
+    let mut commits = calls
+        .iter()
+        .filter_map(|c| c.phase.map(|phase| (c.dispatched, c.repetition, phase)))
+        .collect::<Vec<_>>();
+    commits.sort_unstable();
+    commits
+        .into_iter()
+        .map(|(_, repetition, phase)| (repetition, phase))
+        .collect()
+}
+
+/// Check the Sui `PipelineStages` rules on the observed call clocks: worker clocks are
+/// monotonic and every dependent call is dispatched only after its predecessor's
+/// completion reached the scheduler.
+fn assert_pipeline_order(calls: &[Call], repetitions: usize, depth: usize, readers: usize) {
+    let of = |r: usize| calls.iter().filter(move |c| c.repetition == r);
+    let commits = |r: usize, stage: Stage| {
+        of(r).filter(move |c| c.phase.is_some_and(|p| batch_stage(p) == stage))
+    };
+    let reads = |r: usize| of(r).filter(|c| c.phase.is_none());
+    let stages = [
+        Stage::Sync,
+        Stage::Finalize,
+        Stage::CommitOutputs,
+        Stage::BumpExecuted,
+    ];
+    for r in 0..repetitions {
+        // Execution begins after this checkpoint's sync stage.
+        let synced = commits(r, Stage::Sync).map(|c| c.completed).max();
+        if let (Some(synced), Some(first)) = (synced, reads(r).map(|c| c.dispatched).min()) {
+            assert!(
+                first >= synced,
+                "checkpoint {r} read before its sync stage ended"
+            );
+        }
+        // Execution ends in checkpoint order, so post-execution commits follow every
+        // read of this and all earlier checkpoints.
+        let executed = (0..=r)
+            .filter_map(|q| reads(q).map(|c| c.completed).max())
+            .max()
+            .unwrap_or(0);
+        for stage in &stages[1..] {
+            for c in commits(r, *stage) {
+                assert!(
+                    c.dispatched >= executed,
+                    "checkpoint {r} {stage:?} before execution ended"
+                );
+            }
+        }
+        // Phases of one checkpoint commit one after another, in phase order.
+        let mut own = of(r).filter(|c| c.phase.is_some()).collect::<Vec<_>>();
+        own.sort_by_key(|c| c.dispatched);
+        assert!(
+            own.windows(2)
+                .all(|w| w[0].phase < w[1].phase && w[1].dispatched >= w[0].completed)
+        );
+        // Stage s of checkpoint r begins after stage s of r-1 ends.
+        if r > 0 {
+            for stage in stages {
+                let previous = commits(r - 1, stage).map(|c| c.completed).max();
+                let first = commits(r, stage).map(|c| c.dispatched).min();
+                if let (Some(previous), Some(first)) = (previous, first) {
+                    assert!(first >= previous, "checkpoint {r} {stage:?} overtook r-1");
+                }
+            }
+        }
+        // At most K checkpoints in flight: r starts after r-K retired.
+        if r >= depth {
+            let retired = of(r - depth).map(|c| c.completed).max().unwrap();
+            let first = of(r).map(|c| c.dispatched).min().unwrap();
+            assert!(
+                first >= retired,
+                "checkpoint {r} admitted beyond depth {depth}"
+            );
+        }
+    }
+    // W=1: write calls never overlap.
+    let mut writes = calls
+        .iter()
+        .filter(|c| c.phase.is_some())
+        .collect::<Vec<_>>();
+    writes.sort_by_key(|c| c.dispatched);
+    assert!(writes.windows(2).all(|w| w[1].dispatched >= w[0].completed));
+    // Read parallelism never exceeds the N read callers.
+    let mut edges = calls
+        .iter()
+        .filter(|c| c.phase.is_none())
+        .flat_map(|c| [(c.dispatched, 1i64), (c.completed, -1)])
+        .collect::<Vec<_>>();
+    edges.sort_unstable();
+    let mut in_flight = 0i64;
+    for (_, delta) in edges {
+        in_flight += delta;
+        assert!(
+            in_flight <= readers as i64,
+            "more reads in flight than callers"
+        );
+    }
+}
+
+#[test]
+fn pipeline_depth_is_optional_bounded_and_absent_by_default() {
+    let root = temp("depth-config");
+    let mut cfg = config(&root);
+    let value = serde_json::to_value(&cfg).unwrap();
+    assert!(value["workload"].get("checkpoint_pipeline_depth").is_none());
+    assert_eq!(cfg.pipeline_depth(), 1);
+    for depth in [1, 4, 64] {
+        cfg.workload.checkpoint_pipeline_depth = Some(depth);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.pipeline_depth(), depth as usize);
+        let value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(value["workload"]["checkpoint_pipeline_depth"], depth);
+        let parsed = serde_json::from_value::<ReplayConfig>(value).unwrap();
+        assert_eq!(parsed.workload.checkpoint_pipeline_depth, Some(depth));
+    }
+    for depth in [0, 65] {
+        cfg.workload.checkpoint_pipeline_depth = Some(depth);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("checkpoint_pipeline_depth")
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn depth_one_replays_checkpoints_strictly_in_sequence() {
+    let trace = trace();
+    let prepared = Arc::new(prepare(&trace, 3).unwrap());
+    let root = temp("depth-one");
+    let backend = native(&root, &trace);
+    let m = replay(
+        Arc::clone(&backend),
+        &trace,
+        Arc::clone(&prepared),
+        4,
+        1,
+        Instant::now() + Duration::from_secs(120),
+        30000,
+    )
+    .await
+    .unwrap();
+    assert_full_counts(&m.counts, 3);
+    assert_eq!(m.max_in_flight, 1);
+    assert_eq!((m.cross_overlay_reads, m.cross_store_reads), (0, 0));
+    let calls = calls(&m);
+    let sequential = (0..3)
+        .flat_map(|r| (0..9).map(move |phase| (r, phase)))
+        .collect::<Vec<(usize, u16)>>();
+    assert_eq!(commit_order(&calls), sequential);
+    assert_pipeline_order(&calls, 3, 1, 4);
+    // The sequential scheduler never overlaps a commit with a read.
+    for c in calls.iter().filter(|c| c.phase.is_some()) {
+        for d in calls.iter().filter(|d| d.phase.is_none()) {
+            assert!(d.completed <= c.dispatched || c.completed <= d.dispatched);
+        }
+    }
+    let expected = expected_final_rows(&prepared);
+    assert_contents(&backend, &expected);
+    backend
+        .verify_final(&expected, Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    // Same map as the repetition-then-phase expectation of the sequential scheduler.
+    let mut legacy = FinalRows::new();
+    for p in prepared.iter() {
+        for row in p
+            .preload
+            .iter()
+            .chain(p.batches.iter().flat_map(|b| &b.entries))
+        {
+            legacy.insert((row.table, row.key.clone()), row.clone());
+        }
+    }
+    assert_eq!(expected.len(), legacy.len());
+    assert!(
+        expected
+            .iter()
+            .zip(&legacy)
+            .all(|(a, b)| a.0 == b.0 && a.1.value == b.1.value)
+    );
+    drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_depths_keep_sui_stage_order_counts_and_contents() {
+    let trace = trace();
+    let repetitions = 4;
+    let prepared = Arc::new(prepare(&trace, repetitions as u64).unwrap());
+    let expected = expected_final_rows(&prepared);
+    for depth in [1, 2, 4] {
+        let root = temp(&format!("depth-{depth}"));
+        let backend = native(&root, &trace);
+        let m = replay(
+            Arc::clone(&backend),
+            &trace,
+            Arc::clone(&prepared),
+            4,
+            depth,
+            Instant::now() + Duration::from_secs(120),
+            30000,
+        )
+        .await
+        .unwrap();
+        assert_full_counts(&m.counts, repetitions as u64);
+        assert_eq!(m.max_in_flight, depth.min(repetitions));
+        assert_eq!((m.cross_overlay_reads, m.cross_store_reads), (0, 0));
+        let calls = calls(&m);
+        let order = commit_order(&calls);
+        assert_eq!(order.len(), repetitions * 9);
+        for stage in [
+            Stage::Sync,
+            Stage::Finalize,
+            Stage::CommitOutputs,
+            Stage::BumpExecuted,
+        ] {
+            let staged = order
+                .iter()
+                .filter(|(_, phase)| batch_stage(*phase) == stage)
+                .collect::<Vec<_>>();
+            assert!(
+                staged.windows(2).all(|w| w[0] < w[1]),
+                "{stage:?} commits out of order"
+            );
+        }
+        assert_pipeline_order(&calls, repetitions, depth, 4);
+        // The sequential oracle holds for every depth.
+        assert_contents(&backend, &expected);
+        backend
+            .verify_final(&expected, Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Hold the first committed-outputs batch (phase 7 ends with the table-11 watermark)
+/// until the replay reads `release_key`. Storage is the real engine; the hook only
+/// orders one commit against one get, so a later checkpoint deterministically reads
+/// while the earlier checkpoint's outputs are uncommitted.
+struct HeldOutputs {
+    inner: Arc<NativeReplayBackend>,
+    release_key: Bytes,
+    held: std::sync::atomic::AtomicBool,
+    gate: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+
+impl ReplayBackend for HeldOutputs {
+    fn check_background_health(&self) -> BackendResult<()> {
+        self.inner.check_background_health()
+    }
+    fn get(&self, table: u16, key: &[u8]) -> BackendResult<Option<Bytes>> {
+        if key == &self.release_key[..] {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+        self.inner.get(table, key)
+    }
+    fn commit(&self, db: u16, entries: &[Row]) -> BackendResult<()> {
+        if entries.last().is_some_and(|row| row.table == 11)
+            && !self.held.swap(true, Ordering::Relaxed)
+        {
+            let (mutex, condvar) = &self.gate;
+            let (released, wait) = condvar
+                .wait_timeout_while(mutex.lock().unwrap(), Duration::from_secs(30), |released| {
+                    !*released
+                })
+                .unwrap();
+            // Release the gate lock before the engine commit.
+            drop(released);
+            if wait.timed_out() {
+                return Err("held outputs were never released".into());
+            }
+        }
+        self.inner.commit(db, entries)
+    }
+}
+
+/// Perpetual fixture, two repetitions, where repetition 1 transaction `reader` first
+/// reads the last ObjectKey that repetition 0 transaction `producer` outputs. Returns
+/// (prepared, reader, producer, release key): the release key is a store read of
+/// `reader` that no other repetition-1 transaction reads.
+fn cross_read_fixture(
+    selected: &Trace,
+    value: Option<Bytes>,
+) -> (Vec<Prepared>, usize, usize, Bytes) {
+    let mut prepared = prepare(selected, 2).unwrap();
+    let outputs = prepared[0]
+        .batches
+        .iter()
+        .position(|b| b.phase == 7)
+        .unwrap();
+    let written = prepared[0].batches[outputs]
+        .entries
+        .iter()
+        .rev()
+        .find(|row| row.table == OBJECTS)
+        .unwrap()
+        .clone();
+    let producer = written.tx as usize;
+    let unique = |key: &Bytes| {
+        prepared[1]
+            .reads
+            .iter()
+            .flatten()
+            .filter(|read| read.row.key == *key)
+            .count()
+            == 1
+    };
+    let (reader, release_key) = (0..selected.transactions)
+        .find_map(|tx| {
+            prepared[1].reads[tx]
+                .iter()
+                .find(|read| read.producer.is_none() && unique(&read.row.key))
+                .map(|read| (tx, read.row.backend_key.clone()))
+        })
+        .unwrap();
+    let mut row = written;
+    if let Some(value) = value {
+        row.value = value;
+    }
+    prepared[1].reads[reader].insert(
+        0,
+        Read {
+            row,
+            producer: None,
+        },
+    );
+    prepared[1].overlay[reader].insert(0, None);
+    (prepared, reader, producer, release_key)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn later_checkpoint_reads_in_flight_output_through_overlay() {
+    let mut selected = trace();
+    selected.select_node_databases(&[0]).unwrap();
+    let (prepared, reader, producer, release_key) = cross_read_fixture(&selected, None);
+    // The producer's publication is observable through its own store reads.
+    assert!(
+        prepared[0].reads[producer]
+            .iter()
+            .any(|r| r.producer.is_none())
+    );
+    let prepared = Arc::new(prepared);
+    let deadline = || Instant::now() + Duration::from_secs(60);
+
+    // K=1: repetition 0 committed before repetition 1 starts; the store serves the read.
+    let root = temp("cross-depth-one");
+    let backend = native(&root, &selected);
+    let m = replay(
+        Arc::clone(&backend),
+        &selected,
+        Arc::clone(&prepared),
+        2,
+        1,
+        deadline(),
+        30000,
+    )
+    .await
+    .unwrap();
+    assert_eq!((m.counts.store_gets, m.counts.overlay_demands), (1015, 232));
+    assert_eq!((m.cross_overlay_reads, m.cross_store_reads), (0, 0));
+    assert_contents(&backend, &expected_final_rows(&prepared));
+    drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+
+    // K=2: the read happens while repetition 0's outputs are held uncommitted.
+    let root = temp("cross-depth-two");
+    let inner = native(&root, &selected);
+    let held = Arc::new(HeldOutputs {
+        inner: Arc::clone(&inner),
+        release_key,
+        held: std::sync::atomic::AtomicBool::new(false),
+        gate: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let m = replay(
+        held,
+        &selected,
+        Arc::clone(&prepared),
+        2,
+        2,
+        deadline(),
+        30000,
+    )
+    .await
+    .unwrap();
+    assert_eq!((m.cross_overlay_reads, m.cross_store_reads), (1, 0));
+    assert_eq!((m.counts.store_gets, m.counts.overlay_demands), (1014, 233));
+    assert_eq!((m.counts.transactions, m.counts.checkpoints), (90, 2));
+    let calls = calls(&m);
+    assert_pipeline_order(&calls, 2, 2, 2);
+    let first_read = calls
+        .iter()
+        .filter(|c| c.repetition == 1 && c.tx == Some(reader as u32))
+        .map(|c| c.dispatched)
+        .min()
+        .unwrap();
+    let produced = calls
+        .iter()
+        .filter(|c| c.repetition == 0 && c.tx == Some(producer as u32))
+        .map(|c| c.completed)
+        .max()
+        .unwrap();
+    let outputs_committed = calls
+        .iter()
+        .find(|c| c.repetition == 0 && c.phase == Some(7))
+        .unwrap()
+        .completed;
+    // Gated on the producer's execution, and served before its outputs committed.
+    assert!(produced <= first_read && first_read < outputs_committed);
+    assert_contents(&inner, &expected_final_rows(&prepared));
+    drop(inner);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The final-state oracle is independent of the observed commit order: replaying two
+/// checkpoints' same-key commits in reverse, or skipping one, fails verification.
+#[test]
+fn final_oracle_rejects_reversed_or_skipped_same_key_commits() {
+    let mut selected = trace();
+    selected.select_node_databases(&[0]).unwrap();
+    let mut prepared = prepare(&selected, 2).unwrap();
+    let outputs = prepared[1]
+        .batches
+        .iter()
+        .position(|b| b.phase == 7)
+        .unwrap();
+    // The committed watermark (control table 11, empty key) is shared by every repetition;
+    // give repetition 1 its own value so the two writes are distinguishable.
+    let watermark = prepared[1].batches[outputs]
+        .entries
+        .iter_mut()
+        .find(|row| row.table == 11)
+        .unwrap();
+    assert!(watermark.key.is_empty());
+    watermark.value = Bytes::from_static(b"repetition-1");
+    let expected = expected_final_rows(&prepared);
+    let apply = |order: &[(usize, usize)]| {
+        let root = temp("oracle");
+        let backend = native(&root, &selected);
+        for chunk in prepared.iter().flat_map(|p| p.preload.chunks(256)) {
+            backend.commit(0, chunk).unwrap();
+        }
+        for &(repetition, batch) in order {
+            let batch = &prepared[repetition].batches[batch];
+            backend.commit(batch.db, &batch.entries).unwrap();
+        }
+        let verdict = backend.verify_final(&expected, Instant::now() + Duration::from_secs(60));
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+        verdict
+    };
+    let batches = prepared[0].batches.len();
+    let sequential = (0..2)
+        .flat_map(|r| (0..batches).map(move |b| (r, b)))
+        .collect::<Vec<_>>();
+    apply(&sequential).unwrap();
+    let reversed = (0..2)
+        .rev()
+        .flat_map(|r| (0..batches).map(move |b| (r, b)))
+        .collect::<Vec<_>>();
+    assert!(
+        apply(&reversed)
+            .unwrap_err()
+            .to_string()
+            .contains("mismatch in table 11")
+    );
+    let skipped = sequential
+        .iter()
+        .copied()
+        .filter(|&step| step != (1, outputs))
+        .collect::<Vec<_>>();
+    assert!(apply(&skipped).is_err());
+}
+
+#[test]
+fn cross_checkpoint_links_gate_reject_conflicts_and_wrong_overlay_values() {
+    let mut selected = trace();
+    selected.select_node_databases(&[0]).unwrap();
+    // A key one checkpoint commits as an output and a later one writes in its sync stage
+    // could commit out of order when both are in flight; K=1 and distance >= K are exact.
+    let mut conflicting = prepare(&selected, 3).unwrap();
+    let outputs = conflicting[0]
+        .batches
+        .iter()
+        .position(|b| b.phase == 7)
+        .unwrap();
+    let sync = conflicting[0]
+        .batches
+        .iter()
+        .position(|b| b.phase == 2)
+        .unwrap();
+    let written = conflicting[0].batches[outputs].entries[0].clone();
+    conflicting[2].batches[sync].entries[0] = written;
+    assert!(
+        CrossLinks::new(&selected, &conflicting, 1)
+            .unwrap()
+            .reads
+            .is_empty()
+    );
+    CrossLinks::new(&selected, &conflicting, 2).unwrap();
+    assert!(
+        CrossLinks::new(&selected, &conflicting, 3)
+            .unwrap_err()
+            .to_string()
+            .contains("write-write conflict")
+    );
+
+    let (wrong, reader, producer, _) = cross_read_fixture(
+        &selected,
+        Some(Bytes::from_static(b"not the produced object")),
+    );
+    let links = CrossLinks::new(&selected, &wrong, 2).unwrap();
+    assert!(
+        CrossLinks::new(&selected, &wrong, 1)
+            .unwrap()
+            .reads
+            .is_empty()
+    );
+    assert_eq!(links.reads.len(), 1);
+    let gate = Gate::Publish {
+        repetition: 0,
+        tx: producer,
+    };
+    assert_eq!(links.gates[&(1, reader)], vec![gate]);
+    assert_eq!(links.waiters[&gate], vec![(1, reader)]);
+    let mut scheduler = Scheduler::new(
+        &selected,
+        &wrong,
+        &links,
+        2,
+        2,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    scheduler.admitted = 2;
+    scheduler.slots[0].repetition = 0;
+    scheduler.slots[1].repetition = 1;
+    assert!(!scheduler.gate_open(gate));
+    scheduler.slots[0].execution = Execution::Running(Instant::now());
+    scheduler.slots[0].completed[producer] = true;
+    assert!(scheduler.gate_open(gate));
+    let mut m = Measurements::new(&selected, 2).unwrap();
+    assert!(
+        scheduler
+            .next_store_read(1, reader, 0, &mut m)
+            .unwrap_err()
+            .to_string()
+            .contains("cross-checkpoint overlay missing/wrong value")
+    );
+    // Once every window writer committed, the store serves the read and its bytes decide.
+    scheduler.slots[0].next_batch = outputs + 1;
+    assert_eq!(
+        scheduler.next_store_read(1, reader, 0, &mut m).unwrap(),
+        Some(0)
+    );
+    assert_eq!((m.cross_overlay_reads, m.cross_store_reads), (0, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_report_records_depth_and_verifies_final_contents() {
+    let root = temp("report-depth");
+    let mut cfg = config(&root);
+    cfg.execution.concurrency = 4;
+    cfg.workload.checkpoint_pipeline_depth = Some(2);
+    run(cfg, &root.join("result")).await.unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("result/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["status"], "completed");
+    let phase = &summary["phase_counts"];
+    assert_eq!(phase["counts"]["store_gets"], 1014);
+    assert_eq!(phase["counts"]["checkpoints"], 2);
+    let profile = &phase["profile"];
+    assert_eq!(profile["functional_qualification"], true);
+    assert!(!profile["final_verification"].is_null());
+    assert_eq!(profile["case_identity"]["N"], 4);
+    assert_eq!(profile["case_identity"]["K"], 2);
+    assert_eq!(profile["case_identity"]["W"], 1);
+    assert_eq!(profile["pipeline"]["checkpoint_pipeline_depth"], 2);
+    assert_eq!(profile["pipeline"]["max_in_flight_checkpoints"], 2);
+    assert_eq!(profile["pipeline"]["read_callers"], 4);
+    std::fs::remove_dir_all(root).unwrap();
 }
