@@ -1491,12 +1491,16 @@ impl ConcurrentRemoteDatabase {
     pub fn read_admission_generation(&self) -> u64 {
         self.reads.admission_generation()
     }
+    /// Wait for read credit to change after `observed`. Ordinary reads pass
+    /// `None`: like a native read, load alone never fails them (see
+    /// `ReadService::wait_admission`).
+    ///
     /// # Errors
-    /// Returns an absolute admission deadline, failure, or closed-owner error.
+    /// Returns an expired explicit deadline, failure, or closed-owner error.
     pub fn wait_read_admission(
         &self,
         observed: u64,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
         self.reads.wait_admission(observed, deadline)?;

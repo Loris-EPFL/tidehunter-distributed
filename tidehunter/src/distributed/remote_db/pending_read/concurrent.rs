@@ -110,7 +110,6 @@ impl ConcurrentRemoteDatabase {
             GetResolution::Miss { reference, pin } => (reference, pin),
         };
         let node = node.expect("a miss has a route");
-        let deadline = Instant::now() + self.config.timeout;
         // The member is planned once; a retry after backpressure reuses the
         // plan unless the reader set changed.
         let mut plan = None;
@@ -133,7 +132,7 @@ impl ConcurrentRemoteDatabase {
                     if let Some(trace) = trace {
                         trace.event("admission_wait_started");
                     }
-                    self.wait_read_admission(generation, deadline)?;
+                    self.wait_read_admission(generation, None)?;
                     if let Some(trace) = trace {
                         trace.event("admission_wait_finished");
                     }
@@ -471,7 +470,7 @@ impl ConcurrentRemoteDatabase {
                 if let Some(trace) = trace {
                     trace.event("admission_wait_started");
                 }
-                self.wait_read_admission(generation, batch.deadline)?;
+                self.wait_read_admission(generation, None)?;
                 if let Some(trace) = trace {
                     trace.event("admission_wait_finished");
                 }
@@ -710,7 +709,6 @@ impl ConcurrentRemoteDatabase {
                 key.len(),
                 false,
                 ReadContext {
-                    deadline: Instant::now() + self.reads.timeout(),
                     pin: Some(pin),
                     trace,
                 },
@@ -811,7 +809,6 @@ impl ConcurrentRemoteDatabase {
                 0,
                 false,
                 ReadContext {
-                    deadline: Instant::now() + self.config.timeout,
                     pin: Some(pin),
                     trace: None,
                 },

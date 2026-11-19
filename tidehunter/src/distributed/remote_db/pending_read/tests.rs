@@ -1182,6 +1182,7 @@ fn published_result_stays_unavailable_until_credit_retirement() {
         references: Vec::new(),
         slot: 0,
         completion: FlightCompletion::new(),
+        io_deadline: Mutex::new(None),
         _pin: None,
         _credit: credit.clone(),
     });
@@ -1192,7 +1193,8 @@ fn published_result_stays_unavailable_until_credit_retirement() {
         subscription: None,
         parts,
         credit: credit.clone(),
-        deadline: Instant::now() + Duration::from_secs(5),
+        admitted: Instant::now(),
+        timeout: Duration::from_secs(5),
         trace: None,
     };
     drop(credit);
@@ -1200,7 +1202,7 @@ fn published_result_stays_unavailable_until_credit_retirement() {
     assert!(read.try_result().unwrap().is_none());
     assert_eq!(*state.retained.lock(), (1, 512));
 
-    let deadline = read.deadline;
+    let deadline = Instant::now() + Duration::from_secs(5);
     let waiter = thread::spawn(move || read.finish());
     while state.flight_ready[0].waiters.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
         thread::yield_now();
@@ -1483,7 +1485,7 @@ fn dropped_failed_read_poison_cannot_be_hidden_by_a_cached_hit() {
 }
 
 #[test]
-fn expired_queue_poison_and_foreign_epoch_handles_are_rejected() {
+fn expired_io_poison_and_foreign_epoch_handles_are_rejected() {
     let fixture = Fixture::new();
     let db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
@@ -1492,11 +1494,10 @@ fn expired_queue_poison_and_foreign_epoch_handles_are_rejected() {
     let lane = db.core.reads.lane_client(node_for(&db, 0), 0);
     let held = lane.lock();
     let mut pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
-    if let GetState::Pending { read, .. } = &mut pending.state {
-        read.deadline = Instant::now() - Duration::from_secs(1);
-    } else {
+    let GetState::Pending { read, .. } = &pending.state else {
         panic!("expected miss");
-    }
+    };
+    *read.parts[0].0.io_deadline.lock() = Some(Instant::now() - Duration::from_secs(1));
     assert!(db.poll_get(&mut pending).is_err());
     assert!(db.core.reads.failed());
     drop(held);
@@ -1516,6 +1517,30 @@ fn expired_queue_poison_and_foreign_epoch_handles_are_rejected() {
         value(7)
     );
     reopened.shutdown().unwrap();
+}
+
+/// An admitted read does not spend its I/O timeout in the live lane inbox.
+#[test]
+fn queued_read_waits_for_busy_lane_longer_than_timeout() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = Some(1);
+    fixture.config.read_cache_bytes = 0;
+    fixture.config.timeout = Duration::from_secs(1);
+    let db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    let mut db = reopen_cold(&fixture, db);
+    let lane = db.core.reads.lane_client(node_for(&db, 0), 0);
+    let held = lane.lock();
+    let mut pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
+    thread::sleep(3 * fixture.config.timeout);
+    let queued = db.poll_get(&mut pending);
+    drop(held);
+    assert_eq!(queued.unwrap(), None, "the queued read must stay pending");
+    assert!(!db.core.reads.failed());
+    assert_eq!(db.core.reads.state.retained.lock().0, 1);
+    assert_eq!(db.finish_get(pending).unwrap(), value(7));
+    db.shutdown().unwrap();
 }
 
 #[test]

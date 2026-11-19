@@ -1040,12 +1040,10 @@ mod tests {
             scope.spawn(move || {
                 read_started.send(()).unwrap();
                 read_finished
-                    .send(
-                        core.reads.wait_admission(
-                            read_generation,
-                            Instant::now() + Duration::from_secs(5),
-                        ),
-                    )
+                    .send(core.reads.wait_admission(
+                        read_generation,
+                        Some(Instant::now() + Duration::from_secs(5)),
+                    ))
                     .unwrap();
             });
             scope.spawn(move || {

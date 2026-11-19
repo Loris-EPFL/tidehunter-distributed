@@ -637,10 +637,13 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
             .as_ref(),
         &[6; 32]
     );
-    db.wait_read_admission(generation, Instant::now() + Duration::from_secs(1))
+    db.wait_read_admission(generation, Some(Instant::now() + Duration::from_secs(1)))
         .unwrap();
     // Repeated credit releases must not let an expired caller retry forever.
-    assert!(db.wait_read_admission(generation, Instant::now()).is_err());
+    assert!(
+        db.wait_read_admission(generation, Some(Instant::now()))
+            .is_err()
+    );
     let mut counters = HashMap::new();
     monitor.visit(&mut |name, value| {
         counters.insert(name, value);
@@ -656,6 +659,48 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
     assert_eq!(resolution.pin_preparation.count, 2);
     assert_eq!(resolution.batch_preparation.count, 0);
     assert_eq!(db.read_rpc_count() - rpcs, 2);
+    db.shutdown().unwrap();
+}
+
+/// Native parity: a read that finds the coordinator read budget exhausted
+/// waits for credit, however long another read holds it, and completes once
+/// the credit is released. Load alone never fails it with a deadline.
+#[test]
+fn ordinary_read_waits_for_credit_held_longer_than_timeout() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    fixture.config.max_pending_reads = 1;
+    fixture.config.timeout = Duration::from_secs(1);
+    let original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 50), vec![put(0, 5), put(1, 6)])
+        .unwrap();
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    // The only read credit is held by a read whose value is not consumed.
+    let held = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
+    assert!(RemoteDatabase::read_backpressured(
+        &db.submit_get(KeySpace(0), &0u32.to_be_bytes())
+            .err()
+            .unwrap()
+    ));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let value = get(&db, 0);
+            sender.send(()).unwrap();
+            value
+        });
+        // Hold the credit for three times the configured timeout.
+        assert!(
+            receiver.recv_timeout(3 * fixture.config.timeout).is_err(),
+            "the read must wait for credit, not return"
+        );
+        assert_eq!(
+            db.finish_ready_get(held.wait()).unwrap().unwrap().as_ref(),
+            &[6; 32]
+        );
+        assert_eq!(waiter.join().unwrap(), Some(vec![5; 32]));
+    });
     db.shutdown().unwrap();
 }
 
@@ -675,7 +720,7 @@ fn cancelled_late_read_failure_poison_is_shared_with_writer_and_cache() {
     drop(pending); // cancellation cannot detach a late transport failure
     let observed = db.read_admission_generation();
     drop(held);
-    let _ = db.wait_read_admission(observed, Instant::now() + Duration::from_secs(3));
+    let _ = db.wait_read_admission(observed, Some(Instant::now() + Duration::from_secs(3)));
     assert!(db.validate_cached_read().is_err());
     assert!(db.get(KeySpace(0), &99u32.to_be_bytes()).is_err());
     assert!(

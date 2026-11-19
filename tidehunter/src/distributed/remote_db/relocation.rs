@@ -508,7 +508,7 @@ impl ConcurrentRemoteDatabase {
             match self.submit_record_at(reference, pin.clone()) {
                 Ok(pending) => break pending,
                 Err(error) if RemoteDatabase::read_backpressured(&error) => {
-                    self.wait_read_admission(generation, deadline)?;
+                    self.wait_read_admission(generation, Some(deadline))?;
                 }
                 Err(error) => return Err(error),
             }
