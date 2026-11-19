@@ -370,6 +370,21 @@ pub(super) fn rewrite_marks_for_test(path: &Path, edit: impl FnOnce(&mut [OwnerM
 struct Progress {
     synced_next: u64,
     appended_end: u64,
+    /// When the tracker last asked this owner to sync. A nudge on a live stream
+    /// installs a strict root; while a lagging peer pins the cut, the lag triggers
+    /// stay true, so without this bound an appending owner would install one root
+    /// per poll round trip.
+    last_nudge: Option<Instant>,
+}
+
+impl Progress {
+    /// The first nudge of the epoch is immediate; later ones wait `lag` after the
+    /// previous nudge. A report does not re-arm it: the reply to a nudge advances
+    /// the report itself.
+    fn may_nudge(&self, now: Instant, lag: Duration) -> bool {
+        self.last_nudge
+            .is_none_or(|at| now.saturating_duration_since(at) >= lag)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -418,7 +433,8 @@ impl Tracker {
     /// Recompute the cut from the published floor and the receipted ends.
     /// `receipted[o]` is one above the highest sequence receipted by owner `o`;
     /// it must be read after `published_next` (see [`Shared::published`]).
-    /// Pushes every lagging owner to `nudge` once the cut lag reaches a bound.
+    /// Pushes every lagging owner to `nudge` once the cut lag reaches a bound, at
+    /// most once per `lag` per owner.
     pub(super) fn evaluate(
         &mut self,
         now: Instant,
@@ -468,8 +484,13 @@ impl Tracker {
             now.saturating_duration_since(front.at)
         });
         if age >= self.lag || appended.saturating_sub(self.covered) >= self.lag_bytes {
-            for (owner, (progress, &receipted)) in self.owners.iter().zip(receipted).enumerate() {
-                if pinned(progress, receipted) && progress.synced_next < published_next {
+            for (owner, (progress, &receipted)) in self.owners.iter_mut().zip(receipted).enumerate()
+            {
+                if pinned(progress, receipted)
+                    && progress.synced_next < published_next
+                    && progress.may_nudge(now, self.lag)
+                {
+                    progress.last_nudge = Some(now);
                     nudge.push(owner);
                 }
             }

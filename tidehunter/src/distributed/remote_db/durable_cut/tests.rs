@@ -523,6 +523,76 @@ fn full_sample_queue_keeps_the_oldest_age() {
     );
 }
 
+/// A lagging peer pins the cut while owner 0 keeps appending and reporting.
+/// The lag triggers stay true, yet owner 0 gets at most one nudge (one live
+/// root install) per `lag_ms`: the first fires at once when the byte trigger
+/// first holds, and its advancing reports do not re-arm it.
+#[test]
+fn nudges_to_a_pinned_owner_are_bounded_by_the_lag() {
+    let config = DurableCutConfig::default();
+    let lag = Duration::from_millis(config.lag_ms);
+    let mut tracker = Tracker::new(2, &config);
+    let start = Instant::now();
+    let step = Duration::from_millis(10);
+    let total = Duration::from_secs(10);
+    // Owner 1 never syncs past its first receipt: it pins the cut at 0.
+    tracker.report(1, 0, 0);
+    let mut nudges = Vec::new();
+    for k in 0..=(total.as_millis() / step.as_millis()) as u64 {
+        let at = start + step * u32::try_from(k).unwrap();
+        let published = k + 2;
+        // Owner 0 reports one version behind its receipts, 1 MiB more each step.
+        tracker.report(0, published - 1, (k + 1) << 20);
+        let (cut, nudged) = evaluate(&mut tracker, at, published, &[published, 1]);
+        assert_eq!(cut, 0);
+        if nudged.contains(&0) {
+            nudges.push(at - start);
+        }
+    }
+    // 64 MiB above the cut first holds at step 63.
+    assert_eq!(nudges.first(), Some(&Duration::from_millis(630)));
+    assert!(nudges.windows(2).all(|pair| pair[1] - pair[0] >= lag));
+    let bound = total.as_millis().div_ceil(lag.as_millis());
+    assert!(nudges.len() as u128 <= bound, "{nudges:?}");
+    assert_eq!(nudges.len(), 10);
+}
+
+/// The rate bound does not hold a catching-up peer back: it is re-nudged
+/// exactly `lag_ms` after its previous nudge, and the evaluation after its
+/// covering report advances the cut to the floor.
+#[test]
+fn cut_advances_within_the_lag_after_the_lagging_peer_catches_up() {
+    let mut tracker = Tracker::new(2, &DurableCutConfig::default());
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    tracker.report(0, 5, 0);
+    tracker.report(1, 1, 0);
+    let receipted = [5, 4];
+    assert_eq!(
+        evaluate(&mut tracker, at(0), 5, &receipted),
+        (1, Vec::new())
+    );
+    assert_eq!(
+        evaluate(&mut tracker, at(1000), 5, &receipted),
+        (1, vec![1])
+    );
+    // The reply covers part of the peer's receipts; it stays pinned.
+    tracker.report(1, 3, 0);
+    assert_eq!(
+        evaluate(&mut tracker, at(1500), 5, &receipted),
+        (3, Vec::new())
+    );
+    assert_eq!(
+        evaluate(&mut tracker, at(2000), 5, &receipted),
+        (3, vec![1])
+    );
+    tracker.report(1, 4, 0);
+    assert_eq!(
+        evaluate(&mut tracker, at(2001), 5, &receipted),
+        (5, Vec::new())
+    );
+}
+
 /// The inbox is pre-filled past several drain passes (owners + 8 messages
 /// each). A loop that received one message beyond the bound would drop the
 /// message at position `drain + 1` of the first pass and `2 * (drain + 1)` of

@@ -909,7 +909,7 @@ impl PartitionLog {
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
-                progress: ProgressTail::default(),
+                progress: ProgressTail::recovered(physical_end),
                 namespace_synced_file: None,
                 poison: None,
                 sealed: true,
@@ -1205,6 +1205,7 @@ impl PartitionLog {
             let mut state = log.state.lock();
             state.appended_end = physical_end;
             state.durable_end = physical_end;
+            state.progress = ProgressTail::recovered(physical_end);
             #[cfg(feature = "experimental-nvmeof")]
             {
                 state.live_root_end = physical_end;

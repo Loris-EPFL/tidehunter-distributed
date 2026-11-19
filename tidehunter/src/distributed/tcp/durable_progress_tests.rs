@@ -442,7 +442,8 @@ fn leased_owner_reports_the_adopted_and_synced_prefix() {
     assert_eq!((first.authority_epoch, first.epoch), (1, 1));
     drop(progress);
     // The nudge self-adopts any frames the writer has not had adopted yet, then
-    // syncs them; with the long cap no deadline can answer it first.
+    // syncs them and installs the strict root over them; with the long cap no
+    // deadline can answer it first.
     fixture.node.set_durable_progress_cap_for_test(LONG_CAP);
     let (completed, completions) = mpsc::sync_channel(1);
     submit(&fixture.node, 1, poll(1, 1, 0, WAIT_MS, true), &completed);
@@ -451,5 +452,23 @@ fn leased_owner_reports_the_adopted_and_synced_prefix() {
         (synced.appended, synced.synced, synced.idle),
         (Some(version(1)), Some(version(1)), true)
     );
+    // A later group: the bounded syncer may defer its root within the fragment,
+    // and only a root install reports it. A nudge without its own barrier would
+    // park until the long cap unless the syncer happened to cross a fragment.
+    writer
+        .submit_and_drain_leased_group(1, vec![fixture.batch(2)], &WriteTimeline::default(), 2)
+        .unwrap();
+    submit(
+        &fixture.node,
+        2,
+        poll(1, 1, synced.generation, WAIT_MS, true),
+        &completed,
+    );
+    let rooted = report(receive(&completions, 2));
+    assert_eq!(
+        (rooted.appended, rooted.synced, rooted.idle),
+        (Some(version(2)), Some(version(2)), true)
+    );
+    assert!(rooted.generation > synced.generation);
     writer.close_leased_extent(&mut Vec::new(), None).unwrap();
 }

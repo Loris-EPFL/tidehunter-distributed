@@ -10,6 +10,12 @@
 //! file, namespace and live-root syncs of a capture all returned success. The captured
 //! version is read under the same lock acquisition as the captured byte end, so a report
 //! never names a batch that the sync did not cover. A failed sync leaves it unchanged.
+//!
+//! Strict-root rule: on a live stream, recovery rejects a corrupt frame only below its
+//! strict live root; beyond it, the scan stops at the first defect as at a torn tail. A
+//! sync that defers the root therefore publishes nothing. The synced tail moves only with
+//! a root install (or a seal), so every reported version lies below a root recovery
+//! enforces. The durable-progress nudge installs the root of a lagging stream.
 
 use super::BatchVersion;
 
@@ -20,11 +26,23 @@ pub(super) struct ProgressTail {
     appended: Option<BatchVersion>,
     /// Version of the last batch of the synced prefix.
     synced: Option<BatchVersion>,
+    /// WAL end of the synced prefix: the captured end of the latest publication. On a
+    /// live stream it is also covered by the strict live root.
+    synced_end: u64,
     /// Number of times the synced point advanced on this handle.
     generation: u64,
 }
 
 impl ProgressTail {
+    /// A recovered handle: everything below the recovered end is synced and, on a live
+    /// stream, covered by the root that recovery installed. It tracks no versions.
+    pub(super) fn recovered(end: u64) -> Self {
+        Self {
+            synced_end: end,
+            ..Self::default()
+        }
+    }
+
     /// Record the last batch of a group that reached the appended frontier.
     pub(super) fn appended(&mut self, last: BatchVersion) {
         self.appended = Some(last);
@@ -35,24 +53,25 @@ impl ProgressTail {
         self.appended
     }
 
-    /// Publish a successful sync of `captured`. `advanced` is whether the byte frontier
-    /// moved; the generation counts only real advances so a long-poll is not woken by a
+    /// Publish a successful sync of `captured` through the captured WAL `end`. The
+    /// generation counts only advances of the end, so a long-poll is not woken by a
     /// no-op barrier.
-    pub(super) fn synced(&mut self, captured: Option<BatchVersion>, advanced: bool) {
+    pub(super) fn synced(&mut self, captured: Option<BatchVersion>, end: u64) {
         // Persistence publications are serialized and their captures grow, so the merge is
         // monotonic; `max` keeps it so even if a caller published an older capture.
         self.synced = self.synced.max(captured);
-        if advanced {
+        if end > self.synced_end {
+            self.synced_end = end;
             self.generation += 1;
         }
     }
 
-    pub(super) fn snapshot(&self, appended_end: u64, synced_end: u64) -> LogDurableProgress {
+    pub(super) fn snapshot(&self, appended_end: u64) -> LogDurableProgress {
         LogDurableProgress {
             appended: self.appended,
             synced: self.synced,
             appended_end,
-            synced_end,
+            synced_end: self.synced_end,
             generation: self.generation,
         }
     }
@@ -66,7 +85,9 @@ pub struct LogDurableProgress {
     pub appended: Option<BatchVersion>,
     /// Every batch of this stream with a version at or below this one is synced.
     pub synced: Option<BatchVersion>,
-    /// WAL byte frontiers: contiguous appended end and synced (durable) end.
+    /// Contiguous appended WAL end, and the WAL end of the synced prefix. On a live
+    /// stream the synced end is the end of its strict live root: data synced beyond it
+    /// is not reported until a root covers it.
     pub appended_end: u64,
     pub synced_end: u64,
     /// Advances of the synced point on this log handle; restarts with the handle.
@@ -74,7 +95,7 @@ pub struct LogDurableProgress {
 }
 
 impl LogDurableProgress {
-    /// Nothing appended to this log is waiting for a sync.
+    /// Nothing appended to this log is waiting for a reportable sync.
     #[must_use]
     pub fn idle(&self) -> bool {
         self.appended_end == self.synced_end
@@ -95,23 +116,35 @@ mod tests {
         tail.appended(version(1));
         let first = tail.capture();
         tail.appended(version(4));
-        assert_eq!(tail.snapshot(10, 0).synced, None);
-        tail.synced(first, true);
-        let report = tail.snapshot(20, 10);
+        assert_eq!(tail.snapshot(10).synced, None);
+        tail.synced(first, 10);
+        let report = tail.snapshot(20);
         assert_eq!(
-            (report.synced, report.appended),
-            (Some(version(1)), Some(version(4)))
+            (report.synced, report.appended, report.synced_end),
+            (Some(version(1)), Some(version(4)), 10)
         );
         assert_eq!(report.generation, 1);
         assert!(!report.idle());
-        tail.synced(Some(version(0)), false);
-        assert_eq!(tail.snapshot(20, 20).synced, Some(version(1)));
-        assert_eq!(tail.snapshot(20, 20).generation, 1);
+        tail.synced(Some(version(0)), 10);
+        assert_eq!(tail.snapshot(20).synced, Some(version(1)));
+        assert_eq!(tail.snapshot(20).generation, 1);
         let second = tail.capture();
-        tail.synced(second, true);
-        let report = tail.snapshot(20, 20);
+        tail.synced(second, 20);
+        let report = tail.snapshot(20);
         assert_eq!(report.synced, Some(version(4)));
         assert!(report.idle());
         assert_eq!(report.generation, 2);
+    }
+
+    #[test]
+    fn recovered_tail_reports_its_end_without_versions() {
+        let tail = ProgressTail::recovered(4096);
+        let report = tail.snapshot(4096);
+        assert_eq!(
+            (report.appended, report.synced, report.synced_end),
+            (None, None, 4096)
+        );
+        assert!(report.idle());
+        assert_eq!(report.generation, 0);
     }
 }

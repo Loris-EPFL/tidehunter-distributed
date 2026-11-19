@@ -1684,7 +1684,7 @@ impl PartitionLog {
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
-                progress: ProgressTail::default(),
+                progress: ProgressTail::recovered(physical_end),
                 namespace_synced_file: None,
                 poison: None,
                 sealed: true,
@@ -4014,12 +4014,11 @@ impl PartitionLog {
         self.recovery_hole
     }
 
-    /// Appended and synced tails with their byte frontiers, from one lock hold.
+    /// Appended and synced tails with their byte frontiers, from one lock hold. On a
+    /// live stream the synced tail covers only the prefix of the installed strict root.
     pub fn durable_progress(&self) -> LogDurableProgress {
         let state = self.state.lock();
-        state
-            .progress
-            .snapshot(state.appended_end, state.durable_end)
+        state.progress.snapshot(state.appended_end)
     }
 
     /// Published position-root cut, distinct from the adopted receipt frontier.
@@ -4056,6 +4055,26 @@ impl PartitionLog {
             }
         }
         self.persist_scope(PersistScope::Appended, None)
+    }
+
+    /// Durable-progress nudge on a live stream: make everything appended durable
+    /// and install the strict live root over it, so the next report covers it (see
+    /// [`Self::durable_progress`]). A no-op when the report already covers the
+    /// appended end, as on a recovered handle. Returns false when the stream is not
+    /// live: its reports follow every sync, so the syncer serves the nudge.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn persist_live_progress(&self) -> Result<bool, StorageError> {
+        {
+            let state = self.state.lock();
+            if !state.live {
+                return Ok(false);
+            }
+            if state.progress.snapshot(state.appended_end).idle() {
+                return Ok(true);
+            }
+        }
+        self.persist_scope(PersistScope::Appended, None)?;
+        Ok(true)
     }
 
     /// The durability layer's frontier, once the node attached it.
@@ -4390,9 +4409,16 @@ impl PartitionLog {
         debug_assert!(end <= state.appended_end);
         state.stats.persistence_barriers += 1;
         state.stats.namespace_syncs += u64::from(namespace_sync);
-        let advanced = end > state.durable_end;
         state.durable_end = end;
-        state.progress.synced(captured, advanced);
+        // A live sync that deferred the strict root publishes no progress: recovery
+        // enforces no frame beyond the root, so a report must not cover one.
+        #[cfg(feature = "experimental-nvmeof")]
+        let reportable = live_frontier.is_some() || !state.live;
+        #[cfg(not(feature = "experimental-nvmeof"))]
+        let reportable = true;
+        if reportable {
+            state.progress.synced(captured, end);
+        }
         self.durable_frontier.store(end, Ordering::Release);
         if namespace_sync {
             state.namespace_synced_file =
@@ -5870,11 +5896,11 @@ impl PartitionLog {
             StorageError::Unknown(WalError::Io(io::Error::other(error)))
         })?;
         // The seal synced every registered file under this lock hold, so it covers the
-        // whole appended tail.
+        // whole appended tail. Recovery rejects a scan that ends below the sealed end,
+        // so the seal bounds the report like a live root.
         let captured = state.progress.capture();
-        let advanced = end.physical_end > state.durable_end;
         state.durable_end = end.physical_end;
-        state.progress.synced(captured, advanced);
+        state.progress.synced(captured, end.physical_end);
         self.durable_frontier
             .store(end.physical_end, Ordering::Release);
         Ok(())

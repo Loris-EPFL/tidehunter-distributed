@@ -321,11 +321,15 @@ impl Shared {
             .into_synced()
             .map(|_| ())
             .map_err(|error| TcpError::new(format!("log frontier flush failed: {error}")))?;
-        // An explicit flush also catches up a live root the syncer deferred.
+        // An explicit flush also catches up a live root the syncer deferred. The
+        // catch-up publishes durable progress, so parked polls re-check.
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        for log in &logs {
-            log.persist_live_root()
-                .map_err(|error| TcpError::new(format!("live root flush failed: {error}")))?;
+        {
+            for log in &logs {
+                log.persist_live_root()
+                    .map_err(|error| TcpError::new(format!("live root flush failed: {error}")))?;
+            }
+            self.progress.advanced();
         }
         Ok(())
     }
@@ -1308,8 +1312,11 @@ enum DurablePoll {
 }
 
 /// Validate a poll and answer it now when its condition holds or its wait is zero.
-/// A nudge (`sync`) adopts leased frames and asks the log syncer to cover everything
-/// appended now; it never syncs on this worker.
+/// A nudge (`sync`) adopts leased frames. On a live stream it then runs one barrier
+/// here that syncs everything appended and installs the strict live root over it:
+/// the report covers only the root's prefix, and the bounded syncer may defer the
+/// root for a whole fragment. On any other stream it asks the log syncer to cover
+/// everything appended now and never syncs on this worker.
 fn durable_progress_poll(
     shared: &Shared,
     authority_epoch: u64,
@@ -1349,16 +1356,24 @@ fn durable_progress_poll(
     let wake = if sync {
         #[cfg(feature = "experimental-nvmeof")]
         log.self_adopt_live_extent().map_err(TcpError::component)?;
+        #[cfg(feature = "experimental-nvmeof")]
+        let live = log.persist_live_progress().map_err(TcpError::component)?;
+        #[cfg(not(feature = "experimental-nvmeof"))]
+        let live = false;
+        if live {
+            // Other parked polls of this log see the barrier's publication.
+            shared.progress.advanced();
+        }
         let progress = log.durable_progress();
         // Lag implies an append, which starts the frontier and fixes the tier anyway;
         // an idle log must not start a frontier here.
-        let target = if progress.appended_end > progress.synced_end {
+        let target = if !live && progress.appended_end > progress.synced_end {
             shared
                 .frontier_for(&log)?
                 .request_sync()
                 .map_err(TcpError::component)?
         } else {
-            progress.appended_end
+            progress.synced_end
         };
         Wake::Synced(target)
     } else {
