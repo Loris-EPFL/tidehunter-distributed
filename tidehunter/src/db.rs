@@ -1930,6 +1930,37 @@ impl Db {
         receiver.recv().unwrap();
     }
 
+    /// Request one observed WalBased pass on the native relocation worker.
+    /// A deadline bounds the wait, not an already-running pass.
+    #[cfg(feature = "test_methods")]
+    pub fn start_relocation_for_test(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<crate::RelocationObservation, crate::RelocationTestError> {
+        use crate::RelocationTestError;
+
+        if self.config.relocation_strategy != RelocationStrategy::WalBased {
+            return Err(RelocationTestError::UnsupportedStrategy);
+        }
+        if self.config.batch_codec.is_some() {
+            return Err(RelocationTestError::UnsupportedCodec);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RelocationTestError::DeadlineExceeded);
+        }
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.relocator
+            .0
+            .send(RelocationCommand::ObserveWal { deadline, reply })
+            .map_err(|_| RelocationTestError::WorkerStopped)?;
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => RelocationTestError::DeadlineExceeded,
+                mpsc::RecvTimeoutError::Disconnected => RelocationTestError::WorkerStopped,
+            })?
+    }
+
     /// Wait for all other strong owners to release the database, then synchronously
     /// destroy it. The WAL writer joins its tracker and mapper during destruction.
     ///

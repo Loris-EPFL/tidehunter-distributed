@@ -84,8 +84,16 @@ pub enum RelocationCommand {
     Start(RelocationStrategy),
     Cancel(mpsc::Sender<()>),
     StartBlocking(RelocationStrategy, mpsc::Sender<()>),
+    // The requesting test owns only the reply receiver. Capacity one lets the
+    // worker send without waiting; a timed-out test cannot kill the worker.
+    #[cfg(feature = "test_methods")]
+    ObserveWal {
+        deadline: std::time::Instant,
+        reply: mpsc::SyncSender<Result<RelocationObservation, RelocationTestError>>,
+    },
 }
 
+#[cfg_attr(feature = "test_methods", derive(Debug, Clone, Copy, PartialEq, Eq))]
 pub enum Decision {
     Keep,
     Remove,
@@ -94,6 +102,85 @@ pub enum Decision {
 
 pub trait RelocationFilter: Fn(&[u8], &[u8]) -> Decision + Send + Sync + 'static {}
 impl<F> RelocationFilter for F where F: Fn(&[u8], &[u8]) -> Decision + Send + Sync + 'static {}
+
+#[cfg(feature = "test_methods")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocationGate {
+    NoWork,
+    DidWork,
+}
+
+#[cfg(feature = "test_methods")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocationWorkerWitness {
+    Completed,
+}
+
+#[cfg(feature = "test_methods")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct RelocationCallback {
+    pub keyspace: KeySpace,
+    pub key: Bytes,
+    pub value: Bytes,
+    pub wal_position: u64,
+    pub decision: Decision,
+}
+
+#[cfg(feature = "test_methods")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct RelocationStreamId {
+    pub partition: u32,
+    pub fencing_generation: u64,
+}
+
+#[cfg(feature = "test_methods")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct StreamObservation {
+    pub stream_id: RelocationStreamId,
+    pub processed_upper: u64,
+    pub terminal_position: u64,
+    pub rounded_target: u64,
+}
+
+#[cfg(feature = "test_methods")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct RelocationObservation {
+    pub gate: RelocationGate,
+    pub streams: Vec<StreamObservation>,
+    pub callbacks: Vec<RelocationCallback>,
+    pub copied_survivors: u64,
+    pub witness: RelocationWorkerWitness,
+}
+
+#[cfg(feature = "test_methods")]
+#[derive(Debug)]
+pub enum RelocationTestError {
+    Busy,
+    DeadlineExceeded,
+    WorkerStopped,
+    UnsupportedStrategy,
+    UnsupportedCodec,
+    Native(crate::db::DbError),
+}
+
+#[cfg(feature = "test_methods")]
+impl std::fmt::Display for RelocationTestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("observed relocation was rejected: worker busy"),
+            Self::DeadlineExceeded => f.write_str("observed relocation exceeded its deadline"),
+            Self::WorkerStopped => f.write_str("observed relocation worker stopped"),
+            Self::UnsupportedStrategy => f.write_str("observed relocation requires WalBased"),
+            Self::UnsupportedCodec => {
+                f.write_str("WalBased relocation does not support batch compression")
+            }
+            Self::Native(error) => write!(f, "observed relocation failed: {error:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "test_methods")]
+impl std::error::Error for RelocationTestError {}
 
 struct CellProcessingContext {
     batch: RelocatedWriteBatch,
@@ -175,6 +262,11 @@ impl RelocationDriver {
                     self.relocation_run(strategy).unwrap();
                     cb.send(()).unwrap()
                 }
+                #[cfg(feature = "test_methods")]
+                RelocationCommand::ObserveWal { deadline, reply } => {
+                    let result = self.observe_wal_relocation(deadline);
+                    let _ = reply.send(result);
+                }
             }
         }
     }
@@ -209,6 +301,36 @@ impl RelocationDriver {
                 self.index_based_relocation(db, target_position)
             }
         }
+    }
+
+    #[cfg(feature = "test_methods")]
+    fn observe_wal_relocation(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<RelocationObservation, RelocationTestError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(RelocationTestError::DeadlineExceeded);
+        }
+        let db = self
+            .db
+            .upgrade()
+            .ok_or(RelocationTestError::WorkerStopped)?;
+        let mut observed = RelocationObservation {
+            gate: RelocationGate::NoWork,
+            streams: Vec::new(),
+            callbacks: Vec::new(),
+            copied_survivors: 0,
+            witness: RelocationWorkerWitness::Completed,
+        };
+        if let Some(target_position) = self
+            .relocate_wal_prefix_with(&db, Some(&mut observed))
+            .map_err(RelocationTestError::Native)?
+        {
+            Self::reclaim_wal_prefix(&db, target_position).map_err(RelocationTestError::Native)?;
+        }
+        // Do not send a witness until the worker has completed the gate and
+        // any writes, control-region rebuild, and GC.
+        Ok(observed)
     }
 
     fn index_based_relocation(
@@ -323,6 +445,12 @@ impl RelocationDriver {
         let Some(target_position) = self.relocate_wal_prefix(&db)? else {
             return Ok(());
         };
+        Self::reclaim_wal_prefix(&db, target_position)
+    }
+
+    /// Persists the index after `relocate_wal_prefix`, then reclaims the WAL
+    /// files below `target_position`.
+    fn reclaim_wal_prefix(db: &Db, target_position: u64) -> DbResult<()> {
         db.rebuild_control_region_from(target_position)?;
         db.wal_writer.gc(std::cmp::min(
             target_position,
@@ -337,6 +465,19 @@ impl RelocationDriver {
     /// can be reclaimed. The caller persists the index, then reclaims the
     /// files below the target.
     fn relocate_wal_prefix(&self, db: &Arc<Db>) -> DbResult<Option<u64>> {
+        self.relocate_wal_prefix_with(
+            db,
+            #[cfg(feature = "test_methods")]
+            None,
+        )
+    }
+
+    /// [`Self::relocate_wal_prefix`], reporting to `observed` in tests.
+    fn relocate_wal_prefix_with(
+        &self,
+        db: &Arc<Db>,
+        #[cfg(feature = "test_methods")] mut observed: Option<&mut RelocationObservation>,
+    ) -> DbResult<Option<u64>> {
         // todo: support compressed-batch frames in the terminal_position scan
         // below. Today it only matches `WalEntry::Record(..)`, so records
         // buried inside a `CompressedBatch` never see the relocation filter
@@ -394,7 +535,19 @@ impl RelocationDriver {
             if let WalEntry::Record(ks, key, value, _relocated) = entry
                 && let Some(filter) = db.key_shape.ks(ks).relocation_filter()
             {
-                match filter(&key, &value) {
+                let decision = filter(&key, &value);
+                #[cfg(feature = "test_methods")]
+                if let Some(observed) = &mut observed {
+                    observed.callbacks.push(RelocationCallback {
+                        keyspace: ks,
+                        // Do not keep a WAL mapping pinned across reclamation.
+                        key: Bytes::copy_from_slice(&key),
+                        value: Bytes::copy_from_slice(&value),
+                        wal_position: position.offset(),
+                        decision,
+                    });
+                }
+                match decision {
                     Decision::Keep => {
                         keep_seen[ks.as_usize()] = true;
                         if position.offset() < max_target_position {
@@ -417,9 +570,25 @@ impl RelocationDriver {
         self.metrics
             .relocation_terminal_position
             .set(terminal_position as i64);
+        #[cfg(feature = "test_methods")]
+        if let Some(observed) = &mut observed {
+            observed.streams.push(StreamObservation {
+                stream_id: RelocationStreamId {
+                    partition: 0,
+                    fencing_generation: 0,
+                },
+                processed_upper: upper_limit,
+                terminal_position,
+                rounded_target: target_position,
+            });
+        }
         // ensure the target position is big enough to cut
         if target_position < (db.wal.wal_file_size() + min_wal_position) {
             return Ok(None);
+        }
+        #[cfg(feature = "test_methods")]
+        if let Some(observed) = &mut observed {
+            observed.gate = RelocationGate::DidWork;
         }
         let mut current_cell = CellReference::first(db, KeySpace::first());
         while let Some(cell) = current_cell.take() {
@@ -472,7 +641,13 @@ impl RelocationDriver {
                         .with_label_values(&[ks.name()])
                         .inc();
                     if batch.size_bytes() >= batch_limit {
+                        #[cfg(feature = "test_methods")]
+                        let copied = batch.len() as u64;
                         db.write_relocated_batch(batch)?;
+                        #[cfg(feature = "test_methods")]
+                        if let Some(observed) = &mut observed {
+                            observed.copied_survivors += copied;
+                        }
                         batch = RelocatedWriteBatch::new(
                             cell.keyspace,
                             cell.cell_id.clone(),
@@ -482,7 +657,13 @@ impl RelocationDriver {
                 }
             }
             if !batch.is_empty() {
+                #[cfg(feature = "test_methods")]
+                let copied = batch.len() as u64;
                 db.write_relocated_batch(batch)?;
+                #[cfg(feature = "test_methods")]
+                if let Some(observed) = &mut observed {
+                    observed.copied_survivors += copied;
+                }
             }
             if filter.is_some() {
                 // Kept entries now point to their copies at the WAL head.
@@ -513,6 +694,10 @@ impl RelocationDriver {
                 Err(mpsc::TryRecvError::Empty) => return false,
                 Err(mpsc::TryRecvError::Disconnected) => return true,
                 Ok(RelocationCommand::StartBlocking(_, cb)) => cb.send(()).unwrap(),
+                #[cfg(feature = "test_methods")]
+                Ok(RelocationCommand::ObserveWal { reply, .. }) => {
+                    let _ = reply.send(Err(RelocationTestError::Busy));
+                }
             }
         }
     }
@@ -624,5 +809,87 @@ impl RelocationDriver {
         db.write_relocated_batch(batch)?;
 
         Ok(successful_inserts)
+    }
+}
+
+#[cfg(all(test, feature = "test_methods"))]
+mod observed_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::key_shape::{KeyShape, KeyType};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn observed_wal_busy_does_not_return_completion() {
+        let (sender, receiver) = mpsc::channel();
+        let (reply, result) = mpsc::sync_channel(1);
+        sender
+            .send(RelocationCommand::ObserveWal {
+                deadline: Instant::now() + Duration::from_secs(10),
+                reply,
+            })
+            .unwrap();
+        let driver = RelocationDriver {
+            db: Weak::new(),
+            path: PathBuf::new(),
+            receiver,
+            metrics: Metrics::new(),
+        };
+        assert!(!driver.should_cancel_relocation());
+        assert!(matches!(
+            result.try_recv(),
+            Ok(Err(RelocationTestError::Busy))
+        ));
+    }
+
+    #[test]
+    fn observed_wal_dropped_reply_keeps_worker_alive() {
+        let directory = tempdir::TempDir::new("observe_wal_relocation").unwrap();
+        let db = Db::open(
+            directory.path(),
+            KeyShape::new_single(8, 1, KeyType::uniform(1)),
+            Arc::new(Config::small()),
+            Metrics::new(),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (abandoned, abandoned_result) = mpsc::sync_channel(1);
+        let (reply, result) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        drop(abandoned_result);
+        sender
+            .send(RelocationCommand::ObserveWal {
+                deadline,
+                reply: abandoned,
+            })
+            .unwrap();
+        sender
+            .send(RelocationCommand::ObserveWal { deadline, reply })
+            .unwrap();
+        drop(sender);
+        RelocationDriver {
+            db: Arc::downgrade(&db),
+            path: directory.path().to_path_buf(),
+            receiver,
+            metrics: Metrics::new(),
+        }
+        .run();
+        let observation = result.try_recv().unwrap().unwrap();
+        assert_eq!(observation.witness, RelocationWorkerWitness::Completed);
+        assert_eq!(observation.gate, RelocationGate::NoWork);
+        assert_eq!(
+            observation.streams,
+            [StreamObservation {
+                stream_id: RelocationStreamId {
+                    partition: 0,
+                    fencing_generation: 0,
+                },
+                processed_upper: db.wal_writer.last_processed().as_u64(),
+                terminal_position: 0,
+                rounded_target: 0,
+            }],
+        );
+        assert!(observation.callbacks.is_empty());
+        assert_eq!(observation.copied_survivors, 0);
     }
 }
