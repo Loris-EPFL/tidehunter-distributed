@@ -182,11 +182,10 @@ jobs:
           retention-days: 7
 
   nvme-tcp-loopback:
-    name: Kernel NVMe/TCP four-owner proof (non-gating)
+    name: Kernel NVMe/TCP recovery proofs
     runs-on: ubuntu-24.04
-    continue-on-error: true
-    # Cold native build plus the existing 600 s proof and bounded cleanup.
-    timeout-minutes: 40
+    # Cold native build plus bounded single- and four-owner proofs and cleanup.
+    timeout-minutes: 47
     env:
       KERNEL_TCP_STATE: /var/lib/tidehunter-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -215,49 +214,74 @@ jobs:
           done
           mountpoint -q /sys/kernel/config || sudo mount -t configfs none /sys/kernel/config
           sudo install -d -m 0700 "$KERNEL_TCP_STATE" "$KERNEL_TCP_STATE/libs"
-      - name: Build TCP multi-owner proof binary
+      - name: Build shared kernel TCP proof binary
         timeout-minutes: 10
         run: cargo +1.90 build --locked --offline -p kv-research --bin kv-research --features nvmeof
-      - name: Run existing kernel TCP admission and second-open proof
-        timeout-minutes: 13
+      - name: Gate single-owner abrupt-crash recovery in both histories and tiers
+        # CI uses 8 MiB WAL members with 4 MiB fragments, crossing both boundaries.
+        # Cloud qualification keeps its 1 GiB members.
+        timeout-minutes: 7
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/kernel-nvme-tcp"
           df -B1 /var/lib /mnt "$GITHUB_WORKSPACE" | tee "$RUNNER_TEMP/kernel-nvme-tcp/disk-before.txt"
+          timeout --signal=TERM --kill-after=25s 390s \
+            sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py qualify \
+              --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
+            2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/single-owner.log"
+      - name: Run existing kernel TCP admission and second-open proof (non-gating)
+        id: four_owner
+        continue-on-error: true
+        timeout-minutes: 13
+        run: |
+          set -euo pipefail
           # TERM becomes an exception inside the maintained proof, so its finally
           # block drains/stops exact-owned controllers, targets, namespaces and units.
           timeout --signal=TERM --kill-after=120s 600s \
             sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py run \
               --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
             2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/run.log"
-      - name: Verify exact-owned cleanup and export proof even on failure
+      - name: Verify exact-owned four-owner cleanup (non-gating)
+        if: always() && (steps.four_owner.outcome == 'success' || steps.four_owner.outcome == 'failure' || steps.four_owner.outcome == 'cancelled')
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py cleanup \
+            --state "$KERNEL_TCP_STATE" > "$RUNNER_TEMP/kernel-nvme-tcp/cleanup.log" 2>&1
+      - name: Export kernel proof evidence even on failure
         if: always()
         timeout-minutes: 2
         run: |
-          set +e
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/kernel-nvme-tcp"
-          sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py cleanup \
-            --state "$KERNEL_TCP_STATE" > "$RUNNER_TEMP/kernel-nvme-tcp/cleanup.log" 2>&1
-          cleanup_status=$?
-          # Keep configs, limits, status and raw diagnostics, never owner DB/WAL files.
-          sudo -n find "$KERNEL_TCP_STATE" -type f \
-            \( -name '*.json' -o -name '*.log' -o -name '*.txt' -o -name '*.yaml' -o -name '*.prom' \) \
-            -exec cp --parents '{}' "$RUNNER_TEMP/kernel-nvme-tcp" \;
+          # Keep receipts and diagnostics, never retained single-owner fixtures or WALs.
+          if sudo -n test -d "$KERNEL_TCP_STATE"; then
+            sudo -n find "$KERNEL_TCP_STATE" -type d -name 'kernel-live-root-*' -prune -o -type f \
+              \( -name '*.json' -o -name '*.log' -o -name '*.txt' -o -name '*.yaml' -o -name '*.prom' \) \
+              -exec cp --parents --target-directory "$RUNNER_TEMP/kernel-nvme-tcp" -- '{}' +
+          fi
           sudo -n chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/kernel-nvme-tcp"
           {
-            echo "### Kernel NVMe/TCP four-owner proof (non-gating)"
-            echo "Kernel: $(uname -r); cleanup verifier exit: $cleanup_status"
-            echo "Four colocated owners; leased FUA writes, buffered kernel reads, TCP/TLS control."
+            echo "### Kernel NVMe/TCP recovery proofs"
+            echo "Kernel: $(uname -r)"
+            echo "Single-owner abrupt-crash recovery (gating): both history modes, both tiers."
+            if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/single-owner/summary.json" ]; then
+              echo '```json'
+              cat "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/single-owner/summary.json"
+              echo '```'
+            else
+              echo "No single-owner summary; inspect setup and single-owner logs."
+            fi
+            echo "Four-owner admission and second-open proof (non-gating)."
             echo "No RDMA, independent SSD, HA or performance qualification."
             if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/proof/proof.json" ]; then
               echo '```json'
               cat "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/proof/proof.json"
               echo '```'
             else
-              echo "FAIL: proof did not produce its final receipt; inspect run/cleanup logs."
+              echo "No four-owner proof receipt; check whether the step started."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          exit "$cleanup_status"
       - name: Retain kernel TCP proof and failure diagnostics
         if: always()
         timeout-minutes: 2

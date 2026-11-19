@@ -26,6 +26,22 @@ is a hardware discovery/guard check, not a full data-path or latency proof.
 Do not run every ignored test in Cloud. Hardware absence must not be hidden by a
 software/TCP fallback or reported as a passing hardware test.
 
+## Kernel NVMe/TCP recovery in GitHub Actions
+
+The kernel job uses one binary and a real loopback NVMe/TCP target. Its gating
+single-owner qualification runs the same four-epoch sequence as the cloud
+qualifier: a coordinator child exits without dropping the database or
+checkpointing, then the parent reopens it. It covers both `on_disk` and
+`wal_replay` history, each with native and synchronous durability. The
+four-owner admission and second-open proof remains non-gating.
+CI uses 8 MiB WAL members with 4 MiB fragments to keep the real member and
+fragment crossings small. Cloud qualification keeps its 1 GiB members.
+
+The `kernel-nvme-tcp-*` artifact retains per-history timings, cleanup evidence,
+and the Rust qualifier's phase, child-ready receipt, and log on failure. These
+are functional checks, not RDMA, independent media, or performance evidence.
+The cloud qualifier still selects `on_disk` explicitly.
+
 ## Shared commands
 
 Run these from the checkout root. The Python runner itself resolves the repository
