@@ -389,6 +389,9 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
             config.max_index_bytes = 16 * 1024 * 1024;
             config.timeout = Duration::from_secs(5);
             leased::configure(config, leased::profile(4));
+            // Publication can cache an acknowledged frame before owner adoption.
+            // This test must read that frame through the live lane instead.
+            config.read_cache_bytes = 0;
             // One read lane, warmed below.
             config.read_lanes = Some(1);
         },
