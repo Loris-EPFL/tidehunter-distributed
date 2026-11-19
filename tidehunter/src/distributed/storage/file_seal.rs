@@ -24,6 +24,13 @@ struct SealCandidate {
     file: File,
 }
 
+/// First and last batch sequence of one file, in file order.
+#[derive(Clone, Copy)]
+struct SealSequences {
+    first: u64,
+    last: u64,
+}
+
 impl PartitionLog {
     /// Seal up to `SEALS_PER_KICK` passed files in ascending order. Returns
     /// how many were sealed; zero when the next file is not ready. Never waits
@@ -34,8 +41,8 @@ impl PartitionLog {
             let Some(candidate) = self.capture_sealable_file()? else {
                 break;
             };
-            let last_batch_sequence = self.validate_file_seal(&candidate)?;
-            if !self.install_file_seal(&candidate, last_batch_sequence)? {
+            let sequences = self.validate_file_seal(&candidate)?;
+            if !self.install_file_seal(&candidate, sequences)? {
                 break;
             }
             sealed += 1;
@@ -106,13 +113,17 @@ impl PartitionLog {
 
     /// Scan the pinned inode from its first byte to its end. Every fragment
     /// must be complete live groups, then at most one validated skip marker
-    /// plus zeros reaching the fragment end. Returns the largest batch
-    /// sequence. The bytes lie below the durable position root, so an invalid
-    /// frame or unexplained hole is corruption: the stream is poisoned. An
-    /// I/O error is only "not sealed".
-    fn validate_file_seal(&self, candidate: &SealCandidate) -> Result<Option<u64>, StorageError> {
+    /// plus zeros reaching the fragment end. Batch sequences must strictly
+    /// ascend in file order (design §3 step 3); returns the first and last.
+    /// The bytes lie below the durable position root, so an invalid frame,
+    /// a repeated or backward sequence, or an unexplained hole is
+    /// corruption: the stream is poisoned. An I/O error is only "not sealed".
+    fn validate_file_seal(
+        &self,
+        candidate: &SealCandidate,
+    ) -> Result<Option<SealSequences>, StorageError> {
         let config = self.config();
-        let mut last = None;
+        let mut sequences: Option<SealSequences> = None;
         let mut fragment = candidate.start;
         while fragment < candidate.end {
             let fragment_end = fragment
@@ -146,13 +157,27 @@ impl PartitionLog {
                         )));
                     }
                     let sequence = batch.version().sequence;
-                    last = Some(last.map_or(sequence, |last: u64| last.max(sequence)));
+                    sequences = match sequences {
+                        None => Some(SealSequences {
+                            first: sequence,
+                            last: sequence,
+                        }),
+                        Some(seen) if sequence > seen.last => Some(SealSequences {
+                            last: sequence,
+                            ..seen
+                        }),
+                        Some(_) => {
+                            return Err(self.seal_scan_failure(StorageError::Invalid(
+                                "live batch sequences do not strictly ascend in the file",
+                            )));
+                        }
+                    };
                 }
                 cursor = decoded.frame_end;
             }
             fragment = fragment_end;
         }
-        Ok(last)
+        Ok(sequences)
     }
 
     /// Classify a scan failure. Bytes below the installed position root are
@@ -168,10 +193,12 @@ impl PartitionLog {
 
     /// Recheck and persist one seal. Returns false when the stream moved on
     /// (another seal, a fence or a seal of the stream) and nothing changed.
+    /// Sequences also ascend across files: the immediately preceding file's
+    /// seal, while it is still recorded, must end below this file's first.
     fn install_file_seal(
         &self,
         candidate: &SealCandidate,
-        last_batch_sequence: Option<u64>,
+        sequences: Option<SealSequences>,
     ) -> Result<bool, StorageError> {
         let size = self.config().wal_file_bytes;
         // The path must still name the scanned inode (owner-only directory).
@@ -193,6 +220,23 @@ impl PartitionLog {
             }
             current
         };
+        let previous = candidate
+            .start
+            .checked_sub(size)
+            .and_then(|start| {
+                current
+                    .sealed_files
+                    .binary_search_by_key(&start, |seal| seal.start)
+                    .ok()
+            })
+            .and_then(|index| current.sealed_files[index].last_batch_sequence);
+        if let (Some(previous), Some(sequences)) = (previous, sequences)
+            && sequences.first <= previous
+        {
+            return Err(self.seal_scan_failure(StorageError::Invalid(
+                "live batch sequences do not ascend across sealed files",
+            )));
+        }
         let mut root = WalRoot::clone(&current);
         root.generation = root
             .generation
@@ -204,7 +248,7 @@ impl PartitionLog {
             device: candidate.identity.device,
             inode: candidate.identity.inode,
             root_generation: root.generation,
-            last_batch_sequence,
+            last_batch_sequence: sequences.map(|sequences| sequences.last),
         });
         self.commit_root(root, CommitStep::Seal)?;
         Ok(true)

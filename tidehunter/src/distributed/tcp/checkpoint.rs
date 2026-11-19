@@ -173,12 +173,10 @@ impl Client {
 
     /// Retire durably sealed files of the serving stream (`epoch ==
     /// authority_epoch`). Every proof names the exact inode and seal; the
-    /// witness comes from one adopted Exact root. The caller has already
-    /// closed scoped initiator read admission and drained the victims' I/O.
-    #[allow(
-        dead_code,
-        reason = "the coordinator R1 pass (core_retire_dead_wal_files) is the pending caller"
-    )]
+    /// witness comes from one adopted Exact root. The coordinator proved the
+    /// files unreferenced by every retained root and view; a coordinator read
+    /// holds its index pin until its terminal completion, so no read of a
+    /// proved file is in flight. The owner drains its own target I/O.
     pub(crate) fn retire_sealed_files(
         &mut self,
         authority_epoch: u64,

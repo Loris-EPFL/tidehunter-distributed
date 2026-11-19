@@ -1412,7 +1412,7 @@ impl NodeInventory {
             _ => Err(TcpError::new("recovery requires sealed immutable epoch")),
         }
     }
-    fn retirement_log(
+    pub(super) fn retirement_log(
         &self,
         authority_epoch: u64,
         epoch: u64,

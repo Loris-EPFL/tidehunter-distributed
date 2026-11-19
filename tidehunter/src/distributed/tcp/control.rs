@@ -18,6 +18,9 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 #[cfg(test)]
+#[path = "control_forced_pause_tests.rs"]
+mod forced_pause_tests;
+#[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
 
@@ -62,9 +65,11 @@ pub(super) struct ControlContext {
     /// write their own cache-line shard (relaxed); a snapshot is not atomic.
     pub(super) transport: Arc<OwnerTransportCounters>,
     /// Data-free live-control gate. Lock order: this gate, then the lifecycle
-    /// gate, then the inventory, then `readers`. Fence, seal, retirement, live
-    /// read publication, live pin release and target shutdown take it first;
-    /// terminal publication only `try_lock`s it and defers while it is held.
+    /// gate, then the inventory, then `readers`. Fence, seal, generation trim,
+    /// older-stream retirement, live read publication, live pin release and
+    /// target shutdown take it first. The scheduler orders serving retirement
+    /// against exclusive controls; it does not take this gate. Terminal
+    /// publication only `try_lock`s it and defers while it is held.
     pub(super) live_control_gate: Mutex<()>,
 }
 
@@ -642,6 +647,20 @@ impl Drop for ControlOwner {
         }
     }
 }
+#[cfg(test)]
+impl ControlOwner {
+    /// Test-only: join every file preparer after its current step, so an
+    /// in-process crash image is taken at a step boundary (journal and
+    /// configfs agree) rather than across a running export.
+    pub(super) fn stop_preparers_for_test(&self) {
+        let slots = std::mem::take(&mut *self.shared.preparers.lock());
+        for slot in slots {
+            // A log poisoned by an injected cut still stops its preparer; the
+            // join result only reports that poison.
+            let _ = self.shared.join_preparer(slot);
+        }
+    }
+}
 
 /// Holds the scheduling state of one running command. Dropping it (including on
 /// unwind) releases the slot and wakes every worker, so a waiting control or the
@@ -690,6 +709,23 @@ impl StorageNode {
         let log = self.log_for_test(epoch);
         self.control.shared.frontier_for(&log).unwrap();
         log
+    }
+
+    /// Test accessor: the owner's log of stream `source` while `authority`
+    /// serves (the active log, or an older sealed one), to read records of
+    /// either kind directly from the owner WAL.
+    #[cfg(test)]
+    pub(crate) fn source_log_for_test(
+        &self,
+        authority: u64,
+        source: u64,
+    ) -> Arc<super::super::storage::PartitionLog> {
+        let inventory = self.inventory.lock();
+        if source == authority {
+            inventory.active(source).unwrap()
+        } else {
+            inventory.retirement_log(authority, source).unwrap()
+        }
     }
 
     /// Test hook: cap of a durable-progress wait for requests submitted from now on.
@@ -2075,11 +2111,11 @@ impl ControlContext {
                     return Err(TcpError::new("retirement of a future stream"));
                 }
                 if epoch == authority_epoch {
-                    // File maintenance of the serving stream: no live-control
-                    // gate and no lifecycle hold across storage syncs. The
-                    // coordinator has closed read admission to the victims and
-                    // drained their I/O; per-victim pins are checked under the
-                    // inventory (`retire_active_files`).
+                    // The scheduler counts serving retirement as active stream
+                    // work. Fence, Seal and target shutdown wait for that work
+                    // to finish. Do not block live read publication here: the
+                    // coordinator has drained the victims, whose pins are
+                    // rechecked in retire_active_files.
                     let witness = witness.ok_or_else(|| {
                         TcpError::new("serving stream retirement requires an Exact witness")
                     })?;

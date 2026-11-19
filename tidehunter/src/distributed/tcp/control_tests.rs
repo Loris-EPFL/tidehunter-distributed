@@ -423,7 +423,7 @@ fn position_root_does_not_replace_read_barriers() {
     }
 }
 
-mod live_fencing {
+pub(super) mod live_fencing {
     use super::*;
     use crate::distributed::group::CompleteGroup;
     use crate::distributed::nvmeof::live_storage::LiveGroupDescriptor;
@@ -440,7 +440,10 @@ mod live_fencing {
 
     // Exercise the actual WAL/control lifecycle with the existing journal-only
     // target fixture. This is not evidence of kernel namespace I/O drain.
-    fn open_live(root: &std::path::Path, tier: DurabilityTier) -> (NodeConfig, Arc<StorageNode>) {
+    pub(in crate::distributed::tcp::control) fn open_live(
+        root: &std::path::Path,
+        tier: DurabilityTier,
+    ) -> (NodeConfig, Arc<StorageNode>) {
         open_live_with(root, tier, config(&root.join("node")))
     }
 
@@ -551,7 +554,10 @@ mod live_fencing {
         assert_eq!(node.wal_prewrite_stats(), final_stats);
     }
 
-    fn wait_prepared(log: &crate::distributed::storage::PartitionLog, published: u64) {
+    pub(in crate::distributed::tcp::control) fn wait_prepared(
+        log: &crate::distributed::storage::PartitionLog,
+        published: u64,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let stats = log.live_file_preparation_stats();
@@ -1198,7 +1204,7 @@ mod live_fencing {
         receive(&completions, 1).response
     }
 
-    fn shutdown(node: &StorageNode, epoch: u64) {
+    pub(in crate::distributed::tcp::control) fn shutdown(node: &StorageNode, epoch: u64) {
         let (completed, completions) = mpsc::sync_channel(1);
         for request in [
             Request::Seal { epoch },
@@ -1996,7 +2002,10 @@ mod live_fencing {
         shutdown(&node, 1);
     }
 
-    fn extent_exchange(node: &StorageNode, request: Request) -> Response {
+    pub(in crate::distributed::tcp::control) fn extent_exchange(
+        node: &StorageNode,
+        request: Request,
+    ) -> Response {
         let (completed, completions) = mpsc::sync_channel(1);
         assert!(command(node, 1, request, 4096, &completed).is_ok());
         receive(&completions, 1).response.unwrap()

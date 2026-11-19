@@ -832,6 +832,13 @@ impl StorageNode {
         self.inventory.lock().file_maintenance
     }
 
+    /// Test-only: stop the file preparers after their current step (see
+    /// `ControlOwner::stop_preparers_for_test`). No grant may follow.
+    #[cfg(test)]
+    pub(crate) fn stop_file_preparers_for_test(&self) {
+        self.control.stop_preparers_for_test();
+    }
+
     #[cfg(test)]
     pub(crate) fn bench_live_grant_profiles(&self) -> serde_json::Value {
         self.control.grant_profiles()

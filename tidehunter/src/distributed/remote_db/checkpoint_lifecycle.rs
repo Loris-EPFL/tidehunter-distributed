@@ -628,6 +628,9 @@ fn checkpoint_diagnostic(
     }
 }
 
+/// Logical prune, then both physical retirement passes: older sealed
+/// generations, then the R1 serving-generation pass. R0 shadow mode keeps
+/// the logical work and skips both physical passes.
 pub(super) fn core_retire_history_before(
     core: &Arc<WriteCore>,
     floor: IndexReadCut,
@@ -640,8 +643,8 @@ pub(super) fn core_retire_history_before(
     if core.take_retirement_preflight_busy() {
         return Err(LocalDbError::new("injected retirement preflight busy"));
     }
-    let _live_pause = core.reads.pause_live_for_retirement()?;
-    let result = (|| {
+    let live_pause = core.reads.pause_live_for_retirement()?;
+    let result = (|| -> Result<bool, LocalDbError> {
         core.wait_published_before(core.next_sequence())?;
         core_progress_checkpoint(core, true)?;
         let floor = if floor == IndexReadCut::Latest {
@@ -667,15 +670,32 @@ pub(super) fn core_retire_history_before(
         // R0 shadow mode keeps logical pruning, checkpoints and the floor, and
         // suppresses only physical retirement; the observer samples this prune.
         if core.capacity.shadow_prune(core) {
-            return Ok(());
+            return Ok(false);
         }
-        core_retire_unreachable_sealed_files(core)
+        core_retire_unreachable_sealed_files(core)?;
+        Ok(true)
     })();
+    // The serving-generation pass needs no read pause: in-flight reads hold
+    // their index pins (and so their files) until terminal completion.
+    drop(live_pause);
+    let physical = match result {
+        Ok(physical) => physical,
+        Err(error) => {
+            drop(retirement);
+            core.fail(LocalDbError::new(error.message()));
+            return Err(error);
+        }
+    };
+    // R1: still under the cold gate. A failed or refused request changed no
+    // coordinator state (the next pass re-pages the owner), so its error is
+    // returned to the caller without poisoning the authority.
+    let pass = if physical {
+        super::dead_wal_files::core_retire_dead_wal_files(core)
+    } else {
+        Ok(())
+    };
     drop(retirement);
-    if let Err(error) = &result {
-        core.fail(LocalDbError::new(error.message()));
-    }
-    result
+    pass
 }
 
 pub(super) fn core_retire_unreachable_sealed_files(core: &WriteCore) -> Result<(), LocalDbError> {

@@ -57,6 +57,8 @@ mod retired_files;
 pub use retired_files::{FileSeal, PendingRetirement};
 use retired_files::{RetiredFiles, validate_root_sets};
 mod file_retirement;
+#[cfg(test)]
+pub(crate) use file_retirement::CrashCut;
 pub use file_retirement::{RetireProof, RetirementOutcome, RetirementWitness, WalInode};
 mod file_seal;
 
@@ -918,6 +920,15 @@ pub struct PartitionLog {
     // Test-only crash cut of seal/retirement (`file_retirement::CrashCut` code).
     #[cfg(test)]
     r1_crash: AtomicU8,
+    // Test-only pause after the retirement detach, before the unlinks (no
+    // lock held): writes must proceed while a retirement is mid-flight.
+    #[cfg(test)]
+    before_unlink: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     #[cfg(test)]
     before_persist: Mutex<
         Option<(
@@ -1085,6 +1096,8 @@ impl PartitionLog {
             fail_wal_retire: AtomicBool::new(false),
             #[cfg(test)]
             r1_crash: AtomicU8::new(0),
+            #[cfg(test)]
+            before_unlink: Mutex::new(None),
             #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]

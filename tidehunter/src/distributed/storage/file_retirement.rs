@@ -89,6 +89,21 @@ impl PartitionLog {
         self.r1_crash.store(cut as u8, Ordering::Release);
     }
 
+    /// Park the next serving-stream retirement after its detach and before
+    /// its unlinks. Returns (entered, resume).
+    #[cfg(test)]
+    pub(crate) fn pause_before_unlink(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.before_unlink.lock() = Some((entered, released));
+        (started, resume)
+    }
+
     #[cfg(test)]
     pub(super) fn crash_at(&self, cut: CrashCut) -> Result<(), StorageError> {
         if self
@@ -284,6 +299,16 @@ impl PartitionLog {
         };
         #[cfg(test)]
         self.crash_at(CrashCut::BeforeUnlink)?;
+        #[cfg(test)]
+        {
+            // No lock is held here: foreground writes must keep going. The
+            // wait is bounded so a failing test cannot hang its scope join.
+            let pause = self.before_unlink.lock().take();
+            if let Some((entered, resume)) = pause {
+                let _ = entered.send(());
+                let _ = resume.recv_timeout(std::time::Duration::from_secs(120));
+            }
+        }
         for (index, entry) in pending.iter().enumerate() {
             if self.check_unlink_target(entry)? {
                 match fs::remove_file(self.wal_file_path(entry.start)) {
@@ -506,6 +531,7 @@ impl PartitionLog {
 /// Which root writer installed a root; selects the test crash cut.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CommitStep {
+    /// Only the lease-logical seal (NVMe-oF live streams) installs a seal.
     Seal,
     Retire,
     Clear,

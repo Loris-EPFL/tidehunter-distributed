@@ -233,6 +233,48 @@ fn seal_root_crash_cuts_leave_every_file_and_recover() {
     }
 }
 
+/// The live frame of `batch(config, sequence)`, position independent.
+fn frame_of(config: &PartitionConfig, sequence: u64) -> Vec<u8> {
+    let group = CompleteGroup::new_live(
+        &shape(),
+        vec![batch(config, sequence)],
+        config.batch_limits,
+        config.group_limits,
+    )
+    .unwrap();
+    LiveGroupDescriptor::from_group(&group).unwrap().1.to_vec()
+}
+
+/// Design §3 step 3: sequences strictly ascend for the stream. A valid frame
+/// replaying an earlier sequence below the durable position is corruption,
+/// both inside one file and across the boundary with the previous seal.
+#[test]
+fn seal_requires_strictly_ascending_batch_sequences() {
+    // (stream offset of the replaced group, replayed sequence, seals kept)
+    for (offset, replayed, kept) in [(16 * 1024, 0, 0), (FILE, 1, 1)] {
+        let (temp, config, log) = fixture();
+        fill(&log, &config, 0, 6);
+        log.persist_wal_through(log.appended_frontier()).unwrap();
+        let path = temp.path().join("stream");
+        let frame = frame_of(&config, replayed);
+        assert_eq!(frame.len(), 4096);
+        write_at(
+            &path.join(format!("wal_{:016x}", offset / FILE)),
+            offset % FILE,
+            &frame,
+        );
+        assert!(matches!(
+            log.seal_ready_files(),
+            Err(StorageError::Invalid(message)) if message.contains("ascend")
+        ));
+        let (seals, pending) = log.file_retirement_state();
+        assert_eq!(seals.len(), kept, "offset {offset}");
+        assert!(pending.is_empty());
+        assert!(seals.iter().all(|seal| seal.last_batch_sequence == Some(1)));
+        assert!(log.state.lock().poison.is_some(), "offset {offset}");
+    }
+}
+
 #[test]
 fn retirement_crash_cuts_match_the_no_gc_control() {
     let control = {

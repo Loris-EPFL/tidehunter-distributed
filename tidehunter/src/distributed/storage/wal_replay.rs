@@ -935,6 +935,8 @@ impl PartitionLog {
             #[cfg(test)]
             r1_crash: AtomicU8::new(0),
             #[cfg(test)]
+            before_unlink: Mutex::new(None),
+            #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]
             fail_persist: AtomicBool::new(false),

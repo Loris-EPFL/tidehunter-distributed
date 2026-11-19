@@ -51,6 +51,7 @@ pub use capacity_observer::CapacityObserver;
 mod checkpoint_lifecycle;
 mod concurrent;
 mod coordinator_profile;
+mod dead_wal_files;
 use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
@@ -3396,6 +3397,8 @@ mod tests;
 
 #[cfg(test)]
 mod capacity_observer_tests;
+#[cfg(test)]
+mod dead_wal_files_tests;
 #[cfg(test)]
 mod leased_tests;
 #[cfg(test)]

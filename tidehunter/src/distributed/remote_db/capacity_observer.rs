@@ -89,8 +89,19 @@ impl CapacitySlot {
         true
     }
 
-    fn install_seq(&self) -> u64 {
+    /// Seqlock value: odd while an image installs. Readers of the installed
+    /// image (R0 samples, the R1 retirement pass) compare it again after
+    /// their walk and discard the result if it changed.
+    pub(in crate::distributed::remote_db) fn install_seq(&self) -> u64 {
         self.install_seq.load(Ordering::Acquire)
+    }
+
+    /// Cut of the last image this process installed; `None` before the
+    /// first install. Read it between two equal even `install_seq` values.
+    pub(in crate::distributed::remote_db) fn installed_cut(
+        &self,
+    ) -> Option<Option<MutationVersion>> {
+        *self.installed_cut.lock()
     }
 }
 
