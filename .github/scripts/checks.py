@@ -125,10 +125,6 @@ def check(profile, env):
         fabric = software_fabric_environment(fabric_environment(env), software=True)
         stream = ("-p", "tidehunter-fabric", "--features", "native", "--test", "software_provider")
         selected_ignored(fabric, stream, "software_provider_", SOFTWARE_STREAM_TESTS)
-        direct = "software_provider_runs_direct_packet_adapter_on_large_partial_streams"
-        selected_ignored(fabric, ("-p", "tidehunter-fabric", "--features", "native", "--lib"), direct, (direct,))
-        strict_read = "strict_device_read_rejects_software_provider"
-        selected_ignored(fabric, ("-p", "tidehunter-fabric", "--features", "native", "--lib"), strict_read, (strict_read,))
     elif profile == "harness":
         for directory in ("experiments/kv-comparison", "experiments/kv-comparison/observability",
                           "experiments/gcp-rdma"):

@@ -16,7 +16,7 @@
 //! 31 live_target_stats, 32 shutdown_live_target, 33 lease_live_extent,
 //! 34 adopt_live_extent, 35 open_live_exports, 36 prelease_live_extent,
 //! 37 replay_live_wal, 38 read_evidence, 39 process_resources,
-//! 40 prepare_ram_probe, 41 read_ram_probe, 42 acquire_live_export_pin,
+//! 40 and 41 retired (the removed RAM probe), 42 acquire_live_export_pin,
 //! 43 release_live_export_pin, 44 durable_progress, 45 partition_stats.
 //! Control `a` is the envelope id.
 

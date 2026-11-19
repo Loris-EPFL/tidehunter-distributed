@@ -1172,17 +1172,16 @@ def verify_package(config):
 
 def environment(config):
     result = dict(os.environ)
-    for key in ("LD_PRELOAD", "LD_AUDIT"):
+    for key in ("LD_PRELOAD", "LD_AUDIT", "FI_EFA_USE_DEVICE_RDMA"):
         result.pop(key, None)
-    if platform_module(config):
-        result.update(LD_LIBRARY_PATH=config["fdb_library_dir"],
-                      FDB_CLIENT_LIB_DIR=config["fdb_library_dir"],
-                      FDB_CLIENT_LIB_PATH=config["fdb_library_dir"])
-        result.pop("FI_EFA_USE_DEVICE_RDMA", None)
-        return result
-    result.update(LD_LIBRARY_PATH=config["fdb_library_dir"] + ":/opt/amazon/efa/lib",
-                  FDB_CLIENT_LIB_DIR=config["fdb_library_dir"], FDB_CLIENT_LIB_PATH=config["fdb_library_dir"],
-                  FI_EFA_USE_DEVICE_RDMA="1")
+    library_path = config["fdb_library_dir"]
+    if not platform_module(config):
+        # The sealed AWS package still links libfabric from the pinned installer.
+        # Its path is linkage provenance, not an EFA transport selection.
+        library_path += ":/opt/amazon/efa/lib"
+    result.update(LD_LIBRARY_PATH=library_path,
+                  FDB_CLIENT_LIB_DIR=config["fdb_library_dir"],
+                  FDB_CLIENT_LIB_PATH=config["fdb_library_dir"])
     return result
 
 
@@ -1197,46 +1196,14 @@ def admit_fabrics(config, index, clients, root):
     platform = platform_module(config)
     if platform:
         return platform.admit_fabrics(config, index, clients, root)
-    # Pinned util/info.c maps -p to prov_name, -f to fabric name, and -c/-m
-    # to caps/mode. efa-direct is a fabric of provider efa, not a provider:
-    # https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/util/info.c
-    # Match resources.rs::Info::hints. Direct TLS/native messages need no RMA;
-    # only registered-RAM adds read caps and RX_CQ_DATA. Rust still checks
-    # endpoint geometry and FI_OPT_EFA_EMULATED_READ after endpoint enable.
-    profiles = (
-        ("efa_message", "efa", "FI_MSG|FI_DIRECTED_RECV", "FI_CONTEXT"),
-        ("efa_direct_message", "efa-direct", "FI_MSG", "FI_CONTEXT2"),
-        ("efa_direct_read", "efa-direct", "FI_MSG|FI_RMA|FI_READ|FI_REMOTE_READ", "FI_CONTEXT2|FI_RX_CQ_DATA"),
-    )
     host = config["fleet"]["coordinator"] if index == -1 else config["fleet"]["nodes"][index]
-    receipt = {"complete": False, "run_id": config["prefix"], "instance_id": host["instance_id"],
+    receipt = {"complete": True, "run_id": config["prefix"], "instance_id": host["instance_id"],
                "source_sha256": config["source_sha256"], "binary_sha256": config["binary_sha256"],
-               "scope": "fi_getinfo discovery only; not endpoint/native-read or workload qualification", "probes": {}}
-    failure = None
-    for name, fabric, caps, mode in profiles:
-        argv = ["/opt/amazon/efa/bin/fi_info", "-p", "efa", "-f", fabric,
-                "-t", "FI_EP_RDM", "-c", caps, "-m", mode, "-v"]
-        probe = {"argv": argv}
-        receipt["probes"][name] = probe
-        try:
-            probe["stdout"] = command(argv, timeout=30, env=environment(config))
-            probe["status"] = "discovered"
-        except Exception as exc:
-            probe.update(status="failed", error=type(exc).__name__ + ": " + str(exc))
-            failure = exc
-            break
-    receipt["complete"] = failure is None
+               "scope": "TCP control; no OFI provider probes required", "probes": {}}
     dump(Path(root) / "fabric-admission.json", receipt)
     key = config["prefix"] + ("/results/fabric-admission.json" if index == -1
                               else f"/results/cells/startup/storage/{index}/fabric-admission.json")
-    try:
-        persist_json(clients, config, key, receipt)
-    except Exception as exc:
-        if failure is not None:
-            raise failure from exc
-        raise
-    if failure is not None:
-        raise failure
+    persist_json(clients, config, key, receipt)
     return receipt
 
 
@@ -1490,7 +1457,7 @@ def systemd_argv(config, case, role, cpus, memory, seconds, executable, setenv=N
             "--property=KillMode=control-group", "--property=RemainAfterExit=yes",
             "--property=CPUAccounting=yes", "--property=MemoryAccounting=yes", "--property=IOAccounting=yes",
             "--property=WorkingDirectory=" + config["repository_root"],
-            *["--setenv=" + key + "=" + env[key] for key in ("LD_LIBRARY_PATH", "FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH", "FI_EFA_USE_DEVICE_RDMA") if key in env],
+            *["--setenv=" + key + "=" + env[key] for key in ("LD_LIBRARY_PATH", "FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH") if key in env],
             *["--setenv=" + key + "=" + str(value) for key, value in (setenv or {}).items()],
             "--", *map(str, executable)]
 

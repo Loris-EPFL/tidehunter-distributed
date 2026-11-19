@@ -206,15 +206,6 @@ fn backend_name(transport: &Transport) -> &'static str {
         Transport::Tcp => "tidehunter_tcp",
         Transport::TcpTrusted => "tidehunter_tcp_trusted",
         Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
-            (tidehunter::distributed::tcp::FabricBackend::Efa, FabricSecurity::MutualTls) => {
-                "tidehunter_efa"
-            }
-            (tidehunter::distributed::tcp::FabricBackend::EfaDirect, FabricSecurity::MutualTls) => {
-                "tidehunter_efa_direct"
-            }
-            (tidehunter::distributed::tcp::FabricBackend::EfaDirect, FabricSecurity::Trusted) => {
-                "tidehunter_efa_native"
-            }
             (tidehunter::distributed::tcp::FabricBackend::Verbs, FabricSecurity::MutualTls) => {
                 "tidehunter_verbs"
             }
@@ -227,9 +218,6 @@ fn backend_name(transport: &Transport) -> &'static str {
             ) => "tidehunter_software_tcp",
             (tidehunter::distributed::tcp::FabricBackend::SoftwareTcp, FabricSecurity::Trusted) => {
                 "tidehunter_software_tcp_native"
-            }
-            (tidehunter::distributed::tcp::FabricBackend::Efa, FabricSecurity::Trusted) => {
-                "tidehunter_efa_trusted"
             }
         },
     }
@@ -2752,14 +2740,20 @@ mod tests {
     #[cfg(not(feature = "fabric"))]
     #[test]
     fn rejects_selected_ofi_before_services_when_feature_is_disabled() {
-        let options = serde_json::json!({
-            "path": "/tmp/unused",
-            "transport": {
-                "kind": "ofi",
-                "fabric": {"backend": "efa", "domain": "efa"},
-                "security": "mutual-tls"
-            }
-        });
-        assert!(validate_options(&options).is_err());
+        // parse_options rejects a missing external_remote_config (and, without
+        // nvmeof, the whole backend) before it reaches the transport, so check
+        // the transport guard it then applies directly.
+        let transport: Transport = serde_json::from_value(serde_json::json!({
+            "kind": "ofi",
+            "fabric": {"backend": "verbs", "domain": "mlx5_0"},
+            "security": "mutual-tls"
+        }))
+        .unwrap();
+        let error = transport.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("OFI transport requires experimental-fabric"),
+            "{error}"
+        );
+        assert!(Transport::Tcp.validate().is_ok());
     }
 }

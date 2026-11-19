@@ -23,10 +23,7 @@ class PortableTransportTests(unittest.TestCase):
         expected = {
             'tidehunter_tcp': {'kind': 'tcp'},
             'tidehunter_tcp_trusted': {'kind': 'tcp-trusted'},
-            'tidehunter_efa': {'kind': 'ofi', 'fabric': {'backend': 'efa'}, 'security': 'mutual-tls'},
-            'tidehunter_efa_direct': {'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}, 'security': 'mutual-tls'},
-            'tidehunter_efa_native': {'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}, 'security': 'trusted'},
-            'tidehunter_efa_trusted': {'kind': 'ofi', 'fabric': {'backend': 'efa'}, 'security': 'trusted'},
+            'tidehunter_verbs': {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'mutual-tls'},
             'tidehunter_verbs_native': {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'},
         }
         for label, transport in expected.items():
@@ -35,6 +32,15 @@ class PortableTransportTests(unittest.TestCase):
                 self.assertEqual(runtime_backend(label), 'tidehunter')
         self.assertEqual(transport_for_case('fabric-tcp')['fabric']['backend'], 'software-tcp')
         self.assertEqual(runtime_backend('rocksdb'), 'rocksdb')
+
+    def test_retired_efa_cannot_select_a_runtime_transport(self):
+        for backend in ('efa', 'efa-direct'):
+            with self.subTest(backend=backend), self.assertRaisesRegex(ValueError, 'unsupported canonical'):
+                validate_transport({'kind': 'ofi', 'fabric': {'backend': backend}})
+        for label in ('efa', 'efa-direct', 'efa-native', 'efa-trusted', 'tidehunter_efa',
+                      'tidehunter_efa_direct', 'tidehunter_efa_native', 'tidehunter_efa_trusted'):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, 'unknown transport'):
+                transport_for_case(label)
 
     def test_trusted_tcp_serialization_admission_and_roundtrip(self):
         trusted = {'kind': 'tcp-trusted'}
@@ -79,7 +85,7 @@ class PortableTransportTests(unittest.TestCase):
                  'security': 'trusted'}
         with self.assertRaisesRegex(ValueError, 'explicit owner_transports'):
             select_transports(bound, None, 5)
-        owner = {'kind': 'ofi', 'fabric': {'backend': 'efa'},
+        owner = {'kind': 'ofi', 'fabric': {'backend': 'software-tcp'},
                  'security': 'trusted'}
         with self.assertRaisesRegex(ValueError, 'match client'):
             select_transports(bound, [owner] * 5, 5)
@@ -90,7 +96,7 @@ class PortableTransportTests(unittest.TestCase):
 
     def test_backend_selection_uses_tracked_default_and_rejects_bad_subsets(self):
         configured = ['native', 'tidehunter_tcp', 'valkey_tcp']
-        supported = {'native', 'tidehunter_tcp', 'tidehunter_efa', 'valkey_tcp'}
+        supported = {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'valkey_tcp'}
         self.assertEqual(select_backends(None, configured, supported), configured)
         self.assertEqual(select_backends('valkey_tcp,native', configured, supported),
                          ['valkey_tcp', 'native'])
@@ -98,7 +104,7 @@ class PortableTransportTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 select_backends(raw, configured, supported)
         with self.assertRaisesRegex(ValueError, 'tracked config'):
-            select_backends('tidehunter_efa', configured, supported)
+            select_backends('tidehunter_verbs', configured, supported)
         for tracked in ([], ['native', 'native'], [{'kind': 'tidehunter'}]):
             with self.subTest(tracked=tracked), self.assertRaises(ValueError):
                 select_backends(None, tracked, supported)

@@ -3,30 +3,18 @@
 #[cfg(test)]
 mod nonblocking_tests;
 
-mod efa;
-mod efa_direct;
-
 use super::{
-    CHUNK, OpenProfile, PeerDrainToken, ProgressStats, ProviderGeometry, ProviderInfo,
-    ProviderParameter, RMA_CANCELLED, ReadBuffer, ReadBufferStorage, ReadOperation,
-    RegisteredReadRegion, RemoteReadRegion, RmaAddressMode, RmaCapabilities, RmaConfig,
-    RmaReadMode, SLOTS,
+    CHUNK, OpenProfile, ProgressStats, ProviderGeometry, ProviderInfo, ProviderParameter, SLOTS,
 };
 use crate::{FabricBackend, FabricConfig, MAX_SLOTS};
 use ofi_libfabric_sys::bindgen as ffi;
 use std::{
-    any::Any,
     cell::UnsafeCell,
     ffi::{CStr, CString, c_void},
     io::{self, IoSlice},
     mem::{self, MaybeUninit},
     ptr,
     ptr::NonNull,
-    sync::atomic::AtomicU64,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
     time::{Duration, Instant},
 };
 
@@ -213,12 +201,12 @@ impl WaitRequest {
     /// Software `RxM` always parks in bounded `fi_cq_sread`. `verbs` requests a
     /// wait fd only when the owner parks while idle (`park_idle`): the wait
     /// object adds signalling work to every completion, which a polling client
-    /// never needs. EFA has no CQ wait object, and RMA endpoints keep polling.
-    fn select(backend: FabricBackend, park_idle: bool, direct: bool, rma: bool) -> Self {
+    /// never needs.
+    fn select(backend: FabricBackend, park_idle: bool) -> Self {
         match backend {
-            FabricBackend::SoftwareTcp if !direct && !rma => Self::Software,
-            FabricBackend::Verbs if park_idle && !rma => Self::Fd,
-            _ => Self::None,
+            FabricBackend::SoftwareTcp => Self::Software,
+            FabricBackend::Verbs if park_idle => Self::Fd,
+            FabricBackend::Verbs => Self::None,
         }
     }
 }
@@ -264,387 +252,6 @@ pub(super) struct Resources {
     rx_offset: usize,
     rx_read: usize,
     rx_post: usize,
-    direct: bool,
-    rma: Option<RmaState>,
-}
-
-const GLOBAL_RMA_SOURCE_BYTES: usize = 256 * 1024 * 1024;
-const GLOBAL_RMA_DESTINATION_BYTES: usize = 256 * 1024 * 1024;
-const GLOBAL_RMA_REGION_SLOTS: usize = 65_536;
-const GLOBAL_RMA_DESTINATION_SLOTS: usize = 8_192;
-static RMA_SOURCE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static RMA_DESTINATION_BYTES: AtomicUsize = AtomicUsize::new(0);
-static RMA_REGION_SLOTS: AtomicUsize = AtomicUsize::new(0);
-static RMA_DESTINATION_SLOTS: AtomicUsize = AtomicUsize::new(0);
-const GLOBAL_RMA_DESTINATION_METADATA_SLOTS: usize = 8_192;
-static RMA_DESTINATION_METADATA_SLOTS: AtomicUsize = AtomicUsize::new(0);
-static NEXT_RMA_OWNER_ID: AtomicU64 = AtomicU64::new(1);
-
-struct PoolMetadataCharge {
-    source_slots: usize,
-    destination_slots: usize,
-}
-
-impl Drop for PoolMetadataCharge {
-    fn drop(&mut self) {
-        if self.source_slots != 0 {
-            RmaState::release(&RMA_REGION_SLOTS, self.source_slots);
-        }
-        if self.destination_slots != 0 {
-            RmaState::release(&RMA_DESTINATION_METADATA_SLOTS, self.destination_slots);
-        }
-    }
-}
-
-fn next_rma_owner_id() -> io::Result<u64> {
-    NEXT_RMA_OWNER_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
-        .map_err(|_| invalid("RMA endpoint identities exhausted"))
-}
-const FIRST_DYNAMIC_MR_KEY: u64 = 3;
-static NEXT_MR_KEY: AtomicU64 = AtomicU64::new(FIRST_DYNAMIC_MR_KEY);
-
-fn next_mr_key() -> io::Result<u64> {
-    NEXT_MR_KEY
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |key| {
-            key.checked_add(1)
-        })
-        .map_err(|_| invalid("libfabric MR key space exhausted"))
-}
-
-pub(super) fn release_destination_charge(bytes: usize, slots: usize) {
-    if bytes != 0 {
-        RmaState::release(&RMA_DESTINATION_BYTES, bytes);
-    }
-    if slots != 0 {
-        RmaState::release(&RMA_DESTINATION_SLOTS, slots);
-    }
-}
-
-struct SourceRegion {
-    id: u64,
-    generation: u64,
-    session_id: u64,
-    grant_generation: u64,
-    bytes: Option<Box<[u8]>>,
-    // Keep original WAL authority/file/log ownership tied to the exact MR;
-    // quarantining this endpoint therefore quarantines the source authority too.
-    retained_owner: Option<Arc<dyn Any + Send + Sync>>,
-    mr: *mut ffi::fid_mr,
-}
-
-struct ReadSlot {
-    storage: Arc<ReadBufferStorage>,
-    context: UnsafeCell<ffi::fi_context2>,
-    mr: *mut ffi::fid_mr,
-    generation: u64,
-    pending: bool,
-    complete: bool,
-    completion_error: u32,
-    cancel_state: Arc<AtomicU64>,
-}
-
-struct RmaState {
-    owner_id: u64,
-    config: RmaConfig,
-    capabilities: RmaCapabilities,
-    // Each cold grant owns one charged node; retirement frees that allocation
-    // immediately. Vec/VecDeque retain capacity after removal and would keep
-    // uncharged metadata. This list is not traversed by one-sided data reads.
-    #[allow(clippy::linkedlist)]
-    sources: std::collections::LinkedList<SourceRegion>,
-    // Includes live registrations and sources quarantined after uncertain MR close.
-    source_bytes_live: usize,
-    // Fixed before any fi_context2 is posted; neither elements nor contexts move.
-    destinations: Box<[ReadSlot]>,
-    next_destination: usize,
-    next_region: u64,
-    next_generation: u64,
-    metadata: PoolMetadataCharge,
-}
-
-impl RmaState {
-    fn reserve(counter: &AtomicUsize, limit: usize, amount: usize) -> bool {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(amount).filter(|next| *next <= limit)
-            })
-            .is_ok()
-    }
-
-    fn release(counter: &AtomicUsize, amount: usize) {
-        let previous = counter.fetch_sub(amount, Ordering::AcqRel);
-        debug_assert!(previous >= amount);
-    }
-    fn validate_config(config: RmaConfig) -> io::Result<()> {
-        let source_enabled = config.source_bytes > 0 && config.source_region_slots > 0;
-        let source_invalid = (config.source_bytes == 0) != (config.source_region_slots == 0);
-        let destination_enabled = config.destination_bytes > 0 && config.destination_slots > 0;
-        let destination_invalid =
-            (config.destination_bytes == 0) != (config.destination_slots == 0);
-        if source_invalid
-            || destination_invalid
-            || (!source_enabled && !destination_enabled)
-            || config.source_bytes > GLOBAL_RMA_SOURCE_BYTES
-            || config.destination_bytes > GLOBAL_RMA_DESTINATION_BYTES
-            || config.destination_slots > GLOBAL_RMA_DESTINATION_SLOTS
-            || (destination_enabled
-                && (config.destination_bytes / config.destination_slots == 0
-                    || (config.max_read_bytes > 0
-                        && config.destination_bytes / config.destination_slots
-                            < config.max_read_bytes)))
-        {
-            return Err(invalid("invalid RMA resource limits"));
-        }
-        Ok(())
-    }
-
-    fn cleanup_destinations(destinations: &mut [ReadSlot]) -> bool {
-        let mut uncertain = false;
-        for slot in destinations {
-            if !slot.mr.is_null() {
-                // SAFETY: Construction has not posted reads. Each non-null MR
-                // is uniquely owned here; uncertain close retains its storage.
-                let status = unsafe { ffi::fi_close(&raw mut (*slot.mr).fid) };
-                slot.mr = ptr::null_mut();
-                uncertain |= status != 0;
-            }
-        }
-        uncertain
-    }
-
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep ordered native registration and rollback ownership in one construction path."
-    )]
-    fn new(
-        domain: *mut ffi::fid_domain,
-        config: RmaConfig,
-        capabilities: RmaCapabilities,
-    ) -> io::Result<Self> {
-        Self::validate_config(config)?;
-        let destination_enabled = config.destination_slots > 0;
-        if destination_enabled
-            && (config.max_read_bytes == 0 || config.max_read_bytes > capabilities.max_read_bytes)
-        {
-            return Err(invalid("invalid negotiated RMA read limit"));
-        }
-        let owner_id = next_rma_owner_id()?;
-        if !Self::reserve(
-            &RMA_DESTINATION_METADATA_SLOTS,
-            GLOBAL_RMA_DESTINATION_METADATA_SLOTS,
-            config.destination_slots,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "global RMA destination metadata slots exhausted",
-            ));
-        }
-        let metadata = PoolMetadataCharge {
-            source_slots: 0,
-            destination_slots: config.destination_slots,
-        };
-        let mut destinations = Vec::with_capacity(config.destination_slots);
-        if destination_enabled {
-            let slot_bytes = config.destination_bytes / config.destination_slots;
-            for _ in 0..config.destination_slots {
-                let key = match next_mr_key() {
-                    Ok(key) => key,
-                    Err(err) => {
-                        if Self::cleanup_destinations(&mut destinations) {
-                            std::mem::forget(destinations);
-                            std::mem::forget(metadata);
-                        }
-                        return Err(err);
-                    }
-                };
-                if !Self::reserve(
-                    &RMA_DESTINATION_BYTES,
-                    GLOBAL_RMA_DESTINATION_BYTES,
-                    slot_bytes,
-                ) {
-                    if Self::cleanup_destinations(&mut destinations) {
-                        std::mem::forget(destinations);
-                        std::mem::forget(metadata);
-                    }
-                    return Err(io::Error::other("global RMA destination budget exhausted"));
-                }
-                if !Self::reserve(&RMA_DESTINATION_SLOTS, GLOBAL_RMA_DESTINATION_SLOTS, 1) {
-                    Self::release(&RMA_DESTINATION_BYTES, slot_bytes);
-                    if Self::cleanup_destinations(&mut destinations) {
-                        std::mem::forget(destinations);
-                        std::mem::forget(metadata);
-                    }
-                    return Err(io::Error::other("global RMA destination slots exhausted"));
-                }
-                let storage = Arc::new(ReadBufferStorage {
-                    bytes: (0..slot_bytes)
-                        .map(|_| UnsafeCell::new(0))
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                    len: AtomicUsize::new(0),
-                    charged_bytes: slot_bytes,
-                    charged_slots: 1,
-                });
-                let mut mr = ptr::null_mut();
-                // SAFETY: The caller supplies a live domain. The boxed slot has
-                // slot_bytes writable bytes in UnsafeCell and a stable address.
-                // Its Arc is retained until MR close, or leaked if close is uncertain.
-                let code = unsafe {
-                    ffi::fi_mr_reg(
-                        domain,
-                        storage.bytes.as_ptr().cast(),
-                        slot_bytes,
-                        u64::from(ffi::FI_READ),
-                        0,
-                        key,
-                        0,
-                        &raw mut mr,
-                        ptr::null_mut(),
-                    )
-                };
-                if code != 0 || mr.is_null() {
-                    // SAFETY: A non-null MR is owned by this registration attempt;
-                    // no read was posted. Failed close retains the slot allocation.
-                    let current_uncertain =
-                        !mr.is_null() && unsafe { ffi::fi_close(&raw mut (*mr).fid) } != 0;
-                    if current_uncertain {
-                        std::mem::forget(storage);
-                    }
-                    if Self::cleanup_destinations(&mut destinations) {
-                        std::mem::forget(destinations);
-                        std::mem::forget(metadata);
-                    }
-                    return Err(if code != 0 {
-                        error("register RMA destination", code.unsigned_abs())
-                    } else {
-                        invalid("RMA destination registration returned no MR")
-                    });
-                }
-                destinations.push(ReadSlot {
-                    storage,
-                    context: UnsafeCell::new(ffi::fi_context2::default()),
-                    mr,
-                    generation: 0,
-                    pending: false,
-                    complete: false,
-                    completion_error: 0,
-                    cancel_state: Arc::new(AtomicU64::new(0)),
-                });
-            }
-        }
-        let sources = std::collections::LinkedList::new();
-        Ok(Self {
-            owner_id,
-            config,
-            capabilities,
-            sources,
-            source_bytes_live: 0,
-            destinations: destinations.into_boxed_slice(),
-            next_destination: 0,
-            next_region: 1,
-            next_generation: 1,
-            metadata,
-        })
-    }
-
-    fn source_index(&self, region: &RegisteredReadRegion) -> io::Result<usize> {
-        if region.owner_id != self.owner_id {
-            return Err(invalid("read region belongs to another endpoint"));
-        }
-        self.sources
-            .iter()
-            .rposition(|source| {
-                source.id == region.region_id
-                    && source.generation == region.generation
-                    && source.session_id == region.session_id
-                    && source.grant_generation == region.grant_generation
-            })
-            .ok_or_else(|| invalid("read region reservation is not active"))
-    }
-
-    fn complete(&mut self, context: *mut c_void, completion_error: u32) -> io::Result<bool> {
-        // Contexts live in a fixed slice. Check integer geometry before indexing;
-        // never dereference an arbitrary provider-supplied context pointer.
-        let Some(base) = self
-            .destinations
-            .as_ptr()
-            .addr()
-            .checked_add(std::mem::offset_of!(ReadSlot, context))
-        else {
-            return Ok(false);
-        };
-        let Some(relative) = context.addr().checked_sub(base) else {
-            return Ok(false);
-        };
-        let stride = std::mem::size_of::<ReadSlot>();
-        if relative % stride != 0 {
-            return Ok(false);
-        }
-        let Some(slot) = self.destinations.get_mut(relative / stride) else {
-            return Ok(false);
-        };
-        if !slot.pending {
-            return Err(invalid("unexpected RMA completion context"));
-        }
-        slot.pending = false;
-        slot.completion_error = completion_error;
-        slot.complete =
-            slot.cancel_state.load(Ordering::Acquire) != (slot.generation | RMA_CANCELLED);
-        Ok(true)
-    }
-
-    fn validate_read_operation(&self, operation: &ReadOperation) -> io::Result<()> {
-        let Some(slot) = self.destinations.get(operation.slot) else {
-            return Err(invalid("unknown RMA operation slot"));
-        };
-        if slot.generation != operation.generation
-            || !Arc::ptr_eq(&slot.cancel_state, &operation.cancelled)
-        {
-            return Err(invalid("RMA operation belongs to another slot or endpoint"));
-        }
-        Ok(())
-    }
-
-    fn has_pending_reads(&self) -> bool {
-        self.destinations.iter().any(|slot| slot.pending)
-    }
-    fn read_slot_available(slot: &mut ReadSlot) -> bool {
-        if slot.pending || Arc::get_mut(&mut slot.storage).is_none() {
-            return false;
-        }
-        let cancelled =
-            slot.cancel_state.load(Ordering::Acquire) == (slot.generation | RMA_CANCELLED);
-        !slot.complete || cancelled
-    }
-
-    fn available_read_slots(&mut self) -> usize {
-        self.destinations
-            .iter_mut()
-            .map(Self::read_slot_available)
-            .filter(|available| *available)
-            .count()
-    }
-
-    fn close(&mut self) -> Result<(), i32> {
-        if self.sources.iter().any(|source| source.bytes.is_some()) || self.has_pending_reads() {
-            return Err(i32::try_from(ffi::FI_EBUSY).unwrap());
-        }
-        for slot in &mut self.destinations {
-            if !slot.mr.is_null() {
-                // SAFETY: This non-null MR is uniquely owned; all accepted reads
-                // have terminal completions. Storage stays live through close,
-                // and uncertain close retains it without retrying the MR.
-                let status = unsafe { ffi::fi_close(&raw mut (*slot.mr).fid) };
-                if status != 0 {
-                    slot.mr = ptr::null_mut();
-                    return Err(status);
-                }
-                slot.mr = ptr::null_mut();
-            }
-        }
-        Ok(())
-    }
 }
 
 struct Info(*mut ffi::fi_info);
@@ -660,69 +267,32 @@ impl Drop for Info {
 }
 
 impl Info {
-    fn hints(provider: &CStr, domain: &CStr, direct_fabric: bool, rma: bool) -> io::Result<Self> {
+    fn hints(provider: &CStr, domain: &CStr) -> io::Result<Self> {
         // SAFETY: No arguments. Info owns the result and releases it on all paths.
         let hints = Info(unsafe { ffi::fi_allocinfo() });
         if hints.0.is_null() {
             return Err(error("allocate fabric hints", ffi::FI_ENOMEM));
         }
-        let rma_caps = if rma {
-            u64::from(ffi::FI_RMA | ffi::FI_READ | ffi::FI_REMOTE_READ)
-        } else {
-            0
-        };
         // SAFETY: fi_allocinfo initializes all nested attribute allocations.
         // strdup gives ownership of matching C-allocator strings to fi_freeinfo.
         unsafe {
             (*(*hints.0).ep_attr).type_ = ffi::fi_ep_type_FI_EP_RDM;
-            (*hints.0).caps = u64::from(ffi::FI_MSG)
-                | rma_caps
-                | if direct_fabric {
-                    0
-                } else {
-                    ffi::FI_DIRECTED_RECV
-                };
-            (*hints.0).mode = if direct_fabric {
-                ffi::FI_CONTEXT2 | if rma { ffi::FI_RX_CQ_DATA } else { 0 }
-            } else {
-                ffi::FI_CONTEXT
-            };
+            (*hints.0).caps = u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV;
+            (*hints.0).mode = ffi::FI_CONTEXT;
             (*(*hints.0).domain_attr).threading = ffi::fi_threading_FI_THREAD_DOMAIN;
-            (*(*hints.0).domain_attr).__bindgen_anon_1.data_progress = if direct_fabric {
-                ffi::fi_progress_FI_PROGRESS_AUTO
-            } else {
-                ffi::fi_progress_FI_PROGRESS_MANUAL
-            };
-            let requested_mr_modes = if (rma && provider.to_bytes() == b"efa")
-                || provider.to_bytes() == b"verbs;ofi_rxm"
-            {
+            (*(*hints.0).domain_attr).__bindgen_anon_1.data_progress =
+                ffi::fi_progress_FI_PROGRESS_MANUAL;
+            let requested_mr_modes = if provider.to_bytes() == b"verbs;ofi_rxm" {
                 ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
-            } else if direct_fabric {
-                ffi::FI_MR_LOCAL | ffi::FI_MR_ALLOCATED
             } else {
                 ffi::FI_MR_LOCAL
             };
             (*(*hints.0).domain_attr).mr_mode = i32::try_from(requested_mr_modes).unwrap();
-            if !direct_fabric {
-                (*(*hints.0).tx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
-                (*(*hints.0).rx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
-            }
-            if provider.to_bytes() == b"efa" && !direct_fabric {
-                (*(*hints.0).tx_attr).size = efa::QUEUE;
-                (*(*hints.0).rx_attr).size = efa::QUEUE;
-            } else if direct_fabric {
-                (*(*hints.0).tx_attr).size = SLOTS;
-                (*(*hints.0).rx_attr).size = SLOTS;
-            }
+            (*(*hints.0).tx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
+            (*(*hints.0).rx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
             (*(*hints.0).fabric_attr).prov_name = libc::strdup(provider.as_ptr());
             if (*(*hints.0).fabric_attr).prov_name.is_null() {
                 return Err(error("allocate provider name", ffi::FI_ENOMEM));
-            }
-            if direct_fabric {
-                (*(*hints.0).fabric_attr).name = libc::strdup(c"efa-direct".as_ptr());
-                if (*(*hints.0).fabric_attr).name.is_null() {
-                    return Err(error("allocate direct fabric name", ffi::FI_ENOMEM));
-                }
             }
             if !domain.to_bytes().is_empty() {
                 (*(*hints.0).domain_attr).name = libc::strdup(domain.as_ptr());
@@ -806,21 +376,6 @@ fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
     }
 }
 
-fn is_registered_rdma_pci_device(bus_address: &str) -> bool {
-    let Ok(devices) = std::fs::read_dir("/sys/class/infiniband") else {
-        return false;
-    };
-    devices.filter_map(Result::ok).any(|device| {
-        std::fs::canonicalize(device.path().join("device"))
-            .ok()
-            .and_then(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_owned)
-            })
-            .is_some_and(|name| name == bus_address)
-    })
-}
 fn format_version(version: u32) -> String {
     format!("{}.{}", version >> 16, version & 0xffff)
 }
@@ -999,48 +554,19 @@ impl Resources {
         clippy::too_many_lines,
         reason = "Keep validated provider info and partial resource ownership in one ordered setup path"
     )]
-    pub(super) fn open_mode(
-        &mut self,
-        config: &FabricConfig,
-        rma: Option<RmaConfig>,
-        park_idle: bool,
-    ) -> io::Result<()> {
+    pub(super) fn open_mode(&mut self, config: &FabricConfig, park_idle: bool) -> io::Result<()> {
         config.validate()?;
         let discovery = Instant::now();
         let provider_name = config.backend.provider();
         let provider = CString::new(provider_name).map_err(invalid)?;
         let domain = CString::new(config.domain.as_deref().unwrap_or_default()).map_err(invalid)?;
-        let direct_fabric = config.backend.is_direct();
-        let is_efa = matches!(
-            config.backend,
-            FabricBackend::Efa | FabricBackend::EfaDirect
-        );
-        if config.backend == FabricBackend::Efa && rma.is_some() {
-            return Err(invalid(
-                "regular EFA RMA is unsupported; select the explicit efa-direct backend",
-            ));
-        }
-        self.direct = direct_fabric;
         let slots = config.effective_slots();
         self.set_slots(slots);
         // Software RxM parks in bounded fi_cq_sread. Verbs parks on a provider
         // wait fd only when the owner asks (`park_idle`): the wait object adds
         // signalling work to every completion, which a polling client never needs.
-        let wait_request =
-            WaitRequest::select(config.backend, park_idle, direct_fabric, rma.is_some());
-        if let Some(config) = rma {
-            RmaState::validate_config(config)?;
-        }
-        if config.backend == FabricBackend::Efa {
-            efa::check_environment()?;
-            self.open_profile.requested_tx = efa::QUEUE;
-            self.open_profile.requested_rx = efa::QUEUE;
-        } else if direct_fabric {
-            self.open_profile.requested_tx = SLOTS;
-            self.open_profile.requested_rx = SLOTS;
-        }
-        let mut active_rma = rma;
-        let mut hints = Info::hints(&provider, &domain, direct_fabric, active_rma.is_some())?;
+        let wait_request = WaitRequest::select(config.backend, park_idle);
+        let hints = Info::hints(&provider, &domain)?;
         let source_v4 = config.source_address.and_then(|address| match address {
             std::net::IpAddr::V4(address) => Some(libc::sockaddr_in {
                 sin_family: libc::sa_family_t::try_from(libc::AF_INET).unwrap(),
@@ -1102,46 +628,15 @@ impl Resources {
             Ok(())
         };
         apply_source_hint(&hints)?;
-        let api = (1 << 16)
-            | if provider.as_bytes() == b"efa" {
-                18
-            } else {
-                11
-            };
+        let api = (1 << 16) | 11;
         let mut info = Info(ptr::null_mut());
         // SAFETY: Hints and output storage are live through this synchronous call.
-        let mut discovered =
+        let discovered =
             unsafe { ffi::fi_getinfo(api, ptr::null(), ptr::null(), 0, hints.0, &raw mut info.0) };
-        if discovered != 0 && active_rma.is_some_and(|config| !config.require_device_read) {
-            drop(info);
-            info = Info(ptr::null_mut());
-            active_rma = None;
-            hints = Info::hints(&provider, &domain, direct_fabric, false)?;
-            apply_source_hint(&hints)?;
-            // SAFETY: The replacement hints and empty Info output are live for
-            // this synchronous call; Info owns any returned allocation.
-            discovered = unsafe {
-                ffi::fi_getinfo(api, ptr::null(), ptr::null(), 0, hints.0, &raw mut info.0)
-            };
-        }
-        if direct_fabric && discovered != 0 {
-            let code = discovered.unsigned_abs();
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "efa-direct hardware unavailable: {}",
-                    error("discover direct fabric", code)
-                ),
-            ));
-        }
         check("discover explicit fabric provider", discovered)?;
         self.open_profile.discovery_ns = elapsed_ns(discovery);
         if info.0.is_null() {
-            return Err(invalid(if direct_fabric {
-                "efa-direct hardware unavailable: no direct fabric info"
-            } else {
-                "fabric returned no provider info"
-            }));
+            return Err(invalid("fabric returned no provider info"));
         }
         // SAFETY: info owns the non-null fi_getinfo result throughout this block.
         // Required attribute pointers are checked before use; optional NIC fields
@@ -1150,7 +645,6 @@ impl Resources {
         // used only after successful creation and saved for ordered teardown.
         // Registered buffers and contexts stay allocated until close succeeds;
         // output pointers address live locals or exclusively borrowed fields.
-        let mut selected_rma_capabilities = None;
         unsafe {
             let selected = &*info.0;
             if selected.fabric_attr.is_null()
@@ -1182,65 +676,21 @@ impl Resources {
             let provider_name = (*selected.fabric_attr).prov_name;
             let fabric_name = (*selected.fabric_attr).name;
             let mr_mode = (*selected.domain_attr).mr_mode;
-            let supported_mr_modes = if direct_fabric
-                || is_efa
-                || provider.as_bytes() == b"verbs;ofi_rxm"
-            {
+            let supported_mr_modes = if provider.as_bytes() == b"verbs;ofi_rxm" {
                 ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
             } else {
                 ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR
             };
-            let valid_identity = if direct_fabric {
-                !provider_name.is_null()
-                    && CStr::from_ptr(provider_name).to_bytes() == b"efa"
-                    && !fabric_name.is_null()
-                    && CStr::from_ptr(fabric_name).to_bytes() == b"efa-direct"
-            } else {
-                !provider_name.is_null() && CStr::from_ptr(provider_name) == provider.as_c_str()
-            };
-            let allowed_direct_modes = ffi::FI_CONTEXT2
-                | ffi::FI_CONTEXT
-                | if active_rma.is_some() {
-                    ffi::FI_RX_CQ_DATA
-                } else {
-                    0
-                };
-            let valid_direct_geometry =
-                if direct_fabric && !selected.nic.is_null() && !(*selected.nic).link_attr.is_null()
-                {
-                    efa_direct::validate(
-                        (*selected.fabric_attr).prov_version,
-                        (*selected.ep_attr).protocol,
-                        (*selected.ep_attr).protocol_version,
-                        (*selected.ep_attr).max_msg_size,
-                        active_rma.is_some(),
-                        (*selected.tx_attr).size,
-                        (*selected.rx_attr).size,
-                        selected.mode,
-                        (*selected.domain_attr).__bindgen_anon_1.data_progress,
-                        mr_mode,
-                        (*(*selected.nic).link_attr).mtu,
-                    )?
-                } else {
-                    !direct_fabric
-                };
-            let rma_caps = u64::from(ffi::FI_RMA | ffi::FI_READ | ffi::FI_REMOTE_READ);
-            let valid_rma = active_rma.is_none()
-                || (selected.caps & rma_caps == rma_caps
-                    && (*selected.tx_attr).rma_iov_limit > 0
-                    && ((*selected.ep_attr).max_order_raw_size > 0
-                        || (*selected.ep_attr).max_msg_size > 0));
-            let valid_normal = direct_fabric
-                || ((*selected.ep_attr).max_msg_size >= CHUNK
-                    && selected.caps & (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
-                        == (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
-                    && (*selected.tx_attr).msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
-                    && (*selected.rx_attr).msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
-                    && selected.mode & !ffi::FI_CONTEXT == 0);
+            let valid_identity =
+                !provider_name.is_null() && CStr::from_ptr(provider_name) == provider.as_c_str();
+            let valid_normal = (*selected.ep_attr).max_msg_size >= CHUNK
+                && selected.caps & (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
+                    == (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
+                && (*selected.tx_attr).msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
+                && (*selected.rx_attr).msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
+                && selected.mode & !ffi::FI_CONTEXT == 0;
             if !valid_identity
-                || !valid_direct_geometry
                 || !valid_normal
-                || !valid_rma
                 || (*selected.ep_attr).type_ != ffi::fi_ep_type_FI_EP_RDM
                 || selected.caps & u64::from(ffi::FI_MSG) == 0
                 || (*selected.tx_attr).iov_limit == 0
@@ -1252,17 +702,8 @@ impl Resources {
                 || (*selected.tx_attr).size < slots
                 || (*selected.rx_attr).size < slots
                 || mr_mode & !i32::try_from(supported_mr_modes).unwrap() != 0
-                || (direct_fabric && mr_mode & i32::try_from(ffi::FI_MR_LOCAL).unwrap() == 0)
-                || (direct_fabric
-                    && ((*selected.tx_attr).mode | (*selected.rx_attr).mode)
-                        & !allowed_direct_modes
-                        != 0)
             {
-                return Err(invalid(if direct_fabric {
-                    "unsupported efa-direct fabric capabilities"
-                } else {
-                    "unsupported fabric provider capabilities"
-                }));
+                return Err(invalid("unsupported fabric provider capabilities"));
             }
             self.open_profile.selected_tx = (*selected.tx_attr).size;
             self.open_profile.selected_rx = (*selected.rx_attr).size;
@@ -1270,55 +711,10 @@ impl Resources {
             if !selected.nic.is_null() && !(*selected.nic).link_attr.is_null() {
                 self.open_profile.mtu = (*(*selected.nic).link_attr).mtu;
             }
-            if is_efa && !direct_fabric {
-                efa::validate(
-                    self.open_profile,
-                    (*selected.ep_attr).protocol,
-                    (*selected.ep_attr).protocol_version,
-                )?;
-            }
-            if let Some(rma_config) = active_rma {
-                let provider_limit = if (*selected.ep_attr).max_order_raw_size > 0 {
-                    (*selected.ep_attr).max_order_raw_size
-                } else {
-                    (*selected.ep_attr).max_msg_size
-                };
-                let requested_read_limit = if rma_config.max_read_bytes == 0 {
-                    provider_limit
-                } else {
-                    rma_config.max_read_bytes
-                };
-                let destination_limit = if rma_config.destination_slots == 0 {
-                    usize::MAX
-                } else {
-                    rma_config.destination_bytes / rma_config.destination_slots
-                };
-                let max_read_bytes = requested_read_limit
-                    .min(provider_limit)
-                    .min(destination_limit);
-                if max_read_bytes == 0 && rma_config.destination_slots > 0 {
-                    return Err(invalid("provider selected no usable RMA read size"));
-                }
-                selected_rma_capabilities = Some(RmaCapabilities {
-                    address_mode: if mr_mode & i32::try_from(ffi::FI_MR_VIRT_ADDR).unwrap() != 0 {
-                        RmaAddressMode::Virtual
-                    } else {
-                        RmaAddressMode::Offset
-                    },
-                    read_mode: match config.backend {
-                        FabricBackend::SoftwareTcp => RmaReadMode::Emulated,
-                        FabricBackend::EfaDirect | FabricBackend::Verbs | FabricBackend::Efa => {
-                            RmaReadMode::Unknown
-                        }
-                    },
-                    max_read_bytes,
-                    max_iov: (*selected.tx_attr).rma_iov_limit,
-                });
-            }
             self.addr_format = selected.addr_format;
             if !matches!(
                 self.addr_format,
-                ffi::FI_ADDR_EFA | ffi::FI_SOCKADDR | ffi::FI_SOCKADDR_IN | ffi::FI_SOCKADDR_IN6
+                ffi::FI_SOCKADDR | ffi::FI_SOCKADDR_IN | ffi::FI_SOCKADDR_IN6
             ) {
                 return Err(invalid("unsupported fabric address format"));
             }
@@ -1334,98 +730,8 @@ impl Resources {
                 ffi::fi_domain(self.fabric, info.0, &raw mut self.domain, ptr::null_mut()),
             )?;
             self.open_profile.domain_ns = elapsed_ns(stage);
-            self.open_endpoint(
-                info.0,
-                active_rma.map_or(0, |config| config.destination_slots),
-                wait_request,
-            )?;
+            self.open_endpoint(info.0, wait_request)?;
             let stage = Instant::now();
-            if let (Some(rma_config), Some(mut capabilities)) =
-                (active_rma, selected_rma_capabilities)
-            {
-                if rma_config.destination_slots > 0 {
-                    let mut provider_max = 0_usize;
-                    let mut option_len = mem::size_of::<usize>();
-                    // SAFETY: The selected endpoint and query buffers are valid.
-                    let option_status = ffi::fi_getopt(
-                        &raw mut (*self.ep).fid,
-                        i32::try_from(ffi::FI_OPT_ENDPOINT).unwrap(),
-                        i32::try_from(ffi::FI_OPT_MAX_RMA_SIZE).unwrap(),
-                        (&raw mut provider_max).cast(),
-                        &raw mut option_len,
-                    );
-                    if option_status == 0
-                        && option_len == mem::size_of::<usize>()
-                        && provider_max > 0
-                    {
-                        capabilities.max_read_bytes = capabilities.max_read_bytes.min(provider_max);
-                    }
-                }
-                if is_efa {
-                    let mut emulated = true;
-                    let mut option_len = mem::size_of::<bool>();
-                    // SAFETY: EFA defines this endpoint option as a C bool and
-                    // synchronously writes its native/emulated-read selection.
-                    let option_status = ffi::fi_getopt(
-                        &raw mut (*self.ep).fid,
-                        i32::try_from(ffi::FI_OPT_ENDPOINT).unwrap(),
-                        ffi::FI_OPT_EFA_EMULATED_READ,
-                        (&raw mut emulated).cast(),
-                        &raw mut option_len,
-                    );
-                    if option_status == 0 && option_len == mem::size_of::<bool>() {
-                        capabilities.read_mode = if emulated {
-                            RmaReadMode::Emulated
-                        } else {
-                            RmaReadMode::Native
-                        };
-                    }
-                } else if config.backend == FabricBackend::Verbs {
-                    let nic = selected.nic;
-                    if !nic.is_null() && !(*nic).device_attr.is_null() && !(*nic).bus_attr.is_null()
-                    {
-                        let device = &*(*nic).device_attr;
-                        let bus = &*(*nic).bus_attr;
-                        let driver = if device.driver.is_null() {
-                            String::new()
-                        } else {
-                            CStr::from_ptr(device.driver)
-                                .to_string_lossy()
-                                .to_ascii_lowercase()
-                        };
-                        if bus.bus_type == ffi::fi_bus_type_FI_BUS_PCI
-                            && !device.name.is_null()
-                            && !CStr::from_ptr(device.name).to_bytes().is_empty()
-                            && !device.device_id.is_null()
-                            && !CStr::from_ptr(device.device_id).to_bytes().is_empty()
-                            && !driver.is_empty()
-                            && driver != "rxe"
-                            && driver != "rdma_rxe"
-                            && driver != "siw"
-                        {
-                            let pci = bus.attr.pci;
-                            let bus_address = format!(
-                                "{:04x}:{:02x}:{:02x}.{}",
-                                pci.domain_id, pci.bus_id, pci.device_id, pci.function_id
-                            );
-                            // `verbs;ofi_rxm` reports FI_READ only when its core
-                            // provider supports RMA; require this exact PCI
-                            // function to be registered as an RDMA device too.
-                            if is_registered_rdma_pci_device(&bus_address) {
-                                capabilities.read_mode = RmaReadMode::Native;
-                            }
-                        }
-                    }
-                }
-                if rma_config.require_device_read && capabilities.read_mode != RmaReadMode::Native {
-                    return Err(invalid(
-                        "selected provider/device cannot attest native hardware RMA reads",
-                    ));
-                }
-                let mut rma_config = rma_config;
-                rma_config.max_read_bytes = capabilities.max_read_bytes;
-                self.rma = Some(RmaState::new(self.domain, rma_config, capabilities)?);
-            }
             if mr_mode & i32::try_from(ffi::FI_MR_LOCAL).unwrap() != 0 {
                 check(
                     "register transmit buffer",
@@ -1497,30 +803,6 @@ impl Resources {
                 } else {
                     (None, None, None)
                 };
-            let rma_capabilities = self.rma.as_ref().map(|rma| rma.capabilities);
-            let capability_evidence = match (config.backend, rma_capabilities) {
-                (_, None) => "libfabric fi_getinfo provider/domain selection".to_owned(),
-                (FabricBackend::SoftwareTcp, Some(_)) => {
-                    "libfabric FI_READ capability; software provider, no hardware evidence".to_owned()
-                }
-                (FabricBackend::Efa | FabricBackend::EfaDirect, Some(capabilities))
-                    if capabilities.read_mode == RmaReadMode::Native =>
-                {
-                    "EFA FI_OPT_EFA_EMULATED_READ returned false".to_owned()
-                }
-                (FabricBackend::Efa | FabricBackend::EfaDirect, Some(capabilities))
-                    if capabilities.read_mode == RmaReadMode::Emulated =>
-                {
-                    "EFA FI_OPT_EFA_EMULATED_READ returned true".to_owned()
-                }
-                (FabricBackend::Verbs, Some(capabilities))
-                    if capabilities.read_mode == RmaReadMode::Native =>
-                {
-                    "verbs;ofi_rxm FI_READ with selected PCI BDF matched to /sys/class/infiniband; Falcon identity not inferred"
-                        .to_owned()
-                }
-                (_, Some(_)) => "FI_READ capability selected; native hardware read unverified".to_owned(),
-            };
             self.provider_info = Some(ProviderInfo {
                 backend: config.backend,
                 provider: optional_c_string(provider_name).unwrap_or_default(),
@@ -1530,8 +812,7 @@ impl Resources {
                 device,
                 driver,
                 bus_address,
-                rma_capabilities,
-                capability_evidence,
+                capability_evidence: "libfabric fi_getinfo provider/domain selection".to_owned(),
                 geometry: capture_geometry(selected, api, slots, &self.cq_wait_note),
             });
         }
@@ -1541,14 +822,10 @@ impl Resources {
     fn open_endpoint(
         &mut self,
         info: *mut ffi::fi_info,
-        rma_slots: usize,
         wait_request: WaitRequest,
     ) -> io::Result<()> {
-        let cq_size = (2 * self.slots())
-            .checked_add(rma_slots)
-            .ok_or_else(|| invalid("RMA completion queue size overflow"))?;
         let mut cq = ffi::fi_cq_attr {
-            size: cq_size,
+            size: 2 * self.slots(),
             format: ffi::fi_cq_format_FI_CQ_FORMAT_MSG,
             wait_obj: match wait_request {
                 WaitRequest::None => ffi::fi_wait_obj_FI_WAIT_NONE,
@@ -1690,428 +967,9 @@ impl Resources {
         self.open_profile.peer_setup_ns = elapsed_ns(stage);
         Ok(())
     }
-    pub(super) fn rma_capabilities(&self) -> Option<RmaCapabilities> {
-        self.rma.as_ref().map(|rma| rma.capabilities)
-    }
-    pub(super) fn validate_read_operation(&self, operation: &ReadOperation) -> io::Result<()> {
-        self.rma
-            .as_ref()
-            .ok_or_else(|| invalid("endpoint was not opened for RMA"))?
-            .validate_read_operation(operation)
-    }
-    pub(super) fn available_read_slots(&mut self) -> io::Result<usize> {
-        self.rma
-            .as_mut()
-            .map(RmaState::available_read_slots)
-            .ok_or_else(|| invalid("endpoint was not opened for RMA"))
-    }
-
-    pub(super) fn has_live_read_regions(&self) -> bool {
-        self.rma
-            .as_ref()
-            .is_some_and(|rma| rma.sources.iter().any(|region| region.bytes.is_some()))
-    }
-
-    pub(super) fn reserve_read_region(
-        &mut self,
-        session_id: u64,
-        grant_generation: u64,
-    ) -> io::Result<RegisteredReadRegion> {
-        if self.peer.is_none() || session_id == 0 || grant_generation == 0 {
-            return Err(invalid(
-                "read region requires a bound peer and grant identity",
-            ));
-        }
-        let rma = self
-            .rma
-            .as_mut()
-            .ok_or_else(|| invalid("endpoint was not opened for RMA"))?;
-        if rma.sources.len() >= rma.config.source_region_slots {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "RMA source region slots exhausted",
-            ));
-        }
-        let id = rma.next_region;
-        let generation = rma.next_generation;
-        let next_id = id
-            .checked_add(1)
-            .ok_or_else(|| invalid("RMA region identifiers exhausted"))?;
-        let next_generation = generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("RMA region generations exhausted"))?;
-        rma.next_region = next_id;
-        rma.next_generation = next_generation;
-        if !RmaState::reserve(&RMA_REGION_SLOTS, GLOBAL_RMA_REGION_SLOTS, 1) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "global RMA source metadata slots exhausted",
-            ));
-        }
-        rma.metadata.source_slots += 1;
-        rma.sources.push_back(SourceRegion {
-            id,
-            generation,
-            session_id,
-            grant_generation,
-            bytes: None,
-            retained_owner: None,
-            mr: ptr::null_mut(),
-        });
-        Ok(RegisteredReadRegion {
-            owner_id: rma.owner_id,
-            region_id: id,
-            generation,
-            session_id,
-            grant_generation,
-        })
-    }
-
-    pub(super) fn register_read_region(
-        &mut self,
-        region: &RegisteredReadRegion,
-        bytes: Vec<u8>,
-    ) -> io::Result<RemoteReadRegion> {
-        self.register_read_region_with_owner(region, bytes, None, None)
-    }
-
-    // Keep MR registration, uncertain-close retention and both resource charges
-    // in one ownership scope so every rollback can be audited together.
-    #[allow(clippy::too_many_lines)]
-    pub(super) fn register_read_region_with_owner(
-        &mut self,
-        region: &RegisteredReadRegion,
-        bytes: Vec<u8>,
-        owner: Option<Arc<dyn Any + Send + Sync>>,
-        observation: Option<&mut Option<(u64, bool)>>,
-    ) -> io::Result<RemoteReadRegion> {
-        if self.peer.is_none() {
-            return Err(invalid("read region requires a bound peer"));
-        }
-        let rma = self
-            .rma
-            .as_mut()
-            .ok_or_else(|| invalid("endpoint was not opened for RMA"))?;
-        if region.owner_id != rma.owner_id {
-            return Err(invalid("read region belongs to another endpoint"));
-        }
-        let source = rma
-            .sources
-            .iter_mut()
-            .rev()
-            .find(|source| {
-                source.id == region.region_id
-                    && source.generation == region.generation
-                    && source.session_id == region.session_id
-                    && source.grant_generation == region.grant_generation
-            })
-            .ok_or_else(|| invalid("read region reservation is not active"))?;
-        if source.bytes.is_some() || !source.mr.is_null() {
-            return Err(invalid("read region reservation is already registered"));
-        }
-        let len = bytes.len();
-        let resident = rma.source_bytes_live;
-        if len == 0
-            || len > rma.config.source_bytes
-            || resident
-                .checked_add(len)
-                .is_none_or(|total| total > rma.config.source_bytes)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "RMA source region byte budget exhausted",
-            ));
-        }
-        let key = next_mr_key()?;
-        if !RmaState::reserve(&RMA_SOURCE_BYTES, GLOBAL_RMA_SOURCE_BYTES, len) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "global RMA source byte budget exhausted",
-            ));
-        }
-        let bytes = bytes.into_boxed_slice();
-        let remote_address = match rma.capabilities.address_mode {
-            RmaAddressMode::Virtual => {
-                let Ok(address) = u64::try_from(bytes.as_ptr() as usize) else {
-                    RmaState::release(&RMA_SOURCE_BYTES, len);
-                    return Err(invalid("RMA source address does not fit provider format"));
-                };
-                address
-            }
-            RmaAddressMode::Offset => 0,
-        };
-        let Ok(remote_len) = u64::try_from(len) else {
-            RmaState::release(&RMA_SOURCE_BYTES, len);
-            return Err(invalid("RMA source length overflow"));
-        };
-        let mut mr = ptr::null_mut();
-        // SAFETY: self.domain is live. The box owns len initialized immutable
-        // bytes at a stable address until MR close, or quarantine on uncertain
-        // close. Only remote reads are enabled, and mr is a live output local.
-        let began = observation.as_ref().map(|_| std::time::Instant::now());
-        let status = unsafe {
-            ffi::fi_mr_reg(
-                self.domain,
-                bytes.as_ptr().cast(),
-                len,
-                u64::from(ffi::FI_REMOTE_READ),
-                0,
-                key,
-                0,
-                &raw mut mr,
-                ptr::null_mut(),
-            )
-        };
-        if let (Some(observation), Some(began)) = (observation, began) {
-            *observation = Some((
-                u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                status != 0 || mr.is_null(),
-            ));
-        }
-        if status != 0 || mr.is_null() {
-            let registration_error = if status != 0 {
-                error("register read-only source region", status.unsigned_abs())
-            } else {
-                invalid("RMA source registration returned no MR")
-            };
-            let mut retained = false;
-            if !mr.is_null() {
-                // SAFETY: Registration returned this owned MR, but its descriptor
-                // has not escaped. Failed close quarantines the source allocation.
-                let close_status = unsafe { ffi::fi_close(&raw mut (*mr).fid) };
-                if close_status != 0 {
-                    rma.source_bytes_live += len;
-                    source.bytes = Some(bytes);
-                    source.retained_owner = owner;
-                    source.mr = ptr::null_mut();
-                    retained = true;
-                }
-            }
-            if !retained {
-                RmaState::release(&RMA_SOURCE_BYTES, len);
-            }
-            return Err(registration_error);
-        }
-        rma.source_bytes_live += len;
-        source.bytes = Some(bytes);
-        source.retained_owner = owner;
-        source.mr = mr;
-        Ok(RemoteReadRegion {
-            region_id: region.region_id,
-            generation: region.generation,
-            remote_address,
-            // SAFETY: Successful registration returned this live read-only MR.
-            key: unsafe { ffi::fi_mr_key(mr) },
-            len: remote_len,
-        })
-    }
-
-    pub(super) fn retire_read_region(
-        &mut self,
-        region: RegisteredReadRegion,
-        token: PeerDrainToken,
-    ) -> io::Result<()> {
-        if region.session_id != token.session_id
-            || region.grant_generation != token.grant_generation
-        {
-            return Err(invalid("read region drain token identity mismatch"));
-        }
-        self.retire_source_region(region)
-    }
-    /// Reclaims a region only when its descriptor was never exposed to a peer.
-    ///
-    /// # Safety
-    /// The caller must prove that neither the region descriptor nor any
-    /// equivalent address/key/length was ever published to the remote peer.
-    /// Otherwise a remote `FI_READ` may still access these bytes.
-    pub(super) unsafe fn retire_unpublished_read_region(
-        &mut self,
-        region: RegisteredReadRegion,
-    ) -> io::Result<()> {
-        self.retire_source_region(region)
-    }
-
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "Retirement consumes the one-shot region capability, including on failure."
-    )]
-    fn retire_source_region(&mut self, region: RegisteredReadRegion) -> io::Result<()> {
-        let rma = self
-            .rma
-            .as_mut()
-            .ok_or_else(|| invalid("endpoint was not opened for RMA"))?;
-        let index = rma.source_index(&region)?;
-        let source = rma.sources.iter_mut().nth(index).unwrap();
-        if source.bytes.is_none() {
-            if !source.mr.is_null() {
-                return Err(invalid(
-                    "unregistered source reservation unexpectedly has an MR",
-                ));
-            }
-            let mut suffix = rma.sources.split_off(index);
-            suffix.pop_front();
-            rma.sources.append(&mut suffix);
-            rma.metadata.source_slots -= 1;
-            RmaState::release(&RMA_REGION_SLOTS, 1);
-            return Ok(());
-        }
-        if source.mr.is_null() {
-            return Err(io::Error::other(
-                "source registration is quarantined after uncertain MR close",
-            ));
-        }
-        // SAFETY: The caller proved either exact-peer terminal drain or that no
-        // source descriptor escaped. The MR remains uniquely owned here.
-        let status = unsafe { ffi::fi_close(&raw mut (*source.mr).fid) };
-        if status != 0 {
-            // efa_mr_close may free its MR wrapper even when deregistration
-            // fails. Never retry this FID; keep the allocation/domain quarantined.
-            source.mr = ptr::null_mut();
-            return Err(error(
-                "retire read-only source region",
-                status.unsigned_abs(),
-            ));
-        }
-        let mut suffix = rma.sources.split_off(index);
-        let source = suffix.pop_front().unwrap();
-        rma.sources.append(&mut suffix);
-        rma.metadata.source_slots -= 1;
-        RmaState::release(&RMA_REGION_SLOTS, 1);
-        rma.source_bytes_live -= source.bytes.as_ref().map_or(0, |bytes| bytes.len());
-        RmaState::release(
-            &RMA_SOURCE_BYTES,
-            source.bytes.as_ref().map_or(0, |bytes| bytes.len()),
-        );
-        Ok(())
-    }
-
-    pub(super) fn try_post_read(
-        &mut self,
-        remote: &RemoteReadRegion,
-        offset: usize,
-        len: usize,
-    ) -> io::Result<ReadOperation> {
-        let peer = self.peer.ok_or_else(|| invalid("missing fabric peer"))?;
-        let rma = self
-            .rma
-            .as_mut()
-            .ok_or_else(|| invalid("endpoint was not opened for RMA"))?;
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| invalid("RMA read range overflow"))?;
-        let remote_len = usize::try_from(remote.len)
-            .map_err(|_| invalid("remote RMA region length does not fit local size"))?;
-        if remote.region_id == 0
-            || remote.generation == 0
-            || len == 0
-            || len > rma.config.max_read_bytes
-            || end > remote_len
-        {
-            return Err(invalid("RMA read range outside negotiated limits"));
-        }
-        let offset_u64 = u64::try_from(offset).map_err(|_| invalid("RMA offset overflow"))?;
-        let transfer_len = u64::try_from(len).map_err(|_| invalid("RMA read length overflow"))?;
-        // The peer publishes its own address convention: zero for an MR-relative
-        // window, or its virtual base. Local MR mode does not describe the peer.
-        let remote_addr = remote
-            .remote_address
-            .checked_add(offset_u64)
-            .ok_or_else(|| invalid("remote RMA address overflow"))?;
-        remote_addr
-            .checked_add(transfer_len)
-            .ok_or_else(|| invalid("remote RMA address range overflow"))?;
-        let slots = rma.destinations.len();
-        let first_slot = rma.next_destination;
-        let slot_index = (0..slots)
-            .map(|distance| (first_slot + distance) % slots)
-            .find(|&index| RmaState::read_slot_available(&mut rma.destinations[index]));
-        let slot_index = slot_index.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::WouldBlock, "RMA destination pool exhausted")
-        })?;
-        let slot = &mut rma.destinations[slot_index];
-        if slot.complete {
-            slot.complete = false;
-            slot.completion_error = 0;
-        }
-        let generation = slot
-            .generation
-            .checked_add(1)
-            .filter(|generation| *generation < RMA_CANCELLED)
-            .ok_or_else(|| invalid("RMA operation generations exhausted"))?;
-        let desc = if slot.mr.is_null() {
-            ptr::null_mut()
-        } else {
-            // SAFETY: This live destination MR is retained through CQ completion
-            // and final consumer release; no deregistration can race this call.
-            unsafe { ffi::fi_mr_desc(slot.mr) }
-        };
-        // SAFETY: The endpoint, peer and destination MR are live. Range checks
-        // bound len by this slot's allocation; exclusive Arc ownership and no
-        // pending read prevent aliasing. The UnsafeCell bytes and fixed context
-        // survive terminal CQ completion, or quarantine on uncertain teardown.
-        let code = unsafe {
-            ffi::fi_read(
-                self.ep,
-                slot.storage.bytes.as_ptr().cast_mut().cast(),
-                len,
-                desc,
-                peer,
-                remote_addr,
-                remote.key,
-                slot.context.get().cast(),
-            )
-        };
-        if !posted("post RMA read", code)? {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        slot.storage.len.store(len, Ordering::Release);
-        slot.generation = generation;
-        slot.cancel_state.store(generation, Ordering::Release);
-        slot.pending = true;
-        slot.complete = false;
-        slot.completion_error = 0;
-        let cancelled = Arc::clone(&slot.cancel_state);
-        rma.next_destination = (slot_index + 1) % slots;
-        Ok(ReadOperation {
-            slot: slot_index,
-            generation,
-            cancelled,
-            finished: false,
-        })
-    }
-
-    pub(super) fn take_read_completion(
-        &mut self,
-        operation: &mut ReadOperation,
-    ) -> io::Result<Option<io::Result<ReadBuffer>>> {
-        let Some(rma) = self.rma.as_mut() else {
-            return Err(invalid("endpoint was not opened for RMA"));
-        };
-        rma.validate_read_operation(operation)?;
-        let slot = &mut rma.destinations[operation.slot];
-        if slot.pending || !slot.complete {
-            return Ok(None);
-        }
-        slot.complete = false;
-        operation.finished = true;
-        if slot.completion_error != 0 {
-            let code = std::mem::replace(&mut slot.completion_error, 0);
-            return Ok(Some(Err(error("RMA read completion", code))));
-        }
-        Ok(Some(Ok(ReadBuffer {
-            storage: Arc::clone(&slot.storage),
-        })))
-    }
 
     pub(super) fn free_send_slot(&self) -> Option<usize> {
-        if self.direct {
-            let data_slots = self.slots() - 1;
-            self.tx_pending[..data_slots]
-                .iter()
-                .position(|pending| !pending)
-        } else {
-            self.tx_pending.iter().position(|pending| !pending)
-        }
+        self.tx_pending.iter().position(|pending| !pending)
     }
     pub(super) fn sends_pending(&self) -> bool {
         self.tx_pending.iter().any(|pending| *pending)
@@ -2128,24 +986,6 @@ impl Resources {
     pub(super) fn progress_stats(&self) -> ProgressStats {
         self.progress_stats
     }
-    pub(super) fn record_direct_data_post(&mut self, piggyback_advanced: bool) {
-        self.progress_stats.efa_direct_data_posts =
-            self.progress_stats.efa_direct_data_posts.saturating_add(1);
-        if piggyback_advanced {
-            self.progress_stats.efa_direct_credit_piggyback_advances = self
-                .progress_stats
-                .efa_direct_credit_piggyback_advances
-                .saturating_add(1);
-        }
-    }
-
-    pub(super) fn record_direct_credit_post(&mut self) {
-        self.progress_stats.efa_direct_credit_posts = self
-            .progress_stats
-            .efa_direct_credit_posts
-            .saturating_add(1);
-    }
-
     pub(super) fn configure_progress_stats(&mut self, enabled: bool, reset: bool) {
         self.time_progress = enabled;
         self.last_poll = None;
@@ -2155,40 +995,6 @@ impl Resources {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn enable_test_packet_adapter(&mut self) {
-        self.direct = true;
-    }
-
-    pub(super) fn free_control_slot(&self) -> Option<usize> {
-        self.direct
-            .then(|| self.slots() - 1)
-            .filter(|&slot| !self.tx_pending[slot])
-    }
-
-    /// Direct framing includes its payload copy and checksum in the existing
-    /// opt-in staging clock. No clock is read when profiling is disabled.
-    pub(super) fn prepare_direct_send(
-        &mut self,
-        slot: usize,
-        encode: impl FnOnce(&mut [u8]) -> io::Result<usize>,
-    ) -> io::Result<usize> {
-        let began = self.time_progress.then(Instant::now);
-        let len = encode(self.send_buffer(slot))?;
-        self.record_send_copy(began, len);
-        Ok(len)
-    }
-
-    /// Mutable access to a free registered TX slot for protocol framing.
-    /// The returned bytes must remain unchanged after a successful post until
-    /// the corresponding CQ completion retires this physical slot.
-    fn send_buffer(&mut self, slot: usize) -> &mut [u8] {
-        assert!(slot < self.slots() && !self.tx_pending[slot]);
-        self.forget_staged(slot);
-        // SAFETY: The slot is not provider-owned or otherwise borrowed; the
-        // mutable Resources borrow prevents another safe accessor from aliasing it.
-        unsafe { std::slice::from_raw_parts_mut(self.memory.tx(slot), CHUNK) }
-    }
     pub(super) fn copy_send(&mut self, slot: usize, bytes: &[IoSlice<'_>]) -> usize {
         assert!(slot < self.slots() && !self.tx_pending[slot]);
         self.forget_staged(slot);
@@ -2427,46 +1233,6 @@ impl Resources {
         Ok(true)
     }
 
-    /// Processes one completed direct packet in its provider-owned RX slot.
-    /// The slot is reposted only after the visitor finishes, with EAGAIN
-    /// tolerated; no packet copy or receive-slot alias escapes this method.
-    pub(super) fn process_direct_packet(
-        &mut self,
-        process: impl FnOnce(&[u8]) -> io::Result<()>,
-    ) -> io::Result<bool> {
-        let Some(slot) = self.rx_len.iter().position(|&len| len != 0) else {
-            return Ok(false);
-        };
-        let len = self.rx_len[slot];
-        let began = self.time_progress.then(Instant::now);
-        // SAFETY: A terminal CQE established len <= CHUNK in this live slot.
-        // No provider write remains; the visitor cannot retain its slice, and
-        // this immutable borrow ends before the receive slot is reposted below.
-        process(unsafe { std::slice::from_raw_parts(self.memory.rx(slot), len) })?;
-        // Direct receives include checksum validation and reassembly copying,
-        // not just the ordinary transport's completed-buffer copy.
-        if let Some(began) = began {
-            self.progress_stats.receive_copy_ns = self
-                .progress_stats
-                .receive_copy_ns
-                .saturating_add(elapsed_ns(began));
-            self.progress_stats.receive_copy_calls =
-                self.progress_stats.receive_copy_calls.saturating_add(1);
-            self.progress_stats.receive_copy_bytes = self
-                .progress_stats
-                .receive_copy_bytes
-                .saturating_add(len as u64);
-        }
-        self.rx_len[slot] = 0;
-        self.rx_post = slot;
-        if let Err(error) = self.try_post_receive()
-            && error.kind() != io::ErrorKind::WouldBlock
-        {
-            return Err(error);
-        }
-        Ok(true)
-    }
-
     fn post_receive(&mut self, slot: usize) -> io::Result<bool> {
         let peer = self.peer.ok_or_else(|| invalid("missing fabric peer"))?;
         let began = self.time_progress.then(Instant::now);
@@ -2513,8 +1279,6 @@ impl Resources {
             return self.poll().map(|progress| (progress, false));
         };
         let can_wait = self.supports_idle_wait()
-            && !self.direct
-            && self.rma.is_none()
             && self.peer.is_some()
             && self.tx_pending.iter().all(|pending| !pending)
             && self.rx_pending.iter().all(|pending| *pending)
@@ -2569,7 +1333,7 @@ impl Resources {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "Keep each CQ pass and its message/RMA context retirement in one ordered block."
+        reason = "Keep each CQ pass and its message context retirement in one ordered block."
     )]
     fn poll_with_timeout<const WAIT: bool>(&mut self, timeout_ms: i32) -> io::Result<bool> {
         if self.time_progress {
@@ -2669,14 +1433,6 @@ impl Resources {
             } else {
                 ffi::FI_EIO
             };
-            if count > 0
-                && let Some(rma) = &mut self.rma
-                && rma.complete(failure.op_context, code)?
-            {
-                self.progress_stats.cq_completions =
-                    self.progress_stats.cq_completions.saturating_add(1);
-                return Ok(true);
-            }
             return Err(error("fabric completion", code));
         }
         let count = usize::try_from(count).map_err(|_| {
@@ -2724,11 +1480,6 @@ impl Resources {
         context: *mut c_void,
         receive_len: impl FnOnce() -> usize,
     ) -> io::Result<()> {
-        if let Some(rma) = &mut self.rma
-            && rma.complete(context, 0)?
-        {
-            return Ok(());
-        }
         if let Some(slot) = self.memory.tx_context_slot(context)
             && self.tx_pending[slot]
         {
@@ -2761,9 +1512,6 @@ impl Resources {
     }
 
     pub(super) fn close(&mut self) -> Result<(), i32> {
-        if self.rma.as_ref().is_some_and(RmaState::has_pending_reads) {
-            return Err(i32::try_from(ffi::FI_EBUSY).unwrap());
-        }
         macro_rules! close {
             ($field:ident) => {
                 if !self.$field.is_null() {
@@ -2783,9 +1531,6 @@ impl Resources {
         // Successful endpoint close discards pending operations before memory
         // registrations close and before Memory can reconstruct/free its Box.
         close!(ep);
-        if let Some(rma) = &mut self.rma {
-            rma.close()?;
-        }
         close!(tx_mr);
         close!(rx_mr);
         close!(av);
@@ -2820,23 +1565,21 @@ impl AlignedAddress {
         if bytes.is_empty() || bytes.len() > ADDRESS || bytes.len() != expected_len {
             return Err(invalid("invalid fabric peer address length"));
         }
-        if format != ffi::FI_ADDR_EFA {
-            let family = bytes
-                .get(..size_of::<libc::sa_family_t>())
-                .ok_or_else(|| invalid("short socket address"))?;
-            let family = i32::from(libc::sa_family_t::from_ne_bytes(
-                family.try_into().map_err(invalid)?,
-            ));
-            if !matches!(
-                format,
-                ffi::FI_SOCKADDR | ffi::FI_SOCKADDR_IN | ffi::FI_SOCKADDR_IN6
-            ) || !(family == libc::AF_INET && bytes.len() == size_of::<libc::sockaddr_in>()
-                || family == libc::AF_INET6 && bytes.len() == size_of::<libc::sockaddr_in6>())
-                || format == ffi::FI_SOCKADDR_IN && family != libc::AF_INET
-                || format == ffi::FI_SOCKADDR_IN6 && family != libc::AF_INET6
-            {
-                return Err(invalid("invalid fabric socket address family"));
-            }
+        let family = bytes
+            .get(..size_of::<libc::sa_family_t>())
+            .ok_or_else(|| invalid("short socket address"))?;
+        let family = i32::from(libc::sa_family_t::from_ne_bytes(
+            family.try_into().map_err(invalid)?,
+        ));
+        if !matches!(
+            format,
+            ffi::FI_SOCKADDR | ffi::FI_SOCKADDR_IN | ffi::FI_SOCKADDR_IN6
+        ) || !(family == libc::AF_INET && bytes.len() == size_of::<libc::sockaddr_in>()
+            || family == libc::AF_INET6 && bytes.len() == size_of::<libc::sockaddr_in6>())
+            || format == ffi::FI_SOCKADDR_IN && family != libc::AF_INET
+            || format == ffi::FI_SOCKADDR_IN6 && family != libc::AF_INET6
+        {
+            return Err(invalid("invalid fabric socket address family"));
         }
         let mut address = Self::default();
         address.bytes[..bytes.len()].copy_from_slice(bytes);
@@ -2889,107 +1632,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_configuration_above_global_slots_is_admitted_without_preallocation() {
-        let config = RmaConfig {
-            source_bytes: 4096,
-            source_region_slots: GLOBAL_RMA_REGION_SLOTS + 1,
-            destination_bytes: 0,
-            destination_slots: 0,
-            max_read_bytes: 4096,
-            require_device_read: false,
-        };
-        assert!(RmaState::validate_config(config).is_ok());
-    }
-
-    #[test]
-    fn quarantined_source_stays_charged_and_cannot_be_retired_or_reused() {
-        let config = RmaConfig {
-            source_bytes: 4,
-            source_region_slots: 2,
-            destination_bytes: 0,
-            destination_slots: 0,
-            max_read_bytes: 4,
-            require_device_read: false,
-        };
-        let mut sources = std::collections::LinkedList::new();
-        // This is the state left by uncertain MR close: allocation retained,
-        // FID no longer safe to close again. No provider or DMA is involved.
-        sources.push_back(SourceRegion {
-            id: 1,
-            generation: 1,
-            session_id: 7,
-            grant_generation: 11,
-            bytes: Some(vec![1; 4].into_boxed_slice()),
-            retained_owner: None,
-            mr: ptr::null_mut(),
-        });
-        sources.push_back(SourceRegion {
-            id: 2,
-            generation: 2,
-            session_id: 7,
-            grant_generation: 12,
-            bytes: None,
-            retained_owner: None,
-            mr: ptr::null_mut(),
-        });
-        let mut resources = Resources {
-            peer: Some(0),
-            rma: Some(RmaState {
-                owner_id: 9,
-                config,
-                capabilities: RmaCapabilities {
-                    address_mode: RmaAddressMode::Offset,
-                    read_mode: RmaReadMode::Emulated,
-                    max_read_bytes: 4,
-                    max_iov: 1,
-                },
-                sources,
-                source_bytes_live: 4,
-                destinations: Vec::new().into_boxed_slice(),
-                next_destination: 0,
-                next_region: 3,
-                next_generation: 3,
-                metadata: PoolMetadataCharge {
-                    source_slots: 0,
-                    destination_slots: 0,
-                },
-            }),
-            ..Resources::default()
-        };
-        let quarantined = RegisteredReadRegion {
-            owner_id: 9,
-            region_id: 1,
-            generation: 1,
-            session_id: 7,
-            grant_generation: 11,
-        };
-        let available = RegisteredReadRegion {
-            owner_id: 9,
-            region_id: 2,
-            generation: 2,
-            session_id: 7,
-            grant_generation: 12,
-        };
-        assert!(resources.retire_source_region(quarantined).is_err());
-        assert_eq!(resources.rma.as_ref().unwrap().source_bytes_live, 4);
-        assert_eq!(
-            resources
-                .register_read_region(&available, vec![2])
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::WouldBlock,
-        );
-        assert_eq!(resources.rma.as_ref().unwrap().source_bytes_live, 4);
-    }
-
-    #[test]
-    fn only_efa_requests_bounded_packet_queues_not_application_slot_counts() {
-        for (provider, size) in [(c"efa", efa::QUEUE), (c"tcp;ofi_rxm", 0)] {
-            let hints = Info::hints(provider, c"", false, false).unwrap();
+    fn message_hints_request_sas_ordering_without_application_queue_sizes() {
+        for provider in [c"verbs;ofi_rxm", c"tcp;ofi_rxm"] {
+            let hints = Info::hints(provider, c"").unwrap();
             // SAFETY: Info owns the live, fully initialized hint allocation.
             let (tx, rx) = unsafe { (&*(*hints.0).tx_attr, &*(*hints.0).rx_attr) };
-            assert_eq!(tx.size, size);
-            assert_eq!(rx.size, size);
+            assert_eq!(tx.size, 0);
+            assert_eq!(rx.size, 0);
             assert_eq!(tx.msg_order, u64::from(ffi::FI_ORDER_SAS));
             assert_eq!(rx.msg_order, u64::from(ffi::FI_ORDER_SAS));
         }
@@ -3001,33 +1650,6 @@ mod tests {
 
         state.tx_pending[SLOTS - 1] = false;
         assert_eq!(state.free_send_slot(), Some(SLOTS - 1));
-    }
-    #[test]
-    #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
-    fn strict_device_read_rejects_software_provider() {
-        let config = RmaConfig {
-            source_bytes: 4096,
-            source_region_slots: 1,
-            destination_bytes: 4096,
-            destination_slots: 1,
-            max_read_bytes: 1024,
-            require_device_read: true,
-        };
-        let mut resources = Resources::default();
-        assert!(
-            resources
-                .open_mode(
-                    &FabricConfig {
-                        backend: FabricBackend::SoftwareTcp,
-                        domain: Some("lo".to_owned()),
-                        source_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
-                        slots: None,
-                    },
-                    Some(config),
-                    false,
-                )
-                .is_err()
-        );
     }
 
     #[test]
@@ -3147,51 +1769,5 @@ mod tests {
         );
         assert!(AlignedAddress::new(ffi::FI_SOCKADDR, bytes.len() - 1, &bytes[1..]).is_err());
         assert!(AlignedAddress::new(ffi::FI_ADDR_STR, bytes.len() - 1, &bytes[1..]).is_err());
-    }
-    #[test]
-    fn efa_direct_hints_select_named_fabric_without_ordering_assumptions() {
-        let hints = Info::hints(c"efa", c"", true, false).unwrap();
-        // SAFETY: The live Info owns initialized attributes and their strings.
-        unsafe {
-            let info = &*hints.0;
-            assert_eq!(
-                CStr::from_ptr((*info.fabric_attr).prov_name).to_bytes(),
-                b"efa"
-            );
-            assert_eq!(
-                CStr::from_ptr((*info.fabric_attr).name).to_bytes(),
-                b"efa-direct"
-            );
-            assert_eq!(info.caps, u64::from(ffi::FI_MSG));
-            assert_eq!(info.mode, ffi::FI_CONTEXT2);
-            assert_eq!((*info.tx_attr).msg_order, 0);
-            assert_eq!((*info.rx_attr).msg_order, 0);
-            assert_eq!((*info.tx_attr).size, SLOTS);
-            assert_eq!((*info.rx_attr).size, SLOTS);
-        }
-    }
-    #[test]
-    fn direct_local_cqe_releases_physical_slot_without_remote_credit() {
-        let mut state = Resources {
-            tx_pending: PerSlot(vec![true; SLOTS]),
-            tx_ordinal: PerSlot(vec![1, 2, 3, 4]),
-            accepted_send: 4,
-            direct: true,
-            ..Resources::default()
-        };
-        let mut sender = super::super::efa_direct::SendWindow::default();
-        for ordinal in 1..=super::super::efa_direct::DATA_WINDOW {
-            sender.posted(ordinal).unwrap();
-        }
-        // This exact context identifies a pending TX slot; complete validates it
-        // before changing ownership.
-        state.complete(state.memory.tx_context(0), || 0).unwrap();
-        assert_eq!(state.send_fences(), (4, 1));
-        assert_eq!(state.free_send_slot(), Some(0));
-        assert_eq!(sender.peer_credit(), 0);
-        assert_eq!(
-            sender.next_ordinal().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
     }
 }

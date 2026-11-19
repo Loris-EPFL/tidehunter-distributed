@@ -839,57 +839,46 @@ class ConfigTests(unittest.TestCase):
         argv = controller.systemd_argv(config, "0000-test", "storage-0", 4, 8192, 60, [config["binary"], "launch.yaml"])
         for expected in ("--property=CPUQuota=400%", "--property=MemoryMax=8192M", "--property=MemorySwapMax=0",
                          "--property=LimitMEMLOCK=infinity", "--property=RuntimeMaxSec=60",
-                         "--setenv=FI_EFA_USE_DEVICE_RDMA=1", "--property=IOAccounting=yes",
+                         "--setenv=LD_LIBRARY_PATH=" + config["fdb_library_dir"] + ":/opt/amazon/efa/lib",
+                         "--property=IOAccounting=yes",
                          "--property=RemainAfterExit=yes", "--property=CPUAccounting=yes", "--property=MemoryAccounting=yes"):
             self.assertIn(expected, argv)
         self.assertNotIn("--scope", argv)  # The service manager, not SSM, is the long-lived parent.
+        self.assertFalse(any("FI_EFA_USE_DEVICE_RDMA" in item for item in argv))
         argv = controller.systemd_argv(config, "0000-test", "storage-0", 4, 8192, 60, ["node"],
                                       setenv={"TIDEHUNTER_HISTORY_DIAGNOSTICS": "1"})
         self.assertIn("--setenv=TIDEHUNTER_HISTORY_DIAGNOSTICS=1", argv)
 
 
 class FabricAdmissionTests(unittest.TestCase):
-    def test_failed_read_discovery_retains_prior_observations_without_admitting_host(self):
+    def test_aws_tcp_startup_publishes_receipt_without_provider_probes(self):
         config = config_fixture()
         clients = clients_fixture(config)
         stored = {}
         clients["s3"].put_object.side_effect = lambda **value: stored.update(value)
         clients["s3"].head_object.side_effect = lambda **_: {
             "ContentLength": len(stored["Body"]), "Metadata": stored["Metadata"]}
-        failure = controller.InfrastructureError("fi_getinfo: -61 (No data available)")
-        with tempfile.TemporaryDirectory() as tmp, patch.object(
-                controller, "command", side_effect=["ordinary observed info", "direct observed info", failure]):
-            with self.assertRaises(controller.InfrastructureError) as caught:
-                controller.admit_fabrics(config, 2, clients, Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(controller, "command") as command:
+            result = controller.admit_fabrics(config, 2, clients, Path(tmp))
             receipt = json.loads((Path(tmp) / "fabric-admission.json").read_text())
-        self.assertIs(caught.exception, failure)
-        self.assertFalse(receipt["complete"])
+        command.assert_not_called()
+        self.assertEqual(result, receipt)
+        self.assertTrue(receipt["complete"])
         self.assertEqual(receipt["instance_id"], config["fleet"]["nodes"][2]["instance_id"])
         self.assertEqual(receipt["source_sha256"], config["source_sha256"])
         self.assertEqual(receipt["binary_sha256"], config["binary_sha256"])
-        probes = receipt["probes"]
-        self.assertEqual(probes["efa_message"]["stdout"], "ordinary observed info")
-        self.assertEqual(probes["efa_direct_message"]["stdout"], "direct observed info")
-        self.assertEqual(probes["efa_direct_read"]["status"], "failed")
-        self.assertIn("No data available", probes["efa_direct_read"]["error"])
-        self.assertNotIn("stdout", probes["efa_direct_read"])
+        self.assertEqual(receipt["probes"], {})
+        self.assertIn("TCP control", receipt["scope"])
         self.assertEqual(json.loads(stored["Body"]), receipt)
 
-    def test_receipt_export_failure_cannot_replace_original_discovery_failure(self):
+    def test_tcp_receipt_export_failure_is_not_admitted(self):
         config = config_fixture()
         clients = clients_fixture(config)
         clients["s3"].put_object.side_effect = OSError("receipt upload unavailable")
-        failure = controller.InfrastructureError("EFA discovery unavailable")
-        with tempfile.TemporaryDirectory() as tmp, patch.object(controller, "command", side_effect=failure):
-            with self.assertRaises(controller.InfrastructureError) as caught:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(controller, "command") as command:
+            with self.assertRaisesRegex(OSError, "receipt upload unavailable"):
                 controller.admit_fabrics(config, -1, clients, Path(tmp))
-            receipt = json.loads((Path(tmp) / "fabric-admission.json").read_text())
-        self.assertIs(caught.exception, failure)
-        self.assertIsInstance(caught.exception.__cause__, OSError)
-        self.assertFalse(receipt["complete"])
-        self.assertEqual(receipt["instance_id"], config["fleet"]["coordinator"]["instance_id"])
-        self.assertEqual(set(receipt["probes"]), {"efa_message"})
-        self.assertEqual(receipt["probes"]["efa_message"]["status"], "failed")
+        command.assert_not_called()
 
 
 class OwnershipTests(unittest.TestCase):

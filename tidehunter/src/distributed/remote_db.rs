@@ -1815,18 +1815,6 @@ impl RemoteDatabase {
             super::tcp::Transport::Tcp => BACKEND_ID,
             super::tcp::Transport::TcpTrusted => "tidehunter-tcp-trusted-rf1",
             super::tcp::Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
-                (super::tcp::FabricBackend::Efa, super::tcp::FabricSecurity::MutualTls) => {
-                    "tidehunter-ofi-efa-mutual-tls-rf1"
-                }
-                (super::tcp::FabricBackend::Efa, super::tcp::FabricSecurity::Trusted) => {
-                    "tidehunter-ofi-efa-trusted-rf1"
-                }
-                (super::tcp::FabricBackend::EfaDirect, super::tcp::FabricSecurity::MutualTls) => {
-                    "tidehunter-ofi-efa-direct-mutual-tls-rf1"
-                }
-                (super::tcp::FabricBackend::EfaDirect, super::tcp::FabricSecurity::Trusted) => {
-                    "tidehunter-ofi-efa-direct-trusted-rf1"
-                }
                 (super::tcp::FabricBackend::Verbs, super::tcp::FabricSecurity::MutualTls) => {
                     "tidehunter-ofi-verbs-mutual-tls-rf1"
                 }

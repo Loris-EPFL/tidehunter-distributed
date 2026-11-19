@@ -5,7 +5,6 @@ use super::super::{Endpoint, LIVE};
 use super::*;
 use std::{
     sync::atomic::Ordering,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -155,14 +154,6 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self::new_with_direct(false)
-    }
-
-    fn new_direct() -> Self {
-        Self::new_with_direct(true)
-    }
-
-    fn new_with_direct(direct: bool) -> Self {
         let state = Box::new(UnsafeCell::new(Provider {
             cq_result: -isize::try_from(ffi::FI_EAGAIN).unwrap(),
             ..Provider::default()
@@ -199,7 +190,6 @@ impl Fixture {
             ep: &raw mut *ep,
             cq: &raw mut *cq,
             peer: Some(0),
-            direct,
             ..Resources::default()
         };
         // Balance Endpoint::drop's admission release without opening real handles.
@@ -207,7 +197,6 @@ impl Fixture {
         Self {
             endpoint: Some(Endpoint {
                 resources: Some(Box::new(resources)),
-                direct: direct.then(|| Box::new(super::super::DirectState::new(4096).unwrap())),
                 failed: false,
             }),
             state,
@@ -228,382 +217,6 @@ impl Fixture {
         // Endpoint call while this reference exists. The UnsafeCell stays pinned.
         unsafe { &mut *self.state.get() }
     }
-}
-
-#[test]
-fn direct_eagain_accepts_no_bytes_and_local_cqe_does_not_grant_peer_credit() {
-    let mut fixture = Fixture::new_direct();
-    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
-    assert_eq!(
-        fixture
-            .endpoint()
-            .try_send(b"discarded")
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::WouldBlock
-    );
-    let direct = fixture.endpoint().direct.as_ref().unwrap();
-    assert_eq!(direct.send.next_ordinal().unwrap(), 1);
-    assert_eq!(fixture.endpoint().inner().send_fences(), (0, 0));
-    assert_eq!(fixture.endpoint().inner().free_send_slot(), Some(0));
-    assert_eq!(
-        fixture.endpoint().inner().free_control_slot(),
-        Some(SLOTS - 1)
-    );
-
-    fixture.state().send_result = 0;
-    assert_eq!(fixture.endpoint().try_send(b"payload").unwrap(), 7);
-    let (sent, len, context) = {
-        let state = fixture.state();
-        (state.sent, state.sent_len, state.sent_context)
-    };
-    // SAFETY: The successful post owns this immutable slot until its CQ event.
-    let packet = unsafe { std::slice::from_raw_parts(sent, len) };
-    let super::super::efa_direct::Packet::Data {
-        ordinal, payload, ..
-    } = super::super::efa_direct::decode(packet, 4096).unwrap()
-    else {
-        panic!("expected EFA-direct data packet");
-    };
-    assert_eq!(ordinal, 1);
-    assert_eq!(payload, b"payload");
-    assert_eq!(fixture.endpoint().inner().send_fences(), (1, 0));
-    fixture.state().completion = Some(ffi::fi_cq_msg_entry {
-        op_context: context,
-        ..ffi::fi_cq_msg_entry::default()
-    });
-    assert!(fixture.endpoint().try_progress().unwrap());
-    assert_eq!(fixture.endpoint().inner().send_fences(), (1, 1));
-    let direct = fixture.endpoint().direct.as_ref().unwrap();
-    assert_eq!(direct.send.peer_credit(), 0);
-    assert_eq!(direct.send.next_ordinal().unwrap(), 2);
-    assert_eq!(fixture.endpoint().inner().free_send_slot(), Some(0));
-}
-
-#[test]
-fn direct_ack_eagain_is_retried_by_empty_flush_until_its_cq_completes() {
-    let mut fixture = Fixture::new_direct();
-    assert!(fixture.endpoint().try_progress().unwrap());
-    let (receive_buffer, receive_context) = {
-        let state = fixture.state();
-        (state.received, state.received_context)
-    };
-    assert!(!receive_buffer.is_null());
-    let mut incoming = [0; 4096];
-    let len = super::super::efa_direct::encode_data(&mut incoming, 1, 0, b"reply", 4096)
-        .unwrap()
-        .len();
-    // SAFETY: The fixture's successful receive post owns a full CHUNK slot.
-    unsafe { std::ptr::copy_nonoverlapping(incoming.as_ptr(), receive_buffer, len) };
-    fixture.state().completion = Some(ffi::fi_cq_msg_entry {
-        op_context: receive_context,
-        len,
-        ..ffi::fi_cq_msg_entry::default()
-    });
-    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
-    let mut output = [0; 5];
-    assert_eq!(fixture.endpoint().try_receive(&mut output).unwrap(), 5);
-    assert_eq!(&output, b"reply");
-    assert_eq!(fixture.endpoint().inner().send_fences(), (0, 0));
-    assert!(
-        fixture
-            .endpoint()
-            .direct
-            .as_ref()
-            .unwrap()
-            .control
-            .needs_send(1)
-    );
-
-    fixture.state().send_result = 0;
-    fixture.state().auto_complete = true;
-    fixture
-        .endpoint()
-        .flush(Instant::now() + Duration::from_secs(1))
-        .unwrap();
-    assert_eq!(fixture.endpoint().inner().send_fences(), (1, 1));
-    assert_eq!(fixture.state().sends, 2);
-    let (sent, len) = {
-        let state = fixture.state();
-        (state.sent, state.sent_len)
-    };
-    // SAFETY: The completed control slot remains allocated until endpoint close.
-    let packet = unsafe { std::slice::from_raw_parts(sent, len) };
-    assert!(matches!(
-        super::super::efa_direct::decode(packet, 4096).unwrap(),
-        super::super::efa_direct::Packet::Credit {
-            ordinal: 1,
-            consumed: 1
-        }
-    ));
-    let direct = fixture.endpoint().direct.as_ref().unwrap();
-    assert_eq!(direct.receive.consumed(), 1);
-    assert!(!direct.control.needs_send(1));
-}
-#[test]
-fn sweep_data_send_piggybacks_consumed_credit_without_control_packet() {
-    let mut fixture = Fixture::new_direct();
-    fixture
-        .endpoint()
-        .direct
-        .as_mut()
-        .unwrap()
-        .receive
-        .accept_data(1, b"reply")
-        .unwrap();
-    assert_eq!(
-        fixture.endpoint().try_progress_for_sweep(None).unwrap(),
-        (true, false)
-    );
-    assert_eq!(fixture.state().polls, 1);
-    assert_eq!(fixture.state().sends, 0);
-    let mut received = [0; 5];
-    assert_eq!(
-        fixture
-            .endpoint()
-            .try_receive_no_poll(&mut received)
-            .unwrap(),
-        5
-    );
-    assert_eq!(&received, b"reply");
-    assert_eq!(fixture.state().polls, 1);
-    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
-    assert_eq!(
-        fixture
-            .endpoint()
-            .try_send_vectored_no_poll(&[std::io::IoSlice::new(b"discarded")])
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::WouldBlock
-    );
-    assert!(
-        fixture
-            .endpoint()
-            .direct
-            .as_ref()
-            .unwrap()
-            .control
-            .needs_send(1)
-    );
-    assert_eq!(
-        fixture
-            .endpoint()
-            .direct
-            .as_ref()
-            .unwrap()
-            .send
-            .next_ordinal()
-            .unwrap(),
-        1
-    );
-    fixture.state().send_result = 0;
-    assert_eq!(
-        fixture
-            .endpoint()
-            .try_send_vectored_no_poll(&[std::io::IoSlice::new(b"request")])
-            .unwrap(),
-        7
-    );
-    let (sent, len) = {
-        let state = fixture.state();
-        (state.sent, state.sent_len)
-    };
-    // SAFETY: Successful provider post owns this fixed send slot.
-    let packet = unsafe { std::slice::from_raw_parts(sent, len) };
-    let super::super::efa_direct::Packet::Data {
-        ordinal,
-        credit,
-        payload,
-    } = super::super::efa_direct::decode(packet, 4096).unwrap()
-    else {
-        panic!("expected DATA packet");
-    };
-    assert_eq!(ordinal, 1);
-    assert_eq!(credit, 1);
-    assert_eq!(payload, b"request");
-    assert!(
-        !fixture
-            .endpoint()
-            .direct
-            .as_ref()
-            .unwrap()
-            .control
-            .needs_send(1)
-    );
-    assert!(!fixture.endpoint().finish_sweep_no_poll().unwrap());
-    assert_eq!(fixture.state().sends, 2);
-}
-
-#[test]
-fn sweep_without_data_output_retries_standalone_credit_after_eagain() {
-    let mut fixture = Fixture::new_direct();
-    fixture
-        .endpoint()
-        .direct
-        .as_mut()
-        .unwrap()
-        .receive
-        .accept_data(1, b"reply")
-        .unwrap();
-    let mut received = [0; 5];
-    assert_eq!(
-        fixture
-            .endpoint()
-            .try_receive_no_poll(&mut received)
-            .unwrap(),
-        5
-    );
-    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
-    assert!(!fixture.endpoint().finish_sweep_no_poll().unwrap());
-    assert!(
-        fixture
-            .endpoint()
-            .direct
-            .as_ref()
-            .unwrap()
-            .control
-            .needs_send(1)
-    );
-    fixture.state().send_result = 0;
-    assert!(fixture.endpoint().finish_sweep_no_poll().unwrap());
-    assert_eq!(fixture.state().polls, 0);
-    let (sent, len) = {
-        let state = fixture.state();
-        (state.sent, state.sent_len)
-    };
-    // SAFETY: Successful provider post owns the reserved control slot.
-    let packet = unsafe { std::slice::from_raw_parts(sent, len) };
-    assert!(matches!(
-        super::super::efa_direct::decode(packet, 4096).unwrap(),
-        super::super::efa_direct::Packet::Credit {
-            ordinal: 1,
-            consumed: 1
-        }
-    ));
-}
-
-#[test]
-fn blocking_receive_posts_credit_for_sweep_resident_direct_data() {
-    let mut fixture = Fixture::new_direct();
-    assert_eq!(
-        fixture
-            .endpoint()
-            .try_progress_for_sweep(Some(Instant::now() + Duration::from_secs(1)))
-            .unwrap(),
-        (true, false)
-    );
-    let (receive_buffer, receive_context) = {
-        let state = fixture.state();
-        (state.received, state.received_context)
-    };
-    let mut incoming = [0; 4096];
-    let len = super::super::efa_direct::encode_data(&mut incoming, 1, 0, b"reply", 4096)
-        .unwrap()
-        .len();
-    // SAFETY: The fixture's receive post owns a full CHUNK slot.
-    unsafe { std::ptr::copy_nonoverlapping(incoming.as_ptr(), receive_buffer, len) };
-    fixture.state().completion = Some(ffi::fi_cq_msg_entry {
-        op_context: receive_context,
-        len,
-        ..ffi::fi_cq_msg_entry::default()
-    });
-    assert_eq!(
-        fixture
-            .endpoint()
-            .try_progress_for_sweep(Some(Instant::now() + Duration::from_secs(1)))
-            .unwrap(),
-        (true, false)
-    );
-    assert_eq!(fixture.state().sends, 0);
-
-    let mut output = [0; 5];
-    assert_eq!(
-        fixture
-            .endpoint()
-            .receive(&mut output, Instant::now() + Duration::from_secs(1))
-            .unwrap(),
-        output.len()
-    );
-    assert_eq!(&output, b"reply");
-    assert_eq!(fixture.state().sends, 1);
-    let (sent, sent_len) = {
-        let state = fixture.state();
-        (state.sent, state.sent_len)
-    };
-    // SAFETY: The successful CREDIT post owns the reserved control slot.
-    let packet = unsafe { std::slice::from_raw_parts(sent, sent_len) };
-    assert!(matches!(
-        super::super::efa_direct::decode(packet, 4096).unwrap(),
-        super::super::efa_direct::Packet::Credit {
-            ordinal: 1,
-            consumed: 1
-        }
-    ));
-}
-#[test]
-#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the two-sided software-provider adapter exercise together"
-)]
-fn software_provider_runs_direct_packet_adapter_on_large_partial_streams() -> io::Result<()> {
-    fn exchange(mut endpoint: Endpoint, outbound: &[u8], inbound: &[u8]) -> io::Result<Endpoint> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut sent = 0;
-        let mut received = Vec::with_capacity(inbound.len());
-        let mut buffer = [0; 8179];
-        loop {
-            if Instant::now() >= deadline {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            if sent < outbound.len() {
-                match endpoint.try_send(&outbound[sent..]) {
-                    Ok(len) => sent += len,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            if received.len() < inbound.len() {
-                let amount =
-                    (1 + received.len() % buffer.len()).min(inbound.len() - received.len());
-                match endpoint.try_receive(&mut buffer[..amount]) {
-                    Ok(len) => received.extend_from_slice(&buffer[..len]),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            endpoint.try_progress()?;
-            if sent == outbound.len() && received.len() == inbound.len() {
-                endpoint.flush(deadline)?;
-                assert_eq!(received, inbound);
-                // Local CQ completion is not peer consumption. Keep this live
-                // endpoint until both stream consumers finish and flush.
-                return Ok(endpoint);
-            }
-        }
-    }
-
-    let mut left = Endpoint::open_software_packet_test(Some("lo"))?;
-    let mut right = Endpoint::open_software_packet_test(Some("lo"))?;
-    let left_address = left.address()?;
-    let right_address = right.address()?;
-    left.set_peer(&right_address)?;
-    right.set_peer(&left_address)?;
-
-    let left_out: Vec<u8> = (0..1_000_003)
-        .map(|index| u8::try_from(index % 251).unwrap())
-        .collect();
-    let right_out: Vec<u8> = (0..1_000_019)
-        .map(|index| u8::try_from(index % 239).unwrap())
-        .collect();
-    thread::scope(|scope| {
-        let left_task = scope.spawn(|| exchange(left, &left_out, &right_out));
-        let right_result = exchange(right, &right_out, &left_out);
-        let left_result = left_task.join().unwrap();
-        let _right = right_result?;
-        let _left = left_result?;
-        Ok(())
-    })
 }
 
 #[test]
@@ -1567,23 +1180,19 @@ fn help_defaults_parse_the_forms_libfabric_prints() {
 
 #[test]
 fn only_owners_that_park_request_a_verbs_wait_fd() {
-    use FabricBackend::{Efa, EfaDirect, SoftwareTcp, Verbs};
-    // (backend, park_idle, direct, rma) -> requested wait object
-    for ((backend, park_idle, direct, rma), expected) in [
-        ((Verbs, true, false, false), WaitRequest::Fd),
+    use FabricBackend::{SoftwareTcp, Verbs};
+    // (backend, park_idle) -> requested wait object
+    for ((backend, park_idle), expected) in [
+        ((Verbs, true), WaitRequest::Fd),
         // A polling client never pays for a wait object.
-        ((Verbs, false, false, false), WaitRequest::None),
-        ((Verbs, true, false, true), WaitRequest::None),
-        ((SoftwareTcp, false, false, false), WaitRequest::Software),
-        ((SoftwareTcp, true, false, true), WaitRequest::None),
-        // EFA has no CQ wait object: its idle owner keeps bounded polling.
-        ((Efa, true, false, false), WaitRequest::None),
-        ((EfaDirect, true, true, false), WaitRequest::None),
+        ((Verbs, false), WaitRequest::None),
+        ((SoftwareTcp, false), WaitRequest::Software),
+        ((SoftwareTcp, true), WaitRequest::Software),
     ] {
         assert_eq!(
-            WaitRequest::select(backend, park_idle, direct, rma),
+            WaitRequest::select(backend, park_idle),
             expected,
-            "{backend:?} park={park_idle} direct={direct} rma={rma}"
+            "{backend:?} park={park_idle}"
         );
     }
 }

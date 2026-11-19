@@ -203,15 +203,14 @@ is:
 ```
 
 Transport configuration for the Tidehunter example/benchmark harness uses
-`--transport-config JSON_FILE`. The isolated raw FI_READ probe instead uses
-`--fabric-config JSON_FILE` plus mandatory `--require-device-read true|false`;
-these are separate interfaces and the probe is not a WAL/application benchmark.
+`--transport-config JSON_FILE`.
 
-Historical `tidehunter_tcp`, `tidehunter_efa`, `tidehunter_efa_direct`, and
-`tidehunter_efa_native` remain immutable case labels in existing result
-artifacts. The new runtime backend kind is `tidehunter`, with selection in
-`backend.options.transport`; do not introduce separate EFA/verbs runtime kinds
-or reinterpret historical results.
+Historical `tidehunter_efa`, `tidehunter_efa_direct`, `tidehunter_efa_native`
+and `tidehunter_efa_trusted` remain immutable case labels in existing result
+artifacts only: the EFA and EFA-direct backends were removed and remain in the
+`archive/multi-design` tag. The runtime backend kind is `tidehunter`, with
+selection in `backend.options.transport`; do not introduce separate verbs
+runtime kinds or reinterpret historical results.
 
 ## Tidehunter transport adapters and external owner preparation
 
@@ -224,10 +223,6 @@ reporting labels, not transport/configuration aliases:
 | Case ID (existing result labels stay historical; other IDs are explicit selections) | Structured engine selection | Security/data path |
 |---|---|---|
 | `tidehunter_tcp` | `{"kind":"tcp"}` | Existing TCP with mutual TLS; default and no native library linkage. |
-| `tidehunter_efa` | `{"kind":"ofi","fabric":{"backend":"efa"},"security":"mutual-tls"}` | EFA provider with mutual TLS. |
-| `tidehunter_efa_direct` | `{"kind":"ofi","fabric":{"backend":"efa-direct"},"security":"mutual-tls"}` | EFA-direct with mutual TLS. |
-| `tidehunter_efa_native` | `{"kind":"ofi","fabric":{"backend":"efa-direct"},"security":"trusted"}` | Trusted EFA-direct; separate unencrypted security cohort. |
-| `tidehunter_efa_trusted` | `{"kind":"ofi","fabric":{"backend":"efa"},"security":"trusted"}` | Trusted ordinary EFA; separate unencrypted security cohort. |
 | `tidehunter_verbs` / `tidehunter_verbs_native` | `{"kind":"ofi","fabric":{"backend":"verbs"},"security":"mutual-tls"}` / same with `trusted` | Generic verbs path; distinct trust labels. |
 | `tidehunter_software_tcp` / `tidehunter_software_tcp_native` | `{"kind":"ofi","fabric":{"backend":"software-tcp"},"security":"mutual-tls"}` / same with `trusted` | Software OFI provider; correctness control, never hardware proof. |
 
@@ -235,7 +230,7 @@ The canonical `Transport` configuration is an object, not a backend string.
 For a host-bound selection, add that host's optional `domain` and
 `source_address` inside `fabric`; selectors can differ by host, but provider
 and security must agree between peers. Source-IP support is provider-specific:
-EFA/EFA-direct reject it; verbs accepts IPv4 only because the pinned RxM layer
+verbs accepts IPv4 only because the pinned RxM layer
 lists `FI_SOCKADDR`/`FI_SOCKADDR_IN` (regardless of core verbs IPv6 support);
 software-tcp accepts IPv4/IPv6 when the returned OFI address supports it.
 No source selector means provider-default selection. Metadata reports the
@@ -254,12 +249,8 @@ and endpoint setup are in `tidehunter-fabric/src/config.rs` and
 `tidehunter-fabric/src/endpoint.rs`; adapter construction is in
 `benchmarks/kv-research/src/backends/tidehunter.rs`.
 Provider setup reports actual metadata; requested configuration alone is not
-provider evidence. `require_device_read: true` requires native FI_READ and
-backend-specific evidence, not merely a successful OFI open or provider label.
-For verbs, evidence includes provider PCI NIC/device metadata matched to
-canonical sysfs PCI BDF and excludes software `rxe`, `rdma_rxe`, and `siw`;
-this does not establish Falcon identity. EFA native mode requires an observed
-non-emulated read capability. Software OFI correctness does not qualify
+provider evidence, and a successful OFI open or provider label does not
+establish a hardware data path. Software OFI correctness does not qualify
 hardware or performance. Exercised local checks and explicit hardware limits
 are recorded in the [27 October fabric qualification](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026).
 
@@ -456,8 +447,8 @@ multiplexed handle and a timed-out request only drops its own waiter.
 
 **Transport receipts.** The Tidehunter adapter deserializes the engine `Transport` directly.
 `transport.kind` is `tcp` (mutual TLS), `tcp-trusted` (no TLS) or `ofi`; an `ofi`
-selector accepts `fabric.slots` (omitted means the engine default; EFA accepts only the
-default). The effective configuration receipt carries `transport_config` (the full
+selector accepts `fabric.slots` (omitted means the engine default). The effective
+configuration receipt carries `transport_config` (the full
 serialized selector) and `transport_security`, so every transport knob of a run is recorded.
 
 **Durability tier and comparison rule.** Distributed Tidehunter has two acknowledgement tiers,

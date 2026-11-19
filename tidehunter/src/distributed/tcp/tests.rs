@@ -47,7 +47,7 @@ fn structured_transport_identity_ignores_local_selectors_only() {
     };
     assert!(left.same_protocol(&right));
     assert!(!left.same_protocol(&Transport::ofi(
-        FabricBackend::Efa,
+        FabricBackend::SoftwareTcp,
         FabricSecurity::MutualTls,
     )));
     assert!(!left.same_protocol(&Transport::Ofi {
@@ -62,6 +62,31 @@ fn structured_transport_identity_ignores_local_selectors_only() {
         serde_json::json!({"kind": "tcp"}),
     );
     assert!(serde_json::from_value::<Transport>(serde_json::json!({"kind": "efa"})).is_err());
+}
+
+#[test]
+fn removed_efa_backends_are_rejected_and_their_mode_ids_stay_retired() {
+    let ofi = |backend: &str| {
+        serde_json::from_value::<Transport>(serde_json::json!({
+            "kind": "ofi",
+            "fabric": {"backend": backend},
+            "security": "mutual-tls",
+        }))
+    };
+    assert!(ofi("verbs").is_ok());
+    assert!(ofi("efa").is_err());
+    assert!(ofi("efa-direct").is_err());
+    let mut ids = vec![
+        transport_mode_id(&Transport::Tcp),
+        transport_mode_id(&Transport::TcpTrusted),
+    ];
+    for backend in [FabricBackend::Verbs, FabricBackend::SoftwareTcp] {
+        for security in [FabricSecurity::MutualTls, FabricSecurity::Trusted] {
+            ids.push(transport_mode_id(&Transport::ofi(backend, security)));
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 6, 7, 8, 9, 10]);
 }
 fn shape() -> KeyShape {
     KeyShape::new_single(4, 1, KeyType::uniform(1))

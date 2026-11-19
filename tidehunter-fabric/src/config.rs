@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FabricBackend {
-    Efa,
-    EfaDirect,
     Verbs,
     SoftwareTcp,
 }
@@ -28,8 +26,7 @@ pub struct FabricConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_address: Option<IpAddr>,
     /// TX and RX registered-slot count per endpoint, `1..=MAX_SLOTS`; `None`
-    /// selects `DEFAULT_SLOTS`. EFA and EFA-direct queue geometry is validated
-    /// only for the default count, so those backends accept `None` or the default.
+    /// selects `DEFAULT_SLOTS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<usize>,
 }
@@ -38,15 +35,9 @@ impl FabricBackend {
     #[cfg(feature = "native")]
     pub(crate) const fn provider(self) -> &'static str {
         match self {
-            Self::Efa | Self::EfaDirect => "efa",
             Self::Verbs => "verbs;ofi_rxm",
             Self::SoftwareTcp => "tcp;ofi_rxm",
         }
-    }
-
-    #[cfg(feature = "native")]
-    pub(crate) const fn is_direct(self) -> bool {
-        matches!(self, Self::EfaDirect)
     }
 }
 
@@ -87,27 +78,15 @@ impl FabricConfig {
                 format!("fabric slots must be in 1..={MAX_SLOTS}"),
             ));
         }
-        if matches!(self.backend, FabricBackend::Efa | FabricBackend::EfaDirect)
-            && slots != DEFAULT_SLOTS
+        if self.backend == FabricBackend::Verbs
+            && matches!(self.source_address, Some(IpAddr::V6(_)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "EFA queue geometry is validated only for {DEFAULT_SLOTS} slots; omit slots for EFA backends"
-                ),
+                "verbs;ofi_rxm source selection supports FI_SOCKADDR/FI_SOCKADDR_IN only",
             ));
         }
-        match (self.backend, self.source_address) {
-            (FabricBackend::Efa | FabricBackend::EfaDirect, Some(_)) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "EFA source IP selection is unsupported for opaque FI_ADDR_EFA addresses",
-            )),
-            (FabricBackend::Verbs, Some(IpAddr::V6(_))) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "verbs;ofi_rxm source selection supports FI_SOCKADDR/FI_SOCKADDR_IN only",
-            )),
-            _ => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -142,12 +121,6 @@ mod tests {
             config.validate().unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
-        config.backend = FabricBackend::EfaDirect;
-        config.source_address = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(
-            config.validate().unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
         config.backend = FabricBackend::Verbs;
         config.source_address = Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
         assert_eq!(
@@ -157,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_count_is_bounded_and_efa_keeps_its_validated_geometry() {
+    fn slot_count_is_bounded() {
         let config = |backend, slots| FabricConfig {
             backend,
             domain: None,
@@ -182,14 +155,6 @@ mod tests {
                     .validate()
                     .unwrap_err()
                     .kind(),
-                io::ErrorKind::InvalidInput
-            );
-        }
-        for backend in [FabricBackend::Efa, FabricBackend::EfaDirect] {
-            config(backend, None).validate().unwrap();
-            config(backend, Some(DEFAULT_SLOTS)).validate().unwrap();
-            assert_eq!(
-                config(backend, Some(8)).validate().unwrap_err().kind(),
                 io::ErrorKind::InvalidInput
             );
         }

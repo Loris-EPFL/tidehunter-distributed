@@ -116,15 +116,14 @@ pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
 pub(super) const APPEND_SESSION_BYTES: usize = reactor::SESSION_BYTES;
 const MODE_MAGIC: [u8; 4] = *b"THDP";
 
+/// Mode ids 2-5 were the removed EFA and EFA-direct backends (MutualTls and
+/// Trusted each). They stay retired and are never reassigned, so a preface from
+/// a binary that still had them can never match a current mode.
 fn transport_mode_id(transport: &Transport) -> u8 {
     match transport {
         Transport::Tcp => 1,
         Transport::TcpTrusted => 10,
         Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
-            (FabricBackend::Efa, FabricSecurity::MutualTls) => 2,
-            (FabricBackend::Efa, FabricSecurity::Trusted) => 3,
-            (FabricBackend::EfaDirect, FabricSecurity::MutualTls) => 4,
-            (FabricBackend::EfaDirect, FabricSecurity::Trusted) => 5,
             (FabricBackend::Verbs, FabricSecurity::MutualTls) => 6,
             (FabricBackend::Verbs, FabricSecurity::Trusted) => 7,
             (FabricBackend::SoftwareTcp, FabricSecurity::MutualTls) => 8,

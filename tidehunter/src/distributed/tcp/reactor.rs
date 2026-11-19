@@ -6,8 +6,8 @@
 //! HERD §4.1.1: advance ready pipeline work without waiting for another arrival.
 //! Page-cache reads and bounded output progress in the same sweep;
 //! cold io_uring/worker execution stays off the network owner.
-//! Provider contract: libfabric 3cc1095272b07ebeb5cc8f44851af6aa3eb75e41,
-//! man/fi_efa.7.md Progress: normal `efa` RDM requires manual CQ progress;
+//! Provider contract: fabric endpoints request `FI_PROGRESS_MANUAL` data
+//! progress (`tidehunter_fabric` hints), so this owner drives CQ progress;
 //! it does not require a TCP syscall per CQ poll.
 //! Adaptive TCP parks only a drained owner on socket readability, never on a
 //! periodic sleep. An adaptive fabric owner with no RPC pending parks on the
@@ -41,18 +41,6 @@ pub(super) const TLS_BUFFER_BYTES: usize = 256 * 1024;
 pub(super) const SESSION_REQUESTS: usize = 32;
 pub(super) const SESSION_BYTES: usize = 256 * 1024 * 1024;
 const PROGRESS_BYTES: usize = 64 * 1024;
-
-#[cfg(feature = "experimental-fabric")]
-static NEXT_DIRECT_DIAGNOSTIC_WINDOW: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
-#[cfg(feature = "experimental-fabric")]
-struct DirectDiagnosticWindow {
-    id: u64,
-    data_posts: u64,
-    credit_posts: u64,
-    piggyback_advances: u64,
-}
 
 /// A live fabric control socket is checked at least once per millisecond of
 /// active progress, plus one bounded sweep/scheduler delay. An idle established
@@ -234,8 +222,6 @@ pub(super) struct Session {
     plaintext_pending: usize,
     peer_closed: bool,
     control_peer: ControlPeerHealth,
-    #[cfg(feature = "experimental-fabric")]
-    direct_diagnostic: Option<DirectDiagnosticWindow>,
     /// Server sessions publish their send-path counters to the owner-wide
     /// aggregate; client sessions have none.
     #[cfg(feature = "experimental-fabric")]
@@ -276,8 +262,6 @@ impl Session {
             control_peer: ControlPeerHealth {
                 next_check: Instant::now(),
             },
-            #[cfg(feature = "experimental-fabric")]
-            direct_diagnostic: None,
             #[cfg(feature = "experimental-fabric")]
             owner_transport: None,
         }
@@ -452,8 +436,6 @@ impl Session {
     }
     fn abort(&mut self) {
         self.send_close_notify();
-        #[cfg(feature = "experimental-fabric")]
-        self.finish_direct_diagnostic("session-abort");
         #[cfg(feature = "experimental-fabric")]
         self.flush_owner_transport();
         self.stats = self.transport_stats();
@@ -782,13 +764,6 @@ impl Session {
         }
         Ok((changed, idle_wait_ns))
     }
-    fn finish_fabric_sweep(&mut self) -> Result<bool, TcpError> {
-        #[cfg(feature = "experimental-fabric")]
-        if let Some(endpoint) = &mut self.sock.fabric {
-            return Ok(endpoint.finish_sweep_no_poll()?);
-        }
-        Ok(false)
-    }
     /// Keep submission separate from retirement. Native and TLS output frames
     /// share the same bounded provider ownership and contiguous completion rules.
     fn finish_output(&mut self, accepted: u64, completed: u64) -> bool {
@@ -884,14 +859,6 @@ impl Session {
         }
     }
     pub(super) fn configure_transport_stats(&mut self, enabled: bool, reset: bool) {
-        #[cfg(feature = "experimental-fabric")]
-        if reset || !enabled {
-            self.finish_direct_diagnostic(if reset {
-                "profile-reset"
-            } else {
-                "profile-disable"
-            });
-        }
         self.time_work = enabled;
         if reset || !enabled {
             // Never attribute a frame crossing a reset/disable to the new window.
@@ -922,74 +889,6 @@ impl Session {
                 ..TransportProgressStats::default()
             };
         }
-        #[cfg(feature = "experimental-fabric")]
-        if enabled
-            && self.direct_diagnostic.is_none()
-            && let Some(endpoint) = &self.sock.fabric
-            && let Ok(id) = NEXT_DIRECT_DIAGNOSTIC_WINDOW.fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |next| next.checked_add(1),
-            )
-        {
-            let stats = endpoint.progress_stats();
-            self.direct_diagnostic = Some(DirectDiagnosticWindow {
-                id,
-                data_posts: stats.efa_direct_data_posts,
-                credit_posts: stats.efa_direct_credit_posts,
-                piggyback_advances: stats.efa_direct_credit_piggyback_advances,
-            });
-        }
-    }
-    /// Local observer output, never a wire field or durability receipt.
-    /// Profile boundaries occur outside clean API timing; no CQ is acquired here.
-    #[cfg(feature = "experimental-fabric")]
-    fn finish_direct_diagnostic(&mut self, reason: &'static str) {
-        let Some(window) = self.direct_diagnostic.take() else {
-            return;
-        };
-        let Some(endpoint) = &self.sock.fabric else {
-            return;
-        };
-        let stats = endpoint.progress_stats();
-        let data_posts = stats
-            .efa_direct_data_posts
-            .saturating_sub(window.data_posts);
-        let credit_posts = stats
-            .efa_direct_credit_posts
-            .saturating_sub(window.credit_posts);
-        let piggyback_advances = stats
-            .efa_direct_credit_piggyback_advances
-            .saturating_sub(window.piggyback_advances);
-        if data_posts == 0 && credit_posts == 0 && piggyback_advances == 0 {
-            return;
-        }
-        let peer = self
-            .sock
-            .socket
-            .local_addr()
-            .and_then(|local| {
-                self.sock
-                    .socket
-                    .peer_addr()
-                    .map(|remote| format!("{local}->{remote}"))
-            })
-            .ok();
-        let record = serde_json::json!({
-            "schema": 1,
-            "reason": reason,
-            "window": window.id,
-            "data_posts": data_posts,
-            "credit_posts": credit_posts,
-            "piggyback_advances": piggyback_advances,
-            "peer": peer,
-        });
-        // Observer IO must not change authority or panic during endpoint teardown.
-        // The campaign collector rejects missing required diagnostic records.
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS {record}"
-        );
     }
     fn read_transport(
         conn: &mut Option<rustls::Connection>,
@@ -1145,8 +1044,6 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        #[cfg(feature = "experimental-fabric")]
-        self.finish_direct_diagnostic("session-drop");
         // A session dropped without `abort` (a client going away) still ends its
         // TLS stream deliberately; after `abort` this is a no-op.
         self.send_close_notify();
@@ -1454,7 +1351,6 @@ impl Client {
             return Err(TcpError::new("unknown or duplicate response ID"));
         }
         self.reactor.progressed |= self.stream.progress_output()?;
-        self.reactor.progressed |= self.stream.finish_fabric_sweep()?;
         Ok(())
     }
     pub(super) fn exchange_position(&mut self, request: &Request) -> Result<Response, TcpError> {
@@ -2192,7 +2088,6 @@ pub(super) fn serve_session(
                 stream.progress_output()?;
                 progressed = true;
             }
-            progressed |= stream.finish_fabric_sweep()?;
             // Every send of this sweep has been posted; publish its counters.
             #[cfg(feature = "experimental-fabric")]
             stream.flush_owner_transport();
