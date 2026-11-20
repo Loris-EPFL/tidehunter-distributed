@@ -191,7 +191,7 @@ caller). No trim runs while the database is open.
   database is found at the bound, the open stays refused until a separate
   offline fenced trim tool runs. That tool does not exist. It is built only if
   the gauge fires in a golden or qualification run. An online generation trim is
-  not planned.
+  a possible later design (`checkpoint-work/research/ONLINE-GENERATION-TRIM-2026-11-20.md`).
 
 ## 8. Capacity
 
@@ -212,13 +212,14 @@ file; it never deletes.
 
 Gauges of the capacity path (exported by `sui.rs`, with `snapshot_latch_deferrals`):
 
-- `retained_streams` and `retained_stream_pressure`: the stream table size and
-  its share of the 4096-stream bound (section 7).
+- `retained_streams`: the number of owner streams in the table (section 7).
+  `retained_stream_pressure`: 0 or 1. It is 1 from 75 % of the 4096-stream bound.
 - `relocation_copy_deferrals`: passes that applied nothing because the owners
   had not made the copies durable in time. The relocator runs the pass again.
   It is a count, not a database failure.
 - `retirement_latch_caps`: retirement runs that retired nothing because a held
-  cut latch was below the stored cut. The check fails closed. A later run
+  latch (a relocation pass's frozen cut, or the short NONE latch of a
+  checkpoint pin) was below the stored cut. The check fails closed. A later run
   retries the files.
 
 ## 9. Concurrency contracts

@@ -749,7 +749,10 @@ described above. The keys `profile.coordinator_resolution` and
 `profile.coordinator_resolution_valid` are no longer written. The analysis
 scripts that read them (`decomposition.py`, `focused_analysis.py`,
 `campaign_exporter.py`) treat a missing key as "unavailable". They still read
-the evidence of earlier runs.
+the evidence of earlier runs. One effect: `campaign_exporter.py` gates the
+per-owner `read_profile_*` counters on `eligible or coordinator_resolution_valid`.
+A run that ended with an error no longer emits those owner counters. This is an
+accepted loss.
 
 Batch cache lookup holds the cache for at most 32 consecutive request slots.
 Cache-lock-wait counts are actual acquisitions/windows; cache-lookup counts are
