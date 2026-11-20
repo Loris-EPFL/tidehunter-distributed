@@ -362,9 +362,15 @@ fn traced_bulk_call_preserves_owner_and_member_identity() {
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     db.set_read_profile_limit(1);
     let trace = db.begin_read_trace(123, 3).unwrap();
-    // Tracing is best effort: an event that meets a held trace lock is shed
-    // and counted in `contention_drops` (read_trace.rs `update`). Measure the
-    // sheds of this call alone.
+    // Tracing is best effort: a record (call status, group, or event) that
+    // meets a held trace lock is shed and counted in `contention_drops`
+    // (read_trace.rs `update`), one count per lost record. The two groups'
+    // I/O completions record events from owner threads while this thread is
+    // still creating the second group, so any record can be shed. Measure the
+    // sheds of this call alone and require every missing record to be
+    // covered by a counted shed. Extra sheds may hit records this test does
+    // not assert (lane, classification, intermediate events), so the bound
+    // is `lost <= sheds`, not equality.
     let sheds_before = db.read_trace_snapshot().contention_drops;
     let keys = [0u32.to_be_bytes(), 1u32.to_be_bytes(), 0u32.to_be_bytes()];
     let values = db
@@ -376,16 +382,23 @@ fn traced_bulk_call_preserves_owner_and_member_identity() {
     let sheds = snapshot.contention_drops - sheds_before;
     assert_eq!(snapshot.calls.len(), 1);
     let call = &snapshot.calls[0];
-    assert_eq!(
-        (call.caller_id, call.members, call.status),
-        (123, 3, "complete")
+    assert_eq!((call.caller_id, call.members), (123, 3));
+    assert_eq!(call.dropped_children, 0);
+    // A shed `finish` leaves the call "incomplete"; nothing else may.
+    let status_lost = u64::from(call.status != "complete");
+    assert!(
+        call.status == "complete" || call.status == "incomplete",
+        "unexpected call status {}",
+        call.status
     );
-    assert!(call.groups.iter().any(|group| group.members == [0, 2]));
-    assert!(call.groups.iter().any(|group| group.members == [1]));
-    assert_ne!(call.groups[0].owner, call.groups[1].owner);
-    // Every group's delivery event is recorded unless a counted shed took it;
-    // without sheds, every group has it.
-    let missing = call
+    let shared_group = call.groups.iter().find(|group| group.members == [0, 2]);
+    let single_group = call.groups.iter().find(|group| group.members == [1]);
+    let groups_lost = u64::from(shared_group.is_none()) + u64::from(single_group.is_none());
+    assert_eq!(call.groups.len() as u64 + groups_lost, 2);
+    if let (Some(first), Some(second)) = (shared_group, single_group) {
+        assert_ne!(first.owner, second.owner);
+    }
+    let deliveries_lost = call
         .groups
         .iter()
         .filter(|group| {
@@ -395,13 +408,12 @@ fn traced_bulk_call_preserves_owner_and_member_identity() {
                 .any(|event| event.name == "request_result_delivered")
         })
         .count() as u64;
+    let lost = status_lost + groups_lost + deliveries_lost;
     assert!(
-        missing <= sheds,
-        "{missing} groups lack request_result_delivered with {sheds} counted sheds"
+        lost <= sheds,
+        "{lost} records missing (status {status_lost}, groups {groups_lost}, \
+         deliveries {deliveries_lost}) with {sheds} counted sheds"
     );
-    if sheds == 0 {
-        assert_eq!(missing, 0);
-    }
     db.shutdown().unwrap();
 }
 
