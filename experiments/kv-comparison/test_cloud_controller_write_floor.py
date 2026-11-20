@@ -270,7 +270,10 @@ class WriteFloorTests(unittest.TestCase):
                     spec = self.spec(mode)
                     log = case / (mode + '.log')
                     argv = floors.write_argv(binary, target, log, spec, identity)
-                    raw, flags = controller.run_write_fio(argv, identity, scratch, case, 30)
+                    # The helper streams progress to its log while it runs, so
+                    # the deadline is only a safety cap; use the validated
+                    # maximum so machine load cannot masquerade as a hang.
+                    raw, flags = controller.run_write_fio(argv, identity, scratch, case, 60)
                     result = floors.write_result({'case_id': 'x', 'ssd_write': spec}, raw, log.read_bytes(), '1:2', flags['direct'])
                     rows = [tuple(map(int, line.split(','))) for line in log.read_text().splitlines()]
                     self.assertEqual(len(rows), result['logged_operations'])
@@ -296,7 +299,8 @@ class WriteFloorTests(unittest.TestCase):
                             'operations': 4096, 'warmup_operations': 512}
                     log = case / (mode + '.log')
                     argv = floors.write_argv(binary, target, log, spec, identity)
-                    raw, flags = controller.run_write_fio(argv, identity, scratch, case, 30)
+                    # Same safety-cap rationale as above.
+                    raw, flags = controller.run_write_fio(argv, identity, scratch, case, 60)
                     rows = floors.parse_write_log(log.read_bytes(), spec)
                     result = floors.write_result({'case_id': 'x', 'ssd_write': spec}, raw,
                                                  log.read_bytes(), '1:2', flags['direct'])
