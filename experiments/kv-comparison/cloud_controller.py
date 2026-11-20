@@ -566,6 +566,9 @@ def run_write_fio(argv, identity, scratch_root, case_root, timeout):
     collector.start()
     start = time.monotonic()
     observed = None
+    log_path = Path(argv[3])
+    log_size = None
+    progressed_at = start
     try:
         while process.poll() is None:
             elapsed = time.monotonic() - start
@@ -574,8 +577,26 @@ def run_write_fio(argv, identity, scratch_root, case_root, timeout):
             flags = write_fio_flags(process.pid, identity["device"], identity["inode"], case_root, pipe_inodes)
             if flags is not None:
                 observed = flags
-            elif observed is None and elapsed >= 2:
-                raise FioFailure("fio scratch writable fd not observed")
+            elif observed is None:
+                # Progress-based fd gate: log growth counts as observable
+                # progress, so a scheduled-but-slow helper is not failed while
+                # it advances; a helper showing neither the fd nor log growth
+                # for 2 s is stalled and fails without waiting out the whole
+                # budget. After the fd is seen, the overall timeout bounds the
+                # run. While the log keeps growing without the fd, the gate can
+                # wait up to the whole timeout; `observed` is still required at
+                # exit, so a helper that never shows the fd cannot pass.
+                try:
+                    size = log_path.stat().st_size
+                except FileNotFoundError:
+                    size = None
+                except OSError:
+                    size = log_size
+                if size != log_size:
+                    log_size = size
+                    progressed_at = time.monotonic()
+                elif time.monotonic() - progressed_at >= 2:
+                    raise FioFailure("fio scratch writable fd not observed")
             time.sleep(.01)
         collector.join(timeout=10)
         if collector.is_alive():

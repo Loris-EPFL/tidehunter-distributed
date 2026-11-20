@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import subprocess
+import time
 import sys
 import unittest
 from unittest.mock import patch
@@ -308,6 +309,57 @@ class WriteFloorTests(unittest.TestCase):
                     self.assertEqual([row[3] for row in rows],
                                      [i * 1024 for i in range(512, 4608)])
                     self.assertEqual(result['logged_operations'], 4096)
+
+    def test_fd_gate_waits_for_a_slow_but_progressing_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); scratch = root / 'fio-scratch'; scratch.mkdir()
+            case = root / 'case'; case.mkdir(); target = scratch / 'x'; target.write_bytes(b'x')
+            st = target.stat()
+            identity = {'path': str(target), 'device': st.st_dev, 'inode': st.st_ino}
+            helper = case / 'helper'
+            # Log rows appear every second and the scratch fd opens only at
+            # 3 s, past a fixed 2 s fd deadline: continuous observable progress
+            # (log growth) must keep the gate open until the fd appears.
+            helper.write_text("#!/bin/sh\ni=0\n"
+                              "while [ $i -lt 3 ]; do echo '10,5,15,0' >> \"$3\"; "
+                              "sleep 1; i=$((i+1)); done\n"
+                              "exec 3>\"$1/$2\"\n"
+                              "sleep 1\n"
+                              "printf '{\"total_operations\":1,\"logged_operations\":1,"
+                              "\"elapsed_ns\":1000}'\n")
+            helper.chmod(0o700)
+            argv = floors.write_argv(helper, target, case / 'lat.log', self.spec(), identity)
+            raw, flags = controller.run_write_fio(argv, identity, scratch, case, 30)
+            self.assertEqual(json.loads(raw)['total_operations'], 1)
+            self.assertFalse(flags['direct'])
+
+    def test_fd_gate_fails_a_stalled_helper_without_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); scratch = root / 'fio-scratch'; scratch.mkdir()
+            case = root / 'case'; case.mkdir(); target = scratch / 'x'; target.write_bytes(b'x')
+            st = target.stat()
+            identity = {'path': str(target), 'device': st.st_dev, 'inode': st.st_ino}
+            helper = case / 'helper'
+            helper.write_text('#!/bin/sh\nsleep 30\n')
+            helper.chmod(0o700)
+            argv = floors.write_argv(helper, target, case / 'lat.log', self.spec(), identity)
+            started = time.monotonic()
+            with self.assertRaisesRegex(controller.FioFailure, 'writable fd not observed'):
+                controller.run_write_fio(argv, identity, scratch, case, 30)
+            self.assertLess(
+                time.monotonic() - started, 10,
+                'a stalled helper must fail at the 2 s no-progress bound, not the whole budget')
+
+    def test_run_write_fio_rejects_out_of_range_deadlines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); scratch = root / 'fio-scratch'; scratch.mkdir()
+            case = root / 'case'; case.mkdir(); target = scratch / 'x'; target.write_bytes(b'x')
+            st = target.stat()
+            identity = {'path': str(target), 'device': st.st_dev, 'inode': st.st_ino}
+            argv = floors.write_argv(case / 'helper', target, case / 'lat.log', self.spec(), identity)
+            for bad in (0, -1, 61, float('inf')):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    controller.run_write_fio(argv, identity, scratch, case, bad)
 
     def test_helper_rejects_swapped_scratch_before_writing(self):
         with tempfile.TemporaryDirectory() as tmp:
